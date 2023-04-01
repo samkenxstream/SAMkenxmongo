@@ -26,27 +26,21 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
 
 #include "mongo/db/repl/initial_syncer_common_stats.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
 
 
 namespace mongo {
 namespace repl {
 namespace initial_sync_common_stats {
 
-Counter64 initialSyncFailedAttempts;
-Counter64 initialSyncFailures;
-Counter64 initialSyncCompletes;
-
-ServerStatusMetricField<Counter64> displaySSInitialSyncFailedAttempts(
-    "repl.initialSync.failedAttempts", &initialSyncFailedAttempts);
-ServerStatusMetricField<Counter64> displaySSInitialSyncFailures("repl.initialSync.failures",
-                                                                &initialSyncFailures);
-ServerStatusMetricField<Counter64> displaySSInitialSyncCompleted("repl.initialSync.completed",
-                                                                 &initialSyncCompletes);
+CounterMetric initialSyncFailedAttempts("repl.initialSync.failedAttempts");
+CounterMetric initialSyncFailures("repl.initialSync.failures");
+CounterMetric initialSyncCompletes("repl.initialSync.completed");
 
 void LogInitialSyncAttemptStats(const StatusWith<OpTimeAndWallTime>& attemptResult,
                                 bool hasRetries,

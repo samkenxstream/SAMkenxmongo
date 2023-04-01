@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
@@ -41,6 +40,9 @@
 #include "mongo/s/grid.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/util/fail_point.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
+
 
 namespace mongo {
 namespace txn {
@@ -125,7 +127,7 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
             auto start = _executor->now();
 
             auto requestOpMsg =
-                OpMsgRequest::fromDBAndBody(NamespaceString::kAdminDb, commandObj).serialize();
+                OpMsgRequest::fromDBAndBody(DatabaseName::kAdmin.db(), commandObj).serialize();
             const auto replyOpMsg = OpMsg::parseOwned(
                 service->getServiceEntryPoint()->handleRequest(opCtx, requestOpMsg).get().response);
 
@@ -143,7 +145,7 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
         .then([this, shardId, commandObj = commandObj.getOwned(), readPref](
                   HostAndShard hostAndShard) mutable {
             executor::RemoteCommandRequest request(hostAndShard.hostTargeted,
-                                                   NamespaceString::kAdminDb.toString(),
+                                                   DatabaseName::kAdmin.toString(),
                                                    commandObj,
                                                    readPref.toContainingBSON(),
                                                    nullptr);
@@ -153,15 +155,15 @@ Future<executor::TaskExecutor::ResponseStatus> AsyncWorkScheduler::scheduleRemot
             stdx::unique_lock<Latch> ul(_mutex);
             uassertStatusOK(_shutdownStatus);
 
-            auto scheduledCommandHandle =
-                uassertStatusOK(_executor->scheduleRemoteCommand(request, [
-                    this,
-                    commandObj = std::move(commandObj),
-                    shardId = std::move(shardId),
-                    hostTargeted = std::move(hostAndShard.hostTargeted),
-                    shard = std::move(hostAndShard.shard),
-                    promise = std::make_shared<Promise<ResponseStatus>>(std::move(pf.promise))
-                ](const RemoteCommandCallbackArgs& args) mutable noexcept {
+            auto scheduledCommandHandle = uassertStatusOK(_executor->scheduleRemoteCommand(
+                request,
+                [this,
+                 commandObj = std::move(commandObj),
+                 shardId = std::move(shardId),
+                 hostTargeted = std::move(hostAndShard.hostTargeted),
+                 shard = std::move(hostAndShard.shard),
+                 promise = std::make_shared<Promise<ResponseStatus>>(std::move(pf.promise))](
+                    const RemoteCommandCallbackArgs& args) mutable noexcept {
                     auto status = args.response.status;
                     shard->updateReplSetMonitor(hostTargeted, status);
 
@@ -277,10 +279,10 @@ void AsyncWorkScheduler::_notifyAllTasksComplete(WithLock wl) {
 }
 
 ShardId getLocalShardId(ServiceContext* service) {
-    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
         return ShardId::kConfigServerId;
     }
-    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer)) {
         return ShardingState::get(service)->shardId();
     }
 

@@ -35,9 +35,9 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/service_context.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -59,7 +59,7 @@ TEST(StartChunkCloneRequest, CreateAsCommandComplete) {
     BSONObjBuilder builder;
     StartChunkCloneRequest::appendAsCommand(
         &builder,
-        NamespaceString("TestDB.TestColl"),
+        NamespaceString::createNamespaceString_forTest("TestDB.TestColl"),
         migrationId,
         lsid,
         txnNumber,
@@ -75,7 +75,8 @@ TEST(StartChunkCloneRequest, CreateAsCommandComplete) {
     BSONObj cmdObj = builder.obj();
 
     auto request = assertGet(StartChunkCloneRequest::createFromCommand(
-        NamespaceString(cmdObj["_recvChunkStart"].String()), cmdObj));
+        NamespaceString::createNamespaceString_forTest(cmdObj["_recvChunkStart"].String()),
+        cmdObj));
 
     ASSERT_EQ("TestDB.TestColl", request.getNss().ns());
     ASSERT_EQ(sessionId.toString(), request.getSessionId().toString());

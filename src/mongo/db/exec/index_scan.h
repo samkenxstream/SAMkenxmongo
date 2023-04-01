@@ -48,12 +48,14 @@ struct IndexScanParams {
                     std::string indexName,
                     BSONObj keyPattern,
                     MultikeyPaths multikeyPaths,
-                    bool multikey)
+                    bool multikey,
+                    bool lowPriority = false)
         : indexDescriptor(descriptor),
           name(std::move(indexName)),
           keyPattern(std::move(keyPattern)),
           multikeyPaths(std::move(multikeyPaths)),
-          isMultiKey(multikey) {}
+          isMultiKey(multikey),
+          lowPriority(lowPriority) {}
 
     IndexScanParams(OperationContext* opCtx,
                     const CollectionPtr& collection,
@@ -82,6 +84,8 @@ struct IndexScanParams {
 
     // Do we want to add the key as metadata?
     bool addKeyMetadata{false};
+
+    bool lowPriority = false;
 };
 
 /**
@@ -127,9 +131,23 @@ public:
 
     std::unique_ptr<PlanStageStats> getStats() final;
 
-    const SpecificStats* getSpecificStats() const final;
+    const IndexScanStats* getSpecificStats() const final {
+        return &_specificStats;
+    }
 
     static const char* kStageType;
+
+    const BSONObj& getKeyPattern() const {
+        return _keyPattern;
+    }
+
+    bool isForward() const {
+        return _forward;
+    }
+
+    const IndexBounds& getBounds() const {
+        return _bounds;
+    }
 
 protected:
     void doSaveStateRequiresIndex() final;
@@ -201,6 +219,9 @@ private:
     bool _startKeyInclusive;
     // Is the end key included in the range?
     bool _endKeyInclusive;
+
+    bool _lowPriority;
+    boost::optional<ScopedAdmissionPriorityForLock> _priority;
 };
 
 }  // namespace mongo

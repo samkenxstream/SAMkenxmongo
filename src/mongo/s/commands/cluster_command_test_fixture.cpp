@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -37,14 +36,17 @@
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_manager.h"
-#include "mongo/db/logical_session_cache_noop.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/db/session/logical_session_cache_noop.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/tick_source_mock.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
@@ -122,8 +124,8 @@ DbResponse ClusterCommandTestFixture::runCommand(BSONObj cmd) {
         // Have the new client use the dedicated threading model. This ensures the synchronous
         // execution of the command by the client thread.
         stdx::lock_guard lk(*client.get());
-        auto seCtx = transport::ServiceExecutorContext{};
-        seCtx.setThreadingModel(transport::ServiceExecutor::ThreadingModel::kDedicated);
+        auto seCtx = std::make_unique<transport::ServiceExecutorContext>();
+        seCtx->setUseDedicatedThread(true);
         transport::ServiceExecutorContext::set(client.get(), std::move(seCtx));
     }
 

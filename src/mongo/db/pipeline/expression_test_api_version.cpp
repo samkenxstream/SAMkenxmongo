@@ -34,9 +34,9 @@
 namespace mongo {
 
 REGISTER_TEST_EXPRESSION(_testApiVersion,
+                         ExpressionTestApiVersion::parse,
                          AllowedWithApiStrict::kConditionally,
-                         AllowedWithClientType::kAny,
-                         ExpressionTestApiVersion::parse);
+                         AllowedWithClientType::kAny);
 
 ExpressionTestApiVersion::ExpressionTestApiVersion(ExpressionContext* const expCtx,
                                                    bool unstable,
@@ -89,7 +89,7 @@ boost::intrusive_ptr<Expression> ExpressionTestApiVersion::parse(ExpressionConte
     return new ExpressionTestApiVersion(expCtx, unstableField, deprecatedField);
 }
 
-Value ExpressionTestApiVersion::serialize(bool explain) const {
+Value ExpressionTestApiVersion::serialize(SerializationOptions options) const {
     return Value(Document{{"$_testApiVersion",
                            Document{{"unstable", _unstable ? Value(_unstable) : Value()},
                                     {"deprecated", _deprecated ? Value(_deprecated) : Value()}}}});
@@ -98,7 +98,5 @@ Value ExpressionTestApiVersion::serialize(bool explain) const {
 Value ExpressionTestApiVersion::evaluate(const Document& root, Variables* variables) const {
     return Value(1);
 }
-
-void ExpressionTestApiVersion::_doAddDependencies(DepsTracker* deps) const {}
 
 }  // namespace mongo

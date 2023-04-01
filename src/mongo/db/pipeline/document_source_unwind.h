@@ -43,7 +43,7 @@ public:
     // virtuals from DocumentSource
     const char* getSourceName() const final;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     /**
      * Returns the unwound path, and the 'includeArrayIndex' path, if specified.
@@ -69,6 +69,8 @@ public:
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
     /**
      * Creates a new $unwind DocumentSource from a BSON specification.

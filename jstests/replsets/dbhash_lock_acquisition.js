@@ -3,12 +3,16 @@
  * resources when reading a timestamp using the $_internalReadAtClusterTime option.
  *
  * @tags: [
+ *   # Incompatible with all feature flags running on last continuous as dbHash runs lock-free in
+ *   # v7.0.
+ *   requires_fcv_70,
  *   uses_transactions,
  * ]
  */
 (function() {
 "use strict";
 
+load("jstests/libs/feature_flag_util.js");
 load("jstests/libs/parallelTester.js");  // for Thread
 
 const rst = new ReplSetTest({nodes: 1});
@@ -17,6 +21,13 @@ rst.initiate();
 
 const primary = rst.getPrimary();
 const db = primary.getDB("test");
+
+if (FeatureFlagUtil.isEnabled(db, "PointInTimeCatalogLookups")) {
+    jsTestLog("Skipping test as dbHash is run lock-free with " +
+              "the point-in-time catalog lookups feature flag enabled");
+    rst.stopSet();
+    return;
+}
 
 const session = primary.startSession({causalConsistency: false});
 const sessionDB = session.getDatabase(db.getName());
@@ -32,8 +43,13 @@ assert.commandWorked(sessionDB.mycoll.insert({}));
 const ops = db.currentOp({"lsid.id": session.getSessionId().id}).inprog;
 assert.eq(
     1, ops.length, () => "Failed to find session in currentOp() output: " + tojson(db.currentOp()));
-assert.eq(ops[0].locks,
-          {ReplicationStateTransition: "w", Global: "w", Database: "w", Collection: "w"});
+assert.eq(ops[0].locks, {
+    FeatureCompatibilityVersion: "w",
+    ReplicationStateTransition: "w",
+    Global: "w",
+    Database: "w",
+    Collection: "w",
+});
 
 const threadCaptruncCmd = new Thread(function(host) {
     try {
@@ -77,11 +93,16 @@ threadDBHash.start();
 
 assert.soon(() => {
     const ops = db.currentOp({"command.dbHash": 1, waitingForLock: true}).inprog;
-    if (ops.length === 0) {
+    if (ops.length === 0 || !ops[0].locks.hasOwnProperty("Collection")) {
         return false;
     }
-    assert.eq(ops[0].locks,
-              {ReplicationStateTransition: "w", Global: "r", Database: "r", Collection: "r"});
+    assert.eq(ops[0].locks, {
+        FeatureCompatibilityVersion: "r",
+        ReplicationStateTransition: "w",
+        Global: "r",
+        Database: "r",
+        Collection: "r",
+    });
     return true;
 }, () => "Failed to find create collection in currentOp() output: " + tojson(db.currentOp()));
 

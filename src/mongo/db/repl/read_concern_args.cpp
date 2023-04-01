@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -39,6 +38,9 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 using std::string;
 
@@ -114,7 +116,7 @@ ReadConcernLevel ReadConcernArgs::getLevel() const {
 }
 
 bool ReadConcernArgs::hasLevel() const {
-    return _level.is_initialized();
+    return _level.has_value();
 }
 
 boost::optional<OpTime> ReadConcernArgs::getArgsOpTime() const {
@@ -204,7 +206,7 @@ Status ReadConcernArgs::parse(const BSONObj& readConcernObj) {
         } else if (fieldName == ReadWriteConcernProvenance::kSourceFieldName) {
             try {
                 _provenance = ReadWriteConcernProvenance::parse(
-                    IDLParserErrorContext("ReadConcernArgs::parse"), readConcernObj);
+                    IDLParserContext("ReadConcernArgs::parse"), readConcernObj);
             } catch (const DBException&) {
                 return exceptionToStatus();
             }
@@ -297,7 +299,7 @@ bool ReadConcernArgs::isSpeculativeMajority() const {
 
 void ReadConcernArgs::_appendInfoInner(BSONObjBuilder* builder) const {
     if (_level) {
-        builder->append(kLevelFieldName, readConcernLevels::toString(_level.get()));
+        builder->append(kLevelFieldName, readConcernLevels::toString(_level.value()));
     }
 
     if (_opTime) {

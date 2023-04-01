@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCatalog
 
 #include "mongo/db/catalog/local_oplog_info.h"
 
@@ -38,6 +37,10 @@
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/timer.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCatalog
+
 
 namespace mongo {
 namespace {
@@ -61,16 +64,16 @@ LocalOplogInfo* LocalOplogInfo::get(OperationContext* opCtx) {
     return get(opCtx->getServiceContext());
 }
 
-const CollectionPtr& LocalOplogInfo::getCollection() const {
+const Collection* LocalOplogInfo::getCollection() const {
     return _oplog;
 }
 
-void LocalOplogInfo::setCollection(const CollectionPtr& oplog) {
-    _oplog = CollectionPtr(oplog.get(), CollectionPtr::NoYieldTag{});
+void LocalOplogInfo::setCollection(const Collection* oplog) {
+    _oplog = oplog;
 }
 
 void LocalOplogInfo::resetCollection() {
-    _oplog.reset();
+    _oplog = nullptr;
 }
 
 void LocalOplogInfo::setNewTimestamp(ServiceContext* service, const Timestamp& newTime) {
@@ -111,6 +114,8 @@ std::vector<OplogSlot> LocalOplogInfo::getNextOpTimes(OperationContext* opCtx, s
         invariant(_oplog);
         fassert(28560, _oplog->getRecordStore()->oplogDiskLocRegister(opCtx, ts, orderedCommit));
     }
+
+    Timer oplogSlotDurationTimer;
     std::vector<OplogSlot> oplogSlots(count);
     for (std::size_t i = 0; i < count; i++) {
         oplogSlots[i] = {Timestamp(ts.asULL() + i), term};
@@ -119,8 +124,19 @@ std::vector<OplogSlot> LocalOplogInfo::getNextOpTimes(OperationContext* opCtx, s
     // If we abort a transaction that has reserved an optime, we should make sure to update the
     // stable timestamp if necessary, since this oplog hole may have been holding back the stable
     // timestamp.
-    opCtx->recoveryUnit()->onRollback(
-        [replCoord]() { replCoord->attemptToAdvanceStableTimestamp(); });
+    opCtx->recoveryUnit()->onRollback([replCoord, oplogSlotDurationTimer](OperationContext* opCtx) {
+        replCoord->attemptToAdvanceStableTimestamp();
+        // Sum the oplog slot durations. An operation may participate in multiple transactions.
+        CurOp::get(opCtx)->debug().totalOplogSlotDurationMicros +=
+            Microseconds(oplogSlotDurationTimer.elapsed());
+    });
+
+    opCtx->recoveryUnit()->onCommit(
+        [oplogSlotDurationTimer](OperationContext* opCtx, boost::optional<Timestamp>) {
+            // Sum the oplog slot durations. An operation may participate in multiple transactions.
+            CurOp::get(opCtx)->debug().totalOplogSlotDurationMicros +=
+                Microseconds(oplogSlotDurationTimer.elapsed());
+        });
 
     return oplogSlots;
 }

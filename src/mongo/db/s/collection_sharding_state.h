@@ -31,16 +31,18 @@
 
 #include <vector>
 
-#include "mongo/db/logical_time.h"
-#include "mongo/db/namespace_string.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/s/scoped_collection_metadata.h"
+#include "mongo/s/sharding_index_catalog_cache.h"
 
 namespace mongo {
 
 /**
- * Each collection on a MongoD instance is assigned an instance of CollectionShardingState for the
- * duration of its lifetime, which represents the shard's knowledge of that collection's shard
- * version and the set of chunks that it owns, as well as functions for tracking this state.
+ * Each shard node process (primary or secondary) has one instance of this object for each
+ * collection residing on that shard. It sits on the second level of the hierarchy of the Shard Role
+ * runtime-authoritative caches (along with DatabaseShardingState) and represents the shard's
+ * knowledge of that collection's shard version and the set of chunks that it owns, as well as
+ * functions for tracking this state.
  *
  * This is the only interface that non-sharding consumers should be interfacing with.
  *
@@ -52,9 +54,9 @@ namespace mongo {
  * The CollectionShardingStateFactory class below is used to instantiate the correct subclass of
  * CollectionShardingState at runtime.
  *
- * Synchronization rule: In order to obtain an instance of this object, the caller must have some
- * lock on the respective collection. Different functions require different lock levels though, so
- * be sure to check the function-level comments for details.
+ * SYNCHRONISATION: In order to obtain an instance of this object, the caller must have some lock on
+ * the respective collection. Different functions require different lock levels though, so be sure
+ * to check the function-level comments for details.
  */
 class CollectionShardingState {
 public:
@@ -65,26 +67,44 @@ public:
     CollectionShardingState& operator=(const CollectionShardingState&) = delete;
 
     /**
-     * Obtains the sharding state for the specified collection. If it does not exist, it will be
-     * created and will remain in memory until the collection is dropped.
-     *
-     * Must be called with some lock held on the specific collection being looked up and the
-     * returned pointer must not be stored.
+     * Obtains the sharding state for the specified collection, along with a resource lock
+     * protecting it from concurrent modifications, which will be held util the object goes out of
+     * scope.
      */
-    static CollectionShardingState* get(OperationContext* opCtx, const NamespaceString& nss);
+    class ScopedCollectionShardingState {
+    public:
+        ScopedCollectionShardingState(ScopedCollectionShardingState&&);
+
+        ~ScopedCollectionShardingState();
+
+        CollectionShardingState* operator->() const {
+            return _css;
+        }
+        CollectionShardingState& operator*() const {
+            return *_css;
+        }
+
+    private:
+        friend class CollectionShardingState;
+        friend class CollectionShardingRuntime;
+
+        ScopedCollectionShardingState(Lock::ResourceLock lock, CollectionShardingState* css);
+
+        static ScopedCollectionShardingState acquireScopedCollectionShardingState(
+            OperationContext* opCtx, const NamespaceString& nss, LockMode mode);
+
+        Lock::ResourceLock _lock;
+        CollectionShardingState* _css;
+    };
+    static ScopedCollectionShardingState assertCollectionLockedAndAcquire(
+        OperationContext* opCtx, const NamespaceString& nss);
+    static ScopedCollectionShardingState acquire(OperationContext* opCtx,
+                                                 const NamespaceString& nss);
 
     /**
      * Returns the names of the collections that have a CollectionShardingState.
      */
     static std::vector<NamespaceString> getCollectionNames(OperationContext* opCtx);
-
-    /**
-     * Obtain a pointer to the CollectionShardingState that remains safe to access without holding
-     * a collection lock. Should be called instead of the regular get() if no collection lock is
-     * held. The returned CollectionShardingState instance should not be modified!
-     */
-    static std::shared_ptr<CollectionShardingState> getSharedForLockFreeReads(
-        OperationContext* opCtx, const NamespaceString& nss);
 
     /**
      * Reports all collections which have filtering information associated.
@@ -97,6 +117,11 @@ public:
     static void appendInfoForServerStatus(OperationContext* opCtx, BSONObjBuilder* builder);
 
     /**
+     * Returns the namespace to which this CSS corresponds.
+     */
+    virtual const NamespaceString& nss() const = 0;
+
+    /**
      * If the shard currently doesn't know whether the collection is sharded or not, it will throw a
      * StaleConfig exception.
      *
@@ -104,7 +129,10 @@ public:
      *
      * The returned object *is not safe* to access after the collection lock has been dropped.
      */
-    virtual ScopedCollectionDescription getCollectionDescription(OperationContext* opCtx) = 0;
+    virtual ScopedCollectionDescription getCollectionDescription(OperationContext* opCtx) const = 0;
+
+    virtual ScopedCollectionDescription getCollectionDescription(
+        OperationContext* opCtx, bool operationIsVersioned) const = 0;
 
     /**
      * This method must be called with an OperationShardingState, which specifies an expected shard
@@ -139,7 +167,25 @@ public:
     virtual ScopedCollectionFilter getOwnershipFilter(
         OperationContext* opCtx,
         OrphanCleanupPolicy orphanCleanupPolicy,
-        bool supportNonVersionedOperations = false) = 0;
+        bool supportNonVersionedOperations = false) const = 0;
+
+    virtual ScopedCollectionFilter getOwnershipFilter(
+        OperationContext* opCtx,
+        OrphanCleanupPolicy orphanCleanupPolicy,
+        const ShardVersion& receivedShardVersion) const = 0;
+
+    /**
+     * Gets the shard's index version.
+     */
+    virtual boost::optional<CollectionIndexes> getCollectionIndexes(
+        OperationContext* opCtx) const = 0;
+
+    /**
+     * Gets the shard's index cache.
+     *
+     */
+    virtual boost::optional<ShardingIndexesCatalogCache> getIndexes(
+        OperationContext* opCtx) const = 0;
 
     /**
      * Checks whether the shard version in the operation context is compatible with the shard
@@ -148,12 +194,15 @@ public:
      *
      * If the request is not versioned all collections will be treated as UNSHARDED.
      */
-    virtual void checkShardVersionOrThrow(OperationContext* opCtx) = 0;
+    virtual void checkShardVersionOrThrow(OperationContext* opCtx) const = 0;
+
+    virtual void checkShardVersionOrThrow(OperationContext* opCtx,
+                                          const ShardVersion& receivedShardVersion) const = 0;
 
     /**
      * Appends information about the shard version of the collection.
      */
-    virtual void appendShardVersion(BSONObjBuilder* builder) = 0;
+    virtual void appendShardVersion(BSONObjBuilder* builder) const = 0;
 
     /**
      * Returns the number of ranges scheduled for deletion on the collection.
@@ -182,7 +231,7 @@ public:
     virtual void join() = 0;
 
     /**
-     * Called by the CollectionShardingState::get method once per newly cached namespace. It is
+     * Called by the CollectionShardingState::acquire method once per newly cached namespace. It is
      * invoked under a mutex and must not acquire any locks or do blocking work.
      *
      * Implementations must be thread-safe when called from multiple threads.

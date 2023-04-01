@@ -32,7 +32,7 @@
 #include <functional>
 #include <string>
 
-#include <third_party/murmurhash3/MurmurHash3.h>
+#include <MurmurHash3.h>
 
 #include "mongo/base/data_range.h"
 #include "mongo/base/status_with.h"
@@ -93,7 +93,7 @@ public:
     /**
      * Returns whether this string represents a valid UUID.
      */
-    static bool isUUIDString(const std::string& s);
+    static bool isUUIDString(StringData s);
 
     /*
      * Return the underlying 128-bit array.

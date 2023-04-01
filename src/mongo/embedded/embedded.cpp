@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -39,7 +38,6 @@
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/database_holder_impl.h"
-#include "mongo/db/catalog/health_log.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
@@ -47,16 +45,15 @@
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/global_settings.h"
-#include "mongo/db/index/index_access_method_factory_impl.h"
-#include "mongo/db/kill_sessions_local.h"
-#include "mongo/db/logical_session_cache_impl.h"
-#include "mongo/db/op_observer_impl.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/s/collection_sharding_state_factory_standalone.h"
 #include "mongo/db/service_liaison_mongod.h"
-#include "mongo/db/session_killer.h"
-#include "mongo/db/sessions_collection_standalone.h"
+#include "mongo/db/session/kill_sessions_local.h"
+#include "mongo/db/session/logical_session_cache_impl.h"
+#include "mongo/db/session/session_killer.h"
+#include "mongo/db/session/sessions_collection_standalone.h"
 #include "mongo/db/startup_recovery.h"
 #include "mongo/db/storage/control/storage_control.h"
 #include "mongo/db/storage/encryption_hooks.h"
@@ -64,6 +61,7 @@
 #include "mongo/db/ttl.h"
 #include "mongo/embedded/embedded_options_parser_init.h"
 #include "mongo/embedded/index_builds_coordinator_embedded.h"
+#include "mongo/embedded/oplog_writer_embedded.h"
 #include "mongo/embedded/periodic_runner_embedded.h"
 #include "mongo/embedded/read_write_concern_defaults_cache_lookup_embedded.h"
 #include "mongo/embedded/replication_coordinator_embedded.h"
@@ -73,11 +71,14 @@
 #include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/util/background.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/periodic_runner_factory.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/time_support.h"
 
 #include <boost/filesystem.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 
 namespace mongo {
@@ -103,7 +104,6 @@ MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 
 void setUpCatalog(ServiceContext* serviceContext) {
     DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
-    IndexAccessMethodFactory::set(serviceContext, std::make_unique<IndexAccessMethodFactoryImpl>());
     Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
 }
 
@@ -143,7 +143,9 @@ ServiceContext::ConstructorActionRegisterer collectionShardingStateFactoryRegist
         CollectionShardingStateFactory::set(
             service, std::make_unique<CollectionShardingStateFactoryStandalone>(service));
     },
-    [](ServiceContext* service) { CollectionShardingStateFactory::clear(service); }};
+    [](ServiceContext* service) {
+        CollectionShardingStateFactory::clear(service);
+    }};
 
 }  // namespace
 
@@ -162,7 +164,8 @@ void shutdown(ServiceContext* srvContext) {
         // Close all open databases, shutdown storage engine and run all deinitializers.
         auto shutdownOpCtx = serviceContext->makeOperationContext(client);
         {
-            UninterruptibleLockGuard noInterrupt(shutdownOpCtx->lockState());
+            // TODO (SERVER-71610): Fix to be interruptible or document exception.
+            UninterruptibleLockGuard noInterrupt(shutdownOpCtx->lockState());  // NOLINT.
             Lock::GlobalLock lk(shutdownOpCtx.get(), MODE_X);
             auto databaseHolder = DatabaseHolder::get(shutdownOpCtx.get());
             databaseHolder->closeAll(shutdownOpCtx.get());
@@ -188,7 +191,7 @@ void shutdown(ServiceContext* srvContext) {
 
 
 ServiceContext* initialize(const char* yaml_config) {
-    srand(static_cast<unsigned>(curTimeMicros64()));
+    srand(static_cast<unsigned>(curTimeMicros64()));  // NOLINT
 
     if (yaml_config)
         embedded::EmbeddedOptionsConfig::instance().set(yaml_config);
@@ -206,7 +209,8 @@ ServiceContext* initialize(const char* yaml_config) {
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointEmbedded>());
 
     auto opObserverRegistry = std::make_unique<OpObserverRegistry>();
-    opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
+    opObserverRegistry->addObserver(
+        std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterEmbedded>()));
     serviceContext->setOpObserver(std::move(opObserverRegistry));
 
     DBDirectClientFactory::get(serviceContext).registerImplementation([](OperationContext* opCtx) {
@@ -233,6 +237,13 @@ ServiceContext* initialize(const char* yaml_config) {
     auto periodicRunner = std::make_unique<PeriodicRunnerEmbedded>(
         serviceContext, serviceContext->getPreciseClockSource());
     serviceContext->setPeriodicRunner(std::move(periodicRunner));
+
+    // When starting the server with --queryableBackupMode or --recoverFromOplogAsStandalone, we are
+    // in read-only mode and don't allow user-originating operations to perform writes
+    if (storageGlobalParams.queryableBackupMode ||
+        repl::ReplSettings::shouldRecoverFromOplogAsStandalone()) {
+        serviceContext->disallowUserWrites();
+    }
 
     setUpCatalog(serviceContext);
 
@@ -278,15 +289,11 @@ ServiceContext* initialize(const char* yaml_config) {
         uassert(50677, ss.str().c_str(), boost::filesystem::exists(storageGlobalParams.dbpath));
     }
 
-    if (!storageGlobalParams.readOnly) {
-        boost::filesystem::remove_all(storageGlobalParams.dbpath + "/_tmp/");
-    }
+    boost::filesystem::remove_all(storageGlobalParams.dbpath + "/_tmp/");
 
     ReadWriteConcernDefaults::create(serviceContext, readWriteConcernDefaultsCacheLookupEmbedded);
 
-    bool canCallFCVSetIfCleanStartup =
-        !storageGlobalParams.readOnly && !(storageGlobalParams.engine == "devnull");
-    if (canCallFCVSetIfCleanStartup) {
+    if (storageGlobalParams.engine != "devnull") {
         Lock::GlobalWrite lk(startupOpCtx.get());
         FeatureCompatibilityVersion::setIfCleanStartup(startupOpCtx.get(),
                                                        repl::StorageInterface::get(serviceContext));
@@ -299,7 +306,7 @@ ServiceContext* initialize(const char* yaml_config) {
                             logv2::LogOptions(LogComponent::kControl, logv2::FatalMode::kContinue),
                             "** IMPORTANT: {error_toStatus_reason}",
                             "error_toStatus_reason"_attr = error.toStatus().reason());
-        quickExit(EXIT_NEED_DOWNGRADE);
+        quickExit(ExitCode::needDowngrade);
     }
 
     // Ensure FCV document exists and is initialized in-memory. Fatally asserts if there is an
@@ -312,11 +319,11 @@ ServiceContext* initialize(const char* yaml_config) {
 
     if (storageGlobalParams.upgrade) {
         LOGV2(22553, "finished checking dbs");
-        exitCleanly(EXIT_CLEAN);
+        exitCleanly(ExitCode::clean);
     }
 
     // This is for security on certain platforms (nonce generation)
-    srand((unsigned)(curTimeMicros64()) ^ (unsigned(uintptr_t(&startupOpCtx))));
+    srand((unsigned)(curTimeMicros64()) ^ (unsigned(uintptr_t(&startupOpCtx))));  // NOLINT
 
     // Set up the logical session cache
     LogicalSessionCache::set(serviceContext,

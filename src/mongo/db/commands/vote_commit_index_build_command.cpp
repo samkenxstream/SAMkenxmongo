@@ -27,16 +27,18 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/vote_commit_index_build_gen.h"
+#include "mongo/db/commands/vote_index_build_gen.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -55,7 +57,8 @@ public:
     using Request = VoteCommitIndexBuild;
 
     std::string help() const override {
-        return "Internal intra replica set command";
+        return "Internal intra replica set command to signal to the primary that a member is ready "
+               "to commit an index build.";
     }
 
     bool adminOnly() const override {
@@ -100,7 +103,7 @@ public:
 
     private:
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
 
         bool supportsWriteConcern() const override {

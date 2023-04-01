@@ -76,8 +76,8 @@ ResolvedView ResolvedView::fromBSON(const BSONObj& commandResponseObj) {
     boost::optional<TimeseriesOptions> timeseriesOptions = boost::none;
     if (auto tsOptionsElt = viewDef[kTimeseriesOptions]) {
         if (tsOptionsElt.isABSONObj()) {
-            timeseriesOptions =
-                TimeseriesOptions::parse({"ResolvedView::fromBSON"}, tsOptionsElt.Obj());
+            timeseriesOptions = TimeseriesOptions::parse(IDLParserContext{"ResolvedView::fromBSON"},
+                                                         tsOptionsElt.Obj());
         }
     }
 
@@ -91,11 +91,22 @@ ResolvedView ResolvedView::fromBSON(const BSONObj& commandResponseObj) {
         mixedSchema = boost::optional<bool>(mixedSchemaElem.boolean());
     }
 
+    boost::optional<bool> usesExtendedRange = boost::none;
+    if (auto usesExtendedRangeElem = viewDef[kTimeseriesUsesExtendedRange]) {
+        uassert(6646910,
+                str::stream() << "view definition must have " << kTimeseriesUsesExtendedRange
+                              << " of type bool or no such field",
+                usesExtendedRangeElem.type() == BSONType::Bool);
+
+        usesExtendedRange = boost::optional<bool>(usesExtendedRangeElem.boolean());
+    }
+
     return {NamespaceString(viewDef["ns"].valueStringData()),
             std::move(pipeline),
             std::move(collationSpec),
             std::move(timeseriesOptions),
-            std::move(mixedSchema)};
+            std::move(mixedSchema),
+            std::move(usesExtendedRange)};
 }
 
 void ResolvedView::serialize(BSONObjBuilder* builder) const {
@@ -109,6 +120,10 @@ void ResolvedView::serialize(BSONObjBuilder* builder) const {
     // Only serialize if it doesn't contain mixed data.
     if ((_timeseriesMayContainMixedData && !(*_timeseriesMayContainMixedData)))
         subObj.append(kTimeseriesMayContainMixedData, *_timeseriesMayContainMixedData);
+
+    if ((_timeseriesUsesExtendedRange && (*_timeseriesUsesExtendedRange)))
+        subObj.append(kTimeseriesUsesExtendedRange, *_timeseriesUsesExtendedRange);
+
     if (!_defaultCollation.isEmpty()) {
         subObj.append("collation", _defaultCollation);
     }
@@ -151,12 +166,11 @@ AggregateCommandRequest ResolvedView::asExpandedViewAggregation(
                 builder.append(elem);
             }
         }
+
         resolvedPipeline[1] =
             BSON(DocumentSourceInternalConvertBucketIndexStats::kStageName << builder.obj());
     } else if (resolvedPipeline.size() >= 1 &&
-               resolvedPipeline[0][DocumentSourceInternalUnpackBucket::kStageNameInternal] &&
-               serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
-                   multiversion::FeatureCompatibilityVersion::kVersion_5_2)) {
+               resolvedPipeline[0][DocumentSourceInternalUnpackBucket::kStageNameInternal]) {
         auto unpackStage = resolvedPipeline[0];
 
         BSONObjBuilder builder;
@@ -166,6 +180,10 @@ AggregateCommandRequest ResolvedView::asExpandedViewAggregation(
         }
         builder.append(DocumentSourceInternalUnpackBucket::kAssumeNoMixedSchemaData,
                        ((_timeseriesMayContainMixedData && !(*_timeseriesMayContainMixedData))));
+
+        builder.append(DocumentSourceInternalUnpackBucket::kUsesExtendedRange,
+                       ((_timeseriesUsesExtendedRange && *_timeseriesUsesExtendedRange)));
+
         resolvedPipeline[0] =
             BSON(DocumentSourceInternalUnpackBucket::kStageNameInternal << builder.obj());
     }
@@ -183,9 +201,8 @@ AggregateCommandRequest ResolvedView::asExpandedViewAggregation(
     if (request.getHint() && _timeseriesOptions) {
         BSONObj original = *request.getHint();
         BSONObj rewritten = original;
-        // Only convert if we are given an index spec, not an index name. An index name is provided
-        // in the form of {"$hint": <name>}.
-        if (!original.isEmpty() && original.firstElementFieldNameStringData() != "$hint"_sd) {
+        // Only convert if we are given an index spec, not an index name or a $natural hint.
+        if (timeseries::isHintIndexKey(original)) {
             auto converted = timeseries::createBucketsIndexSpecFromTimeseriesIndexSpec(
                 *_timeseriesOptions, original);
             if (converted.isOK()) {

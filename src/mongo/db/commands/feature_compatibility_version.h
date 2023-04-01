@@ -32,8 +32,8 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/commands/feature_compatibility_version_document_gen.h"
 #include "mongo/db/commands/set_feature_compatibility_version_gen.h"
+#include "mongo/db/feature_compatibility_version_document_gen.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/server_options.h"
 
@@ -55,6 +55,16 @@ public:
      * Fatally asserts if the featureCompatibilityVersion is not properly initialized after startup.
      */
     static void fassertInitializedAfterStartup(OperationContext* opCtx);
+
+    /**
+     * TODO (SERVER-74847): Remove this function once we remove testing around downgrading from
+     * latest to last continuous.
+     *
+     * Adds a transition that allows users to downgrade from latest FCV to last continuous FCV.
+     * This function should only be called if the 'disableTransitionFromLatestToLastContinuous'
+     * server parameter is set to 'false'. That parameter is test-only and defaulted to 'true'.
+     */
+    static void addTransitionFromLatestToLastContinuous();
 
     /**
      * Returns the on-disk feature compatibility version document if it exists.
@@ -81,7 +91,8 @@ public:
         multiversion::FeatureCompatibilityVersion newVersion,
         bool isFromConfigServer,
         boost::optional<Timestamp> timestamp,
-        bool setTargetVersion);
+        bool setTargetVersion,
+        boost::optional<bool> setIsCleaningServerMetadata);
 
     /**
      * If we are in clean startup (the server has no replicated collections), store the

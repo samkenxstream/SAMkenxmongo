@@ -27,13 +27,11 @@
  *    it in the license file.
  */
 
+#include "mongo/db/exec/plan_cache_util.h"
+#include "mongo/logv2/log.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/exec/plan_cache_util.h"
-
-#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace plan_cache_util {
@@ -71,23 +69,26 @@ void logNotCachingNoData(std::string&& solution) {
 }  // namespace log_detail
 
 void updatePlanCache(OperationContext* opCtx,
-                     const CollectionPtr& collection,
+                     const MultipleCollectionAccessor& collections,
                      const CanonicalQuery& query,
                      const QuerySolution& solution,
                      const sbe::PlanStage& root,
                      const stage_builder::PlanStageData& data) {
-    // TODO SERVER-61507: Integration between lowering parts of aggregation pipeline into the find
-    // subsystem and the new SBE cache isn't implemented yet. Remove cq->pipeline().empty() check
-    // once it's implemented.
-    if (shouldCacheQuery(query) && collection && query.pipeline().empty() &&
-        feature_flags::gFeatureFlagSbePlanCache.isEnabledAndIgnoreFCV()) {
-        auto key = plan_cache_key_factory::make<sbe::PlanCacheKey>(query, collection);
+    if (shouldCacheQuery(query) && collections.getMainCollection()) {
+        auto key = plan_cache_key_factory::make(query, collections);
         auto plan = std::make_unique<sbe::CachedSbePlan>(root.clone(), data);
+        plan->indexFilterApplied = solution.indexFilterApplied;
+
+        bool shouldOmitDiagnosticInformation =
+            CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation;
         sbe::getPlanCache(opCtx).setPinned(
             std::move(key),
+            canonical_query_encoder::computeHash(
+                canonical_query_encoder::encodeForPlanCacheCommand(query)),
             std::move(plan),
             opCtx->getServiceContext()->getPreciseClockSource()->now(),
-            buildDebugInfo(&solution));
+            buildDebugInfo(&solution),
+            shouldOmitDiagnosticInformation);
     }
 }
 
@@ -106,9 +107,9 @@ plan_cache_debug_info::DebugInfo buildDebugInfo(
 
     plan_cache_debug_info::CreatedFromQuery createdFromQuery =
         plan_cache_debug_info::CreatedFromQuery{
-            findCommand.getFilter(),
-            findCommand.getSort(),
-            projBuilder.obj(),
+            findCommand.getFilter().getOwned(),
+            findCommand.getSort().getOwned(),
+            projBuilder.obj().getOwned(),
             query.getCollator() ? query.getCollator()->getSpec().toBSON() : BSONObj()};
 
     return {std::move(createdFromQuery), std::move(decision)};
@@ -132,48 +133,65 @@ plan_cache_debug_info::DebugInfoSBE buildDebugInfo(const QuerySolution* solution
         switch (node->getType()) {
             case STAGE_COUNT_SCAN: {
                 auto csn = static_cast<const CountScanNode*>(node);
-                debugInfo.indexesUsed.push_back(csn->index.identifier.catalogName);
+                debugInfo.mainStats.indexesUsed.push_back(csn->index.identifier.catalogName);
                 break;
             }
             case STAGE_DISTINCT_SCAN: {
                 auto dn = static_cast<const DistinctNode*>(node);
-                debugInfo.indexesUsed.push_back(dn->index.identifier.catalogName);
+                debugInfo.mainStats.indexesUsed.push_back(dn->index.identifier.catalogName);
                 break;
             }
             case STAGE_GEO_NEAR_2D: {
                 auto geo2d = static_cast<const GeoNear2DNode*>(node);
-                debugInfo.indexesUsed.push_back(geo2d->index.identifier.catalogName);
+                debugInfo.mainStats.indexesUsed.push_back(geo2d->index.identifier.catalogName);
                 break;
             }
             case STAGE_GEO_NEAR_2DSPHERE: {
                 auto geo2dsphere = static_cast<const GeoNear2DSphereNode*>(node);
-                debugInfo.indexesUsed.push_back(geo2dsphere->index.identifier.catalogName);
+                debugInfo.mainStats.indexesUsed.push_back(
+                    geo2dsphere->index.identifier.catalogName);
                 break;
             }
             case STAGE_IXSCAN: {
                 auto ixn = static_cast<const IndexScanNode*>(node);
-                debugInfo.indexesUsed.push_back(ixn->index.identifier.catalogName);
+                debugInfo.mainStats.indexesUsed.push_back(ixn->index.identifier.catalogName);
+                break;
+            }
+            case STAGE_COLUMN_SCAN: {
+                auto cisn = static_cast<const ColumnIndexScanNode*>(node);
+                debugInfo.mainStats.indexesUsed.push_back(cisn->indexEntry.identifier.catalogName);
                 break;
             }
             case STAGE_TEXT_MATCH: {
                 auto tn = static_cast<const TextMatchNode*>(node);
-                debugInfo.indexesUsed.push_back(tn->index.identifier.catalogName);
+                debugInfo.mainStats.indexesUsed.push_back(tn->index.identifier.catalogName);
                 break;
             }
             case STAGE_COLLSCAN: {
-                debugInfo.collectionScans++;
+                debugInfo.mainStats.collectionScans++;
                 auto csn = static_cast<const CollectionScanNode*>(node);
                 if (!csn->tailable) {
-                    debugInfo.collectionScansNonTailable++;
+                    debugInfo.mainStats.collectionScansNonTailable++;
                 }
                 break;
+            }
+            case STAGE_EQ_LOOKUP: {
+                auto eln = static_cast<const EqLookupNode*>(node);
+                auto& secondaryStats = debugInfo.secondaryStats[eln->foreignCollection.toString()];
+                if (eln->lookupStrategy == EqLookupNode::LookupStrategy::kIndexedLoopJoin) {
+                    tassert(6466200, "Index join lookup should have an index entry", eln->idxEntry);
+                    secondaryStats.indexesUsed.push_back(eln->idxEntry->identifier.catalogName);
+                } else {
+                    secondaryStats.collectionScans++;
+                }
+                [[fallthrough]];
             }
             default:
                 break;
         }
 
         for (auto&& child : node->children) {
-            queue.push(child);
+            queue.push(child.get());
         }
     }
 

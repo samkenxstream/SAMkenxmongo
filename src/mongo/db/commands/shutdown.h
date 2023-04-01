@@ -46,10 +46,13 @@ Status stepDownForShutdown(OperationContext* opCtx,
 
 namespace shutdown_detail {
 /**
- * Completes the shutdown. 'timeoutSecs' is the total time permitted for shutdown-related timeouts.
+ * Completes the shutdown. 'timeout' is the total time permitted for shutdown-related timeouts.
  * 'quiesceTime' is the remaining time allowed for quiescing.
  */
-void finishShutdown(bool force, long long timeoutSecs, Milliseconds quiesceTime);
+void finishShutdown(OperationContext* opCtx,
+                    bool force,
+                    Milliseconds timeout,
+                    Milliseconds quiesceTime);
 }  // namespace shutdown_detail
 
 template <typename Derived>
@@ -64,23 +67,26 @@ public:
 
         void typedRun(OperationContext* opCtx) {
             auto force = Base::request().getForce();
-            auto timeoutSecs = Base::request().getTimeoutSecs();
-            auto shutdownStartTime = opCtx->getServiceContext()->getPreciseClockSource()->now();
+            Seconds timeout{Base::request().getTimeoutSecs()};
+
+            auto getCurrentTime = [&] {
+                return opCtx->getServiceContext()->getPreciseClockSource()->now();
+            };
+
+            auto shutdownStartTime = getCurrentTime();
 
             // Commands derived from CmdShutdown should define their own
             // `beginShutdown` methods.
-            Derived::beginShutdown(opCtx, force, timeoutSecs);
-            Milliseconds quiesceTime =
-                std::max(Milliseconds::zero(),
-                         Milliseconds(Seconds(timeoutSecs)) -
-                             (opCtx->getServiceContext()->getPreciseClockSource()->now() -
-                              shutdownStartTime));
-            shutdown_detail::finishShutdown(force, timeoutSecs, quiesceTime);
+            Derived::beginShutdown(opCtx, force, timeout);
+
+            auto quiesceTime =
+                std::max(shutdownStartTime + timeout - getCurrentTime(), Milliseconds{0});
+            shutdown_detail::finishShutdown(opCtx, force, timeout, quiesceTime);
         }
 
     private:
         NamespaceString ns() const override {
-            return NamespaceString(Base::request().getDbName(), "");
+            return NamespaceString(Base::request().getDbName());
         }
 
         bool supportsWriteConcern() const override {
@@ -107,13 +113,6 @@ public:
     }
     Command::AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return Command::AllowedOnSecondary::kAlways;
-    }
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        ActionSet actions;
-        actions.addAction(ActionType::shutdown);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
 };
 

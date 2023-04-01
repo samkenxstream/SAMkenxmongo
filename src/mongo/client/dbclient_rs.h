@@ -57,7 +57,7 @@ typedef std::shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorPtr;
 */
 class DBClientReplicaSet : public DBClientBase {
 public:
-    using DBClientBase::query_DEPRECATED;
+    using DBClientBase::find;
 
     /** Call connect() after constructing. autoReconnect is always on for DBClientReplicaSet
      * connections. */
@@ -89,33 +89,22 @@ public:
     // ----------- simple functions --------------
 
     std::unique_ptr<DBClientCursor> find(FindCommandRequest findRequest,
-                                         const ReadPreferenceSetting& readPref) override;
+                                         const ReadPreferenceSetting& readPref,
+                                         ExhaustMode exhaustMode) override;
 
-    /** throws userassertion "no primary found" */
-    std::unique_ptr<DBClientCursor> query_DEPRECATED(
-        const NamespaceStringOrUUID& nsOrUuid,
-        const BSONObj& filter,
-        const Query& querySettings,
-        int limit = 0,
-        int nToSkip = 0,
-        const BSONObj* fieldsToReturn = nullptr,
-        int queryOptions = 0,
-        int batchSize = 0,
-        boost::optional<BSONObj> readConcernObj = boost::none) override;
-
-    void insert(const std::string& ns,
+    void insert(const NamespaceString& nss,
                 BSONObj obj,
                 bool ordered = true,
                 boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
     /** insert multiple objects.  Note that single object insert is asynchronous, so this version
         is only nominally faster and not worth a special effort to try to use.  */
-    void insert(const std::string& ns,
+    void insert(const NamespaceString& nss,
                 const std::vector<BSONObj>& v,
                 bool ordered = true,
                 boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
-    void remove(const std::string& ns,
+    void remove(const NamespaceString& nss,
                 const BSONObj& filter,
                 bool removeMany = true,
                 boost::optional<BSONObj> writeConcernObj = boost::none) override;
@@ -205,11 +194,6 @@ public:
     int getMaxWireVersion() final;
     // ---- low level ------
 
-    bool call(Message& toSend,
-              Message& response,
-              bool assertOk,
-              std::string* actualServer) override;
-
     /**
      * Performs a "soft reset" by clearing all states relating to secondary nodes and
      * returning secondary connections to the pool.
@@ -253,6 +237,8 @@ private:
         std::unique_ptr<DBClientCursor> result);
 
     DBClientConnection* checkPrimary();
+
+    void _call(Message& toSend, Message& response, std::string* actualServer) override;
 
     template <typename Authenticate>
     Status _runAuthLoop(Authenticate authCb);

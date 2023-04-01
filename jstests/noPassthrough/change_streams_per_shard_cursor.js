@@ -7,6 +7,8 @@
 (function() {
 "use strict";
 
+load("jstests/libs/catalog_shard_util.js");
+
 const dbName = jsTestName();
 const setupShardedCluster = (shards = 1) => {
     const st = new ShardingTest(
@@ -80,8 +82,12 @@ assert.commandFailedWithCode(
 // The shardId field should be a string.
 assert.commandFailedWithCode(assert.throws(() => pscWatch(sdb, "coll", 42)),
                                           ErrorCodes.TypeMismatch);
-// Can't open a per shard cursor on the config RS.
-assert.commandFailedWithCode(assert.throws(() => pscWatch(sdb, "coll", "config")), 6273803);
+
+const isCatalogShardEnabled = CatalogShardUtil.isEnabledIgnoringFCV(st);
+if (!isCatalogShardEnabled) {
+    // Can't open a per shard cursor on the config RS.
+    assert.commandFailedWithCode(assert.throws(() => pscWatch(sdb, "coll", "config")), 6273803);
+}
 
 // The shardId should be a valid shard.
 assert.commandFailedWithCode(
@@ -98,22 +104,35 @@ let c = pscWatch(sdb, "coll", shardId);
 for (let i = 1; i <= 4; i++) {
     sdb.coll.insertOne({location: 2, i});
     assert(!c.isExhausted());
-    assert(c.hasNext());
+    assert.soon(() => c.hasNext());
     c.next();
 }
 assert(!c.hasNext());
+
+if (isCatalogShardEnabled) {
+    // Can open a per shard cursor on the config server.
+    const configDB = st.s0.getDB("config");
+    c = pscWatch(configDB, "coll", "config", undefined /* options */, {allowToRunOnConfigDB: true});
+    for (let i = 1; i <= 4; i++) {
+        configDB.coll.insertOne({location: 2, i});
+        assert(!c.isExhausted());
+        assert.soon(() => c.hasNext());
+        c.next();
+    }
+    assert(!c.hasNext());
+}
 
 // Simple database level watch
 c = pscWatch(sdb, 1, shardId);
 
 sdb.coll.insertOne({location: 3});
 assert(!c.isExhausted());
-assert(c.hasNext());
+assert.soon(() => c.hasNext());
 c.next();
 
 sdb.coll2.insertOne({location: 4});
 assert(!c.isExhausted());
-assert(c.hasNext());
+assert.soon(() => c.hasNext());
 c.next();
 
 assert(!c.hasNext());
@@ -129,7 +148,7 @@ assert(!c.hasNext());
 
 sdb.toBeCreated.insertOne({location: 8});
 assert(!c.isExhausted());
-assert(c.hasNext());
+assert.soon(() => c.hasNext());
 c.next();
 
 assert(!c.hasNext());
@@ -140,7 +159,7 @@ assert(!explainOut.hasOwnProperty("splitPipeline"));
 assert.hasOwnProperty(explainOut, "stages");
 
 // If we getMore an invalidated cursor the cursor should have been closed on mongos and we should
-// get CursorNotFound, even if the invalidate event was never recieved by mongos.
+// get CursorNotFound, even if the invalidate event was never received by mongos.
 [[], [{$match: {f: "filter out invalidate event"}}]].forEach((pipeline) => {
     assert.commandWorked(st.s.adminCommand({shardCollection: dbName + ".toDrop", key: {_id: 1}}));
     let c = pscWatch(sdb, "toDrop", shardId, {pipeline});
@@ -164,7 +183,7 @@ c = pscWatch(sdb, "coll", shardId);
 
 sdb.coll.insertOne({location: 5, _id: -2});
 assert(!c.isExhausted());
-assert(c.hasNext());
+assert.soon(() => c.hasNext());
 c.next();
 
 sdb.coll.insertOne({location: 6, _id: 2});
@@ -176,12 +195,12 @@ c = pscWatch(sdb.getSiblingDB("admin"), 1, shardId, {}, {allChangesForCluster: t
 
 sdb.coll.insertOne({location: 7, _id: -3});
 assert(!c.isExhausted());
-assert(c.hasNext());
+assert.soon(() => c.hasNext());
 c.next();
 
 sdb.coll2.insertOne({location: 8, _id: -4});
 assert(!c.isExhausted());
-assert(c.hasNext());
+assert.soon(() => c.hasNext());
 c.next();
 
 sdb.coll.insertOne({location: 9, _id: 3});

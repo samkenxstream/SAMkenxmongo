@@ -43,7 +43,7 @@ namespace DirectClientTests {
 using std::unique_ptr;
 using std::vector;
 
-const char* ns = "a.b";
+const NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.b");
 
 class InsertMany {
 public:
@@ -57,17 +57,17 @@ public:
         objs.push_back(BSON("_id" << 1));
         objs.push_back(BSON("_id" << 2));
 
-        client.dropCollection(ns);
+        client.dropCollection(nss);
 
-        auto response = client.insertAcknowledged(ns, objs);
+        auto response = client.insertAcknowledged(nss, objs);
         ASSERT_EQUALS(ErrorCodes::DuplicateKey, getStatusFromWriteCommandReply(response));
-        ASSERT_EQUALS((int)client.count(NamespaceString(ns)), 1);
+        ASSERT_EQUALS((int)client.count(nss), 1);
 
-        client.dropCollection(ns);
+        client.dropCollection(nss);
 
-        response = client.insertAcknowledged(ns, objs, false /*ordered*/);
+        response = client.insertAcknowledged(nss, objs, false /*ordered*/);
         ASSERT_EQUALS(ErrorCodes::DuplicateKey, getStatusFromWriteCommandReply(response));
-        ASSERT_EQUALS((int)client.count(NamespaceString(ns)), 2);
+        ASSERT_EQUALS((int)client.count(nss), 2);
     }
 };
 
@@ -81,7 +81,7 @@ public:
         BSONObj result;
         BSONObj cmdObj = BSON("count"
                               << "");
-        ASSERT(!client.runCommand("", cmdObj, result)) << result;
+        ASSERT(!client.runCommand({boost::none, ""}, cmdObj, result)) << result;
         ASSERT_EQ(getStatusFromCommandResult(result), ErrorCodes::InvalidNamespace);
     }
 };
@@ -109,7 +109,9 @@ public:
         DBDirectClient client(&opCtx);
 
         ASSERT_THROWS_CODE(
-            client.getMore("", 1)->nextSafe(), AssertionException, ErrorCodes::InvalidNamespace);
+            client.getMore(NamespaceString::createNamespaceString_forTest(""), 1)->nextSafe(),
+            AssertionException,
+            ErrorCodes::InvalidNamespace);
     }
 };
 
@@ -120,7 +122,8 @@ public:
         OperationContext& opCtx = *opCtxPtr;
         DBDirectClient client(&opCtx);
 
-        auto response = client.insertAcknowledged("", {BSONObj()});
+        auto response = client.insertAcknowledged(
+            NamespaceString::createNamespaceString_forTest(""), {BSONObj()});
         ASSERT_EQ(ErrorCodes::InvalidNamespace, getStatusFromCommandResult(response));
     }
 };
@@ -133,7 +136,9 @@ public:
         DBDirectClient client(&opCtx);
 
         auto response =
-            client.updateAcknowledged("", BSONObj{} /*filter*/, BSON("$set" << BSON("x" << 1)));
+            client.updateAcknowledged(NamespaceString::createNamespaceString_forTest(""),
+                                      BSONObj{} /*filter*/,
+                                      BSON("$set" << BSON("x" << 1)));
         ASSERT_EQ(ErrorCodes::InvalidNamespace, getStatusFromCommandResult(response));
     }
 };
@@ -145,7 +150,8 @@ public:
         OperationContext& opCtx = *opCtxPtr;
         DBDirectClient client(&opCtx);
 
-        auto response = client.removeAcknowledged("", BSONObj{} /*filter*/);
+        auto response = client.removeAcknowledged(
+            NamespaceString::createNamespaceString_forTest(""), BSONObj{} /*filter*/);
         ASSERT_EQ(ErrorCodes::InvalidNamespace, getStatusFromCommandResult(response));
     }
 };

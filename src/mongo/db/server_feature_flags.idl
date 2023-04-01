@@ -30,22 +30,61 @@ global:
     cpp_namespace: "mongo"
 
 feature_flags:
-    featureFlagMongoStore:
-        description: "Enable mongod operation in MongoStore mode"
-        cpp_varname: gFeatureFlagMongoStore
+    featureFlagSecurityToken:
+        description: "Enable parsing and handling of SecurityTokens in multitenancy mode"
+        cpp_varname: gFeatureFlagSecurityToken
         default: false
     featureFlagRequireTenantID:
         # Only available with the server parameter "multitenancySupport".
         description: >-
             When enabled in conjunction with the server parameter "multitenancySupport",
-            require tenantID to be a part of TenantNamespace and TenantDatabase.
+            require tenantID to be a part of NamespaceString and TenantDatabase.
         cpp_varname: gFeatureFlagRequireTenantID
         default: false
-    featureFlagUserWriteBlocking:
-        description: "Enable user write blocking for C2C replication"
-        cpp_varname: gFeatureFlagUserWriteBlocking
+    featureFlagConnHealthMetrics:
+        description: "Enable newly added cluster connection health metrics"
+        cpp_varname: gFeatureFlagConnHealthMetrics
+        default: true
+        version: 6.3
+    featureFlagGlobalIndexes:
+        description: "Enable support for global indexes"
+        cpp_varname: gFeatureFlagGlobalIndexes
         default: false
-    featureFlagOptionalCfgSvr:
-        description: "Optional config server for small clusters"
-        cpp_varname: gFeatureFlagOptionalCfgSvr
+    featureFlagAdditionalParticipants:
+        description: "Adding additional participants to existing transactions"
+        cpp_varname: gFeatureFlagAdditionalParticipants
+        default: false
+    featureFlagUseNewCompactStructuredEncryptionDataCoordinator:
+        description: "Use the new 6.1 compact structured encryption data coordinator"
+        cpp_varname: gFeatureFlagUseNewCompactStructuredEncryptionDataCoordinator
+        default: true
+        version: 6.1
+    featureFlagOIDC:
+        description: "Feature flag for OIDC support"
+        cpp_varname: gFeatureFlagOIDC
+        default: true
+        version: 7.0
+    featureFlagBulkWriteCommand:
+        description: "Support for bulkWrite command and one-shot transactions"
+        cpp_varname: gFeatureFlagBulkWriteCommand
+        default: false
+    featureFlagAuditConfigClusterParameter:
+        description: "Enable use of new auditConfig cluster server parameter"
+        cpp_varname: feature_flags::gFeatureFlagAuditConfigClusterParameter
+        default: false
+    featureFlagStreams:
+        description: "Enable support for streams"
+        cpp_varname: gFeatureFlagStreams
+        default: false
+    featureFlagUseUnreplicatedTruncatesForDeletions:
+        description: "Feature flag to enable pre-image collection and change collection maintenance
+        using unreplicated truncates instead of normal document deletions replicated from the
+        primary."
+        cpp_varname: feature_flags::gFeatureFlagUseUnreplicatedTruncatesForDeletions
+        default: false
+    featureFlagConfigurableX509ClusterAuthn:
+        description: >- 
+            Enable configurable parameters for detection of peer server nodes using X.509 
+            intracluster authentication.
+        cpp_varname: gFeatureFlagConfigurableX509ClusterAuthn
         default: false

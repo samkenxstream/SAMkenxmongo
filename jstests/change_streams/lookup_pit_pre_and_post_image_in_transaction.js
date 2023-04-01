@@ -1,17 +1,15 @@
 /**
  * Tests that point-in-time pre- and post-images are retrieved for update/replace/delete operations
- * performed in a transaction and non-atomic "applyOps" command.
+ * performed in a transaction and "applyOps" command.
  * @tags: [
- * requires_fcv_53,
- * featureFlagChangeStreamPreAndPostImages,
+ * requires_fcv_62,
  * uses_transactions,
  * ]
  */
 (function() {
 "use strict";
 
-load("jstests/libs/change_stream_util.js");        // For isChangeStreamPreAndPostImagesEnabled and
-                                                   // ChangeStreamTest.
+load("jstests/libs/change_stream_util.js");        // For ChangeStreamTest.
 load("jstests/libs/collection_drop_recreate.js");  // For assertDropAndRecreateCollection.
 load("jstests/libs/fixture_helpers.js");           // For FixtureHelpers.isMongos.
 load("jstests/libs/transactions_util.js");         // For TransactionsUtil.runInTransaction.
@@ -132,14 +130,13 @@ assertChangeEventsReturned(changeStreamCursor, [
 
 // "applyOps" command can only be issued on a replica set.
 if (!FixtureHelpers.isMongos(testDB)) {
-    jsTestLog("Testing non-atomic 'applyOps' command.");
+    jsTestLog("Testing 'applyOps' command.");
     assert.commandWorked(coll.insert([{_id: 5, a: 1}, {_id: 6, a: 1}]));
     assert.commandWorked(testDB.runCommand({
         applyOps: [
-            {op: "u", ns: coll.getFullName(), o2: {_id: 5}, o: {$set: {a: 2}}},
+            {op: "u", ns: coll.getFullName(), o2: {_id: 5}, o: {$v: 2, diff: {u: {a: 2}}}},
             {op: "d", ns: coll.getFullName(), o: {_id: 6}}
-        ],
-        allowAtomic: false,
+        ]
     }));
     assertChangeEventsReturned(changeStreamCursor, [
         {_id: 5, operationType: "insert", postImage: {_id: 5, a: 1}},

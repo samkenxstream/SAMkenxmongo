@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -45,8 +44,9 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/logv2/log.h"
-#include "mongo/transport/transport_layer_asio.h"
+#include "mongo/transport/asio/asio_transport_layer.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/options_parser/options_parser.h"
@@ -55,6 +55,9 @@
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers_synchronous.h"
 #include "mongo/util/testing_proctor.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 using namespace mongo;
 
@@ -112,7 +115,7 @@ MONGO_STARTUP_OPTIONS_VALIDATE(IntegrationTestOptions)(InitializerContext*) {
 
     if (env.count("help")) {
         std::cout << opts.helpString() << std::endl;
-        quickExit(EXIT_SUCCESS);
+        quickExit(ExitCode::clean);
     }
 }
 

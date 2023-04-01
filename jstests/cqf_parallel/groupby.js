@@ -17,21 +17,23 @@ assert.commandWorked(t.insert({a: 4}));
 assert.commandWorked(t.insert({a: 5}));
 
 // Demonstrate local-global optimization.
-const res = t.explain("executionStats").aggregate([{$group: {_id: "$a", cnt: {$sum: 1}}}]);
+// TODO SERVER-71552 The tests freezes with new cost model.
+const res = runWithParams(
+    [{key: 'internalCostModelCoefficients', value: {"groupByStartupCost": 1e-6}}],
+    () => t.explain("executionStats").aggregate([{$group: {_id: "$a", cnt: {$sum: 1}}}]));
 assert.eq(5, res.executionStats.nReturned);
 
-assert.eq("Exchange", res.queryPlanner.winningPlan.optimizerPlan.child.nodeType);
-assert.eq("Centralized", res.queryPlanner.winningPlan.optimizerPlan.child.distribution.type);
+assertValueOnPlanPath("Exchange", res, "child.nodeType");
+assertValueOnPlanPath("Centralized", res, "child.distribution.type");
 
-assert.eq("GroupBy", res.queryPlanner.winningPlan.optimizerPlan.child.child.child.nodeType);
+assertValueOnPlanPath("GroupBy", res, "child.child.child.nodeType");
 
-assert.eq("Exchange", res.queryPlanner.winningPlan.optimizerPlan.child.child.child.child.nodeType);
-assert.eq("HashPartitioning",
-          res.queryPlanner.winningPlan.optimizerPlan.child.child.child.child.distribution.type);
+assertValueOnPlanPath("Exchange", res, "child.child.child.child.nodeType");
+assertValueOnPlanPath("HashPartitioning", res, "child.child.child.child.distribution.type");
 
-assert.eq("GroupBy",
-          res.queryPlanner.winningPlan.optimizerPlan.child.child.child.child.child.nodeType);
-assert.eq("UnknownPartitioning",
-          res.queryPlanner.winningPlan.optimizerPlan.child.child.child.child.child.properties
-              .physicalProperties.distribution.type);
+assertValueOnPlanPath("GroupBy", res, "child.child.child.child.child.nodeType");
+assertValueOnPlanPath(
+    "UnknownPartitioning",
+    res,
+    "child.child.child.child.child.properties.physicalProperties.distribution.type");
 }());

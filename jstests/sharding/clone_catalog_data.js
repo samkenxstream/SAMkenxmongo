@@ -3,7 +3,13 @@
 // Test that the 'cloneCatalogData' command works correctly.
 // Eventually, _shardsvrMovePrimary will use this command.
 
+// Do not check metadata consistency as unsharded collections are cloned to non-primary shards for
+// testing purposes.
+TestData.skipCheckMetadataConsistency = true;
+
 (() => {
+    load("jstests/libs/catalog_shard_util.js");
+
     function sortByName(a, b) {
         if (a.name < b.name)
             return -1;
@@ -106,14 +112,18 @@
     checkOptions(c2, Object.keys(coll2Options));
     checkUUID(c2, coll2uuid);
 
-    function checkIndexes(collName, expectedIndexes) {
+    function checkIndexes(collName, expectedIndexes, shardedColl) {
         var res = toShard.getDB('test').runCommand({listIndexes: collName});
         assert.commandWorked(res, 'Failed to get indexes for collection ' + collName);
         var indexes = res.cursor.firstBatch;
         indexes.sort(sortByName);
 
-        // There should be 3 indexes on each collection - the _id one, and the 2 we created.
-        assert.eq(indexes.length, 3);
+        // TODO SERVER-74252: once 7.0 becomes LastLTS we can assume that the movePrimary will never
+        // copy indexes of sharded collections.
+        if (shardedColl)
+            assert(indexes.length === 1 || indexes.length === 3);
+        else
+            assert(indexes.length === 3);
 
         indexes.forEach((index, i) => {
             var expected;
@@ -127,8 +137,8 @@
         });
     }
 
-    checkIndexes('coll1', coll1Indexes);
-    checkIndexes('coll2', coll2Indexes);
+    checkIndexes('coll1', coll1Indexes, /*shardedColl*/ false);
+    checkIndexes('coll2', coll2Indexes, /*shardedColl*/ true);
 
     // Verify that the data from the unsharded collections resides on the new primary shard, and was
     // copied as part of the clone.
@@ -156,13 +166,33 @@
     }),
                                  ErrorCodes.InvalidOptions);
 
-    // Check that the command fails when attempting to run on the config server.
-    assert.commandFailedWithCode(st.configRS.getPrimary().adminCommand({
-        _shardsvrCloneCatalogData: 'test',
-        from: fromShard.host,
-        writeConcern: {w: "majority"}
-    }),
-                                 ErrorCodes.NoShardingEnabled);
+    const isCatalogShardEnabled = CatalogShardUtil.isEnabledIgnoringFCV(st);
+
+    if (TestData.catalogShard) {
+        // The config server is a shard and already has collections for the database.
+        assert.commandFailedWithCode(st.configRS.getPrimary().adminCommand({
+            _shardsvrCloneCatalogData: 'test',
+            from: fromShard.host,
+            writeConcern: {w: "majority"}
+        }),
+                                     ErrorCodes.NamespaceExists);
+    } else if (isCatalogShardEnabled) {
+        // The config server is dedicated but supports catalog shard mode, so it can accept shaded
+        // commands.
+        assert.commandWorked(st.configRS.getPrimary().adminCommand({
+            _shardsvrCloneCatalogData: 'test',
+            from: fromShard.host,
+            writeConcern: {w: "majority"}
+        }));
+    } else {
+        // A dedicated non-catalog shard supporting config server cannot run the command.
+        assert.commandFailedWithCode(st.configRS.getPrimary().adminCommand({
+            _shardsvrCloneCatalogData: 'test',
+            from: fromShard.host,
+            writeConcern: {w: "majority"}
+        }),
+                                     ErrorCodes.NoShardingEnabled);
+    }
 
     // Check that the command fails when failing to specify a source.
     assert.commandFailedWithCode(

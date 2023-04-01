@@ -48,7 +48,7 @@ public:
 
     Value evaluate(const Document& root, Variables* variables) const final;
 
-    Value serialize(bool explain) const final;
+    Value serialize(SerializationOptions options) const final;
 
     void acceptVisitor(ExpressionMutableVisitor* visitor) final {
         return visitor->visit(this);
@@ -60,7 +60,6 @@ public:
 
 private:
     ExpressionTestApiVersion(ExpressionContext* expCtx, bool unstable, bool deprecated);
-    void _doAddDependencies(DepsTracker* deps) const final override;
 
     bool _unstable;
     bool _deprecated;

@@ -28,6 +28,7 @@
  */
 
 #include "mongo/db/catalog/collection_catalog_helper.h"
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -60,17 +61,17 @@ Status checkIfNamespaceExists(OperationContext* opCtx, const NamespaceString& ns
 
 
 void forEachCollectionFromDb(OperationContext* opCtx,
-                             const TenantDatabaseName& tenantDbName,
+                             const DatabaseName& dbName,
                              LockMode collLockMode,
                              CollectionCatalog::CollectionInfoFn callback,
                              CollectionCatalog::CollectionInfoFn predicate) {
 
     auto catalogForIteration = CollectionCatalog::get(opCtx);
-    for (auto collectionIt = catalogForIteration->begin(opCtx, tenantDbName);
-         collectionIt != catalogForIteration->end(opCtx);
-         ++collectionIt) {
-        auto uuid = collectionIt.uuid().get();
+    for (auto collectionIt = catalogForIteration->begin(opCtx, dbName);
+         collectionIt != catalogForIteration->end(opCtx);) {
+        auto uuid = collectionIt.uuid();
         if (predicate && !catalogForIteration->checkIfCollectionSatisfiable(uuid, predicate)) {
+            ++collectionIt;
             continue;
         }
 
@@ -86,7 +87,7 @@ void forEachCollectionFromDb(OperationContext* opCtx,
 
             if (catalog->lookupNSSByUUID(opCtx, uuid) == nss) {
                 // Success: locked the namespace and the UUID still maps to it.
-                collection = catalog->lookupCollectionByUUID(opCtx, uuid);
+                collection = CollectionPtr(catalog->lookupCollectionByUUID(opCtx, uuid));
                 invariant(collection);
                 break;
             }
@@ -94,11 +95,15 @@ void forEachCollectionFromDb(OperationContext* opCtx,
             clk.reset();
         }
 
+        // Increment iterator before calling callback. This allows for collection deletion inside
+        // this callback even if we are in batched inplace mode.
+        ++collectionIt;
+
         // The NamespaceString couldn't be resolved from the uuid, so the collection was dropped.
         if (!collection)
             continue;
 
-        if (!callback(collection))
+        if (!callback(collection.get()))
             break;
 
         hangBeforeGettingNextCollection.pauseWhileSet();

@@ -30,13 +30,10 @@
 #pragma once
 
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/chunk_version.h"
-#include "mongo/s/shard_id.h"
 
 namespace mongo {
 
 class BSONObj;
-class ChunkWritesTracker;
 
 /**
  * Represents a cache entry for a single Chunk. Owned by a RoutingTableHistory.
@@ -50,8 +47,7 @@ public:
               ShardId shardId,
               ChunkVersion version,
               std::vector<ChunkHistory> history,
-              bool jumbo,
-              std::shared_ptr<ChunkWritesTracker> writesTracker);
+              bool jumbo);
 
     const auto& getRange() const {
         return _range;
@@ -96,13 +92,6 @@ public:
     }
 
     /**
-     * Get writes tracker for this chunk.
-     */
-    std::shared_ptr<ChunkWritesTracker> getWritesTracker() const {
-        return _writesTracker;
-    }
-
-    /**
      * Returns a string represenation of the chunk for logging.
      */
     std::string toString() const;
@@ -131,17 +120,14 @@ private:
     // Indicates whether this chunk should be treated as jumbo and not attempted to be moved or
     // split
     mutable bool _jumbo;
-
-    // Used for tracking writes to this chunk, to estimate its size for the autosplitter. Since
-    // ChunkInfo objects are always treated as const, and this contains metadata about the chunk
-    // that needs to change, it's okay (and necessary) to mark it mutable.
-    mutable std::shared_ptr<ChunkWritesTracker> _writesTracker;
 };
 
 class Chunk {
 public:
     Chunk(ChunkInfo& chunkInfo, const boost::optional<Timestamp>& atClusterTime)
         : _chunkInfo(chunkInfo), _atClusterTime(atClusterTime) {}
+
+    Chunk(const Chunk& other) = default;
 
     const BSONObj& getMin() const {
         return _chunkInfo.getMin();
@@ -177,13 +163,6 @@ public:
 
     bool isJumbo() const {
         return _chunkInfo.isJumbo();
-    }
-
-    /**
-     * Get writes tracker for this chunk.
-     */
-    std::shared_ptr<ChunkWritesTracker> getWritesTracker() const {
-        return _chunkInfo.getWritesTracker();
     }
 
     /**

@@ -35,7 +35,7 @@ namespace mongo {
 constexpr StringData InternalSchemaMatchArrayIndexMatchExpression::kName;
 
 InternalSchemaMatchArrayIndexMatchExpression::InternalSchemaMatchArrayIndexMatchExpression(
-    StringData path,
+    boost::optional<StringData> path,
     long long index,
     std::unique_ptr<ExpressionWithPlaceholder> expression,
     clonable_ptr<ErrorAnnotation> annotation)
@@ -51,15 +51,9 @@ void InternalSchemaMatchArrayIndexMatchExpression::debugString(StringBuilder& de
     _debugAddSpace(debug, indentationLevel);
 
     BSONObjBuilder builder;
-    serialize(&builder, true);
-    debug << builder.obj().toString() << "\n";
-
-    const auto* tag = getTag();
-    if (tag) {
-        debug << " ";
-        tag->debugString(&debug);
-    }
-    debug << "\n";
+    serialize(&builder, {});
+    debug << builder.obj().toString();
+    _debugStringAttachTagInfo(&debug);
 }
 
 bool InternalSchemaMatchArrayIndexMatchExpression::equivalent(const MatchExpression* expr) const {
@@ -72,15 +66,25 @@ bool InternalSchemaMatchArrayIndexMatchExpression::equivalent(const MatchExpress
         _expression->equivalent(other->_expression.get());
 }
 
-BSONObj InternalSchemaMatchArrayIndexMatchExpression::getSerializedRightHandSide() const {
+BSONObj InternalSchemaMatchArrayIndexMatchExpression::getSerializedRightHandSide(
+    SerializationOptions opts) const {
     BSONObjBuilder objBuilder;
     {
         BSONObjBuilder matchArrayElemSubobj(objBuilder.subobjStart(kName));
-        matchArrayElemSubobj.append("index", _index);
-        matchArrayElemSubobj.append("namePlaceholder", _expression->getPlaceholder().value_or(""));
+        if (opts.replacementForLiteralArgs) {
+            matchArrayElemSubobj.append("index", opts.replacementForLiteralArgs.get());
+        } else {
+            matchArrayElemSubobj.append("index", _index);
+        }
+        if (auto placeHolder = _expression->getPlaceholder()) {
+            matchArrayElemSubobj.append("namePlaceholder",
+                                        opts.serializeFieldName(placeHolder.get()));
+        } else {
+            matchArrayElemSubobj.append("namePlaceholder", "");
+        }
         {
             BSONObjBuilder subexprSubObj(matchArrayElemSubobj.subobjStart("expression"));
-            _expression->getFilter()->serialize(&subexprSubObj, true);
+            _expression->getFilter()->serialize(&subexprSubObj, opts);
             subexprSubObj.doneFast();
         }
         matchArrayElemSubobj.doneFast();
@@ -88,10 +92,9 @@ BSONObj InternalSchemaMatchArrayIndexMatchExpression::getSerializedRightHandSide
     return objBuilder.obj();
 }
 
-std::unique_ptr<MatchExpression> InternalSchemaMatchArrayIndexMatchExpression::shallowClone()
-    const {
+std::unique_ptr<MatchExpression> InternalSchemaMatchArrayIndexMatchExpression::clone() const {
     auto clone = std::make_unique<InternalSchemaMatchArrayIndexMatchExpression>(
-        path(), _index, _expression->shallowClone(), _errorAnnotation);
+        path(), _index, _expression->clone(), _errorAnnotation);
     if (getTag()) {
         clone->setTag(getTag()->clone());
     }

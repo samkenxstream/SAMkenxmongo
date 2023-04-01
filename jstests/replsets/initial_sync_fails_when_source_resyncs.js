@@ -1,7 +1,6 @@
 /**
  * Tests that initial sync will abort an attempt if the sync source enters initial sync during
  * cloning. This test will timeout if the attempt is not aborted.
- * @tags: [live_record_incompatible]
  */
 (function() {
 "use strict";
@@ -80,11 +79,12 @@ const res = assert.commandWorked(initialSyncNode.adminCommand({replSetGetStatus:
 
 // The initial sync should have failed.
 assert.eq(res.initialSyncStatus.failedInitialSyncAttempts, 1);
-beforeFinishFailPoint.off();
-
-// Release the initial sync source and sync node oplog fetcher so the test completes.
+// Release the sync node oplog fetcher so the test completes.
 assert.commandWorked(initialSyncNodeDb.adminCommand(
     {configureFailPoint: "hangBeforeStartingOplogFetcher", mode: "off"}));
+beforeFinishFailPoint.off();
+
+// Release the initial sync source so the test completes.
 assert.commandWorked(initialSyncSource.getDB("admin").adminCommand(
     {configureFailPoint: "initialSyncHangBeforeFinish", mode: "off"}));
 

@@ -29,48 +29,70 @@
 global:
   cpp_namespace: "mongo"
   cpp_includes:
-    - "mongo/db/storage/ticketholders.h"
+    - "mongo/db/storage/ticketholder_manager.h"
+
+enums:
+  # TODO (SERVER-73342): Remove this enum once there is only one algorithm.
+  StorageEngineConcurrencyAdjustmentAlgorithm:
+    description: "Algorithm for adjusting the number of concurrent storage engine transactions"
+    type: string
+    values:
+      kNone: ""
+      kThroughputProbing: "throughputProbing"
 
 server_parameters:
-
-  # The wiredTigerQueueingPolicy specifies which policy to use and is essentially
-  # the same as the values of the enum QueueingPolicy
-  storageEngineQueueingPolicy:
-    description: "Storage Engine queueing policy to use"
-    set_at: [ startup ]
-    cpp_class:
-      name: TicketQueueingPolicy
 
   storageEngineConcurrentWriteTransactions:
     description: "Storage Engine Concurrent Write Transactions"
     set_at: [ startup, runtime ]
-    cpp_vartype: AtomicWord<int>
+    cpp_vartype: AtomicWord<int32_t>
     cpp_varname: gConcurrentWriteTransactions
-    on_update: "TicketHolders::updateConcurrentWriteTransactions"
+    on_update: "TicketHolderManager::updateConcurrentWriteTransactions"
     deprecated_name:
       - wiredTigerConcurrentWriteTransactions
     # Default value being 0 means we're allowing the underlying storage engines to use their default values.
     default: 0
     validator:
-      gt: 0
+      gte: 5
 
   storageEngineConcurrentReadTransactions:
     description: "Storage Engine Concurrent Read Transactions"
     set_at: [ startup, runtime ]
-    cpp_vartype: AtomicWord<int>
+    cpp_vartype: AtomicWord<int32_t>
     cpp_varname: gConcurrentReadTransactions
-    on_update: "TicketHolders::updateConcurrentReadTransactions"
+    on_update: "TicketHolderManager::updateConcurrentReadTransactions"
     deprecated_name:
       - wiredTigerConcurrentReadTransactions
     # Default value being 0 means we're allowing the underlying storage engines to use their default values.
     default: 0
     validator:
-      gt: 0
+      gte: 5
 
-enums:
-  QueueingPolicy:
-    description: Queueing policy to use for obtaining tickets
-    type: string
-    values:
-      Semaphore: semaphore
-      FifoQueue: fifoQueue
+  lowPriorityAdmissionBypassThreshold:
+    description: >-
+        Only applicable when Deprioritization is enabled for global lock ticket admission. Limits
+        the number of consecutive times a queue of low-priority operations is bypassed in favor of
+        waking normal-priority operations for ticket admission. Once the threshold is met, an
+        operation from the low-priority queue will be woken for ticket admission.
+    set_at: [ startup, runtime ]
+    cpp_vartype: AtomicWord<int32_t>
+    cpp_varname: gLowPriorityAdmissionBypassThreshold
+    on_update: "TicketHolderManager::updateLowPriorityAdmissionBypassThreshold"
+    # 0 means low priority operations will never be admitted when there are normal priority
+    # operations waiting for ticket admission.
+    default: 5000
+    validator:
+      gte: 0
+
+  # TODO (SERVER-73342): Remove this parameter once there is only one algorithm.
+  storageEngineConcurrencyAdjustmentAlgorithm:
+    description: >-
+      The algorithm to be used for adjusting the number of concurrent storage engine transactions.
+      This is gated behind featureFlagExecutionControl and will have no effect if that feature is
+      not enabled.
+    set_at: startup
+    cpp_vartype: std::string
+    cpp_varname: gStorageEngineConcurrencyAdjustmentAlgorithm
+    default: "throughputProbing"
+    validator:
+      callback: TicketHolderManager::validateConcurrencyAdjustmentAlgorithm

@@ -44,20 +44,13 @@ void InternalSchemaRootDocEqMatchExpression::debugString(StringBuilder& debug,
                                                          int indentationLevel) const {
     _debugAddSpace(debug, indentationLevel);
     debug << kName << " " << _rhsObj.toString();
-
-    auto td = getTag();
-    if (td) {
-        debug << " ";
-        td->debugString(&debug);
-    }
-
-    debug << "\n";
+    _debugStringAttachTagInfo(&debug);
 }
 
 void InternalSchemaRootDocEqMatchExpression::serialize(BSONObjBuilder* out,
-                                                       bool includePath) const {
+                                                       SerializationOptions opts) const {
     BSONObjBuilder subObj(out->subobjStart(kName));
-    subObj.appendElements(_rhsObj);
+    opts.redactObjToBuilder(&subObj, _rhsObj);
     subObj.doneFast();
 }
 
@@ -70,7 +63,7 @@ bool InternalSchemaRootDocEqMatchExpression::equivalent(const MatchExpression* o
     return _objCmp.evaluate(_rhsObj == realOther->_rhsObj);
 }
 
-std::unique_ptr<MatchExpression> InternalSchemaRootDocEqMatchExpression::shallowClone() const {
+std::unique_ptr<MatchExpression> InternalSchemaRootDocEqMatchExpression::clone() const {
     auto clone =
         std::make_unique<InternalSchemaRootDocEqMatchExpression>(_rhsObj.copy(), _errorAnnotation);
     if (getTag()) {

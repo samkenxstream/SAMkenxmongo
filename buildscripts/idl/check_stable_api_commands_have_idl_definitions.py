@@ -35,14 +35,15 @@ import logging
 import os
 import sys
 from tempfile import TemporaryDirectory
-from typing import Dict, List, Set
+from typing import Any, Dict, List, Mapping, Set
 
 from pymongo import MongoClient
 
 # Permit imports from "buildscripts".
 sys.path.append(os.path.normpath(os.path.join(os.path.abspath(__file__), '../../..')))
 
-# pylint: disable=wrong-import-position,wrong-import-order
+# pylint: disable=wrong-import-position
+from idl import syntax
 from buildscripts.idl.lib import list_idls, parse_idl
 from buildscripts.resmokelib import configure_resmoke
 from buildscripts.resmokelib.logging import loggers
@@ -50,7 +51,7 @@ from buildscripts.resmokelib.testing.fixtures import interface
 from buildscripts.resmokelib.testing.fixtures.fixturelib import FixtureLib
 from buildscripts.resmokelib.testing.fixtures.shardedcluster import ShardedClusterFixture
 from buildscripts.resmokelib.testing.fixtures.standalone import MongoDFixture
-from idl import syntax
+# pylint: enable=wrong-import-position
 
 LOGGER_NAME = 'check-idl-definitions'
 LOGGER = logging.getLogger(LOGGER_NAME)
@@ -96,23 +97,23 @@ def list_commands_for_api(api_version: str, mongod_or_mongos: str, install_dir: 
     if mongod_or_mongos == "mongod":
         logger = loggers.new_fixture_logger("MongoDFixture", 0)
         logger.parent = LOGGER
-        fixture: interface.Fixture = fixturelib.make_fixture("MongoDFixture", logger, 0,
-                                                             dbpath_prefix=dbpath.name,
-                                                             mongod_executable=mongod_executable)
+        fixture: interface.Fixture = fixturelib.make_fixture(
+            "MongoDFixture", logger, 0, dbpath_prefix=dbpath.name,
+            mongod_executable=mongod_executable, mongod_options={"set_parameters": {}})
     else:
         logger = loggers.new_fixture_logger("ShardedClusterFixture", 0)
         logger.parent = LOGGER
-        fixture = fixturelib.make_fixture("ShardedClusterFixture", logger, 0,
-                                          dbpath_prefix=dbpath.name,
-                                          mongos_executable=mongos_executable,
-                                          mongod_executable=mongod_executable, mongod_options={})
+        fixture = fixturelib.make_fixture(
+            "ShardedClusterFixture", logger, 0, dbpath_prefix=dbpath.name,
+            mongos_executable=mongos_executable, mongod_executable=mongod_executable,
+            mongod_options={"set_parameters": {}})
 
     fixture.setup()
     fixture.await_ready()
 
     try:
-        client = MongoClient(fixture.get_driver_connection_url())
-        reply = client.admin.command('listCommands')
+        client = MongoClient(fixture.get_driver_connection_url())  # type: MongoClient
+        reply = client.admin.command('listCommands')  # type: Mapping[str, Any]
         commands = {
             name
             for name, info in reply['commands'].items() if api_version in info['apiVersions']
@@ -156,6 +157,8 @@ def remove_skipped_commands(command_sets: Dict[str, Set[str]]):
         "testDeprecationInVersion2",
         # Idl specifies the command_name as hello.
         "isMaster",
+        "_clusterQueryWithoutShardKey",  # Is internal only command.
+        "_clusterWriteWithoutShardKey",  # Is internal only command.
     }
 
     for key in command_sets.keys():
@@ -167,14 +170,21 @@ def main():
     arg_parser = argparse.ArgumentParser(description=__doc__)
     arg_parser.add_argument("--include", type=str, action="append",
                             help="Directory to search for IDL import files")
-    arg_parser.add_argument("--installDir", dest="install_dir", metavar="INSTALL_DIR",
+    arg_parser.add_argument("--install-dir", dest="install_dir", required=True,
                             help="Directory to search for MongoDB binaries")
     arg_parser.add_argument("-v", "--verbose", action="count", help="Enable verbose logging")
     arg_parser.add_argument("api_version", metavar="API_VERSION", help="API Version to check")
     args = arg_parser.parse_args()
 
+    class FakeArgs:
+        """Fake argparse.Namespace-like class to pass arguments to _update_config_vars."""
+
+        def __init__(self):
+            self.INSTALL_DIR = args.install_dir  # pylint: disable=invalid-name
+            self.command = ""
+
     # pylint: disable=protected-access
-    configure_resmoke._update_config_vars(object)
+    configure_resmoke._update_config_vars(FakeArgs())
     configure_resmoke._set_logging_config()
 
     # Configure Fixture logging.

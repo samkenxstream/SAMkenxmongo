@@ -27,13 +27,10 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #define LOGV2_FOR_HEARTBEATS(ID, DLEVEL, MESSAGE, ...) \
     LOGV2_DEBUG_OPTIONS(                               \
         ID, DLEVEL, {logv2::LogComponent::kReplicationHeartbeats}, MESSAGE, ##__VA_ARGS__)
-
-#include "mongo/platform/basic.h"
 
 #include <boost/algorithm/string.hpp>
 
@@ -47,9 +44,8 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status_metric.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
@@ -70,6 +66,9 @@
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/scopeguard.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
 namespace mongo {
 namespace repl {
 
@@ -84,7 +83,9 @@ public:
     virtual void appendAtLeaf(BSONObjBuilder& b) const {
         ReplicationCoordinator::get(getGlobalServiceContext())->appendDiagnosticBSON(&b);
     }
-} replExecutorSSM;
+};
+
+auto& replExecutorSSM = addMetricToTree(std::make_unique<ReplExecutorSSM>());
 
 // Testing only, enabled via command-line.
 class CmdReplSetTest : public ReplSetCommand {
@@ -92,17 +93,19 @@ public:
     std::string help() const override {
         return "Just for tests.\n";
     }
+
     // No auth needed because it only works when enabled via command line.
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
         return Status::OK();
     }
+
     CmdReplSetTest() : ReplSetCommand("replSetTest") {}
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         LOGV2(21573,
               "replSetTest command received: {cmdObj}",
               "replSetTest command received",
@@ -139,26 +142,30 @@ public:
                 // application.
                 ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
                     opCtx->lockState());
-                opCtx->lockState()->skipAcquireTicket();
+                opCtx->lockState()->setAdmissionPriority(AdmissionContext::Priority::kImmediate);
                 // We need to hold the lock so that we don't run when storage is being shutdown.
                 Lock::GlobalLock lk(opCtx,
                                     MODE_IS,
                                     Date_t::now() + Milliseconds(5),
                                     Lock::InterruptBehavior::kLeaveUnlocked,
-                                    true /* skipRSTLLock */);
+                                    [] {
+                                        Lock::GlobalLockSkipOptions options;
+                                        options.skipRSTLLock = true;
+                                        return options;
+                                    }());
                 if (lk.isLocked()) {
                     boost::optional<Timestamp> ts =
                         StorageInterface::get(getGlobalServiceContext())
                             ->getLastStableRecoveryTimestamp(getGlobalServiceContext());
                     if (ts) {
-                        result.append("lastStableRecoveryTimestamp", ts.get());
+                        result.append("lastStableRecoveryTimestamp", ts.value());
                     }
                 } else {
                     LOGV2_WARNING(6100700,
                                   "Failed to get last stable recovery timestamp due to {error}",
                                   "error"_attr = "lock acquire timeout"_sd);
                 }
-            } catch (const ExceptionForCat<ErrorCategory::Interruption>& ex) {
+            } catch (const ExceptionForCat<ErrorCategory::CancellationError>& ex) {
                 LOGV2_WARNING(6100701,
                               "Failed to get last stable recovery timestamp due to {error}",
                               "error"_attr = redact(ex));
@@ -185,7 +192,7 @@ class CmdReplSetGetRBID : public ReplSetCommand {
 public:
     CmdReplSetGetRBID() : ReplSetCommand("replSetGetRBID") {}
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
@@ -205,7 +212,7 @@ public:
     }
     CmdReplSetGetConfig() : ReplSetCommand("replSetGetConfig") {}
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
@@ -337,7 +344,7 @@ public:
                "http://dochub.mongodb.org/core/replicasetcommands";
     }
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         BSONObj configObj;
@@ -432,7 +439,7 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const string&,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         const auto replCoord = ReplicationCoordinator::get(opCtx);
@@ -452,8 +459,9 @@ public:
         // of concurrent reconfigs.
         if (!parsedArgs.force) {
             // Skip the waiting if the current config is from a force reconfig.
-            auto oplogWait = replCoord->getConfigTerm() != OpTime::kUninitializedTerm;
-            auto status = replCoord->awaitConfigCommitment(opCtx, oplogWait);
+            auto configTerm = replCoord->getConfigTerm();
+            auto oplogWait = configTerm != OpTime::kUninitializedTerm;
+            auto status = replCoord->awaitConfigCommitment(opCtx, oplogWait, configTerm);
             status.addContext("New config is rejected");
             if (status == ErrorCodes::MaxTimeMSExpired) {
                 // Convert the error code to be more specific.
@@ -471,8 +479,9 @@ public:
         // Now that the new config has been persisted and installed in memory, wait for the new
         // config to become replicated. For force reconfigs we don't need to do this waiting.
         if (!parsedArgs.force) {
-            auto status =
-                replCoord->awaitConfigCommitment(opCtx, false /* waitForOplogCommitment */);
+            auto configTerm = replCoord->getConfigTerm();
+            auto status = replCoord->awaitConfigCommitment(
+                opCtx, false /* waitForOplogCommitment */, configTerm);
             uassertStatusOK(
                 status.withContext("Reconfig finished but failed to propagate to a majority"));
         }
@@ -500,13 +509,13 @@ public:
     }
     CmdReplSetFreeze() : ReplSetCommand("replSetFreeze") {}
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
         uassertStatusOK(status);
 
-        int secs = (int)cmdObj.firstElement().numberInt();
+        auto secs = cmdObj.firstElement().safeNumberInt();
         uassertStatusOK(ReplicationCoordinator::get(opCtx)->processReplSetFreeze(secs, &result));
         return true;
     }
@@ -527,14 +536,15 @@ public:
                "primary.)\n"
                "http://dochub.mongodb.org/core/replicasetcommands";
     }
-    CmdReplSetStepDown()
-        : ReplSetCommand("replSetStepDown"),
-          _stepDownCmdsWithForceExecutedMetric("commands.replSetStepDownWithForce.total",
-                                               &_stepDownCmdsWithForceExecuted),
-          _stepDownCmdsWithForceFailedMetric("commands.replSetStepDownWithForce.failed",
-                                             &_stepDownCmdsWithForceFailed) {}
+
+    bool shouldCheckoutSession() const final {
+        return false;
+    }
+
+    CmdReplSetStepDown() : ReplSetCommand("replSetStepDown") {}
+
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         const bool force = cmdObj["force"].trueValue();
@@ -598,10 +608,8 @@ public:
     }
 
 private:
-    mutable Counter64 _stepDownCmdsWithForceExecuted;
-    mutable Counter64 _stepDownCmdsWithForceFailed;
-    ServerStatusMetricField<Counter64> _stepDownCmdsWithForceExecutedMetric;
-    ServerStatusMetricField<Counter64> _stepDownCmdsWithForceFailedMetric;
+    CounterMetric _stepDownCmdsWithForceExecuted{"commands.replSetStepDownWithForce.total"};
+    CounterMetric _stepDownCmdsWithForceFailed{"commands.replSetStepDownWithForce.failed"};
 
     ActionSet getAuthActionSet() const override {
         return ActionSet{ActionType::replSetStateChange};
@@ -616,7 +624,7 @@ public:
     }
     CmdReplSetMaintenance() : ReplSetCommand("replSetMaintenance") {}
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
@@ -642,7 +650,7 @@ public:
     }
     CmdReplSetSyncFrom() : ReplSetCommand("replSetSyncFrom") {}
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
@@ -667,7 +675,7 @@ class CmdReplSetUpdatePosition : public ReplSetCommand {
 public:
     CmdReplSetUpdatePosition() : ReplSetCommand("replSetUpdatePosition") {}
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         auto replCoord = repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
@@ -684,7 +692,15 @@ public:
         if (metadataResult.isOK()) {
             // New style update position command has metadata, which may inform the
             // upstream of a higher term.
-            auto metadata = metadataResult.getValue();
+            const auto& metadata = metadataResult.getValue();
+            if (metadata.hasReplicaSetId()) {
+                auto config = replCoord->getConfig();
+                uassert(ErrorCodes::InconsistentReplicaSetNames,
+                        "The current replicaSetId does not match the one in replSetMetaData",
+                        !config.isInitialized() ||
+                            config.getReplicaSetId() == metadata.getReplicaSetId());
+            }
+
             replCoord->processReplSetMetadata(metadata);
         }
 
@@ -710,17 +726,17 @@ namespace {
  */
 bool replHasDatabases(OperationContext* opCtx) {
     StorageEngine* storageEngine = getGlobalServiceContext()->getStorageEngine();
-    std::vector<TenantDatabaseName> tenantDbNames = storageEngine->listDatabases();
+    std::vector<DatabaseName> dbNames = storageEngine->listDatabases();
 
-    if (tenantDbNames.size() >= 2)
+    if (dbNames.size() >= 2)
         return true;
-    if (tenantDbNames.size() == 1) {
-        if (tenantDbNames[0].dbName() != "local")
+    if (dbNames.size() == 1) {
+        if (dbNames[0].db() != "local")
             return true;
 
         // we have a local database.  return true if oplog isn't empty
         BSONObj o;
-        if (Helpers::getSingleton(opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), o)) {
+        if (Helpers::getSingleton(opCtx, NamespaceString::kRsOplogNamespace, o)) {
             return true;
         }
     }
@@ -736,7 +752,7 @@ class CmdReplSetHeartbeat : public ReplSetCommand {
 public:
     CmdReplSetHeartbeat() : ReplSetCommand("replSetHeartbeat") {}
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         rsDelayHeartbeatResponse.execute(
@@ -787,7 +803,7 @@ public:
     CmdReplSetStepUp() : ReplSetCommand("replSetStepUp") {}
 
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
@@ -826,7 +842,7 @@ public:
     CmdReplSetAbortPrimaryCatchUp() : ReplSetCommand("replSetAbortPrimaryCatchUp") {}
 
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) override {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);

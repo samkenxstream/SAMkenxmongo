@@ -9,9 +9,10 @@ from typing import Dict, List
 
 import structlog
 
+mongo_dir = os.path.dirname(os.path.dirname(os.path.abspath(os.path.realpath(__file__))))
 # Get relative imports to work when the package is not installed on the PYTHONPATH.
 if __name__ == "__main__" and __package__ is None:
-    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(os.path.realpath(__file__)))))
+    sys.path.append(mongo_dir)
 
 # pylint: disable=wrong-import-position
 from buildscripts.linter.filediff import gather_changed_files_for_lint
@@ -33,6 +34,11 @@ _LINTERS = [
     mypy.MypyLinter(),
 ]
 
+# List of supported SCons linters
+_SCONS_LINTERS: List[base.LinterBase] = [
+    yapf.YapfLinter(),
+]
+
 
 def get_py_linter(linter_filter):
     # type: (str) -> List[base.LinterBase]
@@ -40,10 +46,14 @@ def get_py_linter(linter_filter):
     Get a list of linters to use.
 
     'all' or None - select all linters
+    'scons' - get all scons linters
     'a,b,c' - a comma delimited list is describes a list of linters to choose
     """
     if linter_filter is None or linter_filter == "all":
         return _LINTERS
+
+    if linter_filter == "scons":
+        return _SCONS_LINTERS
 
     linter_list = linter_filter.split(",")
 
@@ -66,8 +76,20 @@ def is_interesting_file(file_name):
     return file_name.endswith(".py") and file_name.startswith(tuple(directory_list))
 
 
-def _lint_files(linters, config_dict, file_names):
-    # type: (str, Dict[str, str], List[str]) -> None
+def is_scons_file(file_name):
+    # type: (str) -> bool
+    """Return true if this file is related to SCons."""
+    file_denylist = []  # type: List[str]
+    directory_denylist = ["site_scons/third_party"]
+    if file_name in file_denylist or file_name.startswith(tuple(directory_denylist)):
+        return False
+    return (file_name.endswith("SConscript") and file_name.startswith("src")) or \
+            (file_name.endswith(".py") and file_name.startswith("site_scons")) or \
+            file_name == "SConstruct"
+
+
+def _lint_files(linters: str, config_dict: Dict[str, str], file_names: List[str],
+                fix_command: str = "fix"):
     """Lint a list of files with clang-format."""
     linter_list = get_py_linter(linters)
 
@@ -80,7 +102,7 @@ def _lint_files(linters, config_dict, file_names):
     failed_lint = False
 
     for linter in linter_instances:
-        run_fix = lambda param1: lint_runner.run_lint(linter, param1)  # pylint: disable=cell-var-from-loop
+        run_fix = lambda param1: lint_runner.run_lint(linter, param1, mongo_dir, fix_command)  # pylint: disable=cell-var-from-loop
         lint_clean = parallel.parallel_process([os.path.abspath(f) for f in file_names], run_fix)
 
         if not lint_clean:
@@ -128,6 +150,14 @@ def lint_all(linters, config_dict, file_names):
     _lint_files(linters, config_dict, all_file_names)
 
 
+def lint_scons(linters, config_dict, file_names):
+    # type: (str, Dict[str, str], List[str]) -> None
+    """Lint SCons files command entry point."""
+    scons_file_names = git.get_files_to_check(file_names, is_scons_file)
+
+    _lint_files(linters, config_dict, scons_file_names, "fix-scons")
+
+
 def _fix_files(linters, config_dict, file_names):
     # type: (str, Dict[str, str], List[str]) -> None
     """Fix a list of files with linters if possible."""
@@ -147,7 +177,7 @@ def _fix_files(linters, config_dict, file_names):
 
     for linter in linter_instances:
         run_linter = lambda param1: lint_runner.run(linter.cmd_path + linter.linter.  # pylint: disable=cell-var-from-loop
-                                                    get_fix_cmd_args(param1))  # pylint: disable=cell-var-from-loop
+                                                    get_fix_cmd_args(param1))
 
         lint_clean = parallel.parallel_process([os.path.abspath(f) for f in file_names], run_linter)
 
@@ -162,6 +192,14 @@ def fix_func(linters, config_dict, file_names):
     all_file_names = git.get_files_to_check(file_names, is_interesting_file)
 
     _fix_files(linters, config_dict, all_file_names)
+
+
+def fix_scons_func(linters, config_dict, file_names):
+    # type: (str, Dict[str, str], List[str]) -> None
+    """Fix SCons files command entry point."""
+    scons_file_names = git.get_files_to_check(file_names, is_scons_file)
+
+    _fix_files(linters, config_dict, scons_file_names)
 
 
 def main():
@@ -206,6 +244,14 @@ def main():
     parser_fix = sub.add_parser('fix', help='Fix files if possible')
     parser_fix.add_argument("file_names", nargs="*", help="Globs of files to check")
     parser_fix.set_defaults(func=fix_func)
+
+    parser_lint = sub.add_parser('lint-scons', help='Lint only SCons files')
+    parser_lint.add_argument("file_names", nargs="*", help="Globs of files to check")
+    parser_lint.set_defaults(func=lint_scons, linters="scons")
+
+    parser_fix = sub.add_parser('fix-scons', help='Fix SCons related files if possible')
+    parser_fix.add_argument("file_names", nargs="*", help="Globs of files to check")
+    parser_fix.set_defaults(func=fix_scons_func, linters="scons")
 
     args = parser.parse_args()
 

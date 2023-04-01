@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
@@ -36,15 +35,18 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/curop_failpoint_helpers.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/db/transaction_validation.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
+
 
 namespace mongo {
 namespace {
@@ -76,6 +78,19 @@ public:
     std::string help() const final {
         return "Commits a transaction";
     }
+
+    bool isTransactionCommand() const final {
+        return true;
+    }
+
+    bool allowedInTransactions() const final {
+        return true;
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
     class Invocation final : public InvocationBaseGen {
     public:
         using InvocationBaseGen::InvocationBaseGen;
@@ -131,10 +146,11 @@ public:
             auto optionalCommitTimestamp = request().getCommitTimestamp();
             if (optionalCommitTimestamp) {
                 // commitPreparedTransaction will throw if the transaction is not prepared.
-                txnParticipant.commitPreparedTransaction(opCtx, optionalCommitTimestamp.get(), {});
+                txnParticipant.commitPreparedTransaction(
+                    opCtx, optionalCommitTimestamp.value(), {});
             } else {
                 if (ShardingState::get(opCtx)->canAcceptShardedCommands().isOK() ||
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
                     TransactionCoordinatorService::get(opCtx)->cancelIfCommitNotYetStarted(
                         opCtx, *opCtx->getLogicalSessionId(), txnNumberAndRetryCounter);
                 }
@@ -178,6 +194,18 @@ public:
 
     std::string help() const final {
         return "Aborts a transaction";
+    }
+
+    bool isTransactionCommand() const final {
+        return true;
+    }
+
+    bool allowedInTransactions() const final {
+        return true;
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
     }
 
     class Invocation final : public InvocationBaseGen {
@@ -230,7 +258,7 @@ public:
 
             if (!MONGO_unlikely(dontRemoveTxnCoordinatorOnAbort.shouldFail()) &&
                 (ShardingState::get(opCtx)->canAcceptShardedCommands().isOK() ||
-                 serverGlobalParams.clusterRole == ClusterRole::ConfigServer)) {
+                 serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer))) {
                 TransactionCoordinatorService::get(opCtx)->cancelIfCommitNotYetStarted(
                     opCtx, *opCtx->getLogicalSessionId(), txnNumberAndRetryCounter);
             }

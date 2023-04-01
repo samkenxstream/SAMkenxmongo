@@ -1,3 +1,4 @@
+# pylint: disable=invalid-name
 """Extension to the unittest.TestResult.
 
 This is used to support additional test status and timing information for the report.json file.
@@ -10,10 +11,11 @@ import unittest
 
 from buildscripts.resmokelib import config as _config
 from buildscripts.resmokelib import logging
+from buildscripts.resmokelib.testing.symbolizer_service import ResmokeSymbolizer
 
 
 # pylint: disable=attribute-defined-outside-init
-class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attributes
+class TestReport(unittest.TestResult):
     """Record test status and timing information."""
 
     def __init__(self, job_logger, suite_options, job_num=None):
@@ -54,7 +56,9 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
 
         for report in reports:
             if not isinstance(report, TestReport):
-                raise TypeError("reports must be a list of TestReport instances")
+                raise TypeError(
+                    f"reports must be a list of TestReport instances, current report is {type(report)}"
+                )
 
             with report._lock:  # pylint: disable=protected-access
                 for test_info in report.test_infos:
@@ -100,17 +104,12 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
 
         return combined_report
 
-    def startTest(self, test):  # pylint: disable=invalid-name
+    def startTest(self, test):
         """Call before 'test' is run."""
 
         unittest.TestResult.startTest(self, test)
 
         test_info = TestInfo(test.id(), test.test_name, test.dynamic)
-        if _config.SPAWN_USING == "jasper":
-            # The group id represents the group of logs this test belongs to in
-            # cedar buildlogger. It must be sent to evergreen/cedar in order to
-            # create the correct log URL.
-            test_info.group_id = str(self.job_num)
 
         basename = test.basename()
         command = test.as_command()
@@ -129,6 +128,10 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
                                                                       test.basename(), command,
                                                                       test.logger, self.job_num,
                                                                       test.id(), self.job_logger)
+
+        # Set up logging handlers to capture exceptions.
+        test_info.exception_extractors = logging.loggers.configure_exception_capture(test_logger)
+
         test_info.url_endpoint = url_endpoint
         if self.logging_prefix is not None:
             test_logger.info(self.logging_prefix)
@@ -138,31 +141,44 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
         test.override_logger(test_logger)
         test_info.start_time = time.time()
 
-    def stopTest(self, test):  # pylint: disable=invalid-name
+    def stopTest(self, test):
         """Call after 'test' has run."""
 
-        unittest.TestResult.stopTest(self, test)
+        try:
+            # check if there are stacktrace files, if so, invoke the symbolizer here.
+            # If there are no stacktrace files for this job, we do not need to invoke the symbolizer at all.
+            # Take a lock to download the debug symbols if it hasn't already been downloaded.
+            # log symbolized output to test.logger.info()
 
-        with self._lock:
-            test_info = self.find_test_info(test)
-            test_info.end_time = time.time()
-            test_status = "no failures detected" if test_info.status == "pass" else "failed"
+            symbolizer = ResmokeSymbolizer()
+            symbolizer.symbolize_test_logs(test)
+            # symbolization completed
 
-        time_taken = test_info.end_time - test_info.start_time
-        self.job_logger.info("%s ran in %0.2f seconds: %s.", test.basename(), time_taken,
-                             test_status)
+            unittest.TestResult.stopTest(self, test)
 
-        # Asynchronously closes the buildlogger test handler to avoid having too many threads open
-        # on 32-bit systems.
-        for handler in test.logger.handlers:
-            # We ignore the cancellation token returned by close_later() since we always want the
-            # logs to eventually get flushed.
-            logging.flush.close_later(handler)
+            with self._lock:
+                test_info = self.find_test_info(test)
+                test_info.end_time = time.time()
+                test_status = "no failures detected" if test_info.status == "pass" else "failed"
 
-        # Restore the original logger for the test.
-        test.reset_logger()
+            time_taken = test_info.end_time - test_info.start_time
+            self.job_logger.info("%s ran in %0.2f seconds: %s.", test.basename(), time_taken,
+                                 test_status)
 
-    def addError(self, test, err):  # pylint: disable=invalid-name
+        finally:
+            # This is a failsafe. In the event that 'stopTest' fails,
+            # any rogue logger handlers will be removed from this test.
+            # If not cleaned up, these will trigger 'setup failures' --
+            # indicated by exiting with LoggerRuntimeConfigError.EXIT_CODE.
+            for handler in test.logger.handlers:
+                # We ignore the cancellation token returned by close_later() since we always want the
+                # logs to eventually get flushed.
+                logging.flush.close_later(handler)
+
+            # Restore the original logger for the test.
+            test.reset_logger()
+
+    def addError(self, test, err):
         """Call when a non-failureException was raised during the execution of 'test'."""
 
         unittest.TestResult.addError(self, test, err)
@@ -175,8 +191,9 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
             test_info.status = "error"
             test_info.evergreen_status = "fail"
             test_info.return_code = test.return_code
+            test_info.error = self._exc_info_to_string(err, test).split('\n')
 
-    def setError(self, test):  # pylint: disable=invalid-name
+    def setError(self, test, err):
         """Change the outcome of an existing test to an error."""
         self.job_logger.info("setError(%s)", test)
 
@@ -189,6 +206,7 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
             test_info.status = "error"
             test_info.evergreen_status = "fail"
             test_info.return_code = 2
+            test_info.error = self._exc_info_to_string(err, test).split('\n')
 
         # Recompute number of success, failures, and errors.
         self.num_succeeded = len(self.get_successful())
@@ -196,7 +214,7 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
         self.num_errored = len(self.get_errored())
         self.num_interrupted = len(self.get_interrupted())
 
-    def addFailure(self, test, err):  # pylint: disable=invalid-name
+    def addFailure(self, test, err):
         """Call when a failureException was raised during the execution of 'test'."""
 
         unittest.TestResult.addFailure(self, test, err)
@@ -214,7 +232,7 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
                 test_info.evergreen_status = self.suite_options.report_failure_status
             test_info.return_code = test.return_code
 
-    def setFailure(self, test, return_code=1):  # pylint: disable=invalid-name
+    def setFailure(self, test, return_code=1):
         """Change the outcome of an existing test to a failure."""
 
         with self._lock:
@@ -237,7 +255,7 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
         self.num_errored = len(self.get_errored())
         self.num_interrupted = len(self.get_interrupted())
 
-    def addSuccess(self, test):  # pylint: disable=invalid-name
+    def addSuccess(self, test):
         """Call when 'test' executed successfully."""
 
         unittest.TestResult.addSuccess(self, test)
@@ -250,7 +268,7 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
             test_info.evergreen_status = "pass"
             test_info.return_code = test.return_code
 
-    def wasSuccessful(self):  # pylint: disable=invalid-name
+    def wasSuccessful(self):
         """Return true if all tests executed successfully."""
 
         with self._lock:
@@ -378,21 +396,15 @@ class TestReport(unittest.TestResult):  # pylint: disable=too-many-instance-attr
         raise ValueError("Details for %s not found in the report" % (test.basename()))
 
 
-class TestInfo(object):  # pylint: disable=too-many-instance-attributes
+class TestInfo(object):
     """Holder for the test status and timing information."""
 
     def __init__(self, test_id, test_file, dynamic):
         """Initialize the TestInfo instance."""
 
         self.test_id = test_id
-        # If spawned using jasper, we need to set the display_test_name and the
-        # test_file since these are distinct in cedar buildlogger.
-        if _config.SPAWN_USING == "jasper":
-            self.test_file = str(test_id)
-            self.display_test_name = test_file
-        else:
-            self.test_file = test_file
-            self.display_test_name = None
+        self.test_file = test_file
+        self.display_test_name = None
         self.dynamic = dynamic
 
         self.group_id = None
@@ -402,6 +414,8 @@ class TestInfo(object):  # pylint: disable=too-many-instance-attributes
         self.evergreen_status = None
         self.return_code = None
         self.url_endpoint = None
+        self.exception_extractors = None
+        self.error = None
 
 
 def test_order(test_name):

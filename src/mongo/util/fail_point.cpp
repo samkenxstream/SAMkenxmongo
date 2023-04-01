@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/fail_point.h"
@@ -47,6 +46,9 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point_server_parameter_gen.h"
 #include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 namespace {
@@ -358,12 +360,13 @@ FailPointServerParameter::FailPointServerParameter(StringData name, ServerParame
 }
 
 void FailPointServerParameter::append(OperationContext* opCtx,
-                                      BSONObjBuilder& b,
-                                      const std::string& name) {
-    b << name << _data->toBSON();
+                                      BSONObjBuilder* b,
+                                      StringData name,
+                                      const boost::optional<TenantId>&) {
+    *b << name << _data->toBSON();
 }
 
-Status FailPointServerParameter::setFromString(const std::string& str) {
+Status FailPointServerParameter::setFromString(StringData str, const boost::optional<TenantId>&) {
     BSONObj failPointOptions;
     try {
         failPointOptions = fromjson(str);

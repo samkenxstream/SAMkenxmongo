@@ -30,7 +30,6 @@
 
 #pragma once
 
-#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
@@ -189,11 +188,6 @@ public:
     boost::optional<Timestamp> getRecoveryTimestamp(ServiceContext* serviceCtx) const override;
 
     Timestamp getAllDurableTimestamp(ServiceContext* serviceCtx) const override;
-
-    /**
-     * Checks that the "admin" database contains a supported version of the auth data schema.
-     */
-    Status isAdminDbValid(OperationContext* opCtx) override;
 
     void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
                                                  bool primaryOnly) override;

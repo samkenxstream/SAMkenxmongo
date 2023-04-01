@@ -1,11 +1,18 @@
 """GDB Pretty-printers for MongoDB."""
 
+import os
 import re
 import struct
 import sys
 import uuid
-
+from pathlib import Path
+import gdb
 import gdb.printing
+
+if not gdb:
+    sys.path.insert(0, str(Path(os.path.abspath(__file__)).parent.parent.parent))
+    from buildscripts.gdb.mongo import get_boost_optional
+    from buildscripts.gdb.optimizer_printers import register_abt_printers
 
 try:
     import bson
@@ -24,7 +31,7 @@ if sys.version_info[0] < 3:
 
 def get_unique_ptr(obj):
     """Read the value of a libstdc++ std::unique_ptr."""
-    return obj['_M_t']['_M_t']['_M_head_impl']
+    return obj.cast(gdb.lookup_type('std::_Head_base<0, unsigned char*, false>'))['_M_head_impl']
 
 
 ###################################################################################################
@@ -37,22 +44,34 @@ def get_unique_ptr(obj):
 class StatusPrinter(object):
     """Pretty-printer for mongo::Status."""
 
+    @staticmethod
+    def extract_error(val):
+        """Extract the error object (if any) from a Status/StatusWith."""
+        error = val['_error']
+        if 'px' in error.type.iterkeys():
+            return error['px']
+        return error
+
+    @staticmethod
+    def generate_error_details(error):
+        """Generate a (code,reason) tuple from a Status/StatusWith error object."""
+        info = error.dereference()
+        code = info['code']
+        # Remove the mongo::ErrorCodes:: prefix. Does nothing if not a real ErrorCode.
+        code = str(code).split('::')[-1]
+
+        return (code, info['reason'])
+
     def __init__(self, val):
         """Initialize StatusPrinter."""
         self.val = val
 
     def to_string(self):
         """Return status for printing."""
-        if not self.val['_error']:
+        error = StatusPrinter.extract_error(self.val)
+        if not error:
             return 'Status::OK()'
-
-        code = self.val['_error']['code']
-        # Remove the mongo::ErrorCodes:: prefix. Does nothing if not a real ErrorCode.
-        code = str(code).split('::')[-1]
-
-        info = self.val['_error'].dereference()
-        reason = info['reason']
-        return 'Status(%s, %s)' % (code, reason)
+        return 'Status(%s, %s)' % StatusPrinter.generate_error_details(error)
 
 
 class StatusWithPrinter(object):
@@ -64,17 +83,10 @@ class StatusWithPrinter(object):
 
     def to_string(self):
         """Return status for printing."""
-        if not self.val['_status']['_error']:
+        error = StatusPrinter.extract_error(self.val['_status'])
+        if not error:
             return 'StatusWith(OK, %s)' % (self.val['_t'])
-
-        code = self.val['_status']['_error']['code']
-
-        # Remove the mongo::ErrorCodes:: prefix. Does nothing if not a real ErrorCode.
-        code = str(code).split('::')[-1]
-
-        info = self.val['_status']['_error'].dereference()
-        reason = info['reason']
-        return 'StatusWith(%s, %s)' % (code, reason)
+        return 'StatusWith(%s, %s)' % StatusPrinter.generate_error_details(error)
 
 
 class StringDataPrinter(object):
@@ -95,6 +107,18 @@ class StringDataPrinter(object):
         if size == -1:
             return self.val['_data'].lazy_string()
         return self.val['_data'].lazy_string(length=size)
+
+
+class BoostOptionalPrinter(object):
+    """Pretty-printer for boost::optional."""
+
+    def __init__(self, val):
+        """Initialize BoostOptionalPriner."""
+        self.val = val
+
+    def to_string(self):
+        """Return data for printing."""
+        return get_boost_optional(self.val)
 
 
 class BSONObjPrinter(object):
@@ -247,21 +271,23 @@ class RecordIdPrinter(object):
         if rid_format == 0:
             return "null RecordId"
         elif rid_format == 1:
-            hex_bytes = [int(self.val['_buffer'][i]) for i in range(8)]
-            raw_bytes = bytes(hex_bytes)
-            return "RecordId long: %s" % struct.unpack('l', raw_bytes)[0]
+            long_id = int(self.val['_data']['longId']['id'])
+            return "RecordId long: %d" % (long_id)
         elif rid_format == 2:
-            str_len = int(self.val["_buffer"][0])
-            raw_bytes = [int(self.val['_buffer'][i]) for i in range(1, str_len + 1)]
+            inline_str = self.val['_data']['inlineStr']
+            str_len = int(inline_str['size'])
+            str_array = inline_str['dataArr']
+            # Reading the std::array elements
+            raw_bytes = [int(str_array['_M_elems'][i]) for i in range(0, str_len)]
             hex_bytes = [hex(b & 0xFF)[2:].zfill(2) for b in raw_bytes]
             return "RecordId small string %d hex bytes: %s" % (str_len, str("".join(hex_bytes)))
         elif rid_format == 3:
-            holder_ptr = self.val["_sharedBuffer"]["_buffer"]["_holder"]["px"]
+            holder_ptr = self.val['_data']['heapStr']["buffer"]['_buffer']["_holder"]["px"]
             holder = holder_ptr.dereference()
             str_len = int(holder["_capacity"])
             # Start of data is immediately after pointer for holder
             start_ptr = (holder_ptr + 1).dereference().cast(gdb.lookup_type("char")).address
-            raw_bytes = [int(start_ptr[i]) for i in range(1, str_len + 1)]
+            raw_bytes = [int(start_ptr[i]) for i in range(0, str_len)]
             hex_bytes = [hex(b & 0xFF)[2:].zfill(2) for b in raw_bytes]
             return "RecordId big string %d hex bytes @ %s: %s" % (str_len, holder_ptr + 1,
                                                                   str("".join(hex_bytes)))
@@ -364,7 +390,6 @@ class WtCursorPrinter(object):
         """Initializer."""
         self.val = val
 
-    # pylint: disable=R0201
     def to_string(self):
         """to_string."""
         return None
@@ -399,7 +424,6 @@ class WtSessionImplPrinter(object):
         """Initializer."""
         self.val = val
 
-    # pylint: disable=R0201
     def to_string(self):
         """to_string."""
         return None
@@ -434,7 +458,6 @@ class WtTxnPrinter(object):
         """Initializer."""
         self.val = val
 
-    # pylint: disable=R0201
     def to_string(self):
         """to_string."""
         return None
@@ -574,6 +597,7 @@ def find_match_brackets(search, opening='<', closing='>'):
     Example:
         'Foo<T>::iterator<U>''
         returns 5
+
     """
     index = search.find(opening)
     if index == -1:
@@ -633,15 +657,15 @@ class MongoPrettyPrinterCollection(gdb.printing.PrettyPrinter):
 
         index = find_match_brackets(lookup_tag)
 
-        # Ignore subtypes of classes
-        # We do not want HashTable<T>::iterator as an example, just HashTable<T>
-        if index == -1 or index + 1 == len(lookup_tag):
-            for printer in self.subprinters:
-                if not printer.enabled:
-                    continue
-                if ((not printer.is_template or lookup_tag.find(printer.prefix) != 0)
-                        and (printer.is_template or lookup_tag != printer.prefix)):
-                    continue
+        for printer in self.subprinters:
+            if not printer.enabled:
+                continue
+            # Ignore subtypes of templated classes.
+            # We do not want HashTable<T>::iterator as an example, just HashTable<T>
+            if printer.is_template:
+                if (index + 1 == len(lookup_tag) and lookup_tag.find(printer.prefix) == 0):
+                    return printer.printer(val)
+            elif lookup_tag == printer.prefix:
                 return printer.printer(val)
 
         return None
@@ -661,7 +685,6 @@ class WtUpdateToBsonPrinter(object):
         """DisplayHint."""
         return 'map'
 
-    # pylint: disable=R0201
     def to_string(self):
         """ToString."""
         elems = []
@@ -673,8 +696,18 @@ class WtUpdateToBsonPrinter(object):
 
     def children(self):
         """children."""
+        if self.val['type'] != 3:
+            # Type 3 is a "normal" update. Notably type 4 is a deletion and type 1 represents a
+            # delta relative to the previous committed version in the update chain. Only attempt
+            # to parse type 3 as bson.
+            return
+
         memory = gdb.selected_inferior().read_memory(self.ptr, self.size).tobytes()
-        bsonobj = next(bson.decode_iter(memory))  # pylint: disable=stop-iteration-return
+        bsonobj = None
+        try:
+            bsonobj = next(bson.decode_iter(memory))  # pylint: disable=stop-iteration-return
+        except bson.errors.InvalidBSON:
+            return
 
         for key, value in list(bsonobj.items()):
             yield 'key', key
@@ -700,9 +733,22 @@ def read_as_integer(pmem, size):
     # We assume the same platform for the debugger and the debuggee (thus, 'sys.byteorder'). If
     # this becomes a problem look into whether it's possible to determine the byteorder of the
     # inferior.
-    return int.from_bytes( \
-        gdb.selected_inferior().read_memory(pmem, size).tobytes(), \
-        sys.byteorder)
+    return int.from_bytes(
+        gdb.selected_inferior().read_memory(pmem, size).tobytes(),
+        sys.byteorder,
+    )
+
+
+def read_as_integer_signed(pmem, size):
+    """Read 'size' bytes at 'pmem' as an integer."""
+    # We assume the same platform for the debugger and the debuggee (thus, 'sys.byteorder'). If
+    # this becomes a problem look into whether it's possible to determine the byteorder of the
+    # inferior.
+    return int.from_bytes(
+        gdb.selected_inferior().read_memory(pmem, size).tobytes(),
+        sys.byteorder,
+        signed=True,
+    )
 
 
 class SbeCodeFragmentPrinter(object):
@@ -739,7 +785,6 @@ class SbeCodeFragmentPrinter(object):
         """Return sbe::vm::CodeFragment for printing."""
         return "%s" % (self.val.type)
 
-    # pylint: disable=R0915
     def children(self):
         """children."""
         yield '_instrs', '{... (to see raw output, run "disable pretty-printer")}'
@@ -755,8 +800,13 @@ class SbeCodeFragmentPrinter(object):
         ptr_size = gdb.lookup_type('void').pointer().sizeof
         tag_size = gdb.lookup_type('mongo::sbe::value::TypeTags').sizeof
         value_size = gdb.lookup_type('mongo::sbe::value::Value').sizeof
+        uint8_size = gdb.lookup_type('uint8_t').sizeof
         uint32_size = gdb.lookup_type('uint32_t').sizeof
+        uint64_size = gdb.lookup_type('uint64_t').sizeof
         builtin_size = gdb.lookup_type('mongo::sbe::vm::Builtin').sizeof
+        time_unit_size = gdb.lookup_type('mongo::TimeUnit').sizeof
+        timezone_size = gdb.lookup_type('mongo::TimeZone').sizeof
+        day_of_week_size = gdb.lookup_type('mongo::DayOfWeek').sizeof
 
         cur_op = self.pdata
         end_op = self.pdata + self.size
@@ -780,11 +830,11 @@ class SbeCodeFragmentPrinter(object):
             if op_name in ['pushLocalVal', 'pushMoveLocalVal', 'pushLocalLambda']:
                 args = 'arg: ' + str(read_as_integer(cur_op, int_size))
                 cur_op += int_size
-            if op_name in ['jmp', 'jmpTrue', 'jmpNothing']:
-                offset = read_as_integer(cur_op, int_size)
+            elif op_name in ['jmp', 'jmpTrue', 'jmpFalse', 'jmpNothing', 'jmpNotNothing']:
+                offset = read_as_integer_signed(cur_op, int_size)
                 cur_op += int_size
                 args = 'offset: ' + str(offset) + ', target: ' + hex(cur_op + offset)
-            elif op_name in ['pushConstVal']:
+            elif op_name in ['pushConstVal', 'getFieldImm']:
                 tag = read_as_integer(cur_op, tag_size)
                 args = 'tag: ' + self.valuetags_lookup.get(tag, "unknown") + \
                     ', value: ' + hex(read_as_integer(cur_op + tag_size, value_size))
@@ -796,7 +846,7 @@ class SbeCodeFragmentPrinter(object):
                 args = 'convert to: ' + \
                     self.valuetags_lookup.get(read_as_integer(cur_op, tag_size), "unknown")
                 cur_op += tag_size
-            elif op_name in ['typeMatch']:
+            elif op_name in ['typeMatchImm']:
                 args = 'mask: ' + hex(read_as_integer(cur_op, uint32_size))
                 cur_op += uint32_size
             elif op_name in ['function', 'functionSmall']:
@@ -808,50 +858,38 @@ class SbeCodeFragmentPrinter(object):
                 args = 'builtin: ' + self.builtins_lookup.get(builtin_id, "unknown")
                 args += ' arity: ' + str(read_as_integer(cur_op + builtin_size, arity_size))
                 cur_op += (builtin_size + arity_size)
+            elif op_name in ['fillEmptyImm']:
+                args = 'Instruction::Constants: ' + str(read_as_integer(cur_op, uint8_size))
+                cur_op += uint8_size
+            elif op_name in ['traverseFImm', 'traversePImm']:
+                const_enum = read_as_integer(cur_op, uint8_size)
+                cur_op += uint8_size
+                args = \
+                    'Instruction::Constants: ' + str(const_enum) + \
+                    ", offset: " + str(read_as_integer_signed(cur_op, int_size))
+                cur_op += int_size
+            elif op_name in ['dateTruncImm']:
+                unit = read_as_integer(cur_op, time_unit_size)
+                cur_op += time_unit_size
+                args = 'unit: ' + str(unit)
+                bin_size = read_as_integer(cur_op, uint64_size)
+                cur_op += uint64_size
+                args += ', binSize: ' + str(bin_size)
+                timezone = read_as_integer(cur_op, timezone_size)
+                cur_op += timezone_size
+                args += ', timezone: ' + hex(timezone)
+                day_of_week = read_as_integer(cur_op, day_of_week_size)
+                cur_op += day_of_week_size
+                args += ', dayOfWeek: ' + str(day_of_week)
+            elif op_name in ['traverseCsiCellValues', 'traverseCsiCellTypes']:
+                offset = read_as_integer_signed(cur_op, int_size)
+                cur_op += int_size
+                args = 'lambda at: ' + hex(cur_op + offset)
 
             yield hex(op_addr), '{} ({})'.format(op_name, args)
 
         yield 'instructions count', \
             instr_count if not error else '? (successfully parsed {})'.format(instr_count)
-
-
-def eval_print_fn(val, print_fn_name):
-    """Evaluate a print function, and return the resulting string."""
-    print_fn_symbol = gdb.lookup_symbol(print_fn_name)[0]
-    print_fn = print_fn_symbol.value()
-    # The generated output from explain contains the string "\n" (two characters)
-    # replace them with a single EOL character so that GDB prints multi-line
-    # explains nicely.
-    pp_result = print_fn(val)
-    pp_str = str(pp_result).replace("\"", "").replace("\\n", "\n")
-    return pp_str
-
-
-class ABTPrinter(object):
-    """Pretty-printer for mongo::optimizer::ABT."""
-
-    def __init__(self, val):
-        """Initialize ABTPrinter."""
-        self.val = val
-
-    @staticmethod
-    def display_hint():
-        """Display hint."""
-        return 'ABT'
-
-    def to_string(self):
-        """Return ABT for printing."""
-        # Python will truncate/compress certain strings that contain many repeated characters.
-        # For an ABT, this is quite common when indenting nodes to represent children, so
-        # disable it for now.
-        prior_repeats = gdb.parameter("print repeats")
-        prior_elements = gdb.parameter("print elements")
-        gdb.execute("set print repeats 0")  # for "<repeats N times>"
-        gdb.execute("set print elements 0")  # for ... on long strings
-        res = eval_print_fn(self.val, "_printNode")
-        gdb.execute("set print repeats " + str(prior_repeats))
-        gdb.execute("set print elements " + str(prior_elements))
-        return res
 
 
 def build_pretty_printer():
@@ -875,11 +913,10 @@ def build_pretty_printer():
     pp.add('__wt_txn', '__wt_txn', False, WtTxnPrinter)
     pp.add('__wt_update', '__wt_update', False, WtUpdateToBsonPrinter)
     pp.add('CodeFragment', 'mongo::sbe::vm::CodeFragment', False, SbeCodeFragmentPrinter)
+    pp.add('boost::optional', 'boost::optional', True, BoostOptionalPrinter)
 
-    # TODO: enable with SERVER-62044.
     # Optimizer/ABT related pretty printers that can be used only with a running process.
-    # abt_type = gdb.lookup_type("mongo::optimizer::ABT").strip_typedefs()
-    # pp.add("ABT", abt_type.name, True, ABTPrinter)
+    register_abt_printers(pp)
 
     return pp
 

@@ -43,6 +43,15 @@ class ReplicaSetNodeProcessInterface final : public NonShardServerProcessInterfa
 public:
     using NonShardServerProcessInterface::NonShardServerProcessInterface;
 
+    std::unique_ptr<WriteSizeEstimator> getWriteSizeEstimator(
+        OperationContext* opCtx, const NamespaceString& ns) const override {
+        if (_canWriteLocally(opCtx, ns)) {
+            return std::make_unique<LocalWriteSizeEstimator>();
+        } else {
+            return std::make_unique<TargetPrimaryWriteSizeEstimator>();
+        }
+    }
+
     static std::shared_ptr<executor::TaskExecutor> getReplicaSetNodeExecutor(
         ServiceContext* service);
 
@@ -71,12 +80,14 @@ public:
                                     boost::optional<OID> targetEpoch) override;
 
     void renameIfOptionsAndIndexesHaveNotChanged(OperationContext* opCtx,
-                                                 const BSONObj& renameCommandObj,
+                                                 const NamespaceString& sourceNs,
                                                  const NamespaceString& targetNs,
+                                                 bool dropTarget,
+                                                 bool stayTemp,
                                                  const BSONObj& originalCollectionOptions,
                                                  const std::list<BSONObj>& originalIndexes);
     void createCollection(OperationContext* opCtx,
-                          const std::string& dbName,
+                          const DatabaseName& dbName,
                           const BSONObj& cmdObj);
     void dropCollection(OperationContext* opCtx, const NamespaceString& collection);
     void createIndexesOnEmptyCollection(OperationContext* opCtx,

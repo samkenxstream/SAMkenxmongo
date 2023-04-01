@@ -3,12 +3,14 @@
  * name.
  *
  * @tags: [
- *   does_not_support_transactions,
- *   requires_getmore,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 (function() {
 'use strict';
+
+load("jstests/core/timeseries/libs/timeseries.js");
 
 const timeFieldName = 'time';
 
@@ -20,13 +22,19 @@ assert.commandWorked(db.createCollection(coll.getName(), {timeseries: {timeField
 const collections =
     assert.commandWorked(db.runCommand({listCollections: 1, filter: {name: coll.getName()}}))
         .cursor.firstBatch;
-assert.eq(collections, [{
-              name: coll.getName(),
-              type: 'timeseries',
-              options: {
-                  timeseries:
-                      {timeField: timeFieldName, granularity: 'seconds', bucketMaxSpanSeconds: 3600}
-              },
-              info: {readOnly: false},
-          }]);
+
+const timeseriesOptions = {
+    timeField: timeFieldName,
+    granularity: 'seconds',
+    bucketMaxSpanSeconds: 3600
+};
+
+const collectionOptions = [{
+    name: coll.getName(),
+    type: 'timeseries',
+    options: {timeseries: timeseriesOptions},
+    info: {readOnly: false},
+}];
+
+assert.eq(collections, collectionOptions);
 })();

@@ -31,8 +31,89 @@
 
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/storage_options.h"
 
 namespace mongo {
+namespace {
+void validateWriteAllowed(OperationContext* opCtx) {
+    uassert(ErrorCodes::IllegalOperation,
+            "Cannot execute a write operation in read-only mode",
+            !opCtx->readOnly());
+}
+
+}  // namespace
+
+RecordStore::RecordStore(boost::optional<UUID> uuid, StringData identName, bool isCapped)
+    : _ident(std::make_shared<Ident>(identName.toString())),
+      _uuid(uuid),
+      _cappedInsertNotifier(isCapped ? std::make_shared<CappedInsertNotifier>() : nullptr) {}
+
+void RecordStore::deleteRecord(OperationContext* opCtx, const RecordId& dl) {
+    validateWriteAllowed(opCtx);
+    doDeleteRecord(opCtx, dl);
+}
+
+Status RecordStore::insertRecords(OperationContext* opCtx,
+                                  std::vector<Record>* inOutRecords,
+                                  const std::vector<Timestamp>& timestamps) {
+    validateWriteAllowed(opCtx);
+    return doInsertRecords(opCtx, inOutRecords, timestamps);
+}
+
+Status RecordStore::updateRecord(OperationContext* opCtx,
+                                 const RecordId& recordId,
+                                 const char* data,
+                                 int len) {
+    validateWriteAllowed(opCtx);
+    return doUpdateRecord(opCtx, recordId, data, len);
+}
+
+StatusWith<RecordData> RecordStore::updateWithDamages(OperationContext* opCtx,
+                                                      const RecordId& loc,
+                                                      const RecordData& oldRec,
+                                                      const char* damageSource,
+                                                      const mutablebson::DamageVector& damages) {
+    validateWriteAllowed(opCtx);
+    return doUpdateWithDamages(opCtx, loc, oldRec, damageSource, damages);
+}
+
+Status RecordStore::truncate(OperationContext* opCtx) {
+    validateWriteAllowed(opCtx);
+    return doTruncate(opCtx);
+}
+
+Status RecordStore::rangeTruncate(OperationContext* opCtx,
+                                  const RecordId& minRecordId,
+                                  const RecordId& maxRecordId,
+                                  int64_t hintDataSizeDiff,
+                                  int64_t hintNumRecordsDiff) {
+    validateWriteAllowed(opCtx);
+    invariant(minRecordId <= maxRecordId, "Start position cannot be after end position");
+    return doRangeTruncate(opCtx, minRecordId, maxRecordId, hintDataSizeDiff, hintNumRecordsDiff);
+}
+
+void RecordStore::cappedTruncateAfter(OperationContext* opCtx,
+                                      const RecordId& end,
+                                      bool inclusive,
+                                      const AboutToDeleteRecordCallback& aboutToDelete) {
+    validateWriteAllowed(opCtx);
+    doCappedTruncateAfter(opCtx, end, inclusive, std::move(aboutToDelete));
+}
+
+bool RecordStore::haveCappedWaiters() const {
+    return _cappedInsertNotifier && _cappedInsertNotifier.use_count() > 1;
+}
+
+void RecordStore::notifyCappedWaitersIfNeeded() {
+    if (haveCappedWaiters())
+        _cappedInsertNotifier->notifyAll();
+}
+
+Status RecordStore::compact(OperationContext* opCtx) {
+    validateWriteAllowed(opCtx);
+    return doCompact(opCtx);
+}
+
 
 Status RecordStore::oplogDiskLocRegister(OperationContext* opCtx,
                                          const Timestamp& opTime,
@@ -57,6 +138,37 @@ void RecordStore::waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCt
               !opCtx->lockState()->uninterruptibleLocksRequested());
 
     waitForAllEarlierOplogWritesToBeVisibleImpl(opCtx);
+}
+
+void CappedInsertNotifier::notifyAll() const {
+    stdx::lock_guard<Latch> lk(_mutex);
+    ++_version;
+    _notifier.notify_all();
+}
+
+uint64_t CappedInsertNotifier::getVersion() const {
+    stdx::lock_guard<Latch> lk(_mutex);
+    return _version;
+}
+
+void CappedInsertNotifier::waitUntil(uint64_t prevVersion, Date_t deadline) const {
+    stdx::unique_lock<Latch> lk(_mutex);
+    while (!_dead && prevVersion == _version) {
+        if (stdx::cv_status::timeout == _notifier.wait_until(lk, deadline.toSystemTimePoint())) {
+            return;
+        }
+    }
+}
+
+void CappedInsertNotifier::kill() {
+    stdx::lock_guard<Latch> lk(_mutex);
+    _dead = true;
+    _notifier.notify_all();
+}
+
+bool CappedInsertNotifier::isDead() {
+    stdx::lock_guard<Latch> lk(_mutex);
+    return _dead;
 }
 
 }  // namespace mongo

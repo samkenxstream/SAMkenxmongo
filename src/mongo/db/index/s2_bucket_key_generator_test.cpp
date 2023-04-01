@@ -27,19 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/index/expression_keys_private.h"
 
 #include <algorithm>
-
-#include "third_party/s2/s2cell.h"
-#include "third_party/s2/s2latlng.h"
+#include <s2cell.h>
+#include <s2latlng.h>
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/index/expression_keys_private.h"
 #include "mongo/db/index/expression_params.h"
 #include "mongo/db/index/s2_common.h"
 #include "mongo/db/json.h"
@@ -47,6 +42,9 @@
 #include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 using namespace mongo;
 
@@ -137,7 +135,7 @@ struct S2BucketKeyGeneratorTest : public unittest::Test {
 TEST_F(S2BucketKeyGeneratorTest, GetS2BucketKeys) {
     BSONObj keyPattern = fromjson("{'data.geo': '2dsphere_bucket'}");
     BSONObj genKeysFrom = fromjson(
-        "{data: {geo: {"
+        "{control: {version: 1}, data: {geo: {"
         "'0': {type: 'Point', coordinates: [0, 0]},"
         "'1': {type: 'Point', coordinates: [3, 3]}"
         "}}}");
@@ -165,7 +163,7 @@ TEST_F(S2BucketKeyGeneratorTest, GetS2BucketKeys) {
 TEST_F(S2BucketKeyGeneratorTest, GetS2BucketKeysSubField) {
     BSONObj keyPattern = fromjson("{'data.geo.sub': '2dsphere_bucket'}");
     BSONObj genKeysFrom = fromjson(
-        "{data: {geo: {"
+        "{control: {version: 1}, data: {geo: {"
         "'0': {sub: {type: 'Point', coordinates: [0, 0]}},"
         "'1': {sub: {type: 'Point', coordinates: [3, 3]}}"
         "}}}");
@@ -194,7 +192,7 @@ TEST_F(S2BucketKeyGeneratorTest, GetS2BucketKeysSubField) {
 TEST_F(S2BucketKeyGeneratorTest, GetS2BucketKeysDeepSubField) {
     BSONObj keyPattern = fromjson("{'data.geo.sub1.sub2.sub3': '2dsphere_bucket'}");
     BSONObj genKeysFrom = fromjson(
-        "{data: {geo: {"
+        "{control: {version: 1}, data: {geo: {"
         "'0': {sub1: {sub2: {sub3: {type: 'Point', coordinates: [0, 0]}}}},"
         "'1': {sub1: {sub2: {sub3: {type: 'Point', coordinates: [3, 3]}}}}"
         "}}}");
@@ -223,7 +221,7 @@ TEST_F(S2BucketKeyGeneratorTest, GetS2BucketKeysDeepSubField) {
 TEST_F(S2BucketKeyGeneratorTest, GetS2BucketKeysSubFieldSomeMissing) {
     BSONObj keyPattern = fromjson("{'data.geo.sub': '2dsphere_bucket'}");
     BSONObj genKeysFrom = fromjson(
-        "{data: {geo: {"
+        "{control: {version: 1}, data: {geo: {"
         "'0': {sub: {type: 'Point', coordinates: [0, 0]}},"
         "'1': {sub: {}},"
         "'2': {sub: null},"

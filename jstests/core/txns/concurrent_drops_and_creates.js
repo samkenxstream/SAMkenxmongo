@@ -2,7 +2,9 @@
  * Test that a transaction cannot write to a collection that has been dropped or created since the
  * transaction started.
  *
+ * The test runs commands that are not allowed with security token: endSession.
  * @tags: [
+ *   not_allowed_with_security_token,
  *   assumes_no_implicit_collection_creation_after_drop,
  *   uses_snapshot_read_concern,
  *   uses_transactions,
@@ -14,6 +16,7 @@
 // TODO (SERVER-39704): Remove the following load after SERVER-397074 is completed
 // For retryOnceOnTransientAndRestartTxnOnMongos.
 load('jstests/libs/auto_retry_transaction_in_sharding.js');
+load("jstests/libs/feature_flag_util.js");
 
 const dbName1 = "test1";
 const dbName2 = "test2";
@@ -60,18 +63,36 @@ retryOnceOnTransientAndRestartTxnOnMongos(session, () => {
 sessionOutsideTxn.advanceClusterTime(session.getClusterTime());
 assert.commandWorked(testDB2.runCommand({drop: collNameB, writeConcern: {w: "majority"}}));
 
-// Ensure the collection drop is visible to the transaction, since our implementation of the in-
-// memory collection catalog always has the most recent collection metadata. We can detect the
-// drop by attempting a findAndModify on the dropped collection. Since the collection drop is
-// visible, the findAndModify will not match any existing documents.
-// TODO (SERVER-39704): Remove use of retryOnceOnTransientAndRestartTxnOnMongos.
-retryOnceOnTransientAndRestartTxnOnMongos(session, () => {
-    const res = sessionDB2.runCommand(
-        {findAndModify: sessionCollB.getName(), update: {a: 1}, upsert: true});
-    assert.commandWorked(res);
-    assert.eq(res.value, null);
-}, txnOptions);
-assert.commandWorked(session.commitTransaction_forTesting());
+// This test cause a StaleConfig error on sharding so even with the PointInTimeCatalogLookups flag
+// enabled no command will succeed.
+// TODO SERVER-67289: Remove feature flag check.
+if (FeatureFlagUtil.isPresentAndEnabled(db, "PointInTimeCatalogLookups") &&
+    !session.getClient().isMongos()) {
+    // We can perform reads on the dropped collection as it existed when we started the transaction.
+    assert.commandWorked(sessionDB2.runCommand({find: sessionCollB.getName()}));
+
+    // However, trying to perform a write will cause a write conflict.
+    assert.commandFailedWithCode(
+        sessionDB2.runCommand(
+            {findAndModify: sessionCollB.getName(), update: {a: 1}, upsert: true}),
+        ErrorCodes.WriteConflict);
+
+    assert.commandFailedWithCode(session.abortTransaction_forTesting(),
+                                 ErrorCodes.NoSuchTransaction);
+} else {
+    // Ensure the collection drop is visible to the transaction, since our implementation of the in-
+    // memory collection catalog always has the most recent collection metadata. We can detect the
+    // drop by attempting a findAndModify on the dropped collection. Since the collection drop is
+    // visible, the findAndModify will not match any existing documents.
+    // TODO (SERVER-39704): Remove use of retryOnceOnTransientAndRestartTxnOnMongos.
+    retryOnceOnTransientAndRestartTxnOnMongos(session, () => {
+        const res = sessionDB2.runCommand(
+            {findAndModify: sessionCollB.getName(), update: {a: 1}, upsert: true});
+        assert.commandWorked(res);
+        assert.eq(res.value, null);
+    }, txnOptions);
+    assert.commandWorked(session.commitTransaction_forTesting());
+}
 
 //
 // A transaction with snapshot read concern cannot write to a collection that has been created
@@ -91,12 +112,25 @@ assert.commandWorked(sessionCollA.insert({}));
 sessionOutsideTxn.advanceClusterTime(session.getClusterTime());
 assert.commandWorked(testDB2.runCommand({create: collNameB}));
 
-// We cannot write to collection B in the transaction, since it experienced catalog changes
-// since the transaction's read timestamp. Since our implementation of the in-memory collection
-// catalog always has the most recent collection metadata, we do not allow you to read from a
-// collection at a time prior to its most recent catalog changes.
-assert.commandFailedWithCode(sessionCollB.insert({}), ErrorCodes.SnapshotUnavailable);
-assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.NoSuchTransaction);
+// TODO SERVER-67289: Remove feature flag check.
+if (FeatureFlagUtil.isPresentAndEnabled(db, "PointInTimeCatalogLookups")) {
+    // We can insert to collection B in the transaction as the transaction does not have a
+    // collection on this namespace (even as it exist at latest). A collection will be implicitly
+    // created and we will fail to commit this transaction with a WriteConflict error.
+    retryOnceOnTransientAndRestartTxnOnMongos(session, () => {
+        assert.commandWorked(sessionCollB.insert({}));
+    }, txnOptions);
+
+    assert.commandFailedWithCode(session.commitTransaction_forTesting(), ErrorCodes.WriteConflict);
+} else {
+    // We cannot write to collection B in the transaction, since it experienced catalog changes
+    // since the transaction's read timestamp. Since our implementation of the in-memory collection
+    // catalog always has the most recent collection metadata, we do not allow you to read from a
+    // collection at a time prior to its most recent catalog changes.
+    assert.commandFailedWithCode(sessionCollB.insert({}), ErrorCodes.SnapshotUnavailable);
+    assert.commandFailedWithCode(session.abortTransaction_forTesting(),
+                                 ErrorCodes.NoSuchTransaction);
+}
 
 session.endSession();
 }());

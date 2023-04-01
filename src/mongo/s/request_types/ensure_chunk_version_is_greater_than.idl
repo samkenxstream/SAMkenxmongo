@@ -32,7 +32,7 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/s/chunk_version.idl"
 
 commands:
@@ -54,9 +54,9 @@ commands:
                 type: object
                 optional: false
             version:
-                description: The version of the chunk, including major version, minor version, and
-                             epoch.
-                type: ChunkVersionArrayWronglyEncodedAsBSONObjFormat
+                description: The data placement of the chunk, including major version, minor 
+                             version, and epoch.
+                type: ChunkVersion
                 optional: false
             collectionUUID:
                 description: The collection's UUID. This field was introduced in 5.0 as mandatory.

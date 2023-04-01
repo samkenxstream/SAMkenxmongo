@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/platform/basic.h"
 
@@ -36,6 +35,7 @@
 #include "mongo/client/authenticate.h"
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/auth/user.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/exit_code.h"
 #include "mongo/util/icu.h"
@@ -43,6 +43,9 @@
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/sequence_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
+
 
 namespace mongo {
 
@@ -101,7 +104,19 @@ void SASLServerMechanismRegistry::advertiseMechanismNamesForUser(OperationContex
     AuthorizationManager* authManager = AuthorizationManager::get(opCtx->getServiceContext());
 
     UserHandle user;
-    const auto swUser = authManager->acquireUser(opCtx, userName);
+    const auto swUser = [&] {
+        if (gEnableDetailedConnectionHealthMetricLogLines) {
+            ScopedCallbackTimer timer([&](Microseconds elapsed) {
+                LOGV2(6788603,
+                      "Auth metrics report",
+                      "metric"_attr = "sasl_acquireUser",
+                      "micros"_attr = elapsed.count());
+            });
+        }
+
+        return authManager->acquireUser(opCtx, UserRequest(userName, boost::none));
+    }();
+
     if (!swUser.isOK()) {
         auto& status = swUser.getStatus();
         if (status.code() == ErrorCodes::UserNotFound) {
@@ -201,7 +216,7 @@ ServiceContext::ConstructorActionRegisterer SASLServerMechanismRegistryValidatio
                             "mechanism"_attr = mech);
 
                 // Quick Exit since we are in the middle of setting up ServiceContext
-                quickExit(EXIT_BADOPTIONS);
+                quickExit(ExitCode::badOptions);
             }
         }
     }};

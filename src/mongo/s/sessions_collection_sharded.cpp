@@ -35,7 +35,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/query_request_helper.h"
-#include "mongo/db/sessions_collection_rs.h"
+#include "mongo/db/session/sessions_collection_rs.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
@@ -61,7 +61,7 @@ BSONObj lsidQuery(const LogicalSessionId& lsid) {
 
 std::vector<LogicalSessionId> SessionsCollectionSharded::_groupSessionIdsByOwningShard(
     OperationContext* opCtx, const LogicalSessionIdSet& sessions) {
-    const auto cm = uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
+    const auto [cm, _] = uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
         opCtx, NamespaceString::kLogicalSessionsNamespace));
     uassert(ErrorCodes::NamespaceNotSharded,
             str::stream() << "Collection " << NamespaceString::kLogicalSessionsNamespace
@@ -86,7 +86,7 @@ std::vector<LogicalSessionId> SessionsCollectionSharded::_groupSessionIdsByOwnin
 
 std::vector<LogicalSessionRecord> SessionsCollectionSharded::_groupSessionRecordsByOwningShard(
     OperationContext* opCtx, const LogicalSessionRecordSet& sessions) {
-    const auto cm = uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
+    const auto [cm, _] = uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
         opCtx, NamespaceString::kLogicalSessionsNamespace));
     uassert(ErrorCodes::NamespaceNotSharded,
             str::stream() << "Collection " << NamespaceString::kLogicalSessionsNamespace
@@ -119,8 +119,8 @@ void SessionsCollectionSharded::checkSessionsCollectionExists(OperationContext* 
             Grid::get(opCtx)->isShardingInitialized());
 
     // If the collection doesn't exist, fail. Only the config servers generate it.
-    const auto cm = uassertStatusOK(
-        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
+    const auto [cm, _] = uassertStatusOK(
+        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithPlacementRefresh(
             opCtx, NamespaceString::kLogicalSessionsNamespace));
 }
 
@@ -172,7 +172,9 @@ LogicalSessionIdSet SessionsCollectionSharded::findRemovedSessions(
             OpMsgRequest::fromDBAndBody(NamespaceString::kLogicalSessionsNamespace.db(), toSend)
                 .body;
         auto findCommand = query_request_helper::makeFromFindCommand(
-            toSend, NamespaceString::kLogicalSessionsNamespace, apiStrict);
+            toSend,
+            static_cast<const NamespaceString&>(NamespaceString::kLogicalSessionsNamespace),
+            apiStrict);
 
         const boost::intrusive_ptr<ExpressionContext> expCtx;
         auto cq = uassertStatusOK(
@@ -196,7 +198,7 @@ LogicalSessionIdSet SessionsCollectionSharded::findRemovedSessions(
         for (const auto& obj : batch) {
             firstBatch.append(obj);
         }
-        firstBatch.done(cursorId, NamespaceString::kLogicalSessionsNamespace.ns());
+        firstBatch.done(cursorId, NamespaceString::kLogicalSessionsNamespace);
 
         return replyBuilder.releaseBody();
     };

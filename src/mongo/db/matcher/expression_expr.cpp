@@ -77,8 +77,8 @@ Value ExprMatchExpression::evaluateExpression(const MatchableDocument* doc) cons
     return _expression->evaluate(document, &variables);
 }
 
-void ExprMatchExpression::serialize(BSONObjBuilder* out, bool includePath) const {
-    *out << "$expr" << _expression->serialize(false);
+void ExprMatchExpression::serialize(BSONObjBuilder* out, SerializationOptions opts) const {
+    *out << "$expr" << _expression->serialize(opts);
 }
 
 bool ExprMatchExpression::equivalent(const MatchExpression* other) const {
@@ -111,7 +111,7 @@ void ExprMatchExpression::_doSetCollator(const CollatorInterface* collator) {
 }
 
 
-std::unique_ptr<MatchExpression> ExprMatchExpression::shallowClone() const {
+std::unique_ptr<MatchExpression> ExprMatchExpression::clone() const {
     // TODO SERVER-31003: Replace Expression clone via serialization with Expression::clone().
     BSONObjBuilder bob;
     bob << "" << _expression->serialize(false);
@@ -124,6 +124,11 @@ std::unique_ptr<MatchExpression> ExprMatchExpression::shallowClone() const {
         clone->_rewriteResult = _rewriteResult->clone();
     }
     return clone;
+}
+
+bool ExprMatchExpression::isTriviallyTrue() const {
+    auto exprConst = dynamic_cast<ExpressionConstant*>(_expression.get());
+    return exprConst && exprConst->getValue().coerceToBool();
 }
 
 MatchExpression::ExpressionOptimizerFunc ExprMatchExpression::getOptimizer() const {
@@ -148,6 +153,12 @@ MatchExpression::ExpressionOptimizerFunc ExprMatchExpression::getOptimizer() con
             andMatch->add(std::move(expression));
             // Re-optimize the new AND in order to make sure that any AND children are absorbed.
             expression = MatchExpression::optimize(std::move(andMatch));
+        }
+
+        // Replace trivially true expression with an empty AND since the planner doesn't always
+        // check for 'isTriviallyTrue()'.
+        if (expression->isTriviallyTrue()) {
+            expression = std::make_unique<AndMatchExpression>();
         }
 
         return expression;

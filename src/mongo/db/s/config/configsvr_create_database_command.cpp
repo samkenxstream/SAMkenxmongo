@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -45,6 +44,9 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 #include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -70,9 +72,10 @@ public:
         Response typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrCreateDatabase can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             // Set the operation context read concern level to local for reads into the config
             // database.
@@ -81,19 +84,10 @@ public:
 
             auto dbname = request().getCommandParameter();
 
-            if (request().getEnableSharding()) {
-                uassert(ErrorCodes::BadValue,
-                        str::stream() << "Enable sharding can only be set to `true`",
-                        *request().getEnableSharding());
-
-                audit::logEnableSharding(opCtx->getClient(), dbname);
-            }
+            audit::logEnableSharding(opCtx->getClient(), dbname);
 
             auto dbt = ShardingCatalogManager::get(opCtx)->createDatabase(
-                opCtx,
-                dbname,
-                request().getPrimaryShardId(),
-                request().getEnableSharding().value_or(false));
+                opCtx, dbname, request().getPrimaryShardId());
 
             return {dbt.getVersion()};
         }

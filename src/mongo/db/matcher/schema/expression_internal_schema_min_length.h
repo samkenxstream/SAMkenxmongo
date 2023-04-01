@@ -37,7 +37,7 @@ namespace mongo {
 class InternalSchemaMinLengthMatchExpression final : public InternalSchemaStrLengthMatchExpression {
 
 public:
-    InternalSchemaMinLengthMatchExpression(StringData path,
+    InternalSchemaMinLengthMatchExpression(boost::optional<StringData> path,
                                            long long strLen,
                                            clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : InternalSchemaStrLengthMatchExpression(MatchType::INTERNAL_SCHEMA_MIN_LENGTH,
@@ -47,10 +47,12 @@ public:
                                                  std::move(annotation)) {}
 
     Validator getComparator() const final {
-        return [strLen = strLen()](int lenWithoutNullTerm) { return lenWithoutNullTerm >= strLen; };
+        return [strLen = strLen()](int lenWithoutNullTerm) {
+            return lenWithoutNullTerm >= strLen;
+        };
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<InternalSchemaMinLengthMatchExpression> minLen =
             std::make_unique<InternalSchemaMinLengthMatchExpression>(
                 path(), strLen(), _errorAnnotation);

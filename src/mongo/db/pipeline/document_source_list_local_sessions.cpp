@@ -31,9 +31,9 @@
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/pipeline/document_source_list_local_sessions.h"
 #include "mongo/db/pipeline/document_source_list_sessions_gen.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
 
 namespace mongo {
 
@@ -78,7 +78,7 @@ DocumentSourceListLocalSessions::DocumentSourceListLocalSessions(
         invariant(!_spec.getUsers() || _spec.getUsers()->empty());
         _ids = _cache->listIds();
     } else {
-        _ids = _cache->listIds(listSessionsUsersToDigests(_spec.getUsers().get()));
+        _ids = _cache->listIds(listSessionsUsersToDigests(_spec.getUsers().value()));
     }
 }
 
@@ -88,18 +88,15 @@ ListSessionsUser getUserNameForLoggedInUser(const OperationContext* opCtx) {
 
     ListSessionsUser user;
     if (AuthorizationManager::get(client->getServiceContext())->isAuthEnabled()) {
-        const auto& userName = AuthorizationSession::get(client)->getSingleUser()->getName();
-        user.setUser(userName.getUser());
-        user.setDb(userName.getDB());
+        const auto& userName = AuthorizationSession::get(client)->getAuthenticatedUserName();
+        uassert(ErrorCodes::Unauthorized, "There is no user authenticated", userName);
+        user.setUser(userName->getUser());
+        user.setDb(userName->getDB());
     } else {
         user.setUser("");
         user.setDb("");
     }
     return user;
-}
-
-bool operator==(const ListSessionsUser& user1, const ListSessionsUser& user2) {
-    return std::tie(user1.getUser(), user1.getDb()) == std::tie(user2.getUser(), user2.getDb());
 }
 }  // namespace
 
@@ -125,7 +122,7 @@ mongo::PrivilegeVector mongo::listSessionsRequiredPrivileges(const ListSessionsS
 
         const auto& myName =
             getUserNameForLoggedInUser(Client::getCurrent()->getOperationContext());
-        const auto& users = spec.getUsers().get();
+        const auto& users = spec.getUsers().value();
         return !std::all_of(
             users.cbegin(), users.cend(), [myName](const auto& name) { return myName == name; });
     })();
@@ -144,7 +141,7 @@ mongo::ListSessionsSpec mongo::listSessionsParseSpec(StringData stageName,
                           << typeName(spec.type()),
             spec.type() == BSONType::Object);
 
-    IDLParserErrorContext ctx(stageName);
+    IDLParserContext ctx(stageName);
     auto ret = ListSessionsSpec::parse(ctx, spec.Obj());
 
     uassert(ErrorCodes::UnsupportedFormat,

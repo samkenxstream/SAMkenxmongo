@@ -40,14 +40,19 @@ WhereMatchExpressionBase::WhereMatchExpressionBase(WhereParams params)
 
 void WhereMatchExpressionBase::debugString(StringBuilder& debug, int indentationLevel) const {
     _debugAddSpace(debug, indentationLevel);
-    debug << "$where\n";
+    debug << "$where";
+    _debugStringAttachTagInfo(&debug);
 
     _debugAddSpace(debug, indentationLevel + 1);
     debug << "code: " << getCode() << "\n";
 }
 
-void WhereMatchExpressionBase::serialize(BSONObjBuilder* out, bool includePath) const {
-    out->appendCode("$where", getCode());
+void WhereMatchExpressionBase::serialize(BSONObjBuilder* out, SerializationOptions opts) const {
+    if (opts.replacementForLiteralArgs) {
+        out->append("$where", *opts.replacementForLiteralArgs);
+    } else {
+        out->appendCode("$where", getCode());
+    }
 }
 
 bool WhereMatchExpressionBase::equivalent(const MatchExpression* other) const {

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -37,7 +36,7 @@
 
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/unordered_fields_bsonelement_comparator.h"
-#include "mongo/db/commands/feature_compatibility_version_documentation.h"
+#include "mongo/db/feature_compatibility_version_documentation.h"
 #include "mongo/db/matcher/doc_validation_util.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
 #include "mongo/db/matcher/expression_parser.h"
@@ -63,6 +62,9 @@
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_component_settings.h"
 #include "mongo/util/string_map.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -737,8 +739,7 @@ StatusWithMatchExpression parseAllowedProperties(
     // that can't match documents.
     if (requiredMissingID) {
         for (const auto& pattern : patternPropertiesVec) {
-            // for (int i = 0; i < patternPropertiesVec.size(); ++i) {
-            if (pattern.first.regex->FullMatch("_id")) {
+            if (pattern.first.regex->matchView("_id", pcre::ANCHORED | pcre::ENDANCHORED)) {
                 requiredMissingID = false;
                 break;
             }
@@ -1584,7 +1585,7 @@ Status translateEncryptionKeywords(StringMap<BSONElement>& keywordMap,
                                   << "' cannot be an empty object "};
         }
 
-        const IDLParserErrorContext ctxt("encryptMetadata");
+        const IDLParserContext ctxt("encryptMetadata");
         try {
             // Discard the result as we are only concerned with validation.
             EncryptionMetadata::parse(ctxt, encryptMetadataElt.embeddedObject());
@@ -1603,7 +1604,7 @@ Status translateEncryptionKeywords(StringMap<BSONElement>& keywordMap,
 
         try {
             // This checks the types of all the fields. Will throw on any parsing error.
-            const IDLParserErrorContext encryptCtxt("encrypt");
+            const IDLParserContext encryptCtxt("encrypt");
             auto encryptInfo = EncryptionInfo::parse(encryptCtxt, encryptElt.embeddedObject());
             auto infoType = encryptInfo.getBsonType();
 
@@ -1915,7 +1916,7 @@ StatusWithMatchExpression JSONSchemaParser::parse(
                     expCtx, "$jsonSchema", oldAnnotation, schema));
             }
         }
-        expCtx->sbeCompatible = false;
+        expCtx->sbeCompatibility = SbeCompatibility::notCompatible;
         return translation;
     } catch (const DBException& ex) {
         return {ex.toStatus()};

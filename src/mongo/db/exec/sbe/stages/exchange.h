@@ -31,6 +31,7 @@
 
 #include <vector>
 
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
 #include "mongo/stdx/condition_variable.h"
@@ -261,9 +262,12 @@ public:
                      ExchangePolicy policy,
                      std::unique_ptr<EExpression> partition,
                      std::unique_ptr<EExpression> orderLess,
-                     PlanNodeId planNodeId);
+                     PlanNodeId planNodeId,
+                     bool participateInTrialRunTracking = true);
 
-    ExchangeConsumer(std::shared_ptr<ExchangeState> state, PlanNodeId planNodeId);
+    ExchangeConsumer(std::shared_ptr<ExchangeState> state,
+                     PlanNodeId planNodeId,
+                     bool participateInTrialRunTracking = true);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -311,7 +315,8 @@ class ExchangeProducer final : public PlanStage {
 public:
     ExchangeProducer(std::unique_ptr<PlanStage> input,
                      std::shared_ptr<ExchangeState> state,
-                     PlanNodeId planNodeId);
+                     PlanNodeId planNodeId,
+                     bool participateInTrialRunTracking = true);
 
     static void start(OperationContext* opCtx,
                       CompileCtx& ctx,

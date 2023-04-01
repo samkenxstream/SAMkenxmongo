@@ -34,7 +34,6 @@ import sys
 from os import path
 sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
 
-# pylint: disable=too-many-lines
 import idl_check_compatibility  # noqa: E402 pylint: disable=wrong-import-position
 import idl_compatibility_errors  # noqa: E402 pylint: disable=wrong-import-position
 
@@ -95,20 +94,20 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
         new_parameter_no_unstable_field_error = error_collection.get_error_by_command_name(
             "newCommandParameterNoUnstableField")
         self.assertTrue(new_parameter_no_unstable_field_error.error_id ==
-                        idl_compatibility_errors.ERROR_ID_NEW_PARAMETER_REQUIRES_UNSTABLE)
+                        idl_compatibility_errors.ERROR_ID_NEW_PARAMETER_REQUIRES_STABILITY)
         self.assertRegex(
             str(new_parameter_no_unstable_field_error), "newCommandParameterNoUnstableField")
 
         new_reply_no_unstable_field_error = error_collection.get_error_by_command_name(
             "newCommandReplyNoUnstableField")
         self.assertTrue(new_reply_no_unstable_field_error.error_id ==
-                        idl_compatibility_errors.ERROR_ID_NEW_REPLY_FIELD_REQUIRES_UNSTABLE)
+                        idl_compatibility_errors.ERROR_ID_NEW_REPLY_FIELD_REQUIRES_STABILITY)
         self.assertRegex(str(new_reply_no_unstable_field_error), "newCommandReplyNoUnstableField")
 
         new_command_type_struct_no_unstable_field_error = error_collection.get_error_by_command_name(
             "newCommandTypeStructFieldNoUnstableField")
         self.assertTrue(new_command_type_struct_no_unstable_field_error.error_id ==
-                        idl_compatibility_errors.ERROR_ID_NEW_COMMAND_TYPE_FIELD_REQUIRES_UNSTABLE)
+                        idl_compatibility_errors.ERROR_ID_NEW_COMMAND_TYPE_FIELD_REQUIRES_STABILITY)
         self.assertRegex(
             str(new_command_type_struct_no_unstable_field_error),
             "newCommandTypeStructFieldNoUnstableField")
@@ -140,7 +139,7 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
             str(new_command_type_struct_bson_serialization_type_any_error),
             "newCommandTypeStructFieldBsonSerializationTypeAny")
 
-    # pylint: disable=too-many-locals,too-many-statements,invalid-name
+    # pylint: disable=invalid-name
     def test_should_fail(self):
         """Tests that incompatible old and new IDL commands should fail."""
         dir_path = path.dirname(path.realpath(__file__))
@@ -149,7 +148,6 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
             path.join(dir_path, "compatibility_test_fail/new"), ["src"], ["src"])
 
         self.assertTrue(error_collection.has_errors())
-        self.assertEqual(error_collection.count(), 186)
 
         invalid_api_version_new_error = error_collection.get_error_by_command_name(
             "invalidAPIVersionNew")
@@ -203,6 +201,12 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
         self.assertTrue(command_parameter_unstable_error.error_id ==
                         idl_compatibility_errors.ERROR_ID_COMMAND_PARAMETER_UNSTABLE)
         self.assertRegex(str(command_parameter_unstable_error), "commandParameterUnstable")
+
+        command_parameter_internal_error = error_collection.get_error_by_command_name(
+            "commandParameterInternal")
+        self.assertTrue(command_parameter_internal_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_COMMAND_PARAMETER_UNSTABLE)
+        self.assertRegex(str(command_parameter_internal_error), "commandParameterInternal")
 
         command_parameter_stable_required_no_default_error = error_collection.get_error_by_command_name(
             "commandParameterStableRequiredNoDefault")
@@ -413,6 +417,12 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
         self.assertTrue(new_reply_field_unstable_error.error_id ==
                         idl_compatibility_errors.ERROR_ID_NEW_REPLY_FIELD_UNSTABLE)
         self.assertRegex(str(new_reply_field_unstable_error), "newReplyFieldUnstable")
+
+        new_reply_field_internal_error = error_collection.get_error_by_command_name(
+            "newReplyFieldInternal")
+        self.assertTrue(new_reply_field_internal_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_NEW_REPLY_FIELD_UNSTABLE)
+        self.assertRegex(str(new_reply_field_internal_error), "newReplyFieldInternal")
 
         new_reply_field_optional_error = error_collection.get_error_by_error_id(
             idl_compatibility_errors.ERROR_ID_NEW_REPLY_FIELD_OPTIONAL)
@@ -927,6 +937,22 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
             str(new_reply_field_variant_struct_not_subset_error),
             "newReplyFieldVariantStructNotSubset")
 
+        new_reply_field_variant_struct_not_subset_two_error = error_collection.get_error_by_command_name(
+            "newReplyFieldVariantStructNotSubsetTwo")
+        self.assertTrue(new_reply_field_variant_struct_not_subset_two_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_NEW_REPLY_FIELD_VARIANT_TYPE_NOT_SUBSET)
+        self.assertRegex(
+            str(new_reply_field_variant_struct_not_subset_two_error),
+            "newReplyFieldVariantStructNotSubsetTwo")
+
+        new_reply_field_array_variant_struct_not_subset_error = error_collection.get_error_by_command_name(
+            "newReplyFieldArrayVariantStructNotSubset")
+        self.assertTrue(new_reply_field_array_variant_struct_not_subset_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_NEW_REPLY_FIELD_VARIANT_TYPE_NOT_SUBSET)
+        self.assertRegex(
+            str(new_reply_field_array_variant_struct_not_subset_error),
+            "newReplyFieldArrayVariantStructNotSubset")
+
         new_reply_field_variant_struct_recursive_error = error_collection.get_error_by_command_name(
             "replyFieldVariantStructRecursive")
         self.assertTrue(new_reply_field_variant_struct_recursive_error.error_id ==
@@ -1026,6 +1052,22 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
         for error in new_param_variant_not_superset_two_errors:
             self.assertTrue(error.error_id == idl_compatibility_errors.
                             ERROR_ID_NEW_COMMAND_PARAMETER_VARIANT_TYPE_NOT_SUPERSET)
+
+        new_param_variant_not_superset_three_error = error_collection.get_error_by_command_name(
+            "newParamVariantNotSupersetThree")
+        self.assertTrue(
+            new_param_variant_not_superset_three_error.error_id ==
+            idl_compatibility_errors.ERROR_ID_NEW_COMMAND_PARAMETER_VARIANT_TYPE_NOT_SUPERSET)
+        self.assertRegex(
+            str(new_param_variant_not_superset_three_error), "newParamVariantNotSupersetThree")
+
+        new_param_array_variant_not_superset_error = error_collection.get_error_by_command_name(
+            "newParamArrayVariantNotSuperset")
+        self.assertTrue(
+            new_param_array_variant_not_superset_error.error_id ==
+            idl_compatibility_errors.ERROR_ID_NEW_COMMAND_PARAMETER_VARIANT_TYPE_NOT_SUPERSET)
+        self.assertRegex(
+            str(new_param_array_variant_not_superset_error), "newParamArrayVariantNotSuperset")
 
         new_param_type_not_variant_error = error_collection.get_error_by_command_name(
             "newParamTypeNotVariant")
@@ -1244,6 +1286,20 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
                         idl_compatibility_errors.ERROR_ID_NEW_ADDITIONAL_COMPLEX_ACCESS_CHECK)
         self.assertRegex(str(complex_checks_not_subset_two_error), "complexChecksNotSubsetTwo")
 
+        complex_checks_superset_none_allowed_error = error_collection.get_error_by_command_name(
+            "complexChecksSupersetNoneAllowed")
+        self.assertTrue(complex_checks_superset_none_allowed_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_NEW_ADDITIONAL_COMPLEX_ACCESS_CHECK)
+        self.assertRegex(
+            str(complex_checks_superset_none_allowed_error), "complexChecksSupersetNoneAllowed")
+
+        complex_checks_superset_some_allowed_error = error_collection.get_error_by_command_name(
+            "complexChecksSupersetSomeAllowed")
+        self.assertTrue(complex_checks_superset_some_allowed_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_NEW_ADDITIONAL_COMPLEX_ACCESS_CHECK)
+        self.assertRegex(
+            str(complex_checks_superset_some_allowed_error), "complexChecksSupersetSomeAllowed")
+
         complex_resource_pattern_change_error = error_collection.get_error_by_command_name(
             "complexResourcePatternChange")
         self.assertTrue(complex_resource_pattern_change_error.error_id ==
@@ -1268,6 +1324,14 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
         self.assertTrue(additional_complex_access_check_error.error_id ==
                         idl_compatibility_errors.ERROR_ID_NEW_ADDITIONAL_COMPLEX_ACCESS_CHECK)
         self.assertRegex(str(additional_complex_access_check_error), "additionalComplexAccessCheck")
+
+        additional_complex_access_check_agg_stage_error = error_collection.get_error_by_command_name(
+            "additionalComplexAccessCheckAggStage")
+        self.assertTrue(additional_complex_access_check_agg_stage_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_NEW_ADDITIONAL_COMPLEX_ACCESS_CHECK)
+        self.assertRegex(
+            str(additional_complex_access_check_agg_stage_error),
+            "additionalComplexAccessCheckAggStage")
 
         removed_access_check_field_error = error_collection.get_error_by_command_name(
             "removedAccessCheckField")
@@ -1308,14 +1372,14 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
         new_reply_field_missing_unstable_field_error = error_collection.get_error_by_command_name(
             "newReplyFieldMissingUnstableField")
         self.assertTrue(new_reply_field_missing_unstable_field_error.error_id ==
-                        idl_compatibility_errors.ERROR_ID_NEW_REPLY_FIELD_REQUIRES_UNSTABLE)
+                        idl_compatibility_errors.ERROR_ID_NEW_REPLY_FIELD_REQUIRES_STABILITY)
         self.assertRegex(
             str(new_reply_field_missing_unstable_field_error), "newReplyFieldMissingUnstableField")
 
         new_command_type_field_missing_unstable_field_error = error_collection.get_error_by_command_name(
             "newCommandTypeFieldMissingUnstableField")
         self.assertTrue(new_command_type_field_missing_unstable_field_error.error_id ==
-                        idl_compatibility_errors.ERROR_ID_NEW_COMMAND_TYPE_FIELD_REQUIRES_UNSTABLE)
+                        idl_compatibility_errors.ERROR_ID_NEW_COMMAND_TYPE_FIELD_REQUIRES_STABILITY)
         self.assertRegex(
             str(new_command_type_field_missing_unstable_field_error),
             "newCommandTypeFieldMissingUnstableField")
@@ -1323,14 +1387,14 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
         new_parameter_missing_unstable_field_error = error_collection.get_error_by_command_name(
             "newParameterMissingUnstableField")
         self.assertTrue(new_parameter_missing_unstable_field_error.error_id ==
-                        idl_compatibility_errors.ERROR_ID_NEW_PARAMETER_REQUIRES_UNSTABLE)
+                        idl_compatibility_errors.ERROR_ID_NEW_PARAMETER_REQUIRES_STABILITY)
         self.assertRegex(
             str(new_parameter_missing_unstable_field_error), "newParameterMissingUnstableField")
 
         added_new_reply_field_missing_unstable_field_error = error_collection.get_error_by_command_name(
             "addedNewReplyFieldMissingUnstableField")
         self.assertTrue(added_new_reply_field_missing_unstable_field_error.error_id ==
-                        idl_compatibility_errors.ERROR_ID_NEW_REPLY_FIELD_REQUIRES_UNSTABLE)
+                        idl_compatibility_errors.ERROR_ID_NEW_REPLY_FIELD_REQUIRES_STABILITY)
         self.assertRegex(
             str(added_new_reply_field_missing_unstable_field_error),
             "addedNewReplyFieldMissingUnstableField")
@@ -1338,7 +1402,7 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
         added_new_command_type_field_missing_unstable_field_error = error_collection.get_error_by_command_name(
             "addedNewCommandTypeFieldMissingUnstableField")
         self.assertTrue(added_new_command_type_field_missing_unstable_field_error.error_id ==
-                        idl_compatibility_errors.ERROR_ID_NEW_COMMAND_TYPE_FIELD_REQUIRES_UNSTABLE)
+                        idl_compatibility_errors.ERROR_ID_NEW_COMMAND_TYPE_FIELD_REQUIRES_STABILITY)
         self.assertRegex(
             str(added_new_command_type_field_missing_unstable_field_error),
             "addedNewCommandTypeFieldMissingUnstableField")
@@ -1346,7 +1410,7 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
         added_new_parameter_missing_unstable_field_error = error_collection.get_error_by_command_name(
             "addedNewParameterMissingUnstableField")
         self.assertTrue(added_new_parameter_missing_unstable_field_error.error_id ==
-                        idl_compatibility_errors.ERROR_ID_NEW_PARAMETER_REQUIRES_UNSTABLE)
+                        idl_compatibility_errors.ERROR_ID_NEW_PARAMETER_REQUIRES_STABILITY)
         self.assertRegex(
             str(added_new_parameter_missing_unstable_field_error),
             "addedNewParameterMissingUnstableField")
@@ -1407,6 +1471,46 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
         self.assertTrue(bool_to_optional_bool_reply_error.error_id ==
                         idl_compatibility_errors.ERROR_ID_NEW_REPLY_FIELD_OPTIONAL)
 
+        unstable_to_stable_reply_field_error = error_collection.get_error_by_command_name(
+            "unstableToStableReplyField")
+        self.assertTrue(unstable_to_stable_reply_field_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_UNSTABLE_REPLY_FIELD_CHANGED_TO_STABLE)
+        self.assertRegex(str(unstable_to_stable_reply_field_error), "unstableToStableReplyField")
+
+        unstable_to_stable_param_field_error = error_collection.get_error_by_command_name(
+            "unstableToStableParamField")
+        self.assertTrue(unstable_to_stable_param_field_error.error_id == idl_compatibility_errors.
+                        ERROR_ID_UNSTABLE_COMMAND_PARAM_FIELD_CHANGED_TO_STABLE)
+        self.assertRegex(str(unstable_to_stable_param_field_error), "unstableToStableParamField")
+
+        unstable_to_stable_type_field_error = error_collection.get_error_by_command_name(
+            "unstableToStableTypeField")
+        self.assertTrue(unstable_to_stable_type_field_error.error_id == idl_compatibility_errors.
+                        ERROR_ID_UNSTABLE_COMMAND_TYPE_FIELD_CHANGED_TO_STABLE)
+        self.assertRegex(str(unstable_to_stable_type_field_error), "unstableToStableTypeField")
+
+        new_reply_field_added_as_stable_error = error_collection.get_error_by_command_name(
+            "newStableReplyFieldAdded")
+        self.assertTrue(new_reply_field_added_as_stable_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_NEW_REPLY_FIELD_ADDED_AS_STABLE)
+        self.assertRegex(str(new_reply_field_added_as_stable_error), "newStableReplyFieldAdded")
+
+        new_command_param_field_added_as_stable_error = error_collection.get_error_by_command_name(
+            "newStableParameterAdded")
+        self.assertTrue(new_command_param_field_added_as_stable_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_NEW_COMMAND_PARAM_FIELD_ADDED_AS_STABLE)
+        self.assertRegex(
+            str(new_command_param_field_added_as_stable_error), "newStableParameterAdded")
+
+        new_command_type_field_added_as_stable_error = error_collection.get_error_by_command_name(
+            "newStableTypeFieldAdded")
+        self.assertTrue(new_command_type_field_added_as_stable_error.error_id ==
+                        idl_compatibility_errors.ERROR_ID_NEW_COMMAND_TYPE_FIELD_ADDED_AS_STABLE)
+        self.assertRegex(
+            str(new_command_type_field_added_as_stable_error), "newStableTypeFieldAdded")
+
+        self.assertEqual(error_collection.count(), 213)
+
     def test_generic_argument_compatibility_pass(self):
         """Tests that compatible old and new generic_argument.idl files should pass."""
         dir_path = path.dirname(path.realpath(__file__))
@@ -1415,8 +1519,9 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
                 path.join(dir_path,
                           "compatibility_test_pass/old_generic_argument/generic_argument.idl"),
                 path.join(dir_path,
-                          "compatibility_test_pass/new_generic_argument/generic_argument.idl")).
-            has_errors())
+                          "compatibility_test_pass/new_generic_argument/generic_argument.idl"),
+                path.join(dir_path, "compatibility_test_pass/old_generic_argument/"),
+                path.join(dir_path, "compatibility_test_pass/new_generic_argument/")).has_errors())
 
     def test_generic_argument_compatibility_fail(self):
         """Tests that incompatible old and new generic_argument.idl files should fail."""
@@ -1425,7 +1530,9 @@ class TestIDLCompatibilityChecker(unittest.TestCase):
             path.join(dir_path,
                       "compatibility_test_fail/old_generic_argument/generic_argument.idl"),
             path.join(dir_path,
-                      "compatibility_test_fail/new_generic_argument/generic_argument.idl"))
+                      "compatibility_test_fail/new_generic_argument/generic_argument.idl"),
+            path.join(dir_path, "compatibility_test_pass/old_generic_argument/"),
+            path.join(dir_path, "compatibility_test_pass/new_generic_argument/"))
 
         self.assertTrue(error_collection.has_errors())
         self.assertTrue(error_collection.count() == 2)

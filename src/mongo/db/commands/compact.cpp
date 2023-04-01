@@ -47,24 +47,32 @@ namespace mongo {
 using std::string;
 using std::stringstream;
 
-class CompactCmd : public ErrmsgCommandDeprecated {
+class CompactCmd : public BasicCommand {
 public:
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual bool adminOnly() const {
+
+    bool adminOnly() const override {
         return false;
     }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        ActionSet actions;
-        actions.addAction(ActionType::compact);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::compact)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
+
     std::string help() const override {
         return "compact collection\n"
                "warning: this operation locks the database and is slow. you can cancel with "
@@ -72,28 +80,23 @@ public:
                "{ compact : <collection_name>, [force:<bool>] }\n"
                "  force - allows to run on a replica set primary\n";
     }
-    CompactCmd() : ErrmsgCommandDeprecated("compact") {}
 
-    virtual bool errmsgRun(OperationContext* opCtx,
-                           const string& db,
-                           const BSONObj& cmdObj,
-                           string& errmsg,
-                           BSONObjBuilder& result) {
-        NamespaceString nss = CommandHelpers::parseNsCollectionRequired(db, cmdObj);
+    CompactCmd() : BasicCommand("compact") {}
+
+    bool run(OperationContext* opCtx,
+             const DatabaseName& dbName,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        NamespaceString nss = CommandHelpers::parseNsCollectionRequired(dbName, cmdObj);
 
         repl::ReplicationCoordinator* replCoord = repl::ReplicationCoordinator::get(opCtx);
-        if (replCoord->getMemberState().primary() && !cmdObj["force"].trueValue()) {
-            errmsg =
-                "will not run compact on an active replica set primary as this is a slow blocking "
-                "operation. use force:true to force";
-            return false;
-        }
+        uassert(ErrorCodes::IllegalOperation,
+                "will not run compact on an active replica set primary as this will slow down "
+                "other running operations. use force:true to force",
+                !replCoord->getMemberState().primary() || cmdObj["force"].trueValue());
 
-        if (nss.isSystem()) {
-            // Items in system.* cannot be moved as there might be pointers to them.
-            errmsg = "can't compact a system namespace";
-            return false;
-        }
+        // This command is internal to the storage engine and should not block oplog application.
+        ShouldNotConflictWithSecondaryBatchApplicationBlock noPBWMBlock(opCtx->lockState());
 
         StatusWith<int64_t> status = compactCollection(opCtx, nss);
         uassertStatusOK(status.getStatus());

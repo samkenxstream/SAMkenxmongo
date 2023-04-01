@@ -75,7 +75,7 @@ public:
 
     // virtuals from DocumentSource
     const char* getSourceName() const final;
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         StageConstraints constraints(StreamType::kStreaming,
@@ -94,6 +94,8 @@ public:
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);

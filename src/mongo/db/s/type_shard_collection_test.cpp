@@ -39,7 +39,7 @@ namespace {
 
 using unittest::assertGet;
 
-const NamespaceString kNss = NamespaceString("db.coll");
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("db.coll");
 const BSONObj kKeyPattern = BSON("a" << 1);
 const BSONObj kDefaultCollation = BSON("locale"
                                        << "fr_CA");
@@ -56,7 +56,8 @@ TEST(ShardCollectionType, FromBSONEmptyShardKeyFails) {
         ErrorCodes::ShardKeyNotFound);
 }
 
-TEST(ShardCollectionType, FromBSONEpochMatchesLastRefreshedCollectionVersionWhenBSONTimestamp) {
+TEST(ShardCollectionType,
+     FromBSONEpochMatcheslastRefreshedCollectionPlacementVersionWhenBSONTimestamp) {
     OID epoch = OID::gen();
     Timestamp timestamp(1, 1);
 
@@ -67,25 +68,13 @@ TEST(ShardCollectionType, FromBSONEpochMatchesLastRefreshedCollectionVersionWhen
              << ShardCollectionType::kUuidFieldName << UUID::gen()
              << ShardCollectionType::kKeyPatternFieldName << kKeyPattern
              << ShardCollectionType::kUniqueFieldName << true
-             << ShardCollectionType::kLastRefreshedCollectionVersionFieldName << Timestamp(1, 1)));
-    ASSERT_EQ(epoch, shardCollType.getLastRefreshedCollectionVersion()->epoch());
-    ASSERT_EQ(timestamp, shardCollType.getLastRefreshedCollectionVersion()->getTimestamp());
-}
-
-TEST(ShardCollectionType, FromBSONEpochMatchesLastRefreshedCollectionVersionWhenDate) {
-    OID epoch = OID::gen();
-    Timestamp timestamp(1, 1);
-
-    ShardCollectionType shardCollType(
-        BSON(ShardCollectionType::kNssFieldName
-             << kNss.ns() << ShardCollectionType::kEpochFieldName << epoch
-             << ShardCollectionType::kUuidFieldName << UUID::gen()
-             << ShardCollectionType::kTimestampFieldName << timestamp
-             << ShardCollectionType::kKeyPatternFieldName << kKeyPattern
-             << ShardCollectionType::kUniqueFieldName << true
-             << ShardCollectionType::kLastRefreshedCollectionVersionFieldName << Date_t()));
-    ASSERT_EQ(epoch, shardCollType.getLastRefreshedCollectionVersion()->epoch());
-    ASSERT_EQ(timestamp, shardCollType.getLastRefreshedCollectionVersion()->getTimestamp());
+             << ShardCollectionType::kLastRefreshedCollectionMajorMinorVersionFieldName
+             << Timestamp(123, 45)));
+    ASSERT_EQ(epoch, shardCollType.getLastRefreshedCollectionPlacementVersion()->epoch());
+    ASSERT_EQ(timestamp,
+              shardCollType.getLastRefreshedCollectionPlacementVersion()->getTimestamp());
+    ASSERT_EQ(Timestamp(123, 45),
+              Timestamp(shardCollType.getLastRefreshedCollectionPlacementVersion()->toLong()));
 }
 
 TEST(ShardCollectionType, ToBSONEmptyDefaultCollationNotIncluded) {

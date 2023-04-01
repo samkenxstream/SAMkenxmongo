@@ -27,11 +27,10 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/s/stale_exception.h"
 
 #include "mongo/base/init.h"
+#include "mongo/s/shard_version.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -43,6 +42,39 @@ MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(StaleDbRoutingVersion);
 
 }  // namespace
 
+void StaleConfigInfo::serialize(BSONObjBuilder* bob) const {
+    bob->append("ns", _nss.ns());
+    _received.serialize("vReceived", bob);
+    if (_wanted)
+        _wanted->serialize("vWanted", bob);
+
+    invariant(_shardId != "");
+    bob->append("shardId", _shardId.toString());
+}
+
+std::shared_ptr<const ErrorExtraInfo> StaleConfigInfo::parse(const BSONObj& obj) {
+    auto shardId = obj["shardId"].String();
+    uassert(ErrorCodes::NoSuchKey, "The shardId field is missing", !shardId.empty());
+
+    return std::make_shared<StaleConfigInfo>(
+        NamespaceString(obj["ns"].String()),
+        ShardVersion::parse(obj["vReceived"]),
+        [&] {
+            if (auto vWantedElem = obj["vWanted"])
+                return boost::make_optional(ShardVersion::parse(vWantedElem));
+            return boost::optional<ShardVersion>();
+        }(),
+        ShardId(std::move(shardId)));
+}
+
+void StaleEpochInfo::serialize(BSONObjBuilder* bob) const {
+    bob->append("ns", _nss.ns());
+}
+
+std::shared_ptr<const ErrorExtraInfo> StaleEpochInfo::parse(const BSONObj& obj) {
+    return std::make_shared<StaleEpochInfo>(NamespaceString(obj["ns"].String()));
+}
+
 void StaleDbRoutingVersion::serialize(BSONObjBuilder* bob) const {
     bob->append("db", _db);
     bob->append("vReceived", _received.toBSON());
@@ -52,13 +84,10 @@ void StaleDbRoutingVersion::serialize(BSONObjBuilder* bob) const {
 }
 
 std::shared_ptr<const ErrorExtraInfo> StaleDbRoutingVersion::parse(const BSONObj& obj) {
-    return std::make_shared<StaleDbRoutingVersion>(parseFromCommandError(obj));
-}
-
-StaleDbRoutingVersion StaleDbRoutingVersion::parseFromCommandError(const BSONObj& obj) {
-    return StaleDbRoutingVersion(obj["db"].String(),
-                                 DatabaseVersion(obj["vReceived"].Obj()),
-                                 !obj["vWanted"].eoo() ? DatabaseVersion(obj["vWanted"].Obj())
+    return std::make_shared<StaleDbRoutingVersion>(obj["db"].String(),
+                                                   DatabaseVersion(obj["vReceived"].Obj()),
+                                                   !obj["vWanted"].eoo()
+                                                       ? DatabaseVersion(obj["vWanted"].Obj())
                                                        : boost::optional<DatabaseVersion>{});
 }
 

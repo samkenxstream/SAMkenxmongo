@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/client/connection_string.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/query/cursor_response.h"
@@ -38,7 +36,6 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/client/shard_remote.h"
 #include "mongo/s/query/establish_cursors.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/s/sharding_router_test_fixture.h"
 
 namespace mongo {
@@ -80,7 +77,7 @@ protected:
     }
 
     void runDummyCommandOnShard(ShardId shardId) {
-        auto shard = shardRegistry()->getShardNoReload(shardId);
+        auto shard = unittest::assertGet(shardRegistry()->getShard(operationContext(), shardId));
         uassertStatusOK(shard->runCommand(operationContext(),
                                           ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                                           "unusedDb",
@@ -89,115 +86,6 @@ protected:
                                           Shard::RetryPolicy::kNoRetry));
     }
 };
-
-BSONObj makeLastCommittedOpTimeMetadata(LogicalTime time) {
-    return BSON("lastCommittedOpTime" << time.asTimestamp());
-}
-
-TEST_F(ShardRemoteTest, GetAndSetLatestLastCommittedOpTime) {
-    auto shard = shardRegistry()->getShardNoReload(kTestShardIds[0]);
-
-    // Shards can store last committed opTimes.
-    LogicalTime time(Timestamp(10, 2));
-    shard->updateLastCommittedOpTime(time);
-    ASSERT_EQ(time, shard->getLastCommittedOpTime());
-
-    // Later times overwrite earlier times.
-    LogicalTime laterTime(Timestamp(20, 2));
-    shard->updateLastCommittedOpTime(laterTime);
-    ASSERT_EQ(laterTime, shard->getLastCommittedOpTime());
-
-    // Earlier times are ignored.
-    LogicalTime earlierTime(Timestamp(5, 1));
-    shard->updateLastCommittedOpTime(earlierTime);
-    ASSERT_EQ(laterTime, shard->getLastCommittedOpTime());
-}
-
-TEST_F(ShardRemoteTest, NetworkReplyWithLastCommittedOpTime) {
-    // Send a request to one shard.
-    auto targetedShard = kTestShardIds[0];
-    auto future = launchAsync([&] { runDummyCommandOnShard(targetedShard); });
-
-    // Mock a find response with a returned lastCommittedOpTime.
-    LogicalTime expectedTime(Timestamp(100, 2));
-    onFindWithMetadataCommand([&](const executor::RemoteCommandRequest& request) {
-        auto result = std::vector<BSONObj>{BSON("_id" << 1)};
-        auto metadata = makeLastCommittedOpTimeMetadata(expectedTime);
-        return std::make_tuple(result, metadata);
-    });
-
-    future.default_timed_get();
-
-    // Verify the targeted shard has updated its lastCommittedOpTime.
-    ASSERT_EQ(expectedTime,
-              shardRegistry()->getShardNoReload(targetedShard)->getLastCommittedOpTime());
-
-    // Verify shards that were not targeted were not affected.
-    for (auto shardId : kTestShardIds) {
-        if (shardId != targetedShard) {
-            ASSERT(!VectorClock::isValidComponentTime(
-                shardRegistry()->getShardNoReload(shardId)->getLastCommittedOpTime()));
-        }
-    }
-}
-
-TEST_F(ShardRemoteTest, NetworkReplyWithoutLastCommittedOpTime) {
-    // Send a request to one shard.
-    auto targetedShard = kTestShardIds[0];
-    auto future = launchAsync([&] { runDummyCommandOnShard(targetedShard); });
-
-    // Mock a find response without a returned lastCommittedOpTime.
-    onFindWithMetadataCommand([&](const executor::RemoteCommandRequest& request) {
-        auto result = std::vector<BSONObj>{BSON("_id" << 1)};
-        auto metadata = BSONObj();
-        return std::make_tuple(result, metadata);
-    });
-
-    future.default_timed_get();
-
-    // Verify the targeted shard has not updated its lastCommittedOpTime.
-    ASSERT_EQ(LogicalTime::kUninitialized,
-              shardRegistry()->getShardNoReload(targetedShard)->getLastCommittedOpTime());
-}
-
-TEST_F(ShardRemoteTest, ScatterGatherRepliesWithLastCommittedOpTime) {
-    // Send requests to several shards.
-    auto nss = NamespaceString("test.foo");
-    auto cmdObj = BSON("find" << nss.coll());
-    std::vector<std::pair<ShardId, BSONObj>> remotes{
-        {kTestShardIds[0], cmdObj}, {kTestShardIds[1], cmdObj}, {kTestShardIds[2], cmdObj}};
-
-    auto future = launchAsync([&] {
-        establishCursors(operationContext(),
-                         executor(),
-                         nss,
-                         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                         remotes,
-                         false);  // allowPartialResults
-    });
-
-    // All remotes respond with a lastCommittedOpTime.
-    LogicalTime expectedTime(Timestamp(50, 1));
-    for (auto remote : remotes) {
-        onCommandWithMetadata([&](const executor::RemoteCommandRequest& request) {
-            std::vector<BSONObj> batch = {BSON("_id" << 1)};
-            CursorResponse cursorResponse(nss, CursorId(123), batch);
-            auto result = BSONObjBuilder(
-                cursorResponse.toBSON(CursorResponse::ResponseType::InitialResponse));
-            result.appendElements(makeLastCommittedOpTimeMetadata(expectedTime));
-
-            return executor::RemoteCommandResponse(result.obj(), Milliseconds(1));
-        });
-    }
-
-    future.default_timed_get();
-
-    // Verify all shards updated their lastCommittedOpTime.
-    for (auto shardId : kTestShardIds) {
-        ASSERT_EQ(expectedTime,
-                  shardRegistry()->getShardNoReload(shardId)->getLastCommittedOpTime());
-    }
-}
 
 TEST_F(ShardRemoteTest, TargeterMarksHostAsDownWhenConfigStepdown) {
     auto targetedNode = ShardId("config");

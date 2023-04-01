@@ -61,13 +61,13 @@ void invariantNoCurrentClient() {
 }
 }  // namespace
 
-void Client::initThread(StringData desc, transport::SessionHandle session) {
+void Client::initThread(StringData desc, std::shared_ptr<transport::Session> session) {
     initThread(desc, getGlobalServiceContext(), std::move(session));
 }
 
 void Client::initThread(StringData desc,
                         ServiceContext* service,
-                        transport::SessionHandle session) {
+                        std::shared_ptr<transport::Session> session) {
     invariantNoCurrentClient();
 
     std::string fullDesc;
@@ -92,7 +92,9 @@ int64_t generateSeed(const std::string& desc) {
 }
 }  // namespace
 
-Client::Client(std::string desc, ServiceContext* serviceContext, transport::SessionHandle session)
+Client::Client(std::string desc,
+               ServiceContext* serviceContext,
+               std::shared_ptr<transport::Session> session)
     : _serviceContext(serviceContext),
       _session(std::move(session)),
       _desc(std::move(desc)),
@@ -148,8 +150,8 @@ bool haveClient() {
 ServiceContext::UniqueClient Client::releaseCurrent() {
     invariant(haveClient(), "No client to release");
     if (auto opCtx = currentClient->_opCtx)
-        if (auto timer = OperationCPUTimer::get(opCtx))
-            timer->onThreadDetach();
+        if (auto timers = OperationCPUTimers::get(opCtx))
+            timers->onThreadDetach();
     return std::move(currentClient);
 }
 
@@ -157,8 +159,8 @@ void Client::setCurrent(ServiceContext::UniqueClient client) {
     invariantNoCurrentClient();
     currentClient = std::move(client);
     if (auto opCtx = currentClient->_opCtx)
-        if (auto timer = OperationCPUTimer::get(opCtx))
-            timer->onThreadAttach();
+        if (auto timers = OperationCPUTimers::get(opCtx))
+            timers->onThreadAttach();
 }
 
 /**
@@ -186,16 +188,16 @@ ThreadClient::ThreadClient(ServiceContext* serviceContext)
 
 ThreadClient::ThreadClient(StringData desc,
                            ServiceContext* serviceContext,
-                           transport::SessionHandle session) {
+                           std::shared_ptr<transport::Session> session) {
     invariantNoCurrentClient();
-    _originalThreadName = ThreadName::get(ThreadContext::get());
+    _originalThreadName = getThreadNameRef();
     Client::initThread(desc, serviceContext, std::move(session));
 }
 
 ThreadClient::~ThreadClient() {
     invariant(currentClient);
     currentClient.reset(nullptr);
-    ThreadName::set(ThreadContext::get(), _originalThreadName);
+    setThreadNameRef(std::move(_originalThreadName));
 }
 
 Client* ThreadClient::get() const {

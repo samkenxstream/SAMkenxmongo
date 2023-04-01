@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -43,6 +42,9 @@
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace {
 
@@ -319,7 +321,8 @@ public:
     DBClientConnectionForTest(int numInitFailures) : _initFailuresLeft(numInitFailures) {}
 
     std::unique_ptr<DBClientCursor> find(FindCommandRequest findRequest,
-                                         const ReadPreferenceSetting& readPref) override {
+                                         const ReadPreferenceSetting& readPref,
+                                         ExhaustMode exhaustMode) override {
         if (_initFailuresLeft > 0) {
             _initFailuresLeft--;
             LOGV2(21657,
@@ -344,7 +347,9 @@ private:
 void checkRemoteIterator(int numNetworkFailures, bool expectedToSucceed) {
 
     DBClientConnectionForTest conn(numNetworkFailures);
-    auto getConnection = [&]() -> DBClientBase* { return &conn; };
+    auto getConnection = [&]() -> DBClientBase* {
+        return &conn;
+    };
 
     auto localOperation = makeOpAndRecordId(1);
     OplogInterfaceRemote remoteOplogMock(

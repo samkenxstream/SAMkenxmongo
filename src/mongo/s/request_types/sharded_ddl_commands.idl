@@ -26,22 +26,26 @@
 # it in the license file.
 #
 
+# Contains internal DDL commands which are exchanged between Router and Shard/ConfigServer role and are linked both on MongoD and MongoS
+
 global:
     cpp_namespace: "mongo"
     cpp_includes:
         - "mongo/s/catalog/type_collection.h"
+        - "mongo/s/shard_version.h"
 
 imports:
     - "mongo/db/commands/rename_collection.idl"
     - "mongo/db/commands/set_user_write_block_mode.idl"
+    - "mongo/db/drop_indexes.idl"
     - "mongo/db/drop_database.idl"
     - "mongo/db/keypattern.idl"
     - "mongo/db/coll_mod.idl"
-    - "mongo/idl/basic_types.idl"
-    - "mongo/s/chunk_version.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/s/sharding_types.idl"
     - "mongo/s/resharding/common_types.idl"
     - "mongo/db/timeseries/timeseries.idl"
+    - "mongo/db/query/cursor_response.idl"
 
 types:
     CollectionType:
@@ -70,6 +74,7 @@ structs:
     ConfigsvrCreateDatabaseResponse:
         description: "Response for the create database command"
         strict: false
+        is_command_reply: true
         fields:
             databaseVersion:
                 type: database_version
@@ -105,18 +110,16 @@ structs:
     RenameCollectionResponse:
         description: "Response for the rename collection command"
         strict: false
+        is_command_reply: true
         fields:
             collectionVersion:
-                type: ChunkVersionArrayWronglyEncodedAsBSONObjFormat
+                type: shard_version
                 description: "Latest version of the collection"
                 optional: false
 
     CreateCollectionRequest:
         description: "All the parameters sent by the router."
         generate_comparison_operators: false
-        # TODO SERVER-64720 remove the following comment
-        # WARN if you add any new field to this request you must also include it in
-        # CreateCollectionCoordinatorDocumentPre60Compatible::kPre60IncompatibleFields
         strict: false
         fields:
             shardKey:
@@ -138,12 +141,6 @@ structs:
                 description: >-
                     True if the chunks should be pre-split based on the existing zones when
                     sharding a collection with hashed shard key.
-                optional: true
-            initialSplitPoints:
-                type: array<object_owned>
-                description: >-
-                    A specific set of points to create initial splits at, currently used only by
-                    mapReduce.
                 optional: true
             timeseries:
                 description: "The options to create the time-series collection with."
@@ -170,13 +167,14 @@ structs:
     CreateCollectionResponse:
         description: "Response of the create collection command"
         strict: false
+        is_command_reply: true
         fields:
             collectionUUID:
                 type: uuid
                 description: "UUID of the created collection"
                 optional: true
             collectionVersion:
-                type: ChunkVersionArrayWronglyEncodedAsBSONObjFormat
+                type: shard_version
                 description: "Latest version of the collection"
                 optional: false
 
@@ -192,6 +190,12 @@ structs:
                 type: uuid
                 description: "The expected UUID of the collection."
                 optional: true
+            enforceUniquenessCheck:
+                description: >-
+                    Controls whether this command verifies that any unique indexes are prefixed by
+                    the shard key pattern if unique is true. If true then it will verify and if
+                    false then it won't.
+                type: optionalBool
 
     ReshardCollectionRequest:
         description: "Parameters for the reshard collection command"
@@ -239,24 +243,6 @@ structs:
 
 commands:
 
-    clusterCreateDatabase:
-        description: "The public enableSharding command on mongos."
-        command_name: enableSharding
-        command_alias: enablesharding
-        cpp_name: ClusterCreateDatabase
-        strict: false
-        namespace: type
-        type: string
-        api_version: ""
-        reply_type: OkReply
-        fields:
-            primaryShard:
-                type: shard_id
-                description: "If set, indicates to the system which shard should be used as the
-                              primary for the database (if not already created). Otherwise, the
-                              system will use the balancer in order to select a primary."
-                optional: true
-    
     _shardsvrCreateCollection:
         command_name: _shardsvrCreateCollection
         cpp_name: ShardsvrCreateCollection
@@ -288,6 +274,26 @@ commands:
             idIndex:
                 type: object
                 description: "Id index."
+
+    _shardsvrCreateGlobalIndex:
+        description: "Internal command sent to participant shards to create a global index container with a given UUID."
+        command_name: _shardsvrCreateGlobalIndex
+        cpp_name: CreateGlobalIndex
+        strict: true
+        type: uuid
+        namespace: type
+        api_version: ""
+        reply_type: OkReply
+
+    _shardsvrDropGlobalIndex:
+        description: "Internal command sent to participant shards to drop a global index container with a given UUID."
+        command_name: _shardsvrDropGlobalIndex
+        cpp_name: DropGlobalIndex
+        strict: true
+        type: uuid
+        namespace: type
+        api_version: ""
+        reply_type: OkReply
 
     _shardsvrDropDatabase:
         description: "Internal command sent to the primary shard of a database to drop it."
@@ -324,6 +330,11 @@ commands:
         api_version: ""
         cpp_name: ShardsvrDropCollectionParticipant
         strict: false
+        fields:
+            fromMigrate: 
+                type: bool 
+                description: "Whether the drop comes as a result of an interrupted migration process."
+                optional: true
 
     _shardsvrRenameCollection:
         command_name: _shardsvrRenameCollection
@@ -334,6 +345,12 @@ commands:
         api_version: ""
         chained_structs:
             RenameCollectionRequest: RenameCollectionRequest
+        fields:
+            allowEncryptedCollectionRename:
+                description: "Encrypted Collection renames are usually disallowed to minimize user error.
+                              C2C needs to do the renames to replicate create collection."
+                type: bool
+                optional: true
 
     _shardsvrSetAllowMigrations:
         command_name: _shardsvrSetAllowMigrations
@@ -379,8 +396,59 @@ commands:
         namespace: concatenate_with_db
         api_version: ""
         strict: false
-        chained_structs: 
+        chained_structs:
             RefineCollectionShardKeyRequest: RefineCollectionShardKeyRequest
+    
+    _shardsvrValidateShardKeyCandidate:
+        description: "Command run on shards to ensure we have a viable key to refine the shard key."
+        command_name: _shardsvrValidateShardKeyCandidate
+        cpp_name: ShardsvrValidateShardKeyCandidate
+        strict: false
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        fields:
+            key:
+                type: KeyPattern
+                description: "The index specification document to use as the new shard key."
+                optional: false
+            enforceUniquenessCheck:
+                description: >-
+                    Verifies that the shard key index has the same unique setting as the command.
+                type: optionalBool
+
+    _configsvrRefineCollectionShardKey:
+        command_name: _configsvrRefineCollectionShardKey
+        cpp_name: ConfigsvrRefineCollectionShardKey
+        description: "The internal refineCollectionShardKey command on the config server"
+        strict: false
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        fields:
+            key:
+                type: object
+                description: "The index specification document to use as the new shard key."
+                optional: false
+            epoch:
+                type: objectid
+                description: "The expected epoch of the namespace provided to
+                              refineCollectionShardKey."
+                optional: false
+            enforceUniquenessCheck:
+                description: >-
+                    Verifies that the shard key index has the same unique setting as the command.
+                type: optionalBool
+
+    _shardsvrDropIndexes:
+        description: "Parser for the _shardsvrDropIndexes command"
+        command_name: _shardsvrDropIndexes
+        cpp_name: ShardsvrDropIndexes
+        namespace: concatenate_with_db
+        api_version: ""
+        strict: false
+        chained_structs:
+            DropIndexesRequest: DropIndexesRequest
 
     _configsvrCreateDatabase:
         description: "The internal createDatabase command on the config server"
@@ -397,12 +465,6 @@ commands:
                 description: "If set, indicates to the system which shard should be used as the
                               primary for the database (if not already created). Otherwise, the
                               system will use the balancer in order to select a primary."
-                optional: true
-            # TODO SERVER-63983: remove the following field when 6.0 becomes lastLTS
-            enableSharding:
-                type: bool
-                description: "May only be set to 'true'. If set, indicates to the config server that
-                              it must turn on the 'enableSharding' bit for that database."
                 optional: true
 
     _shardsvrCollMod:
@@ -440,13 +502,106 @@ commands:
                 description: "Determines the phase of the blocking/unblocking procedure to be
                               executed."
 
+    _shardsvrSetClusterParameter:
+        command_name: _shardsvrSetClusterParameter
+        cpp_name: ShardsvrSetClusterParameter
+        description: "internal _shardsvrSetClusterParameter command"
+        namespace: type
+        type: object
+        api_version: ""
+        strict: false
+        fields:
+            clusterParameterTime:
+                type: timestamp
+                description: "Time that will be associated with the cluster parameter"
+
+    _shardsvrCheckMetadataConsistency:
+        description: "Internal command sent to the primary shard of a database to check metadata 
+                      consistency."
+        command_name: _shardsvrCheckMetadataConsistency
+        cpp_name: ShardsvrCheckMetadataConsistency
+        namespace: concatenate_with_db
+        allow_global_collection_name: true
+        api_version: ""
+        reply_type: CursorInitialReply
+        strict: false
+        fields:
+            cursor:
+                type: SimpleCursorOptions
+                optional: true
+
+    _shardsvrCheckMetadataConsistencyParticipant:
+        description: "Internal command sent to participants shards to check metadata consistency."
+        command_name: _shardsvrCheckMetadataConsistencyParticipant
+        cpp_name: ShardsvrCheckMetadataConsistencyParticipant
+        namespace: concatenate_with_db
+        allow_global_collection_name: true
+        api_version: ""
+        reply_type: CursorInitialReply
+        strict: false
+        fields:
+            cursor:
+                type: SimpleCursorOptions
+                optional: true
+            primaryShardId:
+                description: "The shard id of the db primary shard"
+                type: shard_id
+
+    _configsvrCheckClusterMetadataConsistency:
+          description: "Internal command sent to the config server to check cluster metadata 
+                        consistency."
+          command_name: _configsvrCheckClusterMetadataConsistency
+          cpp_name: ConfigsvrCheckClusterMetadataConsistency
+          namespace: ignored
+          api_version: ""
+          reply_type: CursorInitialReply
+          strict: false
+          fields:
+              cursor:
+                  type: SimpleCursorOptions
+                  optional: true
+                  
+    _configsvrCheckMetadataConsistency:
+         description: "Internal command sent to the config server to check metadata consistency."
+         command_name: _configsvrCheckMetadataConsistency
+         cpp_name: ConfigsvrCheckMetadataConsistency
+         namespace: concatenate_with_db
+         allow_global_collection_name: true
+         api_version: ""
+         reply_type: CursorInitialReply
+         strict: false
+         fields:
+             cursor:
+                 type: SimpleCursorOptions
+                 optional: true
+
     _configsvrSetClusterParameter:
         command_name: _configsvrSetClusterParameter
         cpp_name: ConfigsvrSetClusterParameter
         description: "Internal command sent to the config server to start a coordinator and set the
                       cluster parameter."
-        # TODO SERVER-63870: use replica set command parameters.
         namespace: type
         type: object_owned
         api_version: ""
         strict: false
+
+    _configsvrClearJumboFlag:
+        command_name: _configsvrClearJumboFlag
+        cpp_name: ConfigsvrClearJumboFlag
+        description: "internal clearJumboFlag command for config server"
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        strict: false
+        fields:
+            epoch:
+                type: objectid
+                description: "The expected epoch of the namespace provided to
+                              clearJumboFlag."
+                optional: false
+            minKey:
+                type: object
+                description: "The lower bound key value of the chunk."
+            maxKey:
+                type: object
+                description: "The upper bound key value of the chunk."

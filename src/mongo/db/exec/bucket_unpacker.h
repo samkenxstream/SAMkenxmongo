@@ -37,6 +37,7 @@
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
 
 namespace mongo {
 /**
@@ -53,13 +54,21 @@ namespace mongo {
  */
 class BucketSpec {
 public:
+    // When unpacking buckets with kInclude we must produce measurements that contain the
+    // set of fields. Otherwise, if the kExclude option is used, the measurements will include the
+    // set difference between all fields in the bucket and the provided fields.
+    enum class Behavior { kInclude, kExclude };
+
     BucketSpec() = default;
     BucketSpec(const std::string& timeField,
                const boost::optional<std::string>& metaField,
                const std::set<std::string>& fields = {},
-               const std::set<std::string>& computedProjections = {});
+               Behavior behavior = Behavior::kExclude,
+               const std::set<std::string>& computedProjections = {},
+               bool usesExtendedRange = false);
     BucketSpec(const BucketSpec&);
     BucketSpec(BucketSpec&&);
+    BucketSpec(const TimeseriesOptions& tsOptions);
 
     BucketSpec& operator=(const BucketSpec&);
 
@@ -91,6 +100,14 @@ public:
         return _fieldSet;
     }
 
+    void setBehavior(Behavior behavior) {
+        _behavior = behavior;
+    }
+
+    Behavior behavior() const {
+        return _behavior;
+    }
+
     void addComputedMetaProjFields(const StringData& field) {
         _computedMetaProjFields.emplace(field);
     }
@@ -101,6 +118,14 @@ public:
 
     void eraseFromComputedMetaProjFields(const std::string& field) {
         _computedMetaProjFields.erase(field);
+    }
+
+    void setUsesExtendedRange(bool usesExtendedRange) {
+        _usesExtendedRange = usesExtendedRange;
+    }
+
+    bool usesExtendedRange() const {
+        return _usesExtendedRange;
     }
 
     // Returns whether 'field' depends on a pushed down $addFields or computed $project.
@@ -117,14 +142,29 @@ public:
         kError,
     };
 
+    struct BucketPredicate {
+        // A loose predicate is a predicate which returns true when any measures of a bucket
+        // matches.
+        std::unique_ptr<MatchExpression> loosePredicate;
+
+        // A tight predicate is a predicate which returns true when all measures of a bucket
+        // matches.
+        std::unique_ptr<MatchExpression> tightPredicate;
+    };
+
     /**
      * Takes a predicate after $_internalUnpackBucket on a bucketed field as an argument and
-     * attempts to map it to a new predicate on the 'control' field. For example, the predicate
-     * {a: {$gt: 5}} will generate the predicate {control.max.a: {$_internalExprGt: 5}}, which will
-     * be added before the $_internalUnpackBucket stage.
+     * attempts to map it to new predicates on the 'control' field. There will be a 'loose'
+     * predicate that will match if some of the event field matches, also a 'tight' predicate that
+     * will match if all of the event field matches. For example, the event level predicate {a:
+     * {$gt: 5}} will generate the loose predicate {control.max.a: {$_internalExprGt: 5}}, and the
+     * tight predicate {control.min.a: {$_internalExprGt: 5}}. The loose predicate will be added
+     * before the
+     * $_internalUnpackBucket stage to filter out buckets with no match. The tight predicate will
+     * be used to evaluate predicate on bucket level to avoid unnecessary event level evaluation.
      *
-     * If the original predicate is on the bucket's timeField we may also create a new predicate
-     * on the '_id' field to assist in index utilization. For example, the predicate
+     * If the original predicate is on the bucket's timeField we may also create a new loose
+     * predicate on the '_id' field to assist in index utilization. For example, the predicate
      * {time: {$lt: new Date(...)}} will generate the following predicate:
      * {$and: [
      *      {_id: {$lt: ObjectId(...)}},
@@ -137,7 +177,7 @@ public:
      * When using IneligiblePredicatePolicy::kIgnore, if the predicate can't be pushed down, it
      * returns null. When using IneligiblePredicatePolicy::kError it raises a user error.
      */
-    static std::unique_ptr<MatchExpression> createPredicatesOnBucketLevelField(
+    static BucketPredicate createPredicatesOnBucketLevelField(
         const MatchExpression* matchExpr,
         const BucketSpec& bucketSpec,
         int bucketMaxSpanSeconds,
@@ -166,8 +206,11 @@ public:
      *
      * When using IneligiblePredicatePolicy::kIgnore, if the predicate can't be pushed down, it
      * returns null. When using IneligiblePredicatePolicy::kError it raises a user error.
+     *
+     * Returns a boolean (alongside the bucket-level predicate) describing if the result contains
+     * a metric predicate.
      */
-    static BSONObj pushdownPredicate(
+    static std::pair<bool, BSONObj> pushdownPredicate(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const TimeseriesOptions& tsOptions,
         ExpressionContext::CollationMatchesDefault collationMatchesDefault,
@@ -183,6 +226,7 @@ public:
 private:
     // The set of field names in the data region that should be included or excluded.
     std::set<std::string> _fieldSet;
+    Behavior _behavior = Behavior::kExclude;
 
     // Set of computed meta field projection names. Added at the end of materialized
     // measurements.
@@ -193,6 +237,7 @@ private:
 
     boost::optional<std::string> _metaField = boost::none;
     boost::optional<HashedFieldName> _metaFieldHashed = boost::none;
+    bool _usesExtendedRange = false;
 };
 
 /**
@@ -200,10 +245,6 @@ private:
  */
 class BucketUnpacker {
 public:
-    // When BucketUnpacker is created with kInclude it must produce measurements that contain the
-    // set of fields. Otherwise, if the kExclude option is used, the measurements will include the
-    // set difference between all fields in the bucket and the provided fields.
-    enum class Behavior { kInclude, kExclude };
     /**
      * Returns the number of measurements in the bucket in O(1) time.
      */
@@ -213,7 +254,7 @@ public:
     static const std::set<StringData> reservedBucketFieldNames;
 
     BucketUnpacker();
-    BucketUnpacker(BucketSpec spec, Behavior unpackerBehavior);
+    BucketUnpacker(BucketSpec spec);
     BucketUnpacker(const BucketUnpacker& other) = delete;
     BucketUnpacker(BucketUnpacker&& other);
     ~BucketUnpacker();
@@ -225,6 +266,11 @@ public:
      * precondition of this method is that 'hasNext()' must be true.
      */
     Document getNext();
+
+    /**
+     * Similar to the previous method, but return a BSON object instead.
+     */
+    BSONObj getNextBson();
 
     /**
      * This method will extract the j-th measurement from the bucket. A precondition of this method
@@ -245,7 +291,6 @@ public:
      */
     BucketUnpacker copy() const {
         BucketUnpacker unpackerCopy;
-        unpackerCopy._unpackerBehavior = _unpackerBehavior;
         unpackerCopy._spec = _spec;
         unpackerCopy._includeMetaField = _includeMetaField;
         unpackerCopy._includeTimeField = _includeTimeField;
@@ -255,10 +300,10 @@ public:
     /**
      * This resets the unpacker to prepare to unpack a new bucket described by the given document.
      */
-    void reset(BSONObj&& bucket);
+    void reset(BSONObj&& bucket, bool bucketMatchedQuery = false);
 
-    Behavior behavior() const {
-        return _unpackerBehavior;
+    BucketSpec::Behavior behavior() const {
+        return _spec.behavior();
     }
 
     const BucketSpec& bucketSpec() const {
@@ -267,6 +312,10 @@ public:
 
     const BSONObj& bucket() const {
         return _bucket;
+    }
+
+    bool bucketMatchedQuery() const {
+        return _bucketMatchedQuery;
     }
 
     bool includeMetaField() const {
@@ -289,7 +338,27 @@ public:
         return _includeMaxTimeAsMetadata;
     }
 
-    void setBucketSpecAndBehavior(BucketSpec&& bucketSpec, Behavior behavior);
+    const std::string& getTimeField() const {
+        return _spec.timeField();
+    }
+
+    const boost::optional<std::string>& getMetaField() const {
+        return _spec.metaField();
+    }
+
+    std::string getMinField(StringData field) const {
+        return std::string{timeseries::kControlMinFieldNamePrefix} + field;
+    }
+
+    std::string getMaxField(StringData field) const {
+        return std::string{timeseries::kControlMaxFieldNamePrefix} + field;
+    }
+
+    bool isClosedBucket() const {
+        return _closedBucket;
+    }
+
+    void setBucketSpec(BucketSpec&& bucketSpec);
     void setIncludeMinTimeAsMetadata();
     void setIncludeMaxTimeAsMetadata();
 
@@ -314,11 +383,13 @@ private:
     void eraseExcludedComputedMetaProjFields();
 
     BucketSpec _spec;
-    Behavior _unpackerBehavior;
 
     std::unique_ptr<UnpackingImpl> _unpackingImpl;
 
     bool _hasNext = false;
+
+    // A flag used to mark that the entire bucket matches the following $match predicate.
+    bool _bucketMatchedQuery = false;
 
     // A flag used to mark that the timestamp value should be materialized in measurements.
     bool _includeTimeField{false};
@@ -340,6 +411,8 @@ private:
     // measurement.
     Value _metaValue;
 
+    BSONElement _metaBSONElem;
+
     // Since the bucket min time is the same across all materialized measurements, we can cache the
     // value in the reset phase and use it to materialize as a metadata field in each measurement
     // if required by the pipeline.
@@ -349,6 +422,10 @@ private:
     // value in the reset phase and use it to materialize as a metadata field in each measurement
     // if required by the pipeline.
     boost::optional<Date_t> _maxTime;
+
+    // Flag indicating whether this bucket is closed, as determined by the presence of the
+    // 'control.closed' field.
+    bool _closedBucket;
 
     // Map <name, BSONElement> for the computed meta field projections. Updated for
     // every bucket upon reset().
@@ -366,9 +443,9 @@ private:
  * Determines if an arbitrary field should be included in the materialized measurements.
  */
 inline bool determineIncludeField(StringData fieldName,
-                                  BucketUnpacker::Behavior unpackerBehavior,
+                                  BucketSpec::Behavior unpackerBehavior,
                                   const std::set<std::string>& unpackFieldsToIncludeExclude) {
-    const bool isInclude = unpackerBehavior == BucketUnpacker::Behavior::kInclude;
+    const bool isInclude = unpackerBehavior == BucketSpec::Behavior::kInclude;
     const bool unpackFieldsContains = unpackFieldsToIncludeExclude.find(fieldName.toString()) !=
         unpackFieldsToIncludeExclude.cend();
     return isInclude == unpackFieldsContains;

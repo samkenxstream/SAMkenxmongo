@@ -1,40 +1,38 @@
 /*
  * Test that tenant access blockers are installed and prevent writes during shard split
  *
- * @tags: [requires_fcv_52, featureFlagShardSplit, serverless]
+ * @tags: [requires_fcv_63, serverless]
  */
+
+import {
+    assertMigrationState,
+    findSplitOperation,
+    ShardSplitTest
+} from "jstests/serverless/libs/shard_split_test.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load('jstests/libs/parallel_shell_helpers.js');
-load("jstests/serverless/libs/basic_serverless_test.js");
-
-(function() {
-"use strict";
 
 jsTestLog("Starting runBlocking");
 
 // Skip db hash check because secondary is left with a different config.
 TestData.skipCheckDBHashes = true;
 
-const test = new BasicServerlessTest({
-    recipientTagName: "recipientNode",
-    recipientSetName: "recipient",
-    quickGarbageCollection: true
-});
+const test = new ShardSplitTest({quickGarbageCollection: true});
 test.addRecipientNodes();
 
 const donorPrimary = test.donor.getPrimary();
-const migrationId = UUID();
-const tenantIds = ["tenant1", "tenant2"];
+const tenantIds = [ObjectId(), ObjectId()];
 
 jsTestLog("Asserting no state document exist before command");
-assert.isnull(findMigration(donorPrimary, migrationId));
+const operation = test.createSplitOperation(tenantIds);
+assert.isnull(findSplitOperation(donorPrimary, operation.migrationId));
 
 jsTestLog("Asserting we can write before the migration");
 tenantIds.forEach(id => {
-    const tenantDB = donorPrimary.getDB(`${id}_data`);
-    const insertedObj = {name: `${id}_1`, payload: "testing_data"};
+    const tenantDB = donorPrimary.getDB(`${id.str}_data`);
+    const insertedObj = {name: `${id.str}_1`, payload: "testing_data"};
     assert.commandWorked(
         tenantDB.runCommand({insert: "testing_collection", documents: [insertedObj]}));
 });
@@ -44,16 +42,12 @@ const adminDb = donorPrimary.getDB("admin");
 const blockingFailPoint = configureFailPoint(adminDb, "pauseShardSplitAfterBlocking");
 
 jsTestLog("Running commitShardSplit command");
-const awaitCommand = startParallelShell(
-    funWithArgs(function(migrationId, recipientTagName, recipientSetName, tenantIds) {
-        assert.commandWorked(db.adminCommand(
-            {commitShardSplit: 1, migrationId, recipientTagName, recipientSetName, tenantIds}));
-    }, migrationId, test.recipientTagName, test.recipientSetName, tenantIds), donorPrimary.port);
+const runThread = operation.commitAsync();
 
 blockingFailPoint.wait();
 
 jsTestLog("Asserting state document is in blocking state");
-assertMigrationState(donorPrimary, migrationId, "blocking");
+assertMigrationState(donorPrimary, operation.migrationId, "blocking");
 
 jsTestLog("Asserting we cannot write in blocking state");
 let writeThreads = [];
@@ -65,7 +59,7 @@ tenantIds.forEach((id, index) => {
         const insertedObj = {name: `${id}_2`, payload: "testing_data2"};
         const res = tenantDB.runCommand({insert: "testing_collection", documents: [insertedObj]});
         jsTestLog("Get response for write command: " + tojson(res));
-    }, donorPrimary.host, id);
+    }, donorPrimary.host, id.str);
     writeThreads[index].start();
 });
 // Poll the numBlockedWrites of tenant migration access blocker from donor and expect it's
@@ -74,7 +68,7 @@ assert.soon(function() {
     return tenantIds.every(id => {
         const mtab = donorPrimary.getDB('admin')
                          .adminCommand({serverStatus: 1})
-                         .tenantMigrationAccessBlocker[id]
+                         .tenantMigrationAccessBlocker[id.str]
                          .donor;
         return mtab.numBlockedWrites > 0;
     });
@@ -82,16 +76,17 @@ assert.soon(function() {
 
 jsTestLog("Disabling failpoints and waiting for command to complete");
 blockingFailPoint.off();
-awaitCommand();
+
+runThread.join();
+const data = runThread.returnData();
+assert(data["ok"] == 1);
 
 writeThreads.forEach(thread => thread.join());
 
 jsTestLog("Asserting state document exist after command");
-assertMigrationState(donorPrimary, migrationId, "committed");
+assertMigrationState(donorPrimary, operation.migrationId, "committed");
 
-test.removeRecipientNodesFromDonor();
+operation.forget();
 
-test.forgetShardSplit(migrationId);
-test.waitForGarbageCollection(migrationId, tenantIds);
+test.waitForGarbageCollection(operation.migrationId, tenantIds);
 test.stop();
-})();

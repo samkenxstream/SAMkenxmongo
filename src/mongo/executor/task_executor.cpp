@@ -222,8 +222,6 @@ ExecutorFuture<void> TaskExecutor::sleepUntil(Date_t when, const CancellationTok
         alarmState->signal(scheduleStatus);
     }
 
-    // TODO (SERVER-51285): Optimize to avoid an additional call to schedule to run the callback
-    // chained by the caller of sleepUntil.
     return std::move(future).thenRunOn(shared_from_this());
 }
 
@@ -295,11 +293,12 @@ StatusWith<TaskExecutor::CallbackHandle> TaskExecutor::scheduleRemoteCommand(
     const RemoteCommandRequest& request,
     const RemoteCommandCallbackFn& cb,
     const BatonHandle& baton) {
-    return scheduleRemoteCommandOnAny(request,
-                                      [cb](const RemoteCommandOnAnyCallbackArgs& args) {
-                                          cb({args, 0});
-                                      },
-                                      baton);
+    return scheduleRemoteCommandOnAny(
+        request,
+        [cb](const RemoteCommandOnAnyCallbackArgs& args) {
+            cb({args, 0});
+        },
+        baton);
 }
 
 ExecutorFuture<TaskExecutor::ResponseStatus> TaskExecutor::scheduleRemoteCommand(
@@ -332,11 +331,12 @@ StatusWith<TaskExecutor::CallbackHandle> TaskExecutor::scheduleExhaustRemoteComm
     const RemoteCommandRequest& request,
     const RemoteCommandCallbackFn& cb,
     const BatonHandle& baton) {
-    return scheduleExhaustRemoteCommandOnAny(request,
-                                             [cb](const RemoteCommandOnAnyCallbackArgs& args) {
-                                                 cb({args, 0});
-                                             },
-                                             baton);
+    return scheduleExhaustRemoteCommandOnAny(
+        request,
+        [cb](const RemoteCommandOnAnyCallbackArgs& args) {
+            cb({args, 0});
+        },
+        baton);
 }
 
 ExecutorFuture<TaskExecutor::ResponseStatus> TaskExecutor::scheduleExhaustRemoteCommand(

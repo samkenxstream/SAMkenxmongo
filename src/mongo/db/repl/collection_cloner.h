@@ -52,7 +52,7 @@ public:
         static constexpr StringData kDocumentsToCopyFieldName = "documentsToCopy"_sd;
         static constexpr StringData kDocumentsCopiedFieldName = "documentsCopied"_sd;
 
-        std::string ns;
+        NamespaceString nss;
         Date_t start;
         Date_t end;
         size_t documentToCopy{0};
@@ -207,10 +207,10 @@ private:
     AfterStageBehavior setupIndexBuildersForUnfinishedIndexesStage();
 
     /**
-     * Put all results from a query batch into a buffer to be inserted, and schedule
-     * it to be inserted.
+     * Put all results from a query batch into a buffer to be inserted, and schedule it to be
+     * inserted.
      */
-    void handleNextBatch(DBClientCursorBatchIterator& iter);
+    void handleNextBatch(DBClientCursor& cursor);
 
     /**
      * Called whenever there is a new batch of documents ready from the DBClientConnection.

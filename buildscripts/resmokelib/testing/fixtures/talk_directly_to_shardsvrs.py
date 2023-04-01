@@ -9,16 +9,16 @@ import buildscripts.resmokelib.testing.fixtures.interface as interface
 from buildscripts.resmokelib.testing.fixtures.fixturelib import FixtureLib
 
 
-class TalkDirectlyToShardsvrsFixture(interface.MultiClusterFixture):  # pylint: disable=too-many-instance-attributes
+class TalkDirectlyToShardsvrsFixture(interface.MultiClusterFixture):
     """Fixture which provides JSTests with a set of shardsvrs and a config svr set to run against."""
 
-    def __init__(  # pylint: disable=too-many-arguments,too-many-locals
-            self, logger, job_num, fixturelib, common_mongod_options=None, dbpath_prefix=None,
-            preserve_dbpath=False, num_replica_sets=1, num_nodes_per_replica_set=3,
-            start_initial_sync_node=False, write_concern_majority_journal_default=None,
-            auth_options=None, replset_config_options=None, voting_secondaries=True,
-            all_nodes_electable=False, use_replica_set_connection_string=None, linear_chain=False,
-            mixed_bin_versions=None, default_read_concern=None, default_write_concern=None):
+    def __init__(self, logger, job_num, fixturelib, common_mongod_options=None, dbpath_prefix=None,
+                 preserve_dbpath=False, num_replica_sets=1, num_nodes_per_replica_set=3,
+                 start_initial_sync_node=False, write_concern_majority_journal_default=None,
+                 auth_options=None, replset_config_options=None, voting_secondaries=True,
+                 all_nodes_electable=False, use_replica_set_connection_string=None,
+                 linear_chain=False, mixed_bin_versions=None, default_read_concern=None,
+                 default_write_concern=None):
         """Initialize TalkDirectlyToShardsvrsFixture with different options for the replica set processes."""
 
         interface.MultiClusterFixture.__init__(self, logger, job_num, fixturelib,
@@ -81,7 +81,7 @@ class TalkDirectlyToShardsvrsFixture(interface.MultiClusterFixture):  # pylint: 
                 mongod_options = self.common_mongod_options.copy()
                 mongod_options["shardsvr"] = ""
                 mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, rs_name)
-                mongod_options["replSet"] = rs_name
+                mongod_options["serverless"] = True
 
                 self.replica_sets.append(
                     self.fixturelib.make_fixture(
@@ -138,8 +138,7 @@ class TalkDirectlyToShardsvrsFixture(interface.MultiClusterFixture):  # pylint: 
             self.logger.info("Adding %s as a shard...", connection_string)
 
             config_primary = self.configsvr.get_primary()
-            config_primary_client = interface.authenticate(config_primary.mongo_client(),
-                                                           self.auth_options)
+            config_primary_client = interface.build_client(config_primary, self.auth_options)
 
             try:
                 config_primary_client.admin.command(

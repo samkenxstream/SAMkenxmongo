@@ -30,7 +30,9 @@
 #pragma once
 
 #include "mongo/config.h"
+#include "mongo/db/exec/field_name_bloom_filter.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/expressions/runtime_environment.h"
 #include "mongo/db/exec/sbe/stages/collection_helpers.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
 #include "mongo/db/exec/sbe/values/bson.h"
@@ -38,7 +40,7 @@
 
 namespace mongo {
 namespace sbe {
-using ScanOpenCallback = std::function<void(OperationContext*, const CollectionPtr&, bool)>;
+using ScanOpenCallback = std::function<void(OperationContext*, const CollectionPtr&)>;
 
 struct ScanCallbacks {
     ScanCallbacks(IndexKeyCorruptionCheckCallback indexKeyCorruptionCheck = {},
@@ -108,7 +110,9 @@ public:
               PlanYieldPolicy* yieldPolicy,
               PlanNodeId nodeId,
               ScanCallbacks scanCallbacks,
-              bool useRandomCursor = false);
+              bool lowPriority = false,
+              bool useRandomCursor = false,
+              bool participateInTrialRunTracking = true);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -135,6 +139,22 @@ protected:
 private:
     // Returns the primary cursor or the random cursor depending on whether _useRandomCursor is set.
     RecordCursor* getActiveCursor() const;
+
+    static size_t computeFieldMaskOffset(const char* name, size_t length) {
+        return static_cast<unsigned char>(name[length / 2]) & 63u;
+    }
+
+    static uint64_t computeFieldMask(size_t offset) {
+        return uint64_t{1} << offset;
+    }
+
+    static uint64_t computeFieldMask(const char* name, size_t length) {
+        return uint64_t{1} << computeFieldMaskOffset(name, length);
+    }
+
+    void initKey();
+
+    value::OwnedValueAccessor* getFieldAccessor(StringData name, size_t offset) const;
 
     const UUID _collUuid;
     const boost::optional<value::SlotId> _recordSlot;
@@ -170,14 +190,36 @@ private:
     value::SlotAccessor* _indexIdAccessor{nullptr};
     value::SlotAccessor* _indexKeyAccessor{nullptr};
     value::SlotAccessor* _indexKeyPatternAccessor{nullptr};
+
+    // If this ScanStage was constructed with _oplogTsSlot set, then _oplogTsAccessor will point to
+    // an accessor in the RuntimeEnvironment, and value of the "ts" field (if it exists) from each
+    // record scanned will be written to this accessor. The engine uses mechanism to keep track of
+    // the most recent timestamp that has been observed when scanning the oplog collection.
     RuntimeEnvironment::Accessor* _oplogTsAccessor{nullptr};
 
     // Used to return a random sample of the collection.
     const bool _useRandomCursor;
 
-    value::FieldAccessorMap _fieldAccessors;
+    std::vector<value::OwnedValueAccessor> _fieldAccessors;
     value::SlotAccessorMap _varAccessors;
     value::SlotAccessor* _seekKeyAccessor{nullptr};
+
+    // Variant stores pointers to field accessors for all fields with a given bloom filter mask
+    // offset. If there is only one field with a given offset, it is stored as a StringData and
+    // pointer pair, which allows us to just compare strings instead of hash map lookup.
+    using FieldAccessorVariant = stdx::variant<stdx::monostate,
+                                               std::pair<StringData, value::OwnedValueAccessor*>,
+                                               StringMap<value::OwnedValueAccessor*>>;
+
+    // Array contains FieldAccessorVariants, indexed by bloom filter mask offset, determined by
+    // computeFieldMaskOffset function.
+    std::array<FieldAccessorVariant, 64> _maskOffsetToFieldAccessors;
+
+    // _tsFieldAccessor points to the accessor for field "ts". We use _tsFieldAccessor to get at
+    // the accessor quickly rather than having to look it up in the _fieldAccessors hashtable.
+    value::SlotAccessor* _tsFieldAccessor{nullptr};
+
+    FieldNameBloomFilter<computeFieldMask> _fieldsBloomFilter;
 
     RecordId _recordId;
 
@@ -190,6 +232,10 @@ private:
 
     RecordId _key;
     bool _firstGetNext{false};
+
+    // Whether the scan should have low storage admission priority.
+    bool _lowPriority;
+    boost::optional<ScopedAdmissionPriorityForLock> _priority;
 
     ScanStats _specificStats;
 
@@ -227,7 +273,8 @@ public:
                       value::SlotVector vars,
                       PlanYieldPolicy* yieldPolicy,
                       PlanNodeId nodeId,
-                      ScanCallbacks callbacks);
+                      ScanCallbacks callbacks,
+                      bool participateInTrialRunTracking = true);
 
     ParallelScanStage(const std::shared_ptr<ParallelState>& state,
                       const UUID& collectionUuid,
@@ -241,7 +288,8 @@ public:
                       value::SlotVector vars,
                       PlanYieldPolicy* yieldPolicy,
                       PlanNodeId nodeId,
-                      ScanCallbacks callbacks);
+                      ScanCallbacks callbacks,
+                      bool participateInTrialRunTracking = true);
 
     std::unique_ptr<PlanStage> clone() const final;
 

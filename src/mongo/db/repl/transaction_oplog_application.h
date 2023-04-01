@@ -40,21 +40,15 @@ namespace mongo {
  * Apply `commitTransaction` oplog entry.
  */
 Status applyCommitTransaction(OperationContext* opCtx,
-                              const repl::OplogEntry& entry,
+                              const repl::ApplierOperation& op,
                               repl::OplogApplication::Mode mode);
 
 /**
  * Apply `abortTransaction` oplog entry.
  */
 Status applyAbortTransaction(OperationContext* opCtx,
-                             const repl::OplogEntry& entry,
+                             const repl::ApplierOperation& op,
                              repl::OplogApplication::Mode mode);
-
-/**
- * Helper used to get previous oplog entry from the same transaction.
- */
-const repl::OplogEntry getPreviousOplogEntry(OperationContext* opCtx,
-                                             const repl::OplogEntry& entry);
 
 /**
  * Follow an oplog chain and copy the operations to destination.  Operations will be copied in
@@ -85,7 +79,7 @@ std::pair<std::vector<repl::OplogEntry>, bool> _readTransactionOperationsFromOpl
  * Apply `prepareTransaction` oplog entry.
  */
 Status applyPrepareTransaction(OperationContext* opCtx,
-                               const repl::OplogEntry& entry,
+                               const repl::ApplierOperation& op,
                                repl::OplogApplication::Mode mode);
 
 /*

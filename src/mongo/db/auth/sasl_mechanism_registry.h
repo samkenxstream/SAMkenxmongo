@@ -34,6 +34,7 @@
 #include <unordered_map>
 
 #include "mongo/base/string_data.h"
+#include "mongo/db/auth/authentication_metrics.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
@@ -146,6 +147,15 @@ public:
     }
 
     /**
+     * Returns the expiration time, if applicable, of the user's authentication for the given
+     * mechanism. The default of boost::none indicates that the user will be authenticated
+     * indefinitely on the session.
+     */
+    virtual boost::optional<Date_t> getExpirationTime() const {
+        return boost::none;
+    }
+
+    /**
      * Appends mechanism specific info in BSON form. The schema of this BSON will vary by mechanism
      * implementation, thus this info is entirely diagnostic/for records.
      */
@@ -176,6 +186,7 @@ public:
      * and either returns an error, or a response to be sent back.
      */
     StatusWith<std::string> step(OperationContext* opCtx, StringData input) {
+
         auto result = stepImpl(opCtx, input);
         if (result.isOK()) {
             bool isSuccess;
@@ -204,6 +215,16 @@ public:
     virtual Status setOptions(BSONObj options) {
         // Be default, ignore any options provided.
         return Status::OK();
+    }
+
+    virtual boost::optional<unsigned int> currentStep() const = 0;
+    virtual boost::optional<unsigned int> totalSteps() const = 0;
+
+    /**
+     * Create a UserRequest to send to AuthorizationSession.
+     */
+    virtual UserRequest getUserRequest() const {
+        return UserRequest(UserName(getPrincipalName(), getAuthenticationDatabase()), boost::none);
     }
 
 protected:

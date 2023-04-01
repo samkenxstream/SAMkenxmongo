@@ -29,6 +29,7 @@
 
 #include "mongo/db/matcher/implicit_validator.h"
 
+#include "mongo/db/query/stage_types.h"
 #include <algorithm>
 
 #include "mongo/bson/bsonobjbuilder.h"
@@ -46,7 +47,7 @@ namespace {
 
 struct Node {
     std::string name;
-    BSONType type;
+    boost::optional<BSONType> type;
     std::vector<Node> subobjs;
 };
 
@@ -76,10 +77,12 @@ std::unique_ptr<Node> buildTreeFromEncryptedFieldPaths(
                 // the rest of the path forms a new branch; append nodes until the last part
                 for (; i < fieldPath.numParts(); i++) {
                     level->subobjs.push_back(
-                        {fieldPath.getPart(i).toString(), BSONType::Object, std::vector<Node>()});
+                        {fieldPath.getPart(i).toString(), boost::none, std::vector<Node>()});
                     level = &(level->subobjs.back());
                 }
-                level->type = typeFromName(field.getBsonType());
+                if (field.getBsonType().has_value()) {
+                    level->type = typeFromName(field.getBsonType().value());
+                }
             } else {
                 // another field with the same prefix already exists in the tree.
                 // make sure that the nodes in common are not leaves
@@ -142,10 +145,12 @@ std::unique_ptr<MatchExpression> treeToMatchExpression(
         // ]}
         auto andExpr = std::make_unique<AndMatchExpression>(doc_validation_error::createAnnotation(
             expCtx, "_property", BSON("propertyName" << node.name)));
+
         andExpr->add(std::make_unique<InternalSchemaBinDataFLE2EncryptedTypeExpression>(
-            node.name,
-            node.type,
+            StringData(node.name),
+            node.type.has_value() ? MatcherTypeSet(node.type.value()) : MatcherTypeSet(),
             doc_validation_error::createAnnotation(expCtx, "fle2Encrypt", BSONObj())));
+
         return andExpr;
     }
 
@@ -160,7 +165,8 @@ std::unique_ptr<MatchExpression> treeToMatchExpression(
         doc_validation_error::createAnnotation(expCtx, "properties", BSONObj()));
     for (auto& subnode : node.subobjs) {
         auto existsExpr = std::make_unique<ExistsMatchExpression>(
-            subnode.name, doc_validation_error::createAnnotation(expCtx, AnnotationMode::kIgnore));
+            StringData(subnode.name),
+            doc_validation_error::createAnnotation(expCtx, AnnotationMode::kIgnore));
         auto notExpr = std::make_unique<NotMatchExpression>(
             std::move(existsExpr),
             doc_validation_error::createAnnotation(expCtx, AnnotationMode::kIgnore));
@@ -175,7 +181,7 @@ std::unique_ptr<MatchExpression> treeToMatchExpression(
     // if top-level, wrap the "and" expression with an outer "and" annotated with $and.
     if (toplevel) {
         auto outerAndExpr = std::make_unique<AndMatchExpression>(
-            doc_validation_error::createAnnotation(expCtx, "$and", BSONObj()));
+            doc_validation_error::createAnnotation(expCtx, "implicitFLESchema", BSONObj()));
         outerAndExpr->add(std::move(subschema));
         return outerAndExpr;
     }

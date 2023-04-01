@@ -5,10 +5,10 @@
  * The test relies on a correct change stream pre-image recording on a node in the primary role.
  *
  * @tags: [
- * # Change streams are only supported on WiredTiger.
- * requires_wiredtiger,
- * requires_fcv_52,
- * featureFlagChangeStreamPreAndPostImages,
+ * # 6.2 removes support for atomic applyOps
+ * requires_fcv_62,
+ * # The test waits for the Checkpointer, but this process runs only for on-disk storage engines.
+ * requires_persistence,
  * ]
  */
 (function() {
@@ -16,7 +16,6 @@
 load("jstests/core/txns/libs/prepare_helpers.js");  // For PrepareHelpers.prepareTransaction.
 load("jstests/libs/change_stream_util.js");         // For getPreImages().
 load("jstests/libs/fail_point_util.js");
-load("jstests/libs/retryable_writes_util.js");
 load("jstests/libs/transactions_util.js");  // For TransactionsUtil.runInTransaction.
 
 const testName = jsTestName();
@@ -34,9 +33,19 @@ replTest.initiate();
 // Asserts that documents in the pre-images collection on the primary node are the same as on a
 // secondary node.
 function assertPreImagesCollectionOnPrimaryMatchesSecondary() {
-    assert.docEq(getPreImages(replTest.getPrimary()),
-                 getPreImages(replTest.getSecondary()),
-                 "pre-images collection content differs");
+    function detailedError() {
+        return "pre-images collection on primary " + tojson(getPreImages(replTest.getPrimary())) +
+            " does not match pre-images collection on secondary " +
+            tojson(getPreImages(replTest.getSecondary()));
+    }
+    const preImagesCollOnPrimary = getPreImagesCollection(replTest.getPrimary());
+    const preImagesCollOnSecondary = getPreImagesCollection(replTest.getSecondary());
+    assert.eq(preImagesCollOnPrimary.find().itcount(),
+              preImagesCollOnSecondary.find().itcount(),
+              detailedError);
+    assert.eq(preImagesCollOnPrimary.hashAllDocs(),
+              preImagesCollOnSecondary.hashAllDocs(),
+              detailedError);
 }
 
 for (const [collectionName, collectionOptions] of [
@@ -52,30 +61,23 @@ for (const [collectionName, collectionOptions] of [
     const coll = testDB[collectionName];
 
     function issueRetryableFindAndModifyCommands(testDB) {
-        if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(
-                jsTest.options().storageEngine)) {
-            jsTestLog(
-                "Retryable writes are not supported, skipping retryable findAndModify testing");
-            return;
-        }
-
         // Open a new session with retryable writes set to on.
         const session = testDB.getMongo().startSession({retryWrites: true});
         const coll = session.getDatabase(testName)[collectionName];
         assert.commandWorked(coll.insert({_id: 5, v: 1}));
 
         // Issue "findAndModify" command to return a document version before update.
-        assert.docEq(coll.findAndModify({query: {_id: 5}, update: {$inc: {v: 1}}, new: false}),
-                     {_id: 5, v: 1});
+        assert.docEq({_id: 5, v: 1},
+                     coll.findAndModify({query: {_id: 5}, update: {$inc: {v: 1}}, new: false}));
 
         // Issue "findAndModify" command to return a document version after update.
-        assert.docEq(coll.findAndModify({query: {_id: 5}, update: {$inc: {v: 1}}, new: true}),
-                     {_id: 5, v: 3});
+        assert.docEq({_id: 5, v: 3},
+                     coll.findAndModify({query: {_id: 5}, update: {$inc: {v: 1}}, new: true}));
 
         // Issue "findAndModify" command to return a document version before deletion.
         assert.docEq(
-            coll.findAndModify({query: {_id: 5}, new: false, remove: true, writeConcern: {w: 2}}),
-            {_id: 5, v: 3});
+            {_id: 5, v: 3},
+            coll.findAndModify({query: {_id: 5}, new: false, remove: true, writeConcern: {w: 2}}));
     }
 
     function issueWriteCommandsInTransaction(testDB) {
@@ -119,15 +121,14 @@ for (const [collectionName, collectionOptions] of [
         assert.commandWorked(PrepareHelpers.commitTransaction(session, prepareTimestamp));
     }
 
-    function issueNonAtomicApplyOpsCommand(testDB) {
+    function issueApplyOpsCommand(testDB) {
         assert.commandWorked(coll.deleteMany({$and: [{_id: {$gte: 9}}, {_id: {$lte: 10}}]}));
         assert.commandWorked(coll.insert([{_id: 9, a: 1}, {_id: 10, a: 1}]));
         assert.commandWorked(testDB.runCommand({
             applyOps: [
-                {op: "u", ns: coll.getFullName(), o2: {_id: 9}, o: {$set: {a: 2}}},
+                {op: "u", ns: coll.getFullName(), o2: {_id: 9}, o: {$v: 2, diff: {u: {a: 2}}}},
                 {op: "d", ns: coll.getFullName(), o: {_id: 10}}
             ],
-            allowAtomic: false,
         }));
     }
 
@@ -165,7 +166,7 @@ for (const [collectionName, collectionOptions] of [
         replTest.awaitReplication();
         assertPreImagesCollectionOnPrimaryMatchesSecondary();
 
-        issueNonAtomicApplyOpsCommand(testDB);
+        issueApplyOpsCommand(testDB);
 
         // Verify that related change stream pre-images were replicated to the secondary.
         replTest.awaitReplication();
@@ -203,7 +204,7 @@ for (const [collectionName, collectionOptions] of [
         assert.commandWorked(coll.deleteOne({_id: 3}, {writeConcern: {w: 2}}));
 
         issueRetryableFindAndModifyCommands(testDB);
-        issueNonAtomicApplyOpsCommand(testDB);
+        issueApplyOpsCommand(testDB);
         issueWriteCommandsInTransaction(testDB);
 
         // Resume the initial sync process.
@@ -247,7 +248,7 @@ for (const [collectionName, collectionOptions] of [
         assert.commandWorked(coll.deleteOne({_id: 4}, {writeConcern: {w: 2}}));
 
         issueRetryableFindAndModifyCommands(testDB);
-        issueNonAtomicApplyOpsCommand(testDB);
+        issueApplyOpsCommand(testDB);
         issueWriteCommandsInTransaction(testDB);
 
         // Do an unclean shutdown of the primary node, and then restart.

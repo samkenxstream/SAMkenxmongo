@@ -30,11 +30,13 @@
 #pragma once
 
 #include <algorithm>
+#include <boost/optional.hpp>
 #include <string>
 #include <vector>
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/rpc/message.h"
 
@@ -120,13 +122,13 @@ struct OpMsg {
     /**
      * Parses and returns an OpMsg containing unowned BSON.
      */
-    static OpMsg parse(const Message& message);
+    static OpMsg parse(const Message& message, Client* client = nullptr);
 
     /**
      * Parses and returns an OpMsg containing owned BSON.
      */
-    static OpMsg parseOwned(const Message& message) {
-        auto msg = parse(message);
+    static OpMsg parseOwned(const Message& message, Client* client = nullptr) {
+        auto msg = parse(message, client);
         msg.shareOwnershipWith(message.sharedBuffer());
         return msg;
     }
@@ -157,8 +159,16 @@ struct OpMsg {
     }
 
     BSONObj body;
-    BSONObj securityToken;
     std::vector<DocumentSequence> sequences;
+
+    boost::optional<auth::ValidatedTenancyScope> validatedTenancyScope = boost::none;
+
+    boost::optional<TenantId> getValidatedTenantId() const {
+        if (!validatedTenancyScope) {
+            return boost::none;
+        }
+        return validatedTenancyScope->tenantId();
+    }
 };
 
 /**
@@ -170,26 +180,15 @@ struct OpMsgRequest : public OpMsg {
     OpMsgRequest() = default;
     explicit OpMsgRequest(OpMsg&& generic) : OpMsg(std::move(generic)) {}
 
-    static OpMsgRequest parse(const Message& message) {
-        return OpMsgRequest(OpMsg::parse(message));
+    static OpMsgRequest parse(const Message& message, Client* client = nullptr) {
+        return OpMsgRequest(OpMsg::parse(message, client));
     }
 
-    static OpMsgRequest parseOwned(const Message& message) {
-        return OpMsgRequest(OpMsg::parseOwned(message));
+    static OpMsgRequest parseOwned(const Message& message, Client* client = nullptr) {
+        return OpMsgRequest(OpMsg::parseOwned(message, client));
     }
 
-    static OpMsgRequest fromDBAndBody(StringData db,
-                                      BSONObj body,
-                                      const BSONObj& extraFields = {}) {
-        OpMsgRequest request;
-        request.body = ([&] {
-            BSONObjBuilder bodyBuilder(std::move(body));
-            bodyBuilder.appendElements(extraFields);
-            bodyBuilder.append("$db", db);
-            return bodyBuilder.obj();
-        }());
-        return request;
-    }
+    static OpMsgRequest fromDBAndBody(StringData db, BSONObj body, const BSONObj& extraFields = {});
 
     StringData getDatabase() const {
         if (auto elem = body["$db"])
@@ -200,6 +199,8 @@ struct OpMsgRequest : public OpMsg {
     StringData getCommandName() const {
         return body.firstElementFieldName();
     }
+
+    void setDollarTenant(const TenantId& tenant);
 
     // DO NOT ADD MEMBERS!  Since this type is essentially a strong typedef (see the class comment),
     // it should not hold more data than an OpMsg. It should be freely interconvertible with OpMsg
@@ -405,6 +406,33 @@ private:
     BufBuilder* _buf;
     OpMsgBuilder* const _msgBuilder;
     const int _sizeOffset;
+};
+
+/**
+ * Builds an OpMsgRequest object.
+ */
+struct OpMsgRequestBuilder {
+public:
+    /**
+     * Creates an OpMsgRequest object.
+     * If tenant id exists in db name, then a "$tenant" will be appended to the OpMsgRequest
+     * object's body.
+     * Do not use if creating an OpMsgRequest in order to run a command directly (i.e.
+     * CommandHelpers::runCommandDirectly). This function does not set a ValidatedTenancyScope on
+     * the request itself, which will lead to the request being parsed incorrectly.
+     */
+    static OpMsgRequest create(const DatabaseName& dbName,
+                               BSONObj body,
+                               const BSONObj& extraFields = {});
+
+    /**
+     * Creates an OpMsgRequest object and directly sets a validated tenancy scope on it.
+     */
+    static OpMsgRequest createWithValidatedTenancyScope(
+        const DatabaseName& dbName,
+        boost::optional<auth::ValidatedTenancyScope> validatedTenancyScope,
+        BSONObj body,
+        const BSONObj& extraFields = {});
 };
 
 }  // namespace mongo

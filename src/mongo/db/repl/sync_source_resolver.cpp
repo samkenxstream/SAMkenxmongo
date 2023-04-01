@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -44,10 +43,12 @@
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/str.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
+
 namespace mongo {
 namespace repl {
 
-const NamespaceString SyncSourceResolver::kLocalOplogNss("local.oplog.rs");
 const Seconds SyncSourceResolver::kFetcherTimeout(30);
 const Seconds SyncSourceResolver::kFetcherErrorDenylistDuration(10);
 const Seconds SyncSourceResolver::kOplogEmptyDenylistDuration(10);
@@ -167,9 +168,9 @@ std::unique_ptr<Fetcher> SyncSourceResolver::_makeFirstOplogEntryFetcher(
     return std::make_unique<Fetcher>(
         _taskExecutor,
         candidate,
-        kLocalOplogNss.db().toString(),
-        BSON("find" << kLocalOplogNss.coll() << "limit" << 1 << "sort" << BSON("$natural" << 1)
-                    << "projection"
+        NamespaceString::kRsOplogNamespace.dbName().db(),
+        BSON("find" << NamespaceString::kRsOplogNamespace.coll() << "limit" << 1 << "sort"
+                    << BSON("$natural" << 1) << "projection"
                     << BSON(OplogEntryBase::kTimestampFieldName
                             << 1 << OplogEntryBase::kTermFieldName << 1)
                     << ReadConcernArgs::kReadConcernFieldName << ReadConcernArgs::kLocal),
@@ -192,8 +193,8 @@ std::unique_ptr<Fetcher> SyncSourceResolver::_makeRequiredOpTimeFetcher(HostAndP
     return std::make_unique<Fetcher>(
         _taskExecutor,
         candidate,
-        kLocalOplogNss.db().toString(),
-        BSON("find" << kLocalOplogNss.coll() << "filter"
+        NamespaceString::kRsOplogNamespace.dbName().db(),
+        BSON("find" << NamespaceString::kRsOplogNamespace.coll() << "filter"
                     << BSON("ts" << BSON("$gte" << _requiredOpTime.getTimestamp() << "$lte"
                                                 << _requiredOpTime.getTimestamp()))
                     << ReadConcernArgs::kReadConcernFieldName << ReadConcernArgs::kLocal),

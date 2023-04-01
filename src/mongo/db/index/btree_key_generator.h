@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <boost/dynamic_bitset.hpp>
 #include <memory>
 #include <set>
 #include <vector>
@@ -56,7 +57,6 @@ public:
     BtreeKeyGenerator(std::vector<const char*> fieldNames,
                       std::vector<BSONElement> fixed,
                       bool isSparse,
-                      const CollatorInterface* collator,
                       KeyString::Version keyStringVersion,
                       Ordering ordering);
 
@@ -74,15 +74,30 @@ public:
      * 'true' to be able to use an optimized algorithm for the index key generation. Otherwise,
      * this parameter must be set to 'false'. In this case a generic algorithm will be used, which
      * can handle both multikey and non-multikey indexes.
+     *
+     * If the 'collator' argument is set to null, this key generator orders strings according to the
+     * simple binary compare. If non-null, represents the collator used to generate index keys for
+     * indexed strings.
      */
     void getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
                  const BSONObj& obj,
                  bool skipMultikey,
                  KeyStringSet* keys,
                  MultikeyPaths* multikeyPaths,
-                 boost::optional<RecordId> id = boost::none) const;
+                 const CollatorInterface* collator = nullptr,
+                 const boost::optional<RecordId>& id = boost::none) const;
 
     size_t getApproximateSize() const;
+
+    /**
+     * This function does _not_ generate any keys but extract non-array elements for building a key
+     * string. It throws an exception if any extracted element is an array. This can be useful when
+     * the caller wants to utilize these elements to build a set of index keys.
+     *
+     * This function returns a bit set denoting which fields in '_fieldNames' are existent in 'obj'.
+     */
+    boost::dynamic_bitset<size_t> extractElements(const BSONObj& obj,
+                                                  std::vector<BSONElement>* elems) const;
 
 private:
     /**
@@ -152,7 +167,8 @@ private:
                            unsigned numNotFound,
                            const std::vector<PositionalPathInfo>& positionalInfo,
                            MultikeyPaths* multikeyPaths,
-                           boost::optional<RecordId> id) const;
+                           const CollatorInterface* collator,
+                           const boost::optional<RecordId>& id) const;
 
     /**
      * An optimized version of the key generation algorithm to be used when it is known that 'obj'
@@ -160,7 +176,8 @@ private:
      */
     void _getKeysWithoutArray(SharedBufferFragmentBuilder& pooledBufferBuilder,
                               const BSONObj& obj,
-                              boost::optional<RecordId> id,
+                              const CollatorInterface* collator,
+                              const boost::optional<RecordId>& id,
                               KeyStringSet* keys) const;
 
     /**
@@ -221,7 +238,8 @@ private:
                              bool mayExpandArrayUnembedded,
                              const std::vector<PositionalPathInfo>& positionalInfo,
                              MultikeyPaths* multikeyPaths,
-                             boost::optional<RecordId> id) const;
+                             const CollatorInterface* collator,
+                             const boost::optional<RecordId>& id) const;
 
     KeyString::Value _buildNullKeyString() const;
 
@@ -246,10 +264,6 @@ private:
     // A vector with size equal to the number of elements in the index key pattern. Each element in
     // the vector is the number of path components in the indexed field.
     std::vector<size_t> _pathLengths;
-
-    // Null if this key generator orders strings according to the simple binary compare. If
-    // non-null, represents the collator used to generate index keys for indexed strings.
-    const CollatorInterface* _collator;
 };
 
 }  // namespace mongo

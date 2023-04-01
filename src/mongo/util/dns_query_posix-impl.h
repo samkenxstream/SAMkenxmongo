@@ -39,7 +39,7 @@
 #include <resolv.h>
 // clang-format on
 
-#include <stdio.h>
+#include <cstdio>
 
 #include <array>
 #include <cassert>
@@ -188,7 +188,7 @@ public:
             uasserted(ErrorCodes::DNSProtocolError, "DNS CNAME record could not be decompressed");
         }
 
-        return std::string(&buf[0], length);
+        return std::string(&buf[0]);
     }
 
     DNSQueryType getType() const {

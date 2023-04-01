@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/db/record_id_helpers.h"
 
@@ -43,26 +42,42 @@
 #include "mongo/logv2/redaction.h"
 #include "mongo/util/debug_util.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+
 namespace mongo {
 namespace record_id_helpers {
 
-StatusWith<RecordId> keyForOptime(const Timestamp& opTime) {
-    // Make sure secs and inc wouldn't be negative if treated as signed. This ensures that they
-    // don't sort differently when put in a RecordId. It also avoids issues with Null/Invalid
-    // RecordIds
-    if (opTime.getSecs() > uint32_t(std::numeric_limits<int32_t>::max()))
-        return {ErrorCodes::BadValue, "ts secs too high"};
+StatusWith<RecordId> keyForOptime(const Timestamp& opTime, const KeyFormat keyFormat) {
+    switch (keyFormat) {
+        case KeyFormat::Long: {
+            // Make sure secs and inc wouldn't be negative if treated as signed. This ensures that
+            // they don't sort differently when put in a RecordId. It also avoids issues with
+            // Null/Invalid RecordIds
+            if (opTime.getSecs() > uint32_t(std::numeric_limits<int32_t>::max()))
+                return {ErrorCodes::BadValue, "ts secs too high"};
 
-    if (opTime.getInc() > uint32_t(std::numeric_limits<int32_t>::max()))
-        return {ErrorCodes::BadValue, "ts inc too high"};
+            if (opTime.getInc() > uint32_t(std::numeric_limits<int32_t>::max()))
+                return {ErrorCodes::BadValue, "ts inc too high"};
 
-    const auto out = RecordId(opTime.getSecs(), opTime.getInc());
-    if (out <= RecordId::minLong())
-        return {ErrorCodes::BadValue, "ts too low"};
-    if (out >= RecordId::maxLong())
-        return {ErrorCodes::BadValue, "ts too high"};
+            auto out = RecordId(opTime.getSecs(), opTime.getInc());
+            if (out <= RecordId::minLong())
+                return {ErrorCodes::BadValue, "ts too low"};
+            if (out >= RecordId::maxLong())
+                return {ErrorCodes::BadValue, "ts too high"};
+            return {std::move(out)};
+        }
+        case KeyFormat::String: {
+            KeyString::Builder keyBuilder(KeyString::Version::kLatestVersion);
+            keyBuilder.appendTimestamp(opTime);
+            return RecordId(keyBuilder.getBuffer(), keyBuilder.getSize());
+        }
+        default: {
+            MONGO_UNREACHABLE_TASSERT(6521004);
+        }
+    }
 
-    return out;
+    MONGO_UNREACHABLE_TASSERT(6521005);
 }
 
 
@@ -82,7 +97,7 @@ StatusWith<RecordId> extractKeyOptime(const char* data, int len) {
     if (elem.type() != bsonTimestamp)
         return {ErrorCodes::BadValue, "ts must be a Timestamp"};
 
-    return keyForOptime(elem.timestamp());
+    return keyForOptime(elem.timestamp(), KeyFormat::Long);
 }
 
 StatusWith<RecordId> keyForDoc(const BSONObj& doc,
@@ -131,7 +146,7 @@ RecordId keyForDate(Date_t date) {
     return RecordId(keyBuilder.getBuffer(), keyBuilder.getSize());
 }
 
-void appendToBSONAs(RecordId rid, BSONObjBuilder* builder, StringData fieldName) {
+void appendToBSONAs(const RecordId& rid, BSONObjBuilder* builder, StringData fieldName) {
     rid.withFormat([&](RecordId::Null) { builder->appendNull(fieldName); },
                    [&](int64_t val) { builder->append(fieldName, val); },
                    [&](const char* str, int len) {
@@ -139,7 +154,7 @@ void appendToBSONAs(RecordId rid, BSONObjBuilder* builder, StringData fieldName)
                    });
 }
 
-BSONObj toBSONAs(RecordId rid, StringData fieldName) {
+BSONObj toBSONAs(const RecordId& rid, StringData fieldName) {
     BSONObjBuilder builder;
     appendToBSONAs(rid, &builder, fieldName);
     return builder.obj();
@@ -159,12 +174,24 @@ RecordId reservedIdFor(ReservationId res, KeyFormat keyFormat) {
         return RecordId(kMinReservedLong);
     } else {
         invariant(keyFormat == KeyFormat::String);
-        constexpr char reservation[] = {kReservedStrPrefix, 0};
+        constexpr char reservation[] = {
+            kReservedStrPrefix, static_cast<char>(ReservationId::kWildcardMultikeyMetadataId)};
         return RecordId(reservation, sizeof(reservation));
     }
 }
 
-bool isReserved(RecordId id) {
+RecordId maxRecordId(KeyFormat keyFormat) {
+    if (keyFormat == KeyFormat::Long) {
+        return RecordId::maxLong();
+    } else {
+        invariant(keyFormat == KeyFormat::String);
+        constexpr char reservation[] = {
+            kReservedStrPrefix, static_cast<char>(ReservationId::kWildcardMultikeyMetadataId)};
+        return RecordId(reservation, sizeof(reservation));
+    }
+}
+
+bool isReserved(const RecordId& id) {
     if (id.isNull()) {
         return false;
     }

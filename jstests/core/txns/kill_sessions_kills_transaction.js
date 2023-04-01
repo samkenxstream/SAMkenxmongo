@@ -1,5 +1,7 @@
 // Tests that killSessions kills inactive transactions.
-// @tags: [uses_transactions, uses_parallel_shell]
+// The test runs commands that are not allowed with security token: endSession, killSessions.
+// @tags: [
+//   not_allowed_with_security_token,uses_transactions, uses_parallel_shell]
 (function() {
 "use strict";
 
@@ -56,14 +58,20 @@ assert.soon(
                        {
                            $match: {
                                $or: [
-                                   {'command.drop': collName},
-                                   {'command._shardsvrDropCollectionParticipant': collName}
-                               ],
-                               waitingForLock: true
+                                   {
+                                       $or: [
+                                           {'command.drop': collName},
+                                           // TODO SERVER-73627: Remove once 7.0 becomes last LTS.
+                                           {'command._shardsvrDropCollectionParticipant': collName}
+                                       ],
+                                       waitingForLock: true
+                                   },
+                                   {'command._shardsvrParticipantBlock': collName},
+                               ]
                            }
                        }
                    ])
-                   .itcount() === 1;
+                   .itcount() > 0;
     },
     function() {
         return "Failed to find drop in currentOp output: " +

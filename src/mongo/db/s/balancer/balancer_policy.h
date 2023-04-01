@@ -37,10 +37,11 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/balancer/cluster_statistics.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/request_types/auto_split_vector_gen.h"
-#include "mongo/s/request_types/move_chunk_request.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/s/request_types/move_range_request_gen.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/util/concurrency/with_lock.h"
 
 namespace mongo {
 
@@ -59,31 +60,38 @@ struct MigrateInfo {
     MigrateInfo(const ShardId& a_to,
                 const NamespaceString& a_nss,
                 const ChunkType& a_chunk,
-                MoveChunkRequest::ForceJumbo a_forceJumbo);
+                ForceJumbo a_forceJumbo,
+                boost::optional<int64_t> maxChunkSizeBytes = boost::none);
 
     MigrateInfo(const ShardId& a_to,
                 const ShardId& a_from,
                 const NamespaceString& a_nss,
                 const UUID& a_uuid,
                 const BSONObj& a_min,
-                const BSONObj& a_max,
+                const boost::optional<BSONObj>& a_max,
                 const ChunkVersion& a_version,
-                MoveChunkRequest::ForceJumbo a_forceJumbo);
+                ForceJumbo a_forceJumbo,
+                boost::optional<int64_t> maxChunkSizeBytes = boost::none);
 
     std::string getName() const;
 
-    BSONObj getMigrationTypeQuery() const;
-
     std::string toString() const;
+
+    boost::optional<int64_t> getMaxChunkSizeBytes() const;
 
     NamespaceString nss;
     UUID uuid;
     ShardId to;
     ShardId from;
     BSONObj minKey;
-    BSONObj maxKey;
+
+    // May be optional in case of moveRange
+    boost::optional<BSONObj> maxKey;
     ChunkVersion version;
-    MoveChunkRequest::ForceJumbo forceJumbo;
+    ForceJumbo forceJumbo;
+
+    // Set only in case of data-size aware balancing
+    boost::optional<int64_t> optMaxChunkSizeBytes;
 };
 
 enum MigrationReason { none, drain, zoneViolation, chunksImbalance };
@@ -100,7 +108,7 @@ typedef std::vector<BSONObj> SplitPoints;
 struct SplitInfo {
     SplitInfo(const ShardId& shardId,
               const NamespaceString& nss,
-              const ChunkVersion& collectionVersion,
+              const ChunkVersion& collectionPlacementVersion,
               const ChunkVersion& chunkVersion,
               const BSONObj& minKey,
               const BSONObj& maxKey,
@@ -110,7 +118,7 @@ struct SplitInfo {
 
     ShardId shardId;
     NamespaceString nss;
-    ChunkVersion collectionVersion;
+    ChunkVersion collectionPlacementVersion;
     ChunkVersion chunkVersion;
     BSONObj minKey;
     BSONObj maxKey;
@@ -119,45 +127,11 @@ struct SplitInfo {
 
 typedef std::vector<SplitInfo> SplitInfoVector;
 
-struct SplitInfoWithKeyPattern {
-    SplitInfoWithKeyPattern(const ShardId& shardId,
-                            const NamespaceString& nss,
-                            const ChunkVersion& collectionVersion,
-                            const BSONObj& minKey,
-                            const BSONObj& maxKey,
-                            SplitPoints splitKeys,
-                            const UUID& uuid,
-                            const BSONObj& keyPattern);
-    SplitInfo info;
-    UUID uuid;
-    BSONObj keyPattern;
-};
-
-struct AutoSplitVectorInfo {
-    AutoSplitVectorInfo(const ShardId& shardId,
-                        const NamespaceString& nss,
-                        const UUID& uuid,
-                        const ChunkVersion& collectionVersion,
-                        const BSONObj& keyPattern,
-                        const BSONObj& minKey,
-                        const BSONObj& maxKey,
-                        long long maxChunkSizeBytes);
-
-    ShardId shardId;
-    NamespaceString nss;
-    UUID uuid;
-    ChunkVersion collectionVersion;
-    BSONObj keyPattern;
-    BSONObj minKey;
-    BSONObj maxKey;
-    long long maxChunkSizeBytes;
-};
-
 struct MergeInfo {
     MergeInfo(const ShardId& shardId,
               const NamespaceString& nss,
               const UUID& uuid,
-              const ChunkVersion& collectionVersion,
+              const ChunkVersion& collectionPlacementVersion,
               const ChunkRange& chunkRange);
 
     std::string toString() const;
@@ -165,8 +139,19 @@ struct MergeInfo {
     ShardId shardId;
     NamespaceString nss;
     UUID uuid;
-    ChunkVersion collectionVersion;
+    ChunkVersion collectionPlacementVersion;
     ChunkRange chunkRange;
+};
+
+struct MergeAllChunksOnShardInfo {
+    MergeAllChunksOnShardInfo(const ShardId& shardId, const NamespaceString& nss);
+
+    std::string toString() const;
+
+    ShardId shardId;
+    NamespaceString nss;
+
+    bool applyThrottling{false};
 };
 
 struct DataSizeInfo {
@@ -174,36 +159,54 @@ struct DataSizeInfo {
                  const NamespaceString& nss,
                  const UUID& uuid,
                  const ChunkRange& chunkRange,
-                 const ChunkVersion& version,
+                 const ShardVersion& version,
                  const KeyPattern& keyPattern,
-                 bool estimatedValue);
+                 bool estimatedValue,
+                 int64_t maxSize);
 
     ShardId shardId;
     NamespaceString nss;
     UUID uuid;
     ChunkRange chunkRange;
-    ChunkVersion version;
+    // Use ShardVersion for CRUD targeting since datasize is considered a CRUD operation, not a DDL
+    // operation.
+    ShardVersion version;
     KeyPattern keyPattern;
     bool estimatedValue;
+    int64_t maxSize;
 };
 
 struct DataSizeResponse {
-    DataSizeResponse(long long sizeBytes, long long numObjects)
-        : sizeBytes(sizeBytes), numObjects(numObjects) {}
+    DataSizeResponse(long long sizeBytes, long long numObjects, bool maxSizeReached)
+        : sizeBytes(sizeBytes), numObjects(numObjects), maxSizeReached(maxSizeReached) {}
 
     long long sizeBytes;
     long long numObjects;
+    bool maxSizeReached;
 };
 
-typedef stdx::
-    variant<MergeInfo, AutoSplitVectorInfo, DataSizeInfo, SplitInfoWithKeyPattern, MigrateInfo>
-        DefragmentationAction;
+typedef int NumMergedChunks;
 
-typedef stdx::variant<Status, StatusWith<AutoSplitVectorResponse>, StatusWith<DataSizeResponse>>
-    DefragmentationActionResponse;
+typedef stdx::variant<MergeInfo, DataSizeInfo, MigrateInfo, MergeAllChunksOnShardInfo>
+    BalancerStreamAction;
+
+typedef stdx::variant<Status, StatusWith<DataSizeResponse>, StatusWith<NumMergedChunks>>
+    BalancerStreamActionResponse;
 
 typedef std::vector<ClusterStatistics::ShardStatistics> ShardStatisticsVector;
 typedef std::map<ShardId, std::vector<ChunkType>> ShardToChunksMap;
+
+/*
+ * Keeps track of info needed for data size aware balancing.
+ */
+struct CollectionDataSizeInfoForBalancing {
+    CollectionDataSizeInfoForBalancing(std::map<ShardId, int64_t>&& shardToDataSizeMap,
+                                       long maxChunkSizeBytes)
+        : shardToDataSizeMap(std::move(shardToDataSizeMap)), maxChunkSizeBytes(maxChunkSizeBytes) {}
+
+    std::map<ShardId, int64_t> shardToDataSizeMap;
+    const int64_t maxChunkSizeBytes;
+};
 
 /**
  * Keeps track of zones for a collection.
@@ -239,12 +242,11 @@ public:
     }
 
     /**
-     * read all tags for collection via the catalog client and add to the zoneInfo
+     * Retrieves the collection zones from the catalog client
      */
-    static Status addTagsFromCatalog(OperationContext* opCtx,
-                                     const NamespaceString& nss,
-                                     const KeyPattern& keyPattern,
-                                     ZoneInfo& zoneInfo);
+    static StatusWith<ZoneInfo> getZonesForCollection(OperationContext* opCtx,
+                                                      const NamespaceString& nss,
+                                                      const KeyPattern& keyPattern);
 
 private:
     // Map of zone max key to the zone description
@@ -266,7 +268,9 @@ class DistributionStatus final {
     DistributionStatus& operator=(const DistributionStatus&) = delete;
 
 public:
-    DistributionStatus(NamespaceString nss, ShardToChunksMap shardToChunksMap);
+    DistributionStatus(NamespaceString nss,
+                       ShardToChunksMap shardToChunksMap,
+                       ZoneInfo zoneInfo = {});
     DistributionStatus(DistributionStatus&&) = default;
     ~DistributionStatus() {}
 
@@ -284,25 +288,9 @@ public:
     Status addRangeToZone(const ZoneRange& range);
 
     /**
-     * Returns total number of chunks across all shards.
-     */
-    size_t totalChunks() const;
-
-    /**
-     * Returns the total number of chunks across all shards, which fall into the specified zone's
-     * range.
-     */
-    size_t totalChunksWithTag(const std::string& tag) const;
-
-    /**
      * Returns number of chunks in the specified shard.
      */
     size_t numberOfChunksInShard(const ShardId& shardId) const;
-
-    /**
-     * Returns number of chunks in the specified shard, which have the given tag.
-     */
-    size_t numberOfChunksInShardWithTag(const ShardId& shardId, const std::string& tag) const;
 
     /**
      * Returns all chunks for the specified shard.
@@ -310,16 +298,16 @@ public:
     const std::vector<ChunkType>& getChunks(const ShardId& shardId) const;
 
     /**
-     * Returns all tag ranges defined for the collection.
+     * Returns all zone ranges defined for the collection.
      */
-    const BSONObjIndexedMap<ZoneRange>& tagRanges() const {
+    const BSONObjIndexedMap<ZoneRange>& zoneRanges() const {
         return _zoneInfo.zoneRanges();
     }
 
     /**
-     * Returns all tags defined for the collection.
+     * Returns all zones defined for the collection.
      */
-    const std::set<std::string>& tags() const {
+    const std::set<std::string>& zones() const {
         return _zoneInfo.allZones();
     }
 
@@ -331,16 +319,10 @@ public:
     }
 
     /**
-     * Using the set of tags defined for the collection, returns what tag corresponds to the
-     * specified chunk. If the chunk doesn't fall into any tag returns the empty string.
+     * Using the set of zones defined for the collection, returns what zone corresponds to the
+     * specified chunk. If the chunk doesn't fall into any zone returns the empty string.
      */
-    std::string getTagForChunk(const ChunkType& chunk) const;
-
-    /**
-     * Returns a BSON/string representation of this distribution status.
-     */
-    void report(BSONObjBuilder* builder) const;
-    std::string toString() const;
+    std::string getZoneForChunk(const ChunkType& chunk) const;
 
 private:
     // Namespace for which this distribution applies
@@ -357,78 +339,83 @@ class BalancerPolicy {
 public:
     /**
      * Determines whether a shard with the specified utilization statistics would be able to accept
-     * a chunk with the specified tag. According to the policy a shard cannot accept chunks if its
-     * size is maxed out and if the chunk's tag conflicts with the tag of the shard.
+     * a chunk with the specified zone. According to the policy a shard cannot accept chunks if its
+     * size is maxed out and if the chunk's zone conflicts with the zone of the shard.
      */
     static Status isShardSuitableReceiver(const ClusterStatistics::ShardStatistics& stat,
-                                          const std::string& chunkTag);
+                                          const std::string& chunkZone);
 
     /**
-     * Returns a suggested set of chunks to move whithin a collection's shards, given the specified
-     * state of the shards (draining, max size reached, etc) and the number of chunks for that
-     * collection. If the policy doesn't recommend anything to move, it returns an empty vector. The
-     * entries in the vector do are all for separate source/destination shards and as such do not
-     * need to be done serially and can be scheduled in parallel.
+     * Returns a suggested set of chunks or ranges to move within a collection's shards, given the
+     * specified state of the shards (draining, max size reached, etc) and the number of chunks or
+     * data size for that collection. If the policy doesn't recommend anything to move, it returns
+     * an empty vector. The entries in the vector do are all for separate source/destination shards
+     * and as such do not need to be done serially and can be scheduled in parallel.
      *
      * The balancing logic calculates the optimum number of chunks per shard for each zone and if
      * any of the shards have chunks, which are sufficiently higher than this number, suggests
      * moving chunks to shards, which are under this number.
      *
-     * The usedShards parameter is in/out and it contains the set of shards, which have already been
-     * used for migrations. Used so we don't return multiple conflicting migrations for the same
-     * shard.
+     * The availableShards parameter is in/out and it contains the set of shards, which haven't
+     * been used for migrations yet. Used so we don't return multiple conflicting migrations for the
+     * same shard.
      */
-    static MigrateInfosWithReason balance(const ShardStatisticsVector& shardStats,
-                                          const DistributionStatus& distribution,
-                                          stdx::unordered_set<ShardId>* usedShards,
-                                          bool forceJumbo);
+    static MigrateInfosWithReason balance(
+        const ShardStatisticsVector& shardStats,
+        const DistributionStatus& distribution,
+        const CollectionDataSizeInfoForBalancing& collDataSizeInfo,
+        stdx::unordered_set<ShardId>* availableShards,
+        bool forceJumbo);
 
     /**
      * Using the specified distribution information, returns a suggested better location for the
      * specified chunk if one is available.
      */
-    static boost::optional<MigrateInfo> balanceSingleChunk(const ChunkType& chunk,
-                                                           const ShardStatisticsVector& shardStats,
-                                                           const DistributionStatus& distribution);
+    static boost::optional<MigrateInfo> balanceSingleChunk(
+        const ChunkType& chunk,
+        const ShardStatisticsVector& shardStats,
+        const DistributionStatus& distribution,
+        const CollectionDataSizeInfoForBalancing& collDataSizeInfo);
 
 private:
-    /**
-     * Return the shard with the specified tag, which has the least number of chunks. If the tag is
-     * empty, considers all shards.
+    /*
+     * Only considers shards with the specified zone, all shards in case the zone is empty.
+     * Returns a tuple <ShardID, amount of data in bytes> referring the shard with less data.
      */
-    static ShardId _getLeastLoadedReceiverShard(const ShardStatisticsVector& shardStats,
-                                                const DistributionStatus& distribution,
-                                                const std::string& tag,
-                                                const stdx::unordered_set<ShardId>& excludedShards);
+    static std::tuple<ShardId, int64_t> _getLeastLoadedReceiverShard(
+        const ShardStatisticsVector& shardStats,
+        const DistributionStatus& distribution,
+        const CollectionDataSizeInfoForBalancing& collDataSizeInfo,
+        const std::string& zone,
+        const stdx::unordered_set<ShardId>& availableShards);
 
     /**
-     * Return the shard which has the least number of chunks with the specified tag. If the tag is
-     * empty, considers all chunks.
+     * Only considers shards with the specified zone, all shards in case the zone is empty.
+     * Returns a tuple <ShardID, amount of data in bytes> referring the shard with more data.
      */
-    static ShardId _getMostOverloadedShard(const ShardStatisticsVector& shardStats,
-                                           const DistributionStatus& distribution,
-                                           const std::string& chunkTag,
-                                           const stdx::unordered_set<ShardId>& excludedShards);
+    static std::tuple<ShardId, int64_t> _getMostOverloadedShard(
+        const ShardStatisticsVector& shardStats,
+        const DistributionStatus& distribution,
+        const CollectionDataSizeInfoForBalancing& collDataSizeInfo,
+        const std::string& zone,
+        const stdx::unordered_set<ShardId>& availableShards);
 
     /**
-     * Selects one chunk for the specified zone (if appropriate) to be moved in order to bring the
-     * deviation of the shards chunk contents closer to even across all shards in the specified
-     * zone. Takes into account and updates the shards, which have already been used for migrations.
-     *
-     * The 'idealNumberOfChunksPerShardForTag' indicates what is the ideal number of chunks which
-     * each shard must have and is used to determine the imbalance and also to prevent chunks from
-     * moving when not necessary.
+     * Selects one range for the specified zone (if appropriate) to be moved in order to bring the
+     * deviation of the collection data size closer to even across all shards in the specified
+     * zone. Takes into account and updates the shards, which haven't been used for migrations yet.
      *
      * Returns true if a migration was suggested, false otherwise. This method is intented to be
      * called multiple times until all posible migrations for a zone have been selected.
      */
-    static bool _singleZoneBalance(const ShardStatisticsVector& shardStats,
-                                   const DistributionStatus& distribution,
-                                   const std::string& tag,
-                                   size_t idealNumberOfChunksPerShardForTag,
-                                   std::vector<MigrateInfo>* migrations,
-                                   stdx::unordered_set<ShardId>* usedShards,
-                                   MoveChunkRequest::ForceJumbo forceJumbo);
+    static bool _singleZoneBalanceBasedOnDataSize(
+        const ShardStatisticsVector& shardStats,
+        const DistributionStatus& distribution,
+        const CollectionDataSizeInfoForBalancing& collDataSizeInfo,
+        const std::string& zone,
+        std::vector<MigrateInfo>* migrations,
+        stdx::unordered_set<ShardId>* availableShards,
+        ForceJumbo forceJumbo);
 };
 
 }  // namespace mongo

@@ -14,14 +14,6 @@
 
 load("jstests/replsets/rslib.js");
 
-// Skip this test if running with --nojournal and WiredTiger.
-if (jsTest.options().noJournal &&
-    (!jsTest.options().storageEngine || jsTest.options().storageEngine === "wiredTiger")) {
-    print("Skipping test because running WiredTiger without journaling isn't a valid" +
-          " replica set configuration");
-    return;
-}
-
 // Skip db hash check because delayed secondary will not catch up to primary.
 TestData.skipCheckDBHashes = true;
 
@@ -60,8 +52,13 @@ if (storageEngine !== "wiredTiger") {
     var primary = rst.getPrimary();  // Waits for PRIMARY state.
 
     // The default WC is majority and we want the delayed secondary to fall behind in replication.
-    assert.commandWorked(primary.adminCommand(
-        {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: 1}}));
+    // Retry to make sure the primary is done executing (but not necessarily replicating) the
+    // reconfig.
+    assert.soonNoExcept(function() {
+        assert.commandWorked(primary.adminCommand(
+            {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: 1}}));
+        return true;
+    });
 
     // Reconfigure primary with a small cache size so less data needs to be
     // inserted to make the cache full while trying to trigger a stall.

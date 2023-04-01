@@ -1,5 +1,7 @@
 // Tests that it is illegal to read from system.views and system.profile within a transaction.
-// @tags: [uses_transactions, uses_snapshot_read_concern]
+// The test runs commands that are not allowed with security token: profile.
+// @tags: [
+//   not_allowed_with_security_token,uses_transactions, uses_snapshot_read_concern]
 (function() {
 "use strict";
 
@@ -40,6 +42,7 @@ while (collectionInfos.hasNext()) {
 assert.neq(null, systemViewsUUID, "did not find UUID for system.views");
 
 session.startTransaction({readConcern: {level: "snapshot"}});
-assert.commandFailedWithCode(testDB.runCommand({find: systemViewsUUID, filter: {}}), 51070);
+assert.commandFailedWithCode(testDB.runCommand({find: systemViewsUUID, filter: {}}),
+                             [51070, 7195700]);
 assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.NoSuchTransaction);
 }());

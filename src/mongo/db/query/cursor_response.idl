@@ -32,11 +32,10 @@ global:
   cpp_namespace: "mongo"
   cpp_includes:
     - "mongo/db/namespace_string.h"
-    - "mongo/idl/basic_types.h"
     - "mongo/db/query/cursor_idl_validator.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 enums:
     CursorType:
@@ -54,29 +53,38 @@ structs:
                 cpp_name: "cursorId"
                 description: "The cursor id of the cursor."
                 type: long
-                unstable: false
+                stability: stable
             ns:
                 description: "The namespace of the cursor."
                 type: namespacestring
-                unstable: false
+                stability: stable
             postBatchResumeToken:
                 description: "An optional resume token object."
                 type: object
                 optional: true
-                unstable: false
+                stability: stable
             atClusterTime:
                 description: "The time stamp at which the response is being returned."
                 type: timestamp
                 optional: true
-                unstable: false
+                stability: stable
             partialResultsReturned:
                 description: "Boolean represents whether partial results are being returned."
                 type: optionalBool
-                unstable: false
+                stability: stable
             invalidated:
                 description: "Boolean represents if the cursor has been invalidated."
                 type: optionalBool
-                unstable: false
+                stability: stable
+            $_wasStatementExecuted:
+                description: "An optional field set to true if a write without shard key had already
+                              applied the write. To provide some context, this internal field is 
+                              used by the two phase write without shard key protocol introduced in 
+                              PM-1632 to support retryable writes for updateOne without shard key, 
+                              deleteOne without shard key, and findAndModify without shard key."
+                type: optionalBool
+                cpp_name: wasStatementExecuted
+                stability: internal
 
     InitialResponseCursor:
         description: "A struct representing an initial response cursor."
@@ -87,7 +95,7 @@ structs:
             firstBatch:
                 description: "The first batch of the cursor."
                 type: array<object>
-                unstable: false
+                stability: stable
 
     MultiResponseInitialResponseCursor: 
         description: "A struct representing an initial response cursor if multiple cursors are returned."
@@ -98,12 +106,12 @@ structs:
             firstBatch:
                 description: "The first batch of the cursor."
                 type: array<object>
-                unstable: false
+                stability: stable
             type:
                 description: "Optional disambiguation string of a cursor."
                 type: CursorType
                 cpp_name: cursorType
-                unstable: true
+                stability: unstable
                 optional: true
  
     MultiResponseCursor:
@@ -112,36 +120,37 @@ structs:
             cursor:
                 description: "The actual cursor object."
                 type: MultiResponseInitialResponseCursor 
-                unstable: true
+                stability: unstable
             ok:
                 type: bool
-                unstable: true
+                stability: unstable
 
     CursorInitialReply:
         description: "A struct representing a initial cursor reply."
         cpp_validator_func: "validateIDLParsedCursorResponse"
+        is_command_reply: true
         fields:
             cursor:
                 description: "A response cursor object."
                 type: InitialResponseCursor
-                unstable: false
+                stability: stable
                 optional: true
             cursors:
                 description: "An array of cursor objects."
                 type: array<MultiResponseCursor>
-                unstable: true
+                stability: unstable
                 optional: true
             vars:
                 description: "An optional field containing additional response information for the query."
                 type: object
                 optional: true
-                unstable: true 
+                stability: unstable
             type:
                 description: "An optional field containing disambiguation information if a reply contains multiple cursors."
                 type: CursorType 
                 cpp_name: cursorType
                 optional: true
-                unstable: true
+                stability: unstable
 
     GetMoreResponseCursor:
         description: "A struct representing a subsequent response cursor."
@@ -152,12 +161,13 @@ structs:
             nextBatch:
                 description: "The subsequent batch of the cursor."
                 type: array<object>
-                unstable: false
+                stability: stable
 
     CursorGetMoreReply:
         description: "A struct representing a getMore cursor reply."
+        is_command_reply: true
         fields:
             cursor:
                 description: "A response cursor object."
                 type: GetMoreResponseCursor
-                unstable: false
+                stability: stable

@@ -126,6 +126,15 @@ public:
         PipelineValidatorCallback validator = nullptr);
 
     /**
+     * Like parse, but takes a BSONElement instead of a vector of objects. 'arrElem' must be an
+     * array of objects.
+     */
+    static std::unique_ptr<Pipeline, PipelineDeleter> parseFromArray(
+        BSONElement arrayElem,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        PipelineValidatorCallback validator = nullptr);
+
+    /**
      * Creates a Pipeline from an existing SourceContainer.
      *
      * Returns a non-OK status if any stage is in an invalid position. For example, if an $out stage
@@ -145,12 +154,25 @@ public:
      * - The boolean opts.optimize determines whether the pipeline will be optimized.
      * - If opts.attachCursorSource is false, the pipeline will be returned without attempting to
      * add an initial cursor source.
-     *
-     * This function throws if parsing the pipeline failed.
      */
     static std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
         const std::vector<BSONObj>& rawPipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        MakePipelineOptions opts = MakePipelineOptions{});
+
+    /**
+     * Creates a Pipeline from an AggregateCommandRequest. This preserves any aggregation options
+     * set on the aggRequest. The state of the returned pipeline will depend upon the supplied
+     * MakePipelineOptions:
+     * - The boolean opts.optimize determines whether the pipeline will be optimized.
+     *
+     * This function requires opts.attachCursorSource to be true.
+     * This function throws if parsing the pipeline set on aggRequest failed.
+     */
+    static std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
+        AggregateCommandRequest& aggRequest,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        boost::optional<BSONObj> shardCursorsSortSpec = boost::none,
         MakePipelineOptions opts = MakePipelineOptions{});
 
     /**
@@ -162,13 +184,28 @@ public:
     static Pipeline::SourceContainer::iterator optimizeEndOfPipeline(
         Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container);
 
+    /**
+     * Applies optimizeAt() to all stages in the given pipeline after the stage that 'itr' points
+     * to.
+     *
+     * Returns a valid iterator that points to the new "end of the pipeline": i.e., the stage that
+     * comes after 'itr' in the newly optimized pipeline.
+     */
+    static Pipeline::SourceContainer::iterator optimizeAtEndOfPipeline(
+        Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container);
+
     static std::unique_ptr<Pipeline, PipelineDeleter> makePipelineFromViewDefinition(
         const boost::intrusive_ptr<ExpressionContext>& subPipelineExpCtx,
         ExpressionContext::ResolvedNamespace resolvedNs,
         std::vector<BSONObj> currentPipeline,
         MakePipelineOptions opts);
 
-    std::unique_ptr<Pipeline, PipelineDeleter> clone() const;
+    /**
+     * Callers can optionally specify 'newExpCtx' to construct the deep clone with it. This will be
+     * used to construct all the cloned DocumentSources as well.
+     */
+    std::unique_ptr<Pipeline, PipelineDeleter> clone(
+        const boost::intrusive_ptr<ExpressionContext>& = nullptr) const;
 
     const boost::intrusive_ptr<ExpressionContext>& getContext() const {
         return pCtx;
@@ -185,6 +222,12 @@ public:
      * to 'opCtx'.
      */
     void reattachToOperationContext(OperationContext* opCtx);
+
+    /**
+     * Recursively validate the operation contexts associated with this pipeline. Return true if
+     * all document sources and subpipelines point to the given operation context.
+     */
+    bool validateOperationContext(const OperationContext* opCtx) const;
 
     /**
      * Releases any resources held by this pipeline such as PlanExecutors or in-memory structures.
@@ -239,6 +282,11 @@ public:
     bool needsShard() const;
 
     /**
+     * Returns 'true' if any stage in the pipeline requires being run on all shards.
+     */
+    bool needsAllShardServers() const;
+
+    /**
      * Returns true if the pipeline can run on mongoS, but is not obliged to; that is, it can run
      * either on mongoS or on a shard.
      */
@@ -268,16 +316,17 @@ public:
     stdx::unordered_set<NamespaceString> getInvolvedCollections() const;
 
     /**
-     * Serializes the pipeline into a form that can be parsed into an equivalent pipeline.
+     * Helpers to serialize a pipeline.
      */
-    std::vector<Value> serialize() const;
-    std::vector<BSONObj> serializeToBson() const;
-    static std::vector<Value> serializeContainer(const SourceContainer& container);
-
-    /**
-     * Serializes the pipeline into BSON for explain/debug logging purposes.
-     */
-    std::vector<BSONObj> serializeToBSONForDebug() const;
+    std::vector<Value> serialize(boost::optional<ExplainOptions::Verbosity> explain) const;
+    std::vector<Value> serialize(boost::optional<SerializationOptions> opts = boost::none) const;
+    std::vector<BSONObj> serializeToBson(boost::optional<ExplainOptions::Verbosity> explain) const;
+    std::vector<BSONObj> serializeToBson(
+        boost::optional<SerializationOptions> opts = boost::none) const;
+    static std::vector<Value> serializeContainer(
+        const SourceContainer& container, boost::optional<ExplainOptions::Verbosity> explain);
+    static std::vector<Value> serializeContainer(
+        const SourceContainer& container, boost::optional<SerializationOptions> opts = boost::none);
 
     // The initial source is special since it varies between mongos and mongod.
     void addInitialSource(boost::intrusive_ptr<DocumentSource> source);
@@ -302,6 +351,12 @@ public:
      * reference unavailable metadata.
      */
     DepsTracker getDependencies(boost::optional<QueryMetadataBitSet> unavailableMetadata) const;
+
+    /**
+     * Populate 'refs' with the variables referred to by this pipeline, including user and system
+     * variables but excluding $$ROOT. Note that field path references are not considered variables.
+     */
+    void addVariableRefs(std::set<Variables::Id>* refs) const;
 
     /**
      * Returns the dependencies needed by the SourceContainer. 'unavailableMetadata' should reflect
@@ -407,6 +462,16 @@ private:
     ~Pipeline();
 
     /**
+     * Helper for public methods that parse pipelines from vectors of different types.
+     */
+    template <class T>
+    static std::unique_ptr<Pipeline, PipelineDeleter> parseCommon(
+        const std::vector<T>& rawPipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        PipelineValidatorCallback validator,
+        std::function<BSONObj(T)> getElemFunc);
+
+    /**
      * Stitch together the source pointers by calling setSource() for each source in '_sources'.
      * This function must be called any time the order of stages within the pipeline changes, e.g.
      * in optimizePipeline().
@@ -418,6 +483,12 @@ private:
      * why it cannot.
      */
     Status _pipelineCanRunOnMongoS() const;
+
+    /**
+     * Asserts whether operation contexts associated with this pipeline are consistent across
+     * sources.
+     */
+    void checkValidOperationContext() const;
 
     SourceContainer _sources;
 

@@ -36,7 +36,7 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 enums:
     ActionType:
@@ -45,6 +45,8 @@ enums:
         values:
            addShard :  "addShard"
            advanceClusterTime :  "advanceClusterTime"
+           allCollectionStats: "allCollectionStats"
+           analyze :  "analyze"
            anyAction :  "anyAction"         # Special ActionType that represents *all* actions
            appendOplogNote :  "appendOplogNote"
            applicationMessage :  "applicationMessage"
@@ -61,6 +63,7 @@ enums:
            changeOwnCustomData :  "changeOwnCustomData"
            changeStream :  "changeStream"
            checkFreeMonitoringStatus :  "checkFreeMonitoringStatus"
+           checkMetadataConsistency :  "checkMetadataConsistency"
            cleanupOrphaned :  "cleanupOrphaned"
            clearJumboFlag :  "clearJumboFlag"
            closeAllDatabases :  "closeAllDatabases"  # Deprecated (backwards compatibility)
@@ -76,6 +79,7 @@ enums:
            createDatabase :  "createDatabase"  # ID only
            createIndex :  "createIndex"     # ID only
            createRole :  "createRole"
+           createSearchIndexes : "createSearchIndexes"
            createUser :  "createUser"
            dbCheck :  "dbCheck"
            dbHash :  "dbHash"
@@ -87,6 +91,7 @@ enums:
            dropDatabase :  "dropDatabase"
            dropIndex :  "dropIndex"
            dropRole :  "dropRole"
+           dropSearchIndex : "dropSearchIndex"
            dropUser :  "dropUser"
            emptycapped :  "emptycapped"
            enableProfiler :  "enableProfiler"
@@ -96,7 +101,7 @@ enums:
            flushRouterConfig :  "flushRouterConfig"
            forceUUID :  "forceUUID"
            fsync :  "fsync"
-           getChangeStreamOptions: "getChangeStreamOptions"
+           getClusterParameter: "getClusterParameter"
            getDatabaseVersion :  "getDatabaseVersion"
            getDefaultRWConcern :  "getDefaultRWConcern"
            getCmdLineOpts :  "getCmdLineOpts"
@@ -125,16 +130,21 @@ enums:
            listCursors :  "listCursors"
            listDatabases :  "listDatabases"
            listIndexes :  "listIndexes"
+           listSearchIndexes : "listSearchIndexes"
            listSessions :  "listSessions"
            listShards :  "listShards"
            logRotate :  "logRotate"
+           updateSearchIndex : "updateSearchIndex"
            moveChunk :  "moveChunk"
            netstat :  "netstat"
+           oidcListKeys :  "oidcListKeys"
+           oidcRefreshKeys :  "oidcRefreshKeys"
            oidReset :  "oidReset"    # machine ID reset via the features command
            operationMetrics :  "operationMetrics"
            planCacheIndexFilter :  "planCacheIndexFilter"  # view/update index filters
            planCacheRead :  "planCacheRead"         # view contents of plan cache
            planCacheWrite :  "planCacheWrite"        # clear cache, drop cache entry, pin/unpin/shun plans
+           telemetryRead: "telemetryRead" # view contents of telemetry store
            refineCollectionShardKey :  "refineCollectionShardKey"
            reIndex :  "reIndex"
            remove :  "remove"
@@ -160,7 +170,6 @@ enums:
            runTenantMigration :  "runTenantMigration"
            serverStatus :  "serverStatus"
            setAuthenticationRestriction :  "setAuthenticationRestriction"
-           setChangeStreamOptions: "setChangeStreamOptions"
            setClusterParameter: "setClusterParameter"
            setDefaultRWConcern :  "setDefaultRWConcern"
            setFeatureCompatibilityVersion :  "setFeatureCompatibilityVersion"
@@ -168,6 +177,7 @@ enums:
            setParameter :  "setParameter"
            setUserWriteBlockMode: "setUserWriteBlockMode"
            shardCollection :  "shardCollection"  # ID only
+           shardedDataDistribution : "shardedDataDistribution"
            shardingState :  "shardingState"
            shutdown :  "shutdown"
            splitChunk :  "splitChunk"
@@ -176,6 +186,8 @@ enums:
            top :  "top"
            touch :  "touch"
            trafficRecord :  "trafficRecord"
+           transitionToCatalogShard : "transitionToCatalogShard"
+           transitionToDedicatedConfigServer : "transitionToDedicatedConfigServer"
            unlock :  "unlock"
            useTenant : "useTenant"
            useUUID :  "useUUID"
@@ -186,6 +198,8 @@ enums:
            viewRole :  "viewRole"
            viewUser :  "viewUser"
            applyOps :  "applyOps"
+           setChangeStreamState: "setChangeStreamState"
+           getChangeStreamState: "getChangeStreamState"
 
     # In 'MatchType' the extra_data field "serverlessActionTypes" is used
     # by the AuthorizationSession while in multitenancy mode to determine
@@ -208,6 +222,7 @@ enums:
                 value: "cluster"
                 extra_data:
                     serverlessActionTypes:
+                        - applyOps
                         - killAnyCursor
                         - killAnySession
                         - killCursors
@@ -220,19 +235,24 @@ enums:
                 value: "collection"
                 extra_data:
                     serverlessActionTypes: &actionsValidOnCollection
+                        - analyze
                         - bypassDocumentValidation
                         - changeStream
                         - collMod
                         - collStats
+                        - compact
                         - compactStructuredEncryptionData
                         - convertToCapped
                         - createCollection
                         - createIndex
+                        - createSearchIndexes
                         - dbCheck
                         - dbHash
                         - dbStats
                         - dropCollection
                         - dropIndex
+                        - dropSearchIndex
+                        - enableProfiler
                         - exportCollection
                         - find
                         - importCollection
@@ -241,11 +261,16 @@ enums:
                         - killCursors
                         - listCollections
                         - listIndexes
+                        - listSearchIndexes
+                        - updateSearchIndex
+                        - planCacheIndexFilter
                         - planCacheRead
+                        - planCacheWrite
                         - reIndex
                         - remove
                         - renameCollection
                         - renameCollectionSameDB
+                        - storageDetails
                         - update
                         - validate
 
@@ -258,19 +283,24 @@ enums:
                         # Actions common to collection patterns.
                         # YAML doesn't support extending list aliases.
                         # Make changes above, then copy here.
+                        - analyze
                         - bypassDocumentValidation
                         - changeStream
                         - collMod
                         - collStats
+                        - compact
                         - compactStructuredEncryptionData
                         - convertToCapped
                         - createCollection
                         - createIndex
+                        - createSearchIndexes
                         - dbCheck
                         - dbHash
                         - dbStats
                         - dropCollection
                         - dropIndex
+                        - dropSearchIndex
+                        - enableProfiler
                         - exportCollection
                         - find
                         - importCollection
@@ -279,11 +309,16 @@ enums:
                         - killCursors
                         - listCollections
                         - listIndexes
+                        - listSearchIndexes
+                        - updateSearchIndex
+                        - planCacheIndexFilter
                         - planCacheRead
+                        - planCacheWrite
                         - reIndex
                         - remove
                         - renameCollection
                         - renameCollectionSameDB
+                        - storageDetails
                         - update
                         - validate
 
@@ -319,28 +354,67 @@ enums:
                 description: Matches a collection named "<db>.system.buckets.<collection>"
                 value: "system_buckets"
                 extra_data:
-                    serverlessActionTypes: *actionsValidOnCollection
+                    serverlessActionTypes: &actionsValidOnSystemBuckets
+                        - analyze
+                        - bypassDocumentValidation
+                        - changeStream
+                        - collMod
+                        - collStats
+                        - compact
+                        - compactStructuredEncryptionData
+                        - convertToCapped
+                        - createCollection
+                        - createIndex
+                        - createSearchIndexes
+                        - dbCheck
+                        - dbHash
+                        - dbStats
+                        - dropCollection
+                        - dropDatabase
+                        - dropIndex
+                        - dropSearchIndex
+                        - enableProfiler
+                        - exportCollection
+                        - find
+                        - importCollection
+                        - insert
+                        - killAnyCursor
+                        - killCursors
+                        - listCollections
+                        - listIndexes
+                        - listSearchIndexes
+                        - updateSearchIndex
+                        - planCacheIndexFilter
+                        - planCacheRead
+                        - planCacheWrite
+                        - reIndex
+                        - remove
+                        - renameCollection
+                        - renameCollectionSameDB
+                        - storageDetails
+                        - update
+                        - validate
 
             # resource: { db: '', system_buckets: 'exact' }
             kMatchSystemBucketInAnyDBResource:
                 description: Matches a collection named "system.buckets.<collection>" in any db
                 value: "system_buckets_in_any_db"
                 extra_data:
-                    serverlessActionTypes: *actionsValidOnCollection
+                    serverlessActionTypes: *actionsValidOnSystemBuckets
 
             # resource: { db: 'exact', system_buckets: '' }
             kMatchAnySystemBucketInDBResource:
                 description: Matches any collection with a prefix of "system.buckets." in a specific db
                 value: "any_system_buckets_in_db"
                 extra_data:
-                    serverlessActionTypes: *actionsValidOnCollection
+                    serverlessActionTypes: *actionsValidOnSystemBuckets
 
             # resource: { db: '', system_buckets: '' }
             kMatchAnySystemBucketResource:
                 description: Matches any collection with a prefix of "system.buckets." in any db
                 value: "any_system_buckets"
                 extra_data:
-                    serverlessActionTypes: *actionsValidOnCollection
+                    serverlessActionTypes: *actionsValidOnSystemBuckets
 
 structs:
       MatchTypeExtraData:

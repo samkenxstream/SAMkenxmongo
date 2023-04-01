@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/platform/basic.h"
 
@@ -48,6 +47,9 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
+
 
 namespace mongo {
 
@@ -75,7 +77,7 @@ void uassertEmptyReply(BSONObj obj) {
 
 template <typename Request, typename Reply>
 Reply parseUMCReply(BSONObj obj) try {
-    return Reply::parse(IDLParserErrorContext(Request::kCommandName), obj);
+    return Reply::parse(IDLParserContext(Request::kCommandName), obj);
 } catch (const AssertionException& ex) {
     uasserted(ex.code(),
               "Received invalid response from {} command: {}, error: {}"_format(
@@ -84,7 +86,7 @@ Reply parseUMCReply(BSONObj obj) try {
 
 struct UserCacheInvalidatorNOOP {
     static constexpr bool kRequireUserName = false;
-    static void invalidate(OperationContext*, StringData) {}
+    static void invalidate(OperationContext*, const DatabaseName&) {}
 };
 struct UserCacheInvalidatorUser {
     static constexpr bool kRequireUserName = true;
@@ -95,16 +97,22 @@ struct UserCacheInvalidatorUser {
 };
 struct UserCacheInvalidatorDB {
     static constexpr bool kRequireUserName = false;
-    static void invalidate(OperationContext* opCtx, StringData dbname) {
+    static void invalidate(OperationContext* opCtx, const DatabaseName& dbname) {
         AuthorizationManager::get(opCtx->getServiceContext())->invalidateUsersFromDB(opCtx, dbname);
     }
 };
 struct UserCacheInvalidatorAll {
     static constexpr bool kRequireUserName = false;
-    static void invalidate(OperationContext* opCtx, StringData) {
+    static void invalidate(OperationContext* opCtx, const DatabaseName&) {
         AuthorizationManager::get(opCtx->getServiceContext())->invalidateUserCache(opCtx);
     }
 };
+
+template <typename T>
+using HasGetCmdParamOp = std::remove_cv_t<decltype(std::declval<T>().getCommandParameter())>;
+template <typename T>
+constexpr bool hasGetCmdParamStringData =
+    stdx::is_detected_exact_v<StringData, HasGetCmdParamOp, T>;
 
 /**
  * Most user management commands follow a very predictable pattern:
@@ -131,7 +139,7 @@ public:
             auto status = Grid::get(opCtx)->catalogClient()->runUserManagementWriteCommand(
                 opCtx,
                 Request::kCommandName,
-                cmd.getDbName(),
+                cmd.getDbName().db(),
                 applyReadWriteConcern(
                     opCtx,
                     this,
@@ -164,7 +172,13 @@ public:
         }
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            const auto& cmd = request();
+            if constexpr (hasGetCmdParamStringData<RequestT>) {
+                return NamespaceStringUtil::parseNamespaceFromRequest(cmd.getDbName(),
+                                                                      cmd.getCommandParameter());
+            } else {
+                return NamespaceString(cmd.getDbName());
+            }
         }
     };
 
@@ -251,7 +265,7 @@ public:
         }
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 
@@ -286,7 +300,7 @@ public:
         }
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 

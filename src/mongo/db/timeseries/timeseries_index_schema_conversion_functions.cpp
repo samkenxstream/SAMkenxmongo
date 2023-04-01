@@ -27,10 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
 
+#include "mongo/db/catalog/index_catalog_impl.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_parser.h"
@@ -39,6 +40,9 @@
 #include "mongo/db/timeseries/timeseries_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/redaction.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo::timeseries {
 
@@ -68,9 +72,28 @@ std::pair<std::string, std::string> extractControlPrefixAndKey(const StringData&
     return {std::string(field.begin(), fieldIt + 1), std::string(fieldIt + 1, field.end())};
 }
 
+/**
+ * Converts an event-level index spec to a bucket-level index spec.
+ *
+ * If the input is not a valid index spec, this function must either:
+ *  - return an error Status
+ *  - return an invalid index spec
+ */
 StatusWith<BSONObj> createBucketsSpecFromTimeseriesSpec(const TimeseriesOptions& timeseriesOptions,
                                                         const BSONObj& timeseriesIndexSpecBSON,
                                                         bool isShardKeySpec) {
+    if (timeseriesIndexSpecBSON.isEmpty()) {
+        return {ErrorCodes::BadValue, "Empty object is not a valid index spec"_sd};
+    }
+    if (timeseriesIndexSpecBSON.firstElement().fieldNameStringData() == "$hint"_sd ||
+        timeseriesIndexSpecBSON.firstElement().fieldNameStringData() == "$natural"_sd) {
+        return {
+            ErrorCodes::BadValue,
+            str::stream() << "Invalid index spec (perhaps it's a valid hint, that was incorrectly "
+                          << "passed to createBucketsSpecFromTimeseriesSpec): "
+                          << timeseriesIndexSpecBSON};
+    }
+
     auto timeField = timeseriesOptions.getTimeField();
     auto metaField = timeseriesOptions.getMetaField();
 
@@ -128,7 +151,8 @@ StatusWith<BSONObj> createBucketsSpecFromTimeseriesSpec(const TimeseriesOptions&
 
         // Indexes on measurement fields are only supported when the 'gTimeseriesMetricIndexes'
         // feature flag is enabled.
-        if (!feature_flags::gTimeseriesMetricIndexes.isEnabledAndIgnoreFCV()) {
+        if (!feature_flags::gTimeseriesMetricIndexes.isEnabled(
+                serverGlobalParams.featureCompatibility)) {
             auto reason = str::stream();
             reason << "Invalid index spec for time-series collection: "
                    << redact(timeseriesIndexSpecBSON) << ". ";
@@ -345,7 +369,7 @@ StatusWith<BSONObj> createBucketsShardKeySpecFromTimeseriesShardKeySpec(
 boost::optional<BSONObj> createTimeseriesIndexFromBucketsIndex(
     const TimeseriesOptions& timeseriesOptions, const BSONObj& bucketsIndex) {
     bool timeseriesMetricIndexesFeatureFlagEnabled =
-        feature_flags::gTimeseriesMetricIndexes.isEnabledAndIgnoreFCV();
+        feature_flags::gTimeseriesMetricIndexes.isEnabled(serverGlobalParams.featureCompatibility);
 
     if (bucketsIndex.hasField(kOriginalSpecFieldName) &&
         timeseriesMetricIndexesFeatureFlagEnabled) {
@@ -365,7 +389,7 @@ boost::optional<BSONObj> createTimeseriesIndexFromBucketsIndex(
             // exists, and modifies the kKeyFieldName field to timeseriesKeyValue.
             BSONObj intermediateObj =
                 bucketsIndex.removeFields(StringDataSet{kOriginalSpecFieldName});
-            return intermediateObj.addFields(BSON(kKeyFieldName << timeseriesKeyValue.get()),
+            return intermediateObj.addFields(BSON(kKeyFieldName << timeseriesKeyValue.value()),
                                              StringDataSet{kKeyFieldName});
         }
     }
@@ -385,21 +409,16 @@ std::list<BSONObj> createTimeseriesIndexesFromBucketsIndexes(
     return indexSpecs;
 }
 
-bool isBucketsIndexSpecCompatibleForDowngrade(const TimeseriesOptions& timeseriesOptions,
-                                              const BSONObj& bucketsIndex) {
+bool shouldIncludeOriginalSpec(const TimeseriesOptions& timeseriesOptions,
+                               const BSONObj& bucketsIndex) {
     if (!bucketsIndex.hasField(kKeyFieldName)) {
-        return false;
-    }
-
-    if (bucketsIndex.hasField(kPartialFilterExpressionFieldName)) {
-        // Partial indexes are not supported in FCV < 5.2.
         return false;
     }
 
     return createTimeseriesIndexSpecFromBucketsIndexSpec(
                timeseriesOptions,
                bucketsIndex.getField(kKeyFieldName).Obj(),
-               /*timeseriesMetricIndexesFeatureFlagEnabled=*/false) != boost::none;
+               /*timeseriesMetricIndexesFeatureFlagEnabled=*/false) == boost::none;
 }
 
 bool doesBucketsIndexIncludeMeasurement(OperationContext* opCtx,
@@ -471,6 +490,61 @@ bool doesBucketsIndexIncludeMeasurement(OperationContext* opCtx,
         }
     }
 
+    return false;
+}
+
+bool isHintIndexKey(const BSONObj& obj) {
+    if (obj.isEmpty())
+        return false;
+    StringData fieldName = obj.firstElement().fieldNameStringData();
+    if (fieldName == "$hint"_sd)
+        return false;
+    if (fieldName == "$natural"_sd)
+        return false;
+
+    return true;
+}
+
+bool collectionHasIndexSupportingReopeningQuery(OperationContext* opCtx,
+                                                const IndexCatalog* indexCatalog,
+                                                const TimeseriesOptions& tsOptions) {
+    const std::string controlTimeField =
+        timeseries::kControlMinFieldNamePrefix.toString() + tsOptions.getTimeField();
+
+    // Populate a vector of index key fields which we check against existing indexes.
+    boost::container::small_vector<std::string, 2> expectedPrefix;
+    if (tsOptions.getMetaField().has_value()) {
+        expectedPrefix.push_back(kBucketMetaFieldName.toString());
+    }
+    expectedPrefix.push_back(controlTimeField);
+
+    auto indexIt = indexCatalog->getIndexIterator(opCtx, IndexCatalog::InclusionPolicy::kReady);
+    while (indexIt->more()) {
+        auto indexEntry = indexIt->next();
+        auto indexDesc = indexEntry->descriptor();
+
+        // We cannot use a partial index when querying buckets to reopen.
+        if (indexDesc->isPartial()) {
+            continue;
+        }
+
+        auto indexKey = indexDesc->keyPattern();
+        size_t index = 0;
+        for (auto& elem : indexKey) {
+            // The index must include the meta and time field (in that order), but may have
+            // additional fields included.
+            //
+            // In cases where there collections do not have a meta field specified, an index on time
+            // suffices.
+            if (elem.fieldName() != expectedPrefix.at(index)) {
+                break;
+            }
+            index++;
+            if (index == expectedPrefix.size()) {
+                return true;
+            }
+        }
+    }
     return false;
 }
 

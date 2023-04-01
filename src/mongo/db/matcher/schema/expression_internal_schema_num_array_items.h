@@ -43,7 +43,7 @@ namespace mongo {
 class InternalSchemaNumArrayItemsMatchExpression : public ArrayMatchingMatchExpression {
 public:
     InternalSchemaNumArrayItemsMatchExpression(MatchType type,
-                                               StringData path,
+                                               boost::optional<StringData> path,
                                                long long numItems,
                                                StringData name,
                                                clonable_ptr<ErrorAnnotation> annotation = nullptr);
@@ -52,7 +52,7 @@ public:
 
     void debugString(StringBuilder& debug, int indentationLevel) const final;
 
-    BSONObj getSerializedRightHandSide() const final;
+    BSONObj getSerializedRightHandSide(SerializationOptions opts) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 
@@ -61,7 +61,7 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const final {
-        MONGO_UNREACHABLE;
+        MONGO_UNREACHABLE_TASSERT(6400215);
     }
 
     void resetChild(size_t i, MatchExpression* other) override {
@@ -79,7 +79,9 @@ protected:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     StringData _name;

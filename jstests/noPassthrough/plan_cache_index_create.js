@@ -3,6 +3,8 @@
  * index available to queries that had a cached plan prior to the build.
  * @tags: [
  *   requires_replication,
+ *   # TODO SERVER-67607: Test plan cache with CQF enabled.
+ *   cqf_incompatible,
  * ]
  */
 (function() {
@@ -178,8 +180,8 @@ rst.initiate();
 const primaryDB = rst.getPrimary().getDB(dbName);
 const secondaryDB = rst.getSecondary().getDB(dbName);
 
-if (checkSBEEnabled(primaryDB, ["featureFlagSbePlanCache"])) {
-    jsTest.log("Skipping test because SBE and SBE plan cache are both enabled.");
+if (checkSBEEnabled(primaryDB)) {
+    jsTest.log("Skipping test because SBE is enabled");
     rst.stopSet();
     return;
 }

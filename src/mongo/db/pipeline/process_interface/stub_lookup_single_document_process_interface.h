@@ -81,8 +81,17 @@ public:
         ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
         boost::optional<BSONObj> readConcern = boost::none) final;
 
+    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+        const AggregateCommandRequest& aggRequest,
+        Pipeline* pipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        boost::optional<BSONObj> shardCursorsSortSpec = boost::none,
+        ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
+        boost::optional<BSONObj> readConcern = boost::none) final;
+
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipelineForLocalRead(
-        Pipeline* ownedPipeline) final;
+        Pipeline* ownedPipeline,
+        boost::optional<const AggregateCommandRequest&> aggRequest = boost::none) final;
 
     boost::optional<Document> lookupSingleDocument(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -90,16 +99,6 @@ public:
         UUID collectionUUID,
         const Document& documentKey,
         boost::optional<BSONObj> readConcern);
-
-    std::unique_ptr<ShardFilterer> getShardFilterer(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx) const override {
-        // Try to emulate the behavior mongos and mongod would each follow.
-        if (expCtx->inMongos) {
-            return nullptr;
-        } else {
-            return std::make_unique<StubShardFilterer>();
-        }
-    }
 
 private:
     std::deque<DocumentSource::GetNextResult> _mockResults;

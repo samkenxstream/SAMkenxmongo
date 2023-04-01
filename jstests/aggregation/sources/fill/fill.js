@@ -14,32 +14,48 @@ load("jstests/libs/fixture_helpers.js");
 load("jstests/libs/feature_flag_util.js");    // For isEnabled.
 load("jstests/aggregation/extras/utils.js");  // For arrayEq.
 
-if (!FeatureFlagUtil.isEnabled(db, "Fill")) {
-    jsTestLog("Skipping as featureFlagFill is not enabled");
-    return;
-}
 const coll = db[jsTestName()];
 coll.drop();
 const documents = [
-    {_id: 1, linear: 1, other: 1, part: 1},
-    {_id: 2, linear: 1, other: 1, part: 2},
-    {_id: 3, linear: null, other: null, part: 1},
-    {_id: 4, linear: null, other: null, part: 2},
-    {_id: 5, linear: 5, other: 10, part: 1},
-    {_id: 6, linear: 6, other: 2, part: 2},
-    {_id: 7, linear: null, other: null, part: 1},
-    {_id: 8, linear: 3, other: 5, part: 2},
-    {_id: 9, linear: 7, other: 15, part: 1},
-    {_id: 10, linear: null, other: null, part: 2}
+    {_id: 1, linear: 1, other: 1, part: 1, nested: {part: 1}},
+    {_id: 2, linear: 1, other: 1, part: 2, nested: {part: 2}},
+    {_id: 3, linear: null, other: null, part: 1, nested: {part: 1}},
+    {_id: 4, linear: null, other: null, part: 2, nested: {part: 2}},
+    {_id: 5, linear: 5, other: 10, part: 1, nested: {part: 1}},
+    {_id: 6, linear: 6, other: 2, part: 2, nested: {part: 2}},
+    {_id: 7, linear: null, other: null, part: 1, nested: {part: 1}},
+    {_id: 8, linear: 3, other: 5, part: 2, nested: {part: 2}},
+    {_id: 9, linear: 7, other: 15, part: 1, nested: {part: 1}},
+    {_id: 10, linear: null, other: null, part: 2, nested: {part: 2}}
 ];
 
 assert.commandWorked(coll.insert(documents));
 
 const testCases = [
     [
+        // Verify $fill partitionBy works with type string and object.
+        [
+            {$project: {nested: 0}},
+            {$fill: {sortBy: {_id: 1}, partitionBy: "$part", output: {linear: {method: "linear"}}}}
+        ],
+
+        [
+            {_id: 1, linear: 1, other: 1, part: 1},
+            {_id: 3, linear: 3, other: null, part: 1},
+            {_id: 5, linear: 5, other: 10, part: 1},
+            {_id: 7, linear: 6, other: null, part: 1},
+            {_id: 9, linear: 7, other: 15, part: 1},
+            {_id: 2, linear: 1, other: 1, part: 2},
+            {_id: 4, linear: 3.5, other: null, part: 2},
+            {_id: 6, linear: 6, other: 2, part: 2},
+            {_id: 8, linear: 3, other: 5, part: 2},
+            {_id: 10, linear: null, other: null, part: 2},
+        ]
+    ],  // 0
+    [
         [
             {$match: {part: 1}},
-            {$project: {other: 0, part: 0}},
+            {$project: {other: 0, part: 0, nested: 0}},
             {$fill: {sortBy: {_id: 1}, output: {linear: {method: "linear"}}}}
         ],
         [
@@ -49,10 +65,10 @@ const testCases = [
             {_id: 7, linear: 6},
             {_id: 9, linear: 7}
         ]
-    ],  // 0
+    ],  // 1
     [
         [
-            {$project: {linear: 0, part: 0}},
+            {$project: {linear: 0, part: 0, nested: 0}},
             {$fill: {sortBy: {_id: 1}, output: {other: {method: "locf"}}}}
         ],
         [
@@ -67,9 +83,10 @@ const testCases = [
             {_id: 9, other: 15},
             {_id: 10, other: 15}
         ]
-    ],  // 1
+    ],  // 2
     [
         [
+            {$project: {nested: 0}},
             {$match: {part: 2}},
             {
                 $fill: {
@@ -85,31 +102,19 @@ const testCases = [
             {_id: 8, linear: 3, other: 5, part: 2},
             {_id: 10, linear: null, other: 5, part: 2}
         ]
-    ],  // 2
-    [
-        [{
-            $fill:
-                {sortBy: {_id: 1}, output: {other: {method: "locf"}}, partitionByFields: ["part"]}
-        }],
-        [
-            {_id: 1, linear: 1, other: 1, part: 1},
-            {_id: 2, linear: 1, other: 1, part: 2},
-            {_id: 3, linear: null, other: 1, part: 1},
-            {_id: 4, linear: null, other: 1, part: 2},
-            {_id: 5, linear: 5, other: 10, part: 1},
-            {_id: 6, linear: 6, other: 2, part: 2},
-            {_id: 7, linear: null, other: 10, part: 1},
-            {_id: 8, linear: 3, other: 5, part: 2},
-            {_id: 9, linear: 7, other: 15, part: 1},
-            {_id: 10, linear: null, other: 5, part: 2}
-        ]
 
     ],  // 3
     [
-        [{
-            $fill:
-                {sortBy: {_id: 1}, output: {other: {method: "locf"}}, partitionBy: {part: "$part"}}
-        }],
+        [
+            {$project: {nested: 0}},
+            {
+                $fill: {
+                    sortBy: {_id: 1},
+                    output: {other: {method: "locf"}},
+                    partitionByFields: ["part"]
+                }
+            }
+        ],
         [
             {_id: 1, linear: 1, other: 1, part: 1},
             {_id: 2, linear: 1, other: 1, part: 2},
@@ -125,35 +130,41 @@ const testCases = [
 
     ],  // 4
     [
-        [{
-            $fill: {
-                sortBy: {_id: 1},
-                output: {linear: {method: "linear"}},
-                partitionByFields: ["part"]
+        [
+            {$project: {nested: 0}},
+            {
+                $fill: {
+                    sortBy: {_id: 1},
+                    output: {other: {method: "locf"}},
+                    partitionBy: {part: "$part"}
+                }
             }
-        }],
+        ],
         [
             {_id: 1, linear: 1, other: 1, part: 1},
-            {_id: 3, linear: 3, other: null, part: 1},
-            {_id: 5, linear: 5, other: 10, part: 1},
-            {_id: 7, linear: 6, other: null, part: 1},
-            {_id: 9, linear: 7, other: 15, part: 1},
             {_id: 2, linear: 1, other: 1, part: 2},
-            {_id: 4, linear: 3.5, other: null, part: 2},
+            {_id: 3, linear: null, other: 1, part: 1},
+            {_id: 4, linear: null, other: 1, part: 2},
+            {_id: 5, linear: 5, other: 10, part: 1},
             {_id: 6, linear: 6, other: 2, part: 2},
+            {_id: 7, linear: null, other: 10, part: 1},
             {_id: 8, linear: 3, other: 5, part: 2},
-            {_id: 10, linear: null, other: null, part: 2}
+            {_id: 9, linear: 7, other: 15, part: 1},
+            {_id: 10, linear: null, other: 5, part: 2}
         ]
 
     ],  // 5
     [
-        [{
-            $fill: {
-                sortBy: {_id: 1},
-                output: {linear: {method: "linear"}},
-                partitionBy: {part: "$part"}
+        [
+            {$project: {nested: 0}},
+            {
+                $fill: {
+                    sortBy: {_id: 1},
+                    output: {linear: {method: "linear"}},
+                    partitionByFields: ["part"]
+                }
             }
-        }],
+        ],
         [
             {_id: 1, linear: 1, other: 1, part: 1},
             {_id: 3, linear: 3, other: null, part: 1},
@@ -169,13 +180,41 @@ const testCases = [
 
     ],  // 6
     [
-        [{
-            $fill: {
-                sortBy: {_id: 1},
-                output: {other: {method: "locf"}, linear: {method: "linear"}},
-                partitionByFields: ["part"]
+        [
+            {$project: {nested: 0}},
+            {
+                $fill: {
+                    sortBy: {_id: 1},
+                    output: {linear: {method: "linear"}},
+                    partitionBy: {part: "$part"}
+                }
             }
-        }],
+        ],
+        [
+            {_id: 1, linear: 1, other: 1, part: 1},
+            {_id: 3, linear: 3, other: null, part: 1},
+            {_id: 5, linear: 5, other: 10, part: 1},
+            {_id: 7, linear: 6, other: null, part: 1},
+            {_id: 9, linear: 7, other: 15, part: 1},
+            {_id: 2, linear: 1, other: 1, part: 2},
+            {_id: 4, linear: 3.5, other: null, part: 2},
+            {_id: 6, linear: 6, other: 2, part: 2},
+            {_id: 8, linear: 3, other: 5, part: 2},
+            {_id: 10, linear: null, other: null, part: 2}
+        ]
+
+    ],  // 7
+    [
+        [
+            {$project: {nested: 0}},
+            {
+                $fill: {
+                    sortBy: {_id: 1},
+                    output: {other: {method: "locf"}, linear: {method: "linear"}},
+                    partitionByFields: ["part"]
+                }
+            }
+        ],
         [
             {_id: 1, linear: 1, other: 1, part: 1},
             {_id: 3, linear: 3, other: 1, part: 1},
@@ -188,11 +227,11 @@ const testCases = [
             {_id: 8, linear: 3, other: 5, part: 2},
             {_id: 10, linear: null, other: 5, part: 2}
         ]
-
-    ],  // 7
+    ],  // 8
     // Test with first element in partition having a null fill field.
     [
         [
+            {$project: {nested: 0}},
             {$set: {linear: {$cond: [{$eq: ["$linear", 1]}, null, "$linear"]}}},
             {
                 $fill: {
@@ -214,12 +253,12 @@ const testCases = [
             {_id: 8, linear: 3, other: 5, part: 2},
             {_id: 10, linear: null, other: 5, part: 2}
         ]
-    ],  // 8
+    ],  // 9
     // Test $fill with arbitrary values.
     [
         [
             {$match: {part: 1}},
-            {$project: {linear: 0, part: 0}},
+            {$project: {linear: 0, part: 0, nested: 0}},
             {$fill: {sortBy: {_id: 1}, output: {other: {value: "$_id"}}}}
         ],
         [
@@ -229,11 +268,11 @@ const testCases = [
             {_id: 7, other: 7},
             {_id: 9, other: 15},
         ]
-    ],  // 9
+    ],  // 10
     [
         [
             {$match: {part: 1}},
-            {$project: {linear: 0, part: 0}},
+            {$project: {linear: 0, part: 0, nested: 0}},
             {$fill: {sortBy: {_id: 1}, output: {other: {value: -1}}}}
         ],
         [
@@ -243,9 +282,10 @@ const testCases = [
             {_id: 7, other: -1},
             {_id: 9, other: 15},
         ]
-    ],  // 10
+    ],  // 11
     [
         [
+            {$project: {nested: 0}},
             {$match: {part: 1}},
             {
                 $fill: {
@@ -262,12 +302,13 @@ const testCases = [
             {_id: 7, other: -1, linear: 2},
             {_id: 9, other: 15, linear: 7},
         ]
-    ],  // 11
+
+    ],  // 12
     // Verify behavior if the filling expression can evaluate to missing or null.
     [
         [
             {$match: {part: 1}},
-            {$project: {part: 0}},
+            {$project: {part: 0, nested: 0}},
             {$unionWith: {pipeline: [{$documents: [{_id: 2}, {_id: 4}]}]}},
             {$fill: {sortBy: {_id: 1}, output: {other: {value: "$linear"}}}},
             {$project: {linear: 0}},
@@ -280,10 +321,60 @@ const testCases = [
             {_id: 5, other: 10},
             {_id: 7, other: null},
             {_id: 9, other: 15},
-
         ]
 
-    ],  // 12
+    ],  // 13
+    // Verify that $fill with 'partitionByFields' can partition by a dotted path.
+    [
+        [
+            {$project: {part: 0, other: 0}},
+            {
+                $fill: {
+                    sortBy: {_id: 1},
+                    partitionByFields: ["nested.part"],
+                    output: {linear: {method: "locf"}}
+                }
+            },
+        ],
+        [
+            {"_id": 1, "linear": 1, "nested": {"part": 1}},
+            {"_id": 2, "linear": 1, "nested": {"part": 2}},
+            {"_id": 3, "linear": 1, "nested": {"part": 1}},
+            {"_id": 4, "linear": 1, "nested": {"part": 2}},
+            {"_id": 5, "linear": 5, "nested": {"part": 1}},
+            {"_id": 6, "linear": 6, "nested": {"part": 2}},
+            {"_id": 7, "linear": 5, "nested": {"part": 1}},
+            {"_id": 8, "linear": 3, "nested": {"part": 2}},
+            {"_id": 9, "linear": 7, "nested": {"part": 1}},
+            {"_id": 10, "linear": 3, "nested": {"part": 2}}
+        ],
+    ],  // 14
+    // Repeat for 'partitionBy'.
+    [
+        [
+            {$project: {part: 0, other: 0}},
+            {
+                $fill: {
+                    sortBy: {_id: 1},
+                    partitionBy: {part: "$nested.part"},
+                    output: {linear: {method: "locf"}}
+                }
+            },
+        ],
+        [
+            {"_id": 1, "linear": 1, "nested": {"part": 1}},
+            {"_id": 2, "linear": 1, "nested": {"part": 2}},
+            {"_id": 3, "linear": 1, "nested": {"part": 1}},
+            {"_id": 4, "linear": 1, "nested": {"part": 2}},
+            {"_id": 5, "linear": 5, "nested": {"part": 1}},
+            {"_id": 6, "linear": 6, "nested": {"part": 2}},
+            {"_id": 7, "linear": 5, "nested": {"part": 1}},
+            {"_id": 8, "linear": 3, "nested": {"part": 2}},
+            {"_id": 9, "linear": 7, "nested": {"part": 1}},
+            {"_id": 10, "linear": 3, "nested": {"part": 2}}
+        ],
+
+    ],  // 15
 
 ];
 

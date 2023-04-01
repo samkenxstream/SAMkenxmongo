@@ -32,12 +32,13 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/mr_common.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/util/database_name_util.h"
 
 namespace mongo {
 
-class MapReduceCommandBase : public ErrmsgCommandDeprecated {
+class MapReduceCommandBase : public BasicCommand {
 public:
-    MapReduceCommandBase() : ErrmsgCommandDeprecated("mapReduce", "mapreduce") {}
+    MapReduceCommandBase() : BasicCommand("mapReduce", "mapreduce") {}
 
     std::string help() const override {
         return "Runs the mapReduce command. See http://dochub.mongodb.org/core/mapreduce for "
@@ -82,13 +83,14 @@ public:
         return true;
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        map_reduce_common::addPrivilegesRequiredForMapReduce(this, dbname, cmdObj, out);
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        return map_reduce_common::checkAuthForMapReduce(this, opCtx, dbName, cmdObj);
     }
 
     virtual void _explainImpl(OperationContext* opCtx,
+                              const DatabaseName& dbName,
                               const BSONObj& cmd,
                               BSONObjBuilder& result,
                               boost::optional<ExplainOptions::Verbosity> verbosity) const = 0;
@@ -100,7 +102,12 @@ public:
         auto builder = result->getBodyBuilder();
         auto explain = boost::make_optional(verbosity);
         try {
-            _explainImpl(opCtx, request.body, builder, explain);
+            _explainImpl(opCtx,
+                         DatabaseNameUtil::deserialize(request.getValidatedTenantId(),
+                                                       request.getDatabase()),
+                         request.body,
+                         builder,
+                         explain);
         } catch (...) {
             return exceptionToStatus();
         }

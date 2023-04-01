@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -40,15 +39,14 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/authenticate.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/cloner_gen.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/list_collections_filter.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -65,6 +63,9 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
@@ -88,13 +89,15 @@ BSONObj Cloner::_getIdIndexSpec(const std::list<BSONObj>& indexSpecs) {
 
 Cloner::Cloner() {}
 
-struct Cloner::Fun {
-    Fun(OperationContext* opCtx, const std::string& dbName)
-        : lastLog(0), opCtx(opCtx), _dbName(dbName) {}
+struct Cloner::BatchHandler {
+    BatchHandler(OperationContext* opCtx, const std::string& dbName)
+        : lastLog(0), opCtx(opCtx), _dbName(dbName), numSeen(0), saveLast(0) {}
 
-    void operator()(DBClientCursorBatchIterator& i) {
+    void operator()(DBClientCursor& cursor) {
         boost::optional<Lock::DBLock> dbLock;
-        dbLock.emplace(opCtx, _dbName, MODE_X);
+        // TODO SERVER-63111 Once the Cloner holds a DatabaseName obj, use _dbName directly
+        DatabaseName dbName(boost::none, _dbName);
+        dbLock.emplace(opCtx, dbName, MODE_X);
         uassert(ErrorCodes::NotWritablePrimary,
                 str::stream() << "Not primary while cloning collection " << nss,
                 !opCtx->writesAreReplicated() ||
@@ -102,9 +105,7 @@ struct Cloner::Fun {
 
         // Make sure database still exists after we resume from the temp release
         auto databaseHolder = DatabaseHolder::get(opCtx);
-        // TODO SERVER-63111 use TenantDatabase in the Cloner.
-        const TenantDatabaseName tenantDbName(boost::none, _dbName);
-        auto db = databaseHolder->openDb(opCtx, tenantDbName);
+        auto db = databaseHolder->openDb(opCtx, dbName);
         auto catalog = CollectionCatalog::get(opCtx);
         auto collection = catalog->lookupCollectionByNamespace(opCtx, nss);
         if (!collection) {
@@ -126,7 +127,7 @@ struct Cloner::Fun {
             });
         }
 
-        while (i.moreInCurrentBatch()) {
+        while (cursor.moreInCurrentBatch()) {
             if (numSeen % 128 == 127) {
                 time_t now = time(nullptr);
                 if (now - lastLog >= 60) {
@@ -141,7 +142,10 @@ struct Cloner::Fun {
 
                 CurOp::get(opCtx)->yielded();
 
-                dbLock.emplace(opCtx, _dbName, MODE_X);
+                // TODO SERVER-63111 Once the cloner takes in a DatabaseName obj, use _dbName
+                // directly
+                DatabaseName dbName(boost::none, _dbName);
+                dbLock.emplace(opCtx, dbName, MODE_X);
 
                 // Check if everything is still all right.
                 if (opCtx->writesAreReplicated()) {
@@ -151,7 +155,7 @@ struct Cloner::Fun {
                         repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss));
                 }
 
-                db = databaseHolder->getDb(opCtx, tenantDbName);
+                db = databaseHolder->getDb(opCtx, dbName);
                 uassert(28593,
                         str::stream() << "Database " << _dbName << " dropped while cloning",
                         db != nullptr);
@@ -162,7 +166,7 @@ struct Cloner::Fun {
                         collection);
             }
 
-            BSONObj tmp = i.nextSafe();
+            BSONObj tmp = cursor.nextSafe();
 
             /* assure object is valid.  note this will slow us down a little. */
             // We allow cloning of collections containing decimal data even if decimal is disabled.
@@ -189,9 +193,11 @@ struct Cloner::Fun {
                 WriteUnitOfWork wunit(opCtx);
 
                 BSONObj doc = tmp;
-                OpDebug* const nullOpDebug = nullptr;
-                Status status =
-                    collection->insertDocument(opCtx, InsertStatement(doc), nullOpDebug, true);
+                Status status = collection_internal::insertDocument(opCtx,
+                                                                    CollectionPtr(collection),
+                                                                    InsertStatement(doc),
+                                                                    nullptr /* OpDebug */,
+                                                                    true);
                 if (!status.isOK() && status.code() != ErrorCodes::DuplicateKey) {
                     LOGV2_ERROR(20424,
                                 "error: exception cloning object",
@@ -243,23 +249,23 @@ void Cloner::_copy(OperationContext* opCtx,
                 logAttrs(nss),
                 "conn_getServerAddress"_attr = conn->getServerAddress());
 
-    Fun f(opCtx, toDBName);
-    f.numSeen = 0;
-    f.nss = nss;
-    f.from_options = from_opts;
-    f.from_id_index = from_id_index;
-    f.saveLast = time(nullptr);
+    BatchHandler batchHandler{opCtx, toDBName};
+    batchHandler.numSeen = 0;
+    batchHandler.nss = nss;
+    batchHandler.from_options = from_opts;
+    batchHandler.from_id_index = from_id_index;
+    batchHandler.saveLast = time(nullptr);
 
-    int options = QueryOption_NoCursorTimeout | QueryOption_Exhaust;
+    FindCommandRequest findCmd{nss};
+    findCmd.setNoCursorTimeout(true);
+    findCmd.setReadConcern(repl::ReadConcernArgs::kLocal);
+    auto cursor = conn->find(
+        std::move(findCmd), ReadPreferenceSetting{ReadPreference::PrimaryOnly}, ExhaustMode::kOn);
 
-    conn->query_DEPRECATED(std::function<void(DBClientCursorBatchIterator&)>(f),
-                           nss,
-                           BSONObj{} /* filter */,
-                           Query() /* querySettings */,
-                           nullptr,
-                           options,
-                           0 /* batchSize */,
-                           repl::ReadConcernArgs::kLocal);
+    // Process the results of the cursor in batches.
+    while (cursor->more()) {
+        batchHandler(*cursor);
+    }
 }
 
 void Cloner::_copyIndexes(OperationContext* opCtx,
@@ -340,9 +346,9 @@ Status Cloner::_createCollectionsForDb(
     const std::vector<CreateCollectionParams>& createCollectionParams,
     const std::string& dbName) {
     auto databaseHolder = DatabaseHolder::get(opCtx);
-    const TenantDatabaseName tenantDbName(boost::none, dbName);
+    const DatabaseName tenantDbName(boost::none, dbName);
     auto db = databaseHolder->openDb(opCtx, tenantDbName);
-    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
+    invariant(opCtx->lockState()->isDbLockedForMode(tenantDbName, MODE_X));
 
     auto catalog = CollectionCatalog::get(opCtx);
     auto collCount = 0;
@@ -362,7 +368,7 @@ Status Cloner::_createCollectionsForDb(
             opCtx->checkForInterrupt();
             WriteUnitOfWork wunit(opCtx);
 
-            CollectionPtr collection = catalog->lookupCollectionByNamespace(opCtx, nss);
+            const Collection* collection = catalog->lookupCollectionByNamespace(opCtx, nss);
             if (collection) {
                 if (!params.shardedColl) {
                     // If the collection is unsharded then we want to fail when a collection
@@ -477,8 +483,9 @@ Status Cloner::copyDb(OperationContext* opCtx,
     }
 
     // Gather the list of collections to clone
-    std::list<BSONObj> initialCollections =
-        conn->getCollectionInfos(dBName, ListCollectionsFilter::makeTypeCollectionFilter());
+    // TODO SERVER-63111 Once the cloner takes in a DatabaseName obj, use dBName directly
+    std::list<BSONObj> initialCollections = conn->getCollectionInfos(
+        DatabaseName(boost::none, dBName), ListCollectionsFilter::makeTypeCollectionFilter());
 
     auto statusWithCollections = _filterCollectionsForClone(dBName, initialCollections);
     if (!statusWithCollections.isOK()) {
@@ -518,7 +525,9 @@ Status Cloner::copyDb(OperationContext* opCtx,
     }
 
     {
-        Lock::DBLock dbXLock(opCtx, dBName, MODE_X);
+        // TODO SERVER-63111 Once the cloner takes in a DatabaseName obj, use dBName directly
+        DatabaseName dbName(boost::none, dBName);
+        Lock::DBLock dbXLock(opCtx, dbName, MODE_X);
         uassert(ErrorCodes::NotWritablePrimary,
                 str::stream() << "Not primary while cloning database " << dBName
                               << " (after getting list of collections to clone)",
@@ -533,6 +542,13 @@ Status Cloner::copyDb(OperationContext* opCtx,
 
         // now build the secondary indexes
         for (auto&& params : createCollectionParams) {
+
+            // Indexes of sharded collections are not copied: the primary shard is not required to
+            // have all indexes. The listIndexes cmd is sent to the shard owning the MinKey value.
+            if (params.shardedColl) {
+                continue;
+            }
+
             LOGV2(20422,
                   "copying indexes for: {collectionInfo}",
                   "Copying indexes",

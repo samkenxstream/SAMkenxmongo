@@ -27,13 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/dbhelpers.h"
 
 #include "mongo/db/catalog/clustered_collection_util.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/btree_access_method.h"
@@ -41,7 +41,7 @@
 #include "mongo/db/keypattern.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_request.h"
@@ -53,21 +53,20 @@
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+
 namespace mongo {
 
 using std::set;
 using std::string;
 using std::unique_ptr;
 
-/* fetch a single object from collection ns that matches query
-   set your db SavedContext first
-*/
 bool Helpers::findOne(OperationContext* opCtx,
                       const CollectionPtr& collection,
                       const BSONObj& query,
-                      BSONObj& result,
-                      bool requireIndex) {
-    RecordId loc = findOne(opCtx, collection, query, requireIndex);
+                      BSONObj& result) {
+    RecordId loc = findOne(opCtx, collection, query);
     if (loc.isNull())
         return false;
     result = collection->docFor(opCtx, loc).value();
@@ -79,8 +78,7 @@ BSONObj Helpers::findOneForTesting(OperationContext* opCtx,
                                    const BSONObj& query,
                                    const bool invariantOnError) {
     BSONObj ret;
-    const bool requiresIndex = true;
-    bool found = findOne(opCtx, collection, query, ret, requiresIndex);
+    bool found = findOne(opCtx, collection, query, ret);
     if (invariantOnError) {
         invariant(found);
     }
@@ -94,20 +92,18 @@ BSONObj Helpers::findOneForTesting(OperationContext* opCtx,
 */
 RecordId Helpers::findOne(OperationContext* opCtx,
                           const CollectionPtr& collection,
-                          const BSONObj& query,
-                          bool requireIndex) {
+                          const BSONObj& query) {
     if (!collection)
         return RecordId();
 
     auto findCommand = std::make_unique<FindCommandRequest>(collection->ns());
     findCommand->setFilter(query);
-    return findOne(opCtx, collection, std::move(findCommand), requireIndex);
+    return findOne(opCtx, collection, std::move(findCommand));
 }
 
 RecordId Helpers::findOne(OperationContext* opCtx,
                           const CollectionPtr& collection,
-                          std::unique_ptr<FindCommandRequest> findCommand,
-                          bool requireIndex) {
+                          std::unique_ptr<FindCommandRequest> findCommand) {
     if (!collection)
         return RecordId();
 
@@ -124,14 +120,13 @@ RecordId Helpers::findOne(OperationContext* opCtx,
 
     massertStatusOK(statusWithCQ.getStatus());
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+    cq->setForceGenerateRecordId(true);
 
-    size_t options = requireIndex ? QueryPlannerParams::NO_TABLE_SCAN : QueryPlannerParams::DEFAULT;
     auto exec = uassertStatusOK(getExecutor(opCtx,
                                             &collection,
                                             std::move(cq),
                                             nullptr /* extractAndAttachPipelineStages */,
-                                            PlanYieldPolicy::YieldPolicy::NO_YIELD,
-                                            options));
+                                            PlanYieldPolicy::YieldPolicy::NO_YIELD));
 
     PlanExecutor::ExecState state;
     BSONObj obj;
@@ -143,18 +138,13 @@ RecordId Helpers::findOne(OperationContext* opCtx,
 }
 
 bool Helpers::findById(OperationContext* opCtx,
-                       Database* database,
-                       StringData ns,
+                       const NamespaceString& nss,
                        BSONObj query,
                        BSONObj& result,
                        bool* nsFound,
                        bool* indexFound) {
-    invariant(database);
-
-    // TODO ForRead?
-    NamespaceString nss{ns};
-    CollectionPtr collection =
-        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
+    auto collCatalog = CollectionCatalog::get(opCtx);
+    const Collection* collection = collCatalog->lookupCollectionByNamespace(opCtx, nss);
     if (!collection) {
         return false;
     }
@@ -190,7 +180,7 @@ bool Helpers::findById(OperationContext* opCtx,
         *indexFound = 1;
 
     auto recordId = catalog->getEntry(desc)->accessMethod()->asSortedData()->findSingle(
-        opCtx, collection, query["_id"].wrap());
+        opCtx, CollectionPtr(collection), query["_id"].wrap());
     if (recordId.isNull())
         return false;
     result = collection->docFor(opCtx, recordId).value();
@@ -232,10 +222,10 @@ const CollectionPtr& getCollectionForRead(
     }
 }
 
-bool Helpers::getSingleton(OperationContext* opCtx, const char* ns, BSONObj& result) {
+bool Helpers::getSingleton(OperationContext* opCtx, const NamespaceString& nss, BSONObj& result) {
     boost::optional<AutoGetCollectionForReadCommand> autoColl;
     boost::optional<AutoGetOplog> autoOplog;
-    const auto& collection = getCollectionForRead(opCtx, NamespaceString(ns), autoColl, autoOplog);
+    const auto& collection = getCollectionForRead(opCtx, nss, autoColl, autoOplog);
     if (!collection) {
         return false;
     }
@@ -257,10 +247,10 @@ bool Helpers::getSingleton(OperationContext* opCtx, const char* ns, BSONObj& res
     return false;
 }
 
-bool Helpers::getLast(OperationContext* opCtx, const char* ns, BSONObj& result) {
+bool Helpers::getLast(OperationContext* opCtx, const NamespaceString& nss, BSONObj& result) {
     boost::optional<AutoGetCollectionForReadCommand> autoColl;
     boost::optional<AutoGetOplog> autoOplog;
-    const auto& collection = getCollectionForRead(opCtx, NamespaceString(ns), autoColl, autoOplog);
+    const auto& collection = getCollectionForRead(opCtx, nss, autoColl, autoOplog);
     if (!collection) {
         return false;
     }
@@ -281,25 +271,24 @@ bool Helpers::getLast(OperationContext* opCtx, const char* ns, BSONObj& result) 
 }
 
 UpdateResult Helpers::upsert(OperationContext* opCtx,
-                             const string& ns,
+                             const NamespaceString& nss,
                              const BSONObj& o,
                              bool fromMigrate) {
     BSONElement e = o["_id"];
     verify(e.type());
     BSONObj id = e.wrap();
-    return upsert(opCtx, ns, id, o, fromMigrate);
+    return upsert(opCtx, nss, id, o, fromMigrate);
 }
 
 UpdateResult Helpers::upsert(OperationContext* opCtx,
-                             const string& ns,
+                             const NamespaceString& nss,
                              const BSONObj& filter,
                              const BSONObj& updateMod,
                              bool fromMigrate) {
-    OldClientContext context(opCtx, ns);
+    OldClientContext context(opCtx, nss);
 
-    const NamespaceString requestNs(ns);
     auto request = UpdateRequest();
-    request.setNamespaceString(requestNs);
+    request.setNamespaceString(nss);
 
     request.setQuery(filter);
     request.setUpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(updateMod));
@@ -313,15 +302,14 @@ UpdateResult Helpers::upsert(OperationContext* opCtx,
 }
 
 void Helpers::update(OperationContext* opCtx,
-                     const string& ns,
+                     const NamespaceString& nss,
                      const BSONObj& filter,
                      const BSONObj& updateMod,
                      bool fromMigrate) {
-    OldClientContext context(opCtx, ns);
+    OldClientContext context(opCtx, nss);
 
-    const NamespaceString requestNs(ns);
     auto request = UpdateRequest();
-    request.setNamespaceString(requestNs);
+    request.setNamespaceString(nss);
 
     request.setQuery(filter);
     request.setUpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(updateMod));
@@ -333,12 +321,11 @@ void Helpers::update(OperationContext* opCtx,
     ::mongo::update(opCtx, context.db(), request);
 }
 
-void Helpers::putSingleton(OperationContext* opCtx, const char* ns, BSONObj obj) {
-    OldClientContext context(opCtx, ns);
+void Helpers::putSingleton(OperationContext* opCtx, const NamespaceString& nss, BSONObj obj) {
+    OldClientContext context(opCtx, nss);
 
-    const NamespaceString requestNs(ns);
     auto request = UpdateRequest();
-    request.setNamespaceString(requestNs);
+    request.setNamespaceString(nss);
 
     request.setUpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(obj));
     request.setUpsert();
@@ -365,11 +352,12 @@ BSONObj Helpers::inferKeyPattern(const BSONObj& o) {
 }
 
 void Helpers::emptyCollection(OperationContext* opCtx, const NamespaceString& nss) {
-    OldClientContext context(opCtx, nss.ns());
+    OldClientContext context(opCtx, nss);
     repl::UnreplicatedWritesBlock uwb(opCtx);
-    CollectionPtr collection = context.db()
-        ? CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)
-        : nullptr;
+    CollectionPtr collection = CollectionPtr(
+        context.db() ? CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)
+                     : nullptr);
+
     deleteObjects(opCtx, collection, nss, BSONObj(), false);
 }
 
@@ -396,10 +384,17 @@ bool Helpers::findByIdAndNoopUpdate(OperationContext* opCtx,
     // BSONObj because that's a second way OpObserverImpl::onUpdate() detects and ignores no-op
     // updates.
     repl::UnreplicatedWritesBlock uwb(opCtx);
-    CollectionUpdateArgs args;
+    CollectionUpdateArgs args(snapshottedDoc.value());
     args.criteria = idQuery;
     args.update = BSONObj();
-    collection->updateDocument(opCtx, recordId, snapshottedDoc, result, false, nullptr, &args);
+    collection_internal::updateDocument(opCtx,
+                                        collection,
+                                        recordId,
+                                        snapshottedDoc,
+                                        result,
+                                        collection_internal::kUpdateNoIndexes,
+                                        nullptr,
+                                        &args);
 
     return true;
 }

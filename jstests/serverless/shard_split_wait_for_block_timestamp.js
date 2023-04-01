@@ -1,25 +1,25 @@
 /*
- * Test that the shard split operation waits for recipient nodes to reach the blockTimestamp by
+ * Test that the shard split operation waits for recipient nodes to reach the blockOpTime by
  * pausing replication and observing the operation time out, then reenabling replication and
  * observing a successful split.
  *
- * @tags: [requires_fcv_52, featureFlagShardSplit, serverless]
+ * @tags: [requires_fcv_63, serverless]
  */
+
+import {
+    assertMigrationState,
+    findSplitOperation,
+    ShardSplitTest
+} from "jstests/serverless/libs/shard_split_test.js";
 
 load("jstests/libs/fail_point_util.js");                         // for "configureFailPoint"
 load("jstests/libs/write_concern_util.js");                      // for "stopServerReplication"
 load("jstests/noPassthrough/libs/server_parameter_helpers.js");  // for "setParameter"
-load('jstests/libs/parallel_shell_helpers.js');                  // for "startParallelShell"
-load("jstests/serverless/libs/basic_serverless_test.js");
-
-(function() {
-"use strict";
 
 // Skip db hash check because secondary is left with a different config.
 TestData.skipCheckDBHashes = true;
-const test = new BasicServerlessTest({
-    recipientTagName: "recipientNode",
-    recipientSetName: "recipient",
+
+const test = new ShardSplitTest({
     quickGarbageCollection: true,
     nodeOptions: {
         setParameter:  // Timeout to test that the operation times out waiting for replication
@@ -29,7 +29,7 @@ const test = new BasicServerlessTest({
 test.addRecipientNodes();
 
 const donorPrimary = test.donor.getPrimary();
-const tenantIds = ["tenant1", "tenant2"];
+const tenantIds = [ObjectId(), ObjectId()];
 
 // Stop replication on recipient nodes, and write a lot of data to the set
 test.recipientNodes.forEach(node => stopServerReplication(node));
@@ -41,56 +41,26 @@ for (let i = 0; i < 2000; i++) {
 assert.commandWorked(bulk.execute());
 
 jsTestLog("Running commitShardSplit command");
-const firstOperationId = UUID();
-assert.isnull(findMigration(donorPrimary, firstOperationId));
-const awaitFirstSplitOperation = startParallelShell(
-    funWithArgs(
-        function(migrationId, recipientTagName, recipientSetName, tenantIds) {
-            assert.commandWorked(db.adminCommand(
-                {commitShardSplit: 1, migrationId, recipientTagName, recipientSetName, tenantIds}));
-        },
-        firstOperationId,
-        test.recipientTagName,
-        test.recipientSetName,
-        tenantIds),
-    donorPrimary.port);
+const firstOperation = test.createSplitOperation(tenantIds);
+assert.commandFailedWithCode(firstOperation.commit({retryOnRetryableErrors: false}),
+                             ErrorCodes.TenantMigrationAborted);
 
-awaitFirstSplitOperation();
-assertMigrationState(donorPrimary, firstOperationId, "aborted");
-
-jsTestLog(`Running forgetShardSplit command: ${tojson(firstOperationId)}`);
-test.forgetShardSplit(firstOperationId);
-
-test.waitForGarbageCollection(firstOperationId, tenantIds);
+firstOperation.forget();
+test.cleanupSuccesfulAborted(firstOperation.migrationId, tenantIds);
 
 jsTestLog("Restarting replication on recipient nodes, and running new split operation");
+test.addRecipientNodes();
 test.recipientNodes.forEach(node => restartServerReplication(node));
 test.donor.awaitReplication();
 test.donor.nodes.forEach(
     node => assert.commandWorked(setParameter(node, "shardSplitTimeoutMS", 60 * 1000)));
 
-const secondOperationId = UUID();
-assert.isnull(findMigration(donorPrimary, secondOperationId));
-const awaitSecondSplitOperation = startParallelShell(
-    funWithArgs(
-        function(migrationId, recipientTagName, recipientSetName, tenantIds) {
-            assert.commandWorked(db.adminCommand(
-                {commitShardSplit: 1, migrationId, recipientTagName, recipientSetName, tenantIds}));
-        },
-        secondOperationId,
-        test.recipientTagName,
-        test.recipientSetName,
-        tenantIds),
-    donorPrimary.port);
+const secondOperation = test.createSplitOperation(tenantIds);
+assert.isnull(findSplitOperation(donorPrimary, secondOperation.migrationId));
+assert.commandWorked(secondOperation.commit());
+assertMigrationState(donorPrimary, secondOperation.migrationId, "committed");
 
-awaitSecondSplitOperation();
-assertMigrationState(donorPrimary, secondOperationId, "committed");
+secondOperation.forget();
 
-test.removeRecipientNodesFromDonor();
-
-jsTestLog(`Running forgetShardSplit command: ${tojson(secondOperationId)}`);
-test.forgetShardSplit(secondOperationId);
-
-test.waitForGarbageCollection(secondOperationId, tenantIds);
+test.waitForGarbageCollection(secondOperation.migrationId, tenantIds);
 test.stop();
-})();

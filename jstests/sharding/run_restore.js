@@ -1,6 +1,10 @@
 /**
  * Tests that the "_configsvrRunRestore" command removes documents in config collections not
  * referenced in the "local.system.collections_to_restore" collection.
+ *
+ * @tags: [
+ *      requires_persistence,
+ * ]
  */
 (function() {
 "use strict";
@@ -12,7 +16,7 @@ const s =
 
 let mongos = s.s0;
 let db = s.getDB("test");
-if (!FeatureFlagUtil.isEnabled(db, "SelectiveBackup")) {
+if (!FeatureFlagUtil.isEnabled(s.configRS.getPrimary().getDB("test"), "SelectiveBackup")) {
     jsTestLog("Skipping as featureFlagSelectiveBackup is not enabled");
     s.stop();
     return;
@@ -84,12 +88,8 @@ for (const uuid of [aCollUUID, bCollUUID]) {
 assert.eq(1, mongos.getDB("config").getCollection("collections").find({_id: "test.a"}).count());
 assert.eq(1, mongos.getDB("config").getCollection("collections").find({_id: "test.b"}).count());
 
-assert.eq(1, mongos.getDB("config").getCollection("locks").find({_id: "test"}).count());
-assert.eq(1, mongos.getDB("config").getCollection("locks").find({_id: "test.a"}).count());
-assert.eq(1, mongos.getDB("config").getCollection("locks").find({_id: "test.b"}).count());
-assert.eq(1, mongos.getDB("config").getCollection("locks").find({_id: "unusedDB"}).count());
-
 assert.eq(1, mongos.getDB("config").getCollection("databases").find({_id: "test"}).count());
+
 assert.eq(1, mongos.getDB("config").getCollection("databases").find({_id: "unusedDB"}).count());
 
 s.stop({noCleanData: true});
@@ -116,8 +116,20 @@ assert.commandWorked(conn.getDB("admin").runCommand({setParameter: 1, logLevel: 
 assert.commandFailedWithCode(conn.getDB("admin").runCommand({_configsvrRunRestore: 1}),
                              ErrorCodes.NamespaceNotFound);
 
-// Create the "local.system.collections_to_restore" collection and insert "test.a".
+let [_, uuidStr] = aCollUUID.toString().match(/"((?:\\.|[^"\\])*)"/);
+assert.commandWorked(conn.getDB("local").getCollection("system.collections_to_restore").insert({
+    ns: "test.a",
+    uuid: uuidStr
+}));
+
+// The "local.system.collections_to_restore" collection must have UUID as the correct type.
+assert.commandFailedWithCode(conn.getDB("admin").runCommand({_configsvrRunRestore: 1}),
+                             ErrorCodes.BadValue);
+
+// Recreate the "local.system.collections_to_restore" collection and insert 'test.a'.
+assert(conn.getDB("local").getCollection("system.collections_to_restore").drop());
 assert.commandWorked(conn.getDB("local").createCollection("system.collections_to_restore"));
+
 assert.commandWorked(conn.getDB("local").getCollection("system.collections_to_restore").insert({
     ns: "test.a",
     uuid: aCollUUID
@@ -149,11 +161,6 @@ assert.eq(0,
 
 assert.eq(1, conn.getDB("config").getCollection("collections").find({_id: "test.a"}).count());
 assert.eq(0, conn.getDB("config").getCollection("collections").find({_id: "test.b"}).count());
-
-assert.eq(1, conn.getDB("config").getCollection("locks").find({_id: "test"}).count());
-assert.eq(1, conn.getDB("config").getCollection("locks").find({_id: "test.a"}).count());
-assert.eq(0, conn.getDB("config").getCollection("locks").find({_id: "test.b"}).count());
-assert.eq(0, conn.getDB("config").getCollection("locks").find({_id: "unusedDB"}).count());
 
 assert.eq(1, conn.getDB("config").getCollection("databases").find({_id: "test"}).count());
 assert.eq(0, conn.getDB("config").getCollection("databases").find({_id: "unusedDB"}).count());

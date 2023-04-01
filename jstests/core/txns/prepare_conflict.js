@@ -1,12 +1,19 @@
 /**
  * Tests that prepare conflicts for prepared transactions are retried.
  *
+ * The test runs commands that are not allowed with security token: prepareTransaction, profile.
  * @tags: [
+ *   not_allowed_with_security_token,
  *   uses_prepare_transaction,
  *   uses_transactions,
- *   uses_parallel_shell
+ *   uses_parallel_shell,
+ *   # TODO SERVER-70847: Snapshot reads do not succeed on non-conflicting documents while txn is
+ *   # in prepare.
+ *   cqf_incompatible,
+ *   requires_profiling,
  * ]
  */
+
 (function() {
 "use strict";
 load("jstests/core/txns/libs/prepare_helpers.js");
@@ -76,7 +83,7 @@ assert.commandWorked(testColl.runCommand({
 
 // Enable the profiler to log slow queries. We expect a 'find' to hang until the prepare
 // conflict is resolved.
-assert.commandWorked(testDB.runCommand({profile: 1, level: 1, slowms: 100}));
+assert.commandWorked(testDB.runCommand({profile: 1, slowms: 100}));
 
 const session = db.getMongo().startSession({causalConsistency: false});
 const sessionDB = session.getDatabase(dbName);

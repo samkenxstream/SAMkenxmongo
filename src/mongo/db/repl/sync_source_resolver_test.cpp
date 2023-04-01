@@ -93,14 +93,18 @@ const OpTime lastOpTimeFetched(Timestamp(Seconds(100), 1U), 1LL);
 void SyncSourceResolverTest::setUp() {
     executor::ThreadPoolExecutorTest::setUp();
 
-    _shouldFailRequest = [](const executor::RemoteCommandRequest&) { return false; };
+    _shouldFailRequest = [](const executor::RemoteCommandRequest&) {
+        return false;
+    };
     _executorProxy = std::make_unique<TaskExecutorWithFailureInScheduleRemoteCommand>(
         &getExecutor(), [this](const executor::RemoteCommandRequest& request) {
             return _shouldFailRequest(request);
         });
 
     _response.syncSourceStatus = getDetectableErrorStatus();
-    _onCompletion = [this](const SyncSourceResolverResponse& response) { _response = response; };
+    _onCompletion = [this](const SyncSourceResolverResponse& response) {
+        _response = response;
+    };
 
     _selector = std::make_unique<SyncSourceSelectorMock>();
     _resolver = _makeResolver(lastOpTimeFetched, OpTime());
@@ -127,7 +131,7 @@ std::unique_ptr<SyncSourceResolver> SyncSourceResolverTest::_makeResolver(
         [this](const SyncSourceResolverResponse& response) { _onCompletion(response); });
 }
 
-const NamespaceString nss("local.oplog.rs");
+const NamespaceString nss = NamespaceString::createNamespaceString_forTest("local.oplog.rs");
 
 const OpTime requiredOpTime(Timestamp(200, 1U), 1LL);
 class SyncSourceResolverRequiredOpTimeTest : public SyncSourceResolverTest {
@@ -167,7 +171,8 @@ TEST_F(SyncSourceResolverTest, InvalidConstruction) {
     SyncSourceSelectorMock selector;
     const OpTime lastOpTimeFetched(Timestamp(Seconds(100), 1U), 1LL);
     const OpTime requiredOpTime;
-    auto onCompletion = [](const SyncSourceResolverResponse&) {};
+    auto onCompletion = [](const SyncSourceResolverResponse&) {
+    };
 
     // Null task executor.
     ASSERT_THROWS_CODE_AND_WHAT(
@@ -279,7 +284,9 @@ TEST_F(SyncSourceResolverTest,
 
 TEST_F(SyncSourceResolverTest,
        SyncSourceResolverReturnsScheduleErrorIfTaskExecutorFailsToScheduleRemoteCommand) {
-    _shouldFailRequest = [](const executor::RemoteCommandRequest&) { return true; };
+    _shouldFailRequest = [](const executor::RemoteCommandRequest&) {
+        return true;
+    };
     ASSERT_EQUALS(ErrorCodes::OperationFailed, _resolver->startup());
     ASSERT_EQUALS(ErrorCodes::OperationFailed, _response.syncSourceStatus);
 }
@@ -293,11 +300,11 @@ void _scheduleFirstOplogEntryFetcherResponse(executor::NetworkInterfaceMock* net
     ASSERT_TRUE(net->hasReadyRequests());
     auto request = net->scheduleSuccessfulResponse(makeCursorResponse(0, nss, docs));
     ASSERT_EQUALS(currentSyncSource, request.target);
-    ASSERT_EQUALS(SyncSourceResolver::kLocalOplogNss.db(), request.dbname);
+    ASSERT_EQUALS(NamespaceString::kRsOplogNamespace.db(), request.dbname);
     ASSERT_EQUALS(SyncSourceResolver::kFetcherTimeout, request.timeout);
     auto firstElement = request.cmdObj.firstElement();
     ASSERT_EQUALS("find"_sd, firstElement.fieldNameStringData());
-    ASSERT_EQUALS(SyncSourceResolver::kLocalOplogNss.coll(), firstElement.String());
+    ASSERT_EQUALS(NamespaceString::kRsOplogNamespace.coll(), firstElement.String());
     ASSERT_EQUALS(1, request.cmdObj.getIntField("limit"));
     ASSERT_BSONOBJ_EQ(BSON("$natural" << 1), request.cmdObj.getObjectField("sort"));
 
@@ -311,20 +318,18 @@ void _scheduleFirstOplogEntryFetcherResponse(executor::NetworkInterfaceMock* net
  * Generates oplog entries with the given optime.
  */
 BSONObj _makeOplogEntry(Timestamp ts, long long term) {
-    return DurableOplogEntry(OpTime(ts, term),                 // optime
-                             boost::none,                      // hash
-                             OpTypeEnum::kNoop,                // op type
-                             boost::none,                      // tenant id
-                             NamespaceString("a.a"),           // namespace
-                             boost::none,                      // uuid
-                             boost::none,                      // fromMigrate
-                             repl::OplogEntry::kOplogVersion,  // version
-                             BSONObj(),                        // o
-                             boost::none,                      // o2
-                             {},                               // sessionInfo
-                             boost::none,                      // upsert
-                             Date_t(),                         // wall clock time
-                             {},                               // statement ids
+    return DurableOplogEntry(OpTime(ts, term),                                       // optime
+                             OpTypeEnum::kNoop,                                      // op type
+                             NamespaceString::createNamespaceString_forTest("a.a"),  // namespace
+                             boost::none,                                            // uuid
+                             boost::none,                                            // fromMigrate
+                             repl::OplogEntry::kOplogVersion,                        // version
+                             BSONObj(),                                              // o
+                             boost::none,                                            // o2
+                             {},                                                     // sessionInfo
+                             boost::none,                                            // upsert
+                             Date_t(),     // wall clock time
+                             {},           // statement ids
                              boost::none,  // optime of previous write within same transaction
                              boost::none,  // pre-image optime
                              boost::none,  // post-image optime
@@ -676,11 +681,11 @@ void _scheduleRequiredOpTimeFetcherResponse(executor::NetworkInterfaceMock* net,
     ASSERT_TRUE(net->hasReadyRequests());
     auto request = net->scheduleSuccessfulResponse(makeCursorResponse(0, nss, docs));
     ASSERT_EQUALS(currentSyncSource, request.target);
-    ASSERT_EQUALS(SyncSourceResolver::kLocalOplogNss.db(), request.dbname);
+    ASSERT_EQUALS(NamespaceString::kRsOplogNamespace.db(), request.dbname);
     ASSERT_EQUALS(SyncSourceResolver::kFetcherTimeout, request.timeout);
     auto firstElement = request.cmdObj.firstElement();
     ASSERT_EQUALS("find"_sd, firstElement.fieldNameStringData());
-    ASSERT_EQUALS(SyncSourceResolver::kLocalOplogNss.coll(), firstElement.String());
+    ASSERT_EQUALS(NamespaceString::kRsOplogNamespace.coll(), firstElement.String());
     auto filter = request.cmdObj.getObjectField("filter");
     ASSERT_TRUE(filter.hasField("ts")) << request.cmdObj;
     auto tsFilter = filter.getObjectField("ts");
@@ -899,7 +904,7 @@ TEST_F(SyncSourceResolverRequiredOpTimeTest,
     _shouldFailRequest = [](const executor::RemoteCommandRequest& request) {
         // Fail find commands reading the oplog with filter containing a "ts" predicate.
         if (StringData{request.cmdObj.getStringField("find")} !=
-            SyncSourceResolver::kLocalOplogNss.coll()) {
+            NamespaceString::kRsOplogNamespace.coll()) {
             return false;
         }
 

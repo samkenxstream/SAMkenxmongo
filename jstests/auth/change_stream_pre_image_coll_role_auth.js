@@ -3,8 +3,7 @@
  * root role can issue 'find' and 'remove' commands on the 'config.system.preimages' collections.
  * Verify that if pre-image for the collection has been deleted by the 'root' user.
  * @tags: [
- *  requires_fcv_53,
- *  featureFlagChangeStreamPreAndPostImages,
+ *  requires_fcv_60,
  *  uses_change_streams,
  *  assumes_read_preference_unchanged,
  *  requires_replication,

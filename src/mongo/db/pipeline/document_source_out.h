@@ -91,8 +91,7 @@ public:
                 UnionRequirement::kNotAllowed};
     }
 
-    Value serialize(
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final override;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     /**
      * Creates a new $out stage from the given arguments.
@@ -110,12 +109,14 @@ public:
         return kStageName.rawData();
     }
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
 private:
     DocumentSourceOut(NamespaceString outputNs,
                       const boost::intrusive_ptr<ExpressionContext>& expCtx)
         : DocumentSourceWriter(kStageName.rawData(), std::move(outputNs), expCtx) {}
 
-    static NamespaceString parseNsFromElem(const BSONElement& spec, const StringData& defaultDB);
+    static NamespaceString parseNsFromElem(const BSONElement& spec, const DatabaseName& defaultDB);
 
     void initialize() override;
 
@@ -131,7 +132,8 @@ private:
 
     std::pair<BSONObj, int> makeBatchObject(Document&& doc) const override {
         auto obj = doc.toBson();
-        return {obj, obj.objsize()};
+        tassert(6628900, "_writeSizeEstimator should be initialized", _writeSizeEstimator);
+        return {obj, _writeSizeEstimator->estimateInsertSizeBytes(obj)};
     }
 
     void waitWhileFailPointEnabled() override;

@@ -27,10 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/pipeline/process_interface/mongos_process_interface.h"
 
 #include "mongo/db/auth/authorization_session.h"
@@ -40,11 +36,11 @@
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_merge.h"
 #include "mongo/db/pipeline/sharded_agg_helpers.h"
-#include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/redaction.h"
+#include "mongo/s/analyze_shard_key_role.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
@@ -52,9 +48,12 @@
 #include "mongo/s/query/document_source_merge_cursors.h"
 #include "mongo/s/query/establish_cursors.h"
 #include "mongo/s/query/router_exec_stage.h"
+#include "mongo/s/query_analysis_sample_counters.h"
 #include "mongo/s/stale_shard_version_helpers.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/util/fail_point.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 namespace mongo {
 namespace {
@@ -63,13 +62,13 @@ namespace {
  * Returns the routing information for the namespace set on the passed ExpressionContext. Also
  * verifies that the ExpressionContext's UUID, if present, matches that of the routing table entry.
  */
-StatusWith<ChunkManager> getCollectionRoutingInfo(
+StatusWith<CollectionRoutingInfo> getCollectionRoutingInfo(
     const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     auto catalogCache = Grid::get(expCtx->opCtx)->catalogCache();
     auto swRoutingInfo = catalogCache->getCollectionRoutingInfo(expCtx->opCtx, expCtx->ns);
     // Additionally check that the ExpressionContext's UUID matches the collection routing info.
-    if (swRoutingInfo.isOK() && expCtx->uuid && swRoutingInfo.getValue().isSharded()) {
-        if (!swRoutingInfo.getValue().uuidMatches(*expCtx->uuid)) {
+    if (swRoutingInfo.isOK() && expCtx->uuid && swRoutingInfo.getValue().cm.isSharded()) {
+        if (!swRoutingInfo.getValue().cm.uuidMatches(*expCtx->uuid)) {
             return {ErrorCodes::NamespaceNotFound,
                     str::stream() << "The UUID of collection " << expCtx->ns.ns()
                                   << " changed; it may have been dropped and re-created."};
@@ -99,6 +98,12 @@ bool supportsUniqueKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
 
 }  // namespace
 
+std::unique_ptr<CommonProcessInterface::WriteSizeEstimator>
+MongosProcessInterface::getWriteSizeEstimator(OperationContext* opCtx,
+                                              const NamespaceString& ns) const {
+    return std::make_unique<TargetPrimaryWriteSizeEstimator>();
+}
+
 std::unique_ptr<Pipeline, PipelineDeleter> MongosProcessInterface::attachCursorSourceToPipeline(
     Pipeline* ownedPipeline,
     ShardTargetingPolicy shardTargetingPolicy,
@@ -110,6 +115,27 @@ std::unique_ptr<Pipeline, PipelineDeleter> MongosProcessInterface::attachCursorS
 
     return sharded_agg_helpers::attachCursorToPipeline(
         ownedPipeline, shardTargetingPolicy, std::move(readConcern));
+}
+
+std::unique_ptr<Pipeline, PipelineDeleter> MongosProcessInterface::attachCursorSourceToPipeline(
+    const AggregateCommandRequest& aggRequest,
+    Pipeline* pipeline,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    boost::optional<BSONObj> shardCursorsSortSpec,
+    ShardTargetingPolicy shardTargetingPolicy,
+    boost::optional<BSONObj> readConcern) {
+    // On mongos we can't have local cursors.
+    tassert(7393502,
+            "shardTargetingPolicy cannot be kNotAllowed on mongos",
+            shardTargetingPolicy != ShardTargetingPolicy::kNotAllowed);
+    std::unique_ptr<Pipeline, PipelineDeleter> targetPipeline(pipeline,
+                                                              PipelineDeleter(expCtx->opCtx));
+    return sharded_agg_helpers::targetShardsAndAddMergeCursors(
+        expCtx,
+        std::make_pair(aggRequest, std::move(targetPipeline)),
+        shardCursorsSortSpec,
+        shardTargetingPolicy,
+        std::move(readConcern));
 }
 
 BSONObj MongosProcessInterface::preparePipelineAndExplain(Pipeline* ownedPipeline,
@@ -157,10 +183,10 @@ boost::optional<Document> MongosProcessInterface::lookupSingleDocument(
             str::stream() << "Looking up document matching " << redact(filter.toBson()),
             [&]() -> std::vector<RemoteCursor> {
                 // Verify that the collection exists, with the correct UUID.
-                auto cm = uassertStatusOK(getCollectionRoutingInfo(foreignExpCtx));
+                auto cri = uassertStatusOK(getCollectionRoutingInfo(foreignExpCtx));
 
                 // Finalize the 'find' command object based on the routing table information.
-                if (findCmdIsByUuid && cm.isSharded()) {
+                if (findCmdIsByUuid && cri.cm.isSharded()) {
                     // Find by UUID and shard versioning do not work together (SERVER-31946).  In
                     // the sharded case we've already checked the UUID, so find by namespace is
                     // safe.  In the unlikely case that the collection has been deleted and a new
@@ -176,7 +202,7 @@ boost::optional<Document> MongosProcessInterface::lookupSingleDocument(
                 // is present, we may need to scatter-gather the query to all shards in order to
                 // find the document.
                 auto requests = getVersionedRequestsForTargetedShards(
-                    expCtx->opCtx, nss, cm, findCmd, filterObj, CollationSpec::kSimpleSpec);
+                    expCtx->opCtx, nss, cri, findCmd, filterObj, CollationSpec::kSimpleSpec);
 
                 // Dispatch the requests. The 'establishCursors' method conveniently prepares the
                 // result into a vector of cursor responses for us.
@@ -286,6 +312,13 @@ void MongosProcessInterface::_reportCurrentOpsForPrimaryOnlyServices(
     CurrentOpSessionsMode sessionMode,
     std::vector<BSONObj>* ops) const {};
 
+void MongosProcessInterface::_reportCurrentOpsForQueryAnalysis(OperationContext* opCtx,
+                                                               std::vector<BSONObj>* ops) const {
+    if (analyze_shard_key::supportsSamplingQueries(opCtx)) {
+        analyze_shard_key::QueryAnalysisSampleCounters::get(opCtx).reportForCurrentOp(ops);
+    }
+}
+
 std::vector<GenericCursor> MongosProcessInterface::getIdleCursors(
     const boost::intrusive_ptr<ExpressionContext>& expCtx, CurrentOpUserMode userMode) const {
     invariant(hasGlobalServiceContext());
@@ -295,7 +328,7 @@ std::vector<GenericCursor> MongosProcessInterface::getIdleCursors(
 }
 
 bool MongosProcessInterface::isSharded(OperationContext* opCtx, const NamespaceString& nss) {
-    auto cm =
+    auto [cm, _] =
         uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
     return cm.isSharded();
 }
@@ -327,11 +360,12 @@ std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
 MongosProcessInterface::ensureFieldsUniqueOrResolveDocumentKey(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     boost::optional<std::set<FieldPath>> fieldPaths,
-    boost::optional<ChunkVersion> targetCollectionVersion,
+    boost::optional<ChunkVersion> targetCollectionPlacementVersion,
     const NamespaceString& outputNs) const {
     invariant(expCtx->inMongos);
-    uassert(
-        51179, "Received unexpected 'targetCollectionVersion' on mongos", !targetCollectionVersion);
+    uassert(51179,
+            "Received unexpected 'targetCollectionPlacementVersion' on mongos",
+            !targetCollectionPlacementVersion);
 
     if (fieldPaths) {
         uassert(51190,
@@ -356,12 +390,16 @@ MongosProcessInterface::ensureFieldsUniqueOrResolveDocumentKey(
     // collection was dropped a long time ago. Because of this, we are okay with piggy-backing
     // off another thread's request to refresh the cache, simply waiting for that request to
     // return instead of forcing another refresh.
-    targetCollectionVersion = refreshAndGetCollectionVersion(expCtx, outputNs);
+    boost::optional<ShardVersion> targetCollectionVersion =
+        refreshAndGetCollectionVersion(expCtx, outputNs);
+    targetCollectionPlacementVersion = targetCollectionVersion
+        ? boost::make_optional(targetCollectionVersion->placementVersion())
+        : boost::none;
 
     auto docKeyPaths = collectDocumentKeyFieldsActingAsRouter(expCtx->opCtx, outputNs);
     return {std::set<FieldPath>(std::make_move_iterator(docKeyPaths.begin()),
                                 std::make_move_iterator(docKeyPaths.end())),
-            targetCollectionVersion};
+            targetCollectionPlacementVersion};
 }
 
 }  // namespace mongo

@@ -27,7 +27,8 @@ error_categories:
     - CloseConnectionError
     - VersionedAPIError
     - ValidationError
-    # Codes for internal use only that must never be returned in a network response.
+    # Codes for internal use only. The codes can be passed between servers in a cluster, but must
+    # never be returned to the client in a network response.
     - InternalOnly
     - TenantMigrationError
     - TenantMigrationConflictError
@@ -96,9 +97,9 @@ error_codes:
     - {code: 60,name: OBSOLETE_DatabaseNotFound}
     - {code: 61,name: ShardKeyNotFound}
     - {code: 62,name: OplogOperationUnsupported}
-    - {code: 63,name: StaleShardVersion,categories: [StaleShardVersionError,NeedRetargettingError]}
+    - {code: 63,name: OBSOLETE_StaleShardVersion}
     - {code: 64,name: WriteConcernFailed,categories: [WriteConcernError]}
-    - {code: 65,name: MultipleErrorsOccurred}
+    - {code: 65,name: MultipleErrorsOccurred, extra: MultipleErrorsOccurredInfo}
     - {code: 66,name: ImmutableField}
     - {code: 67,name: CannotCreateIndex}
     - {code: 68,name: IndexAlreadyExists}
@@ -171,7 +172,7 @@ error_codes:
     #- {code: 131,name: RLPInitializationFailed} # Removed in 4.2
     - {code: 132,name: OBSOLETE_ConfigServersInconsistent}
     - {code: 133,name: FailedToSatisfyReadPreference}
-    - {code: 134,name: ReadConcernMajorityNotAvailableYet}
+    - {code: 134,name: ReadConcernMajorityNotAvailableYet, categories: [RetriableError]}
     - {code: 135,name: StaleTerm}
     - {code: 136,name: CappedPositionLost}
     - {code: 137,name: IncompatibleShardingConfigVersion}
@@ -187,6 +188,8 @@ error_codes:
     - {code: 147,name: ZLibError}
     - {code: 148,name: ReadConcernMajorityNotEnabled,categories: [VoteAbortError]}
     - {code: 149,name: NoConfigPrimary}
+    # This error code is obsolete as of version 6.0 and no new places where it is thrown should be
+    # added. Use StaleConfig.
     - {code: 150,name: StaleEpoch,
                  categories: [StaleShardVersionError,NeedRetargettingError],
                  extra: StaleEpochInfo,
@@ -326,8 +329,8 @@ error_codes:
     - {code: 280,name: ChangeStreamFatalError,categories: [NonResumableChangeStreamError]}
 
     # TransactionCoordinatorSteppingDown gets converted to InterruptedDueToReplStateChange
-    - {code: 281,name: TransactionCoordinatorSteppingDown,categories: [Interruption,InternalOnly]}
-    - {code: 282,name: TransactionCoordinatorReachedAbortDecision,categories: [Interruption,InternalOnly]}
+    - {code: 281,name: TransactionCoordinatorSteppingDown,categories: [Interruption]}
+    - {code: 282,name: TransactionCoordinatorReachedAbortDecision,categories: [Interruption]}
 
     - {code: 283,name: WouldChangeOwningShard,extra: WouldChangeOwningShardInfo}
     - {code: 284,name: ForTestingErrorExtraInfoWithExtraInfoInNamespace,
@@ -459,7 +462,7 @@ error_codes:
 
     - {code: 359, name: CannotConvertIndexToUnique, extra: CannotConvertIndexToUniqueInfo}
 
-    - {code: 360, name: ShardVersionRefreshCanceled, categories: [InternalOnly]}
+    - {code: 360, name: PlacementVersionRefreshCanceled, categories: [InternalOnly]}
 
     - {code: 361, name: CollectionUUIDMismatch, extra: CollectionUUIDMismatchInfo}
 
@@ -467,15 +470,61 @@ error_codes:
 
     - {code: 363, name: RetryableTransactionInProgress}
 
-    - {code: 364, name: TxnRetryCounterNotSupported}
-
     - {code: 365, name: TemporarilyUnavailable}
 
     - {code: 366, name: WouldChangeOwningShardDeletedNoDocument}
 
     - {code: 367, name: FLECompactionPlaceholder}
-    - {code: 368, name: FLEStateCollectionContention}
     - {code: 369, name: FLETransactionAbort}
+    - {code: 370, name: CannotDropShardKeyIndex}
+
+    - {code: 371, name: UserWritesBlocked}
+
+    - {code: 372, name: CloseConnectionForShutdownCommand, categories: [CloseConnectionError,InternalOnly]}
+
+    - {code: 373, name: InternalTransactionsExhaustiveFindHasMore}
+
+    - {code: 374, name: TransactionAPIMustRetryTransaction, categories: [InternalOnly]}
+    - {code: 375, name: TransactionAPIMustRetryCommit, categories: [InternalOnly]}
+    - {code: 376, name: ChangeStreamNotEnabled}
+    - {code: 377, name: FLEMaxTagLimitExceeded }
+    - {code: 378, name: NonConformantBSON, categories: [ValidationError]}
+
+    - {code: 379, name: DatabaseMetadataRefreshCanceled, categories: [InternalOnly]}
+    - {code: 380, name: RequestAlreadyFulfilled}
+
+    - {code: 381, name: ReshardingCoordinatorServiceConflictingOperationInProgress, extra: ReshardingCoordinatorServiceConflictingOperationInProgressInfo, categories: [InternalOnly]}
+
+    - {code: 382, name: RemoteCommandExecutionError, extra: AsyncRPCErrorInfo, categories: [InternalOnly]}
+
+    - {code: 383, name: CollectionIsEmptyLocally}
+
+    - {code: 384, name: ConnectionError, categories: [NetworkError,RetriableError,InternalOnly]}
+
+    - {code: 385, name: ConflictingServerlessOperation}
+
+    - {code: 386, name: DuplicateKeyId}
+
+    - {code: 387, name: EncounteredFLEPayloadWhileRedacting}
+
+    - {code: 388, name: TransactionTooLargeForCache}
+    - {code: 389, name: LibmongocryptError}
+
+    - {code: 390, name: InvalidSignature}
+    - {code: 391, name: ReauthenticationRequired}
+    - {code: 392, name: InvalidJWT}
+    - {code: 393, name: InvalidTenantId}
+
+    - {code: 394, name: MovePrimaryRecipientDocNotFound, categories: [InternalOnly]}
+
+    - {code: 395, name: TruncatedSerialization}
+
+    # This error code is not generated internally in mongod/s servers, but must be parsed and
+    # reserve an error code. It can be returned by a remote search index management server.
+    - {code: 396, name: IndexInformationTooLarge}
+    
+    - {code: 397, name: MovePrimaryAborted}
+    - {code: 398, name: StreamTerminated, categories: [CloseConnectionError]}
 
     # Error codes 4000-8999 are reserved.
 

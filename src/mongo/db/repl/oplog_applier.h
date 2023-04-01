@@ -67,10 +67,10 @@ public:
         Options() = delete;
         explicit Options(OplogApplication::Mode inputMode)
             : mode(inputMode),
-              allowNamespaceNotFoundErrorsOnCrudOps(
-                  inputMode == OplogApplication::Mode::kInitialSync ||
-                  inputMode == OplogApplication::Mode::kRecovering),
-              skipWritesToOplog(inputMode == OplogApplication::Mode::kRecovering) {}
+              allowNamespaceNotFoundErrorsOnCrudOps(inputMode ==
+                                                        OplogApplication::Mode::kInitialSync ||
+                                                    OplogApplication::inRecovering(inputMode)),
+              skipWritesToOplog(OplogApplication::inRecovering(inputMode)) {}
 
         // Used to determine which operations should be applied. Only initial sync will set this to
         // be something other than the null optime.
@@ -159,8 +159,10 @@ public:
     /**
      * Calls the OplogBatcher's getNextApplierBatch.
      */
-    StatusWith<std::vector<OplogEntry>> getNextApplierBatch(OperationContext* opCtx,
-                                                            const BatchLimits& batchLimits);
+    StatusWith<std::vector<OplogEntry>> getNextApplierBatch(
+        OperationContext* opCtx,
+        const BatchLimits& batchLimits,
+        Milliseconds waitToFillBatch = Milliseconds(0));
 
     const Options& getOptions() const;
 

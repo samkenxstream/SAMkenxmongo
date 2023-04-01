@@ -33,6 +33,7 @@
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_root_doc_eq.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -110,8 +111,18 @@ TEST(InternalSchemaRootDocEqMatchExpression, EquivalentToClone) {
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     Matcher rootDocEq(std::move(query), expCtx);
 
-    auto clone = rootDocEq.getMatchExpression()->shallowClone();
+    auto clone = rootDocEq.getMatchExpression()->clone();
     ASSERT_TRUE(rootDocEq.getMatchExpression()->equivalent(clone.get()));
 }
+
+DEATH_TEST_REGEX(InternalSchemaRootDocEqMatchExpression,
+                 GetChildFailsIndexLargerThanZero,
+                 "Tripwire assertion.*6400218") {
+    InternalSchemaRootDocEqMatchExpression rootDocEq(BSON("a" << 1 << "b" << BSON("c" << 1)));
+
+    ASSERT_EQ(rootDocEq.numChildren(), 0);
+    ASSERT_THROWS_CODE(rootDocEq.getChild(0), AssertionException, 6400218);
+}
+
 }  // namespace
 }  // namespace mongo

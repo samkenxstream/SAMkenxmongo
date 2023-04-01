@@ -35,7 +35,7 @@ global:
         - "mongo/idl/idl_test.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/idl/unittest_import.idl"
     - "mongo/db/auth/access_checks.idl"
     - "mongo/db/auth/action_type.idl"
@@ -179,6 +179,7 @@ structs:
 
     reply_type_struct:
         description: Used for testing the IDL command reply_type field
+        is_command_reply: true
         fields:
             reply_field: int
 
@@ -286,6 +287,12 @@ structs:
         description: UnitTest for a single namespacestring
         fields:
             value: namespacestring
+
+    two_base64string:
+        description: UnitTest for a single base64string
+        fields:
+            basic: base64string
+            url: base64urlstring
 
 ##################################################################################################
 #
@@ -414,6 +421,18 @@ structs:
                 type: object
                 always_serialize: false
                 optional: true
+
+##################################################################################################
+#
+# Test struct with namespace string field
+#
+##################################################################################################
+    NamespaceInfoStruct:
+        description: "Test struct with namespace string field."
+        strict: true
+        fields:
+            ns:
+                type: namespacestring
 
 ##################################################################################################
 #
@@ -644,6 +663,18 @@ structs:
 # Test struct with variant
 #
 ##################################################################################################
+    insert_variant_struct:
+        description: Struct with first field name insert
+        strict: false
+        fields:
+            insert: int
+
+    update_variant_struct:
+        description: Struct with first field name update
+        strict: false
+        fields:
+            update: string
+    
     one_variant:
         description: UnitTest for a single variant which accepts int or string
         strict: false
@@ -710,6 +741,16 @@ structs:
                     - int
                     - array<one_string>
 
+    one_variant_two_structs:
+        description: UnitTest for a single variant which accepts a one_string or one_int
+        strict: false
+        fields:
+            value:
+                type:
+                    variant:
+                    - insert_variant_struct
+                    - update_variant_struct
+
     one_variant_two_arrays:
         description: UnitTest for a single variant which accepts array of int or array of string
         strict: false
@@ -728,6 +769,13 @@ structs:
                 type:
                     variant: [int, string]
                 optional: true
+
+    one_array_variant:
+        description: UnitTest for an array of variant
+        strict: false
+        fields:
+            value:
+                type: array<variant<update_variant_struct, insert_variant_struct>>
 
     two_variants:
         description: UnitTest for a struct with two variant fields
@@ -875,6 +923,47 @@ structs:
                 type: array<one_int>
                 validator: { callback: 'validateOneInt' }
 
+    int_array_validators:
+        description: Struct using fields with integer array validators
+        fields:
+            int_even:
+                type: array<int>
+                validator: { callback: 'validateEvenNumber' }
+
+    string_array_validators:
+        description: Struct using fields with string array validators
+        fields:
+            caps_strings:
+                type: array<string>
+                validator: { callback: 'validateAllCapsArray' }
+
+##################################################################################################
+#
+# Durations
+#
+##################################################################################################
+
+    struct_with_durations:
+        description: A struct expecting durations.
+        fields:
+            secs:
+                type: seconds
+                optional: true
+            millis:
+                type: milliseconds
+                optional: true
+
+##################################################################################################
+#
+# Date types
+#
+##################################################################################################
+
+    struct_with_epochs:
+        description: A struct expecting a unix epoch and a millis epoch.
+        fields:
+            unix: unixEpoch
+            ecma: millisEpoch
 
 ##################################################################################################
 #
@@ -946,6 +1035,16 @@ commands:
                 type: array<object_basic_type>
                 supports_doc_sequence: true
                 optional: true
+
+    DocSequenceCommandArrayVariant:
+        description: UnitTest for a basic command with a array<variant> field marked with supports_doc_sequence
+        command_name: DocSequenceCommandArrayVariant
+        namespace: concatenate_with_db
+        api_version: ""
+        fields:
+            structs:
+                type: array<variant<update_variant_struct, insert_variant_struct>>
+                supports_doc_sequence: true
 
     DocSequenceCommandNonStrict:
         description: UnitTest for a basic command with fields marked with supports_doc_sequence and non-strict parsing
@@ -1045,6 +1144,15 @@ commands:
         type:
             variant: [bool, one_string]
 
+    CommandTypeNamespaceCommand:
+        description: Command with custom type namespacestring
+        command_name: CommandTypeNamespaceCommand
+        namespace: type
+        type: namespacestring
+        api_version: ""
+        fields:
+            field1: int
+
     _underscore_command:
         description: Command with custom type string
         command_name: _underscore_command
@@ -1118,6 +1226,29 @@ commands:
         reply_type: OkReply
         fields:
             anyTypeField: IDLAnyTypeOwned
+
+    CommandWithNamespaceMember:
+        description: "A mock command to test field with namespacestring"
+        command_name: CommandWithNamespaceMember
+        namespace: ignored
+        api_version: ""
+        fields:
+            field1:
+                type: namespacestring
+            field2:
+                type: array<namespacestring>
+
+    CommandWithNamespaceStruct:
+        description: UnitTest for a command whose struct field has namespace string data
+        command_name: CommandWithNamespaceStruct
+        namespace: ignored
+        api_version: ""
+        fields:
+            field1:
+                type: NamespaceInfoStruct
+            field2:
+                type: array<NamespaceInfoStruct>
+                supports_doc_sequence: true
 
     AccessCheckNone:
         description: A Stable API command with access_check and none
@@ -1209,29 +1340,3 @@ commands:
         access_check:
             none: true
         reply_type: OkReply
-
-##################################################################################################
-#
-# Test field lists
-#
-##################################################################################################
-
-generic_argument_lists:
-    my_generic_args_list:
-        description: UnitTest for generic arguments list
-        fields:
-            my_generic_field_0:
-                forward_to_shards: false
-            my_generic_field_1:
-                forward_to_shards: true
-            my_generic_field_3: {}
-
-generic_reply_field_lists:
-    my_generic_reply_field_list:
-        description: UnitTest for generic reply fields list
-        fields:
-            my_generic_field_0:
-                forward_from_shards: false
-            my_generic_field_1:
-                forward_from_shards: true
-            my_generic_field_3: {}

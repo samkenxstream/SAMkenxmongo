@@ -29,22 +29,14 @@
 
 #pragma once
 
-#include <memory>
 #include <vector>
 
-#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
-#include "mongo/db/exec/filter.h"
+#include "mongo/db/field_ref.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
-#include "mongo/db/query/index_bounds.h"
-#include "mongo/db/repl/oplog_entry.h"
 
 namespace mongo {
-
-class CanonicalQuery;
-class FieldRef;
-class OperationContext;
 
 /**
  * Helper struct when generating flattened bounds below
@@ -114,11 +106,17 @@ public:
 
     bool hasHashedPrefix() const;
 
-    BSONElement getHashedField() const;
+    BSONElement getHashedField() const {
+        return _hashedField;
+    }
 
-    const KeyPattern& getKeyPattern() const;
+    const KeyPattern& getKeyPattern() const {
+        return _keyPattern;
+    }
 
-    const std::vector<std::unique_ptr<FieldRef>>& getKeyPatternFields() const;
+    const std::vector<std::unique_ptr<FieldRef>>& getKeyPatternFields() const {
+        return _keyPatternPaths;
+    }
 
     const BSONObj& toBSON() const;
 
@@ -214,117 +212,42 @@ public:
     BSONObj extractShardKeyFromDocThrows(const BSONObj& doc) const;
 
     /**
-     * Given an Oplog entry, extracts the shard key corresponding to the key pattern for insert,
-     * update, and delete op types. If the op type is not a CRUD operation, an empty BSONObj()
-     * will be returned.
-     *
-     * For update and delete operations, the Oplog entry will contain an object with the document
-     * key.
-     *
-     * For insert operations, the Oplog entry will contain the original document from which the
-     * document key must be extracted
-     *
-     * Examples:
-     *  For KeyPattern {'a.b': 1}
-     *   If the oplog entries contains field op='i'
-     *     oplog contains: { a : { b : "1" } }
-     *   If the oplog entries contains field op='u' or op='d'
-     *     oplog contains: { 'a.b': "1" }
-     */
-    BSONObj extractShardKeyFromOplogEntry(const repl::OplogEntry& entry) const;
-
-    /**
      * Returns the document with missing shard key values set to null.
      */
     BSONObj emplaceMissingShardKeyValuesForDocument(BSONObj doc) const;
 
     /**
-     * Given a simple BSON query, extracts the shard key corresponding to the key pattern
-     * from equality matches in the query.  The query expression *must not* be a complex query
-     * with sorts or other attributes.
-     *
-     * Logically, the equalities in the BSON query can be serialized into a BSON document and
-     * then a shard key is extracted from this equality document.
-     *
-     * NOTE: BSON queries and BSON documents look similar but are different languages.  Use the
-     * correct shard key extraction function.
-     *
-     * Returns !OK status if the query cannot be parsed.  Returns an empty BSONObj() if there is
-     * no shard key found in the query equalities.
-     *
-     * Examples:
-     *  If the key pattern is { a : 1 }
-     *   { a : "hi", b : 4 } --> returns { a : "hi" }
-     *   { a : { $eq : "hi" }, b : 4 } --> returns { a : "hi" }
-     *   { $and : [{a : { $eq : "hi" }}, { b : 4 }] } --> returns { a : "hi" }
-     *  If the key pattern is { 'a.b' : 1 }
-     *   { a : { b : "hi" } } --> returns { 'a.b' : "hi" }
-     *   { 'a.b' : "hi" } --> returns { 'a.b' : "hi" }
-     *   { a : { b : { $eq : "hi" } } } --> returns {} because the query language treats this as
-     *                                                 a : { $eq : { b : ... } }
-     */
-    StatusWith<BSONObj> extractShardKeyFromQuery(OperationContext* opCtx,
-                                                 const NamespaceString& nss,
-                                                 const BSONObj& basicQuery) const;
-
-    // Used to parse queries that contain let parameters and runtime constants.
-    StatusWith<BSONObj> extractShardKeyFromQuery(boost::intrusive_ptr<ExpressionContext> expCtx,
-                                                 const BSONObj& basicQuery) const;
-
-    BSONObj extractShardKeyFromQuery(const CanonicalQuery& query) const;
-
-    /**
-     * Returns true if the shard key pattern can ensure that the unique index pattern is
-     * respected across all shards.
+     * Returns true if the shard key pattern can ensure that the index uniqueness is respected
+     * across all shards.
      *
      * Primarily this just checks whether the shard key pattern field names are equal to or a
-     * prefix of the unique index pattern field names.  Since documents with the same fields in
-     * the shard key pattern are guaranteed to go to the same shard, and all documents must
-     * contain the full shard key, a unique index with a shard key pattern prefix can be sure
-     * when resolving duplicates that documents on other shards will have different shard keys,
-     * and so are not duplicates.
+     * prefix of the 'unique' or 'prepareUnique' index pattern field names. Since documents with the
+     * same fields in the shard key pattern are guaranteed to go to the same shard, and all
+     * documents must contain the full shard key, an index with {unique: true} or {prepareUnique:
+     * true} and a shard key pattern prefix can be sure when resolving duplicates that documents on
+     * other shards will have different shard keys, and so are not duplicates.
      *
      * Hashed shard key patterns are similar to ordinary patterns in that they guarantee similar
      * shard keys go to the same shard.
      *
      * Examples:
-     *     shard key {a : 1} is compatible with a unique index on {_id : 1}
-     *     shard key {a : 1} is compatible with a unique index on {a : 1 , b : 1}
-     *     shard key {a : 1} is compatible with a unique index on {a : -1 , b : 1 }
-     *     shard key {a : "hashed"} is compatible with a unique index on {a : 1}
-     *     shard key {a : 1} is not compatible with a unique index on {b : 1}
-     *     shard key {a : "hashed" , b : 1 } is not compatible with unique index on { b : 1 }
+     *     shard key {a : 1} is compatible with a unique/prepareUnique index on {_id : 1}
+     *     shard key {a : 1} is compatible with a unique/prepareUnique index on {a : 1, b : 1}
+     *     shard key {a : 1} is compatible with a unique/prepareUnique index on {a : -1, b : 1}
+     *     shard key {a : "hashed"} is compatible with a unique/prepareUnique index on {a : 1}
+     *     shard key {a : 1} is not compatible with a unique/prepareUnique index on {b : 1}
+     *     shard key {a : "hashed", b : 1} is not compatible with unique/prepareUnique index on
+     *     {b : 1}
      *
      * All unique index patterns starting with _id are assumed to be enforceable by the fact
      * that _ids must be unique, and so all unique _id prefixed indexes are compatible with
      * any shard key pattern.
      *
-     * NOTE: We assume 'uniqueIndexPattern' is a valid unique index pattern - a pattern like
-     * { k : "hashed" } is not capable of being a unique index and is an invalid argument to
-     * this method.
+     * NOTE: We assume 'indexPattern' is a valid unique/prepareUnique index pattern - a pattern like
+     * { k : "hashed" } is not capable of being a unique/prepareUnique index and is an invalid
+     * argument to this method.
      */
-    bool isUniqueIndexCompatible(const BSONObj& uniqueIndexPattern) const;
-
-    /**
-     * Return an ordered list of bounds generated using this KeyPattern and the
-     * bounds from the IndexBounds.  This function is used in sharding to
-     * determine where to route queries according to the shard key pattern.
-     *
-     * Examples:
-     *
-     * Key { a: 1 }, Bounds a: [0] => { a: 0 } -> { a: 0 }
-     * Key { a: 1 }, Bounds a: [2, 3) => { a: 2 } -> { a: 3 }  // bound inclusion ignored.
-     *
-     * The bounds returned by this function may be a superset of those defined
-     * by the constraints.  For instance, if this KeyPattern is {a : 1, b: 1}
-     * Bounds: { a : {$in : [1,2]} , b : {$in : [3,4,5]} }
-     *         => {a : 1 , b : 3} -> {a : 1 , b : 5}, {a : 2 , b : 3} -> {a : 2 , b : 5}
-     *
-     * If the IndexBounds are not defined for all the fields in this keypattern, which
-     * means some fields are unsatisfied, an empty BoundList could return.
-     *
-     */
-    BoundList flattenBounds(const IndexBounds& indexBounds) const;
+    bool isIndexUniquenessCompatible(const BSONObj& indexPattern) const;
 
     /**
      * Returns true if the key pattern has an "_id" field of any flavor.
@@ -334,6 +257,8 @@ public:
     };
 
     size_t getApproximateSize() const;
+
+    static bool isValidShardKeyElementForStorage(const BSONElement& element);
 
 private:
     KeyPattern _keyPattern;

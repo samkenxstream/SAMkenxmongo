@@ -30,62 +30,17 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/exec/inclusion_projection_executor.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
 
 namespace mongo::projection_executor {
 using ComputedFieldsPolicy = ProjectionPolicies::ComputedFieldsPolicy;
 
 Document FastPathEligibleInclusionNode::applyToDocument(const Document& inputDoc) const {
-    // A fast-path inclusion projection supports inclusion-only fields, so make sure we have no
-    // computed fields in the specification.
-    invariant(!_subtreeContainsComputedFields);
-
-    // If we can get the backing BSON object off the input document without allocating an owned
-    // copy, then we can apply a fast-path BSON-to-BSON inclusion projection.
-    if (auto bson = inputDoc.toBsonIfTriviallyConvertible()) {
-        BSONObjBuilder bob;
-        _applyProjections(*bson, &bob);
-
-        Document outputDoc{bob.obj()};
-        // Make sure that we always pass through any metadata present in the input doc.
-        if (inputDoc.metadata()) {
-            MutableDocument md{std::move(outputDoc)};
-            md.copyMetaDataFrom(inputDoc);
-            return md.freeze();
-        }
-        return outputDoc;
+    if (auto outputDoc = tryApplyFastPathProjection(inputDoc)) {
+        return outputDoc.get();
     }
-
     // A fast-path projection is not feasible, fall back to default implementation.
     return InclusionNode::applyToDocument(inputDoc);
-}
-
-void FastPathEligibleInclusionNode::_applyProjections(BSONObj bson, BSONObjBuilder* bob) const {
-    auto nFieldsNeeded = _projectedFields.size() + _children.size();
-
-    BSONObjIterator it{bson};
-    while (it.more() && nFieldsNeeded > 0) {
-        const auto bsonElement{it.next()};
-        const auto fieldName{bsonElement.fieldNameStringData()};
-
-        if (_projectedFields.find(fieldName) != _projectedFields.end()) {
-            bob->append(bsonElement);
-            --nFieldsNeeded;
-        } else if (auto childIt = _children.find(fieldName); childIt != _children.end()) {
-            auto child = static_cast<FastPathEligibleInclusionNode*>(childIt->second.get());
-
-            if (bsonElement.type() == BSONType::Object) {
-                BSONObjBuilder subBob{bob->subobjStart(fieldName)};
-                child->_applyProjections(bsonElement.embeddedObject(), &subBob);
-            } else if (bsonElement.type() == BSONType::Array) {
-                BSONArrayBuilder subBab{bob->subarrayStart(fieldName)};
-                child->_applyProjectionsToArray(bsonElement.embeddedObject(), &subBab);
-            } else {
-                // The projection semantics dictate to exclude the field in this case if it
-                // contains a scalar.
-            }
-            --nFieldsNeeded;
-        }
-    }
 }
 
 namespace {
@@ -99,6 +54,49 @@ boost::intrusive_ptr<Expression> substituteInExpr(boost::intrusive_ptr<Expressio
     }
     return ex;
 };
+
+/**
+ * Returns a vector of top-level dependencies where each index i in the vector corresponds to the
+ * dependencies from the ith expression according to 'orderToProcess'.
+ */
+std::vector<OrderedPathSet> getTopLevelDeps(
+    const std::vector<std::string>& orderToProcess,
+    const StringMap<boost::intrusive_ptr<Expression>>& expressions,
+    const StringMap<std::unique_ptr<ProjectionNode>>& children) {
+    std::vector<OrderedPathSet> topLevelDeps;
+    for (const auto& field : orderToProcess) {
+        DepsTracker deps;
+        if (auto exprIt = expressions.find(field); exprIt != expressions.end()) {
+            expression::addDependencies(exprIt->second.get(), &deps);
+        } else {
+            // Each expression in orderToProcess should either be in expressions or children.
+            auto childIt = children.find(field);
+            tassert(6657000, "Unable to calculate dependencies", childIt != children.end());
+            childIt->second->reportDependencies(&deps);
+        }
+
+        topLevelDeps.push_back(
+            DepsTracker::simplifyDependencies(deps.fields, DepsTracker::TruncateToRootLevel::yes));
+    }
+    return topLevelDeps;
+}
+
+/**
+ * Returns whether or not there is an expression in the projection which depends on 'field' other
+ * than the expression which computes 'field'. For example, given field "a" and projection
+ * {a: "$b", c: {$sum: ["$a", 5]}}, return true. Given field "a" and projection
+ * {a: {$sum: ["$a", 5]}, c: "$b"}, return false. 'field' should be a top level path.
+ */
+bool computedExprDependsOnField(const std::vector<OrderedPathSet>& topLevelDeps,
+                                const std::string& field,
+                                const size_t fieldIndex) {
+    for (size_t i = 0; i < topLevelDeps.size(); i++) {
+        if (i != fieldIndex && topLevelDeps[i].count(field) > 0) {
+            return true;
+        }
+    }
+    return false;
+}
 }  // namespace
 
 std::pair<BSONObj, bool> InclusionNode::extractComputedProjectionsInProject(
@@ -109,8 +107,8 @@ std::pair<BSONObj, bool> InclusionNode::extractComputedProjectionsInProject(
         return {BSONObj{}, false};
     }
 
-    DepsTracker allDeps;
-    reportDependencies(&allDeps);
+    std::vector<OrderedPathSet> topLevelDeps =
+        getTopLevelDeps(_orderToProcessAdditionsAndChildren, _expressions, _children);
 
     // Auxiliary vector with extracted computed projections: <name, expression, replacement
     // strategy>. If the replacement strategy flag is true, the expression is replaced with a
@@ -118,19 +116,15 @@ std::pair<BSONObj, bool> InclusionNode::extractComputedProjectionsInProject(
     std::vector<std::tuple<StringData, boost::intrusive_ptr<Expression>, bool>>
         addFieldsExpressions;
     bool replaceWithProjField = true;
-    for (auto&& field : _orderToProcessAdditionsAndChildren) {
+    for (size_t i = 0; i < _orderToProcessAdditionsAndChildren.size(); i++) {
+        auto&& field = _orderToProcessAdditionsAndChildren[i];
+
         if (reservedNames.count(field) > 0) {
             // Do not pushdown computed projection with reserved name.
             replaceWithProjField = false;
             continue;
         }
-        if (allDeps.fields.count(field) > 0) {
-            // Do not extract a computed projection if its name is the same as a dependent field. If
-            // the extracted $addFields were to be placed before this projection, the dependency
-            // with the common name would be shadowed by the computed projection.
-            replaceWithProjField = false;
-            continue;
-        }
+
         auto expressionIt = _expressions.find(field);
         if (expressionIt == _expressions.end()) {
             // After seeing the first dotted path expression we need to replace computed
@@ -138,13 +132,17 @@ std::pair<BSONObj, bool> InclusionNode::extractComputedProjectionsInProject(
             replaceWithProjField = false;
             continue;
         }
-        DepsTracker deps;
-        expressionIt->second->addDependencies(&deps);
-        auto topLevelFieldNames =
-            deps.toProjectionWithoutMetadata(DepsTracker::TruncateToRootLevel::yes)
-                .getFieldNames<std::set<std::string>>();
-        topLevelFieldNames.erase("_id");
 
+        // Do not extract a computed projection if it is computing a value that other fields in the
+        // same projection depend on. If the extracted $addFields were to be placed before this
+        // projection, the dependency with the common name would be shadowed by the computed
+        // projection.
+        if (computedExprDependsOnField(topLevelDeps, field, i)) {
+            replaceWithProjField = false;
+            continue;
+        }
+
+        const auto& topLevelFieldNames = topLevelDeps[i];
         if (topLevelFieldNames.size() == 1 && topLevelFieldNames.count(oldName.toString()) == 1) {
             // Substitute newName for oldName in the expression.
             StringMap<std::string> renames;
@@ -168,7 +166,8 @@ std::pair<BSONObj, bool> InclusionNode::extractComputedProjectionsInProject(
 
             if (std::get<2>(expressionSpec)) {
                 // Replace the expression with an inclusion projected field.
-                _projectedFields.insert(fieldName);
+                auto it = _projectedFields.insert(_projectedFields.end(), fieldName);
+                _projectedFieldsSet.insert(StringData(*it));
                 _expressions.erase(fieldName);
                 // Only computed projections at the beginning of the list were marked to become
                 // projected fields. The new projected field is at the beginning of the
@@ -197,35 +196,34 @@ std::pair<BSONObj, bool> InclusionNode::extractComputedProjectionsInAddFields(
         return {BSONObj{}, false};
     }
 
-    DepsTracker allDeps;
-    reportDependencies(&allDeps);
+    std::vector<OrderedPathSet> topLevelDeps =
+        getTopLevelDeps(_orderToProcessAdditionsAndChildren, _expressions, _children);
 
     // Auxiliary vector with extracted computed projections: <name, expression>.
     // To preserve the original fields order, only projections at the beginning of the
     // _orderToProcessAdditionsAndChildren list can be extracted for pushdown.
     std::vector<std::pair<StringData, boost::intrusive_ptr<Expression>>> addFieldsExpressions;
-    for (auto&& field : _orderToProcessAdditionsAndChildren) {
+    for (size_t i = 0; i < _orderToProcessAdditionsAndChildren.size(); i++) {
+        auto&& field = _orderToProcessAdditionsAndChildren[i];
         // Do not extract for pushdown computed projection with reserved name.
         if (reservedNames.count(field) > 0) {
             break;
         }
-        if (allDeps.fields.count(field) > 0) {
-            // Do not extract a computed projection if its name is the same as a dependent field. If
-            // the extracted $addFields were to be placed before this $addFields, the dependency
-            // with the common name would be shadowed by the computed projection.
-            break;
-        }
+
         auto expressionIt = _expressions.find(field);
         if (expressionIt == _expressions.end()) {
             break;
         }
-        DepsTracker deps;
-        expressionIt->second->addDependencies(&deps);
-        auto topLevelFieldNames =
-            deps.toProjectionWithoutMetadata(DepsTracker::TruncateToRootLevel::yes)
-                .getFieldNames<std::set<std::string>>();
-        topLevelFieldNames.erase("_id");
 
+        // Do not extract a computed projection if it is computing a value that other fields in the
+        // same projection depend on. If the extracted $addFields were to be placed before this
+        // projection, the dependency with the common name would be shadowed by the computed
+        // projection.
+        if (computedExprDependsOnField(topLevelDeps, field, i)) {
+            break;
+        }
+
+        auto& topLevelFieldNames = topLevelDeps[i];
         if (topLevelFieldNames.size() == 1 && topLevelFieldNames.count(oldName.toString()) == 1) {
             // Substitute newName for oldName in the expression.
             StringMap<std::string> renames;
@@ -254,27 +252,4 @@ std::pair<BSONObj, bool> InclusionNode::extractComputedProjectionsInAddFields(
     return {BSONObj{}, false};
 }
 
-void FastPathEligibleInclusionNode::_applyProjectionsToArray(BSONObj array,
-                                                             BSONArrayBuilder* bab) const {
-    BSONObjIterator it{array};
-
-    while (it.more()) {
-        const auto bsonElement{it.next()};
-
-        if (bsonElement.type() == BSONType::Object) {
-            BSONObjBuilder subBob{bab->subobjStart()};
-            _applyProjections(bsonElement.embeddedObject(), &subBob);
-        } else if (bsonElement.type() == BSONType::Array) {
-            if (_policies.arrayRecursionPolicy ==
-                ProjectionPolicies::ArrayRecursionPolicy::kDoNotRecurseNestedArrays) {
-                continue;
-            }
-            BSONArrayBuilder subBab{bab->subarrayStart()};
-            _applyProjectionsToArray(bsonElement.embeddedObject(), &subBab);
-        } else {
-            // The projection semantics dictate to drop scalar array elements when we're projecting
-            // through an array path.
-        }
-    }
-}
 }  // namespace mongo::projection_executor

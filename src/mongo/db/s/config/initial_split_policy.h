@@ -35,12 +35,11 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_tags.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/string_map.h"
-
 namespace mongo {
 
 struct SplitPolicyParams {
@@ -59,7 +58,6 @@ public:
         const ShardKeyPattern& shardKeyPattern,
         std::int64_t numInitialChunks,
         bool presplitHashedZones,
-        const boost::optional<std::vector<BSONObj>>& initialSplitPoints,
         const std::vector<TagsType>& tags,
         size_t numShards,
         bool collectionIsEmpty);
@@ -72,7 +70,7 @@ public:
     struct ShardCollectionConfig {
         std::vector<ChunkType> chunks;
 
-        const auto& collVersion() const {
+        const auto& collPlacementVersion() const {
             return chunks.back().getVersion();
         }
     };
@@ -137,34 +135,11 @@ public:
 };
 
 /**
- * Split point building strategy to be used when no optimizations are available. We send a
- * splitVector command to the primary shard in order to calculate the appropriate split points.
- */
-class UnoptimizedSplitPolicy : public InitialSplitPolicy {
-public:
-    ShardCollectionConfig createFirstChunks(OperationContext* opCtx,
-                                            const ShardKeyPattern& shardKeyPattern,
-                                            const SplitPolicyParams& params) override;
-
-    bool isOptimized() override {
-        return false;
-    }
-};
-
-/**
- * Split point building strategy to be used when explicit split points are supplied, or where the
- * appropriate splitpoints can be trivially deduced from the shard key.
+ * Split point building strategy to be used when the appropriate splitpoints can be trivially
+ * deduced from the shard key.
  */
 class SplitPointsBasedSplitPolicy : public InitialSplitPolicy {
 public:
-    /**
-     * Constructor used when split points are provided.
-     */
-    SplitPointsBasedSplitPolicy(std::vector<BSONObj> explicitSplitPoints)
-        : _splitPoints(std::move(explicitSplitPoints)) {
-        _numContiguousChunksPerShard = 1;
-    }
-
     /**
      * Constructor used when generating split points for a hashed-prefix shard key.
      */
@@ -276,7 +251,7 @@ private:
 /**
  * Split point building strategy for resharding.
  */
-class ReshardingSplitPolicy : public InitialSplitPolicy {
+class SamplingBasedSplitPolicy : public InitialSplitPolicy {
 public:
     using SampleDocumentPipeline = std::unique_ptr<Pipeline, PipelineDeleter>;
 
@@ -285,6 +260,7 @@ public:
     public:
         virtual ~SampleDocumentSource(){};
         virtual boost::optional<BSONObj> getNext() = 0;
+        virtual Pipeline* getPipeline_forTest() = 0;
     };
 
     // Provides documents from a real Pipeline
@@ -293,6 +269,9 @@ public:
         PipelineDocumentSource() = delete;
         PipelineDocumentSource(SampleDocumentPipeline pipeline, int skip);
         boost::optional<BSONObj> getNext() override;
+        Pipeline* getPipeline_forTest() override {
+            return _pipeline.get();
+        }
 
     private:
         SampleDocumentPipeline _pipeline;
@@ -300,20 +279,27 @@ public:
     };
 
     /**
-     * Creates a new ReshardingSplitPolicy. Note that it should not outlive the operation
+     * Creates a new SamplingBasedSplitPolicy. Note that it should not outlive the operation
      * context used to create it.
      */
-    static ReshardingSplitPolicy make(OperationContext* opCtx,
-                                      const NamespaceString& origNs,
-                                      const NamespaceString& reshardingTempNs,
-                                      const ShardKeyPattern& shardKey,
-                                      int numInitialChunks,
-                                      boost::optional<std::vector<TagsType>> zones,
-                                      int samplesPerChunk = kDefaultSamplesPerChunk);
+    static SamplingBasedSplitPolicy make(OperationContext* opCtx,
+                                         const NamespaceString& nss,
+                                         const ShardKeyPattern& shardKey,
+                                         int numInitialChunks,
+                                         boost::optional<std::vector<TagsType>> zones,
+                                         int samplesPerChunk = kDefaultSamplesPerChunk);
 
-    ReshardingSplitPolicy(int numInitialChunks,
-                          boost::optional<std::vector<TagsType>> zones,
-                          std::unique_ptr<SampleDocumentSource> samples);
+    SamplingBasedSplitPolicy(int numInitialChunks,
+                             boost::optional<std::vector<TagsType>> zones,
+                             std::unique_ptr<SampleDocumentSource> samples);
+
+    /**
+     * Generates the initial split points and returns them in ascending shard key order. Does not
+     * include MinKey or MaxKey.
+     */
+    BSONObjSet createFirstSplitPoints(OperationContext* opCtx,
+                                      const ShardKeyPattern& shardKeyPattern,
+                                      const SplitPolicyParams& params);
 
     ShardCollectionConfig createFirstChunks(OperationContext* opCtx,
                                             const ShardKeyPattern& shardKeyPattern,
@@ -323,10 +309,17 @@ public:
      * Creates the aggregation pipeline BSON to get documents for sampling from shards.
      */
     static std::vector<BSONObj> createRawPipeline(const ShardKeyPattern& shardKey,
-                                                  int numSplitPoints,
+                                                  int numInitialChunks,
                                                   int samplesPerChunk);
 
     static constexpr int kDefaultSamplesPerChunk = 10;
+
+    static std::unique_ptr<SampleDocumentSource> makePipelineDocumentSource_forTest(
+        OperationContext* opCtx,
+        const NamespaceString& ns,
+        const ShardKeyPattern& shardKey,
+        int numInitialChunks,
+        int samplesPerChunk);
 
 private:
     static std::unique_ptr<SampleDocumentSource> _makePipelineDocumentSource(
@@ -334,7 +327,8 @@ private:
         const NamespaceString& ns,
         const ShardKeyPattern& shardKey,
         int numInitialChunks,
-        int samplesPerChunk);
+        int samplesPerChunk,
+        MakePipelineOptions opts = {});
 
     /**
      * Returns a set of split points to ensure that chunk boundaries will align with the zone

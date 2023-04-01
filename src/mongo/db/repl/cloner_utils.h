@@ -34,6 +34,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/serverless/serverless_types_gen.h"
 
 namespace mongo {
 namespace repl {
@@ -64,7 +65,9 @@ public:
     /**
      * Checks if the database belongs to the given tenant.
      */
-    static bool isDatabaseForTenant(StringData db, StringData prefix);
+    static bool isDatabaseForTenant(const DatabaseName& db,
+                                    const boost::optional<TenantId>& prefix,
+                                    MigrationProtocolEnum protocol);
 
     /**
      * Checks if the collection belongs to the given tenant.

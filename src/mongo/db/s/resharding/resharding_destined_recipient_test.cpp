@@ -27,10 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
-
-#include "mongo/platform/basic.h"
-
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -44,15 +41,18 @@
 #include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_write_router.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache_loader_mock.h"
 #include "mongo/s/database_version.h"
 #include "mongo/s/shard_cannot_refresh_due_to_locks_held_exception.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/s/shard_version_factory.h"
 #include "mongo/unittest/unittest.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
 namespace {
@@ -66,7 +66,8 @@ void runInTransaction(OperationContext* opCtx, Callable&& func) {
     opCtx->setTxnNumber(txnNum);
     opCtx->setInMultiDocumentTransaction();
 
-    MongoDOperationContextSession ocs(opCtx);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
 
     auto txnParticipant = TransactionParticipant::get(opCtx);
     ASSERT(txnParticipant);
@@ -82,7 +83,7 @@ void runInTransaction(OperationContext* opCtx, Callable&& func) {
 
 class DestinedRecipientTest : public ShardServerTestFixture {
 public:
-    const NamespaceString kNss{"test.foo"};
+    const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test.foo");
     const std::string kShardKey = "x";
     const HostAndPort kConfigHostAndPort{"DummyConfig", 12345};
     const std::vector<ShardType> kShardList = {ShardType("shard0", "Host0:12345"),
@@ -135,15 +136,23 @@ public:
             return repl::OpTimeWith<std::vector<ShardType>>(_shards);
         }
 
-        std::vector<CollectionType> getCollections(
-            OperationContext* opCtx,
-            StringData dbName,
-            repl::ReadConcernLevel readConcernLevel) override {
+        std::vector<CollectionType> getCollections(OperationContext* opCtx,
+                                                   StringData dbName,
+                                                   repl::ReadConcernLevel readConcernLevel,
+                                                   const BSONObj& sort) override {
             return _colls;
         }
 
         void setCollections(std::vector<CollectionType> colls) {
             _colls = std::move(colls);
+        }
+
+        std::pair<CollectionType, std::vector<IndexCatalogType>>
+        getCollectionAndShardingIndexCatalogEntries(
+            OperationContext* opCtx,
+            const NamespaceString& nss,
+            const repl::ReadConcernArgs& readConcern) override {
+            return std::make_pair(CollectionType(), std::vector<IndexCatalogType>());
         }
 
     private:
@@ -162,11 +171,11 @@ protected:
                                         const std::string& shardKey) {
         auto range1 = ChunkRange(BSON(shardKey << MINKEY), BSON(shardKey << 5));
         ChunkType chunk1(
-            uuid, range1, ChunkVersion(1, 0, epoch, timestamp), kShardList[0].getName());
+            uuid, range1, ChunkVersion({epoch, timestamp}, {1, 0}), kShardList[0].getName());
 
         auto range2 = ChunkRange(BSON(shardKey << 5), BSON(shardKey << MAXKEY));
         ChunkType chunk2(
-            uuid, range2, ChunkVersion(1, 0, epoch, timestamp), kShardList[1].getName());
+            uuid, range2, ChunkVersion({epoch, timestamp}, {1, 0}), kShardList[1].getName());
 
         return {chunk1, chunk2};
     }
@@ -177,33 +186,37 @@ protected:
         NamespaceString tempNss;
         UUID sourceUuid;
         ShardId destShard;
-        ChunkVersion version;
+        ShardVersion version;
         DatabaseVersion dbVersion{UUID::gen(), Timestamp(1, 1)};
     };
 
     ReshardingEnv setupReshardingEnv(OperationContext* opCtx, bool refreshTempNss) {
         DBDirectClient client(opCtx);
-        ASSERT(client.createCollection(NamespaceString::kSessionTransactionsTableNamespace.ns()));
+        ASSERT(client.createCollection(NamespaceString::kSessionTransactionsTableNamespace));
+        client.createIndexes(NamespaceString::kSessionTransactionsTableNamespace,
+                             {MongoDSessionCatalog::getConfigTxnPartialIndexSpec()});
 
         OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
             opCtx);
-        Status status = createCollection(
-            operationContext(), kNss.db().toString(), BSON("create" << kNss.coll()));
+        Status status =
+            createCollection(operationContext(), kNss.dbName(), BSON("create" << kNss.coll()));
         if (status != ErrorCodes::NamespaceExists) {
             uassertStatusOK(status);
         }
 
         ReshardingEnv env(CollectionCatalog::get(opCtx)->lookupUUIDByNSS(opCtx, kNss).value());
         env.destShard = kShardList[1].getName();
-        env.version = ChunkVersion(1, 0, OID::gen(), Timestamp(1, 1));
-        env.tempNss =
-            NamespaceString(kNss.db(),
-                            fmt::format("{}{}",
-                                        NamespaceString::kTemporaryReshardingCollectionPrefix,
-                                        env.sourceUuid.toString()));
+        CollectionGeneration gen(OID::gen(), Timestamp(1, 1));
+        env.version = ShardVersionFactory::make(ChunkVersion(gen, {1, 0}),
+                                                boost::optional<CollectionIndexes>(boost::none));
+        env.tempNss = NamespaceString::createNamespaceString_forTest(
+            kNss.db(),
+            fmt::format("{}{}",
+                        NamespaceString::kTemporaryReshardingCollectionPrefix,
+                        env.sourceUuid.toString()));
 
         uassertStatusOK(createCollection(
-            operationContext(), env.tempNss.db().toString(), BSON("create" << env.tempNss.coll())));
+            operationContext(), env.tempNss.dbName(), BSON("create" << env.tempNss.coll())));
 
         TypeCollectionReshardingFields reshardingFields;
         reshardingFields.setReshardingUUID(UUID::gen());
@@ -214,8 +227,8 @@ protected:
         reshardingFields.setState(CoordinatorStateEnum::kPreparingToDonate);
 
         CollectionType coll(kNss,
-                            env.version.epoch(),
-                            env.version.getTimestamp(),
+                            env.version.placementVersion().epoch(),
+                            env.version.placementVersion().getTimestamp(),
                             Date_t::now(),
                             UUID::gen(),
                             BSON(kShardKey << 1));
@@ -226,16 +239,21 @@ protected:
         _mockCatalogCacheLoader->setCollectionRefreshValues(
             kNss,
             coll,
-            createChunks(
-                env.version.epoch(), env.sourceUuid, env.version.getTimestamp(), kShardKey),
+            createChunks(env.version.placementVersion().epoch(),
+                         env.sourceUuid,
+                         env.version.placementVersion().getTimestamp(),
+                         kShardKey),
             reshardingFields);
         _mockCatalogCacheLoader->setCollectionRefreshValues(
             env.tempNss,
             coll,
-            createChunks(env.version.epoch(), env.sourceUuid, env.version.getTimestamp(), "y"),
+            createChunks(env.version.placementVersion().epoch(),
+                         env.sourceUuid,
+                         env.version.placementVersion().getTimestamp(),
+                         "y"),
             boost::none);
 
-        forceDatabaseRefresh(opCtx, kNss.db());
+        ASSERT_OK(onDbVersionMismatchNoExcept(opCtx, kNss.db(), boost::none));
         forceShardFilteringMetadataRefresh(opCtx, kNss);
 
         if (refreshTempNss)
@@ -250,7 +268,7 @@ protected:
                   const ReshardingEnv& env) {
         AutoGetCollection coll(opCtx, nss, MODE_IX);
         WriteUnitOfWork wuow(opCtx);
-        ASSERT_OK(coll->insertDocument(opCtx, InsertStatement(doc), nullptr));
+        ASSERT_OK(collection_internal::insertDocument(opCtx, *coll, InsertStatement(doc), nullptr));
         wuow.commit();
     }
 
@@ -260,7 +278,7 @@ protected:
                    const BSONObj& update,
                    const ReshardingEnv& env) {
         AutoGetCollection coll(opCtx, nss, MODE_IX);
-        Helpers::update(opCtx, nss.toString(), filter, update);
+        Helpers::update(opCtx, nss, filter, update);
     }
 
     void deleteDoc(OperationContext* opCtx,
@@ -269,12 +287,12 @@ protected:
                    const ReshardingEnv& env) {
         AutoGetCollection coll(opCtx, nss, MODE_IX);
 
-        RecordId rid = Helpers::findOne(opCtx, coll.getCollection(), query, false);
+        RecordId rid = Helpers::findOne(opCtx, coll.getCollection(), query);
         ASSERT(!rid.isNull());
 
         WriteUnitOfWork wuow(opCtx);
         OpDebug opDebug;
-        coll->deleteDocument(opCtx, kUninitializedStmtId, rid, &opDebug);
+        collection_internal::deleteDocument(opCtx, *coll, kUninitializedStmtId, rid, &opDebug);
         wuow.commit();
     }
 
@@ -355,7 +373,7 @@ TEST_F(DestinedRecipientTest, TestOpObserverSetsDestinedRecipientOnInsertsInTran
     auto info = repl::ApplyOpsCommandInfo::parse(entry.getOperationToApply());
 
     auto ops = info.getOperations();
-    auto replOp = repl::ReplOperation::parse(IDLParserErrorContext("insertOp"), ops[0]);
+    auto replOp = repl::ReplOperation::parse(IDLParserContext("insertOp"), ops[0]);
     ASSERT_EQ(replOp.getNss(), kNss);
 
     auto recipShard = replOp.getDestinedRecipient();
@@ -367,7 +385,7 @@ TEST_F(DestinedRecipientTest, TestOpObserverSetsDestinedRecipientOnUpdates) {
     auto opCtx = operationContext();
 
     DBDirectClient client(opCtx);
-    client.insert(kNss.toString(), BSON("_id" << 0 << "x" << 2 << "y" << 10 << "z" << 4));
+    client.insert(kNss, BSON("_id" << 0 << "x" << 2 << "y" << 10 << "z" << 4));
 
     auto env = setupReshardingEnv(opCtx, true);
 
@@ -385,17 +403,18 @@ TEST_F(DestinedRecipientTest, TestOpObserverSetsDestinedRecipientOnMultiUpdates)
     auto opCtx = operationContext();
 
     DBDirectClient client(opCtx);
-    client.insert(kNss.toString(), BSON("x" << 0 << "y" << 10 << "z" << 4));
-    client.insert(kNss.toString(), BSON("x" << 0 << "y" << 10 << "z" << 4));
+    client.insert(kNss, BSON("x" << 0 << "y" << 10 << "z" << 4));
+    client.insert(kNss, BSON("x" << 0 << "y" << 10 << "z" << 4));
 
     auto env = setupReshardingEnv(opCtx, true);
 
-    OperationShardingState::setShardRole(opCtx, kNss, ChunkVersion::IGNORED(), env.dbVersion);
-    client.update(kNss.ns(),
-                  BSON("x" << 0),
-                  BSON("$set" << BSON("z" << 5)),
-                  false /*upsert*/,
-                  true /*multi*/);
+    OperationShardingState::setShardRole(
+        opCtx,
+        kNss,
+        ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none),
+        env.dbVersion);
+    client.update(
+        kNss, BSON("x" << 0), BSON("$set" << BSON("z" << 5)), false /*upsert*/, true /*multi*/);
 
     auto entry = getLastOplogEntry(opCtx);
     auto recipShard = entry.getDestinedRecipient();
@@ -408,7 +427,7 @@ TEST_F(DestinedRecipientTest, TestOpObserverSetsDestinedRecipientOnUpdatesOutOfP
     auto opCtx = operationContext();
 
     DBDirectClient client(opCtx);
-    client.insert(kNss.toString(), BSON("_id" << 0 << "x" << 2 << "y" << 10));
+    client.insert(kNss, BSON("_id" << 0 << "x" << 2 << "y" << 10));
 
     auto env = setupReshardingEnv(opCtx, true);
 
@@ -426,7 +445,7 @@ TEST_F(DestinedRecipientTest, TestOpObserverSetsDestinedRecipientOnUpdatesInTran
     auto opCtx = operationContext();
 
     DBDirectClient client(opCtx);
-    client.insert(kNss.toString(), BSON("_id" << 0 << "x" << 2 << "y" << 10 << "z" << 4));
+    client.insert(kNss, BSON("_id" << 0 << "x" << 2 << "y" << 10 << "z" << 4));
 
     auto env = setupReshardingEnv(opCtx, true);
 
@@ -442,7 +461,7 @@ TEST_F(DestinedRecipientTest, TestOpObserverSetsDestinedRecipientOnUpdatesInTran
     auto info = repl::ApplyOpsCommandInfo::parse(entry.getOperationToApply());
 
     auto ops = info.getOperations();
-    auto replOp = repl::ReplOperation::parse(IDLParserErrorContext("insertOp"), ops[0]);
+    auto replOp = repl::ReplOperation::parse(IDLParserContext("insertOp"), ops[0]);
     ASSERT_EQ(replOp.getNss(), kNss);
 
     auto recipShard = replOp.getDestinedRecipient();
@@ -454,7 +473,7 @@ TEST_F(DestinedRecipientTest, TestOpObserverSetsDestinedRecipientOnDeletes) {
     auto opCtx = operationContext();
 
     DBDirectClient client(opCtx);
-    client.insert(kNss.toString(), BSON("_id" << 0 << "x" << 2 << "y" << 10 << "z" << 4));
+    client.insert(kNss, BSON("_id" << 0 << "x" << 2 << "y" << 10 << "z" << 4));
 
     auto env = setupReshardingEnv(opCtx, true);
 
@@ -472,7 +491,7 @@ TEST_F(DestinedRecipientTest, TestOpObserverSetsDestinedRecipientOnDeletesInTran
     auto opCtx = operationContext();
 
     DBDirectClient client(opCtx);
-    client.insert(kNss.toString(), BSON("_id" << 0 << "x" << 2 << "y" << 10));
+    client.insert(kNss, BSON("_id" << 0 << "x" << 2 << "y" << 10));
 
     auto env = setupReshardingEnv(opCtx, true);
 
@@ -487,7 +506,7 @@ TEST_F(DestinedRecipientTest, TestOpObserverSetsDestinedRecipientOnDeletesInTran
     auto info = repl::ApplyOpsCommandInfo::parse(entry.getOperationToApply());
 
     auto ops = info.getOperations();
-    auto replOp = repl::ReplOperation::parse(IDLParserErrorContext("deleteOp"), ops[0]);
+    auto replOp = repl::ReplOperation::parse(IDLParserContext("deleteOp"), ops[0]);
     ASSERT_EQ(replOp.getNss(), kNss);
 
     auto recipShard = replOp.getDestinedRecipient();
@@ -499,7 +518,7 @@ TEST_F(DestinedRecipientTest, TestUpdateChangesOwningShardThrows) {
     auto opCtx = operationContext();
 
     DBDirectClient client(opCtx);
-    client.insert(kNss.toString(), BSON("_id" << 0 << "x" << 2 << "y" << 2 << "z" << 4));
+    client.insert(kNss, BSON("_id" << 0 << "x" << 2 << "y" << 2 << "z" << 4));
 
     auto env = setupReshardingEnv(opCtx, true);
 
@@ -519,7 +538,7 @@ TEST_F(DestinedRecipientTest, TestUpdateSameOwningShard) {
     auto opCtx = operationContext();
 
     DBDirectClient client(opCtx);
-    client.insert(kNss.toString(), BSON("_id" << 0 << "x" << 2 << "y" << 2 << "z" << 4));
+    client.insert(kNss, BSON("_id" << 0 << "x" << 2 << "y" << 2 << "z" << 4));
 
     auto env = setupReshardingEnv(opCtx, true);
 

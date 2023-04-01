@@ -33,7 +33,7 @@
 #include <functional>
 #include <queue>
 
-#include "mongo/db/logical_session_id.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/s/query/cluster_client_cursor.h"
 
 namespace mongo {
@@ -105,10 +105,6 @@ public:
     void setLastUseDate(Date_t now) final;
 
     boost::optional<uint32_t> getQueryHash() const final;
-
-    std::uint64_t getNBatches() const final;
-
-    void incNBatches() final;
 
     /**
      * Returns false unless the mock cursor has been fully iterated.

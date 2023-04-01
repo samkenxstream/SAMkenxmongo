@@ -231,25 +231,14 @@ var ReplSetTest = function(opts) {
      */
     function _isRunningWithoutJournaling(conn) {
         var result = asCluster(conn, function() {
+            // Persistent storage engines (WT) can only run with journal enabled.
             var serverStatus = assert.commandWorked(conn.adminCommand({serverStatus: 1}));
             if (serverStatus.storageEngine.hasOwnProperty('persistent')) {
-                if (!serverStatus.storageEngine.persistent) {
-                    return true;
+                if (serverStatus.storageEngine.persistent) {
+                    return false;
                 }
-            } else if (serverStatus.storageEngine.name == 'inMemory' ||
-                       serverStatus.storageEngine.name == 'ephemeralForTest') {
-                return true;
             }
-            var cmdLineOpts = assert.commandWorked(conn.adminCommand({getCmdLineOpts: 1}));
-            var getWithDefault = function(dict, key, dflt) {
-                if (dict[key] === undefined)
-                    return dflt;
-                return dict[key];
-            };
-            return !getWithDefault(
-                getWithDefault(getWithDefault(cmdLineOpts.parsed, "storage", {}), "journal", {}),
-                "enabled",
-                true);
+            return true;
         });
         return result;
     }
@@ -655,6 +644,9 @@ var ReplSetTest = function(opts) {
         // If the caller has explicitly specified 'waitForConnect:false', then we will start up all
         // replica set nodes and return without waiting to connect to any of them.
         const skipWaitingForAllConnections = (options && options.waitForConnect === false);
+
+        // Keep a copy of these options
+        self.startSetOptions = options;
 
         // Start up without waiting for connections.
         this.startSetAsync(options, restart);
@@ -1361,6 +1353,28 @@ var ReplSetTest = function(opts) {
 
         cmd[cmdKey] = config;
 
+        // If this ReplSet is started using this.startSet and binVersions (ie:
+        // rst.startSet({binVersion: [...]}) we need to make sure the binVersion combination is
+        // valid.
+        if (typeof (this.startSetOptions) === "object" &&
+            this.startSetOptions.hasOwnProperty("binVersion") &&
+            typeof (this.startSetOptions.binVersion) === "object") {
+            let lastLTSSpecified = false;
+            let lastContinuousSpecified = false;
+            this.startSetOptions.binVersion.forEach(function(binVersion, _) {
+                if (lastLTSSpecified === false) {
+                    lastLTSSpecified = MongoRunner.areBinVersionsTheSame(binVersion, lastLTSFCV);
+                }
+                if ((lastContinuousSpecified === false) && (lastLTSFCV !== lastContinuousFCV)) {
+                    lastContinuousSpecified =
+                        MongoRunner.areBinVersionsTheSame(binVersion, lastContinuousFCV);
+                }
+            });
+            if (lastLTSSpecified && lastContinuousSpecified) {
+                throw new Error("Can only specify one of 'last-lts' and 'last-continuous' " +
+                                "in binVersion, not both.");
+            }
+        }
         // Initiating a replica set with a single node will use "latest" FCV. This will
         // cause IncompatibleServerVersion errors if additional "last-lts"/"last-continuous" binary
         // version nodes are subsequently added to the set, since such nodes cannot set their FCV to
@@ -1372,11 +1386,15 @@ var ReplSetTest = function(opts) {
         Object.keys(this.nodeOptions).forEach(function(key, index) {
             let val = self.nodeOptions[key];
             if (typeof (val) === "object" && val.hasOwnProperty("binVersion")) {
-                lastLTSBinVersionWasSpecifiedForSomeNode =
-                    MongoRunner.areBinVersionsTheSame(val.binVersion, lastLTSFCV);
-                lastContinuousBinVersionWasSpecifiedForSomeNode =
-                    (lastLTSFCV !== lastContinuousFCV) &&
-                    MongoRunner.areBinVersionsTheSame(val.binVersion, lastContinuousFCV);
+                if (lastLTSBinVersionWasSpecifiedForSomeNode === false) {
+                    lastLTSBinVersionWasSpecifiedForSomeNode =
+                        MongoRunner.areBinVersionsTheSame(val.binVersion, lastLTSFCV);
+                }
+                if ((lastContinuousBinVersionWasSpecifiedForSomeNode === false) &&
+                    (lastLTSFCV !== lastContinuousFCV)) {
+                    lastContinuousBinVersionWasSpecifiedForSomeNode =
+                        MongoRunner.areBinVersionsTheSame(val.binVersion, lastContinuousFCV);
+                }
                 explicitBinVersionWasSpecifiedForSomeNode = true;
             }
         });
@@ -1448,8 +1466,17 @@ var ReplSetTest = function(opts) {
             asCluster(self.nodes, function setFCV() {
                 let fcv = setLastLTSFCV ? lastLTSFCV : lastContinuousFCV;
                 print("Setting feature compatibility version for replica set to '" + fcv + "'");
-                assert.commandWorked(
-                    self.getPrimary().adminCommand({setFeatureCompatibilityVersion: fcv}));
+                const res = self.getPrimary().adminCommand({setFeatureCompatibilityVersion: fcv});
+                // TODO (SERVER-74398): Remove the retry with 'confirm: true' once 7.0 is last LTS.
+                if (!res.ok && res.code === 7369100) {
+                    // We failed due to requiring 'confirm: true' on the command. This will only
+                    // occur on 7.0+ nodes that have 'enableTestCommands' set to false. Retry the
+                    // setFCV command with 'confirm: true'.
+                    assert.commandWorked(self.getPrimary().adminCommand(
+                        {setFeatureCompatibilityVersion: fcv, confirm: true}));
+                } else {
+                    assert.commandWorked(res);
+                }
                 checkFCV(self.getPrimary().getDB("admin"), fcv);
 
                 // The server has a practice of adding a reconfig as part of upgrade/downgrade logic
@@ -1617,8 +1644,17 @@ var ReplSetTest = function(opts) {
             asCluster(self.nodes, function setFCV() {
                 let fcv = jsTest.options().replSetFeatureCompatibilityVersion;
                 print("Setting feature compatibility version for replica set to '" + fcv + "'");
-                assert.commandWorked(
-                    self.getPrimary().adminCommand({setFeatureCompatibilityVersion: fcv}));
+                const res = self.getPrimary().adminCommand({setFeatureCompatibilityVersion: fcv});
+                // TODO (SERVER-74398): Remove the retry with 'confirm: true' once 7.0 is last LTS.
+                if (!res.ok && res.code === 7369100) {
+                    // We failed due to requiring 'confirm: true' on the command. This will only
+                    // occur on 7.0+ nodes that have 'enableTestCommands' set to false. Retry the
+                    // setFCV command with 'confirm: true'.
+                    assert.commandWorked(self.getPrimary().adminCommand(
+                        {setFeatureCompatibilityVersion: fcv, confirm: true}));
+                } else {
+                    assert.commandWorked(res);
+                }
 
                 // Wait for the new 'featureCompatibilityVersion' to propagate to all nodes in the
                 // replica set. The 'setFeatureCompatibilityVersion' command only waits for
@@ -1924,7 +1960,7 @@ var ReplSetTest = function(opts) {
                     if (friendlyEqual(rcmOpTime, {ts: Timestamp(0, 0), t: NumberLong(0)})) {
                         return false;
                     }
-                    if (rs.compareOpTimes(rcmOpTime, primaryOpTime) < 0) {
+                    if (globalThis.rs.compareOpTimes(rcmOpTime, primaryOpTime) < 0) {
                         return false;
                     }
                 }
@@ -2181,7 +2217,7 @@ var ReplSetTest = function(opts) {
 
             // If the node doesn't have a valid opTime, it likely hasn't received any writes from
             // the primary yet.
-            if (!rs.isValidOpTime(secondaryOpTime)) {
+            if (!globalThis.rs.isValidOpTime(secondaryOpTime)) {
                 print("ReplSetTest awaitReplication: optime for secondary #" + secondaryCount +
                       ", " + secondaryName + ", is " + tojson(secondaryOpTime) +
                       ", which is NOT valid.");
@@ -2190,11 +2226,12 @@ var ReplSetTest = function(opts) {
 
             // See if the node made progress. We count it as progress even if the node's last optime
             // went backwards because that means the node is in rollback.
-            let madeProgress = (nodeProgress[index] &&
-                                (rs.compareOpTimes(nodeProgress[index], secondaryOpTime) != 0));
+            let madeProgress =
+                (nodeProgress[index] &&
+                 (globalThis.rs.compareOpTimes(nodeProgress[index], secondaryOpTime) != 0));
             nodeProgress[index] = secondaryOpTime;
 
-            if (rs.compareOpTimes(primaryLatestOpTime, secondaryOpTime) < 0) {
+            if (globalThis.rs.compareOpTimes(primaryLatestOpTime, secondaryOpTime) < 0) {
                 primaryLatestOpTime = _getLastOpTime(primary);
                 print("ReplSetTest awaitReplication: optime for " + secondaryName +
                       " is newer, resetting latest primary optime to " +
@@ -2273,9 +2310,9 @@ var ReplSetTest = function(opts) {
         }
     };
 
-    this.getHashesUsingSessions = function(sessions, dbName, {
-        readAtClusterTime,
-    } = {}) {
+    this.getHashesUsingSessions = function(
+        sessions, dbName, {readAtClusterTime,
+                           skipTempCollections = false} = {skipTempCollections: false}) {
         return sessions.map(session => {
             const commandObj = {dbHash: 1};
             const db = session.getDatabase(dbName);
@@ -2288,6 +2325,9 @@ var ReplSetTest = function(opts) {
                     commandObj.$_internalReadAtClusterTime = readAtClusterTime;
                 }
             }
+            if (skipTempCollections) {
+                commandObj.skipTempCollections = 1;
+            }
 
             return assert.commandWorked(db.runCommand(commandObj));
         });
@@ -2295,7 +2335,7 @@ var ReplSetTest = function(opts) {
 
     // Gets the dbhash for the current primary and for all secondaries (or the members of
     // 'secondaries', if specified).
-    this.getHashes = function(dbName, secondaries) {
+    this.getHashes = function(dbName, secondaries, skipTempCollections) {
         assert.neq(dbName, 'local', 'Cannot run getHashes() on the "local" database');
 
         // _determineLiveSecondaries() repopulates both 'self._secondaries' and 'self._primary'. If
@@ -2309,7 +2349,7 @@ var ReplSetTest = function(opts) {
             })
         ].map(conn => conn.getDB('test').getSession());
 
-        const hashes = this.getHashesUsingSessions(sessions, dbName);
+        const hashes = this.getHashesUsingSessions(sessions, dbName, {skipTempCollections});
         return {primary: hashes[0], secondaries: hashes.slice(1)};
     };
 
@@ -2466,8 +2506,8 @@ var ReplSetTest = function(opts) {
                     const hasSecondaryIndexes =
                         replSetConfig.members[rst.getNodeId(secondary)].buildIndexes !== false;
 
-                    print(
-                        `checking db hash between primary: ${primary} and secondary ${secondary}`);
+                    print(`checking db hash between primary: ${primary.host}, and secondary: ${
+                        secondary.host}`);
                     success = DataConsistencyChecker.checkDBHash(primaryDBHash,
                                                                  primaryCollInfos,
                                                                  secondaryDBHash,
@@ -2759,13 +2799,14 @@ var ReplSetTest = function(opts) {
             defaults.serverless = true;
         }
 
-        if (options && options.binVersion &&
-            jsTest.options().useRandomBinVersionsWithinReplicaSet) {
+        const nodeOptions = this.nodeOptions["n" + n];
+        const hasBinVersion =
+            (options && options.binVersion) || (nodeOptions && nodeOptions.binVersion);
+        if (hasBinVersion && jsTest.options().useRandomBinVersionsWithinReplicaSet) {
             throw new Error(
                 "Can only specify one of binVersion and useRandomBinVersionsWithinReplicaSet, not both.");
         }
 
-        //
         // Note : this replaces the binVersion of the shared startSet() options the first time
         // through, so the full set is guaranteed to have different versions if size > 1.  If using
         // start() independently, independent version choices will be made
@@ -2786,7 +2827,7 @@ var ReplSetTest = function(opts) {
         } else {
             baseOptions = defaults;
         }
-        baseOptions = Object.merge(baseOptions, this.nodeOptions["n" + n]);
+        baseOptions = Object.merge(baseOptions, nodeOptions);
         options = Object.merge(baseOptions, options);
         if (options.hasOwnProperty("rsConfig")) {
             this.nodeOptions["n" + n] =
@@ -2846,6 +2887,17 @@ var ReplSetTest = function(opts) {
         // spinning up. We will re-enable this check after the replica set has finished initiating.
         if (jsTestOptions().enableTestCommands) {
             options.setParameter.enableReconfigRollbackCommittedWritesCheck = false;
+
+            // TODO (SERVER-74847): Remove this transition once we remove testing around
+            // downgrading from latest to last continuous.
+            options.setParameter.disableTransitionFromLatestToLastContinuous =
+                options.setParameter.disableTransitionFromLatestToLastContinuous || false;
+
+            // TODO (SERVER-74398): Remove special handling of 'confirm: true' once we no longer run
+            // suites with v6.X. We disable this check by default now so that we can pass suites
+            // without individually handling each multiversion test running on old binaries.
+            options.setParameter.requireConfirmInSetFcv =
+                options.setParameter.requireConfirmInSetFcv || false;
         }
 
         if (tojson(options) != tojson({}))
@@ -3348,18 +3400,34 @@ var ReplSetTest = function(opts) {
     /**
      * Constructor, which instantiates the ReplSetTest object from existing nodes.
      */
-    function _constructFromExistingNodes(
-        {name, serverless, nodeHosts, nodeOptions, keyFile, host, waitForKeys}) {
+    function _constructFromExistingNodes({
+        name,
+        serverless,
+        nodeHosts,
+        nodeOptions,
+        keyFile,
+        host,
+        waitForKeys,
+        pidValue = undefined
+    }) {
         print('Recreating replica set from existing nodes ' + tojson(nodeHosts));
 
         self.name = name;
         self.serverless = serverless;
         self.ports = nodeHosts.map(node => node.split(':')[1]);
+
+        let i = 0;
         self.nodes = nodeHosts.map((node) => {
             const conn = Mongo(node);
             conn.name = conn.host;
+            conn.port = node.split(':')[1];
+            if (pidValue !== undefined && pidValue[i] !== undefined) {
+                conn.pid = pidValue[i];
+                i++;
+            }
             return conn;
         });
+
         self.host = host;
         self.waitForKeys = waitForKeys;
         self.keyFile = keyFile;

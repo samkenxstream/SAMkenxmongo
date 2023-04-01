@@ -12,30 +12,31 @@
  * TODO SERVER-61231: shard merge can't handle restart, adapt this test.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
  *   requires_persistence,
+ *   # The currentOp output field 'dataSyncCompleted' was renamed to 'migrationCompleted'.
+ *   requires_fcv_70,
  *   serverless,
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {makeX509OptionsForTest} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
 load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
 load('jstests/replsets/rslib.js');
 
 const donorRst = new ReplSetTest({
     name: `${jsTestName()}_donor`,
     nodes: 3,
+    serverless: true,
     settings: {chainingAllowed: false},
-    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor, {
+    nodeOptions: Object.assign(makeX509OptionsForTest().donor, {
         setParameter: {
             // Allow non-timestamped reads on donor after migration completes for testing.
             'failpoint.tenantMigrationDonorAllowsNonTimestampedReads': tojson({mode: 'alwaysOn'}),
@@ -53,7 +54,7 @@ const tenantMigrationTest = new TenantMigrationTest({
     sharedOptions: {setParameter: {tenantMigrationExcludeDonorHostTimeoutMS: 1000}}
 });
 
-const tenantId = "testTenantId";
+const tenantId = ObjectId().str;
 const tenantDB = tenantMigrationTest.tenantDB(tenantId, "testDB");
 const collName = "testColl";
 
@@ -97,8 +98,8 @@ hangRecipientPrimaryAfterRetrievingStartOpTimes.wait();
 let res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
 let currOp = res.inprog[0];
 // The migration should not be complete.
+assert.eq(currOp.garbageCollectable, false, tojson(res));
 assert.eq(currOp.migrationCompleted, false, tojson(res));
-assert.eq(currOp.dataSyncCompleted, false, tojson(res));
 // The sync source can only be 'donorSecondary'.
 assert.eq(donorSecondary.host, currOp.donorSyncSource, tojson(res));
 
@@ -136,8 +137,8 @@ hangAfterRetrievingOpTimesAfterRestart.wait();
 res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
 currOp = res.inprog[0];
 // The migration should not be complete.
+assert.eq(currOp.garbageCollectable, false, tojson(res));
 assert.eq(currOp.migrationCompleted, false, tojson(res));
-assert.eq(currOp.dataSyncCompleted, false, tojson(res));
 // Since 'donorSecondary' was shut down, the sync source can only be 'delayedSecondary'.
 assert.eq(delayedSecondary.host, currOp.donorSyncSource, tojson(res));
 
@@ -167,4 +168,3 @@ TenantMigrationTest.assertCommitted(tenantMigrationTest.waitForMigrationToComple
 
 donorRst.stopSet();
 tenantMigrationTest.stop();
-})();

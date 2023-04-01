@@ -30,6 +30,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/multitenancy_gen.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/cloner_utils.h"
 #include "mongo/db/repl/read_concern_args.h"
@@ -55,12 +56,31 @@ BSONObj ClonerUtils::buildMajorityWaitRequest(Timestamp operationTime) {
     return bob.obj();
 }
 
-bool ClonerUtils::isDatabaseForTenant(StringData db, StringData prefix) {
-    return db.startsWith(prefix + "_");
+bool ClonerUtils::isDatabaseForTenant(const DatabaseName& db,
+                                      const boost::optional<TenantId>& prefix,
+                                      MigrationProtocolEnum protocol) {
+    if (!prefix) {
+        return protocol == MigrationProtocolEnum::kShardMerge;
+    }
+
+    if (db.tenantId()) {
+        return *db.tenantId() == *prefix;
+    } else {
+        auto fullDbName = db.db();
+        auto tenantDelim = fullDbName.find('_');
+        if (tenantDelim != std::string::npos) {
+            return (*prefix).toString() == fullDbName.substr(0, tenantDelim);
+        }
+        return false;
+    }
 }
 
+// TODO SERVER-70027: Pass tenantID object to this function instead of StringData.
 bool ClonerUtils::isNamespaceForTenant(NamespaceString nss, StringData prefix) {
-    return isDatabaseForTenant(nss.db(), prefix);
+    if (gMultitenancySupport && nss.tenantId() != boost::none) {
+        return nss.tenantId()->toString() == prefix;
+    }
+    return nss.db().startsWith(prefix + "_");
 }
 
 }  // namespace repl

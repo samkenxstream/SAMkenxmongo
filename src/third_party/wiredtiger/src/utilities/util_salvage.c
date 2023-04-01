@@ -10,14 +10,14 @@
 
 /*
  * usage --
- *     TODO: Add a comment describing this function.
+ *     Display a usage message for the salvage command.
  */
 static int
 usage(void)
 {
     static const char *options[] = {"-F",
       "force salvage (by default salvage will refuse to salvage tables that fail basic tests)",
-      NULL, NULL};
+      "-?", "show this message", NULL, NULL};
 
     util_usage("salvage [-F] uri", "options:", options);
     return (1);
@@ -25,7 +25,7 @@ usage(void)
 
 /*
  * util_salvage --
- *     TODO: Add a comment describing this function.
+ *     The salvage command.
  */
 int
 util_salvage(WT_SESSION *session, int argc, char *argv[])
@@ -37,12 +37,14 @@ util_salvage(WT_SESSION *session, int argc, char *argv[])
 
     force = NULL;
     uri = NULL;
-    while ((ch = __wt_getopt(progname, argc, argv, "F")) != EOF)
+    while ((ch = __wt_getopt(progname, argc, argv, "F?")) != EOF)
         switch (ch) {
         case 'F':
             force = "force";
             break;
         case '?':
+            usage();
+            return (0);
         default:
             return (usage());
         }

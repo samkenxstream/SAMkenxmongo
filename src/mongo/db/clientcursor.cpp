@@ -27,21 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/clientcursor.h"
 
+#include <ctime>
 #include <string>
-#include <time.h>
 #include <vector>
 
-#include "mongo/base/counter.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/external_data_source_scope_guard.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status.h"
@@ -51,6 +48,7 @@
 #include "mongo/db/cursor_server_params.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/explain.h"
+#include "mongo/db/query/telemetry.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/util/background.h"
@@ -62,24 +60,45 @@ namespace mongo {
 using std::string;
 using std::stringstream;
 
-static Counter64 cursorStatsOpen;           // gauge
-static Counter64 cursorStatsOpenPinned;     // gauge
-static Counter64 cursorStatsOpenNoTimeout;  // gauge
-static Counter64 cursorStatsTimedOut;
-static Counter64 cursorStatsTotalOpened;
-static Counter64 cursorStatsMoreThanOneBatch;
+static CounterMetric cursorStatsOpen{"cursor.open.total"};
+static CounterMetric cursorStatsOpenPinned{"cursor.open.pinned"};
+static CounterMetric cursorStatsOpenNoTimeout{"cursor.open.noTimeout"};
+static CounterMetric cursorStatsTimedOut{"cursor.timedOut"};
+static CounterMetric cursorStatsTotalOpened{"cursor.totalOpened"};
+static CounterMetric cursorStatsMoreThanOneBatch{"cursor.moreThanOneBatch"};
 
-static ServerStatusMetricField<Counter64> dCursorStatsOpen("cursor.open.total", &cursorStatsOpen);
-static ServerStatusMetricField<Counter64> dCursorStatsOpenPinned("cursor.open.pinned",
-                                                                 &cursorStatsOpenPinned);
-static ServerStatusMetricField<Counter64> dCursorStatsOpenNoTimeout("cursor.open.noTimeout",
-                                                                    &cursorStatsOpenNoTimeout);
-static ServerStatusMetricField<Counter64> dCursorStatusTimedout("cursor.timedOut",
-                                                                &cursorStatsTimedOut);
-static ServerStatusMetricField<Counter64> dCursorStatsTotalOpened("cursor.totalOpened",
-                                                                  &cursorStatsTotalOpened);
-static ServerStatusMetricField<Counter64> dCursorStatsMoreThanOneBatch(
-    "cursor.moreThanOneBatch", &cursorStatsMoreThanOneBatch);
+static CounterMetric cursorStatsLifespanLessThan1Second{"cursor.lifespan.lessThan1Second"};
+static CounterMetric cursorStatsLifespanLessThan5Seconds{"cursor.lifespan.lessThan5Seconds"};
+static CounterMetric cursorStatsLifespanLessThan15Seconds{"cursor.lifespan.lessThan15Seconds"};
+static CounterMetric cursorStatsLifespanLessThan30Seconds{"cursor.lifespan.lessThan30Seconds"};
+static CounterMetric cursorStatsLifespanLessThan1Minute{"cursor.lifespan.lessThan1Minute"};
+static CounterMetric cursorStatsLifespanLessThan10Minutes{"cursor.lifespan.lessThan10Minutes"};
+static CounterMetric cursorStatsLifespanGreaterThanOrEqual10Minutes{
+    "cursor.lifespan.greaterThanOrEqual10Minutes"};
+
+void incrementCursorLifespanMetric(Date_t birth, Date_t death) {
+    auto elapsed = death - birth;
+
+    if (elapsed < Seconds(1)) {
+        cursorStatsLifespanLessThan1Second.increment();
+    } else if (elapsed < Seconds(5)) {
+        cursorStatsLifespanLessThan5Seconds.increment();
+    } else if (elapsed < Seconds(15)) {
+        cursorStatsLifespanLessThan15Seconds.increment();
+    } else if (elapsed < Seconds(30)) {
+        cursorStatsLifespanLessThan30Seconds.increment();
+    } else if (elapsed < Minutes(1)) {
+        cursorStatsLifespanLessThan1Minute.increment();
+    } else if (elapsed < Minutes(10)) {
+        cursorStatsLifespanLessThan10Minutes.increment();
+    } else {
+        cursorStatsLifespanGreaterThanOrEqual10Minutes.increment();
+    }
+}
+
+const ClientCursor::Decoration<std::shared_ptr<ExternalDataSourceScopeGuard>>
+    ExternalDataSourceScopeGuard::get =
+        ClientCursor::declareDecoration<std::shared_ptr<ExternalDataSourceScopeGuard>>();
 
 ClientCursor::ClientCursor(ClientCursorParams params,
                            CursorId cursorId,
@@ -87,7 +106,7 @@ ClientCursor::ClientCursor(ClientCursorParams params,
                            Date_t now)
     : _cursorid(cursorId),
       _nss(std::move(params.nss)),
-      _authenticatedUsers(std::move(params.authenticatedUsers)),
+      _authenticatedUser(std::move(params.authenticatedUser)),
       _lsid(operationUsingCursor->getLogicalSessionId()),
       _txnNumber(operationUsingCursor->getTxnNumber()),
       _apiParameters(std::move(params.apiParameters)),
@@ -105,6 +124,7 @@ ClientCursor::ClientCursor(ClientCursorParams params,
       _planSummary(_exec->getPlanExplainer().getPlanSummary()),
       _planCacheKey(CurOp::get(operationUsingCursor)->debug().planCacheKey),
       _queryHash(CurOp::get(operationUsingCursor)->debug().queryHash),
+      _telemetryStoreKey(CurOp::get(operationUsingCursor)->debug().telemetryStoreKey),
       _opKey(operationUsingCursor->getOperationKey()) {
     invariant(_exec);
     invariant(_operationUsingCursor);
@@ -129,26 +149,38 @@ ClientCursor::~ClientCursor() {
         // needs to keep data pinned.
         _stashedRecoveryUnit->setAbandonSnapshotMode(RecoveryUnit::AbandonSnapshotMode::kAbort);
     }
+}
+
+void ClientCursor::dispose(OperationContext* opCtx, boost::optional<Date_t> now) {
+    if (_disposed) {
+        return;
+    }
+
+    if (_telemetryStoreKey && opCtx) {
+        telemetry::writeTelemetry(opCtx,
+                                  _telemetryStoreKey,
+                                  getOriginatingCommandObj(),
+                                  _metrics.executionTime.value_or(Microseconds{0}).count(),
+                                  _metrics.nreturned.value_or(0));
+    }
+
+    if (now) {
+        incrementCursorLifespanMetric(_createdDate, *now);
+    }
 
     cursorStatsOpen.decrement();
     if (isNoTimeout()) {
         cursorStatsOpenNoTimeout.decrement();
     }
 
-    if (_nBatchesReturned > 1)
+    if (_metrics.nBatches && *_metrics.nBatches > 1) {
         cursorStatsMoreThanOneBatch.increment();
-}
-
-void ClientCursor::markAsKilled(Status killStatus) {
-    _exec->markAsKilled(killStatus);
-}
-
-void ClientCursor::dispose(OperationContext* opCtx) {
-    if (_disposed) {
-        return;
     }
 
     _exec->dispose(opCtx);
+    // Update opCtx of the decorated ExternalDataSourceScopeGuard object so that it can drop virtual
+    // collections in the new 'opCtx'.
+    ExternalDataSourceScopeGuard::updateOperationContext(this, opCtx);
     _disposed = true;
 }
 
@@ -156,7 +188,7 @@ GenericCursor ClientCursor::toGenericCursor() const {
     GenericCursor gc;
     gc.setCursorId(cursorid());
     gc.setNs(nss());
-    gc.setNDocsReturned(_nReturnedSoFar);
+    gc.setNDocsReturned(_metrics.nreturned.value_or(0));
     gc.setTailable(isTailable());
     gc.setAwaitData(isAwaitData());
     gc.setNoCursorTimeout(isNoTimeout());
@@ -180,7 +212,10 @@ GenericCursor ClientCursor::toGenericCursor() const {
 ClientCursorPin::ClientCursorPin(OperationContext* opCtx,
                                  ClientCursor* cursor,
                                  CursorManager* cursorManager)
-    : _opCtx(opCtx), _cursor(cursor), _cursorManager(cursorManager) {
+    : _opCtx(opCtx),
+      _cursor(cursor),
+      _cursorManager(cursorManager),
+      _interruptibleLockGuard(std::make_unique<InterruptibleLockGuard>(opCtx->lockState())) {
     invariant(_cursor);
     invariant(_cursor->_operationUsingCursor);
     invariant(!_cursor->_disposed);
@@ -197,6 +232,7 @@ ClientCursorPin::ClientCursorPin(ClientCursorPin&& other)
     : _opCtx(other._opCtx),
       _cursor(other._cursor),
       _cursorManager(other._cursorManager),
+      _interruptibleLockGuard(std::move(other._interruptibleLockGuard)),
       _shouldSaveRecoveryUnit(other._shouldSaveRecoveryUnit) {
     // The pinned cursor is being transferred to us from another pin. The 'other' pin must have a
     // pinned cursor.
@@ -232,6 +268,8 @@ ClientCursorPin& ClientCursorPin::operator=(ClientCursorPin&& other) {
 
     _cursorManager = other._cursorManager;
     other._cursorManager = nullptr;
+
+    _interruptibleLockGuard = std::move(other._interruptibleLockGuard);
 
     _shouldSaveRecoveryUnit = other._shouldSaveRecoveryUnit;
     other._shouldSaveRecoveryUnit = false;
@@ -269,24 +307,12 @@ void ClientCursorPin::deleteUnderlying() {
     invariant(_cursor);
     invariant(_cursor->_operationUsingCursor);
     invariant(_cursorManager);
-    // Note the following subtleties of this method's implementation:
-    // - We must unpin the cursor (by clearing the '_operationUsingCursor' field) before
-    //   destruction, since it is an error to delete a pinned cursor.
-    // - In addition, we must deregister the cursor before clearing the '_operationUsingCursor'
-    //   field, since it is an error to unpin a registered cursor without holding the appropriate
-    //   cursor manager mutex. By first deregistering the cursor, we ensure that no other thread can
-    //   access '_cursor', meaning that it is safe for us to write to '_operationUsingCursor'
-    //   without holding the CursorManager mutex.
 
-    _cursorManager->deregisterCursor(_cursor);
-
-    // Make sure the cursor is disposed and unpinned before being destroyed.
-    _cursor->dispose(_opCtx);
-    _cursor->_operationUsingCursor = nullptr;
-    delete _cursor;
+    std::unique_ptr<ClientCursor, ClientCursor::Deleter> ownedCursor(_cursor);
+    _cursor = nullptr;
+    _cursorManager->deregisterAndDestroyCursor(_opCtx, std::move(ownedCursor));
 
     cursorStatsOpenPinned.decrement();
-    _cursor = nullptr;
     _shouldSaveRecoveryUnit = false;
 }
 
@@ -356,6 +382,31 @@ void _appendCursorStats(BSONObjBuilder& b) {
 
 void startClientCursorMonitor() {
     getClientCursorMonitor(getGlobalServiceContext()).go();
+}
+
+void collectTelemetryMongod(OperationContext* opCtx,
+                            ClientCursorPin& pinnedCursor,
+                            long long nreturned) {
+    auto curOp = CurOp::get(opCtx);
+    telemetry::collectMetricsOnOpDebug(curOp, nreturned);
+    pinnedCursor->incrementCursorMetrics(curOp->debug().additiveMetrics);
+}
+
+void collectTelemetryMongod(OperationContext* opCtx,
+                            const BSONObj& originatingCommand,
+                            long long nreturned) {
+    auto curOp = CurOp::get(opCtx);
+    telemetry::collectMetricsOnOpDebug(curOp, nreturned);
+
+    // If we haven't registered a cursor to prepare for getMore requests, we record
+    // telemetry directly.
+    auto& opDebug = curOp->debug();
+    telemetry::writeTelemetry(
+        opCtx,
+        opDebug.telemetryStoreKey,
+        originatingCommand,
+        opDebug.additiveMetrics.executionTime.value_or(Microseconds{0}).count(),
+        opDebug.additiveMetrics.nreturned.value_or(0));
 }
 
 }  // namespace mongo

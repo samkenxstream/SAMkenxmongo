@@ -27,23 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
-
 #include <boost/optional.hpp>
-#include <string>
 
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/field_parser.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/db/range_arithmetic.h"
-#include "mongo/db/s/chunk_move_write_concern_options.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
@@ -51,7 +41,8 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/request_types/migration_secondary_throttle_options.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
 namespace {
@@ -80,20 +71,21 @@ CleanupResult cleanupOrphanedData(OperationContext* opCtx,
                   "{namespace} does not exist",
                   "cleanupOrphaned skipping waiting for orphaned data cleanup because "
                   "collection does not exist",
-                  "namespace"_attr = ns.ns());
+                  logAttrs(ns));
             return CleanupResult::kDone;
         }
         collectionUuid.emplace(autoColl.getCollection()->uuid());
 
-        auto* const csr = CollectionShardingRuntime::get(opCtx, ns);
-        const auto optCollDescr = csr->getCurrentMetadataIfKnown();
+        const auto scopedCsr =
+            CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, ns);
+        auto optCollDescr = scopedCsr->getCurrentMetadataIfKnown();
         if (!optCollDescr || !optCollDescr->isSharded()) {
             LOGV2(4416001,
                   "cleanupOrphaned skipping waiting for orphaned data cleanup because "
                   "{namespace} is not sharded",
                   "cleanupOrphaned skipping waiting for orphaned data cleanup because "
                   "collection is not sharded",
-                  "namespace"_attr = ns.ns());
+                  logAttrs(ns));
             return CleanupResult::kDone;
         }
         range.emplace(optCollDescr->getMinKey(), optCollDescr->getMaxKey());
@@ -129,7 +121,7 @@ CleanupResult cleanupOrphanedData(OperationContext* opCtx,
 
         LOGV2(4416003,
               "cleanupOrphaned going to wait for range deletion tasks to complete",
-              "namespace"_attr = ns.ns(),
+              logAttrs(ns),
               "collectionUUID"_attr = *collectionUuid,
               "numRemainingDeletionTasks"_attr = numRemainingDeletionTasks);
 
@@ -168,11 +160,12 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::cleanupOrphaned)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                    ActionType::cleanupOrphaned)) {
             return Status(ErrorCodes::Unauthorized, "Not authorized for cleanupOrphaned command.");
         }
         return Status::OK();
@@ -214,7 +207,7 @@ public:
             return false;
         }
 
-        onShardVersionMismatch(opCtx, nss, boost::none);
+        onCollectionPlacementVersionMismatch(opCtx, nss, boost::none);
 
         CleanupResult cleanupResult = cleanupOrphanedData(opCtx, nss, startingFromKey, &errmsg);
 

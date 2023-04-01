@@ -34,10 +34,9 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/multi_index_block.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/collection_bulk_loader.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/shard_role.h"
 
 namespace mongo {
 namespace repl {
@@ -60,9 +59,9 @@ public:
         BSONObj toBSON() const;
     };
 
-    CollectionBulkLoaderImpl(ServiceContext::UniqueClient&& client,
-                             ServiceContext::UniqueOperationContext&& opCtx,
-                             std::unique_ptr<AutoGetCollection>&& autoColl,
+    CollectionBulkLoaderImpl(ServiceContext::UniqueClient client,
+                             ServiceContext::UniqueOperationContext opCtx,
+                             const NamespaceString& nss,
                              const BSONObj& idIndexSpec);
     virtual ~CollectionBulkLoaderImpl();
 
@@ -104,7 +103,7 @@ private:
 
     ServiceContext::UniqueClient _client;
     ServiceContext::UniqueOperationContext _opCtx;
-    std::unique_ptr<AutoGetCollection> _collection;
+    ScopedCollectionAcquisition _acquisition;
     NamespaceString _nss;
     std::unique_ptr<MultiIndexBlock> _idIndexBlock;
     std::unique_ptr<MultiIndexBlock> _secondaryIndexesBlock;

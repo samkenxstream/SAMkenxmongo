@@ -9,6 +9,8 @@
 (function() {
 "use strict";
 
+load("jstests/libs/catalog_shard_util.js");
+
 const kDBName = "foo";
 const kCollName = "bar";
 
@@ -16,9 +18,15 @@ const kCollName = "bar";
 // error was different than when a command is rejected for not having sharding enabled.
 const clusterCommandsCases = [
     {cmd: {clusterAbortTransaction: 1}, expectedErr: ErrorCodes.InvalidOptions},
+    {cmd: {clusterAggregate: kCollName, pipeline: [{$match: {}}], cursor: {}}},
     {cmd: {clusterCommitTransaction: 1}, expectedErr: ErrorCodes.InvalidOptions},
+    {cmd: {clusterCount: "x"}},
     {cmd: {clusterDelete: kCollName, deletes: [{q: {}, limit: 1}]}},
     {cmd: {clusterFind: kCollName}},
+    {
+        cmd: {clusterGetMore: NumberLong(1), collection: kCollName},
+        expectedErr: ErrorCodes.CursorNotFound
+    },
     {cmd: {clusterInsert: kCollName, documents: [{x: 1}]}},
     {cmd: {clusterUpdate: kCollName, updates: [{q: {doesNotExist: 1}, u: {x: 1}}]}},
 ];
@@ -88,11 +96,20 @@ function runTestCaseExpectSuccess(conn, testCase) {
     }
 
     //
-    // Cluster commands are not allowed on a config server node.
+    // Cluster commands are allowed on a catalog shard enabled config server.
     //
 
+    const isCatalogShardEnabled = CatalogShardUtil.isEnabledIgnoringFCV(st);
     for (let testCase of clusterCommandsCases) {
-        runTestCaseExpectFail(st.configRS.getPrimary(), testCase, ErrorCodes.NoShardingEnabled);
+        if (isCatalogShardEnabled) {
+            if (testCase.expectedErr) {
+                runTestCaseExpectFail(st.rs0.getPrimary(), testCase, testCase.expectedErr);
+            } else {
+                runTestCaseExpectSuccess(st.rs0.getPrimary(), testCase);
+            }
+        } else {
+            runTestCaseExpectFail(st.configRS.getPrimary(), testCase, ErrorCodes.NoShardingEnabled);
+        }
     }
 
     //

@@ -88,7 +88,7 @@ ServiceContext::UniqueOperationContext makeOpCtx() {
  * Returns true if collection exists.
  */
 bool collectionExists(OperationContext* opCtx, const NamespaceString& nss) {
-    return AutoGetCollectionForRead(opCtx, nss).getCollection() != nullptr;
+    return static_cast<bool>(AutoGetCollectionForRead(opCtx, nss).getCollection());
 }
 
 /**
@@ -107,7 +107,7 @@ CollectionOptions getCollectionOptions(OperationContext* opCtx, const NamespaceS
 const double cappedCollectionSize = 8192.0;
 
 TEST_F(CappedUtilsTest, ConvertToCappedReturnsNamespaceNotFoundIfCollectionIsMissing) {
-    NamespaceString nss("test.t");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.t");
     auto opCtx = makeOpCtx();
     ASSERT_FALSE(collectionExists(opCtx.get(), nss));
     ASSERT_THROWS_CODE(
@@ -115,7 +115,7 @@ TEST_F(CappedUtilsTest, ConvertToCappedReturnsNamespaceNotFoundIfCollectionIsMis
 }
 
 TEST_F(CappedUtilsTest, ConvertToCappedUpdatesCollectionOptionsOnSuccess) {
-    NamespaceString nss("test.t");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.t");
 
     auto opCtx = makeOpCtx();
     ASSERT_OK(_storage->createCollection(opCtx.get(), nss, {}));
@@ -130,7 +130,7 @@ TEST_F(CappedUtilsTest, ConvertToCappedUpdatesCollectionOptionsOnSuccess) {
 }
 
 TEST_F(CappedUtilsTest, ConvertToCappedReturnsNamespaceNotFoundIfCollectionIsDropPending) {
-    NamespaceString nss("test.t");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.t");
     repl::OpTime dropOpTime(Timestamp(Seconds(100), 0), 1LL);
     auto dropPendingNss = nss.makeDropPendingNamespace(dropOpTime);
 

@@ -41,7 +41,7 @@ namespace mongo {
 
 namespace {
 
-const NamespaceString kTestNss("testdb.testcoll");
+const NamespaceString kTestNss = NamespaceString::createNamespaceString_forTest("testdb.testcoll");
 const HostAndPort kTestConfigShardHost = HostAndPort("FakeConfigHost", 12345);
 const std::vector<ShardId> kTestShardIds = {
     ShardId("FakeShard1"), ShardId("FakeShard2"), ShardId("FakeShard3")};
@@ -214,7 +214,7 @@ TEST_F(AsyncRequestsSenderTest, HandlesExceptionWhenUnyielding) {
     future.default_timed_get();
 }
 
-TEST_F(AsyncRequestsSenderTest, ExceptionWhileWaitingSkipsUnyield) {
+TEST_F(AsyncRequestsSenderTest, ExceptionWhileWaitingDoesNotSkipUnyield) {
     class CountingResourceYielder : public ResourceYielder {
     public:
         void yield(OperationContext*) {
@@ -258,7 +258,7 @@ TEST_F(AsyncRequestsSenderTest, ExceptionWhileWaitingSkipsUnyield) {
     future.default_timed_get();
 
     ASSERT_EQ(yielderPointer->timesYielded, 1);
-    ASSERT_EQ(yielderPointer->timesUnyielded, 0);
+    ASSERT_EQ(yielderPointer->timesUnyielded, 1);
 }
 }  // namespace
 }  // namespace mongo

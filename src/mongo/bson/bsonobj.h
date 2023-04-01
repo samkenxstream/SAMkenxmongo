@@ -123,6 +123,7 @@ public:
     using ComparisonRulesSet = BSONComparatorInterfaceBase<BSONObj>::ComparisonRulesSet;
 
     static constexpr char kMinBSONLength = 5;
+    static const BSONObj kEmptyObject;
 
     /**
      * Construct an empty BSONObj -- that is, {}.
@@ -265,9 +266,17 @@ public:
     BSONObj copy() const;
 
     /**
+     * If the data buffer is not under the control of this BSONObj, allocate
+     * a separate copy and make this object a fully owned one.
+     */
+    void makeOwned();
+
+    /**
      * @return a new full (and owned) redacted copy of the object.
      */
-    BSONObj redact() const;
+    BSONObj redact(
+        bool onlyEncryptedFields = false,
+        std::function<std::string(const BSONElement&)> fieldNameRedactor = nullptr) const;
 
     /**
      * Readable representation of a BSON object in an extended JSON-style notation.
@@ -638,11 +647,6 @@ public:
     bool hasFieldNames() const;
 
     /**
-     * Returns true if this object is valid and returns false otherwise.
-     */
-    bool valid() const;
-
-    /**
      * add all elements of the object to the specified vector
      */
     void elems(std::vector<BSONElement>&) const;
@@ -661,6 +665,12 @@ public:
      *
      *      for (BSONElement elem : BSON("a" << 1 << "b" << 2)) {
      *          ... // Do something with elem
+     *      }
+     *
+     * You can also loop over a bson object as-if it were a map<StringData, BSONElement>:
+     *
+     *      for (auto [fieldName, elem] : BSON("a" << 1 << "b" << 2)) {
+     *          ... // Do something with fieldName and elem
      *      }
      */
     iterator begin() const;

@@ -42,7 +42,7 @@
 #include "mongo/db/pipeline/variable_validation.h"
 #include "mongo/db/query/util/make_data_structure.h"
 #include "mongo/stdx/variant.h"
-#include "mongo/util/visit_helper.h"
+#include "mongo/util/overloaded_visitor.h"
 
 namespace mongo::c_node_validation {
 using namespace std::string_literals;
@@ -206,8 +206,8 @@ Status addPathsFromTreeToSet(const CNode::ObjectChildren& children,
         // like '{"a.b": 1}'.
         auto currentPath = previousPath;
         if (auto&& fieldname = stdx::get_if<FieldnamePath>(&child.first))
-            for (auto&& component :
-                 stdx::visit([](auto&& fn) -> auto&& { return fn.components; }, *fieldname))
+            for (auto&& component : stdx::visit(
+                     [](auto&& fn) -> auto&& { return fn.components; }, *fieldname))
                 currentPath.emplace_back(component);
         // Or add a translaiton of _id if we have a key for that.
         else
@@ -220,7 +220,7 @@ Status addPathsFromTreeToSet(const CNode::ObjectChildren& children,
                  stdx::get<KeyFieldname>(child.first) == KeyFieldname::id));
 
         if (auto status = stdx::visit(
-                visit_helper::Overloaded{
+                OverloadedVisitor{
                     [&](const CompoundInclusionKey& compoundKey) {
                         // In this context we have a compound inclusion key to descend into.
                         return addPathsFromTreeToSet(
@@ -275,7 +275,7 @@ Status validateNumericType(T num) {
 
 Status validateSingleType(const CNode& element) {
     return stdx::visit(
-        visit_helper::Overloaded{
+        OverloadedVisitor{
             [&](const UserDouble& dbl) { return validateNumericType(dbl); },
             [&](const UserInt& num) { return validateNumericType(num); },
             [&](const UserLong& lng) { return validateNumericType(lng); },
@@ -301,7 +301,9 @@ Status validateSingleType(const CNode& element) {
                 }
                 return Status::OK();
             },
-            [&](auto &&) -> Status { MONGO_UNREACHABLE; }},
+            [&](auto&&) -> Status {
+                MONGO_UNREACHABLE;
+            }},
         element.payload);
 }
 }  // namespace

@@ -10,18 +10,20 @@
 
 /*
  * usage --
- *     TODO: Add a comment describing this function.
+ *     Display a usage message for the read command.
  */
 static int
 usage(void)
 {
-    util_usage("read uri key ...", NULL, NULL);
+    static const char *options[] = {"-?", "show this message", NULL, NULL};
+
+    util_usage("read uri key ...", "options:", options);
     return (1);
 }
 
 /*
  * util_read --
- *     TODO: Add a comment describing this function.
+ *     The read command.
  */
 int
 util_read(WT_SESSION *session, int argc, char *argv[])
@@ -34,9 +36,11 @@ util_read(WT_SESSION *session, int argc, char *argv[])
     bool rkey, rval;
 
     uri = NULL;
-    while ((ch = __wt_getopt(progname, argc, argv, "")) != EOF)
+    while ((ch = __wt_getopt(progname, argc, argv, "?")) != EOF)
         switch (ch) {
         case '?':
+            usage();
+            return (0);
         default:
             return (usage());
         }

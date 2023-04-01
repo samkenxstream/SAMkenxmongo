@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -41,7 +40,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/flow_control.h"
-#include "mongo/db/storage/ticketholders.h"
+#include "mongo/db/storage/ticketholder_manager.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/stdx/new.h"
@@ -51,6 +50,10 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
+#include "mongo/util/testing_proctor.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
@@ -145,8 +148,6 @@ bool LockerImpl::_shouldDelayUnlock(ResourceId resId, LockMode mode) const {
             return false;
 
         case RESOURCE_GLOBAL:
-        case RESOURCE_PBWM:
-        case RESOURCE_RSTL:
         case RESOURCE_DATABASE:
         case RESOURCE_COLLECTION:
         case RESOURCE_METADATA:
@@ -203,11 +204,15 @@ void LockerImpl::dump() const {
         ResourceId key;
         LockRequest::Status status;
         LockMode mode;
+        unsigned int recursiveCount;
+        unsigned int unlockPending;
 
         BSONObj toBSON() const {
             BSONObjBuilder b;
             b.append("key", key.toString());
             b.append("status", lockRequestStatusName(status));
+            b.append("recursiveCount", static_cast<int>(recursiveCount));
+            b.append("unlockPending", static_cast<int>(unlockPending));
             b.append("mode", modeName(mode));
             return b.obj();
         }
@@ -219,7 +224,8 @@ void LockerImpl::dump() const {
     {
         auto lg = stdx::lock_guard(_lock);
         for (auto it = _requests.begin(); !it.finished(); it.next())
-            entries.push_back({it.key(), it->status, it->mode});
+            entries.push_back(
+                {it.key(), it->status, it->mode, it->recursiveCount, it->unlockPending});
     }
     LOGV2(20523,
           "Locker id {id} status: {requests}",
@@ -291,8 +297,11 @@ void CondVarLockGrantNotification::notify(ResourceId resId, LockResult result) {
 // Locker
 //
 
-LockerImpl::LockerImpl()
-    : _id(idCounter.addAndFetch(1)), _wuowNestingLevel(0), _threadId(stdx::this_thread::get_id()) {}
+LockerImpl::LockerImpl(ServiceContext* serviceCtx)
+    : _id(idCounter.addAndFetch(1)),
+      _wuowNestingLevel(0),
+      _threadId(stdx::this_thread::get_id()),
+      _ticketHolderManager(TicketHolderManager::get(serviceCtx)) {}
 
 stdx::thread::id LockerImpl::getThreadId() const {
     return _threadId;
@@ -312,6 +321,7 @@ LockerImpl::~LockerImpl() {
     // to delete with unaccounted locks anyways.
     invariant(!inAWriteUnitOfWork());
     invariant(_numResourcesToUnlockAtEndUnitOfWork == 0);
+    invariant(!_ticket || !_ticket->valid());
 
     if (!_requests.empty()) {
         _dumpLockerAndLockManagerRequests();
@@ -319,9 +329,6 @@ LockerImpl::~LockerImpl() {
     invariant(_requests.empty());
 
     invariant(_modeForTicket == MODE_NONE);
-
-    // Reset the locking statistics so the object can be reused
-    _stats.reset();
 }
 
 Locker::ClientState LockerImpl::getClientState() const {
@@ -347,41 +354,58 @@ void LockerImpl::reacquireTicket(OperationContext* opCtx) {
     if (clientState != kInactive)
         return;
 
-    if (!_maxLockTimeout || _uninterruptibleLocksRequested) {
-        invariant(_acquireTicket(opCtx, _modeForTicket, Date_t::max()));
-    } else {
-        uassert(ErrorCodes::LockTimeout,
-                str::stream() << "Unable to acquire ticket with mode '" << _modeForTicket
-                              << "' within a max lock request timeout of '" << *_maxLockTimeout
-                              << "' milliseconds.",
-                _acquireTicket(opCtx, _modeForTicket, Date_t::now() + *_maxLockTimeout));
+    if (_acquireTicket(opCtx, _modeForTicket, Date_t::now())) {
+        return;
     }
+
+    do {
+        for (auto it = _requests.begin(); it; it.next()) {
+            invariant(it->mode == LockMode::MODE_IS || it->mode == LockMode::MODE_IX);
+            opCtx->checkForInterrupt();
+
+            // If we've reached this point then that means we tried to acquire a ticket but were
+            // unsuccessful, implying that tickets are currently exhausted. Additionally, since
+            // we're holding an IS or IX lock for this resource, any pending requests for the same
+            // resource must be S or X and will not be able to be granted. Thus, since such a
+            // pending lock request may also be holding a ticket, if there are any present we fail
+            // this ticket reacquisition in order to avoid a deadlock.
+            uassert(ErrorCodes::LockTimeout,
+                    fmt::format("Unable to acquire ticket with mode '{}' due to detected lock "
+                                "conflict for resource {}",
+                                _modeForTicket,
+                                it.key().toString()),
+                    !getGlobalLockManager()->hasConflictingRequests(it.objAddr()));
+        }
+    } while (!_acquireTicket(opCtx, _modeForTicket, Date_t::now() + Milliseconds{100}));
 }
 
 bool LockerImpl::_acquireTicket(OperationContext* opCtx, LockMode mode, Date_t deadline) {
+    // Upon startup, the holder is not guaranteed to be initialized.
+    auto holder = _ticketHolderManager ? _ticketHolderManager->getTicketHolder(mode) : nullptr;
     const bool reader = isSharedLockMode(mode);
-    auto& ticketHolders = ticketHoldersDecoration(getGlobalServiceContext());
-    auto holder = shouldAcquireTicket() ? ticketHolders.getTicketHolder(mode) : nullptr;
-    if (holder) {
-        _clientState.store(reader ? kQueuedReader : kQueuedWriter);
 
+    if (!shouldWaitForTicket() && holder) {
+        holder->reportImmediatePriorityAdmission();
+    } else if (mode != MODE_X && mode != MODE_NONE && holder) {
+        // MODE_X is exclusive of all other locks, thus acquiring a ticket is unnecessary.
+        _clientState.store(reader ? kQueuedReader : kQueuedWriter);
         // If the ticket wait is interrupted, restore the state of the client.
         ScopeGuard restoreStateOnErrorGuard([&] { _clientState.store(kInactive); });
 
         // Acquiring a ticket is a potentially blocking operation. This must not be called after a
         // transaction timestamp has been set, indicating this transaction has created an oplog
         // hole.
-        if (opCtx)
-            invariant(!opCtx->recoveryUnit()->isTimestamped());
+        invariant(!opCtx->recoveryUnit()->isTimestamped());
 
-        OperationContext* interruptible = _uninterruptibleLocksRequested ? nullptr : opCtx;
-        if (deadline == Date_t::max()) {
-            holder->waitForTicket(interruptible);
-        } else if (!holder->waitForTicketUntil(interruptible, deadline)) {
+        if (auto ticket = holder->waitForTicketUntil(
+                _uninterruptibleLocksRequested ? nullptr : opCtx, &_admCtx, deadline)) {
+            _ticket = std::move(*ticket);
+        } else {
             return false;
         }
         restoreStateOnErrorGuard.dismiss();
     }
+
     _clientState.store(reader ? kActiveReader : kActiveWriter);
     return true;
 }
@@ -390,12 +414,10 @@ void LockerImpl::lockGlobal(OperationContext* opCtx, LockMode mode, Date_t deadl
     dassert(isLocked() == (_modeForTicket != MODE_NONE));
     if (_modeForTicket == MODE_NONE) {
         if (_uninterruptibleLocksRequested) {
-            // Ignore deadline and _maxLockTimeout.
+            // Ignore deadline.
             invariant(_acquireTicket(opCtx, mode, Date_t::max()));
         } else {
             auto beforeAcquire = Date_t::now();
-            deadline = std::min(deadline,
-                                _maxLockTimeout ? beforeAcquire + *_maxLockTimeout : Date_t::max());
             uassert(ErrorCodes::LockTimeout,
                     str::stream() << "Unable to acquire ticket with mode '" << mode
                                   << "' within a max lock request timeout of '"
@@ -403,6 +425,13 @@ void LockerImpl::lockGlobal(OperationContext* opCtx, LockMode mode, Date_t deadl
                     _acquireTicket(opCtx, mode, deadline));
         }
         _modeForTicket = mode;
+    } else if (TestingProctor::instance().isEnabled() && !isModeCovered(mode, _modeForTicket)) {
+        LOGV2_FATAL(
+            6614500,
+            "Ticket held does not cover requested mode for global lock. Global lock upgrades are "
+            "not allowed",
+            "held"_attr = modeName(_modeForTicket),
+            "requested"_attr = modeName(mode));
     }
 
     const LockResult result = _lockBegin(opCtx, resourceIdGlobal, mode);
@@ -411,7 +440,7 @@ void LockerImpl::lockGlobal(OperationContext* opCtx, LockMode mode, Date_t deadl
         return;
 
     invariant(result == LOCK_WAITING);
-    _lockComplete(opCtx, resourceIdGlobal, mode, deadline);
+    _lockComplete(opCtx, resourceIdGlobal, mode, deadline, nullptr);
 }
 
 bool LockerImpl::unlockGlobal() {
@@ -427,8 +456,7 @@ bool LockerImpl::unlockGlobal() {
         // error for any lock used with multi-granularity locking to have more references than
         // the global lock, because every scope starts by calling lockGlobal.
         const auto resType = it.key().getType();
-        if (resType == RESOURCE_GLOBAL || resType == RESOURCE_PBWM || resType == RESOURCE_RSTL ||
-            resType == RESOURCE_MUTEX) {
+        if (resType == RESOURCE_GLOBAL || resType == RESOURCE_MUTEX) {
             it.next();
         } else {
             invariant(_unlockImpl(&it));
@@ -547,7 +575,7 @@ void LockerImpl::lock(OperationContext* opCtx, ResourceId resId, LockMode mode, 
         return;
 
     invariant(result == LOCK_WAITING);
-    _lockComplete(opCtx, resId, mode, deadline);
+    _lockComplete(opCtx, resId, mode, deadline, nullptr);
 }
 
 void LockerImpl::downgrade(ResourceId resId, LockMode newMode) {
@@ -619,9 +647,7 @@ bool LockerImpl::isLockHeldForMode(ResourceId resId, LockMode mode) const {
     return isModeCovered(mode, getLockMode(resId));
 }
 
-bool LockerImpl::isDbLockedForMode(StringData dbName, LockMode mode) const {
-    invariant(nsIsDbOnly(dbName));
-
+bool LockerImpl::isDbLockedForMode(const DatabaseName& dbName, LockMode mode) const {
     if (isW())
         return true;
     if (isR() && isSharedLockMode(mode))
@@ -639,7 +665,7 @@ bool LockerImpl::isCollectionLockedForMode(const NamespaceString& nss, LockMode 
     if (isR() && isSharedLockMode(mode))
         return true;
 
-    const ResourceId resIdDb(RESOURCE_DATABASE, nss.db());
+    const ResourceId resIdDb(RESOURCE_DATABASE, nss.dbName());
 
     LockMode dbMode = getLockMode(resIdDb);
     if (!shouldConflictWithSecondaryBatchApplication())
@@ -654,7 +680,7 @@ bool LockerImpl::isCollectionLockedForMode(const NamespaceString& nss, LockMode 
             return isSharedLockMode(mode);
         case MODE_IX:
         case MODE_IS: {
-            const ResourceId resIdColl(RESOURCE_COLLECTION, nss.ns());
+            const ResourceId resIdColl(RESOURCE_COLLECTION, nss);
             return isLockHeldForMode(resIdColl, mode);
         } break;
         case LockModesCount:
@@ -780,8 +806,9 @@ bool LockerImpl::saveLockStateAndUnlock(Locker::LockSnapshot* stateOut) {
 
         // We should never have to save and restore metadata locks.
         invariant(RESOURCE_DATABASE == resType || RESOURCE_COLLECTION == resType ||
-                  (RESOURCE_PBWM == resType && isSharedLockMode(it->mode)) ||
-                  (RESOURCE_RSTL == resType && it->mode == MODE_IX));
+                  (resId == resourceIdParallelBatchWriterMode && isSharedLockMode(it->mode)) ||
+                  resId == resourceIdFeatureCompatibilityVersion ||
+                  (resId == resourceIdReplicationStateTransitionLock && it->mode == MODE_IX));
 
         // And, stuff the info into the out parameter.
         OneLock info;
@@ -809,14 +836,20 @@ void LockerImpl::restoreLockState(OperationContext* opCtx, const Locker::LockSna
     invariant(_modeForTicket == MODE_NONE);
     invariant(_clientState.load() == kInactive);
 
-    if (opCtx) {
-        getFlowControlTicket(opCtx, state.globalMode);
-    }
+    getFlowControlTicket(opCtx, state.globalMode);
 
     std::vector<OneLock>::const_iterator it = state.locks.begin();
-    // If we locked the PBWM, it must be locked before the resourceIdGlobal and
-    // resourceIdReplicationStateTransitionLock resources.
+    // If we locked the PBWM, it must be locked before the
+    // resourceIdFeatureCompatibilityVersion, resourceIdReplicationStateTransitionLock, and
+    // resourceIdGlobal resources.
     if (it != state.locks.end() && it->resourceId == resourceIdParallelBatchWriterMode) {
+        lock(opCtx, it->resourceId, it->mode);
+        it++;
+    }
+
+    // If we locked the FCV lock, it must be locked before the
+    // resourceIdReplicationStateTransitionLock and resourceIdGlobal resources.
+    if (it != state.locks.end() && it->resourceId == resourceIdFeatureCompatibilityVersion) {
         lock(opCtx, it->resourceId, it->mode);
         it++;
     }
@@ -829,6 +862,8 @@ void LockerImpl::restoreLockState(OperationContext* opCtx, const Locker::LockSna
 
     lockGlobal(opCtx, state.globalMode);
     for (; it != state.locks.end(); it++) {
+        // Ensures we don't acquire locks out of order which can lead to deadlock.
+        invariant(it->resourceId.getType() != ResourceType::RESOURCE_GLOBAL);
         lock(opCtx, it->resourceId, it->mode);
     }
     invariant(_modeForTicket != MODE_NONE);
@@ -844,7 +879,8 @@ LockResult LockerImpl::_lockBegin(OperationContext* opCtx, ResourceId resId, Loc
     dassert(!getWaitingResource().isValid());
 
     // Operations which are holding open an oplog hole cannot block when acquiring locks.
-    if (opCtx && !shouldAllowLockAcquisitionOnTimestampedUnitOfWork()) {
+    if (opCtx && !shouldAllowLockAcquisitionOnTimestampedUnitOfWork() &&
+        resId.getType() != RESOURCE_METADATA && resId.getType() != RESOURCE_MUTEX) {
         invariant(!opCtx->recoveryUnit()->isTimestamped(),
                   str::stream()
                       << "Operation holding open an oplog hole tried to acquire locks. ResourceId: "
@@ -884,7 +920,7 @@ LockResult LockerImpl::_lockBegin(OperationContext* opCtx, ResourceId resId, Loc
     // Give priority to the full modes for Global, PBWM, and RSTL resources so we don't stall global
     // operations such as shutdown or stepdown.
     const ResourceType resType = resId.getType();
-    if (resType == RESOURCE_GLOBAL || resType == RESOURCE_PBWM || resType == RESOURCE_RSTL) {
+    if (resType == RESOURCE_GLOBAL) {
         if (mode == MODE_S || mode == MODE_X) {
             request->enqueueAtFront = true;
             request->compatibleFirst = true;
@@ -928,11 +964,13 @@ LockResult LockerImpl::_lockBegin(OperationContext* opCtx, ResourceId resId, Loc
 void LockerImpl::_lockComplete(OperationContext* opCtx,
                                ResourceId resId,
                                LockMode mode,
-                               Date_t deadline) {
+                               Date_t deadline,
+                               const LockTimeoutCallback& onTimeout) {
     // Operations which are holding open an oplog hole cannot block when acquiring locks. Lock
     // requests entering this function have been queued up and will be granted the lock as soon as
     // the lock is released, which is a blocking operation.
-    if (opCtx && !shouldAllowLockAcquisitionOnTimestampedUnitOfWork()) {
+    if (opCtx && !shouldAllowLockAcquisitionOnTimestampedUnitOfWork() &&
+        resId.getType() != RESOURCE_METADATA && resId.getType() != RESOURCE_MUTEX) {
         invariant(!opCtx->recoveryUnit()->isTimestamped(),
                   str::stream()
                       << "Operation holding open an oplog hole tried to acquire locks. ResourceId: "
@@ -1013,6 +1051,9 @@ void LockerImpl::_lockComplete(OperationContext* opCtx,
         // Check if the lock acquisition has timed out. If we have an operation context and client
         // we can provide additional diagnostics data.
         if (waitTime == Milliseconds(0)) {
+            if (onTimeout) {
+                onTimeout();
+            }
             std::string timeoutMessage = str::stream()
                 << "Unable to acquire " << modeName(mode) << " lock on '" << resId.toString()
                 << "' within " << timeout << ".";
@@ -1034,7 +1075,8 @@ void LockerImpl::_lockComplete(OperationContext* opCtx,
 void LockerImpl::getFlowControlTicket(OperationContext* opCtx, LockMode lockMode) {
     auto ticketholder = FlowControlTicketholder::get(opCtx);
     if (ticketholder && lockMode == LockMode::MODE_IX && _clientState.load() == kInactive &&
-        opCtx->shouldParticipateInFlowControl() && !_uninterruptibleLocksRequested) {
+        _admCtx.getPriority() != AdmissionContext::Priority::kImmediate &&
+        !_uninterruptibleLocksRequested) {
         // FlowControl only acts when a MODE_IX global lock is being taken. The clientState is only
         // being modified here to change serverStatus' `globalLock.currentQueue` metrics. This
         // method must not exit with a side-effect on the clientState. That value is also used for
@@ -1060,8 +1102,11 @@ LockResult LockerImpl::lockRSTLBegin(OperationContext* opCtx, LockMode mode) {
     return _lockBegin(opCtx, resourceIdReplicationStateTransitionLock, mode);
 }
 
-void LockerImpl::lockRSTLComplete(OperationContext* opCtx, LockMode mode, Date_t deadline) {
-    _lockComplete(opCtx, resourceIdReplicationStateTransitionLock, mode, deadline);
+void LockerImpl::lockRSTLComplete(OperationContext* opCtx,
+                                  LockMode mode,
+                                  Date_t deadline,
+                                  const LockTimeoutCallback& onTimeout) {
+    _lockComplete(opCtx, resourceIdReplicationStateTransitionLock, mode, deadline, onTimeout);
 }
 
 void LockerImpl::releaseTicket() {
@@ -1070,11 +1115,7 @@ void LockerImpl::releaseTicket() {
 }
 
 void LockerImpl::_releaseTicket() {
-    auto& ticketHolders = ticketHoldersDecoration(getGlobalServiceContext());
-    auto holder = shouldAcquireTicket() ? ticketHolders.getTicketHolder(_modeForTicket) : nullptr;
-    if (holder) {
-        holder->release();
-    }
+    _ticket.reset();
     _clientState.store(kInactive);
 }
 

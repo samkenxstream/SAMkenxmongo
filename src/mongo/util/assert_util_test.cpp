@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/config.h"
 #include "mongo/platform/basic.h"
@@ -35,11 +34,16 @@
 #include <type_traits>
 
 #include "mongo/base/static_assert.h"
+#include "mongo/unittest/assert_that.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace {
@@ -75,8 +79,6 @@ MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NetworkError
                                      ExceptionFor<ErrorCodes::BadValue>>());
 MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NotPrimaryError>,
                                      ExceptionFor<ErrorCodes::BadValue>>());
-MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::Interruption>,
-                                     ExceptionFor<ErrorCodes::BadValue>>());
 
 TEST(AssertUtils, UassertNamedCodeWithoutCategories) {
     ASSERT_CATCHES(ErrorCodes::BadValue, DBException);
@@ -85,7 +87,6 @@ TEST(AssertUtils, UassertNamedCodeWithoutCategories) {
     ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionFor<ErrorCodes::DuplicateKey>);
     ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionForCat<ErrorCategory::NetworkError>);
     ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionForCat<ErrorCategory::NotPrimaryError>);
-    ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionForCat<ErrorCategory::Interruption>);
 }
 
 // NotWritablePrimary - NotPrimaryError, RetriableError
@@ -98,8 +99,6 @@ MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NetworkError
                                      ExceptionFor<ErrorCodes::NotWritablePrimary>>());
 MONGO_STATIC_ASSERT(std::is_base_of<ExceptionForCat<ErrorCategory::NotPrimaryError>,
                                     ExceptionFor<ErrorCodes::NotWritablePrimary>>());
-MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::Interruption>,
-                                     ExceptionFor<ErrorCodes::NotWritablePrimary>>());
 
 TEST(AssertUtils, UassertNamedCodeWithOneCategory) {
     ASSERT_CATCHES(ErrorCodes::NotWritablePrimary, DBException);
@@ -109,11 +108,10 @@ TEST(AssertUtils, UassertNamedCodeWithOneCategory) {
     ASSERT_NOT_CATCHES(ErrorCodes::NotWritablePrimary,
                        ExceptionForCat<ErrorCategory::NetworkError>);
     ASSERT_CATCHES(ErrorCodes::NotWritablePrimary, ExceptionForCat<ErrorCategory::NotPrimaryError>);
-    ASSERT_NOT_CATCHES(ErrorCodes::NotWritablePrimary,
-                       ExceptionForCat<ErrorCategory::Interruption>);
 }
 
 // InterruptedDueToReplStateChange - NotPrimaryError, Interruption, RetriableError
+// TODO(SERVER-56251): revise list when removing the Interruption category.
 MONGO_STATIC_ASSERT(
     std::is_same<error_details::ErrorCategoriesFor<ErrorCodes::InterruptedDueToReplStateChange>,
                  error_details::CategoryList<ErrorCategory::Interruption,
@@ -124,8 +122,6 @@ MONGO_STATIC_ASSERT(std::is_base_of<AssertionException,
 MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NetworkError>,
                                      ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
 MONGO_STATIC_ASSERT(std::is_base_of<ExceptionForCat<ErrorCategory::NotPrimaryError>,
-                                    ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
-MONGO_STATIC_ASSERT(std::is_base_of<ExceptionForCat<ErrorCategory::Interruption>,
                                     ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
 
 TEST(AssertUtils, UassertNamedCodeWithTwoCategories) {
@@ -139,8 +135,6 @@ TEST(AssertUtils, UassertNamedCodeWithTwoCategories) {
                        ExceptionForCat<ErrorCategory::NetworkError>);
     ASSERT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange,
                    ExceptionForCat<ErrorCategory::NotPrimaryError>);
-    ASSERT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange,
-                   ExceptionForCat<ErrorCategory::Interruption>);
 }
 
 MONGO_STATIC_ASSERT(!error_details::isNamedCode<19999>);
@@ -152,7 +146,6 @@ TEST(AssertUtils, UassertNumericCode) {
     ASSERT_NOT_CATCHES(19999, ExceptionFor<ErrorCodes::DuplicateKey>);
     ASSERT_NOT_CATCHES(19999, ExceptionForCat<ErrorCategory::NetworkError>);
     ASSERT_NOT_CATCHES(19999, ExceptionForCat<ErrorCategory::NotPrimaryError>);
-    ASSERT_NOT_CATCHES(19999, ExceptionForCat<ErrorCategory::Interruption>);
 }
 
 TEST(AssertUtils, UassertStatusOKPreservesExtraInfo) {
@@ -323,12 +316,22 @@ DEATH_TEST_REGEX(TassertTerminationTest,
                  tassertUncleanLogMsg,
                  "4457002.*Detected prior failed tripwire assertions") {
     doTassert();
-    quickExit(EXIT_ABRUPT);
+    quickExit(ExitCode::abrupt);
 }
 
 DEATH_TEST(TassertTerminationTest, mongoUnreachableNonFatal, "Hit a MONGO_UNREACHABLE_TASSERT!") {
     try {
         MONGO_UNREACHABLE_TASSERT(4457093);
+    } catch (const DBException&) {
+        // Catch the DBException, to ensure that we eventually abort during clean exit.
+    }
+}
+
+DEATH_TEST_REGEX(TassertTerminationTest,
+                 mongoUnimplementedNonFatal,
+                 "6634500.*Hit a MONGO_UNIMPLEMENTED_TASSERT!") {
+    try {
+        MONGO_UNIMPLEMENTED_TASSERT(6634500);
     } catch (const DBException&) {
         // Catch the DBException, to ensure that we eventually abort during clean exit.
     }
@@ -388,6 +391,10 @@ DEATH_TEST_REGEX(InvariantTerminationTest, invariant, "Invariant failure.*false.
 
 DEATH_TEST(InvariantTerminationTest, invariantOverload, "Terminating with invariant") {
     invariant(Status(ErrorCodes::InternalError, "Terminating with invariant"));
+}
+
+DEATH_TEST(InvariantTerminationTest, mongoUnimplementedFatal, "Hit a MONGO_UNIMPLEMENTED!") {
+    MONGO_UNIMPLEMENTED;
 }
 
 DEATH_TEST(InvariantTerminationTest, invariantStatusWithOverload, "Terminating with invariant") {
@@ -494,6 +501,42 @@ DEATH_TEST(DassertTerminationTest,
     dassert(false, msg);
 }
 #endif  // defined(MONGO_CONFIG_DEBUG_BUILD)
+
+TEST(ScopedDebugInfo, Stack) {
+    using namespace unittest::match;
+    ScopedDebugInfoStack infoStack{};  // Avoiding the tls instance for now.
+    std::vector<std::string> expected;
+    ASSERT_THAT(infoStack.getAll(), Eq(expected));
+    {
+        ScopedDebugInfo greetingGuard("greeting", "hello", &infoStack);
+        expected.push_back("greeting: hello");
+        ASSERT_THAT(infoStack.getAll(), Eq(expected));
+
+        ScopedDebugInfo numberGuard("age", 123, &infoStack);
+        expected.push_back("age: 123");
+        ASSERT_THAT(infoStack.getAll(), Eq(expected));
+
+        {
+            ScopedDebugInfo innerGuard("inner", 222, &infoStack);
+            expected.push_back("inner: 222");
+            ASSERT_THAT(infoStack.getAll(), Eq(expected));
+            expected.pop_back();  // innerGuard
+        }
+        ASSERT_THAT(infoStack.getAll(), Eq(expected));
+        expected.pop_back();  // numberGuard
+        expected.pop_back();  // greetingGuard
+    }
+    ASSERT_THAT(infoStack.getAll(), Eq(expected));
+}
+
+void someRiskyBusiness() {
+    invariant(false, "ouch");
+}
+
+DEATH_TEST(ScopedDebugInfo, PrintedOnInvariant, "mission: ATestInjectedString") {
+    ScopedDebugInfo g("mission", "ATestInjectedString");
+    someRiskyBusiness();
+}
 
 }  // namespace
 }  // namespace mongo

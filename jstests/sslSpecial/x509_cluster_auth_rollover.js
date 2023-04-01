@@ -31,6 +31,14 @@ rst.nodes.forEach((node) => {
     assert(node.getDB("admin").auth("root", "root"));
 });
 
+// Future connections should authenticate immediately on connecting so that replSet actions succeed.
+const originalAwaitConnection = MongoRunner.awaitConnection;
+MongoRunner.awaitConnection = function(args) {
+    const conn = originalAwaitConnection(args);
+    assert(conn.getDB('admin').auth('root', 'root'));
+    return conn;
+};
+
 // All the certificates' DNs share this base
 const dnBase = "C=US, ST=New York, L=New York,";
 // This is the DN of the rollover certificate.
@@ -48,7 +56,6 @@ const rolloverConfig = function(newConfig) {
         rst.nodeOptions[configId] = Object.merge(rst.nodeOptions[configId], newConfig, true);
         const newNode = rst.start(nodeId, {}, true, true);
         rst.awaitSecondaryNodes();
-        assert(newNode.getDB("admin").auth("root", "root"));
     };
 
     rst.nodes.forEach(function(node) {

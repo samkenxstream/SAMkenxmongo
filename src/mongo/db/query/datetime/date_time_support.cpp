@@ -27,10 +27,10 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
+#include <absl/container/flat_hash_map.h>
 #include <limits>
 #include <memory>
 #include <timelib.h>
@@ -45,6 +45,9 @@
 #include "mongo/util/ctype.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
@@ -74,9 +77,12 @@ long long seconds(Date_t date) {
 // Format specifier map when parsing a date from a string with a required format.
 //
 const std::vector<timelib_format_specifier> kDateFromStringFormatMap = {
+    {'b', TIMELIB_FORMAT_TEXTUAL_MONTH_3_LETTER},
+    {'B', TIMELIB_FORMAT_TEXTUAL_MONTH_FULL},
     {'d', TIMELIB_FORMAT_DAY_TWO_DIGIT},
     {'G', TIMELIB_FORMAT_YEAR_ISO},
     {'H', TIMELIB_FORMAT_HOUR_TWO_DIGIT_24_MAX},
+    {'j', TIMELIB_FORMAT_DAY_OF_YEAR},
     {'L', TIMELIB_FORMAT_MILLISECOND_THREE_DIGIT},
     {'m', TIMELIB_FORMAT_MONTH_TWO_DIGIT},
     {'M', TIMELIB_FORMAT_MINUTE_TWO_DIGIT},
@@ -92,6 +98,8 @@ const std::vector<timelib_format_specifier> kDateFromStringFormatMap = {
 // Format specifier map when converting a date to a string.
 //
 const std::vector<timelib_format_specifier> kDateToStringFormatMap = {
+    {'b', TIMELIB_FORMAT_TEXTUAL_MONTH_3_LETTER},
+    {'B', TIMELIB_FORMAT_TEXTUAL_MONTH_FULL},
     {'d', TIMELIB_FORMAT_DAY_TWO_DIGIT},
     {'G', TIMELIB_FORMAT_YEAR_ISO},
     {'H', TIMELIB_FORMAT_HOUR_TWO_DIGIT_24_MAX},
@@ -108,27 +116,45 @@ const std::vector<timelib_format_specifier> kDateToStringFormatMap = {
     {'z', TIMELIB_FORMAT_TIMEZONE_OFFSET},
     {'Z', TIMELIB_FORMAT_TIMEZONE_OFFSET_MINUTES}};
 
-
 // Verifies that any '%' is followed by a valid format character as indicated by 'allowedFormats',
 // and that the 'format' string ends with an even number of '%' symbols.
-void validateFormat(StringData format,
-                    const std::vector<timelib_format_specifier>& allowedFormats) {
+template <bool UserErrorMessage>
+bool checkFormatString(StringData format,
+                       const std::vector<timelib_format_specifier>& allowedFormats) {
     for (auto it = format.begin(); it != format.end(); ++it) {
         if (*it != '%') {
             continue;
         }
 
         ++it;  // next character must be format modifier
-        uassert(18535, "Unmatched '%' at end of format string", it != format.end());
+        if constexpr (UserErrorMessage) {
+            uassert(18535, "Unmatched '%' at end of format string", it != format.end());
+        } else if (it == format.end()) {
+            return false;
+        }
 
         const bool validSpecifier = (*it == '%') ||
             std::find_if(allowedFormats.begin(), allowedFormats.end(), [=](const auto& format) {
                 return format.specifier == *it;
             }) != allowedFormats.end();
-        uassert(18536,
-                str::stream() << "Invalid format character '%" << *it << "' in format string",
-                validSpecifier);
+        if constexpr (UserErrorMessage) {
+            uassert(18536,
+                    str::stream() << "Invalid format character '%" << *it << "' in format string",
+                    validSpecifier);
+        } else if (!validSpecifier) {
+            return false;
+        }
     }
+    return true;
+}
+
+bool isValidFormat(StringData format, const std::vector<timelib_format_specifier>& allowedFormats) {
+    return checkFormatString<false>(format, allowedFormats);
+}
+
+void validateFormat(StringData format,
+                    const std::vector<timelib_format_specifier>& allowedFormats) {
+    checkFormatString<true>(format, allowedFormats);
 }
 
 }  // namespace
@@ -162,6 +188,12 @@ void TimeZoneDatabase::TimelibErrorContainerDeleter::operator()(
     timelib_error_container_dtor(errorContainer);
 }
 
+void TimeZoneDatabase::TimelibTZInfoDeleter::operator()(timelib_tzinfo* tzInfo) {
+    if (tzInfo) {
+        timelib_tzinfo_dtor(tzInfo);
+    }
+}
+
 void TimeZoneDatabase::loadTimeZoneInfo(
     std::unique_ptr<timelib_tzdb, TimeZoneDBDeleter> timeZoneDatabase) {
     invariant(timeZoneDatabase);
@@ -170,7 +202,7 @@ void TimeZoneDatabase::loadTimeZoneInfo(
     auto timezone_identifier_list =
         timelib_timezone_identifiers_list(_timeZoneDatabase.get(), &nTimeZones);
     for (int i = 0; i < nTimeZones; ++i) {
-        auto entry = timezone_identifier_list[i];
+        const auto& entry = timezone_identifier_list[i];
         int errorCode = TIMELIB_ERROR_NO_ERROR;
         auto tzInfo = timelib_parse_tzfile(entry.id, _timeZoneDatabase.get(), &errorCode);
         if (!tzInfo) {
@@ -184,7 +216,15 @@ void TimeZoneDatabase::loadTimeZoneInfo(
 
         invariant(errorCode == TIMELIB_ERROR_NO_ERROR ||
                   errorCode == TIMELIB_ERROR_EMPTY_POSIX_STRING);
-        _timeZones[entry.id] = TimeZone{tzInfo};
+
+        if (strcmp(entry.id, "UTC") == 0) {
+            _timeZones[entry.id] = TimeZone{nullptr};
+            timelib_tzinfo_dtor(tzInfo);
+        } else {
+            _timeZoneInfos.emplace_back(
+                std::unique_ptr<_timelib_tzinfo, TimelibTZInfoDeleter>(tzInfo));
+            _timeZones[entry.id] = TimeZone{tzInfo};
+        }
     }
 }
 
@@ -385,7 +425,7 @@ std::vector<std::string> TimeZoneDatabase::getTimeZoneStrings() const {
 
 void TimeZone::adjustTimeZone(timelib_time* timelibTime) const {
     if (isTimeZoneIDZone()) {
-        timelib_set_timezone(timelibTime, _tzInfo.get());
+        timelib_set_timezone(timelibTime, _tzInfo);
     } else if (isUtcOffsetZone()) {
         timelib_set_timezone_from_offset(timelibTime, durationCount<Seconds>(_utcOffset));
     }
@@ -478,14 +518,7 @@ TimeZone::Iso8601DateParts::Iso8601DateParts(const timelib_time& timelib_time, D
 }
 
 
-void TimeZone::TimelibTZInfoDeleter::operator()(timelib_tzinfo* tzInfo) {
-    if (tzInfo) {
-        timelib_tzinfo_dtor(tzInfo);
-    }
-}
-
-TimeZone::TimeZone(timelib_tzinfo* tzInfo)
-    : _tzInfo(tzInfo, TimelibTZInfoDeleter()), _utcOffset(0) {}
+TimeZone::TimeZone(timelib_tzinfo* tzInfo) : _tzInfo(tzInfo), _utcOffset(0) {}
 
 TimeZone::TimeZone(Seconds utcOffsetSeconds) : _tzInfo(nullptr), _utcOffset(utcOffsetSeconds) {}
 
@@ -497,9 +530,12 @@ std::unique_ptr<timelib_time, TimeZone::TimelibTimeDeleter> TimeZone::getTimelib
     Date_t date) const {
     auto time = createTimelibTime();
 
-    timelib_unixtime2gmt(time.get(), seconds(date));
-    adjustTimeZone(time.get());
-    timelib_unixtime2local(time.get(), seconds(date));
+    if (isUtcZone()) {
+        timelib_unixtime2gmt(time.get(), seconds(date));
+    } else {
+        adjustTimeZone(time.get());
+        timelib_unixtime2local(time.get(), seconds(date));
+    }
 
     return time;
 }
@@ -567,14 +603,75 @@ long long TimeZone::isoYear(Date_t date) const {
 
 Seconds TimeZone::utcOffset(Date_t date) const {
     if (isTimeZoneIDZone()) {
-        auto* offset = timelib_get_time_zone_info(
-            durationCount<Seconds>(date.toDurationSinceEpoch()), _tzInfo.get());
-        auto timezoneOffsetFromUTC = Seconds(offset->offset);
-        timelib_time_offset_dtor(offset);
-        return timezoneOffsetFromUTC;
+        int32_t timezoneOffsetFromUTC = 0;
+        int result =
+            timelib_get_time_zone_offset_info(durationCount<Seconds>(date.toDurationSinceEpoch()),
+                                              _tzInfo,
+                                              &timezoneOffsetFromUTC,
+                                              nullptr,
+                                              nullptr);
+        uassert(6828900, "Failed to obtain timezone offset", result);
+        return Seconds(timezoneOffsetFromUTC);
     } else {
         return _utcOffset;
     }
+}
+
+// A mapping from months to full string representations of the month.
+static const absl::flat_hash_map<int, std::string> monthToFullMonthNameMap{
+    {1, "January"},
+    {2, "February"},
+    {3, "March"},
+    {4, "April"},
+    {5, "May"},
+    {6, "June"},
+    {7, "July"},
+    {8, "August"},
+    {9, "September"},
+    {10, "October"},
+    {11, "November"},
+    {12, "December"},
+};
+
+// A mapping from months to three letter string representations of the month.
+static const absl::flat_hash_map<int, std::string> monthToThreeLetterMonthNameMap{
+    {1, "Jan"},
+    {2, "Feb"},
+    {3, "Mar"},
+    {4, "Apr"},
+    {5, "May"},
+    {6, "Jun"},
+    {7, "Jul"},
+    {8, "Aug"},
+    {9, "Sep"},
+    {10, "Oct"},
+    {11, "Nov"},
+    {12, "Dec"},
+};
+
+std::string TimeZone::fullMonthName(int monthNum) const {
+    auto iterator = monthToFullMonthNameMap.find(monthNum);
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << "unknown month value: " << monthNum,
+            iterator != monthToFullMonthNameMap.end());
+    return iterator->second;
+}
+
+std::string TimeZone::threeLetterMonthName(int monthNum) const {
+    auto iterator = monthToThreeLetterMonthNameMap.find(monthNum);
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << "unknown month value: " << monthNum,
+            iterator != monthToThreeLetterMonthNameMap.end());
+    return iterator->second;
+}
+
+
+bool TimeZone::isValidToStringFormat(StringData format) {
+    return isValidFormat(format, kDateToStringFormatMap);
+}
+
+bool TimeZone::isValidFromStringFormat(StringData format) {
+    return isValidFormat(format, kDateFromStringFormatMap);
 }
 
 void TimeZone::validateToStringFormat(StringData format) {
@@ -591,6 +688,20 @@ StatusWith<std::string> TimeZone::formatDate(StringData format, Date_t date) con
         return status;
     else
         return formatted.str();
+}
+
+std::string TimeZone::toString() const {
+    std::stringstream ss;
+    ss << "TimeZone(";
+    if (isTimeZoneIDZone()) {
+        ss << "name=" << _tzInfo->name;
+    } else if (_utcOffset != Seconds::zero()) {
+        ss << "utcOffset=" << _utcOffset;
+    } else {
+        ss << "UTC";
+    }
+    ss << ")";
+    return ss.str();
 }
 
 namespace {
@@ -773,6 +884,7 @@ static const StringMap<DayOfWeek> dayOfWeekNameToDayOfWeekMap{
     {"sunday", DayOfWeek::sunday},
     {"sun", DayOfWeek::sunday},
 };
+
 }  // namespace
 
 long long dateDiff(Date_t startDate,
@@ -842,7 +954,7 @@ StringData serializeTimeUnit(TimeUnit unit) {
         case TimeUnit::millisecond:
             return "millisecond"_sd;
     }
-    MONGO_UNREACHABLE_TASSERT(5339900);
+    MONGO_UNREACHABLE_TASSERT(5339903);
 }
 
 DayOfWeek parseDayOfWeek(StringData dayOfWeek) {
@@ -1197,21 +1309,20 @@ Date_t dateAdd(Date_t date, TimeUnit unit, long long amount, const TimeZone& tim
     auto intervalInDays = daysToAdd(localTime.get(), unit, amount);
     if (intervalInDays) {
         unit = TimeUnit::day;
-        amount = intervalInDays.get();
+        amount = intervalInDays.value();
     }
 
     auto interval = getTimelibRelTime(unit, amount);
 
-    auto timeAfterAddition = [&]() {
-        // For time units of day or larger perform the computation in the local timezone. This
-        // keeps the values of hour, minute, second, and millisecond components from the input date
-        // the same in the result date regardless of transitions from DST to Standard Time and vice
-        // versa that may happen between the input date and the result.
-        if (timezone.isUtcZone() || timezone.isUtcOffsetZone() || interval->d || interval->m ||
-            interval->y) {
-            return timelib_add(localTime.get(), interval.get());
-        }
-
+    timelib_time* timeAfterAddition;
+    // For time units of day or larger perform the computation in the local timezone. This
+    // keeps the values of hour, minute, second, and millisecond components from the input date
+    // the same in the result date regardless of transitions from DST to Standard Time and vice
+    // versa that may happen between the input date and the result.
+    if (timezone.isUtcZone() || timezone.isUtcOffsetZone() || interval->d || interval->m ||
+        interval->y) {
+        timeAfterAddition = timelib_add(localTime.get(), interval.get());
+    } else {
         // For time units of hour or smaller and a timezone different from UTC perform the
         // computation in UTC. In this case we don't want to apply the DST correction to the return
         // date, which would happen by default if we used the timelib_add() function with local
@@ -1223,8 +1334,8 @@ Date_t dateAdd(Date_t date, TimeUnit unit, long long amount, const TimeZone& tim
         auto utcTime = createTimelibTime();
         timelib_unixtime2gmt(utcTime.get(), seconds(date));
         utcTime->us = microSec;
-        return timelib_add(utcTime.get(), interval.get());
-    }();
+        timeAfterAddition = timelib_add(utcTime.get(), interval.get());
+    }
 
     long long res;
     if (overflow::mul(timeAfterAddition->sse, 1000L, &res)) {

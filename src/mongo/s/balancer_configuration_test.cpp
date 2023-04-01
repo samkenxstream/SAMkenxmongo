@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <boost/date_time/gregorian/gregorian_types.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/date_time/posix_time/posix_time_types.hpp>
@@ -44,7 +42,6 @@
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/hostandport.h"
@@ -113,6 +110,7 @@ TEST_F(BalancerConfigurationTestFixture, NoConfigurationDocuments) {
     expectSettingsQuery(BalancerSettingsType::kKey, boost::optional<BSONObj>());
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>());
     expectSettingsQuery(AutoSplitSettingsType::kKey, boost::optional<BSONObj>());
+    expectSettingsQuery(AutoMergeSettingsType::kKey, boost::optional<BSONObj>());
 
     future.default_timed_get();
 
@@ -134,6 +132,7 @@ TEST_F(BalancerConfigurationTestFixture, ChunkSizeSettingsDocumentOnly) {
     expectSettingsQuery(BalancerSettingsType::kKey, boost::optional<BSONObj>());
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>(BSON("value" << 3)));
     expectSettingsQuery(AutoSplitSettingsType::kKey, boost::optional<BSONObj>());
+    expectSettingsQuery(AutoMergeSettingsType::kKey, boost::optional<BSONObj>());
 
     future.default_timed_get();
 
@@ -156,6 +155,7 @@ TEST_F(BalancerConfigurationTestFixture, BalancerSettingsDocumentOnly) {
                         boost::optional<BSONObj>(BSON("stopped" << true)));
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>());
     expectSettingsQuery(AutoSplitSettingsType::kKey, boost::optional<BSONObj>());
+    expectSettingsQuery(AutoMergeSettingsType::kKey, boost::optional<BSONObj>());
 
     future.default_timed_get();
 
@@ -178,6 +178,7 @@ TEST_F(BalancerConfigurationTestFixture, AutoSplitSettingsDocumentOnly) {
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>());
     expectSettingsQuery(AutoSplitSettingsType::kKey,
                         boost::optional<BSONObj>(BSON("enabled" << false)));
+    expectSettingsQuery(AutoMergeSettingsType::kKey, boost::optional<BSONObj>());
 
     future.default_timed_get();
 
@@ -201,6 +202,8 @@ TEST_F(BalancerConfigurationTestFixture, BalancerSettingsDocumentBalanceForAutoS
                                                       << "autoSplitOnly")));
     expectSettingsQuery(ChunkSizeSettingsType::kKey, boost::optional<BSONObj>());
     expectSettingsQuery(AutoSplitSettingsType::kKey,
+                        boost::optional<BSONObj>(BSON("enabled" << true)));
+    expectSettingsQuery(AutoMergeSettingsType::kKey,
                         boost::optional<BSONObj>(BSON("enabled" << true)));
 
     future.default_timed_get();

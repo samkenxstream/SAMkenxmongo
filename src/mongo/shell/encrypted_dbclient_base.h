@@ -51,7 +51,6 @@
 #include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
-#include "mongo/shell/encrypted_shell_options.h"
 #include "mongo/shell/kms.h"
 #include "mongo/shell/kms_gen.h"
 #include "mongo/shell/shell_options.h"
@@ -67,7 +66,7 @@ constexpr uint8_t kRandomEncryptionBit = 0x02;
 
 static constexpr auto kExplain = "explain"_sd;
 
-constexpr std::array<StringData, 11> kEncryptedCommands = {"aggregate"_sd,
+constexpr std::array<StringData, 14> kEncryptedCommands = {"aggregate"_sd,
                                                            "count"_sd,
                                                            "delete"_sd,
                                                            "distinct"_sd,
@@ -77,14 +76,16 @@ constexpr std::array<StringData, 11> kEncryptedCommands = {"aggregate"_sd,
                                                            "findAndModify"_sd,
                                                            "getMore"_sd,
                                                            "insert"_sd,
-                                                           "update"_sd};
+                                                           "update"_sd,
+                                                           "create"_sd,
+                                                           "createIndexes"_sd,
+                                                           "collMod"_sd};
 
 class EncryptedDBClientBase : public DBClientBase,
                               public mozjs::EncryptionCallbacks,
                               public FLEKeyVault {
 public:
     using DBClientBase::find;
-    using DBClientBase::query_DEPRECATED;
 
     EncryptedDBClientBase(std::unique_ptr<DBClientBase> conn,
                           ClientSideFLEOptions encryptionOptions,
@@ -93,13 +94,15 @@ public:
 
     std::string getServerAddress() const final;
 
-    bool call(Message& toSend, Message& response, bool assertOk, std::string* actualServer) final;
-
     void say(Message& toSend, bool isRetry, std::string* actualServer) final;
 
     using DBClientBase::runCommandWithTarget;
     virtual std::pair<rpc::UniqueReply, DBClientBase*> runCommandWithTarget(
-        OpMsgRequest request) override;
+        OpMsgRequest request) final;
+
+    std::pair<rpc::UniqueReply, std::shared_ptr<DBClientBase>> runCommandWithTarget(
+        OpMsgRequest request, std::shared_ptr<DBClientBase>) final;
+
     std::string toString() const final;
 
     int getMinWireVersion() final;
@@ -121,22 +124,15 @@ public:
     using EncryptionCallbacks::compact;
     void compact(JSContext* cx, JS::CallArgs args) final;
 
+    using EncryptionCallbacks::cleanup;
+    void cleanup(JSContext* cx, JS::CallArgs args) final;
+
     using EncryptionCallbacks::trace;
     void trace(JSTracer* trc) final;
 
     std::unique_ptr<DBClientCursor> find(FindCommandRequest findRequest,
-                                         const ReadPreferenceSetting& readPref) final;
-
-    std::unique_ptr<DBClientCursor> query_DEPRECATED(
-        const NamespaceStringOrUUID& nsOrUuid,
-        const BSONObj& filter,
-        const Query& querySettings,
-        int limit,
-        int nToSkip,
-        const BSONObj* fieldsToReturn,
-        int queryOptions,
-        int batchSize,
-        boost::optional<BSONObj> readConcernObj = boost::none) final;
+                                         const ReadPreferenceSetting& readPref,
+                                         ExhaustMode exhaustMode) final;
 
     bool isFailed() const final;
 
@@ -150,6 +146,8 @@ public:
 
     bool isMongos() const final;
 
+    DBClientBase* getRawConnection();
+
 #ifdef MONGO_CONFIG_SSL
     const SSLConfiguration* getSSLConfiguration() override;
 
@@ -157,22 +155,61 @@ public:
 #endif
 
     KeyMaterial getKey(const UUID& uuid) final;
+    BSONObj getEncryptedKey(const UUID& uuid) final;
+
+    SymmetricKey& getKMSLocalKey() final;
 
 protected:
     BSONObj _decryptResponsePayload(BSONObj& reply, StringData databaseName, bool isFLE2);
 
-    std::pair<rpc::UniqueReply, DBClientBase*> processResponseFLE1(rpc::UniqueReply result,
-                                                                   StringData databaseName);
+    enum class RunCommandConnectionType { rawPtr, sharedPtr };
 
-    std::pair<rpc::UniqueReply, DBClientBase*> processResponseFLE2(rpc::UniqueReply result,
-                                                                   StringData databaseName);
+    struct RunCommandParams {
+        OpMsgRequest request;
+        std::shared_ptr<DBClientBase> conn;
+        RunCommandConnectionType type;
 
-    std::pair<rpc::UniqueReply, DBClientBase*> prepareReply(rpc::UniqueReply result,
-                                                            StringData databaseName,
-                                                            BSONObj decryptedDoc);
+        RunCommandParams(OpMsgRequest request)
+            : request(std::move(request)), type(RunCommandConnectionType::rawPtr){};
 
+        RunCommandParams(OpMsgRequest request, std::shared_ptr<DBClientBase> base)
+            : request(std::move(request)), conn(base), type(RunCommandConnectionType::sharedPtr){};
 
-    BSONObj encryptDecryptCommand(const BSONObj& object, bool encrypt, StringData databaseName);
+        RunCommandParams(OpMsgRequest request, RunCommandParams params)
+            : request(std::move(request)), type(params.type) {
+            if (type == RunCommandConnectionType::sharedPtr) {
+                conn = params.conn;
+            };
+        };
+    };
+
+    using RunCommandReturnConn = stdx::variant<DBClientBase*, std::shared_ptr<DBClientBase>>;
+
+    struct RunCommandReturn {
+        rpc::UniqueReply returnReply;
+        RunCommandReturnConn returnConn;
+
+        RunCommandReturn(std::pair<rpc::UniqueReply, DBClientBase*> pair)
+            : returnReply(std::move(std::get<0>(pair))), returnConn(std::get<1>(pair)) {}
+
+        RunCommandReturn(std::pair<rpc::UniqueReply, std::shared_ptr<DBClientBase>> pair)
+            : returnReply(std::move(std::get<0>(pair))), returnConn(std::get<1>(pair)) {}
+
+        RunCommandReturn(rpc::UniqueReply reply, RunCommandReturn& result)
+            : returnReply(std::move(reply)), returnConn(result.returnConn) {}
+    };
+
+    RunCommandReturn doRunCommand(RunCommandParams params);
+
+    virtual RunCommandReturn handleEncryptionRequest(RunCommandParams params);
+
+    RunCommandReturn processResponseFLE1(RunCommandReturn result, const DatabaseName& databaseName);
+
+    RunCommandReturn processResponseFLE2(RunCommandReturn result);
+
+    RunCommandReturn prepareReply(RunCommandReturn result, BSONObj decryptedDoc);
+
+    BSONObj encryptDecryptCommand(const BSONObj& object, bool encrypt, const DatabaseName& dbName);
 
     JS::Value getCollection() const;
 
@@ -191,6 +228,8 @@ protected:
     FLEDecryptionFrame createDecryptionFrame(ConstDataRange data);
 
 private:
+    void _call(Message& toSend, Message& response, std::string* actualServer) final;
+
     virtual void encryptMarking(const BSONObj& elem, BSONObjBuilder* builder, StringData elemName);
 
     void decryptPayload(ConstDataRange data, BSONObjBuilder* builder, StringData elemName);
@@ -215,6 +254,7 @@ private:
         kEncryptedDBCacheSize};
     JS::Heap<JS::Value> _collection;
     JSContext* _cx;
+    boost::optional<SymmetricKey> _localKey;
 };
 
 using ImplicitEncryptedDBClientCallback =

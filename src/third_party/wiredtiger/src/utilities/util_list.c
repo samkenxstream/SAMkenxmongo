@@ -14,15 +14,15 @@ static int list_print_checkpoint(WT_SESSION *, const char *);
 
 /*
  * usage --
- *     TODO: Add a comment describing this function.
+ *     Display a usage message for the list command.
  */
 static int
 usage(void)
 {
     static const char *options[] = {"-c",
       "display checkpoints in human-readable format (by default checkpoints are not displayed)",
-      "-v", "display the complete schema table (by default only a subset is displayed)", NULL,
-      NULL};
+      "-v", "display the complete schema table (by default only a subset is displayed)", "-?",
+      "show this message", NULL, NULL};
 
     util_usage("list [-cv] [uri]", "options:", options);
     return (1);
@@ -30,7 +30,7 @@ usage(void)
 
 /*
  * util_list --
- *     TODO: Add a comment describing this function.
+ *     The list command.
  */
 int
 util_list(WT_SESSION *session, int argc, char *argv[])
@@ -42,7 +42,7 @@ util_list(WT_SESSION *session, int argc, char *argv[])
 
     cflag = vflag = false;
     uri = NULL;
-    while ((ch = __wt_getopt(progname, argc, argv, "cv")) != EOF)
+    while ((ch = __wt_getopt(progname, argc, argv, "cv?")) != EOF)
         switch (ch) {
         case 'c':
             cflag = true;
@@ -51,6 +51,8 @@ util_list(WT_SESSION *session, int argc, char *argv[])
             vflag = true;
             break;
         case '?':
+            usage();
+            return (0);
         default:
             return (usage());
         }

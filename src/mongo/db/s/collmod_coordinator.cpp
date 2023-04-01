@@ -27,10 +27,10 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/db/s/collmod_coordinator.h"
 
+#include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_uuid_mismatch.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -51,6 +51,9 @@
 #include "mongo/s/grid.h"
 #include "mongo/util/fail_point.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
+
 namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(collModBeforeConfigServerUpdate);
@@ -67,92 +70,41 @@ bool isShardedColl(OperationContext* opCtx, const NamespaceString& nss) {
     }
 }
 
-bool hasTimeSeriesGranularityUpdate(const CollModRequest& request) {
-    return request.getTimeseries() && request.getTimeseries()->getGranularity();
-}
-
-CollModCollectionInfo getCollModCollectionInfo(OperationContext* opCtx,
-                                               const NamespaceString& nss) {
-    CollModCollectionInfo info;
-    info.setTimeSeriesOptions(timeseries::getTimeseriesOptions(opCtx, nss, true));
-    info.setNsForTargetting(info.getTimeSeriesOptions() ? nss.makeTimeseriesBucketsNamespace()
-                                                        : nss);
-    info.setIsSharded(isShardedColl(opCtx, info.getNsForTargetting()));
-    if (info.getIsSharded()) {
-        const auto chunkManager =
-            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithRefresh(
-                opCtx, info.getNsForTargetting()));
-        info.setPrimaryShard(chunkManager.dbPrimary());
-        tassert(8423352,
-                "Unexpected unsharded collection info found on local catalog cache during collMod",
-                chunkManager.isSharded());
-        std::set<ShardId> shardIdsSet;
-        chunkManager.getAllShardIds(&shardIdsSet);
-        std::vector<ShardId> shardIdsVec{shardIdsSet.begin(), shardIdsSet.end()};
-        info.setShardsOwningChunks(shardIdsVec);
+bool hasTimeSeriesBucketingUpdate(const CollModRequest& request) {
+    if (!request.getTimeseries().has_value()) {
+        return false;
     }
-    return info;
+    auto& ts = request.getTimeseries();
+    return ts->getGranularity() || ts->getBucketMaxSpanSeconds() || ts->getBucketRoundingSeconds();
 }
 
 }  // namespace
 
 CollModCoordinator::CollModCoordinator(ShardingDDLCoordinatorService* service,
                                        const BSONObj& initialState)
-    : ShardingDDLCoordinator(service, initialState) {
-    _initialState = initialState.getOwned();
-    _doc = CollModCoordinatorDocument::parse(IDLParserErrorContext("CollModCoordinatorDocument"),
-                                             _initialState);
-}
+    : RecoverableShardingDDLCoordinator(service, "CollModCoordinator", initialState),
+      _request{_doc.getCollModRequest()} {}
 
 void CollModCoordinator::checkIfOptionsConflict(const BSONObj& doc) const {
     const auto otherDoc =
-        CollModCoordinatorDocument::parse(IDLParserErrorContext("CollModCoordinatorDocument"), doc);
+        CollModCoordinatorDocument::parse(IDLParserContext("CollModCoordinatorDocument"), doc);
 
-    const auto& selfReq = _doc.getCollModRequest().toBSON();
+    const auto& selfReq = _request.toBSON();
     const auto& otherReq = otherDoc.getCollModRequest().toBSON();
 
     uassert(ErrorCodes::ConflictingOperationInProgress,
-            str::stream() << "Another collMod for namespace " << nss()
+            str::stream() << "Another collMod for namespace " << originalNss()
                           << " is being executed with different parameters: " << selfReq,
             SimpleBSONObjComparator::kInstance.evaluate(selfReq == otherReq));
 }
 
-boost::optional<BSONObj> CollModCoordinator::reportForCurrentOp(
-    MongoProcessInterface::CurrentOpConnectionsMode connMode,
-    MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept {
+void CollModCoordinator::appendCommandInfo(BSONObjBuilder* cmdInfoBuilder) const {
+    cmdInfoBuilder->appendElements(_request.toBSON());
+};
 
-    BSONObjBuilder cmdBob;
-    if (const auto& optComment = getForwardableOpMetadata().getComment()) {
-        cmdBob.append(optComment.get().firstElement());
-    }
-    cmdBob.appendElements(_doc.getCollModRequest().toBSON());
-    BSONObjBuilder bob;
-    bob.append("type", "op");
-    bob.append("desc", "CollModCoordinator");
-    bob.append("op", "command");
-    bob.append("ns", nss().toString());
-    bob.append("command", cmdBob.obj());
-    bob.append("currentPhase", _doc.getPhase());
-    bob.append("active", true);
-    return bob.obj();
-}
-
-void CollModCoordinator::_enterPhase(Phase newPhase) {
-    StateDoc newDoc(_doc);
-    newDoc.setPhase(newPhase);
-
-    LOGV2_DEBUG(6069401,
-                2,
-                "CollMod coordinator phase transition",
-                "namespace"_attr = nss(),
-                "newPhase"_attr = CollModCoordinatorPhase_serializer(newDoc.getPhase()),
-                "oldPhase"_attr = CollModCoordinatorPhase_serializer(_doc.getPhase()));
-
-    if (_doc.getPhase() == Phase::kUnset) {
-        _doc = _insertStateDocument(std::move(newDoc));
-        return;
-    }
-    _doc = _updateStateDocument(cc().makeOperationContext().get(), std::move(newDoc));
+// TODO SERVER-68008 Remove once 7.0 becomes last LTS
+bool CollModCoordinator::_isPre61Compatible() const {
+    return operationType() == DDLCoordinatorTypeEnum::kCollModPre61Compatible;
 }
 
 void CollModCoordinator::_performNoopRetryableWriteOnParticipants(
@@ -160,13 +112,46 @@ void CollModCoordinator::_performNoopRetryableWriteOnParticipants(
     auto shardsAndConfigsvr = [&] {
         const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
         auto participants = shardRegistry->getAllShardIds(opCtx);
-        participants.emplace_back(shardRegistry->getConfigShard()->getId());
+        if (std::find(participants.begin(), participants.end(), ShardId::kConfigServerId) ==
+            participants.end()) {
+            // The config server may be a shard, so only add if it isn't already in participants.
+            participants.emplace_back(shardRegistry->getConfigShard()->getId());
+        }
         return participants;
     }();
 
-    _doc = _updateSession(opCtx, _doc);
+    _updateSession(opCtx);
     sharding_ddl_util::performNoopRetryableWriteOnShards(
-        opCtx, shardsAndConfigsvr, getCurrentSession(_doc), executor);
+        opCtx, shardsAndConfigsvr, getCurrentSession(), executor);
+}
+
+void CollModCoordinator::_saveCollectionInfoOnCoordinatorIfNecessary(OperationContext* opCtx) {
+    if (!_collInfo) {
+        CollectionInfo info;
+        info.timeSeriesOptions = timeseries::getTimeseriesOptions(opCtx, originalNss(), true);
+        info.nsForTargeting =
+            info.timeSeriesOptions ? originalNss().makeTimeseriesBucketsNamespace() : originalNss();
+        info.isSharded = isShardedColl(opCtx, info.nsForTargeting);
+        _collInfo = std::move(info);
+    }
+}
+
+void CollModCoordinator::_saveShardingInfoOnCoordinatorIfNecessary(OperationContext* opCtx) {
+    tassert(
+        6522700, "Sharding information must be gathered after collection information", _collInfo);
+    if (!_shardingInfo && _collInfo->isSharded) {
+        ShardingInfo info;
+        const auto [chunkManager, _] = uassertStatusOK(
+            Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithPlacementRefresh(
+                opCtx, _collInfo->nsForTargeting));
+
+        info.primaryShard = chunkManager.dbPrimary();
+        std::set<ShardId> shardIdsSet;
+        chunkManager.getAllShardIds(&shardIdsSet);
+        std::vector<ShardId> shardIdsVec{shardIdsSet.begin(), shardIdsSet.end()};
+        info.shardsOwningChunks = std::move(shardIdsVec);
+        _shardingInfo = std::move(info);
+    }
 }
 
 ExecutorFuture<void> CollModCoordinator::_runImpl(
@@ -181,64 +166,88 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
             if (_doc.getPhase() > Phase::kUnset) {
                 _performNoopRetryableWriteOnParticipants(opCtx, **executor);
             }
+
+            {
+                AutoGetCollection coll{opCtx,
+                                       nss(),
+                                       MODE_IS,
+                                       AutoGetCollection::Options{}
+                                           .viewMode(auto_get_collection::ViewMode::kViewsPermitted)
+                                           .expectedUUID(_request.getCollectionUUID())};
+            }
+
+            _saveCollectionInfoOnCoordinatorIfNecessary(opCtx);
+
+            auto isGranularityUpdate = hasTimeSeriesBucketingUpdate(_request);
+            uassert(6201808,
+                    "Cannot use time-series options for a non-timeseries collection",
+                    _collInfo->timeSeriesOptions || !isGranularityUpdate);
+            if (isGranularityUpdate) {
+                uassertStatusOK(timeseries::isTimeseriesGranularityValidAndUnchanged(
+                    _collInfo->timeSeriesOptions.get(), _request.getTimeseries().get()));
+            }
         })
-        .then(_executePhase(
+        .then([this, executor = executor, anchor = shared_from_this()] {
+            if (_isPre61Compatible()) {
+                return;
+            }
+            _buildPhaseHandler(
+                Phase::kFreezeMigrations, [this, executor = executor, anchor = shared_from_this()] {
+                    auto opCtxHolder = cc().makeOperationContext();
+                    auto* opCtx = opCtxHolder.get();
+                    getForwardableOpMetadata().setOn(opCtx);
+
+                    _saveCollectionInfoOnCoordinatorIfNecessary(opCtx);
+
+                    if (_collInfo->isSharded) {
+                        _doc.setCollUUID(
+                            sharding_ddl_util::getCollectionUUID(opCtx, _collInfo->nsForTargeting));
+                        sharding_ddl_util::stopMigrations(
+                            opCtx, _collInfo->nsForTargeting, _doc.getCollUUID());
+                    }
+                })();
+        })
+        .then(_buildPhaseHandler(
             Phase::kBlockShards,
             [this, executor = executor, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
                 getForwardableOpMetadata().setOn(opCtx);
 
-                _doc = _updateSession(opCtx, _doc);
+                _updateSession(opCtx);
 
-                {
-                    AutoGetCollection coll{
-                        opCtx, nss(), MODE_IS, AutoGetCollectionViewMode::kViewsPermitted};
-                    checkCollectionUUIDMismatch(
-                        opCtx, nss(), *coll, _doc.getCollModRequest().getCollectionUUID());
-                }
+                _saveCollectionInfoOnCoordinatorIfNecessary(opCtx);
 
-                if (!_doc.getInfo()) {
-                    _doc.setInfo(getCollModCollectionInfo(opCtx, nss()));
-                }
+                if (_isPre61Compatible() && _collInfo->isSharded) {
+                    const auto migrationsAlreadyBlockedForBucketNss =
+                        hasTimeSeriesBucketingUpdate(_request) &&
+                        _doc.getMigrationsAlreadyBlockedForBucketNss();
 
-
-                auto isGranularityUpdate = hasTimeSeriesGranularityUpdate(_doc.getCollModRequest());
-                uassert(6201808,
-                        "Cannot use time-series options for a non-timeseries collection",
-                        _doc.getInfo()->getTimeSeriesOptions() || !isGranularityUpdate);
-                if (isGranularityUpdate) {
-                    uassert(ErrorCodes::InvalidOptions,
-                            "Invalid transition for timeseries.granularity. Can only transition "
-                            "from 'seconds' to 'minutes' or 'minutes' to 'hours'.",
-                            timeseries::isValidTimeseriesGranularityTransition(
-                                _doc.getInfo()->getTimeSeriesOptions()->getGranularity(),
-                                *_doc.getCollModRequest().getTimeseries()->getGranularity()));
-
-                    if (_doc.getInfo()->getIsSharded()) {
-                        tassert(6201805,
-                                "shardsOwningChunks should be set on state document for sharded "
-                                "collection",
-                                _doc.getInfo()->getShardsOwningChunks());
-
+                    if (!migrationsAlreadyBlockedForBucketNss) {
                         _doc.setCollUUID(sharding_ddl_util::getCollectionUUID(
-                            opCtx, nss(), true /* allowViews */));
-                        sharding_ddl_util::stopMigrations(opCtx, nss(), _doc.getCollUUID());
-
-                        ShardsvrParticipantBlock blockCRUDOperationsRequest(
-                            _doc.getInfo()->getNsForTargetting());
-                        const auto cmdObj = CommandHelpers::appendMajorityWriteConcern(
-                            blockCRUDOperationsRequest.toBSON({}));
-                        sharding_ddl_util::sendAuthenticatedCommandToShards(
-                            opCtx,
-                            nss().db(),
-                            cmdObj,
-                            *_doc.getInfo()->getShardsOwningChunks(),
-                            **executor);
+                            opCtx, _collInfo->nsForTargeting, true /* allowViews */));
+                        sharding_ddl_util::stopMigrations(
+                            opCtx, _collInfo->nsForTargeting, _doc.getCollUUID());
                     }
                 }
+
+                _saveShardingInfoOnCoordinatorIfNecessary(opCtx);
+
+                if (_collInfo->isSharded && hasTimeSeriesBucketingUpdate(_request)) {
+                    if (_isPre61Compatible()) {
+                        auto newDoc = _doc;
+                        newDoc.setMigrationsAlreadyBlockedForBucketNss(true);
+                        _updateStateDocument(opCtx, std::move(newDoc));
+                    }
+
+                    ShardsvrParticipantBlock blockCRUDOperationsRequest(_collInfo->nsForTargeting);
+                    const auto cmdObj = CommandHelpers::appendMajorityWriteConcern(
+                        blockCRUDOperationsRequest.toBSON({}));
+                    sharding_ddl_util::sendAuthenticatedCommandToShards(
+                        opCtx, nss().db(), cmdObj, _shardingInfo->shardsOwningChunks, **executor);
+                }
             }))
-        .then(_executePhase(
+        .then(_buildPhaseHandler(
             Phase::kUpdateConfig,
             [this, executor = executor, anchor = shared_from_this()] {
                 collModBeforeConfigServerUpdate.pauseWhileSet();
@@ -247,13 +256,14 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
                 auto* opCtx = opCtxHolder.get();
                 getForwardableOpMetadata().setOn(opCtx);
 
-                _doc = _updateSession(opCtx, _doc);
-                tassert(6201803, "collMod collection information should be set", _doc.getInfo());
+                _updateSession(opCtx);
 
-                if (_doc.getInfo()->getIsSharded() && _doc.getInfo()->getTimeSeriesOptions() &&
-                    hasTimeSeriesGranularityUpdate(_doc.getCollModRequest())) {
-                    ConfigsvrCollMod request(_doc.getInfo()->getNsForTargetting(),
-                                             _doc.getCollModRequest());
+                _saveCollectionInfoOnCoordinatorIfNecessary(opCtx);
+                _saveShardingInfoOnCoordinatorIfNecessary(opCtx);
+
+                if (_collInfo->isSharded && _collInfo->timeSeriesOptions &&
+                    hasTimeSeriesBucketingUpdate(_request)) {
+                    ConfigsvrCollMod request(_collInfo->nsForTargeting, _request);
                     const auto cmdObj =
                         CommandHelpers::appendMajorityWriteConcern(request.toBSON({}));
 
@@ -266,76 +276,120 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
                                                 Shard::RetryPolicy::kIdempotent)));
                 }
             }))
-        .then(_executePhase(
+        .then(_buildPhaseHandler(
             Phase::kUpdateShards,
             [this, executor = executor, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
                 getForwardableOpMetadata().setOn(opCtx);
 
-                _doc = _updateSession(opCtx, _doc);
-                tassert(6201804, "collMod collection information should be set", _doc.getInfo());
+                _updateSession(opCtx);
 
-                if (_doc.getInfo()->getIsSharded()) {
-                    tassert(
-                        6201806,
-                        "shardsOwningChunks should be set on state document for sharded collection",
-                        _doc.getInfo()->getShardsOwningChunks());
-                    tassert(6201807,
-                            "primaryShard should be set on state document for sharded collection",
-                            _doc.getInfo()->getPrimaryShard());
+                _saveCollectionInfoOnCoordinatorIfNecessary(opCtx);
+                _saveShardingInfoOnCoordinatorIfNecessary(opCtx);
 
-                    ShardsvrCollModParticipant request(nss(), _doc.getCollModRequest());
-                    bool needsUnblock = _doc.getInfo()->getTimeSeriesOptions() &&
-                        hasTimeSeriesGranularityUpdate(_doc.getCollModRequest());
-                    request.setNeedsUnblock(needsUnblock);
+                if (_collInfo->isSharded) {
+                    try {
+                        if (!_firstExecution) {
+                            bool allowMigrations = sharding_ddl_util::checkAllowMigrations(
+                                opCtx, _collInfo->nsForTargeting);
+                            if (_result.is_initialized() && allowMigrations) {
+                                // The command finished and we have the response. Return it.
+                                return;
+                            } else if (allowMigrations) {
+                                // Previous run on a different node completed, but we lost the
+                                // result in the stepdown. Restart from stage in which we disallow
+                                // migrations.
+                                auto newPhase = _isPre61Compatible() ? Phase::kBlockShards
+                                                                     : Phase::kFreezeMigrations;
+                                _enterPhase(newPhase);
+                                uasserted(ErrorCodes::Interrupted,
+                                          "Retriable error to move to previous stage");
+                            }
+                        }
 
-                    std::vector<AsyncRequestsSender::Response> responses;
-                    auto shardsOwningChunks = *_doc.getInfo()->getShardsOwningChunks();
-                    auto primaryShardOwningChunk = std::find(shardsOwningChunks.begin(),
-                                                             shardsOwningChunks.end(),
-                                                             _doc.getInfo()->getPrimaryShard());
-                    // A view definition will only be present on the primary shard. So we pass an
-                    // addition 'performViewChange' flag only to the primary shard.
-                    if (primaryShardOwningChunk != shardsOwningChunks.end()) {
-                        request.setPerformViewChange(true);
-                        const auto& primaryResponse =
+                        ShardsvrCollModParticipant request(originalNss(), _request);
+                        bool needsUnblock =
+                            _collInfo->timeSeriesOptions && hasTimeSeriesBucketingUpdate(_request);
+                        request.setNeedsUnblock(needsUnblock);
+
+                        std::vector<AsyncRequestsSender::Response> responses;
+                        auto shardsOwningChunks = _shardingInfo->shardsOwningChunks;
+                        auto primaryShardOwningChunk = std::find(shardsOwningChunks.begin(),
+                                                                 shardsOwningChunks.end(),
+                                                                 _shardingInfo->primaryShard);
+
+                        // If trying to convert an index to unique, executes a dryRun first to find
+                        // any duplicates without actually changing the indexes to avoid
+                        // inconsistent index specs on different shards. Example:
+                        //   Shard0: {_id: 0, a: 1}
+                        //   Shard1: {_id: 1, a: 2}, {_id: 2, a: 2}
+                        //   When trying to convert index {a: 1} to unique, the dry run will return
+                        //   the duplicate errors to the user without converting the indexes.
+                        if (isCollModIndexUniqueConversion(_request)) {
+                            // The 'dryRun' option only works with 'unique' index option. We need to
+                            // strip out other incompatible options.
+                            auto dryRunRequest = ShardsvrCollModParticipant{
+                                originalNss(), makeCollModDryRunRequest(_request)};
+                            sharding_ddl_util::sendAuthenticatedCommandToShards(
+                                opCtx,
+                                nss().db(),
+                                CommandHelpers::appendMajorityWriteConcern(
+                                    dryRunRequest.toBSON({})),
+                                shardsOwningChunks,
+                                **executor);
+                        }
+
+                        // A view definition will only be present on the primary shard. So we pass
+                        // an addition 'performViewChange' flag only to the primary shard.
+                        if (primaryShardOwningChunk != shardsOwningChunks.end()) {
+                            request.setPerformViewChange(true);
+                            const auto& primaryResponse =
+                                sharding_ddl_util::sendAuthenticatedCommandToShards(
+                                    opCtx,
+                                    nss().db(),
+                                    CommandHelpers::appendMajorityWriteConcern(request.toBSON({})),
+                                    {_shardingInfo->primaryShard},
+                                    **executor);
+                            responses.insert(
+                                responses.end(), primaryResponse.begin(), primaryResponse.end());
+                            shardsOwningChunks.erase(primaryShardOwningChunk);
+                        }
+
+                        request.setPerformViewChange(false);
+                        const auto& secondaryResponses =
                             sharding_ddl_util::sendAuthenticatedCommandToShards(
                                 opCtx,
                                 nss().db(),
                                 CommandHelpers::appendMajorityWriteConcern(request.toBSON({})),
-                                {*_doc.getInfo()->getPrimaryShard()},
+                                shardsOwningChunks,
                                 **executor);
                         responses.insert(
-                            responses.end(), primaryResponse.begin(), primaryResponse.end());
-                        shardsOwningChunks.erase(primaryShardOwningChunk);
-                    }
+                            responses.end(), secondaryResponses.begin(), secondaryResponses.end());
 
-                    request.setPerformViewChange(false);
-                    const auto& secondaryResponses =
-                        sharding_ddl_util::sendAuthenticatedCommandToShards(
-                            opCtx,
-                            nss().db(),
-                            CommandHelpers::appendMajorityWriteConcern(request.toBSON({})),
-                            shardsOwningChunks,
-                            **executor);
-                    responses.insert(
-                        responses.end(), secondaryResponses.begin(), secondaryResponses.end());
-
-                    BSONObjBuilder builder;
-                    std::string errmsg;
-                    auto ok = appendRawResponses(opCtx, &errmsg, &builder, responses).responseOK;
-                    if (!errmsg.empty()) {
-                        CommandHelpers::appendSimpleCommandStatus(builder, ok, errmsg);
+                        BSONObjBuilder builder;
+                        std::string errmsg;
+                        auto ok =
+                            appendRawResponses(opCtx, &errmsg, &builder, responses).responseOK;
+                        if (!errmsg.empty()) {
+                            CommandHelpers::appendSimpleCommandStatus(builder, ok, errmsg);
+                        }
+                        _result = builder.obj();
+                        sharding_ddl_util::resumeMigrations(
+                            opCtx, _collInfo->nsForTargeting, _doc.getCollUUID());
+                    } catch (DBException& ex) {
+                        if (!_isRetriableErrorForDDLCoordinator(ex.toStatus())) {
+                            sharding_ddl_util::resumeMigrations(
+                                opCtx, _collInfo->nsForTargeting, _doc.getCollUUID());
+                        }
+                        throw;
                     }
-                    _result = builder.obj();
-                    sharding_ddl_util::resumeMigrations(opCtx, nss(), _doc.getCollUUID());
                 } else {
-                    CollMod cmd(nss());
-                    cmd.setCollModRequest(_doc.getCollModRequest());
+                    CollMod cmd(originalNss());
+                    cmd.setCollModRequest(_request);
                     BSONObjBuilder collModResBuilder;
                     uassertStatusOK(timeseries::processCollModCommandWithTimeSeriesTranslation(
-                        opCtx, nss(), cmd, true, &collModResBuilder));
+                        opCtx, originalNss(), cmd, true, &collModResBuilder));
                     auto collModRes = collModResBuilder.obj();
 
                     const auto dbInfo = uassertStatusOK(
@@ -355,17 +409,8 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
                 !status.isA<ErrorCategory::ShutdownError>()) {
                 LOGV2_ERROR(5757002,
                             "Error running collMod",
-                            "namespace"_attr = nss(),
+                            logAttrs(nss()),
                             "error"_attr = redact(status));
-                // If we have the collection UUID set, this error happened in a sharded collection,
-                // we should restore the migrations.
-                if (_doc.getCollUUID()) {
-                    auto opCtxHolder = cc().makeOperationContext();
-                    auto* opCtx = opCtxHolder.get();
-                    getForwardableOpMetadata().setOn(opCtx);
-
-                    sharding_ddl_util::resumeMigrations(opCtx, nss(), _doc.getCollUUID());
-                }
             }
             return status;
         });

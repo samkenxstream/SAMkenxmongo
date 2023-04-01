@@ -1,7 +1,7 @@
 # -*- mode: python; -*-
 
 from functools import partial
-import libdeps
+import libdeps_tool as libdeps
 
 Import("env")
 Import("get_option")
@@ -19,18 +19,14 @@ env.AutoInstall(
 )
 
 mongoEmbeddedEnv = env.Clone()
-mongoEmbeddedEnv.AppendUnique(
-    CPPDEFINES=[
-        'MONGO_EMBEDDED_COMPILING',
-    ],
-)
+mongoEmbeddedEnv.AppendUnique(CPPDEFINES=[
+    'MONGO_EMBEDDED_COMPILING',
+], )
 
 if get_option('link-model') == 'static':
-    mongoEmbeddedEnv.AppendUnique(
-        CPPDEFINES=[
-            'MONGO_EMBEDDED_STATIC',
-        ],
-    )
+    mongoEmbeddedEnv.AppendUnique(CPPDEFINES=[
+        'MONGO_EMBEDDED_STATIC',
+    ], )
 elif get_option('link-model') == 'dynamic-sdk':
     # TODO(SERVER-59134): This fails to honor the libdeps-debug flag
     mongoEmbeddedEnv['LIBDEPS_SHLIBEMITTER'] = partial(
@@ -39,11 +35,9 @@ elif get_option('link-model') == 'dynamic-sdk':
         visibility_map=libdeps.dependency_visibility_honored,
     )
 
-mongoEmbeddedEnv.AppendUnique(
-    SHLINKFLAGS=[
-        '$MONGO_EXPORT_FILE_SHLINKFLAGS',
-    ],
-)
+mongoEmbeddedEnv.AppendUnique(SHLINKFLAGS=[
+    '$MONGO_EXPORT_FILE_SHLINKFLAGS',
+], )
 
 if mongoEmbeddedEnv.TargetOSIs('darwin'):
     # The current version and compatibility are the *minor* ABI
@@ -57,9 +51,7 @@ if mongoEmbeddedEnv.TargetOSIs('darwin'):
         SHLINKFLAGS=[
             '-Wl,-current_version,1',
             '-Wl,-compatibility_version,1',
-        ],
-    )
-
+        ], )
 
 mongoEmbeddedTargets = mongoEmbeddedEnv.Library(
     target='mongo_embedded',
@@ -94,8 +86,9 @@ if get_option('link-model') != 'dynamic-sdk':
         ],
         LIBDEPS=[
             '$BUILD_DIR/mongo/base',
+            '$BUILD_DIR/mongo/bson/bson_validate',
             '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
-            '$BUILD_DIR/mongo/db/server_options_core',
+            '$BUILD_DIR/mongo/db/server_base',
             '$BUILD_DIR/mongo/rpc/message',
             '$BUILD_DIR/mongo/unittest/unittest',
             '$BUILD_DIR/mongo/util/net/network',

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -52,7 +51,8 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/fail_point.h"
 
-#include <boost/optional/optional_io.hpp>
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace repl {
@@ -1315,7 +1315,7 @@ TEST_F(TakeoverTest, SchedulesCatchupTakeoverIfNodeIsFresherThanCurrentPrimary) 
     // Make sure that the catchup takeover has actually been scheduled and at the
     // correct time.
     ASSERT(replCoord->getCatchupTakeover_forTest());
-    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().get();
+    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().value();
     Milliseconds catchupTakeoverDelay = catchupTakeoverTime - now;
     ASSERT_EQUALS(config.getCatchUpTakeoverDelay(), catchupTakeoverDelay);
 }
@@ -1362,7 +1362,7 @@ TEST_F(TakeoverTest, SchedulesCatchupTakeoverIfBothTakeoversAnOption) {
     // correct time and that a priority takeover has not been scheduled.
     ASSERT(replCoord->getCatchupTakeover_forTest());
     ASSERT_FALSE(replCoord->getPriorityTakeover_forTest());
-    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().get();
+    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().value();
     Milliseconds catchupTakeoverDelay = catchupTakeoverTime - now;
     ASSERT_EQUALS(config.getCatchUpTakeoverDelay(), catchupTakeoverDelay);
 }
@@ -1461,7 +1461,7 @@ TEST_F(TakeoverTest, CatchupTakeoverNotScheduledTwice) {
     ASSERT(replCoord->getCatchupTakeover_forTest());
     executor::TaskExecutor::CallbackHandle catchupTakeoverCbh =
         replCoord->getCatchupTakeoverCbh_forTest();
-    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().get();
+    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().value();
     Milliseconds catchupTakeoverDelay = catchupTakeoverTime - now;
     ASSERT_EQUALS(config.getCatchUpTakeoverDelay(), catchupTakeoverDelay);
 
@@ -1470,7 +1470,7 @@ TEST_F(TakeoverTest, CatchupTakeoverNotScheduledTwice) {
         config, now + config.getHeartbeatInterval(), HostAndPort("node2", 12345), behindOptime);
 
     // Make sure another catchup takeover wasn't scheduled
-    ASSERT_EQUALS(catchupTakeoverTime, replCoord->getCatchupTakeover_forTest().get());
+    ASSERT_EQUALS(catchupTakeoverTime, replCoord->getCatchupTakeover_forTest().value());
     ASSERT_TRUE(catchupTakeoverCbh == replCoord->getCatchupTakeoverCbh_forTest());
 }
 
@@ -1519,7 +1519,7 @@ TEST_F(TakeoverTest, CatchupAndPriorityTakeoverNotScheduledAtSameTime) {
     // Make sure that the catchup takeover has actually been scheduled and at the
     // correct time.
     ASSERT(replCoord->getCatchupTakeover_forTest());
-    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().get();
+    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().value();
     Milliseconds catchupTakeoverDelay = catchupTakeoverTime - now;
     ASSERT_EQUALS(config.getCatchUpTakeoverDelay(), catchupTakeoverDelay);
 
@@ -1579,7 +1579,7 @@ TEST_F(TakeoverTest, CatchupTakeoverCallbackCanceledIfElectionTimeoutRuns) {
     // Make sure that the catchup takeover has actually been scheduled and at the
     // correct time.
     ASSERT(replCoord->getCatchupTakeover_forTest());
-    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().get();
+    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().value();
     Milliseconds catchupTakeoverDelay = catchupTakeoverTime - now;
     ASSERT_EQUALS(config.getCatchUpTakeoverDelay(), catchupTakeoverDelay);
 
@@ -1651,7 +1651,7 @@ TEST_F(TakeoverTest, CatchupTakeoverCanceledIfTransitionToRollback) {
     // Make sure that the catchup takeover has actually been scheduled and at the
     // correct time.
     ASSERT(replCoord->getCatchupTakeover_forTest());
-    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().get();
+    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().value();
     Milliseconds catchupTakeoverDelay = catchupTakeoverTime - now;
     ASSERT_EQUALS(config.getCatchUpTakeoverDelay(), catchupTakeoverDelay);
 
@@ -1712,7 +1712,7 @@ TEST_F(TakeoverTest, SuccessfulCatchupTakeover) {
     // Make sure that the catchup takeover has actually been scheduled and at the
     // correct time.
     ASSERT(replCoord->getCatchupTakeover_forTest());
-    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().get();
+    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().value();
     Milliseconds catchupTakeoverDelay = catchupTakeoverTime - now;
     ASSERT_EQUALS(config.getCatchUpTakeoverDelay(), catchupTakeoverDelay);
 
@@ -1796,7 +1796,7 @@ TEST_F(TakeoverTest, CatchupTakeoverDryRunFailsPrimarySaysNo) {
     // Make sure that the catchup takeover has actually been scheduled and at the
     // correct time.
     ASSERT(replCoord->getCatchupTakeover_forTest());
-    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().get();
+    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().value();
     Milliseconds catchupTakeoverDelay = catchupTakeoverTime - now;
     ASSERT_EQUALS(config.getCatchUpTakeoverDelay(), catchupTakeoverDelay);
 
@@ -1905,7 +1905,7 @@ TEST_F(TakeoverTest, PrimaryCatchesUpBeforeCatchupTakeover) {
     // Make sure that the catchup takeover has actually been scheduled and at the
     // correct time.
     ASSERT(replCoord->getCatchupTakeover_forTest());
-    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().get();
+    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().value();
     Milliseconds catchupTakeoverDelay = catchupTakeoverTime - now;
     ASSERT_EQUALS(config.getCatchUpTakeoverDelay(), catchupTakeoverDelay);
 
@@ -1966,7 +1966,7 @@ TEST_F(TakeoverTest, PrimaryCatchesUpBeforeHighPriorityNodeCatchupTakeover) {
     // Make sure that the catchup takeover has actually been scheduled and at the
     // correct time.
     ASSERT(replCoord->getCatchupTakeover_forTest());
-    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().get();
+    auto catchupTakeoverTime = replCoord->getCatchupTakeover_forTest().value();
     Milliseconds catchupTakeoverDelay = catchupTakeoverTime - now;
     ASSERT_EQUALS(config.getCatchUpTakeoverDelay(), catchupTakeoverDelay);
 
@@ -1986,7 +1986,7 @@ TEST_F(TakeoverTest, PrimaryCatchesUpBeforeHighPriorityNodeCatchupTakeover) {
     // Make sure that the priority takeover has now been scheduled and at the
     // correct time.
     ASSERT(replCoord->getPriorityTakeover_forTest());
-    auto priorityTakeoverTime = replCoord->getPriorityTakeover_forTest().get();
+    auto priorityTakeoverTime = replCoord->getPriorityTakeover_forTest().value();
     assertValidPriorityTakeoverDelay(config, now, priorityTakeoverTime, 0);
 
     // Node 1 schedules the priority takeover, and since it has the second highest
@@ -2037,7 +2037,7 @@ TEST_F(TakeoverTest, SchedulesPriorityTakeoverIfNodeHasHigherPriorityThanCurrent
     // Make sure that the priority takeover has actually been scheduled and at the
     // correct time.
     ASSERT(replCoord->getPriorityTakeover_forTest());
-    auto priorityTakeoverTime = replCoord->getPriorityTakeover_forTest().get();
+    auto priorityTakeoverTime = replCoord->getPriorityTakeover_forTest().value();
     assertValidPriorityTakeoverDelay(config, now, priorityTakeoverTime, 0);
 
     // Also make sure that updating the term cancels the scheduled priority takeover.
@@ -2080,7 +2080,7 @@ TEST_F(TakeoverTest, SuccessfulPriorityTakeover) {
     // Make sure that the priority takeover has actually been scheduled and at the
     // correct time.
     ASSERT(replCoord->getPriorityTakeover_forTest());
-    auto priorityTakeoverTime = replCoord->getPriorityTakeover_forTest().get();
+    auto priorityTakeoverTime = replCoord->getPriorityTakeover_forTest().value();
     assertValidPriorityTakeoverDelay(config, now, priorityTakeoverTime, 0);
 
     // The priority takeover might be scheduled at a time later than one election
@@ -2148,7 +2148,7 @@ TEST_F(TakeoverTest, DontCallForPriorityTakeoverWhenLaggedSameSecond) {
     // Make sure that the priority takeover has actually been scheduled and at the
     // correct time.
     ASSERT(replCoord->getPriorityTakeover_forTest());
-    auto priorityTakeoverTime = replCoord->getPriorityTakeover_forTest().get();
+    auto priorityTakeoverTime = replCoord->getPriorityTakeover_forTest().value();
     assertValidPriorityTakeoverDelay(config, now, priorityTakeoverTime, 0);
 
     // At this point the other nodes are all ahead of the current node, so it can't call for
@@ -2179,7 +2179,7 @@ TEST_F(TakeoverTest, DontCallForPriorityTakeoverWhenLaggedSameSecond) {
     // Make sure that a new priority takeover has been scheduled and at the
     // correct time.
     ASSERT(replCoord->getPriorityTakeover_forTest());
-    priorityTakeoverTime = replCoord->getPriorityTakeover_forTest().get();
+    priorityTakeoverTime = replCoord->getPriorityTakeover_forTest().value();
     assertValidPriorityTakeoverDelay(config, now, priorityTakeoverTime, 0);
 
     // Now make us caught up enough to call for priority takeover to succeed.
@@ -2236,7 +2236,7 @@ TEST_F(TakeoverTest, DontCallForPriorityTakeoverWhenLaggedDifferentSecond) {
     // Make sure that the priority takeover has actually been scheduled and at the
     // correct time.
     ASSERT(replCoord->getPriorityTakeover_forTest());
-    auto priorityTakeoverTime = replCoord->getPriorityTakeover_forTest().get();
+    auto priorityTakeoverTime = replCoord->getPriorityTakeover_forTest().value();
     assertValidPriorityTakeoverDelay(config, now, priorityTakeoverTime, 0);
 
     // At this point the other nodes are all ahead of the current node, so it can't call for
@@ -2267,7 +2267,7 @@ TEST_F(TakeoverTest, DontCallForPriorityTakeoverWhenLaggedDifferentSecond) {
     // Make sure that a new priority takeover has been scheduled and at the
     // correct time.
     ASSERT(replCoord->getPriorityTakeover_forTest());
-    priorityTakeoverTime = replCoord->getPriorityTakeover_forTest().get();
+    priorityTakeoverTime = replCoord->getPriorityTakeover_forTest().value();
     assertValidPriorityTakeoverDelay(config, now, priorityTakeoverTime, 0);
 
     // Now make us caught up enough to call for priority takeover to succeed.

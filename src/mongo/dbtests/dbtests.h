@@ -29,16 +29,11 @@
 
 #pragma once
 
-/**
- * Test suite generator headers.
- */
-
 #include "mongo/db/db_raii.h"
 #include "mongo/unittest/unittest.h"
 
 using namespace mongo;
 using namespace mongo::unittest;
-using std::shared_ptr;
 
 namespace mongo {
 
@@ -80,7 +75,8 @@ public:
     }
 
     CollectionPtr getCollection() const {
-        return CollectionCatalog::get(_opCtx)->lookupCollectionByNamespace(_opCtx, _nss);
+        return CollectionPtr(
+            CollectionCatalog::get(_opCtx)->lookupCollectionByNamespace(_opCtx, _nss));
     }
 
 private:

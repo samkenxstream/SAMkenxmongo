@@ -18,6 +18,7 @@ TestData.failIfUnterminatedProcesses = false;
 // the mongos in this test.
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
 const mongosParams = {
     setParameter: {
@@ -43,6 +44,7 @@ var st = new ShardingTest({
     shards: 1,
     mongos: [mongosParams, {}],
     other: {useBridge: true},
+    config: 3,
 });
 
 assert.commandWorked(st.s0.adminCommand(
@@ -116,6 +118,9 @@ assert.soon(() => {
 }, 'Mongos is not shutting down as expected', 40000, 400);
 
 try {
+    // Refresh PIDs to force de-registration of the crashed mongos.
+    var pids = _runningMongoChildProcessIds();
+    jsTestLog(`Running processes: ${tojson(pids)}`);
     st.stop({skipValidatingExitCode: true, skipValidation: true});
 } catch (e) {
     jsTestLog(`Exception during shutdown: ${e}`);

@@ -33,14 +33,14 @@
 
 #include "mongo/db/api_parameters.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/db/session_catalog.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/session_catalog.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/db/stats/single_transaction_stats.h"
 #include "mongo/s/async_requests_sender.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -70,6 +70,9 @@ public:
         kTwoPhaseCommit,
         kRecoverWithToken,
     };
+
+    // The reason why TransactionRouter::Router::stash() is called.
+    enum class StashReason { kDone, kYield };
 
     // The default value to use as the statement id of the first command in the transaction if none
     // was sent.
@@ -326,6 +329,15 @@ public:
             return o().txnNumberAndRetryCounter.getTxnNumber() != kUninitializedTxnNumber;
         }
 
+        /**
+         * Returns if this TransactionRouter instance can be reaped. Always true unless an operation
+         * has yielded the router and has not unyielded yet. We cannot reap the instance in that
+         * case or the unyield would check out a different TransactionRouter than it yielded.
+         */
+        auto canBeReaped() const {
+            return o().activeYields == 0;
+        }
+
     protected:
         explicit Observer(TransactionRouter* tr) : _tr(tr) {}
 
@@ -372,9 +384,10 @@ public:
                                 TransactionActions action);
 
         /**
-         * Updates transaction diagnostics when the transaction's session is checked in.
+         * Updates transaction diagnostics and, if necessary, the number of active yielders when the
+         * transaction's session is checked in.
          */
-        void stash(OperationContext* opCtx);
+        void stash(OperationContext* opCtx, StashReason reason);
 
         /**
          * Validates transaction state is still compatible after a yield.
@@ -775,6 +788,11 @@ private:
         // certain transaction events. Unset until the transaction router has processed at least one
         // transaction command.
         boost::optional<MetricsTracker> metricsTracker;
+
+        // How many operations that checked out the router's session have currently yielded it. The
+        // transaction number cannot be changed until this returns to 0, otherwise we cannot
+        // guarantee that unyielding the session cannot fail.
+        int32_t activeYields{0};
     } _o;
 
     /**

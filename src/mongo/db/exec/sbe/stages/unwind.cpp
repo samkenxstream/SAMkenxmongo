@@ -27,6 +27,7 @@
  *    it in the license file.
  */
 
+#include "mongo/config.h"
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/exec/sbe/stages/unwind.h"
@@ -40,8 +41,10 @@ UnwindStage::UnwindStage(std::unique_ptr<PlanStage> input,
                          value::SlotId outField,
                          value::SlotId outIndex,
                          bool preserveNullAndEmptyArrays,
-                         PlanNodeId planNodeId)
-    : PlanStage("unwind"_sd, planNodeId),
+                         PlanNodeId planNodeId,
+                         PlanYieldPolicy* yieldPolicy,
+                         bool participateInTrialRunTracking)
+    : PlanStage("unwind"_sd, yieldPolicy, planNodeId, participateInTrialRunTracking),
       _inField(inField),
       _outField(outField),
       _outIndex(outIndex),
@@ -59,7 +62,9 @@ std::unique_ptr<PlanStage> UnwindStage::clone() const {
                                          _outField,
                                          _outIndex,
                                          _preserveNullAndEmptyArrays,
-                                         _commonStats.nodeId);
+                                         _commonStats.nodeId,
+                                         _yieldPolicy,
+                                         _participateInTrialRunTracking);
 }
 
 void UnwindStage::prepare(CompileCtx& ctx) {
@@ -99,6 +104,17 @@ void UnwindStage::open(bool reOpen) {
 
 PlanState UnwindStage::getNext() {
     auto optTimer(getOptTimer(_opCtx));
+
+    checkForInterrupt(_opCtx);
+
+#if defined(MONGO_CONFIG_DEBUG_BUILD)
+    // If we are iterating over the array, then we are not going to advance the child.
+    // In such case, we expect that child slots are accessible, as otherwise our enumerator state is
+    // not valid.
+    tassert(7200405,
+            "Child stage slots must be accessible while iterating over array elements",
+            !_inArray || _children[0]->slotsAccessible());
+#endif
 
     if (!_inArray) {
         do {
@@ -202,15 +218,14 @@ std::vector<DebugPrinter::Block> UnwindStage::debugPrint() const {
 }
 
 void UnwindStage::doSaveState(bool fullSave) {
-    if (!slotsAccessible() || !fullSave) {
+    if (!fullSave) {
         return;
     }
-
     if (_outFieldOutputAccessor) {
-        _outFieldOutputAccessor->makeOwned();
+        prepareForYielding(*_outFieldOutputAccessor, slotsAccessible());
     }
     if (_outIndexOutputAccessor) {
-        _outIndexOutputAccessor->makeOwned();
+        prepareForYielding(*_outIndexOutputAccessor, slotsAccessible());
     }
 }
 

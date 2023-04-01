@@ -32,8 +32,8 @@
 #include "mongo/base/shim.h"
 #include "mongo/db/s/transaction_coordinator_factory.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
-#include "mongo/db/transaction_participant.h"
-#include "mongo/db/transaction_participant_gen.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant_gen.h"
 
 namespace mongo {
 namespace {
@@ -41,7 +41,7 @@ namespace {
 void createTransactionCoordinatorImpl(OperationContext* opCtx,
                                       TxnNumber clientTxnNumber,
                                       boost::optional<TxnRetryCounter> clientTxnRetryCounter) {
-    auto clientLsid = opCtx->getLogicalSessionId().get();
+    auto clientLsid = opCtx->getLogicalSessionId().value();
     auto clockSource = opCtx->getServiceContext()->getFastClockSource();
 
     // If this shard has been selected as the coordinator, set up the coordinator state

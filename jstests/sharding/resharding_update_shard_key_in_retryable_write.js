@@ -3,7 +3,7 @@
  * its shard key value during resharding is not retryable on the recipient after resharding
  * completes.
  *
- * @tags: [requires_fcv_53, featureFlagInternalTransactions]
+ * @tags: [requires_fcv_60]
  */
 (function() {
 
@@ -47,8 +47,8 @@ function runTest(reshardInPlace) {
     const mongosTestDB = mongosConn.getDB(dbName);
 
     // Test commands that the shard key of a document in the test collection from change its shard
-    // key Note we don't test the remove:true case because the document can't move shards if it is
-    // being delete.
+    // key. Note we don't test the remove:true case because the document can't move shards if it is
+    // being deleted.
     const updateCmdObj = {
         update: collName,
         updates: [
@@ -76,6 +76,30 @@ function runTest(reshardInPlace) {
         txnNumber: NumberLong(3),
     };
 
+    const expectedTransientErrors = new Set([
+        ErrorCodes.StaleConfig,
+        ErrorCodes.NoSuchTransaction,
+        ErrorCodes.ShardCannotRefreshDueToLocksHeld,
+        ErrorCodes.LockTimeout,
+        ErrorCodes.IncompleteTransactionHistory
+    ]);
+
+    function runCommandRetryOnTransientErrors(db, cmdObj) {
+        let res;
+        assert.soon(() => {
+            res = db.runCommand(cmdObj);
+
+            if (expectedTransientErrors.has(res.code) ||
+                (res.writeErrors && expectedTransientErrors.has(res.writeErrors[0].code))) {
+                cmdObj.txnNumber = NumberLong(cmdObj.txnNumber + 1);
+                return false;
+            }
+            assert.commandWorked(res);
+            return true;
+        });
+        return res;
+    }
+
     assert.commandWorked(mongosTestColl.insert({oldShardKey: -1, newShardKey: -1}));
     assert.commandWorked(mongosTestColl.insert({oldShardKey: -2, newShardKey: -2}));
 
@@ -96,19 +120,19 @@ function runTest(reshardInPlace) {
 
             jsTest.log("Start running retryable writes during resharding");
 
-            const updateRes = assert.commandWorked(mongosTestDB.runCommand(updateCmdObj));
+            const updateRes = runCommandRetryOnTransientErrors(mongosTestDB, updateCmdObj);
             assert.eq(updateRes.n, 1, tojson(updateRes));
             assert.eq(updateRes.nModified, 1, tojson(updateRes));
 
             const findAndModifyUpdateRes =
-                assert.commandWorked(mongosTestDB.runCommand(findAndModifyUpdateCmdObj));
+                runCommandRetryOnTransientErrors(mongosTestDB, findAndModifyUpdateCmdObj);
             assert.eq(findAndModifyUpdateRes.lastErrorObject.n, 1, tojson(findAndModifyUpdateRes));
             assert.eq(findAndModifyUpdateRes.lastErrorObject.updatedExisting,
                       true,
                       tojson(findAndModifyUpdateRes));
 
-            const findAndModifyUpsertRes =
-                assert.commandWorked(mongosTestDB.runCommand(findAndModifyUpsertCmdObj));
+            let findAndModifyUpsertRes =
+                runCommandRetryOnTransientErrors(mongosTestDB, findAndModifyUpsertCmdObj);
             assert.eq(findAndModifyUpsertRes.lastErrorObject.n, 1, tojson(findAndModifyUpsertRes));
             assert.eq(findAndModifyUpsertRes.lastErrorObject.updatedExisting,
                       false,

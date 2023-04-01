@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/process_interface/mongos_process_interface.h"
 #include "mongo/unittest/unittest.h"
@@ -60,26 +58,27 @@ public:
     }
 };
 
-TEST_F(MongosProcessInterfaceTest, FailsToEnsureFieldsUniqueIfTargetCollectionVersionIsSpecified) {
+TEST_F(MongosProcessInterfaceTest,
+       FailsToEnsureFieldsUniqueIftargetCollectionPlacementVersionIsSpecified) {
     auto expCtx = getExpCtx();
-    auto targetCollectionVersion =
-        boost::make_optional(ChunkVersion(0, 0, OID::gen(), Timestamp(1, 1)));
+    auto targetCollectionPlacementVersion =
+        boost::make_optional(ChunkVersion({OID::gen(), Timestamp(1, 1)}, {0, 0}));
     auto processInterface = makeProcessInterface();
 
     ASSERT_THROWS_CODE(processInterface->ensureFieldsUniqueOrResolveDocumentKey(
-                           expCtx, {{"_id"}}, targetCollectionVersion, expCtx->ns),
+                           expCtx, {{"_id"}}, targetCollectionPlacementVersion, expCtx->ns),
                        AssertionException,
                        51179);
 }
 
 TEST_F(MongosProcessInterfaceTest, FailsToEnsureFieldsUniqueIfNotSupportedByIndex) {
     auto expCtx = getExpCtx();
-    auto targetCollectionVersion = boost::none;
+    auto targetCollectionPlacementVersion = boost::none;
     auto processInterface = makeProcessInterface();
 
     processInterface->hasSupportingIndexForFields = false;
     ASSERT_THROWS_CODE(processInterface->ensureFieldsUniqueOrResolveDocumentKey(
-                           expCtx, {{"x"}}, targetCollectionVersion, expCtx->ns),
+                           expCtx, {{"x"}}, targetCollectionPlacementVersion, expCtx->ns),
                        AssertionException,
                        51190);
 }

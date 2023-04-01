@@ -4,7 +4,6 @@
  * data, and 3) is in the tenant oplog application phase.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
@@ -15,15 +14,14 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {makeX509OptionsForTest} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
 load('jstests/replsets/rslib.js');  // for waitForNewlyAddedRemovalForNodeToBeCommitted
 
-const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
+const migrationX509Options = makeX509OptionsForTest();
 
 const testDBName = 'testDB';
 const testCollName = 'testColl';
@@ -54,11 +52,10 @@ function restartNodeAndCheckState(tenantId, tenantMigrationTest, checkMtab) {
         () => {
             recipientDocOnPrimary =
                 originalRecipientPrimary.getCollection(TenantMigrationTest.kConfigRecipientsNS)
-                    .findOne({tenantId: tenantId});
+                    .findOne({tenantId});
             recipientDocOnNewNode =
-                initialSyncNode.getCollection(TenantMigrationTest.kConfigRecipientsNS).findOne({
-                    tenantId: tenantId
-                });
+                initialSyncNode.getCollection(TenantMigrationTest.kConfigRecipientsNS)
+                    .findOne({tenantId});
 
             return recipientDocOnPrimary.state == recipientDocOnNewNode.state;
         },
@@ -90,7 +87,7 @@ function restartNodeAndCheckStateWithoutOplogApplication(
 
     jsTestLog("Stepping up the new node.");
     // Now step up the new node
-    assert.commandWorked(initialSyncNode.adminCommand({"replSetStepUp": 1}));
+    tenantMigrationTest.getRecipientRst().stepUp(initialSyncNode);
     fpOnRecipient.off();
 }
 
@@ -119,7 +116,7 @@ function restartNodeAndCheckStateDuringOplogApplication(
 
     jsTestLog("Stepping up the new node.");
     // Now step up the new node
-    assert.commandWorked(initialSyncNode.adminCommand({"replSetStepUp": 1}));
+    tenantMigrationTest.getRecipientRst().stepUp(initialSyncNode);
     fpPauseOplogApplierOnBatch.off();
     fpOnRecipient.off();
 }
@@ -133,10 +130,12 @@ function restartNodeAndCheckStateDuringOplogApplication(
 // 4. Makes sure the restarted node's state is as expected.
 // 5. Steps up the restarted node as the recipient primary, lifts the recipient failpoint, and
 //    allows the migration to complete.
-function runTestCase(tenantId, recipientFailpoint, checkMtab, restartNodeAndCheckStateFunction) {
+function runTestCase(recipientFailpoint, checkMtab, restartNodeAndCheckStateFunction) {
+    const tenantId = ObjectId().str;
     const donorRst = new ReplSetTest({
         name: "donorRst",
         nodes: 1,
+        serverless: true,
         nodeOptions: Object.assign(migrationX509Options.donor, {
             setParameter: {
                 // Allow non-timestamped reads on donor after migration completes for testing.
@@ -154,7 +153,7 @@ function runTestCase(tenantId, recipientFailpoint, checkMtab, restartNodeAndChec
         sharedOptions: {setParameter: {tenantApplierBatchSizeOps: 2}}
     });
 
-    const migrationOpts = {migrationIdString: extractUUIDFromObject(UUID()), tenantId: tenantId};
+    const migrationOpts = {migrationIdString: extractUUIDFromObject(UUID()), tenantId};
     const dbName = tenantMigrationTest.tenantDB(tenantId, testDBName);
     const originalRecipientPrimary = tenantMigrationTest.getRecipientPrimary();
 
@@ -181,25 +180,20 @@ function runTestCase(tenantId, recipientFailpoint, checkMtab, restartNodeAndChec
 
 // These two test cases are for before the mtab is created, and before the oplog applier has been
 // started.
-runTestCase('tenantId1',
-            "fpAfterStartingOplogFetcherMigrationRecipientInstance",
+runTestCase("fpAfterStartingOplogFetcherMigrationRecipientInstance",
             false /* checkMtab */,
             restartNodeAndCheckStateWithoutOplogApplication);
-runTestCase('tenantId2',
-            "tenantCollectionClonerHangAfterCreateCollection",
+runTestCase("tenantCollectionClonerHangAfterCreateCollection",
             false /* checkMtab */,
             restartNodeAndCheckStateWithoutOplogApplication);
 
 // Test case to initial sync a node while the recipient is in the oplog application phase.
-runTestCase('tenantId3',
-            "fpBeforeFulfillingDataConsistentPromise",
+runTestCase("fpBeforeFulfillingDataConsistentPromise",
             true /* checkMtab */,
             restartNodeAndCheckStateDuringOplogApplication);
 
 // A case after data consistency so that the mtab exists. We do not care about the oplog applier in
 // this case.
-runTestCase('tenantId4',
-            "fpAfterWaitForRejectReadsBeforeTimestamp",
+runTestCase("fpAfterWaitForRejectReadsBeforeTimestamp",
             true /* checkMtab */,
             restartNodeAndCheckStateWithoutOplogApplication);
-})();

@@ -2,9 +2,12 @@
  * Tests that retrying a failed tenant migration works even if the config.transactions on the
  * recipient is not cleaned up after the failed migration.
  *
+ * TODO SERVER-61231: aborts migration after sending recipientSyncData and starting
+ * cloning on recipient, adapt this test to handle file cleanup on recipient.
+ *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
+ *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
  *   requires_persistence,
@@ -12,18 +15,16 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {checkTenantDBHashes} from "jstests/replsets/libs/tenant_migration_util.js";
 
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 load("jstests/replsets/rslib.js");
 load("jstests/libs/uuid_util.js");
 
 const tenantMigrationTest =
     new TenantMigrationTest({name: jsTestName(), quickGarbageCollection: true});
 
-const kTenantId = "testTenantId";
+const kTenantId = ObjectId().str;
 const kDbName = tenantMigrationTest.tenantDB(kTenantId, "testDB");
 const kCollName = "testColl";
 
@@ -32,8 +33,8 @@ const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 
 tenantMigrationTest.insertDonorDB(kDbName, kCollName, [{_id: 1}, {_id: 2}]);
 
-let waitAfterCloning =
-    configureFailPoint(recipientPrimary, "fpAfterCollectionClonerDone", {action: "hang"});
+let waitBeforeFetchingTransactions =
+    configureFailPoint(recipientPrimary, "fpBeforeFetchingCommittedTransactions", {action: "hang"});
 
 const migrationId = UUID();
 const migrationOpts = {
@@ -42,7 +43,7 @@ const migrationOpts = {
 };
 tenantMigrationTest.startMigration(migrationOpts);
 
-waitAfterCloning.wait();
+waitBeforeFetchingTransactions.wait();
 
 // Run transactions against the donor while the migration is running.
 const session1 = donorPrimary.startSession();
@@ -77,7 +78,7 @@ for (const lsid of [lsid1, lsid2]) {
 
 // Abort the first migration.
 const abortFp = configureFailPoint(donorPrimary, "abortTenantMigrationBeforeLeavingBlockingState");
-waitAfterCloning.off();
+waitBeforeFetchingTransactions.off();
 
 TenantMigrationTest.assertAborted(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
 tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString);
@@ -88,13 +89,13 @@ abortFp.off();
 // Clean up tenant data after a failed migration.
 assert.commandWorked(recipientPrimary.getDB(kDbName).dropDatabase());
 
-waitAfterCloning =
-    configureFailPoint(recipientPrimary, "fpAfterCollectionClonerDone", {action: "hang"});
+waitBeforeFetchingTransactions =
+    configureFailPoint(recipientPrimary, "fpBeforeFetchingCommittedTransactions", {action: "hang"});
 
 // Retry the migration.
 tenantMigrationTest.startMigration(migrationOpts);
 
-waitAfterCloning.wait();
+waitBeforeFetchingTransactions.wait();
 
 // Run a newer transaction on session2 during the migration.
 session2.startTransaction({writeConcern: {w: "majority"}});
@@ -113,7 +114,7 @@ assert.commandWorked(donorPrimary.getDB(kDbName).runCommand({
     lsid: lsid2
 }));
 
-waitAfterCloning.off();
+waitBeforeFetchingTransactions.off();
 
 TenantMigrationTest.assertCommitted(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
 
@@ -153,8 +154,10 @@ assert.commandWorked(recipientPrimary.getDB(kDbName).runCommand({
 
 // The dbhash between the donor and the recipient should still match after retrying
 // commitTransaction and the retryable writes because they should be noop.
-TenantMigrationUtil.checkTenantDBHashes(
-    tenantMigrationTest.getDonorRst(), tenantMigrationTest.getRecipientRst(), kTenantId);
+checkTenantDBHashes({
+    donorRst: tenantMigrationTest.getDonorRst(),
+    recipientRst: tenantMigrationTest.getRecipientRst(),
+    tenantId: kTenantId
+});
 
 tenantMigrationTest.stop();
-})();

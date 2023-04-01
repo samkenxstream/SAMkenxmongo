@@ -35,9 +35,9 @@
 
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/generic_cursor.h"
-#include "mongo/db/kill_sessions.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/session_killer.h"
+#include "mongo/db/session/kill_sessions.h"
+#include "mongo/db/session/session_killer.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
 #include "mongo/s/query/cluster_client_cursor.h"
@@ -117,7 +117,7 @@ public:
     // Represents a function that may be passed into a ClusterCursorManager method which checks
     // whether the current client is authorized to perform the operation in question. The function
     // will be passed the list of users authorized to use the cursor.
-    using AuthzCheckFn = std::function<Status(UserNameIterator)>;
+    using AuthzCheckFn = std::function<Status(const boost::optional<UserName>&)>;
 
     /**
      * PinnedCursor is a moveable, non-copyable class representing ownership of a cursor that has
@@ -226,7 +226,7 @@ public:
                     CursorType cursorType,
                     CursorLifetime cursorLifetime,
                     Date_t lastActive,
-                    UserNameIterator authenticatedUsersIter,
+                    boost::optional<UserName> authenticatedUser,
                     UUID clientUUID,
                     boost::optional<OperationKey> opKey,
                     NamespaceString nss)
@@ -238,8 +238,7 @@ public:
               _opKey(std::move(opKey)),
               _nss(std::move(nss)),
               _originatingClient(std::move(clientUUID)),
-              _authenticatedUsers(
-                  userNameIteratorToContainer<std::vector<UserName>>(authenticatedUsersIter)) {
+              _authenticatedUser(std::move(authenticatedUser)) {
             invariant(_cursor);
         }
 
@@ -330,8 +329,8 @@ public:
             _lastActive = lastActive;
         }
 
-        UserNameIterator getAuthenticatedUsers() const {
-            return makeUserNameIterator(_authenticatedUsers.begin(), _authenticatedUsers.end());
+        const boost::optional<UserName>& getAuthenticatedUser() const {
+            return _authenticatedUser;
         }
 
         const UUID& originatingClientUuid() const {
@@ -365,7 +364,7 @@ public:
         /**
          * The set of users authorized to use this cursor.
          */
-        std::vector<UserName> _authenticatedUsers;
+        boost::optional<UserName> _authenticatedUser;
     };
 
     /**
@@ -408,7 +407,7 @@ public:
                                         const NamespaceString& nss,
                                         CursorType cursorType,
                                         CursorLifetime cursorLifetime,
-                                        UserNameIterator authenticatedUsers);
+                                        const boost::optional<UserName>& authenticatedUser);
 
     /**
      * Moves the given cursor to the 'pinned' state, and transfers ownership of the cursor to the
@@ -474,6 +473,7 @@ public:
     /**
      * Informs the manager that all mortal cursors with a 'last active' time equal to or earlier
      * than 'cutoff' should be killed.  The cursors need not necessarily be in the 'idle' state.
+     * The number of killed cursors is added to '_cursorsTimedOut' counter.
      *
      * May block waiting for other threads to finish, but does not block on the network.
      *
@@ -516,13 +516,7 @@ public:
      */
     stdx::unordered_set<CursorId> getCursorsForSession(LogicalSessionId lsid) const;
 
-    void incrementCursorsTimedOut(size_t inc) {
-        _cursorsTimedOut += inc;
-    }
-
-    size_t cursorsTimedOut() const {
-        return _cursorsTimedOut;
-    }
+    size_t cursorsTimedOut() const;
 
 private:
     using CursorEntryMap = stdx::unordered_map<CursorId, CursorEntry>;
@@ -598,5 +592,21 @@ private:
 
     size_t _cursorsTimedOut = 0;
 };
+
+/**
+ * Record metrics for the current operation on opDebug and aggregates those metrics for telemetry
+ * use. If a cursor is provided (via ClusterClientCursorGuard or
+ * ClusterCursorManager::PinnedCursor), metrics are aggregated on the cursor; otherwise, metrics are
+ * written directly to the telemetry store.
+ */
+void collectTelemetryMongos(OperationContext* opCtx,
+                            const BSONObj& originatingCommand,
+                            long long nreturned);
+void collectTelemetryMongos(OperationContext* opCtx,
+                            ClusterClientCursorGuard& cursor,
+                            long long nreturned);
+void collectTelemetryMongos(OperationContext* opCtx,
+                            ClusterCursorManager::PinnedCursor& cursor,
+                            long long nreturned);
 
 }  // namespace mongo

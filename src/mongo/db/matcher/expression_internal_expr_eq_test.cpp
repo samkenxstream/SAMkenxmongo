@@ -183,7 +183,7 @@ TEST(InternalExprEqMatchExpression, CorrectlyMatchesArrayElement) {
 
 TEST(InternalSchemaEqMatchExpression, DoesNotTraverseThroughAnArrayWithANumericalPathComponent) {
     BSONObj operand = BSON("" << 5);
-    InternalExprEqMatchExpression eq("a.0.b", operand.firstElement());
+    InternalExprEqMatchExpression eq("a.0.b"_sd, operand.firstElement());
     ASSERT_TRUE(eq.matchesBSON(BSON("a" << BSON("0" << BSON("b" << 5)))));
     ASSERT_FALSE(eq.matchesBSON(BSON("a" << BSON("0" << BSON("b" << 6)))));
     ASSERT_TRUE(eq.matchesBSON(BSON("a" << BSON_ARRAY(BSON("b" << 7)))));
@@ -264,7 +264,7 @@ TEST(InternalExprEqMatchExpression, SerializesCorrectly) {
                                      operand.firstElement());
 
     BSONObjBuilder bob;
-    eq.serialize(&bob, true);
+    eq.serialize(&bob, {});
 
     ASSERT_BSONOBJ_EQ(BSON("x" << BSON("$_internalExprEq" << 5)), bob.obj());
 }
@@ -296,7 +296,7 @@ TEST(InternalExprEqMatchExpression, EquivalentToClone) {
     relevantTag->notFirst.push_back(1u);
     eq.getMatchExpression()->setTag(relevantTag.release());
 
-    auto clone = eq.getMatchExpression()->shallowClone();
+    auto clone = eq.getMatchExpression()->clone();
     ASSERT_TRUE(eq.getMatchExpression()->equivalent(clone.get()));
 }
 

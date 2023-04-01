@@ -22,7 +22,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/pipeline/pipeline',
         '$BUILD_DIR/mongo/db/pipeline/variable_validation',
         '$BUILD_DIR/mongo/db/query/datetime/date_time_support',
-    ]
+    ],
 )
 
 env.CppUnitTest(
@@ -39,11 +39,11 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         # $text depends on FTSAccessMethod.
-        '$BUILD_DIR/mongo/db/index/index_access_methods',
+        '$BUILD_DIR/mongo/db/index/index_access_method',
         '$BUILD_DIR/mongo/db/matcher/expressions_mongod_only',
         '$BUILD_DIR/mongo/db/query/query_test_service_context',
         'cst',
-    ]
+    ],
 )
 
 env.CppUnitTest(
@@ -56,19 +56,19 @@ env.CppUnitTest(
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/query/query_test_service_context',
         'cst',
-    ]
-)
-
-env.Benchmark(
-    target='cst_bm',
-    source=[
-        'cst_bm.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/db/pipeline/pipeline',
-        '$BUILD_DIR/mongo/db/query/query_test_service_context',
-        '$BUILD_DIR/mongo/unittest/unittest',
-        '$BUILD_DIR/mongo/util/processinfo',
-        'cst',
     ],
 )
+# Disabled under SERVER-64949.
+# env.Benchmark(
+#     target='cst_bm',
+#     source=[
+#         'cst_bm.cpp',
+#     ],
+#     LIBDEPS=[
+#         '$BUILD_DIR/mongo/db/pipeline/pipeline',
+#         '$BUILD_DIR/mongo/db/query/query_test_service_context',
+#         '$BUILD_DIR/mongo/unittest/unittest',
+#         '$BUILD_DIR/mongo/util/processinfo',
+#         'cst',
+#     ],
+# )

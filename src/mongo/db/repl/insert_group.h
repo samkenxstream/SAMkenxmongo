@@ -40,7 +40,7 @@ namespace repl {
 /**
  * Groups consecutive insert operations on the same namespace and applies the combined operation
  * as a single oplog entry.
- * Advances the the std::vector<const OplogEntry*> iterator if the grouped insert is applied
+ * Advances the the std::vector<ApplierOperation> iterator if the grouped insert is applied
  * successfully.
  */
 class InsertGroup {
@@ -48,13 +48,13 @@ class InsertGroup {
     InsertGroup& operator=(const InsertGroup&) = delete;
 
 public:
-    using ConstIterator = std::vector<const OplogEntry*>::const_iterator;
+    using ConstIterator = std::vector<ApplierOperation>::const_iterator;
     using Mode = OplogApplication::Mode;
     typedef std::function<Status(
         OperationContext*, const OplogEntryOrGroupedInserts&, OplogApplication::Mode, bool)>
         ApplyFunc;
 
-    InsertGroup(std::vector<const OplogEntry*>* ops,
+    InsertGroup(std::vector<ApplierOperation>* ops,
                 OperationContext* opCtx,
                 Mode mode,
                 bool isDataConsistent,

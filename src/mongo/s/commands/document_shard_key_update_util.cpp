@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/commands/document_shard_key_update_util.h"
@@ -40,6 +39,9 @@
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -62,9 +64,10 @@ bool executeOperationsAsPartOfShardKeyUpdate(OperationContext* opCtx,
 
     BatchedCommandResponse deleteResponse;
     BatchWriteExecStats deleteStats;
-
     cluster::write(opCtx, deleteRequest, &deleteStats, &deleteResponse);
-    uassertStatusOK(deleteResponse.toStatus());
+    uassertStatusOKWithContext(deleteResponse.toStatus(),
+                               "During delete stage of updating a shard key");
+
     // If shouldUpsert is true, this means the original command specified {upsert: true} and did not
     // match any docs, so we should not match any when doing this delete. If shouldUpsert is false
     // and we do not delete any document, this is essentially equivalent to not matching a doc and
@@ -88,7 +91,9 @@ bool executeOperationsAsPartOfShardKeyUpdate(OperationContext* opCtx,
     BatchedCommandResponse insertResponse;
     BatchWriteExecStats insertStats;
     cluster::write(opCtx, insertRequest, &insertStats, &insertResponse);
-    uassertStatusOK(insertResponse.toStatus());
+    uassertStatusOKWithContext(insertResponse.toStatus(),
+                               "During insert stage of updating a shard key");
+
     uassert(ErrorCodes::NamespaceNotFound,
             "Document not successfully inserted while changing shard key for namespace " +
                 insertRequest.getNS().toString(),
@@ -118,9 +123,18 @@ write_ops::DeleteCommandRequest createShardKeyDeleteOp(const NamespaceString& ns
  * Creates the insert op that will be used to insert the new document with the post-update image.
  */
 write_ops::InsertCommandRequest createShardKeyInsertOp(const NamespaceString& nss,
-                                                       const BSONObj& updatePostImage) {
+                                                       const BSONObj& updatePostImage,
+                                                       bool fleCrudProcessed) {
     write_ops::InsertCommandRequest insertOp(nss);
     insertOp.setDocuments({updatePostImage});
+    if (fleCrudProcessed) {
+        EncryptionInformation encryptionInformation;
+        encryptionInformation.setCrudProcessed(fleCrudProcessed);
+
+        // We need to set an empty BSON object here for the schema.
+        encryptionInformation.setSchema(BSONObj());
+        insertOp.getWriteCommandRequestBase().setEncryptionInformation(encryptionInformation);
+    }
     return insertOp;
 }
 
@@ -130,12 +144,13 @@ namespace documentShardKeyUpdateUtil {
 
 bool updateShardKeyForDocumentLegacy(OperationContext* opCtx,
                                      const NamespaceString& nss,
-                                     const WouldChangeOwningShardInfo& documentKeyChangeInfo) {
+                                     const WouldChangeOwningShardInfo& documentKeyChangeInfo,
+                                     bool fleCrudProcessed) {
     auto updatePreImage = documentKeyChangeInfo.getPreImage().getOwned();
     auto updatePostImage = documentKeyChangeInfo.getPostImage().getOwned();
 
     auto deleteCmdObj = constructShardKeyDeleteCmdObj(nss, updatePreImage);
-    auto insertCmdObj = constructShardKeyInsertCmdObj(nss, updatePostImage);
+    auto insertCmdObj = constructShardKeyInsertCmdObj(nss, updatePostImage, fleCrudProcessed);
 
     return executeOperationsAsPartOfShardKeyUpdate(
         opCtx, deleteCmdObj, insertCmdObj, nss.db(), documentKeyChangeInfo.getShouldUpsert());
@@ -163,15 +178,18 @@ BSONObj constructShardKeyDeleteCmdObj(const NamespaceString& nss, const BSONObj&
     return deleteOp.toBSON({});
 }
 
-BSONObj constructShardKeyInsertCmdObj(const NamespaceString& nss, const BSONObj& updatePostImage) {
-    auto insertOp = createShardKeyInsertOp(nss, updatePostImage);
+BSONObj constructShardKeyInsertCmdObj(const NamespaceString& nss,
+                                      const BSONObj& updatePostImage,
+                                      bool fleCrudProcessed) {
+    auto insertOp = createShardKeyInsertOp(nss, updatePostImage, fleCrudProcessed);
     return insertOp.toBSON({});
 }
 
 SemiFuture<bool> updateShardKeyForDocument(const txn_api::TransactionClient& txnClient,
                                            ExecutorPtr txnExec,
                                            const NamespaceString& nss,
-                                           const WouldChangeOwningShardInfo& changeInfo) {
+                                           const WouldChangeOwningShardInfo& changeInfo,
+                                           bool fleCrudProcessed) {
     auto deleteCmdObj = documentShardKeyUpdateUtil::constructShardKeyDeleteCmdObj(
         nss, changeInfo.getPreImage().getOwned());
     auto deleteOpMsg = OpMsgRequest::fromDBAndBody(nss.db(), std::move(deleteCmdObj));
@@ -181,7 +199,7 @@ SemiFuture<bool> updateShardKeyForDocument(const txn_api::TransactionClient& txn
     // so send it with the uninitialized sentinel statement id to opt out of storing history.
     return txnClient.runCRUDOp(deleteRequest, {kUninitializedStmtId})
         .thenRunOn(txnExec)
-        .then([&txnClient, &nss, &changeInfo](
+        .then([&txnClient, &nss, &changeInfo, fleCrudProcessed](
                   auto deleteResponse) -> SemiFuture<BatchedCommandResponse> {
             uassertStatusOK(deleteResponse.toStatus());
 
@@ -206,7 +224,7 @@ SemiFuture<bool> updateShardKeyForDocument(const txn_api::TransactionClient& txn
             }
 
             auto insertCmdObj = documentShardKeyUpdateUtil::constructShardKeyInsertCmdObj(
-                nss, changeInfo.getPostImage().getOwned());
+                nss, changeInfo.getPostImage().getOwned(), fleCrudProcessed);
             auto insertOpMsg = OpMsgRequest::fromDBAndBody(nss.db(), std::move(insertCmdObj));
             auto insertRequest = BatchedCommandRequest::parseInsert(std::move(insertOpMsg));
 

@@ -34,7 +34,6 @@
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/read_write_concern_provenance_base_gen.h"
-#include "mongo/idl/basic_types_gen.h"
 
 namespace mongo {
 
@@ -144,7 +143,7 @@ public:
     /**
      * Creates a provenance with source according to the given object's 'provenance' field.
      */
-    static ReadWriteConcernProvenance parse(const IDLParserErrorContext& ctxt,
+    static ReadWriteConcernProvenance parse(const IDLParserContext& ctxt,
                                             const BSONObj& bsonObject);
 
     /**

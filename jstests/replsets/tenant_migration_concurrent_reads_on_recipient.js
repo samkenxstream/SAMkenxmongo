@@ -9,7 +9,6 @@
  *   reads with atClusterTime < rejectReadsBeforeTimestamp until the state doc is garbage collected.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
@@ -18,15 +17,16 @@
  * ]
  */
 
-(function() {
-'use strict';
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    isShardMergeEnabled,
+    runMigrationAsync
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
-load("jstests/replsets/rslib.js");
+load("jstests/replsets/rslib.js");  // 'createRstArgs'
 
 const kCollName = "testColl";
 const kTenantDefinedDbName = "0";
@@ -67,14 +67,13 @@ function testRejectAllReadsAfterCloningDone({testCase, dbName, collName, tenantM
     const recipientRst = tenantMigrationTest.getRecipientRst();
     const recipientPrimary = recipientRst.getPrimary();
 
-    let clonerDoneFp =
-        configureFailPoint(recipientPrimary, "fpAfterCollectionClonerDone", {action: "hang"});
+    let beforeFetchingTransactionsFp = configureFailPoint(
+        recipientPrimary, "fpBeforeFetchingCommittedTransactions", {action: "hang"});
 
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(donorRst);
-    const runMigrationThread =
-        new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
+    const donorRstArgs = createRstArgs(donorRst);
+    const runMigrationThread = new Thread(runMigrationAsync, migrationOpts, donorRstArgs);
     runMigrationThread.start();
-    clonerDoneFp.wait();
+    beforeFetchingTransactionsFp.wait();
 
     // Wait for the write to mark cloning as done to be replicated to all nodes.
     recipientRst.awaitReplication();
@@ -88,9 +87,10 @@ function testRejectAllReadsAfterCloningDone({testCase, dbName, collName, tenantM
         runCommand(db, command, ErrorCodes.SnapshotTooOld);
     });
 
-    clonerDoneFp.off();
+    beforeFetchingTransactionsFp.off();
     TenantMigrationTest.assertCommitted(runMigrationThread.returnData());
     assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
+    tenantMigrationTest.waitForMigrationGarbageCollection(migrationOpts.migrationIdString);
 }
 
 /**
@@ -118,9 +118,8 @@ function testRejectOnlyReadsWithAtClusterTimeLessThanRejectReadsBeforeTimestamp(
     let waitForRejectReadsBeforeTsFp = configureFailPoint(
         recipientPrimary, "fpAfterWaitForRejectReadsBeforeTimestamp", {action: "hang"});
 
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(donorRst);
-    const runMigrationThread =
-        new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
+    const donorRstArgs = createRstArgs(donorRst);
+    const runMigrationThread = new Thread(runMigrationAsync, migrationOpts, donorRstArgs);
     runMigrationThread.start();
     waitForRejectReadsBeforeTsFp.wait();
 
@@ -129,10 +128,12 @@ function testRejectOnlyReadsWithAtClusterTimeLessThanRejectReadsBeforeTimestamp(
     // unspecified atClusterTime have read timestamp >= rejectReadsBeforeTimestamp.
     recipientRst.awaitLastOpCommitted();
 
-    const recipientDoc =
-        recipientPrimary.getCollection(TenantMigrationTest.kConfigRecipientsNS).findOne({
-            tenantId: tenantId
-        });
+    const recipientStateDocNss = isShardMergeEnabled(recipientPrimary.getDB("admin"))
+        ? TenantMigrationTest.kConfigShardMergeRecipientsNS
+        : TenantMigrationTest.kConfigRecipientsNS;
+    const recipientDoc = recipientPrimary.getCollection(recipientStateDocNss).findOne({
+        _id: UUID(migrationOpts.migrationIdString),
+    });
     assert.lt(preMigrationTimestamp, recipientDoc.rejectReadsBeforeTimestamp);
 
     const nodes = testCase.isSupportedOnSecondaries ? recipientRst.nodes : [recipientPrimary];
@@ -170,6 +171,7 @@ function testRejectOnlyReadsWithAtClusterTimeLessThanRejectReadsBeforeTimestamp(
     });
 
     assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
+    tenantMigrationTest.waitForMigrationGarbageCollection(migrationOpts.migrationIdString);
 }
 
 /**
@@ -222,6 +224,7 @@ function testDoNotRejectReadsAfterMigrationAbortedBeforeReachingRejectReadsBefor
             runCommand(db, testCase.command(collName), null);
         }
     });
+    tenantMigrationTest.waitForMigrationGarbageCollection(migrationOpts.migrationIdString);
 }
 
 /**
@@ -272,10 +275,12 @@ function testDoNotRejectReadsAfterMigrationAbortedAfterReachingRejectReadsBefore
     // unspecified atClusterTime have read timestamp >= rejectReadsBeforeTimestamp.
     recipientRst.awaitLastOpCommitted();
 
-    const recipientDoc =
-        recipientPrimary.getCollection(TenantMigrationTest.kConfigRecipientsNS).findOne({
-            tenantId: tenantId
-        });
+    const recipientStateDocNss = isShardMergeEnabled(recipientPrimary.getDB("admin"))
+        ? TenantMigrationTest.kConfigShardMergeRecipientsNS
+        : TenantMigrationTest.kConfigRecipientsNS;
+    const recipientDoc = recipientPrimary.getCollection(recipientStateDocNss).findOne({
+        _id: UUID(migrationOpts.migrationIdString),
+    });
 
     const nodes = testCase.isSupportedOnSecondaries ? recipientRst.nodes : [recipientPrimary];
     nodes.forEach(node => {
@@ -413,25 +418,34 @@ const testFuncs = {
         testDoNotRejectReadsAfterMigrationAbortedAfterReachingRejectReadsBeforeTimestamp
 };
 
+const tenantMigrationTest = new TenantMigrationTest({
+    name: jsTestName(),
+    quickGarbageCollection: true,
+});
 for (const [testName, testFunc] of Object.entries(testFuncs)) {
     for (const [testCaseName, testCase] of Object.entries(testCases)) {
-        jsTest.log("Testing " + testName + " with testCase " + testCaseName);
-        let tenantId = `${testCaseName}-${testName}`;
+        let tenantId = ObjectId().str;
+        jsTest.log("Testing " + testName + " with testCase " + testCaseName + " with tenantId " +
+                   tenantId);
+        let migrationDb = `${tenantId}_test`;
+        tenantMigrationTest.insertDonorDB(migrationDb, "test");
         let dbName = `${tenantId}_${kTenantDefinedDbName}`;
-        const tenantMigrationTest = new TenantMigrationTest({
-            name: jsTestName(),
-            quickGarbageCollection: true,
-            insertDataForTenant: tenantId,
-        });
 
-        // Force the recipient to preserve all snapshot history to ensure that snapshot reads do not
-        // fail with SnapshotTooOld due to snapshot being unavailable.
+        // Force the recipient to preserve all snapshot history to ensure that snapshot reads do
+        // not fail with SnapshotTooOld due to snapshot being unavailable.
         tenantMigrationTest.getRecipientRst().nodes.forEach(node => {
             configureFailPoint(node, "WTPreserveSnapshotHistoryIndefinitely");
         });
 
         testFunc({testCase, dbName, collName: kCollName, tenantMigrationTest});
-        tenantMigrationTest.stop();
+
+        // ShardMerge is not robust to migrating the twice in quick succession. We drop the data
+        // files to ensure a subsequent tenant migration will avoid trying to merge files from the
+        // previous migration.
+        assert.commandWorked(
+            tenantMigrationTest.getDonorRst().getPrimary().getDB(migrationDb).dropDatabase());
+        assert.commandWorked(
+            tenantMigrationTest.getRecipientRst().getPrimary().getDB(migrationDb).dropDatabase());
     }
 }
-})();
+tenantMigrationTest.stop();

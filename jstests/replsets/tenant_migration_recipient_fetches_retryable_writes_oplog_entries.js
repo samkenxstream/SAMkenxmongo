@@ -3,7 +3,6 @@
  * and adds them to its oplog buffer.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
@@ -11,41 +10,34 @@
  *   serverless,
  * ]
  */
-(function() {
-"use strict";
 
-load("jstests/libs/retryable_writes_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {isShardMergeEnabled} from "jstests/replsets/libs/tenant_migration_util.js";
+
 load("jstests/libs/uuid_util.js");        // For extractUUIDFromObject().
 load("jstests/libs/fail_point_util.js");  // For configureFailPoint().
 load("jstests/libs/parallelTester.js");   // For Thread.
 
-if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
-    jsTestLog("Retryable writes are not supported, skipping test");
-    return;
-}
-
 const kMaxBatchSize = 1;
-const kParams = {
-    // Set the delay before a donor state doc is garbage collected to be short to speed up
-    // the test.
-    tenantMigrationGarbageCollectionDelayMS: 3 * 1000,
 
-    // Set the TTL monitor to run at a smaller interval to speed up the test.
-    ttlMonitorSleepSecs: 1,
+function runTest({storeFindAndModifyImagesInSideCollection = false}) {
+    const tenantMigrationTest = new TenantMigrationTest({
+        name: jsTestName(),
+        quickGarbageCollection: true,
+        sharedOptions: {
+            nodes: 1,
+            setParameter: {
+                // Decrease internal max batch size so we can still show writes are batched without
+                // inserting hundreds of documents.
+                internalInsertMaxBatchSize: kMaxBatchSize,
+            }
+        }
+    });
 
-    // Decrease internal max batch size so we can still show writes are batched without inserting
-    // hundreds of documents.
-    internalInsertMaxBatchSize: kMaxBatchSize,
-};
-
-function runTest(storeImagesInSideCollection) {
-    const tenantMigrationTest = new TenantMigrationTest(
-        {name: jsTestName(), sharedOptions: {nodes: 1, setParameter: kParams}});
-
-    const kTenantId = "testTenantId";
-    const kDbName = kTenantId + "_" +
-        "testDb";
+    const kTenantId = ObjectId().str;
+    const kTenantId2 = ObjectId().str;
+    const kDbName = `${kTenantId}_testDb`;
+    const kDbName2 = `${kTenantId2}_testDb`;
     const kCollName = "testColl";
 
     const donorRst = tenantMigrationTest.getDonorRst();
@@ -53,15 +45,11 @@ function runTest(storeImagesInSideCollection) {
     const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
     const setParam = {
         setParameter: 1,
-        storeFindAndModifyImagesInSideCollection: storeImagesInSideCollection
+        storeFindAndModifyImagesInSideCollection,
     };
     donorPrimary.adminCommand(setParam);
     recipientPrimary.adminCommand(setParam);
     const rsConn = new Mongo(donorRst.getURL());
-
-    // Create a collection on a database that isn't prefixed with `kTenantId`.
-    const session = rsConn.startSession({retryWrites: true});
-    const collection = session.getDatabase("test")["collection"];
 
     const tenantSession = rsConn.startSession({retryWrites: true});
     const tenantCollection = tenantSession.getDatabase(kDbName)[kCollName];
@@ -72,11 +60,17 @@ function runTest(storeImagesInSideCollection) {
     const tenantSession3 = rsConn.startSession({retryWrites: true});
     const tenantCollection3 = tenantSession3.getDatabase(kDbName)[kCollName];
 
+    // Create a collection on a database that isn't prefixed with `kTenantId`.
+    const secondTenantSession = rsConn.startSession({retryWrites: true});
+    const secondTenantCollection = secondTenantSession.getDatabase(kDbName2)[kCollName];
+
+    const isShardMergeEnabledOnDonor = isShardMergeEnabled(donorRst.getPrimary().getDB("adminDB"));
+
     jsTestLog("Run retryable writes prior to the migration");
 
     // Retryable insert, but not on correct tenant database. This write should not show up in the
-    // oplog buffer.
-    assert.commandWorked(collection.insert({_id: "retryableWrite1"}));
+    // oplog buffer for the tenant migration protocol. It will however for the shard merge protocol.
+    assert.commandWorked(secondTenantCollection.insert({_id: "retryableWrite1"}));
 
     // The following retryable writes should occur on the correct tenant database, so they should
     // all be retrieved by the pipeline.
@@ -90,8 +84,14 @@ function runTest(storeImagesInSideCollection) {
     const migrationId = UUID();
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(migrationId),
-        tenantId: kTenantId,
     };
+    if (isShardMergeEnabledOnDonor) {
+        // Shard merge needs both tenants otherwise it will fail when it receives data for an
+        // unknown tenant.
+        migrationOpts.tenantIds = [ObjectId(kTenantId), ObjectId(kTenantId2)];
+    } else {
+        migrationOpts.tenantId = kTenantId;
+    }
 
     jsTestLog("Set up failpoints.");
     // Use `hangDuringBatchInsert` on the donor to hang after the first batch of a bulk insert. The
@@ -99,10 +99,10 @@ function runTest(storeImagesInSideCollection) {
     // `startFetchingDonorOpTime`.
     const writeFp = configureFailPoint(donorPrimary, "hangDuringBatchInsert", {}, {skip: 1});
 
-    var batchInsertWorker = new Thread((host, dbName, collName, numToInsert) => {
+    const batchInsertWorker = new Thread((host, dbName, collName, numToInsert) => {
         // Insert elements [{_id: bulkRetryableWrite0}, {_id: bulkRetryableWrite1}].
         const docsToInsert =
-            [...Array(numToInsert).keys()].map(i => ({_id: "bulkRetryableWrite" + i}));
+            [...Array(numToInsert).keys()].map(i => ({_id: `bulkRetryableWrite${i}`}));
 
         donorConn = new Mongo(host);
         const tenantSession4 = donorConn.startSession({retryWrites: true});
@@ -164,22 +164,24 @@ function runTest(storeImagesInSideCollection) {
     fpAfterRetrievingStartOpTime.off();
     fpAfterRetrievingRetryableWrites.wait();
 
-    const kOplogBufferNS = "repl.migration.oplog_" + migrationOpts.migrationIdString;
+    const kOplogBufferNS = `repl.migration.oplog_${migrationOpts.migrationIdString}`;
     const recipientOplogBuffer = recipientPrimary.getDB("config")[kOplogBufferNS];
     jsTestLog({"oplog buffer ns": kOplogBufferNS});
 
-    // We expect to see retryableWrite2, retryableWrite3, retryableWrite3's postImage, and
-    // bulkRetryableWrite0 (bulk insert batch size is 1).
-    const findRes = recipientOplogBuffer.find().toArray();
-    assert.eq(findRes.length, 4, `Incorrect number of oplog entries in buffer: ${tojson(findRes)}`);
+    // We expect to see retryableWrite2, retryableWrite3, retryableWrite3's postImage,
+    // and bulkRetryableWrite0 (bulk insert batch size is 1).
     assert.eq(1, recipientOplogBuffer.find({"entry.o._id": "retryableWrite2"}).itcount());
     assert.eq(1, recipientOplogBuffer.find({"entry.o._id": "retryableWrite3"}).itcount());
     assert.eq(1, recipientOplogBuffer.find({"entry.o2._id": "retryableWrite3"}).itcount());
     assert.eq(1, recipientOplogBuffer.find({"entry.o._id": "bulkRetryableWrite0"}).itcount());
 
+    // Only for shardMerge we expect to have the other tenantId. Otherwise only for the provided
+    // tenantId.
+    assert.eq(isShardMergeEnabledOnDonor ? 1 : 0,
+              recipientOplogBuffer.find({"entry.o._id": "retryableWrite1"}).itcount());
+
     // Ensure the retryable write oplog entries that should not be in `kOplogBufferNS` are in fact
     // not.
-    assert.eq(0, recipientOplogBuffer.find({"entry.o._id": "retryableWrite1"}).itcount());
     assert.eq(0, recipientOplogBuffer.find({"entry.o._id": "retryableWrite4"}).itcount());
     assert.eq(0, recipientOplogBuffer.find({"entry.o2._id": "retryableWrite4"}).itcount());
     assert.eq(0, recipientOplogBuffer.find({"entry.o._id": "bulkRetryableWrite1"}).itcount());
@@ -195,8 +197,5 @@ function runTest(storeImagesInSideCollection) {
     tenantMigrationTest.stop();
 }
 
-// Run test with `storeFindAndModifyImagesInSideCollection`=false.
-runTest(false);
-// Run test with `storeFindAndModifyImagesInSideCollection`=true.
-runTest(true);
-})();
+runTest({storeFindAndModifyImagesInSideCollection: false});
+runTest({storeFindAndModifyImagesInSideCollection: true});

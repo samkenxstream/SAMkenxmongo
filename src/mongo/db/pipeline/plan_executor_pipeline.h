@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/util/duration.h"
 #include <queue>
 
 #include "mongo/db/exec/document_value/document.h"
@@ -110,12 +111,15 @@ public:
     long long executeDelete() override {
         MONGO_UNREACHABLE;
     }
+    BatchedDeleteStats getBatchedDeleteStats() override {
+        MONGO_UNREACHABLE;
+    }
 
     void dispose(OperationContext* opCtx) override {
         _pipeline->dispose(opCtx);
     }
 
-    void enqueue(const BSONObj& obj) override {
+    void stashResult(const BSONObj& obj) override {
         _stash.push(obj.getOwned());
     }
 
@@ -168,6 +172,8 @@ public:
         return _pipeline->getTypeString();
     }
 
+    PlanExecutor::QueryFramework getQueryFramework() const override final;
+
 private:
     /**
      * Obtains the next document from the underlying Pipeline, and does change streams-related
@@ -180,6 +186,11 @@ private:
      * be thrown.
      */
     boost::optional<Document> _tryGetNext();
+
+    /**
+     * Serialize the given document to BSON while updating stats for BSONObjectTooLarge exception.
+     */
+    BSONObj _trySerializeToBson(const Document& doc);
 
     /**
      * For a change stream or resumable oplog scan, updates the scan state based on the latest

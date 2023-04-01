@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -41,20 +40,21 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/resharding/resharding_metrics_helpers.h"
 #include "mongo/db/s/scoped_operation_completion_sharding_actions.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_entry_point_common.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_cannot_refresh_due_to_locks_held_exception.h"
 #include "mongo/s/stale_exception.h"
 
-namespace mongo {
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-constexpr auto kLastCommittedOpTimeFieldName = "lastCommittedOpTime"_sd;
+
+namespace mongo {
 
 class ServiceEntryPointMongod::Hooks final : public ServiceEntryPointCommon::Hooks {
 public:
@@ -81,13 +81,13 @@ public:
                             const OpMsgRequest& request) const override {
         Status rcStatus = mongo::waitForReadConcern(opCtx,
                                                     repl::ReadConcernArgs::get(opCtx),
-                                                    request.getDatabase(),
+                                                    invocation->ns().dbName(),
                                                     invocation->allowsAfterClusterTime());
 
         if (!rcStatus.isOK()) {
             if (ErrorCodes::isExceededTimeLimitError(rcStatus.code())) {
                 const int debugLevel =
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 0 : 2;
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer) ? 0 : 2;
                 LOGV2_DEBUG(21975,
                             debugLevel,
                             "Command on database {db} timed out waiting for read concern to be "
@@ -124,6 +124,11 @@ public:
             return;
         }
 
+        // Do not increase consumption metrics during wait for write concern, as in serverless this
+        // might cause a tenant to be billed for reading the oplog entry (which might be of
+        // considerable size) of another tenant.
+        ResourceConsumption::PauseMetricsCollectorBlock pauseMetricsCollection(opCtx);
+
         auto lastOpAfterRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
 
         auto waitForWriteConcernAndAppendStatus = [&]() {
@@ -134,11 +139,21 @@ public:
             CommandHelpers::appendCommandWCStatus(commandResponseBuilder, waitForWCStatus, res);
         };
 
+        // If lastOp has changed, then a write has been done by this client. This timestamp is
+        // sufficient for waiting for write concern.
         if (lastOpAfterRun != lastOpBeforeRun) {
             invariant(lastOpAfterRun > lastOpBeforeRun);
             waitForWriteConcernAndAppendStatus();
             return;
         }
+
+        // If an error occurs after performing a write but before waiting for write concern and
+        // returning to the client, the driver may retry an operation that has already been
+        // completed, resulting in a no-op. The no-op has to wait for the write concern nonetheless,
+        // because acknowledgement from secondaries might still be pending. Given that the timestamp
+        // of the original operation that performed the write is not available, the best
+        // approximation is to use the system’s last op time, which is guaranteed to be >= than the
+        // original op time.
 
         // Ensures that if we tried to do a write, we wait for write concern, even if that write was
         // a noop. We do not need to update this for multi-document transactions as read-only/noop
@@ -188,22 +203,9 @@ public:
         CurOp::get(opCtx)->debug().errInfo = getStatusFromCommandResult(replyObj);
     }
 
-    // Called from the error contexts where request may not be available.
-    void appendReplyMetadataOnError(OperationContext* opCtx,
-                                    BSONObjBuilder* metadataBob) const override {
-        const bool isConfig = serverGlobalParams.clusterRole == ClusterRole::ConfigServer;
-        if (ShardingState::get(opCtx)->enabled() || isConfig) {
-            auto lastCommittedOpTime =
-                repl::ReplicationCoordinator::get(opCtx)->getLastCommittedOpTime();
-            metadataBob->append(kLastCommittedOpTimeFieldName, lastCommittedOpTime.getTimestamp());
-        }
-    }
-
     void appendReplyMetadata(OperationContext* opCtx,
                              const OpMsgRequest& request,
                              BSONObjBuilder* metadataBob) const override {
-        const bool isShardingAware = ShardingState::get(opCtx)->enabled();
-        const bool isConfig = serverGlobalParams.clusterRole == ClusterRole::ConfigServer;
         auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
         const bool isReplSet =
             replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
@@ -213,45 +215,33 @@ public:
             repl::OpTime lastOpTimeFromClient =
                 repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
             replCoord->prepareReplMetadata(request.body, lastOpTimeFromClient, metadataBob);
-
-            if (isShardingAware || isConfig) {
-                // The getLastError command is removed in version 5.1 and 'ShardingMetadata' is for
-                // mongos getLastError processing. So, it's not necessary to send 'ShardingMetadata'
-                // when FCV >= 5.1.
-                // TODO: SERVER-58743: Remove following 'if' block.
-                if (auto& fcv = serverGlobalParams.featureCompatibility;
-                    !fcv.isVersionInitialized() ||
-                    fcv.isLessThan(multiversion::FeatureCompatibilityVersion::kVersion_5_1)) {
-                    // For commands from mongos, append some info to help getLastError(w) work.
-                    rpc::ShardingMetadata(lastOpTimeFromClient, replCoord->getElectionId())
-                        .writeToMetadata(metadataBob)
-                        .transitional_ignore();
-                }
-
-                auto lastCommittedOpTime = replCoord->getLastCommittedOpTime();
-                metadataBob->append(kLastCommittedOpTimeFieldName,
-                                    lastCommittedOpTime.getTimestamp());
-            }
         }
     }
 
-    bool refreshDatabase(OperationContext* opCtx, const StaleDbRoutingVersion& se) const
-        noexcept override {
+    bool refreshDatabase(OperationContext* opCtx,
+                         const StaleDbRoutingVersion& se) const noexcept override {
         return onDbVersionMismatchNoExcept(opCtx, se.getDb(), se.getVersionReceived()).isOK();
     }
 
-    bool refreshCollection(OperationContext* opCtx, const StaleConfigInfo& se) const
-        noexcept override {
-        return onShardVersionMismatchNoExcept(opCtx, se.getNss(), se.getVersionReceived()).isOK();
+    bool refreshCollection(OperationContext* opCtx,
+                           const StaleConfigInfo& se) const noexcept override {
+        return onCollectionPlacementVersionMismatchNoExcept(
+                   opCtx, se.getNss(), se.getVersionReceived().placementVersion())
+            .isOK();
     }
 
-    bool refreshCatalogCache(OperationContext* opCtx,
-                             const ShardCannotRefreshDueToLocksHeldInfo& refreshInfo) const
-        noexcept override {
+    bool refreshCatalogCache(
+        OperationContext* opCtx,
+        const ShardCannotRefreshDueToLocksHeldInfo& refreshInfo) const noexcept override {
         return Grid::get(opCtx)
             ->catalogCache()
             ->getCollectionRoutingInfo(opCtx, refreshInfo.getNss())
             .isOK();
+    }
+
+    void handleReshardingCriticalSectionMetrics(OperationContext* opCtx,
+                                                const StaleConfigInfo& se) const noexcept override {
+        resharding_metrics::onCriticalSectionError(opCtx, se);
     }
 
     // The refreshDatabase, refreshCollection, and refreshCatalogCache methods may have modified the
@@ -263,7 +253,7 @@ public:
         // It is necessary to lock the client to change the Locker on the OperationContext.
         stdx::lock_guard<Client> lk(*opCtx->getClient());
         invariant(!opCtx->lockState()->isLocked());
-        opCtx->swapLockState(std::make_unique<LockerImpl>(), lk);
+        opCtx->swapLockState(std::make_unique<LockerImpl>(opCtx->getServiceContext()), lk);
     }
 
     std::unique_ptr<PolymorphicScoped> scopedOperationCompletionShardingActions(

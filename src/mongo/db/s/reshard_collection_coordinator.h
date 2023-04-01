@@ -34,7 +34,9 @@
 #include "mongo/util/future.h"
 
 namespace mongo {
-class ReshardCollectionCoordinator : public ShardingDDLCoordinator {
+class ReshardCollectionCoordinator
+    : public RecoverableShardingDDLCoordinator<ReshardCollectionCoordinatorDocument,
+                                               ReshardCollectionCoordinatorPhaseEnum> {
 public:
     using StateDoc = ReshardCollectionCoordinatorDocument;
     using Phase = ReshardCollectionCoordinatorPhaseEnum;
@@ -44,9 +46,7 @@ public:
 
     void checkIfOptionsConflict(const BSONObj& coorDoc) const override;
 
-    boost::optional<BSONObj> reportForCurrentOp(
-        MongoProcessInterface::CurrentOpConnectionsMode connMode,
-        MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override;
+    void appendCommandInfo(BSONObjBuilder* cmdInfoBuilder) const override;
 
 protected:
     ReshardCollectionCoordinator(ShardingDDLCoordinatorService* service,
@@ -54,42 +54,14 @@ protected:
                                  bool persistCoordinatorDocument);
 
 private:
-    ShardingDDLCoordinatorMetadata const& metadata() const override {
-        return _doc.getShardingDDLCoordinatorMetadata();
+    StringData serializePhase(const Phase& phase) const override {
+        return ReshardCollectionCoordinatorPhase_serializer(phase);
     }
 
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                   const CancellationToken& token) noexcept override;
 
-    template <typename Func>
-    auto _executePhase(const Phase& newPhase, Func&& func) {
-        return [=] {
-            const auto& currPhase = _doc.getPhase();
-
-            if (currPhase > newPhase) {
-                // Do not execute this phase if we already reached a subsequent one.
-                return;
-            }
-            if (currPhase < newPhase) {
-                // Persist the new phase if this is the first time we are executing it.
-                _enterPhase(newPhase);
-            }
-            return func();
-        };
-    }
-
-    void _enterPhase(Phase newPhase);
-
-    const BSONObj _initialState;
-    ReshardCollectionCoordinatorDocument _doc;
-    const bool _persistCoordinatorDocument;  // TODO: SERVER-62338 remove this then 6.0 branches out
-};
-
-// TODO: SERVER-62338 remove this then 6.0 branches out
-class ReshardCollectionCoordinator_NORESILIENT : public ReshardCollectionCoordinator {
-public:
-    ReshardCollectionCoordinator_NORESILIENT(ShardingDDLCoordinatorService* service,
-                                             const BSONObj& initialState);
+    const mongo::ReshardCollectionRequest _request;
 };
 
 }  // namespace mongo

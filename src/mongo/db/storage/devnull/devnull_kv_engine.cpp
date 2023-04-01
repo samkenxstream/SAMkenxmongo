@@ -62,10 +62,14 @@ public:
 class DevNullRecordStore : public RecordStore {
 public:
     DevNullRecordStore(StringData ns,
+                       boost::optional<UUID> uuid,
                        StringData identName,
                        const CollectionOptions& options,
                        KeyFormat keyFormat)
-        : RecordStore(ns, identName), _options(options), _keyFormat(keyFormat) {
+        : RecordStore(uuid, identName, options.capped),
+          _options(options),
+          _keyFormat(keyFormat),
+          _ns(ns.toString()) {
         _numInserts = 0;
         _dummy = BSON("_id" << 1);
     }
@@ -74,7 +78,9 @@ public:
         return "devnull";
     }
 
-    virtual void setCappedCallback(CappedCallback*) {}
+    virtual std::string ns(OperationContext* opCtx) const override {
+        return _ns;
+    }
 
     virtual long long dataSize(OperationContext* opCtx) const {
         return 0;
@@ -102,11 +108,11 @@ public:
         return false;
     }
 
-    virtual void deleteRecord(OperationContext* opCtx, const RecordId& dl) {}
+    void doDeleteRecord(OperationContext* opCtx, const RecordId& dl) override {}
 
-    virtual Status insertRecords(OperationContext* opCtx,
-                                 std::vector<Record>* inOutRecords,
-                                 const std::vector<Timestamp>& timestamps) {
+    Status doInsertRecords(OperationContext* opCtx,
+                           std::vector<Record>* inOutRecords,
+                           const std::vector<Timestamp>& timestamps) override {
         _numInserts += inOutRecords->size();
         for (auto& record : *inOutRecords) {
             record.id = RecordId(6, 4);
@@ -114,10 +120,10 @@ public:
         return Status::OK();
     }
 
-    virtual Status updateRecord(OperationContext* opCtx,
-                                const RecordId& oldLocation,
-                                const char* data,
-                                int len) {
+    Status doUpdateRecord(OperationContext* opCtx,
+                          const RecordId& oldLocation,
+                          const char* data,
+                          int len) override {
         return Status::OK();
     }
 
@@ -125,15 +131,17 @@ public:
         return false;
     }
 
-    virtual StatusWith<RecordData> updateWithDamages(OperationContext* opCtx,
-                                                     const RecordId& loc,
-                                                     const RecordData& oldRec,
-                                                     const char* damageSource,
-                                                     const mutablebson::DamageVector& damages) {
+    StatusWith<RecordData> doUpdateWithDamages(OperationContext* opCtx,
+                                               const RecordId& loc,
+                                               const RecordData& oldRec,
+                                               const char* damageSource,
+                                               const mutablebson::DamageVector& damages) override {
         MONGO_UNREACHABLE;
     }
 
-    virtual void printRecordMetadata(OperationContext* opCtx, const RecordId& recordId) const {
+    virtual void printRecordMetadata(OperationContext* opCtx,
+                                     const RecordId& recordId,
+                                     std::set<Timestamp>* recordTimestamps) const {
         MONGO_UNREACHABLE;
     }
 
@@ -142,11 +150,22 @@ public:
         return std::make_unique<EmptyRecordCursor>();
     }
 
-    virtual Status truncate(OperationContext* opCtx) {
+    Status doTruncate(OperationContext* opCtx) override {
         return Status::OK();
     }
 
-    virtual void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) {}
+    Status doRangeTruncate(OperationContext* opCtx,
+                           const RecordId& minRecordId,
+                           const RecordId& maxRecordId,
+                           int64_t hintDataSizeDiff,
+                           int64_t hintNumRecordsDiff) override {
+        return Status::OK();
+    }
+
+    void doCappedTruncateAfter(OperationContext* opCtx,
+                               const RecordId& end,
+                               bool inclusive,
+                               const AboutToDeleteRecordCallback& aboutToDelete) override {}
 
     virtual void appendNumericCustomStats(OperationContext* opCtx,
                                           BSONObjBuilder* result,
@@ -158,6 +177,14 @@ public:
                                         long long numRecords,
                                         long long dataSize) {}
 
+    virtual void reserveRecordIds(OperationContext* opCtx,
+                                  std::vector<RecordId>* out,
+                                  size_t nRecords) final {
+        for (size_t i = 0; i < nRecords; i++) {
+            out->push_back(RecordId(i));
+        }
+    };
+
 protected:
     void waitForAllEarlierOplogWritesToBeVisibleImpl(OperationContext* opCtx) const override {}
 
@@ -166,6 +193,7 @@ private:
     KeyFormat _keyFormat;
     long long _numInserts;
     BSONObj _dummy;
+    std::string _ns;
 };
 
 class DevNullSortedDataBuilderInterface : public SortedDataBuilderInterface {
@@ -197,7 +225,8 @@ public:
 
     virtual Status insert(OperationContext* opCtx,
                           const KeyString::Value& keyString,
-                          bool dupsAllowed) {
+                          bool dupsAllowed,
+                          IncludeDuplicateRecordId includeDuplicateRecordId) {
         return Status::OK();
     }
 
@@ -214,9 +243,9 @@ public:
         return boost::none;
     }
 
-    virtual void fullValidate(OperationContext* opCtx,
-                              long long* numKeysOut,
-                              IndexValidateResults* fullResults) const {}
+    virtual IndexValidateResults validate(OperationContext* opCtx, bool full) const {
+        return IndexValidateResults{};
+    }
 
     virtual bool appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* output,
@@ -236,6 +265,13 @@ public:
         return true;
     }
 
+    virtual int64_t numEntries(OperationContext* opCtx) const {
+        return 0;
+    }
+
+    virtual void printIndexEntryMetadata(OperationContext* opCtx,
+                                         const KeyString::Value& keyString) const {}
+
     virtual std::unique_ptr<SortedDataInterface::Cursor> newCursor(OperationContext* opCtx,
                                                                    bool isForward) const {
         return {};
@@ -253,28 +289,34 @@ public:
 };
 
 DevNullKVEngine::DevNullKVEngine() {
-    _mockBackupBlocks.push_back(
-        BackupBlock(/*opCtx=*/nullptr, "filename.wt", /*checkpointTimestamp=*/boost::none));
+    _mockBackupBlocks.push_back(BackupBlock(/*opCtx=*/nullptr,
+                                            "filename.wt",
+                                            /*identToNamespaceAndUUIDMap=*/{},
+                                            /*checkpointTimestamp=*/boost::none));
 }
 
 std::unique_ptr<RecordStore> DevNullKVEngine::getRecordStore(OperationContext* opCtx,
-                                                             StringData ns,
+                                                             const NamespaceString& nss,
                                                              StringData ident,
                                                              const CollectionOptions& options) {
     if (ident == "_mdb_catalog") {
-        return std::make_unique<EphemeralForTestRecordStore>(ns, ident, &_catalogInfo);
+        return std::make_unique<EphemeralForTestRecordStore>(
+            nss.ns(), options.uuid, ident, &_catalogInfo);
     }
-    return std::make_unique<DevNullRecordStore>(ns, ident, options, KeyFormat::Long);
+    return std::make_unique<DevNullRecordStore>(
+        nss.ns(), options.uuid, ident, options, KeyFormat::Long);
 }
 
 std::unique_ptr<RecordStore> DevNullKVEngine::makeTemporaryRecordStore(OperationContext* opCtx,
                                                                        StringData ident,
                                                                        KeyFormat keyFormat) {
-    return std::make_unique<DevNullRecordStore>("" /* ns */, ident, CollectionOptions(), keyFormat);
+    return std::make_unique<DevNullRecordStore>(
+        "" /* ns */, boost::none /* uuid */, ident, CollectionOptions(), keyFormat);
 }
 
 std::unique_ptr<SortedDataInterface> DevNullKVEngine::getSortedDataInterface(
     OperationContext* opCtx,
+    const NamespaceString& nss,
     const CollectionOptions& collOptions,
     StringData ident,
     const IndexDescriptor* desc) {

@@ -66,26 +66,23 @@ DB.prototype.commandHelp = function(name) {
     return res.help;
 };
 
-// utility to attach readPreference if needed.
+// Utility to attach readPreference if needed.
 DB.prototype._attachReadPreferenceToCommand = function(cmdObj, readPref) {
     "use strict";
-    // if the user has not set a readpref, return the original cmdObj
+    // If the user has not set a read pref, return the original 'cmdObj'.
     if ((readPref === null) || typeof (readPref) !== "object") {
         return cmdObj;
     }
 
-    // if user specifies $readPreference manually, then don't change it
+    // If user specifies $readPreference manually, then don't change it.
     if (cmdObj.hasOwnProperty("$readPreference")) {
         return cmdObj;
     }
 
-    // copy object so we don't mutate the original
+    // Copy object so we don't mutate the original.
     var clonedCmdObj = Object.extend({}, cmdObj);
-    // The server selection spec mandates that the key is '$query', but
-    // the shell has historically used 'query'. The server accepts both,
-    // so we maintain the existing behavior
-    var cmdObjWithReadPref = {query: clonedCmdObj, $readPreference: readPref};
-    return cmdObjWithReadPref;
+    clonedCmdObj["$readPreference"] = readPref;
+    return clonedCmdObj;
 };
 
 /**
@@ -185,7 +182,7 @@ DB.prototype.runCommand = function(obj, extra, queryOptions) {
         // "error doing query: failed". Even though this message is arguably incorrect
         // for a command failing due to a connection failure, we preserve it for backwards
         // compatibility. See SERVER-18334 for details.
-        if (ex.message.indexOf("network error") >= 0) {
+        if (ex.hasOwnProperty("message") && ex.message.indexOf("network error") >= 0) {
             throw new Error("error doing query: failed: " + ex.message);
         }
         throw ex;
@@ -473,6 +470,7 @@ DB.prototype.help = function() {
     print("\tdb.eval() - deprecated");
     print("\tdb.fsyncLock() flush data to disk and lock server for backups");
     print("\tdb.fsyncUnlock() unlocks server following a db.fsyncLock()");
+    print("\tdb.checkMetadataConsistency() checks the consistency of the metadata in the db");
     print("\tdb.getCollection(cname) same as db['cname'] or db.cname");
     print("\tdb.getCollectionInfos([filter]) - returns a list that contains the names and options" +
           " of the db's collections");
@@ -636,7 +634,7 @@ DB.prototype.dbEval = DB.prototype.eval;
 DB.prototype.groupeval = function(parmsObj) {
     var groupFunction = function() {
         var parms = args[0];
-        var c = db[parms.ns].find(parms.cond || {});
+        var c = globalThis.db[parms.ns].find(parms.cond || {});
         var map = new Map();
         var pks = parms.key ? Object.keySet(parms.key) : null;
         var pkl = pks ? pks.length : 0;
@@ -800,20 +798,7 @@ DB.prototype.hello = function() {
     return this.runCommand("hello");
 };
 
-var commandUnsupported = function(res) {
-    return (!res.ok &&
-            (res.errmsg.startsWith("no such cmd") || res.errmsg.startsWith("no such command") ||
-             res.code === 59 /* CommandNotFound */));
-};
-
 DB.prototype.currentOp = function(arg) {
-    // TODO CLOUDP-89361: The shell is connected to the Atlas Proxy, which currently does not
-    // support the $currentOp aggregation stage. Remove the legacy server command path once the
-    // proxy can support $currentOp.
-    if (this.serverStatus().hasOwnProperty("atlasVersion")) {
-        return this.currentOpLegacy(arg);
-    }
-
     try {
         const results = this.currentOpCursor(arg).toArray();
         let res = {"inprog": results.length > 0 ? results : [], "ok": 1};
@@ -827,33 +812,6 @@ DB.prototype.currentOp = function(arg) {
     } catch (e) {
         return {"ok": 0, "code": e.code, "errmsg": "Error executing $currentOp: " + e.message};
     }
-};
-DB.prototype.currentOP = DB.prototype.currentOp;
-
-DB.prototype.currentOpLegacy = function(arg) {
-    let q = {};
-    if (arg) {
-        if (typeof (arg) == "object")
-            Object.extend(q, arg);
-        else if (arg)
-            q["$all"] = true;
-    }
-
-    var commandObj = {"currentOp": 1};
-    Object.extend(commandObj, q);
-    var res = this.adminCommand(commandObj);
-    if (commandUnsupported(res)) {
-        // always send legacy currentOp with default (null) read preference (SERVER-17951)
-        const session = this.getSession();
-        const readPreference = session.getOptions().getReadPreference();
-        try {
-            session.getOptions().setReadPreference(null);
-            res = this.getSiblingDB("admin").$cmd.sys.inprog.findOne(q);
-        } finally {
-            session.getOptions().setReadPreference(readPreference);
-        }
-    }
-    return res;
 };
 
 DB.prototype.currentOpCursor = function(arg) {
@@ -898,19 +856,7 @@ DB.prototype.currentOpCursor = function(arg) {
 DB.prototype.killOp = function(op) {
     if (!op)
         throw Error("no opNum to kill specified");
-    var res = this.adminCommand({'killOp': 1, 'op': op});
-    if (commandUnsupported(res)) {
-        // fall back for old servers
-        const session = this.getSession();
-        const readPreference = session.getOptions().getReadPreference();
-        try {
-            session.getOptions().setReadPreference(null);
-            res = this.getSiblingDB("admin").$cmd.sys.killop.findOne({'op': op});
-        } finally {
-            session.getOptions().setReadPreference(readPreference);
-        }
-    }
-    return res;
+    return this.adminCommand({'killOp': 1, 'op': op});
 };
 DB.prototype.killOP = DB.prototype.killOp;
 
@@ -1200,18 +1146,7 @@ DB.prototype.fsyncLock = function() {
 };
 
 DB.prototype.fsyncUnlock = function() {
-    var res = this.adminCommand({fsyncUnlock: 1});
-    if (commandUnsupported(res)) {
-        const session = this.getSession();
-        const readPreference = session.getOptions().getReadPreference();
-        try {
-            session.getOptions().setReadPreference(null);
-            res = this.getSiblingDB("admin").$cmd.sys.unlock.findOne();
-        } finally {
-            session.getOptions().setReadPreference(readPreference);
-        }
-    }
-    return res;
+    return this.adminCommand({fsyncUnlock: 1});
 };
 
 DB.autocomplete = function(obj) {
@@ -1829,15 +1764,18 @@ DB.prototype.createEncryptedCollection = function(name, opts) {
 
     assert.commandWorked(this.getCollection(name).createIndex({__safeContent__: 1}));
 
-    assert.commandWorked(this.createCollection(ef.escCollection));
-    assert.commandWorked(this.createCollection(ef.eccCollection));
-    assert.commandWorked(this.createCollection(ef.ecocCollection));
+    assert.commandWorked(
+        this.createCollection(ef.escCollection, {clusteredIndex: {key: {_id: 1}, unique: true}}));
+    assert.commandWorked(
+        this.createCollection(ef.eccCollection, {clusteredIndex: {key: {_id: 1}, unique: true}}));
+    assert.commandWorked(
+        this.createCollection(ef.ecocCollection, {clusteredIndex: {key: {_id: 1}, unique: true}}));
 
     return res;
 };
 
 DB.prototype.dropEncryptedCollection = function(name) {
-    const ci = db.getCollectionInfos({name: name})[0];
+    const ci = globalThis.db.getCollectionInfos({name: name})[0];
     if (ci == undefined) {
         throw `Encrypted Collection '${name}' not found`;
     }
@@ -1852,13 +1790,9 @@ DB.prototype.dropEncryptedCollection = function(name) {
     this.getCollection(ef.ecocCollection).drop();
     return this.getCollection(name).drop();
 };
-}());
 
-DB.prototype._sbe = function(query) {
-    const res = this.runCommand({sbe: query});
-    if (!res.ok) {
-        throw _getErrorWithCode(res, "sbe failed: " + tojson(res));
-    }
-
+DB.prototype.checkMetadataConsistency = function() {
+    const res = assert.commandWorked(this.runCommand({checkMetadataConsistency: 1}));
     return new DBCommandCursor(this, res);
 };
+}());

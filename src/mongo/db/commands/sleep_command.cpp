@@ -27,15 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
 
@@ -68,9 +66,11 @@ public:
     }
 
     // No auth needed because it only works when enabled via command line.
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {}
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();
+    }
 
     /**
      * An empty 'ns' causes the global lock to be taken.
@@ -101,7 +101,7 @@ public:
             dbMode = isSharedLockMode(mode) ? MODE_IS : MODE_IX;
         }
 
-        Lock::DBLock dbLock(opCtx, nss.db(), dbMode, Date_t::max());
+        Lock::DBLock dbLock(opCtx, nss.dbName(), dbMode, Date_t::max());
 
         if (nsIsDbOnly(ns)) {
             LOGV2(6001602,
@@ -123,23 +123,20 @@ public:
     }
 
     void _sleepInPBWM(mongo::OperationContext* opCtx, long long millis) {
-        Lock::ResourceLock pbwm(opCtx->lockState(), resourceIdParallelBatchWriterMode);
-        pbwm.lock(nullptr, MODE_X);
+        Lock::ResourceLock pbwm(opCtx, resourceIdParallelBatchWriterMode, MODE_X);
+        LOGV2(6001604, "PBWM MODE_X lock acquired by sleep command.");
         opCtx->sleepFor(Milliseconds(millis));
-        pbwm.unlock();
     }
 
     void _sleepInRSTL(mongo::OperationContext* opCtx, long long millis) {
-        Lock::ResourceLock rstl(opCtx->lockState(), resourceIdReplicationStateTransitionLock);
-        rstl.lock(nullptr, MODE_X);
+        Lock::ResourceLock rstl(opCtx, resourceIdReplicationStateTransitionLock, MODE_X);
         LOGV2(6001600, "RSTL MODE_X lock acquired by sleep command.");
         opCtx->sleepFor(Milliseconds(millis));
-        rstl.unlock();
     }
 
     CmdSleep() : BasicCommand("sleep") {}
     bool run(OperationContext* opCtx,
-             const std::string& ns,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         LOGV2(20504, "Test-only command 'sleep' invoked");

@@ -27,24 +27,20 @@ var RetryableWritesUtil = (function() {
         });
     }
 
-    const kRetryableWriteCommands =
-        new Set(["delete", "findandmodify", "findAndModify", "insert", "update"]);
+    const kRetryableWriteCommands = new Set([
+        "delete",
+        "findandmodify",
+        "findAndModify",
+        "insert",
+        "update",
+        "testInternalTransactions"
+    ]);
 
     /**
      * Returns true if the command name is that of a retryable write command.
      */
     function isRetryableWriteCmdName(cmdName) {
         return kRetryableWriteCommands.has(cmdName);
-    }
-
-    const kStorageEnginesWithoutDocumentLocking = new Set(["ephemeralForTest"]);
-
-    /**
-     * Returns true if the given storage engine supports retryable writes (i.e. supports
-     * document-level locking).
-     */
-    function storageEngineSupportsRetryableWrites(storageEngineName) {
-        return !kStorageEnginesWithoutDocumentLocking.has(storageEngineName);
     }
 
     /**
@@ -95,7 +91,6 @@ var RetryableWritesUtil = (function() {
         isRetryableCode,
         errmsgContainsRetryableCodeName,
         isRetryableWriteCmdName,
-        storageEngineSupportsRetryableWrites,
         checkTransactionTable,
         assertSameRecordOnBothConnections,
         runRetryableWrite,

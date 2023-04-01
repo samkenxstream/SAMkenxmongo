@@ -41,14 +41,15 @@ ProjectionNode::ProjectionNode(ProjectionPolicies policies, std::string pathToNo
 
 void ProjectionNode::addProjectionForPath(const FieldPath& path) {
     // Enforce that this method can only be called on the root node.
-    invariant(_pathToNode.empty());
+    tassert(7241722, "can only add projection to path from the root node", _pathToNode.empty());
     _addProjectionForPath(path);
 }
 
 void ProjectionNode::_addProjectionForPath(const FieldPath& path) {
     makeOptimizationsStale();
     if (path.getPathLength() == 1) {
-        _projectedFields.insert(path.fullPath());
+        auto it = _projectedFields.insert(_projectedFields.end(), path.fullPath());
+        _projectedFieldsSet.insert(StringData(*it));
         return;
     }
     // FieldPath can't be empty, so it is safe to obtain the first path component here.
@@ -58,7 +59,7 @@ void ProjectionNode::_addProjectionForPath(const FieldPath& path) {
 void ProjectionNode::addExpressionForPath(const FieldPath& path,
                                           boost::intrusive_ptr<Expression> expr) {
     // Enforce that this method can only be called on the root node.
-    invariant(_pathToNode.empty());
+    tassert(7241723, "can only add expression to path from the root node", _pathToNode.empty());
     _addExpressionForPath(path, std::move(expr));
 }
 
@@ -66,7 +67,9 @@ void ProjectionNode::_addExpressionForPath(const FieldPath& path,
                                            boost::intrusive_ptr<Expression> expr) {
     makeOptimizationsStale();
     // If the computed fields policy is 'kBanComputedFields', we should never reach here.
-    invariant(_policies.computedFieldsPolicy == ComputedFieldsPolicy::kAllowComputedFields);
+    tassert(7241724,
+            "computed fields must be allowed in inclusion projections",
+            _policies.computedFieldsPolicy == ComputedFieldsPolicy::kAllowComputedFields);
 
     // We're going to add an expression either to this node, or to some child of this node.
     // In any case, the entire subtree will contain at least one computed field.
@@ -106,7 +109,9 @@ ProjectionNode* ProjectionNode::addOrGetChild(const std::string& field) {
 
 ProjectionNode* ProjectionNode::addChild(const std::string& field) {
     makeOptimizationsStale();
-    invariant(!str::contains(field, "."));
+    tassert(7241725,
+            "field for child in projection cannot contain a path or '.'",
+            !str::contains(field, "."));
     _orderToProcessAdditionsAndChildren.push_back(field);
     auto insertedPair = _children.emplace(std::make_pair(field, makeChild(field)));
     return insertedPair.first->second.get();
@@ -141,7 +146,7 @@ void ProjectionNode::applyProjections(const Document& inputDoc, MutableDocument*
     while (it.more()) {
         auto fieldName = it.fieldName();
 
-        if (_projectedFields.find(fieldName) != _projectedFields.end()) {
+        if (_projectedFieldsSet.find(fieldName) != _projectedFieldsSet.end()) {
             outputProjectedField(
                 fieldName, applyLeafProjectionToValue(it.next().second), outputDoc);
             ++projectedFields;
@@ -195,7 +200,9 @@ void ProjectionNode::applyExpressions(const Document& root, MutableDocument* out
                 field, childIt->second->applyExpressionsToValue(root, outputDoc->peek()[field]));
         } else {
             auto expressionIt = _expressions.find(field);
-            invariant(expressionIt != _expressions.end());
+            tassert(7241726,
+                    "reached end of expression iterator, but trying to evaluate the expression",
+                    expressionIt != _expressions.end());
             outputDoc->setField(
                 field,
                 expressionIt->second->evaluate(
@@ -229,7 +236,7 @@ Value ProjectionNode::applyExpressionsToValue(const Document& root, Value inputV
     }
 }
 
-void ProjectionNode::reportProjectedPaths(std::set<std::string>* projectedPaths) const {
+void ProjectionNode::reportProjectedPaths(OrderedPathSet* projectedPaths) const {
     for (auto&& projectedField : _projectedFields) {
         projectedPaths->insert(FieldPath::getFullyQualifiedPath(_pathToNode, projectedField));
     }
@@ -239,7 +246,7 @@ void ProjectionNode::reportProjectedPaths(std::set<std::string>* projectedPaths)
     }
 }
 
-void ProjectionNode::reportComputedPaths(std::set<std::string>* computedPaths,
+void ProjectionNode::reportComputedPaths(OrderedPathSet* computedPaths,
                                          StringMap<std::string>* renamedPaths) const {
     for (auto&& computedPair : _expressions) {
         // The expression's path is the concatenation of the path to this node, plus the field name
@@ -268,25 +275,27 @@ void ProjectionNode::optimize() {
     _maxFieldsToProject = maxFieldsToProject();
 }
 
-Document ProjectionNode::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+Document ProjectionNode::serialize(boost::optional<ExplainOptions::Verbosity> explain,
+                                   SerializationOptions options) const {
     MutableDocument outputDoc;
-    serialize(explain, &outputDoc);
+    serialize(explain, &outputDoc, options);
     return outputDoc.freeze();
 }
 
 void ProjectionNode::serialize(boost::optional<ExplainOptions::Verbosity> explain,
-                               MutableDocument* output) const {
+                               MutableDocument* output,
+                               SerializationOptions options) const {
     // Determine the boolean value for projected fields in the explain output.
     const bool projVal = !applyLeafProjectionToValue(Value(true)).missing();
 
     // Always put "_id" first if it was projected (implicitly or explicitly).
-    if (_projectedFields.find("_id") != _projectedFields.end()) {
-        output->addField("_id", Value(projVal));
+    if (_projectedFieldsSet.find("_id") != _projectedFieldsSet.end()) {
+        output->addField(options.serializeFieldName("_id"), Value(projVal));
     }
 
     for (auto&& projectedField : _projectedFields) {
         if (projectedField != "_id") {
-            output->addField(projectedField, Value(projVal));
+            output->addField(options.serializeFieldName(projectedField), Value(projVal));
         }
     }
 
@@ -294,13 +303,18 @@ void ProjectionNode::serialize(boost::optional<ExplainOptions::Verbosity> explai
         auto childIt = _children.find(field);
         if (childIt != _children.end()) {
             MutableDocument subDoc;
-            childIt->second->serialize(explain, &subDoc);
-            output->addField(field, subDoc.freezeToValue());
+            childIt->second->serialize(explain, &subDoc, options);
+            output->addField(options.serializeFieldName(field), subDoc.freezeToValue());
         } else {
-            invariant(_policies.computedFieldsPolicy == ComputedFieldsPolicy::kAllowComputedFields);
+            tassert(7241727,
+                    "computed fields must be allowed in inclusion projections.",
+                    _policies.computedFieldsPolicy == ComputedFieldsPolicy::kAllowComputedFields);
             auto expressionIt = _expressions.find(field);
-            invariant(expressionIt != _expressions.end());
-            output->addField(field, expressionIt->second->serialize(static_cast<bool>(explain)));
+            tassert(7241728,
+                    "reached end of the expression iterator",
+                    expressionIt != _expressions.end());
+            output->addField(options.serializeFieldName(field),
+                             expressionIt->second->serialize(options));
         }
     }
 }

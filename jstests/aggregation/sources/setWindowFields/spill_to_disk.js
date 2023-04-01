@@ -4,6 +4,7 @@
  * requires_profiling,
  * assumes_read_concern_unchanged,
  * do_not_wrap_aggregations_in_facets,
+ * featureFlagApproxPercentiles
  * ]
  */
 (function() {
@@ -22,29 +23,16 @@ const origParamValue = assert.commandWorked(db.adminCommand({
 }))["internalDocumentSourceSetWindowFieldsMaxMemoryBytes"];
 const coll = db[jsTestName()];
 coll.drop();
-// Doc size was found through logging the size in the SpillableCache. Partition sizes were chosen
-// arbitrarily.
-let avgDocSize = 274;
-let smallPartitionSize = 6;
-let largePartitionSize = 21;
-setParameterOnAllHosts(DiscoverTopology.findNonConfigNodes(db.getMongo()),
-                       "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
-                       avgDocSize * smallPartitionSize + 1);
 
-seedWithTickerData(coll, 10);
-
-// Run $sum test with memory limits that cause spilling to disk.
-testAccumAgainstGroup(coll, "$sum", 0);
-
-function checkProfilerForDiskWrite(dbToCheck) {
+function checkProfilerForDiskWrite(dbToCheck, expectedFirstStage) {
     if (!FixtureHelpers.isMongos(dbToCheck)) {
         const profileObj = getLatestProfilerEntry(dbToCheck, {usedDisk: true});
         jsTestLog(profileObj);
         // Verify that this was a $setWindowFields stage as expected.
         if (profileObj.hasOwnProperty("originatingCommand")) {
-            assert(profileObj.originatingCommand.pipeline[0].hasOwnProperty("$setWindowFields"));
+            assert(profileObj.originatingCommand.pipeline[0].hasOwnProperty(expectedFirstStage));
         } else if (profileObj.hasOwnProperty("command")) {
-            assert(profileObj.command.pipeline[0].hasOwnProperty("$setWindowFields"));
+            assert(profileObj.command.pipeline[0].hasOwnProperty(expectedFirstStage));
         } else {
             assert(false, "Profiler should have had command field", profileObj);
         }
@@ -57,7 +45,63 @@ function resetProfiler(db) {
     FixtureHelpers.runCommandOnEachPrimary({db: db, cmdObj: {profile: 2}});
 }
 
+// Doc size was found through logging the size in the SpillableCache. Partition sizes were chosen
+// arbitrarily.
+let avgDocSize = 171;
+let smallPartitionSize = 6;
+let largePartitionSize = 21;
+// The number 600 was chosen by observing how much memory is required for the accumulators to run
+// on all windows (~1600 bytes).
+setParameterOnAllHosts(DiscoverTopology.findNonConfigNodes(db.getMongo()),
+                       "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
+                       avgDocSize * smallPartitionSize + 600);
+
+seedWithTickerData(coll, 10);
+
+// Run $sum test with memory limits that cause spilling to disk.
+testAccumAgainstGroup(coll, "$sum", 0);
+
+// Run a $percentile test that fails since we go over the memory limit allowed and can't spill.
+let errorPipeline = [
+    {
+        $setWindowFields: {
+            partitionBy: "$partition",
+            sortBy: {partition: 1},
+            output: {
+                p: {
+                    $percentile: {p: [0.9], input: "$price", method: "approximate"},
+                    window: {documents: [0, "unbounded"]}
+                }
+            }
+        }
+    },
+    {$sort: {_id: 1}}
+];
+assert.commandFailedWithCode(
+    db.runCommand(
+        {aggregate: coll.getName(), pipeline: errorPipeline, allowDiskUse: false, cursor: {}}),
+    5643011);
+
+// Run $percentile test with memory limits that cause spilling to disk and assert it succeeds.
+// In the test suite below, we will run a query identical to the one that failed above.
+resetProfiler(db);
+testAccumAgainstGroup(
+    coll, "$percentile", [null], {p: [0.9], input: "$price", method: "approximate"});
+// Confirm that spilling did occur.
+checkProfilerForDiskWrite(db, "$setWindowFields");
+
+// Run $median test with memory limits that cause spilling to disk.
+resetProfiler(db);
+testAccumAgainstGroup(coll, "$median", null, {input: "$price", method: "approximate"});
+// Confirm that spilling did occur.
+checkProfilerForDiskWrite(db, "$setWindowFields");
+
 // Test that a query that spills to disk succeeds across getMore requests.
+// The next test uses less memory. Reduce memory limit to ensure spilling occurs. The number 70 was
+// chosen by observing how much memory is required for the test to run.
+setParameterOnAllHosts(DiscoverTopology.findNonConfigNodes(db.getMongo()),
+                       "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
+                       avgDocSize * smallPartitionSize + 70);
 resetProfiler(db);
 const wfResults =
     coll.aggregate(
@@ -72,7 +116,7 @@ const wfResults =
             {allowDiskUse: true, cursor: {batchSize: 1}})
         .toArray();
 assert.eq(wfResults.length, 20);
-checkProfilerForDiskWrite(db);
+checkProfilerForDiskWrite(db, "$setWindowFields");
 
 // Test a small, in memory, partition and a larger partition that requires spilling to disk.
 coll.drop();
@@ -113,7 +157,7 @@ for (let i = 0; i < results.length; i++) {
         assert.eq(results[i].sum, 210, "Unexepcted result in second partition at position " + i);
     }
 }
-checkProfilerForDiskWrite(db);
+checkProfilerForDiskWrite(db, "$setWindowFields");
 
 // We don't execute setWindowFields in a sharded explain.
 if (!FixtureHelpers.isMongos(db)) {
@@ -172,7 +216,7 @@ results = coll.aggregate(
                   ],
                   {allowDiskUse: true})
               .toArray();
-checkProfilerForDiskWrite(db);
+checkProfilerForDiskWrite(db, "$setWindowFields");
 for (let i = 0; i < results.length; i++) {
     if (results[i].partition === 1) {
         assert(arrayEq(results[i].arr, [0, 1, 2, 3, 4, 5]),
@@ -189,22 +233,27 @@ for (let i = 0; i < results.length; i++) {
 setParameterOnAllHosts(DiscoverTopology.findNonConfigNodes(db.getMongo()),
                        "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
                        avgDocSize * 2);
-assert.commandFailedWithCode(db.runCommand({
-    aggregate: coll.getName(),
-    pipeline: [
-        {
-            $setWindowFields: {
-                partitionBy: "$partition",
-                sortBy: {partition: 1},
-                output: {arr: {$push: "$val", window: {documents: [-21, 21]}}}
-            }
-        },
-        {$sort: {_id: 1}}
-    ],
-    allowDiskUse: true,
-    cursor: {}
-}),
-                             5414201);
+
+function runExceedMemoryLimitTest(spec) {
+    assert.commandFailedWithCode(db.runCommand({
+        aggregate: coll.getName(),
+        pipeline: [
+            {$setWindowFields: {partitionBy: "$partition", sortBy: {partition: 1}, output: spec}},
+            {$sort: {_id: 1}}
+        ],
+        allowDiskUse: true,
+        cursor: {}
+    }),
+                                 5414201);
+}
+
+runExceedMemoryLimitTest({arr: {$push: "$val", window: {documents: [-21, 21]}}});
+runExceedMemoryLimitTest({
+    percentile: {
+        $percentile: {p: [0.6, 0.7], input: "$price", method: "approximate"},
+        window: {documents: [-21, 21]}
+    }
+});
 
 coll.drop();
 // Test that situations that would require a large spill successfully write to disk.
@@ -234,12 +283,37 @@ results =
             ],
             {allowDiskUse: true})
         .toArray();
-checkProfilerForDiskWrite(db);
+checkProfilerForDiskWrite(db, "$setWindowFields");
 // Check that the command succeeded.
 assert.eq(results.length, numDocs);
 for (let i = 0; i < numDocs; i++) {
     assert.eq(results[i].arr, 616605, results);
 }
+
+// Test that usedDisk true is set when spilling occurs inside $lookup subpipline.
+// Lower the memory limit to ensure spilling occurs.
+setParameterOnAllHosts(DiscoverTopology.findNonConfigNodes(db.getMongo()),
+                       "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
+                       500);
+resetProfiler(db);
+coll.aggregate(
+        [
+            {
+                $lookup: {
+                    from: coll.getName(),
+                    as: "same",
+                    pipeline: [{
+                        $setWindowFields: {
+                            sortBy: { _id: 1 },
+                            output: { res: { $sum: "$price", window: { documents: ["unbounded", 5] } } }
+                        },
+                    }],
+                }
+            }],
+        { allowDiskUse: true, cursor: {} })
+        .toArray();
+checkProfilerForDiskWrite(db, "$lookup");
+
 // Reset limit for other tests.
 setParameterOnAllHosts(DiscoverTopology.findNonConfigNodes(db.getMongo()),
                        "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",

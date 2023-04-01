@@ -27,25 +27,20 @@
  *    it in the license file.
  */
 
-/**
- * pdfile unit tests
- */
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/json.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/dbtests/dbtests.h"
 
+namespace mongo {
 namespace PdfileTests {
-
 namespace Insert {
+
 class Base {
 public:
-    Base() : _lk(&_opCtx), _context(&_opCtx, nss().ns()) {}
+    Base() : _lk(&_opCtx), _context(&_opCtx, nss()) {}
 
     virtual ~Base() {
         if (!collection())
@@ -60,7 +55,8 @@ protected:
         return NamespaceString("unittests.pdfiletests.Insert");
     }
     CollectionPtr collection() {
-        return CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        return CollectionPtr(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
     }
 
     const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
@@ -75,20 +71,22 @@ public:
         WriteUnitOfWork wunit(&_opCtx);
         BSONObj x = BSON("x" << 1);
         ASSERT(x["_id"].type() == 0);
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
-            coll = _context.db()->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(_context.db()->createCollection(&_opCtx, nss()));
         }
         ASSERT(coll);
         OpDebug* const nullOpDebug = nullptr;
-        ASSERT(!coll->insertDocument(&_opCtx, InsertStatement(x), nullOpDebug, true).isOK());
+        ASSERT_NOT_OK(collection_internal::insertDocument(
+            &_opCtx, coll, InsertStatement(x), nullOpDebug, true));
 
         StatusWith<BSONObj> fixed = fixDocumentForInsert(&_opCtx, x);
         ASSERT(fixed.isOK());
         x = fixed.getValue();
         ASSERT(x["_id"].type() == jstOID);
-        ASSERT(coll->insertDocument(&_opCtx, InsertStatement(x), nullOpDebug, true).isOK());
+        ASSERT_OK(collection_internal::insertDocument(
+            &_opCtx, coll, InsertStatement(x), nullOpDebug, true));
         wunit.commit();
     }
 };
@@ -171,3 +169,4 @@ public:
 OldStyleSuiteInitializer<All> myall;
 
 }  // namespace PdfileTests
+}  // namespace mongo

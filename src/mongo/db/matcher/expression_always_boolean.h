@@ -59,11 +59,16 @@ public:
 
     void debugString(StringBuilder& debug, int indentationLevel = 0) const final {
         _debugAddSpace(debug, indentationLevel);
-        debug << name() << ": 1\n";
+        debug << name() << ": 1";
+        _debugStringAttachTagInfo(&debug);
     }
 
-    void serialize(BSONObjBuilder* out, bool includePath) const final {
-        out->append(name(), 1);
+    void serialize(BSONObjBuilder* out, SerializationOptions opts) const final {
+        if (opts.replacementForLiteralArgs) {
+            out->append(name(), *opts.replacementForLiteralArgs);
+        } else {
+            out->append(name(), 1);
+        }
     }
 
     bool equivalent(const MatchExpression* other) const final {
@@ -79,7 +84,7 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const override {
-        MONGO_UNREACHABLE;
+        MONGO_UNREACHABLE_TASSERT(6400202);
     }
 
     void resetChild(size_t, MatchExpression*) override {
@@ -92,7 +97,9 @@ public:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     bool _value;
@@ -109,7 +116,7 @@ public:
         return kName;
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         return std::make_unique<AlwaysFalseMatchExpression>(_errorAnnotation);
     }
 
@@ -137,7 +144,7 @@ public:
         return kName;
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         return std::make_unique<AlwaysTrueMatchExpression>(_errorAnnotation);
     }
 

@@ -29,9 +29,6 @@
 
 #include "mongo/db/index/btree_key_generator.h"
 
-#include <boost/optional.hpp>
-#include <memory>
-
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/field_ref.h"
@@ -57,12 +54,13 @@ const BSONElement undefinedElt = undefinedObj.firstElement();
  * if the path doesn't exist.
  *
  * The 'path' can be specified using a dotted notation in order to traverse through embedded
- * objects.
+ * objects. If 'exist' is specified it should be set to true if the element is present. This output
+ * can help the caller to know whether the 'path' is missing or has a 'null' value.
  *
- * This function must only be used when there is no an array element along the 'path'. The caller is
- * responsible to ensure this invariant holds.
+ * This function must only be used when there is no an array element along the 'path'. Otherwise,
+ * an exception will be thrown if encounters any array.
  */
-BSONElement extractNonArrayElementAtPath(const BSONObj& obj, StringData path) {
+std::pair<BSONElement, bool> extractNonArrayElementAtPath(const BSONObj& obj, StringData path) {
     static const auto kEmptyElt = BSONElement{};
 
     auto&& [elt, tail] = [&]() -> std::pair<BSONElement, StringData> {
@@ -71,25 +69,26 @@ BSONElement extractNonArrayElementAtPath(const BSONObj& obj, StringData path) {
         }
         return {obj.getField(path), ""_sd};
     }();
-    invariant(elt.type() != BSONType::Array);
+    uassert(7246301,
+            str::stream() << "field " << path << " cannot be indexed as an array (multikey)",
+            elt.type() != BSONType::Array);
 
     if (elt.eoo()) {
-        return kEmptyElt;
+        return {kEmptyElt, false};
     } else if (tail.empty()) {
-        return elt;
+        return {elt, true};
     } else if (elt.type() == BSONType::Object) {
         return extractNonArrayElementAtPath(elt.embeddedObject(), tail);
     }
     // We found a scalar element, but there is more path to traverse, e.g. {a: 1} with a path of
     // "a.b".
-    return kEmptyElt;
+    return {kEmptyElt, false};
 }
 }  // namespace
 
 BtreeKeyGenerator::BtreeKeyGenerator(std::vector<const char*> fieldNames,
                                      std::vector<BSONElement> fixed,
                                      bool isSparse,
-                                     const CollatorInterface* collator,
                                      KeyString::Version keyStringVersion,
                                      Ordering ordering)
     : _keyStringVersion(keyStringVersion),
@@ -99,8 +98,7 @@ BtreeKeyGenerator::BtreeKeyGenerator(std::vector<const char*> fieldNames,
       _fieldNames(std::move(fieldNames)),
       _nullKeyString(_buildNullKeyString()),
       _fixed(std::move(fixed)),
-      _emptyPositionalInfo(_fieldNames.size()),
-      _collator(collator) {
+      _emptyPositionalInfo(_fieldNames.size()) {
 
     for (const char* fieldName : _fieldNames) {
         FieldRef fieldRef{fieldName};
@@ -174,7 +172,8 @@ void BtreeKeyGenerator::_getKeysArrEltFixed(const std::vector<const char*>& fiel
                                             bool mayExpandArrayUnembedded,
                                             const std::vector<PositionalPathInfo>& positionalInfo,
                                             MultikeyPaths* multikeyPaths,
-                                            boost::optional<RecordId> id) const {
+                                            const CollatorInterface* collator,
+                                            const boost::optional<RecordId>& id) const {
     // fieldNamesTemp and fixedTemp are passed in by the caller to be used as temporary data
     // structures as we need them to be mutable in the recursion. When they are stored outside we
     // can reuse their memory.
@@ -201,6 +200,7 @@ void BtreeKeyGenerator::_getKeysArrEltFixed(const std::vector<const char*>& fiel
                       numNotFound,
                       positionalInfo,
                       multikeyPaths,
+                      collator,
                       id);
 }
 
@@ -209,7 +209,8 @@ void BtreeKeyGenerator::getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder
                                 bool skipMultikey,
                                 KeyStringSet* keys,
                                 MultikeyPaths* multikeyPaths,
-                                boost::optional<RecordId> id) const {
+                                const CollatorInterface* collator,
+                                const boost::optional<RecordId>& id) const {
     if (_isIdIndex) {
         // we special case for speed
         BSONElement e = obj["_id"];
@@ -218,9 +219,9 @@ void BtreeKeyGenerator::getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder
         } else {
             KeyString::PooledBuilder keyString(pooledBufferBuilder, _keyStringVersion, _ordering);
 
-            if (_collator) {
+            if (collator) {
                 keyString.appendBSONElement(e, [&](StringData stringData) {
-                    return _collator->getComparisonString(stringData);
+                    return collator->getComparisonString(stringData);
                 });
             } else {
                 keyString.appendBSONElement(e);
@@ -245,7 +246,7 @@ void BtreeKeyGenerator::getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder
             invariant(multikeyPaths->empty());
             multikeyPaths->resize(_fieldNames.size());
         }
-        _getKeysWithoutArray(pooledBufferBuilder, obj, id, keys);
+        _getKeysWithoutArray(pooledBufferBuilder, obj, collator, id, keys);
     } else {
         if (multikeyPaths) {
             invariant(multikeyPaths->empty());
@@ -265,6 +266,7 @@ void BtreeKeyGenerator::getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder
                           0,
                           _emptyPositionalInfo,
                           multikeyPaths,
+                          collator,
                           id);
         // Put the sequence back into the set, it will sort and guarantee uniqueness, this is
         // O(NlogN)
@@ -308,21 +310,22 @@ size_t BtreeKeyGenerator::PositionalPathInfo::getApproximateSize() const {
 
 void BtreeKeyGenerator::_getKeysWithoutArray(SharedBufferFragmentBuilder& pooledBufferBuilder,
                                              const BSONObj& obj,
-                                             boost::optional<RecordId> id,
+                                             const CollatorInterface* collator,
+                                             const boost::optional<RecordId>& id,
                                              KeyStringSet* keys) const {
 
     KeyString::PooledBuilder keyString{pooledBufferBuilder, _keyStringVersion, _ordering};
     size_t numNotFound{0};
 
     for (auto&& fieldName : _fieldNames) {
-        auto elem = extractNonArrayElementAtPath(obj, fieldName);
+        auto [elem, _] = extractNonArrayElementAtPath(obj, fieldName);
         if (elem.eoo()) {
             ++numNotFound;
         }
 
-        if (_collator) {
+        if (collator) {
             keyString.appendBSONElement(elem, [&](StringData stringData) {
-                return _collator->getComparisonString(stringData);
+                return collator->getComparisonString(stringData);
             });
         } else {
             keyString.appendBSONElement(elem);
@@ -339,6 +342,18 @@ void BtreeKeyGenerator::_getKeysWithoutArray(SharedBufferFragmentBuilder& pooled
     keys->insert(keyString.release());
 }
 
+boost::dynamic_bitset<size_t> BtreeKeyGenerator::extractElements(
+    const BSONObj& obj, std::vector<BSONElement>* elems) const {
+    boost::dynamic_bitset<size_t> existFields(_fieldNames.size());
+    size_t idx = 0;
+    for (auto&& fieldName : _fieldNames) {
+        auto [elem, exist] = extractNonArrayElementAtPath(obj, fieldName);
+        elems->push_back(elem);
+        existFields[idx++] = exist;
+    }
+    return existFields;
+}
+
 void BtreeKeyGenerator::_getKeysWithArray(std::vector<const char*>* fieldNames,
                                           std::vector<BSONElement>* fixed,
                                           SharedBufferFragmentBuilder& pooledBufferBuilder,
@@ -347,7 +362,8 @@ void BtreeKeyGenerator::_getKeysWithArray(std::vector<const char*>* fieldNames,
                                           unsigned numNotFound,
                                           const std::vector<PositionalPathInfo>& positionalInfo,
                                           MultikeyPaths* multikeyPaths,
-                                          boost::optional<RecordId> id) const {
+                                          const CollatorInterface* collator,
+                                          const boost::optional<RecordId>& id) const {
     BSONElement arrElt;
 
     // A set containing the position of any indexed fields in the key pattern that traverse through
@@ -418,9 +434,9 @@ void BtreeKeyGenerator::_getKeysWithArray(std::vector<const char*>* fieldNames,
         }
         KeyString::PooledBuilder keyString(pooledBufferBuilder, _keyStringVersion, _ordering);
         for (const auto& elem : *fixed) {
-            if (_collator) {
+            if (collator) {
                 keyString.appendBSONElement(elem, [&](StringData stringData) {
-                    return _collator->getComparisonString(stringData);
+                    return collator->getComparisonString(stringData);
                 });
             } else {
                 keyString.appendBSONElement(elem);
@@ -463,6 +479,7 @@ void BtreeKeyGenerator::_getKeysWithArray(std::vector<const char*>* fieldNames,
                             true,
                             _emptyPositionalInfo,
                             multikeyPaths,
+                            collator,
                             id);
     } else {
         BSONObj arrObj = arrElt.embeddedObject();
@@ -551,6 +568,7 @@ void BtreeKeyGenerator::_getKeysWithArray(std::vector<const char*>* fieldNames,
                                 mayExpandArrayUnembedded,
                                 subPositionalInfo,
                                 multikeyPaths,
+                                collator,
                                 id);
         }
     }

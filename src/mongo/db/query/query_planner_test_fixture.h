@@ -91,7 +91,13 @@ protected:
 
     void runQueryWithPipeline(
         BSONObj query,
+        BSONObj proj,
         std::vector<std::unique_ptr<InnerPipelineStageInterface>> queryLayerPipeline);
+    void runQueryWithPipeline(
+        BSONObj query,
+        std::vector<std::unique_ptr<InnerPipelineStageInterface>> queryLayerPipeline) {
+        runQueryWithPipeline(query, BSONObj(), std::move(queryLayerPipeline));
+    }
 
     void runQuerySortProj(const BSONObj& query, const BSONObj& sort, const BSONObj& proj);
 
@@ -246,6 +252,10 @@ protected:
         markQueriesSbeCompatible = sbeCompatible;
     }
 
+    void setIsCountLike() {
+        isCountLike = true;
+    }
+
     //
     // Data members.
     //
@@ -263,7 +273,14 @@ protected:
     std::vector<std::unique_ptr<QuerySolution>> solns;
 
     bool relaxBoundsCheck = false;
+    // Value used for the sbeCompatible flag in the CanonicalQuery objects created by the
+    // test.
     bool markQueriesSbeCompatible = false;
+    // Value used for the forceGenerateRecordId flag in the CanonicalQuery objects created by the
+    // test.
+    bool forceRecordId = false;
+    // Value used for the 'isCountLike' flag in the CanonicalQuery objects created by the test.
+    bool isCountLike = false;
 };
 
 }  // namespace mongo

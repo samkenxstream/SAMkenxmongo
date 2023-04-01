@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -42,6 +41,9 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 #include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -65,31 +67,31 @@ public:
                     str::stream() << "Not authorized to drop database '" << request().getDbName()
                                   << "'",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnNamespace(NamespaceString(request().getDbName()),
-                                                            ActionType::dropDatabase));
+                        ->isAuthorizedForActionsOnNamespace(ns(), ActionType::dropDatabase));
         }
         Reply typedRun(OperationContext* opCtx) final {
             auto dbName = request().getDbName();
-            auto nss = NamespaceString(dbName);
 
             uassert(ErrorCodes::IllegalOperation,
                     "Cannot drop the config database",
-                    dbName != NamespaceString::kConfigDb);
+                    dbName != DatabaseName::kConfig);
             uassert(ErrorCodes::IllegalOperation,
                     "Cannot drop the admin database",
-                    dbName != NamespaceString::kAdminDb);
+                    dbName != DatabaseName::kAdmin);
             uassert(ErrorCodes::BadValue,
                     "Must pass 1 as the 'dropDatabase' parameter",
                     request().getCommandParameter() == 1);
 
             try {
                 const CachedDatabaseInfo dbInfo =
-                    uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName));
+                    uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(
+                        opCtx, dbName.toStringWithTenantId()));
 
                 // Invalidate the database metadata so the next access kicks off a full reload, even
                 // if sending the command to the config server fails due to e.g. a NetworkError.
-                ON_BLOCK_EXIT(
-                    [opCtx, dbName] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbName); });
+                ON_BLOCK_EXIT([opCtx, dbName] {
+                    Grid::get(opCtx)->catalogCache()->purgeDatabase(dbName.toStringWithTenantId());
+                });
 
                 // Send it to the primary shard
                 ShardsvrDropDatabase dropDatabaseCommand;
@@ -97,7 +99,7 @@ public:
 
                 auto cmdResponse = executeCommandAgainstDatabasePrimary(
                     opCtx,
-                    dbName,
+                    dbName.db(),
                     dbInfo,
                     CommandHelpers::appendMajorityWriteConcern(dropDatabaseCommand.toBSON({}),
                                                                opCtx->getWriteConcern()),

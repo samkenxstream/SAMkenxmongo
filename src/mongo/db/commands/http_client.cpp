@@ -107,7 +107,7 @@ public:
             client->allowInsecureHTTP(isLocalhost);
             auto timeoutSecs = cmd.getTimeoutSecs();
             if (timeoutSecs) {
-                client->setTimeout(Seconds(timeoutSecs.get()));
+                client->setTimeout(Seconds(timeoutSecs.value()));
             }
 
             auto ret = client->request(HttpClient::HttpMethod::kGET, uri, {nullptr, 0});
@@ -127,7 +127,7 @@ public:
         void doCheckAuthorization(OperationContext*) const final {}
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 

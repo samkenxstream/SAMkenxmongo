@@ -27,17 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
-#include <boost/optional/optional_io.hpp>
 #include <utility>
 
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/op_observer_noop.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/op_observer/op_observer_noop.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/persistent_task_store.h"
@@ -47,16 +44,20 @@
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/s/operation_sharding_state.h"
-#include "mongo/db/s/recoverable_critical_section_service.h"
 #include "mongo/db/s/resharding/resharding_change_event_o2_field_gen.h"
 #include "mongo/db/s/resharding/resharding_data_copy_util.h"
 #include "mongo/db/s/resharding/resharding_donor_service.h"
 #include "mongo/db/s/resharding/resharding_service_test_helpers.h"
 #include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/db/s/sharding_recovery_service.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace {
@@ -64,7 +65,8 @@ namespace {
 using DonorStateTransitionController =
     resharding_service_test_helpers::StateTransitionController<DonorStateEnum>;
 using OpObserverForTest =
-    resharding_service_test_helpers::OpObserverForTest<DonorStateEnum, ReshardingDonorDocument>;
+    resharding_service_test_helpers::StateTransitionControllerOpObserver<DonorStateEnum,
+                                                                         ReshardingDonorDocument>;
 using PauseDuringStateTransitions =
     resharding_service_test_helpers::PauseDuringStateTransitions<DonorStateEnum>;
 
@@ -84,31 +86,27 @@ public:
                                    const BSONObj& query,
                                    const BSONObj& update) override {}
 
-    void clearFilteringMetadata(OperationContext* opCtx) override {}
-};
-
-class DonorOpObserverForTest : public OpObserverForTest {
-public:
-    DonorOpObserverForTest(std::shared_ptr<DonorStateTransitionController> controller)
-        : OpObserverForTest(std::move(controller),
-                            NamespaceString::kDonorReshardingOperationsNamespace) {}
-
-    DonorStateEnum getState(const ReshardingDonorDocument& donorDoc) override {
-        return donorDoc.getMutableState().getState();
-    }
+    void clearFilteringMetadata(OperationContext* opCtx,
+                                const NamespaceString& sourceNss,
+                                const NamespaceString& tempReshardingNss) override {}
 };
 
 class ReshardingDonorServiceForTest : public ReshardingDonorService {
 public:
     explicit ReshardingDonorServiceForTest(ServiceContext* serviceContext)
-        : ReshardingDonorService(serviceContext) {}
+        : ReshardingDonorService(serviceContext), _serviceContext(serviceContext) {}
 
     std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialState) override {
         return std::make_shared<DonorStateMachine>(
             this,
-            ReshardingDonorDocument::parse({"ReshardingDonorServiceForTest"}, initialState),
-            std::make_unique<ExternalStateForTest>());
+            ReshardingDonorDocument::parse(IDLParserContext{"ReshardingDonorServiceForTest"},
+                                           initialState),
+            std::make_unique<ExternalStateForTest>(),
+            _serviceContext);
     }
+
+private:
+    ServiceContext* _serviceContext;
 };
 
 class ReshardingDonorServiceTest : public repl::PrimaryOnlyServiceMongoDTest {
@@ -129,7 +127,12 @@ public:
         repl::StorageInterface::set(serviceContext, std::move(storageMock));
 
         _controller = std::make_shared<DonorStateTransitionController>();
-        _opObserverRegistry->addObserver(std::make_unique<DonorOpObserverForTest>(_controller));
+        _opObserverRegistry->addObserver(std::make_unique<OpObserverForTest>(
+            _controller,
+            NamespaceString::kDonorReshardingOperationsNamespace,
+            [](const ReshardingDonorDocument& donorDoc) {
+                return donorDoc.getMutableState().getState();
+            }));
     }
 
     DonorStateTransitionController* controller() {
@@ -147,12 +150,13 @@ public:
 
         NamespaceString sourceNss("sourcedb.sourcecollection");
         auto sourceUUID = UUID::gen();
-        auto commonMetadata =
-            CommonReshardingMetadata(UUID::gen(),
-                                     sourceNss,
-                                     sourceUUID,
-                                     constructTemporaryReshardingNss(sourceNss.db(), sourceUUID),
-                                     BSON("newKey" << 1));
+        auto commonMetadata = CommonReshardingMetadata(
+            UUID::gen(),
+            sourceNss,
+            sourceUUID,
+            resharding::constructTemporaryReshardingNss(sourceNss.db(), sourceUUID),
+            BSON("newKey" << 1));
+        commonMetadata.setStartTime(getServiceContext()->getFastClockSource()->now());
 
         doc.setCommonReshardingMetadata(std::move(commonMetadata));
         return doc;
@@ -278,10 +282,9 @@ TEST_F(ReshardingDonorServiceTest, WritesNoOpOplogEntryOnReshardingBegin) {
     ASSERT_FALSE(cursor->more()) << "Found multiple oplog entries for source collection: "
                                  << op.getEntry() << " and " << cursor->nextSafe();
 
-    ReshardingChangeEventO2Field expectedChangeEvent{doc.getReshardingUUID(),
-                                                     ReshardingChangeEventEnum::kReshardBegin};
-    auto receivedChangeEvent = ReshardingChangeEventO2Field::parse(
-        IDLParserErrorContext("ReshardingChangeEventO2Field"), *op.getObject2());
+    ReshardBeginChangeEventO2Field expectedChangeEvent{sourceNss, doc.getReshardingUUID()};
+    auto receivedChangeEvent = ReshardBeginChangeEventO2Field::parse(
+        IDLParserContext("ReshardBeginChangeEventO2Field"), *op.getObject2());
 
     ASSERT_EQ(OpType_serializer(op.getOpType()), OpType_serializer(repl::OpTypeEnum::kNoop))
         << op.getEntry();
@@ -347,7 +350,7 @@ TEST_F(ReshardingDonorServiceTest, WritesFinalReshardOpOplogEntriesWhileWritesBl
 
     DBDirectClient client(opCtx.get());
     FindCommandRequest findRequest{NamespaceString::kRsOplogNamespace};
-    findRequest.setFilter(BSON("o2.type" << kReshardFinalOpLogType));
+    findRequest.setFilter(BSON("o2.type" << resharding::kReshardFinalOpLogType));
     auto cursor = client.find(std::move(findRequest));
 
     ASSERT_TRUE(cursor->more()) << "Found no oplog entries for source collection";
@@ -709,7 +712,7 @@ TEST_F(ReshardingDonorServiceTest, TruncatesXLErrorOnDonorDocument) {
             // to the primitive truncation algorithm - Check that the total size is less than
             // kReshardErrorMaxBytes + a couple additional bytes to provide a buffer for the field
             // name sizes.
-            int maxReshardErrorBytesCeiling = kReshardErrorMaxBytes + 200;
+            int maxReshardErrorBytesCeiling = resharding::kReshardErrorMaxBytes + 200;
             ASSERT_LT(persistedAbortReasonBSON->objsize(), maxReshardErrorBytesCeiling);
             ASSERT_EQ(persistedAbortReasonBSON->getIntField("code"),
                       ErrorCodes::ReshardCollectionTruncatedError);
@@ -736,29 +739,18 @@ TEST_F(ReshardingDonorServiceTest, RestoreMetricsOnKBlockingWrites) {
     };
     doc.setMutableState(makeDonorCtx());
 
-    auto makeMetricsTimeInterval = [&](const Date_t startTime) {
-        ReshardingMetricsTimeInterval timeInterval;
-        timeInterval.setStart(startTime);
-        return timeInterval;
-    };
-
-    auto timeNow = Date_t::now();
-    auto opTimeDurationSecs = 60;
-    auto critSecDurationSecs = 10;
-
-    ReshardingDonorMetrics reshardingDonorMetrics;
-    reshardingDonorMetrics.setOperationRuntime(
-        makeMetricsTimeInterval(timeNow - Seconds(opTimeDurationSecs)));
-    reshardingDonorMetrics.setCriticalSection(
-        makeMetricsTimeInterval(timeNow - Seconds(critSecDurationSecs)));
-    doc.setMetrics(reshardingDonorMetrics);
+    auto timeNow = getServiceContext()->getFastClockSource()->now();
+    const auto opTimeDurationSecs = 60;
+    auto commonMetadata = doc.getCommonReshardingMetadata();
+    commonMetadata.setStartTime(timeNow - Seconds(opTimeDurationSecs));
+    doc.setCommonReshardingMetadata(std::move(commonMetadata));
 
     createSourceCollection(opCtx.get(), doc);
     DonorStateMachine::insertStateDocument(opCtx.get(), doc);
 
     // This acquires the critical section required by resharding donor machine when it is in
     // kBlockingWrites.
-    RecoverableCriticalSectionService::get(opCtx.get())
+    ShardingRecoveryService::get(opCtx.get())
         ->acquireRecoverableCriticalSectionBlockWrites(opCtx.get(),
                                                        doc.getSourceNss(),
                                                        BSON("command"
@@ -775,11 +767,10 @@ TEST_F(ReshardingDonorServiceTest, RestoreMetricsOnKBlockingWrites) {
         donor
             ->reportForCurrentOp(MongoProcessInterface::CurrentOpConnectionsMode::kExcludeIdle,
                                  MongoProcessInterface::CurrentOpSessionsMode::kExcludeIdle)
-            .get();
+            .value();
     ASSERT_EQ(currOp.getStringField("donorState"),
               DonorState_serializer(DonorStateEnum::kBlockingWrites));
     ASSERT_GTE(currOp.getField("totalOperationTimeElapsedSecs").Long(), opTimeDurationSecs);
-    ASSERT_GTE(currOp.getField("totalCriticalSectionTimeElapsedSecs").Long(), critSecDurationSecs);
 
     stateTransitionsGuard.unset(kDoneState);
     ASSERT_OK(donor->getCompletionFuture().getNoThrow());

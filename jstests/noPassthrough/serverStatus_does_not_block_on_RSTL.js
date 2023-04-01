@@ -5,8 +5,6 @@
  *   # Certain serverStatus sections might pivot to taking the RSTL lock if an action is unsupported
  *   # by a non-WT storage engine.
  *   requires_wiredtiger,
- *   # Replication requires journaling support so this tag also implies exclusion from --nojournal
- *   # test configurations.
  *   requires_sharding,
  *   requires_replication,
  * ]
@@ -18,7 +16,8 @@ load("jstests/libs/parallel_shell_helpers.js");  // startParallelShell
 load("jstests/libs/wait_for_command.js");        // waitForCommand
 
 // Use a sharding environment in order to exercise the sharding specific serverStatus sections.
-const st = new ShardingTest({mongos: 1, config: 1, shards: 1, rs: {nodes: 1}});
+const st = new ShardingTest(
+    {mongos: 1, config: 1, shards: 1, rs: {nodes: 1, setParameter: {watchdogPeriodSeconds: 60}}});
 const testDB = st.rs0.getPrimary().getDB("test");
 
 jsTestLog("Starting the sleep command in a parallel thread to take the RSTL MODE_X lock");
@@ -43,25 +42,13 @@ checkLog.containsJson(testDB, 6001600);
 
 try {
     jsTestLog("Running serverStatus concurrently with the RSTL X lock held by the sleep cmd");
-    const serverStatusResult = assert.commandWorked(testDB.adminCommand({
-        serverStatus: 1,
-        repl: 1,
-        mirroredReads: 1,
-        advisoryHostFQDNs: 1,
-        defaultRWConcern: 1,
-        heapProfile: 1,
-        http_client: 1,
-        latchAnalysis: 1,
-        opWriteConcernCounters: 1,
-        oplog: 1,
-        resourceConsumption: 1,
-        sharding: 1,
-        tenantMigrationAccessBlocker: 1,
-        // TODO: uncomment this when SERVER-63271 gets fixed.
-        // watchdog: 1,
-        maxTimeMS: 20 * 1000
-    }));
+    const serverStatusResult =
+        assert.commandWorked(testDB.adminCommand({serverStatus: 1, all: 1, maxTimeMS: 20 * 1000}));
     jsTestLog("ServerStatus results: " + tojson(serverStatusResult));
+
+    // Check that serverStatus includes some non-default sections, as a sanity check.
+    assert(serverStatusResult["repl"]);
+    assert(serverStatusResult["mirroredReads"]);
 } finally {
     jsTestLog("Ensure the sleep cmd releases the lock so that the server can shutdown");
     assert.commandWorked(testDB.killOp(sleepCmdOpID));  // kill the sleep cmd

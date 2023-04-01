@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -39,6 +38,9 @@
 #include "mongo/logv2/log.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -84,7 +86,7 @@ public:
     }
 
     Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbName,
+                                 const DatabaseName& dbName,
                                  const BSONObj& cmdObj) const override {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
         if (!AuthorizationSession::get(opCtx->getClient())
@@ -96,23 +98,20 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbName,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
-        LOGV2_DEBUG(22757,
-                    1,
-                    "setIndexCommitQuorum",
-                    "namespace"_attr = nss,
-                    "command"_attr = redact(cmdObj));
+        LOGV2_DEBUG(
+            22757, 1, "setIndexCommitQuorum", logAttrs(nss), "command"_attr = redact(cmdObj));
 
-        auto routingInfo =
+        auto cri =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
         auto shardResponses = scatterGatherVersionedTargetByRoutingTable(
             opCtx,
             nss.db(),
             nss,
-            routingInfo,
+            cri,
             applyReadWriteConcern(
                 opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
             ReadPreferenceSetting::get(opCtx),
@@ -126,7 +125,7 @@ public:
         CommandHelpers::appendSimpleCommandStatus(result, ok, errmsg);
 
         if (ok) {
-            LOGV2(5688700, "Index commit quorums set", "namespace"_attr = nss);
+            LOGV2(5688700, "Index commit quorums set", logAttrs(nss));
         }
 
         return ok;

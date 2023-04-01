@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/stacktrace_somap.h"
@@ -57,6 +56,9 @@
 #include "mongo/util/hex.h"
 #include "mongo/util/str.h"
 #include "mongo/util/version.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 // Given `#define A aaa` and `#define B bbb`, `TOKEN_CAT(A, B)` evaluates to `aaabbb`.
 #define TOKEN_CAT(a, b) TOKEN_CAT_PRIMITIVE(a, b)
@@ -100,7 +102,6 @@ void processNoteSegment(const dl_phdr_info& info, const ElfW(Phdr) & phdr, BSONO
 #ifdef NT_GNU_BUILD_ID
     const char* const notesBegin = reinterpret_cast<const char*>(info.dlpi_addr) + phdr.p_vaddr;
     const char* const notesEnd = notesBegin + phdr.p_memsz;
-    ElfW(Nhdr) noteHeader;
     // Returns the size in bytes of an ELF note entry with the given header.
     auto roundUpToElfWordAlignment = [](size_t offset) -> size_t {
         static const size_t elfWordSizeBytes = sizeof(ElfW(Word));
@@ -110,6 +111,7 @@ void processNoteSegment(const dl_phdr_info& info, const ElfW(Phdr) & phdr, BSONO
         return sizeof(noteHeader) + roundUpToElfWordAlignment(noteHeader.n_namesz) +
             roundUpToElfWordAlignment(noteHeader.n_descsz);
     };
+    ElfW(Nhdr) noteHeader;
     for (const char* notesCurr = notesBegin; (notesCurr + sizeof(noteHeader)) < notesEnd;
          notesCurr += getNoteSizeBytes(noteHeader)) {
         memcpy(&noteHeader, notesCurr, sizeof(noteHeader));
@@ -147,7 +149,7 @@ void processLoadSegment(const dl_phdr_info& info, const ElfW(Phdr) & phdr, BSONO
 
     const char* filename = info.dlpi_name;
 
-    if (memcmp(&eHeader.e_ident[EI_MAG0], ELFMAG, SELFMAG)) {
+    if (memcmp(&eHeader.e_ident[EI_MAG0], ELFMAG, SELFMAG) != 0) {
         LOGV2_WARNING(23842,
                       "Bad ELF magic number",
                       "filename"_attr = filename,

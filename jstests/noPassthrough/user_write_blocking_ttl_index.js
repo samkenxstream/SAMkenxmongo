@@ -5,7 +5,6 @@
 //   requires_fcv_60,
 //   requires_non_retryable_commands,
 //   requires_replication,
-//   featureFlagUserWriteBlocking,
 // ]
 
 (function() {
@@ -65,8 +64,11 @@ function runTest(conn, testCase) {
         } else {
             assert.eq(1, target.col.count());
             checkLog.containsJson(conn, 5400703, {
-                "error":
-                    {"code": 96, "codeName": "OperationFailed", "errmsg": "User writes blocked"}
+                "error": {
+                    "code": ErrorCodes.UserWritesBlocked,
+                    "codeName": "UserWritesBlocked",
+                    "errmsg": "User writes blocked"
+                }
             });
         }
     }

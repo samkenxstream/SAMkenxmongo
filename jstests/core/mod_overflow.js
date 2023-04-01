@@ -16,13 +16,13 @@ assert.commandWorked(testColl.insert(insertedDocs));
 
 // For each possible integral representation of -1, confirm that overflow does not occur.
 for (let divisor of [-1.0, NumberInt("-1"), NumberLong("-1"), NumberDecimal("-1")]) {
-    assert.docEq(testColl.find({val: {$mod: [divisor, 0]}}).sort({_id: 1}).toArray(), insertedDocs);
+    assert.docEq(insertedDocs, testColl.find({val: {$mod: [divisor, 0]}}).sort({_id: 1}).toArray());
     assert.docEq(
+        insertedDocs,
         testColl
             .aggregate(
                 [{$match: {$expr: {$eq: [0, {$mod: ["$val", divisor]}]}}}, {$sort: {_id: 1}}])
-            .toArray(),
-        insertedDocs);
+            .toArray());
 
     // Confirm that overflow does not occur during agg expression evaluation. Also confirm that the
     // correct type is returned for each combination of input types.
@@ -31,15 +31,15 @@ for (let divisor of [-1.0, NumberInt("-1"), NumberLong("-1"), NumberDecimal("-1"
             insertedDocs[0],
             {modVal: (divisor instanceof NumberDecimal ? NumberDecimal("-0") : NumberLong("0"))}),
         Object.merge(insertedDocs[1], {
-            modVal: (divisor instanceof NumberLong
-                         ? NumberLong("0")
-                         : divisor instanceof NumberDecimal ? NumberDecimal("-0") : 0)
+            modVal: (divisor instanceof NumberLong          ? NumberLong("0")
+                         : divisor instanceof NumberDecimal ? NumberDecimal("-0")
+                                                            : 0)
         })
     ];
     assert.docEq(
+        expectedResults,
         testColl
             .aggregate([{$project: {val: 1, modVal: {$mod: ["$val", divisor]}}}, {$sort: {_id: 1}}])
-            .toArray(),
-        expectedResults);
+            .toArray());
 }
 })();

@@ -92,40 +92,8 @@ private:
     // The original object. Used to generate more helpful error messages.
     const BSONObj& _rawObj;
 
-    // Custom comparator that orders fieldpath strings by path prefix first, then by field.
-    struct PathPrefixComparator {
-        static constexpr char dot = '.';
-
-        // Returns true if the lhs value should sort before the rhs, false otherwise.
-        bool operator()(const std::string& lhs, const std::string& rhs) const {
-            for (size_t pos = 0, len = std::min(lhs.size(), rhs.size()); pos < len; ++pos) {
-                auto &lchar = lhs[pos], &rchar = rhs[pos];
-                if (lchar == rchar) {
-                    continue;
-                }
-
-                // Consider the path delimiter '.' as being less than all other characters, so that
-                // paths sort directly before any paths they prefix and directly after any paths
-                // which prefix them.
-                if (lchar == dot) {
-                    return true;
-                } else if (rchar == dot) {
-                    return false;
-                }
-
-                // Otherwise, default to normal character comparison.
-                return lchar < rchar;
-            }
-
-            // If we get here, then we have reached the end of lhs and/or rhs and all of their path
-            // segments up to this point match. If lhs is shorter than rhs, then lhs prefixes rhs
-            // and should sort before it.
-            return lhs.size() < rhs.size();
-        }
-    };
-
     // Tracks which paths we've seen to ensure no two paths conflict with each other.
-    std::set<std::string, PathPrefixComparator> _seenPaths;
+    OrderedPathSet _seenPaths;
 };
 
 void ProjectionSpecValidator::uassertValid(const BSONObj& spec) {
@@ -174,12 +142,6 @@ void ProjectionSpecValidator::parseElement(const BSONElement& elem, const FieldP
 
 void ProjectionSpecValidator::parseNestedObject(const BSONObj& thisLevelSpec,
                                                 const FieldPath& prefix) {
-    if (thisLevelSpec.isEmpty()) {
-        uasserted(
-            40180,
-            str::stream() << "an empty object is not a valid value. Found empty object at path "
-                          << prefix.fullPath());
-    }
     for (auto&& elem : thisLevelSpec) {
         auto fieldName = elem.fieldNameStringData();
         if (fieldName[0] == '$') {
@@ -271,7 +233,9 @@ bool AddFieldsProjectionExecutor::parseObjectAsExpression(
     const VariablesParseState& variablesParseState) {
     if (objSpec.firstElementFieldName()[0] == '$') {
         // This is an expression like {$add: [...]}. We already verified that it has only one field.
-        invariant(objSpec.nFields() == 1);
+        tassert(7241737,
+                "expression in Projection Executor should only have one field",
+                objSpec.nFields() == 1);
         _root->addExpressionForPath(
             pathToObject, Expression::parseExpression(_expCtx.get(), objSpec, variablesParseState));
         return true;
@@ -282,12 +246,18 @@ bool AddFieldsProjectionExecutor::parseObjectAsExpression(
 void AddFieldsProjectionExecutor::parseSubObject(const BSONObj& subObj,
                                                  const VariablesParseState& variablesParseState,
                                                  const FieldPath& pathToObj) {
+    bool elemInSubObj = false;
     for (auto&& elem : subObj) {
+        elemInSubObj = true;
         auto fieldName = elem.fieldNameStringData();
-        invariant(fieldName[0] != '$');
+        tassert(7241738,
+                "the field name in the Projection Executor cannot be an operator",
+                fieldName[0] != '$');
         // Dotted paths in a sub-object have already been detected and disallowed by the function
         // ProjectionSpecValidator::validate().
-        invariant(fieldName.find('.') == std::string::npos);
+        tassert(7241739,
+                "dotted paths in Projection Executor are not allowed",
+                fieldName.find('.') == std::string::npos);
 
         auto currentPath = pathToObj.concat(fieldName);
         if (elem.type() == BSONType::Object) {
@@ -301,6 +271,11 @@ void AddFieldsProjectionExecutor::parseSubObject(const BSONObj& subObj,
             _root->addExpressionForPath(
                 currentPath, Expression::parseOperand(_expCtx.get(), elem, variablesParseState));
         }
+    }
+
+    if (!elemInSubObj) {
+        _root->addExpressionForPath(
+            pathToObj, Expression::parseObject(_expCtx.get(), subObj, variablesParseState));
     }
 }
 }  // namespace mongo::projection_executor

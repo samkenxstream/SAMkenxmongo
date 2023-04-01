@@ -58,7 +58,7 @@ const Document kDefaultCursorOptionDocument{
 
 TEST(AggregationRequestTest, ShouldParseAllKnownOptions) {
     // Using oplog namespace so that validation of $_requestReshardingResumeToken succeeds.
-    NamespaceString nss("local.oplog.rs");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("local.oplog.rs");
     BSONObj inputBson = fromjson(
         "{aggregate: 'oplog.rs', pipeline: [{$match: {a: 'abc'}}], explain: false, allowDiskUse: "
         "true, fromMongos: true, "
@@ -66,7 +66,7 @@ TEST(AggregationRequestTest, ShouldParseAllKnownOptions) {
         "collation: {locale: 'en_US'}, cursor: {batchSize: 10}, hint: {a: 1}, maxTimeMS: 100, "
         "readConcern: {level: 'linearizable'}, $queryOptions: {$readPreference: 'nearest'}, "
         "exchange: {policy: 'roundrobin', consumers:NumberInt(2)}, isMapReduceCommand: true, $db: "
-        "'local'}");
+        "'local', $_isClusterQueryWithoutShardKeyCmd: true}");
     auto uuid = UUID::gen();
     BSONObjBuilder uuidBob;
     uuid.appendToBuilder(&uuidBob, AggregateCommandRequest::kCollectionUUIDFieldName);
@@ -80,6 +80,7 @@ TEST(AggregationRequestTest, ShouldParseAllKnownOptions) {
     ASSERT_TRUE(request.getNeedsMerge());
     ASSERT_TRUE(request.getBypassDocumentValidation().value_or(false));
     ASSERT_TRUE(request.getRequestReshardingResumeToken());
+    ASSERT_TRUE(request.getIsClusterQueryWithoutShardKeyCmd());
     ASSERT_EQ(
         request.getCursor().getBatchSize().value_or(aggregation_request_helper::kDefaultBatchSize),
         10);
@@ -94,13 +95,13 @@ TEST(AggregationRequestTest, ShouldParseAllKnownOptions) {
     ASSERT_BSONOBJ_EQ(request.getUnwrappedReadPref().value_or(BSONObj()),
                       BSON("$readPreference"
                            << "nearest"));
-    ASSERT_TRUE(request.getExchange().is_initialized());
+    ASSERT_TRUE(request.getExchange().has_value());
     ASSERT_TRUE(request.getIsMapReduceCommand());
     ASSERT_EQ(*request.getCollectionUUID(), uuid);
 }
 
 TEST(AggregationRequestTest, ShouldParseExplicitRequestReshardingResumeTokenFalseForNonOplog) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj inputBson = fromjson(
         "{aggregate: 'collection', pipeline: [], $_requestReshardingResumeToken: false, cursor: "
         "{}, $db: 'a'}");
@@ -110,7 +111,7 @@ TEST(AggregationRequestTest, ShouldParseExplicitRequestReshardingResumeTokenFals
 }
 
 TEST(AggregationRequestTest, ShouldParseExplicitExplainTrue) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj inputBson =
         fromjson("{aggregate: 'collection', pipeline: [], explain: true, cursor: {}, $db: 'a'}");
     auto request =
@@ -120,7 +121,7 @@ TEST(AggregationRequestTest, ShouldParseExplicitExplainTrue) {
 }
 
 TEST(AggregationRequestTest, ShouldParseExplicitExplainFalseWithCursorOption) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj inputBson = fromjson(
         "{aggregate: 'collection', pipeline: [], explain: false, cursor: {batchSize: 10}, $db: "
         "'a'}");
@@ -133,7 +134,7 @@ TEST(AggregationRequestTest, ShouldParseExplicitExplainFalseWithCursorOption) {
 }
 
 TEST(AggregationRequestTest, ShouldParseWithSeparateQueryPlannerExplainModeArg) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj inputBson =
         fromjson("{aggregate: 'collection', pipeline: [], cursor: {}, $db: 'a'}");
     auto request = unittest::assertGet(aggregation_request_helper::parseFromBSONForTests(
@@ -143,7 +144,7 @@ TEST(AggregationRequestTest, ShouldParseWithSeparateQueryPlannerExplainModeArg) 
 }
 
 TEST(AggregationRequestTest, ShouldParseWithSeparateQueryPlannerExplainModeArgAndCursorOption) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj inputBson =
         fromjson("{aggregate: 'collection', pipeline: [], cursor: {batchSize: 10}, $db: 'a'}");
     auto request = unittest::assertGet(aggregation_request_helper::parseFromBSONForTests(
@@ -156,7 +157,7 @@ TEST(AggregationRequestTest, ShouldParseWithSeparateQueryPlannerExplainModeArgAn
 }
 
 TEST(AggregationRequestTest, ShouldParseExplainFlagWithReadConcern) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     // Non-local readConcern should not be allowed with the explain flag, but this is checked
     // elsewhere to avoid having to parse the readConcern in AggregationCommand.
     const BSONObj inputBson = fromjson(
@@ -175,8 +176,8 @@ TEST(AggregationRequestTest, ShouldParseExplainFlagWithReadConcern) {
 //
 
 TEST(AggregationRequestTest, ShouldOnlySerializeRequiredFieldsIfNoOptionalFieldsAreSpecified) {
-    NamespaceString nss("a.collection");
-    AggregateCommandRequest request(nss, {});
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
+    AggregateCommandRequest request(nss, std::vector<mongo::BSONObj>());
 
     auto expectedSerialization =
         Document{{AggregateCommandRequest::kCommandName, nss.coll()},
@@ -187,8 +188,8 @@ TEST(AggregationRequestTest, ShouldOnlySerializeRequiredFieldsIfNoOptionalFields
 }
 
 TEST(AggregationRequestTest, ShouldSerializeOptionalValuesIfSet) {
-    NamespaceString nss("a.collection");
-    AggregateCommandRequest request(nss, {});
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
+    AggregateCommandRequest request(nss, std::vector<mongo::BSONObj>());
     request.setAllowDiskUse(true);
     request.setFromMongos(true);
     request.setNeedsMerge(true);
@@ -215,6 +216,7 @@ TEST(AggregationRequestTest, ShouldSerializeOptionalValuesIfSet) {
     request.setLet(letParamsObj);
     auto uuid = UUID::gen();
     request.setCollectionUUID(uuid);
+    request.setIsClusterQueryWithoutShardKeyCmd(true);
 
     auto expectedSerialization = Document{
         {AggregateCommandRequest::kCommandName, nss.coll()},
@@ -232,14 +234,15 @@ TEST(AggregationRequestTest, ShouldSerializeOptionalValuesIfSet) {
         {query_request_helper::kUnwrappedReadPrefField, readPrefObj},
         {AggregateCommandRequest::kRequestReshardingResumeTokenFieldName, true},
         {AggregateCommandRequest::kIsMapReduceCommandFieldName, true},
-        {AggregateCommandRequest::kCollectionUUIDFieldName, uuid}};
+        {AggregateCommandRequest::kCollectionUUIDFieldName, uuid},
+        {AggregateCommandRequest::kIsClusterQueryWithoutShardKeyCmdFieldName, true}};
     ASSERT_DOCUMENT_EQ(aggregation_request_helper::serializeToCommandDoc(request),
                        expectedSerialization);
 }
 
 TEST(AggregationRequestTest, ShouldSerializeBatchSizeIfSetAndExplainFalse) {
-    NamespaceString nss("a.collection");
-    AggregateCommandRequest request(nss, {});
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
+    AggregateCommandRequest request(nss, std::vector<mongo::BSONObj>());
     SimpleCursorOptions cursor;
     cursor.setBatchSize(10);
     request.setCursor(cursor);
@@ -253,8 +256,9 @@ TEST(AggregationRequestTest, ShouldSerializeBatchSizeIfSetAndExplainFalse) {
 }
 
 TEST(AggregationRequestTest, ShouldSerialiseAggregateFieldToOneIfCollectionIsAggregateOneNSS) {
-    NamespaceString nss = NamespaceString::makeCollectionlessAggregateNSS("a");
-    AggregateCommandRequest request(nss, {});
+    NamespaceString nss =
+        NamespaceString::makeCollectionlessAggregateNSS(DatabaseName(boost::none, "a"));
+    AggregateCommandRequest request(nss, std::vector<mongo::BSONObj>());
 
     auto expectedSerialization =
         Document{{AggregateCommandRequest::kCommandName, 1},
@@ -268,7 +272,7 @@ TEST(AggregationRequestTest, ShouldSerialiseAggregateFieldToOneIfCollectionIsAgg
 }
 
 TEST(AggregationRequestTest, ShouldSetBatchSizeToDefaultOnEmptyCursorObject) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj inputBson = fromjson(
         "{aggregate: 'collection', pipeline: [{$match: {a: 'abc'}}], cursor: {}, $db: 'a'}");
     auto request = aggregation_request_helper::parseFromBSONForTests(nss, inputBson);
@@ -279,7 +283,7 @@ TEST(AggregationRequestTest, ShouldSetBatchSizeToDefaultOnEmptyCursorObject) {
 }
 
 TEST(AggregationRequestTest, ShouldAcceptHintAsString) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj inputBson = fromjson(
         "{aggregate: 'collection', pipeline: [{$match: {a: 'abc'}}], hint: 'a_1', cursor: {}, $db: "
         "'a'}");
@@ -291,8 +295,8 @@ TEST(AggregationRequestTest, ShouldAcceptHintAsString) {
 }
 
 TEST(AggregationRequestTest, ShouldNotSerializeBatchSizeWhenExplainSet) {
-    NamespaceString nss("a.collection");
-    AggregateCommandRequest request(nss, {});
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
+    AggregateCommandRequest request(nss, std::vector<mongo::BSONObj>());
     SimpleCursorOptions cursor;
     cursor.setBatchSize(10);
     request.setCursor(cursor);
@@ -380,17 +384,20 @@ void parseNSHelper(const std::string& dbName,
                    const BSONObj& invalidFields,
                    ErrorCodes::Error expectedCode) {
     // Verify that 'validRequest' parses correctly.
-    auto shouldNotThrow = aggregation_request_helper::parseNs(dbName, validRequest);
+    auto shouldNotThrow =
+        aggregation_request_helper::parseNs(DatabaseName(boost::none, dbName), validRequest);
 
     auto invalidRequest = constructInvalidRequest(validRequest, invalidFields);
 
     // Verify that the constructed invalid request fails to parse with 'expectedCode'.
     ASSERT_THROWS_CODE(
-        aggregation_request_helper::parseNs("a", invalidRequest), AssertionException, expectedCode);
+        aggregation_request_helper::parseNs(DatabaseName(boost::none, "a"), invalidRequest),
+        AssertionException,
+        expectedCode);
 }
 
 TEST(AggregationRequestTest, ShouldRejectNonArrayPipeline) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest =
         fromjson("{aggregate: 'collection', pipeline: [], cursor: {}, $db: 'a'}");
     const BSONObj nonArrayPipeline = fromjson("{pipeline: {}}");
@@ -399,7 +406,7 @@ TEST(AggregationRequestTest, ShouldRejectNonArrayPipeline) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectPipelineArrayIfAnElementIsNotAnObject) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection', pipeline: [{$match: {a: 'abc'}}], cursor: {}, $db: 'a'}");
     BSONObj nonObjectPipelineElem = fromjson("{pipeline: [4]}");
@@ -412,7 +419,7 @@ TEST(AggregationRequestTest, ShouldRejectPipelineArrayIfAnElementIsNotAnObject) 
 }
 
 TEST(AggregationRequestTest, ShouldRejectNonObjectCollation) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection', "
         "pipeline: [{$match: {a: 'abc'}}],"
@@ -425,7 +432,7 @@ TEST(AggregationRequestTest, ShouldRejectNonObjectCollation) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectNonStringNonObjectHint) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection', "
         "pipeline: [{$match: {a: 'abc'}}],"
@@ -438,7 +445,7 @@ TEST(AggregationRequestTest, ShouldRejectNonStringNonObjectHint) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectExplainIfNumber) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection',"
         "pipeline: [{$match: {a: 'abc'}}],"
@@ -451,7 +458,7 @@ TEST(AggregationRequestTest, ShouldRejectExplainIfNumber) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectExplainIfObject) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection',"
         "pipeline: [{$match: {a: 'abc'}}],"
@@ -464,7 +471,7 @@ TEST(AggregationRequestTest, ShouldRejectExplainIfObject) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectNonBoolFromMongos) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection',"
         "pipeline: [{$match: {a: 'abc'}}],"
@@ -477,7 +484,7 @@ TEST(AggregationRequestTest, ShouldRejectNonBoolFromMongos) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectNonBoolNeedsMerge) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection',"
         "pipeline: [{$match: {a: 'abc'}}], "
@@ -491,7 +498,7 @@ TEST(AggregationRequestTest, ShouldRejectNonBoolNeedsMerge) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectNeedsMergeIfFromMongosNotPresent) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection',"
         "pipeline: [{$match: {a: 'abc'}}],"
@@ -503,7 +510,7 @@ TEST(AggregationRequestTest, ShouldRejectNeedsMergeIfFromMongosNotPresent) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectNonBoolAllowDiskUse) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection',"
         "pipeline: [{$match: {a: 'abc'}}],"
@@ -516,7 +523,7 @@ TEST(AggregationRequestTest, ShouldRejectNonBoolAllowDiskUse) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectNonBoolIsMapReduceCommand) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection',"
         "pipeline: [{$match: {a: 'abc'}}],"
@@ -529,7 +536,7 @@ TEST(AggregationRequestTest, ShouldRejectNonBoolIsMapReduceCommand) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectNoCursorNoExplain) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
 
     // An aggregate with neither cursor nor explain should fail to parse.
     const BSONObj invalidRequest = fromjson(
@@ -555,7 +562,7 @@ TEST(AggregationRequestTest, ShouldRejectNoCursorNoExplain) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectNonObjectCursor) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection',"
         "pipeline: [{$match: {a: 'abc'}}],"
@@ -572,7 +579,7 @@ TEST(AggregationRequestTest, ShouldRejectNonObjectCursor) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectExplainTrueWithSeparateExplainArg) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection',"
         "pipeline: [],"
@@ -587,7 +594,7 @@ TEST(AggregationRequestTest, ShouldRejectExplainTrueWithSeparateExplainArg) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectExplainFalseWithSeparateExplainArg) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection',"
         "pipeline: [],"
@@ -602,7 +609,7 @@ TEST(AggregationRequestTest, ShouldRejectExplainFalseWithSeparateExplainArg) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectExplainWithWriteConcernMajority) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest =
         fromjson("{aggregate: 'collection', pipeline: [], explain: true, $db: 'a'}");
     const BSONObj wcMajority = fromjson("{writeConcern: {w: 'majority'}}");
@@ -610,7 +617,7 @@ TEST(AggregationRequestTest, ShouldRejectExplainWithWriteConcernMajority) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectExplainExecStatsVerbosityWithWriteConcernMajority) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest =
         fromjson("{aggregate: 'collection', pipeline: [], cursor: {}, $db: 'a'}");
     const BSONObj wcMajority = fromjson("{writeConcern: {w: 'majority'}}");
@@ -622,7 +629,7 @@ TEST(AggregationRequestTest, ShouldRejectExplainExecStatsVerbosityWithWriteConce
 }
 
 TEST(AggregationRequestTest, ShouldRejectRequestReshardingResumeTokenIfNonBooleanType) {
-    NamespaceString oplogNss("local.oplog.rs");
+    NamespaceString oplogNss = NamespaceString::createNamespaceString_forTest("local.oplog.rs");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection',"
         "pipeline: [],"
@@ -636,7 +643,7 @@ TEST(AggregationRequestTest, ShouldRejectRequestReshardingResumeTokenIfNonBoolea
 }
 
 TEST(AggregationRequestTest, ShouldRejectRequestReshardingResumeTokenIfNonOplogNss) {
-    NamespaceString oplogNss("local.oplog.rs");
+    NamespaceString oplogNss = NamespaceString::createNamespaceString_forTest("local.oplog.rs");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection',"
         "pipeline: [],"
@@ -646,7 +653,7 @@ TEST(AggregationRequestTest, ShouldRejectRequestReshardingResumeTokenIfNonOplogN
     ASSERT_OK(
         aggregation_request_helper::parseFromBSONForTests(oplogNss, validRequest).getStatus());
 
-    NamespaceString nonOplogNss("a.collection");
+    NamespaceString nonOplogNss = NamespaceString::createNamespaceString_forTest("a.collection");
     auto status =
         aggregation_request_helper::parseFromBSONForTests(nonOplogNss, validRequest).getStatus();
     ASSERT_NOT_OK(status);
@@ -660,7 +667,8 @@ TEST(AggregationRequestTest, ParseNSShouldReturnAggregateOneNSIfAggregateFieldIs
     for (auto& one : ones) {
         const BSONObj inputBSON =
             fromjson(str::stream() << "{aggregate: " << one << ", pipeline: [], $db: 'a'}");
-        ASSERT(aggregation_request_helper::parseNs("a", inputBSON).isCollectionlessAggregateNS());
+        ASSERT(aggregation_request_helper::parseNs(DatabaseName(boost::none, "a"), inputBSON)
+                   .isCollectionlessAggregateNS());
     }
 }
 
@@ -692,10 +700,10 @@ TEST(AggregationRequestTest, ParseFromBSONOverloadsShouldProduceIdenticalRequest
     const BSONObj inputBSON = fromjson(
         "{aggregate: 'collection', pipeline: [{$match: {}}, {$project: {}}], cursor: {}, $db: "
         "'a'}");
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
 
-    auto aggReqDBName =
-        unittest::assertGet(aggregation_request_helper::parseFromBSONForTests("a", inputBSON));
+    auto aggReqDBName = unittest::assertGet(
+        aggregation_request_helper::parseFromBSONForTests(nss.dbName(), inputBSON));
     auto aggReqNSS =
         unittest::assertGet(aggregation_request_helper::parseFromBSONForTests(nss, inputBSON));
 
@@ -704,7 +712,7 @@ TEST(AggregationRequestTest, ParseFromBSONOverloadsShouldProduceIdenticalRequest
 }
 
 TEST(AggregationRequestTest, ShouldRejectExchangeNotObject) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection', "
         "pipeline: [],"
@@ -717,7 +725,7 @@ TEST(AggregationRequestTest, ShouldRejectExchangeNotObject) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectExchangeInvalidSpec) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection',"
         "pipeline: [],"
@@ -731,7 +739,7 @@ TEST(AggregationRequestTest, ShouldRejectExchangeInvalidSpec) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectInvalidWriteConcern) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection',"
         "pipeline: [{$match: {a: 'abc'}}],"
@@ -743,7 +751,7 @@ TEST(AggregationRequestTest, ShouldRejectInvalidWriteConcern) {
 }
 
 TEST(AggregationRequestTest, ShouldRejectInvalidCollectionUUID) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     auto uuid = UUID::gen();
     BSONObjBuilder validRequestBuilder(
         fromjson("{aggregate: 'collection', cursor: {}, pipeline: [{$match: {}}], $db: 'a'}"));
@@ -759,7 +767,7 @@ TEST(AggregationRequestTest, ShouldRejectInvalidCollectionUUID) {
 //
 
 TEST(AggregationRequestTest, ShouldRejectUnknownField) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj validRequest = fromjson(
         "{aggregate: 'collection', "
         "pipeline: [],"
@@ -773,7 +781,7 @@ TEST(AggregationRequestTest, ShouldRejectUnknownField) {
 }
 
 TEST(AggregationRequestTest, ShouldIgnoreQueryOptions) {
-    NamespaceString nss("a.collection");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
     const BSONObj inputBson = fromjson(
         "{aggregate: 'collection', pipeline: [{$match: {a: 'abc'}}], cursor: {}, $queryOptions: "
         "{}, $db: 'a'}");

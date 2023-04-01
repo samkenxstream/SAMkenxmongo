@@ -73,7 +73,8 @@ resumeToken = change._id;
 // Remove the fields we cannot predict, then test that the change is as expected.
 delete change._id;
 delete change.clusterTime;
-assert.docEq(change, expected);
+delete change.wallTime;
+assert.docEq(expected, change);
 
 jsTestLog("Testing watch() with pipeline");
 changeStreamCursor = coll.watch([{$project: {clusterTime: 1, docId: "$documentKey._id"}}]);

@@ -3,7 +3,6 @@
  * migration.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
@@ -12,24 +11,24 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    getTenantMigrationAccessBlocker,
+    makeX509OptionsForTest
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
 load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
 load('jstests/libs/parallel_shell_helpers.js');
 
-const kTenantIdPrefix = "testTenantId";
 // During "shard merge" tenant migrations, writes to internal DBs are still allowed.
 const kUnrelatedDbName = "admin";
 const collName = "foo";
-const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
+const migrationX509Options = makeX509OptionsForTest();
 
-let counter = 0;
 let makeTenantId = function() {
-    return kTenantIdPrefix + "-" + counter++;
+    return ObjectId().str;
 };
 
 function makeTestParams() {
@@ -52,8 +51,7 @@ function advanceClusterTime(conn, dbName, collName) {
 }
 
 function getBlockTimestamp(conn, tenantId) {
-    const mtabServerStatus =
-        TenantMigrationUtil.getTenantMigrationAccessBlocker({donorNode: conn, tenantId}).donor;
+    const mtabServerStatus = getTenantMigrationAccessBlocker({donorNode: conn, tenantId}).donor;
     assert(mtabServerStatus.blockTimestamp, tojson(mtabServerStatus));
     return mtabServerStatus.blockTimestamp;
 }
@@ -76,6 +74,7 @@ function setup() {
     const donorRst = new ReplSetTest({
         nodes: 3,
         name: "donor",
+        serverless: true,
         settings: {chainingAllowed: false},
         nodeOptions: Object.assign(migrationX509Options.donor, {
             setParameter: {
@@ -91,6 +90,7 @@ function setup() {
     const recipientRst = new ReplSetTest({
         nodes: 3,
         name: "recipient",
+        serverless: true,
         settings: {chainingAllowed: false},
         nodeOptions: migrationX509Options.recipient
     });
@@ -235,4 +235,3 @@ function setup() {
     awaitReadOnDonor();
     teardown();
 }
-})();

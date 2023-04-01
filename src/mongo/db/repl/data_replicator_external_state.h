@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/base/status_with.h"
+#include "mongo/db/repl/last_vote.h"
 #include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/oplog_buffer.h"
@@ -90,7 +91,7 @@ public:
      * Forwards the parsed metadata in the query results to the replication system.
      */
     virtual void processMetadata(const rpc::ReplSetMetadata& replMetadata,
-                                 rpc::OplogQueryMetadata oqMetadata) = 0;
+                                 const rpc::OplogQueryMetadata& oqMetadata) = 0;
 
     /**
      * Evaluates quality of sync source. Accepts the current sync source; the last optime on this
@@ -142,6 +143,12 @@ public:
      * Stores the replica set config document in local storage, or returns an error.
      */
     virtual Status storeLocalConfigDocument(OperationContext* opCtx, const BSONObj& config) = 0;
+
+    /**
+     * Returns the current stored replica set "last vote" if there is one, or an error why there
+     * isn't.
+     */
+    virtual StatusWith<LastVote> loadLocalLastVoteDocument(OperationContext* opCtx) const = 0;
 
     /**
      * Returns the replication journal listener.

@@ -26,20 +26,23 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/unittest/death_test.h"
+
+#include <cstdio>
 #include <fmt/format.h>
-#include <pcrecpp.h>
-#include <stdio.h>
 
 #include "mongo/bson/json.h"
-#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/temp_dir.h"
 #include "mongo/util/exit_code.h"
 
 #ifndef _WIN32
+#include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -58,7 +61,11 @@
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/debugger.h"
+#include "mongo/util/pcre_util.h"
 #include "mongo/util/quick_exit.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 #if defined(__has_feature)
 #if __has_feature(thread_sanitizer)
@@ -82,19 +89,20 @@ public:
     using std::runtime_error::runtime_error;
 };
 
-#define LOG_AND_THROW_WITH_ERRNO(expr) logAndThrowWithErrnoAt(expr, __FILE__, __LINE__, errno)
+#define LOG_AND_THROW_WITH_ERRNO(expr) logAndThrowWithErrnoAt(expr, __FILE__, __LINE__)
 
-void logAndThrowWithErrnoAt(StringData expr, StringData file, unsigned line, int err) {
+void logAndThrowWithErrnoAt(StringData expr, StringData file, unsigned line) {
+    auto ec = lastPosixError();
     LOGV2_ERROR(24138,
                 "{expr} failed: {error} @{file}:{line}",
                 "expression failed",
                 "expr"_attr = expr,
-                "error"_attr = errnoWithDescription(err),
+                "error"_attr = errorMessage(ec),
                 "file"_attr = file,
                 "line"_attr = line);
     breakpoint();
     throw DeathTestSyscallException(
-        "{} failed: {} @{}:{}"_format(expr, errnoWithDescription(err), file, line));
+        "{} failed: {} @{}:{}"_format(expr, errorMessage(ec), file, line));
 }
 
 
@@ -117,7 +125,7 @@ void initDeathTest() {
 #ifdef DEATH_TEST_ENABLED
 struct DeathTestBase::Subprocess {
     void run();
-    void execChild();
+    void execChild(std::string tempPath);
     void monitorChild(FILE* fromChild);
     void prepareChild(int (&pipes)[2]);
     void invokeTest();
@@ -154,6 +162,53 @@ int eintrLoop(F&& libcCall) {
             continue;
         return r;
     }
+}
+
+/**
+ * Reassign `arg0` (obtained from an `argv[0]`) with its full path.
+ * This is necessary to self-exec if this program was invoked through a `$PATH`
+ * lookup, such that `argv[0]` is just a basename. The `execve` used needs a
+ * pathname and does not consult the PATH.
+ *
+ * If `arg0` contains any '/' characters, then it didn't come from a PATH
+ * substitution, and is not changed.
+ *
+ * This reassignment is only attempted on Linux. This is simply because it's
+ * easy there to perform a realpath("/proc/self/exe") and find this
+ * program's executable pathname. Support for other OSes can be added as needed.
+ *
+ * Possibilities:
+ *   - "Finding current executable's path without /proc/self/exe"
+ *     [link](https://stackoverflow.com/questions/1023306)
+ *   - "What is the equivalent of /proc/self/exe on Macintosh OS X Mavericks?"
+ *     [link](https://stackoverflow.com/questions/22675457)
+ */
+void canonicalizeExe(std::string& arg0) {
+    // If it contains slashes, `orig` is already a pathname. It didn't come
+    // from a PATH search.
+    if (arg0.find('/') != std::string::npos) {
+        LOGV2_DEBUG(
+            7070500, 1, "Not changing executable pathname containing '/'", "arg0"_attr = arg0);
+        return;
+    }
+#ifdef __linux__
+    char* absPath = realpath("/proc/self/exe", nullptr);
+    if (!absPath) {
+        auto ec = lastPosixError();
+        LOGV2_WARNING(7070501,
+                      "Call to realpath failed. Not changing arg0",
+                      "arg0"_attr = arg0,
+                      "error"_attr = errorMessage(ec));
+        return;
+    }
+    ScopeGuard freeGuard = [&] {
+        free(absPath);
+    };
+    auto orig = std::exchange(arg0, std::string(absPath));
+    LOGV2_INFO(7070502, "Canonical executable pathname", "orig"_attr = orig, "arg0"_attr = arg0);
+#else
+    LOGV2_DEBUG(7070503, 1, "Recovery of executable pathname unimplemented", "arg0"_attr = arg0);
+#endif
 }
 
 /** Removes "--opt val" and "--opt=val" argument sequences from `av`. */
@@ -196,36 +251,44 @@ void DeathTestBase::Subprocess::run() {
     }
     LOGV2(6186001, "Child", "exec"_attr = doExec);
 
+    TempDir childTempPath{"DeathTestChildTempPath"};
+
     int pipes[2];
     THROWY_LIBC(pipe(pipes));
     if ((child = THROWY_LIBC(fork())) != 0) {
         THROWY_LIBC(close(pipes[1]));
         FILE* pf = THROWY_LIBC_IF(fdopen(pipes[0], "r"), [](FILE* f) { return !f; });
-        ScopeGuard pfGuard = [&] { THROWY_LIBC(fclose(pf)); };
+        ScopeGuard pfGuard = [&] {
+            THROWY_LIBC(fclose(pf));
+        };
         monitorChild(pf);
     } else {
         prepareChild(pipes);
         if (doExec) {
             // Go further: fully reboot the child with `execve`.
-            execChild();
+            execChild(childTempPath.release());
         } else {
+            TempDir::setTempPath(childTempPath.release());
             invokeTest();
         }
     }
 }
 
-void DeathTestBase::Subprocess::execChild() {
+void DeathTestBase::Subprocess::execChild(std::string tempPath) {
     auto& spawnInfo = getSpawnInfo();
     std::vector<std::string> av = spawnInfo.argVec;
+    canonicalizeExe(av[0]);
     // Arrange for the subprocess to execute only this test, exactly once.
     // Remove '--repeat' option. We want to repeat the whole death test not its child.
     stripOption(av, "repeat");
     stripOption(av, "suite");
     stripOption(av, "filter");
     stripOption(av, "filterFileName");
+    stripOption(av, "tempPath");
     const TestInfo* info = UnitTest::getInstance()->currentTestInfo();
     av.push_back("--suite={}"_format(info->suiteName()));
-    av.push_back("--filter=^{}$"_format(pcrecpp::RE::QuoteMeta(std::string{info->testName()})));
+    av.push_back("--filter=^{}$"_format(pcre_util::quoteMeta(info->testName())));
+    av.push_back("--tempPath={}"_format(tempPath));
     // The presence of this flag is how the test body in the child process knows it's in the
     // child process, and therefore to not exec again. Its value is ignored.
     av.push_back("--internalRunDeathTest=1");
@@ -242,11 +305,15 @@ void DeathTestBase::Subprocess::monitorChild(FILE* pf) {
     std::ostringstream os;
 
     LOGV2(5042601, "Death test starting");
-    ScopeGuard alwaysLogExit = [] { LOGV2(5042602, "Death test finishing"); };
+    ScopeGuard alwaysLogExit = [] {
+        LOGV2(5042602, "Death test finishing");
+    };
 
     char* lineBuf = nullptr;
     size_t lineBufSize = 0;
-    ScopeGuard lineBufGuard = [&] { free(lineBuf); };
+    ScopeGuard lineBufGuard = [&] {
+        free(lineBuf);
+    };
     while (true) {
         ssize_t bytesRead = eintrLoop([&] { return getline(&lineBuf, &lineBufSize, pf); });
         if (bytesRead == -1)
@@ -283,7 +350,7 @@ void DeathTestBase::Subprocess::monitorChild(FILE* pf) {
     if (WIFSIGNALED(stat) || (WIFEXITED(stat) && WEXITSTATUS(stat) != 0)) {
         // Exited with a signal or non-zero code. Validate the expected message.
 #if defined(TSAN_ENABLED_)
-        if (WEXITSTATUS(stat) == EXIT_THREAD_SANITIZER) {
+        if (WEXITSTATUS(stat) == static_cast<int>(ExitCode::threadSanitizer)) {
             FAIL(
                 "Death test exited with Thread Sanitizer exit code, search test output for "
                 "'ThreadSanitizer' for more information");
@@ -321,7 +388,7 @@ void DeathTestBase::Subprocess::prepareChild(int (&pipes)[2]) {
     // Our callback handler exits with the default TSAN exit code so we can check in the death test
     // framework Without this, the use could override the exit code and get a false positive that
     // the test passes in TSAN builds.
-    __sanitizer_set_death_callback(+[] { _exit(EXIT_THREAD_SANITIZER); });
+    __sanitizer_set_death_callback(+[] { _exit(static_cast<int>(ExitCode::threadSanitizer)); });
 #endif
 }
 
@@ -338,7 +405,7 @@ void DeathTestBase::Subprocess::invokeTest() {
     }
     // To fail the test, we must exit with a successful error code, because the parent process
     // is checking for the child to die with an exit code indicating an error.
-    quickExit(EXIT_SUCCESS);
+    quickExit(ExitCode::clean);
 }
 #endif  // DEATH_TEST_ENABLED
 

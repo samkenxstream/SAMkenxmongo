@@ -34,15 +34,47 @@
 namespace mongo {
 namespace repl {
 namespace {
-TEST(MakeSplitConfig, toBSONRoundTripAbility) {
-    ReplSetConfig configA;
-    ReplSetConfig configB;
+TEST(MakeSplitConfig, recipientConfigHasNewReplicaSetId) {
     const std::string recipientTagName{"recipient"};
     const auto donorReplSetId = OID::gen();
     const auto recipientMemberBSON =
         BSON("_id" << 1 << "host"
                    << "localhost:20002"
                    << "priority" << 0 << "votes" << 0 << "tags" << BSON(recipientTagName << "one"));
+
+    ReplSetConfig configA =
+        ReplSetConfig::parse(BSON("_id"
+                                  << "rs0"
+                                  << "version" << 1 << "protocolVersion" << 1 << "members"
+                                  << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                           << "localhost:12345")
+                                                << recipientMemberBSON)
+                                  << "settings"
+                                  << BSON("heartbeatIntervalMillis"
+                                          << 5000 << "heartbeatTimeoutSecs" << 20 << "replicaSetId"
+                                          << donorReplSetId)));
+
+    const std::string recipientConfigSetName{"newSet"};
+    const ReplSetConfig splitConfigResult =
+        serverless::makeSplitConfig(configA, recipientConfigSetName, recipientTagName);
+
+    ASSERT_EQ(splitConfigResult.getReplicaSetId(), donorReplSetId);
+    ASSERT_NE(splitConfigResult.getReplicaSetId(),
+              splitConfigResult.getRecipientConfig()->getReplicaSetId());
+    ASSERT_NE(splitConfigResult.getRecipientConfig()->getReplicaSetId(), OID());
+}
+
+TEST(MakeSplitConfig, toBSONRoundTripAbility) {
+    ReplSetConfig configA;
+    ReplSetConfig configB;
+    const std::string recipientTagName{"recipient"};
+    const auto donorReplSetId = OID::gen();
+    const auto recipientMemberBSON = BSON("_id" << 1 << "host"
+                                                << "localhost:20002"
+                                                << "priority" << 0 << "votes" << 0 << "tags"
+                                                << BSON(recipientTagName << "one"
+                                                                         << "k1"
+                                                                         << "v1"));
 
     configA = ReplSetConfig::parse(BSON("_id"
                                         << "rs0"
@@ -57,18 +89,26 @@ TEST(MakeSplitConfig, toBSONRoundTripAbility) {
     configB = ReplSetConfig::parse(configA.toBSON());
     ASSERT_TRUE(configA == configB);
 
+    const std::string recipientConfigSetName{"newSet"};
+    const ReplSetConfig splitConfigResult =
+        serverless::makeSplitConfig(configA, recipientConfigSetName, recipientTagName);
+
     // here we will test that the result from the method `makeSplitConfig` matches the hardcoded
     // resultSplitConfigBSON. We will also check that the recipient from the splitConfig matches
     // the hardcoded recipientConfig.
-    const std::string recipientConfigSetName{"newSet"};
     BSONObj resultRecipientConfigBSON = BSON(
         "_id" << recipientConfigSetName << "version" << 2 << "protocolVersion" << 1 << "members"
               << BSON_ARRAY(BSON("_id" << 0 << "host"
                                        << "localhost:20002"
                                        << "priority" << 1 << "votes" << 1 << "tags"
-                                       << BSON(recipientTagName << "one")))
+                                       << BSON("k1"
+                                               << "v1")))
               << "settings"
-              << BSON("heartbeatIntervalMillis" << 5000 << "heartbeatTimeoutSecs" << 20));
+              // we use getReplicaSetId to match the newly replicaSetId created from makeSplitConfig
+              // on the recipientConfig since configA had a replicaSetId in its config.
+              << BSON("heartbeatIntervalMillis"
+                      << 5000 << "heartbeatTimeoutSecs" << 20 << "replicaSetId"
+                      << splitConfigResult.getRecipientConfig()->getReplicaSetId()));
 
     BSONObj resultSplitConfigBSON = BSON("_id"
                                          << "rs0"
@@ -81,9 +121,6 @@ TEST(MakeSplitConfig, toBSONRoundTripAbility) {
                                                  << "replicaSetId" << donorReplSetId)
                                          << "recipientConfig" << resultRecipientConfigBSON);
 
-    const ReplSetConfig splitConfigResult =
-        serverless::makeSplitConfig(configA, recipientConfigSetName, recipientTagName);
-
     ASSERT_OK(splitConfigResult.validate());
     ASSERT_TRUE(splitConfigResult == ReplSetConfig::parse(splitConfigResult.toBSON()));
 
@@ -92,8 +129,6 @@ TEST(MakeSplitConfig, toBSONRoundTripAbility) {
     ASSERT_TRUE(splitConfigResult == resultSplitConfig);
 
     auto recipientConfigResultPtr = splitConfigResult.getRecipientConfig();
-    // we use getReplicaSetId to match the newly replicaSetId created from makeSplitConfig on the
-    // recipientConfig since configA had a replicaSetId in its config.
 
     ASSERT_TRUE(*recipientConfigResultPtr == ReplSetConfig::parse(resultRecipientConfigBSON));
 }
@@ -111,12 +146,13 @@ TEST(MakeSplitConfig, ValidateSplitConfigIntegrityTest) {
                                                     << "NY"))
                                  << BSON("_id" << 1 << "host"
                                                << "localhost:20002"
-                                               << "priority" << 0 << "votes" << 0 << "tags"
-                                               << BSON(recipientTagName << "one"))
+                                               << "priority" << 0 << "hidden" << true << "votes"
+                                               << 0 << "tags" << BSON(recipientTagName << "one"))
                                  << BSON("_id" << 2 << "host"
                                                << "localhost:20003"
                                                << "priority" << 6))
-                   << "settings" << BSON("electionTimeoutMillis" << 1000)));
+                   << "settings"
+                   << BSON("electionTimeoutMillis" << 1000 << "replicaSetId" << OID::gen())));
 
 
     const ReplSetConfig splitConfig =
@@ -125,6 +161,11 @@ TEST(MakeSplitConfig, ValidateSplitConfigIntegrityTest) {
     ASSERT_EQ(splitConfig.getReplSetName(), donorConfigSetName);
     ASSERT_TRUE(splitConfig.toBSON().hasField("members"));
     ASSERT_EQUALS(2, splitConfig.getNumMembers());
+
+    for (const auto& member : splitConfig.getRecipientConfig()->members()) {
+        ASSERT_FALSE(member.isHidden());
+    }
+
     ASSERT_TRUE(splitConfig.isSplitConfig());
 
     auto recipientConfigPtr = splitConfig.getRecipientConfig();
@@ -175,18 +216,19 @@ TEST(MakeSplitConfig, SplitConfigAssertionsTest) {
 }
 
 TEST(MakeSplitConfig, RecipientConfigValidationTest) {
-    std::vector<std::string> tenantIds = {"tenant1", "tenantAB"};
+    std::vector<TenantId> tenantIds = {TenantId(OID::gen()), TenantId(OID::gen())};
     std::string recipientSetName{"recipientSetName"};
     const std::string recipientTagName{"recipient"};
     const std::string donorConfigSetName{"rs0"};
     const std::string recipientConfigSetName{"newSet"};
 
     auto statedoc = ShardSplitDonorDocument::parse(
-        {"donor.document"},
-        BSON("_id" << UUID::gen() << "tenantIds" << tenantIds << "recipientTagName"
-                   << recipientTagName << "recipientSetName" << recipientSetName));
+        IDLParserContext{"donor.document"},
+        BSON("_id" << UUID::gen() << "recipientTagName" << recipientTagName << "recipientSetName"
+                   << recipientSetName));
+    statedoc.setTenantIds(tenantIds);
 
-    auto makeConfig = [&](auto setName, bool shouldVote, bool uniqueTagValue) {
+    auto makeConfig = [&](auto setName, bool shouldVote, bool uniqueTagValue, bool hidden) {
         auto vote = shouldVote ? 1 : 0;
         return ReplSetConfig::parse(BSON(
             "_id"
@@ -194,20 +236,21 @@ TEST(MakeSplitConfig, RecipientConfigValidationTest) {
             << BSON_ARRAY(
                    BSON("_id" << 0 << "host"
                               << "localhost:20001"
-                              << "priority" << 0 << "votes" << vote << "tags"
+                              << "priority" << 0 << "hidden" << hidden << "votes" << vote << "tags"
                               << BSON(recipientTagName
                                       << (uniqueTagValue ? UUID::gen().toString() : "") + "one"))
                    << BSON("_id" << 1 << "host"
                                  << "localhost:20002"
-                                 << "priority" << 0 << "votes" << vote << "tags"
+                                 << "priority" << 0 << "hidden" << hidden << "votes" << vote
+                                 << "tags"
                                  << BSON(recipientTagName
                                          << (uniqueTagValue ? UUID::gen().toString() : "") + "one"))
-                   << BSON(
-                          "_id" << 2 << "host"
-                                << "localhost:20003"
-                                << "priority" << 0 << "votes" << vote << "tags"
-                                << BSON(recipientTagName
-                                        << (uniqueTagValue ? UUID::gen().toString() : "") + "one")))
+                   << BSON("_id"
+                           << 2 << "host"
+                           << "localhost:20003"
+                           << "priority" << 0 << "hidden" << hidden << "votes" << vote << "tags"
+                           << BSON(recipientTagName
+                                   << (uniqueTagValue ? UUID::gen().toString() : "") + "one")))
             << "settings" << BSON("electionTimeoutMillis" << 1000)));
     };
 
@@ -215,7 +258,7 @@ TEST(MakeSplitConfig, RecipientConfigValidationTest) {
     auto recipientTagNameOptional = boost::make_optional<StringData>(recipientTagName);
 
     // Test we fail here because recipientSetName == localConfig.getReplSetName.
-    ReplSetConfig config = makeConfig(recipientSetName, false, true);
+    ReplSetConfig config = makeConfig(recipientSetName, false, true, true);
     ASSERT_EQ(serverless::validateRecipientNodesForShardSplit(statedoc, config).code(),
               ErrorCodes::BadValue);
 
@@ -235,19 +278,83 @@ TEST(MakeSplitConfig, RecipientConfigValidationTest) {
               ErrorCodes::InvalidReplicaSetConfig);
 
     // Test we fail since recipient tags don't have unique value associated.
-    config = makeConfig(donorConfigSetName, false, false);
+    config = makeConfig(donorConfigSetName, false, false, true);
     ASSERT_EQ(serverless::validateRecipientNodesForShardSplit(statedoc, config),
               ErrorCodes::InvalidOptions);
 
     // Test we fail since recipient nodes should be non-voting.
-    config = makeConfig(donorConfigSetName, true, true);
+    config = makeConfig(donorConfigSetName, true, true, true);
     ASSERT_EQ(serverless::validateRecipientNodesForShardSplit(statedoc, config),
               ErrorCodes::InvalidOptions);
 
-    config = makeConfig(donorConfigSetName, false, true);
+    // Test we fail since recipient nodes should be hidden.
+    config = makeConfig(donorConfigSetName, false, true, false);
+    ASSERT_EQ(serverless::validateRecipientNodesForShardSplit(statedoc, config),
+              ErrorCodes::InvalidOptions);
+
+    config = makeConfig(donorConfigSetName, false, true, true);
     ASSERT_OK(serverless::validateRecipientNodesForShardSplit(statedoc, config));
 }
 
+TEST(MakeRecipientConnectionString, StringCreationSuccess) {
+    std::string recipientSetName{"recipientSetName"};
+    const std::string recipientTagName{"recipient"};
+
+    auto config =
+        ReplSetConfig::parse(BSON("_id"
+                                  << "donorSetName"
+                                  << "version" << 1 << "protocolVersion" << 1 << "members"
+                                  << BSON_ARRAY(
+                                         BSON("_id" << 0 << "host"
+                                                    << "localhost:20001"
+                                                    << "priority" << 1 << "votes" << 1)
+                                         << BSON("_id" << 2 << "host"
+                                                       << "localhost:20004"
+                                                       << "priority" << 0 << "votes" << 0 << "tags"
+                                                       << BSON(recipientTagName << "one"))
+                                         << BSON("_id" << 3 << "host"
+                                                       << "localhost:20005"
+                                                       << "priority" << 0 << "votes" << 0 << "tags"
+                                                       << BSON(recipientTagName << "one"))
+                                         << BSON("_id" << 4 << "host"
+                                                       << "localhost:20006"
+                                                       << "priority" << 0 << "votes" << 0 << "tags"
+                                                       << BSON(recipientTagName << "one")))));
+
+    auto connectionString =
+        serverless::makeRecipientConnectionString(config, recipientTagName, recipientSetName);
+    ASSERT_EQ(connectionString.getServers().size(), 3);
+}
+
+TEST(MakeRecipientConnectionString, StringCreationFailure) {
+    std::string recipientSetName{"recipientSetName"};
+    const std::string recipientTagName{"recipient"};
+
+    auto config =
+        ReplSetConfig::parse(BSON("_id"
+                                  << "donorSetName"
+                                  << "version" << 1 << "protocolVersion" << 1 << "members"
+                                  << BSON_ARRAY(
+                                         BSON("_id" << 0 << "host"
+                                                    << "localhost:20001"
+                                                    << "priority" << 1 << "votes" << 1)
+                                         << BSON("_id" << 2 << "host"
+                                                       << "localhost:20004"
+                                                       << "priority" << 0 << "votes" << 0 << "tags"
+                                                       << BSON(recipientTagName << "one"))
+                                         << BSON("_id" << 3 << "host"
+                                                       << "localhost:20005"
+                                                       << "priority" << 0 << "votes" << 0 << "tags"
+                                                       << BSON(recipientTagName << "one")))));
+
+    ASSERT_THROWS_CODE(
+        serverless::makeRecipientConnectionString(config, recipientTagName, recipientSetName),
+        AssertionException,
+        ErrorCodes::BadValue);
+}
+
 }  // namespace
+
+
 }  // namespace repl
 }  // namespace mongo

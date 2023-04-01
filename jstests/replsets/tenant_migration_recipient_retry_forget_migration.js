@@ -2,30 +2,32 @@
  * Tests that a recipientForgetMigration is received after the recipient state doc has been deleted.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
+ *   # Shard merge protocol will be tested by
+ *   # tenant_migration_shard_merge_recipient_retry_forget_migration.js.
+ *   incompatible_with_shard_merge,
  *   requires_persistence,
  *   serverless,
+ *   # The currentOp output field 'state' was changed from an enum value to a string.
+ *   requires_fcv_70,
  * ]
  */
 
-(function() {
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {getCertificateAndPrivateKey} from "jstests/replsets/libs/tenant_migration_util.js";
 
-"use strict";
 load("jstests/libs/fail_point_util.js");  // For configureFailPoint().
 load("jstests/libs/parallelTester.js");   // For Thread()
 load("jstests/libs/uuid_util.js");        // For extractUUIDFromObject().
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
 const migrationId = UUID();
-const tenantId = 'testTenantId';
+const tenantId = ObjectId().str;
 const recipientCertificateForDonor =
-    TenantMigrationUtil.getCertificateAndPrivateKey("jstests/libs/tenant_migration_recipient.pem");
+    getCertificateAndPrivateKey("jstests/libs/tenant_migration_recipient.pem");
 
 const dbName = tenantMigrationTest.tenantDB(tenantId, "test");
 const collName = "coll";
@@ -75,7 +77,7 @@ let currOp = assert
                  .commandWorked(recipientPrimary.adminCommand(
                      {currentOp: true, desc: "tenant recipient migration"}))
                  .inprog[0];
-assert.eq(currOp.state, 3 /* kDone */, currOp);
+assert.eq(currOp.state, TenantMigrationTest.RecipientState.kDone, currOp);
 assert(!currOp.hasOwnProperty("expireAt"), currOp);
 
 // Test that we can still read from the recipient.
@@ -85,7 +87,7 @@ const newRecipientPrimary = tenantMigrationTest.getRecipientRst().getSecondary()
 const newPrimaryFp = configureFailPoint(newRecipientPrimary, "hangBeforeTaskCompletion");
 
 // Step up a new recipient primary before the state doc is truly marked as garbage collectable.
-assert.commandWorked(newRecipientPrimary.adminCommand({replSetStepUp: 1}));
+tenantMigrationTest.getRecipientRst().stepUp(newRecipientPrimary);
 fp.off();
 
 // The new primary should skip all tenant migration steps but wait for another
@@ -112,8 +114,7 @@ currOp = assert
              .commandWorked(newRecipientPrimary.adminCommand(
                  {currentOp: true, desc: "tenant recipient migration"}))
              .inprog[0];
-assert.eq(currOp.state, 3 /* kDone */, currOp);
+assert.eq(currOp.state, TenantMigrationTest.RecipientState.kDone, currOp);
 assert(currOp.hasOwnProperty("expireAt"), currOp);
 
 tenantMigrationTest.stop();
-})();

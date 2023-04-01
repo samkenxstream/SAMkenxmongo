@@ -327,8 +327,8 @@ test_one_set(WT_SESSION *session, TEST_SET set)
         search_using_item(cursor, set, i);
     testutil_check(cursor->close(cursor));
 
-    testutil_drop(session, "table:main", NULL);
-    testutil_drop(session, "table:main2", NULL);
+    WT_OP_CHECKPOINT_WAIT(session, session->drop(session, "table:main", NULL));
+    WT_OP_CHECKPOINT_WAIT(session, session->drop(session, "table:main2", NULL));
 }
 
 /*
@@ -347,7 +347,8 @@ main(int argc, char *argv[])
     testutil_check(testutil_parse_opts(argc, argv, opts));
     testutil_make_work_dir(opts->home);
 
-    testutil_check(wiredtiger_open(opts->home, NULL, "create", &opts->conn));
+    testutil_check(wiredtiger_open(opts->home, NULL,
+      "create,statistics=(all),statistics_log=(json,on_close,wait=1)", &opts->conn));
     testutil_check(opts->conn->open_session(opts->conn, NULL, NULL, &session));
 
     /* Add any collators and extractors used by tests */

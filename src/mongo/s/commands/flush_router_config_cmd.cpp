@@ -27,14 +27,17 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/is_mongos.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -65,16 +68,20 @@ public:
                "{flushRouterconfig: 'db.coll'} flushes only the given collection";
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::flushRouterConfig);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                  ActionType::flushRouterConfig)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         auto const grid = Grid::get(opCtx);
@@ -101,8 +108,10 @@ public:
                 LOGV2(22763,
                       "Routing metadata flushed for collection {namespace}",
                       "Routing metadata flushed for collection",
-                      "namespace"_attr = nss);
+                      logAttrs(nss));
                 catalogCache->invalidateCollectionEntry_LINEARIZABLE(nss);
+                LOGV2(7343300, "Index information flushed for collection", logAttrs(nss));
+                catalogCache->invalidateIndexEntry_LINEARIZABLE(nss);
             }
         }
 

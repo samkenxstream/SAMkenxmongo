@@ -115,12 +115,25 @@ void MatchExpression::sortTree(MatchExpression* tree) {
 }
 
 // static
-bool MatchExpression::parameterize(MatchExpression* tree) {
+std::vector<const MatchExpression*> MatchExpression::parameterize(
+    MatchExpression* tree, boost::optional<size_t> maxParameterCount) {
     MatchExpressionParameterizationVisitorContext context{};
     MatchExpressionParameterizationVisitor visitor{&context};
     MatchExpressionParameterizationWalker walker{&visitor};
     tree_walker::walk<false, MatchExpression>(tree, &walker);
-    return context.hasAssignedParameters();
+
+    // If the number of parameters exceed the maxParameterCount limit, we need to clear all ParamIds
+    // that were set on expression nodes.
+    //
+    // The alternative could be to count the parameters first and then set the ParamIds, but that
+    // would result in performing always two passes, rather than just one pass in a happy case.
+    if (maxParameterCount && context.inputParamIdToExpressionMap.size() > *maxParameterCount) {
+        context.revertMode = true;
+        context.inputParamIdToExpressionMap.clear();
+        tree_walker::walk<false, MatchExpression>(tree, &walker);
+    }
+
+    return std::move(context.inputParamIdToExpressionMap);
 }
 
 std::string MatchExpression::toString() const {
@@ -156,25 +169,6 @@ void MatchExpression::setCollator(const CollatorInterface* collator) {
     _doSetCollator(collator);
 }
 
-void MatchExpression::addDependencies(DepsTracker* deps) const {
-    for (size_t i = 0; i < numChildren(); ++i) {
-
-        // Don't recurse through MatchExpression nodes which require an entire array or entire
-        // subobject for matching.
-        const auto type = matchType();
-        switch (type) {
-            case MatchExpression::ELEM_MATCH_VALUE:
-            case MatchExpression::ELEM_MATCH_OBJECT:
-            case MatchExpression::INTERNAL_SCHEMA_OBJECT_MATCH:
-                continue;
-            default:
-                getChild(i)->addDependencies(deps);
-        }
-    }
-
-    _doAddDependencies(deps);
-}
-
 MatchExpression::ErrorAnnotation::SchemaAnnotations::SchemaAnnotations(
     const BSONObj& jsonSchemaElement) {
     auto title = jsonSchemaElement[JSONSchemaParser::kSchemaTitleKeyword];
@@ -191,11 +185,11 @@ MatchExpression::ErrorAnnotation::SchemaAnnotations::SchemaAnnotations(
 void MatchExpression::ErrorAnnotation::SchemaAnnotations::appendElements(
     BSONObjBuilder& builder) const {
     if (title) {
-        builder << JSONSchemaParser::kSchemaTitleKeyword << title.get();
+        builder << JSONSchemaParser::kSchemaTitleKeyword << title.value();
     }
 
     if (description) {
-        builder << JSONSchemaParser::kSchemaDescriptionKeyword << description.get();
+        builder << JSONSchemaParser::kSchemaDescriptionKeyword << description.value();
     }
 }
 }  // namespace mongo

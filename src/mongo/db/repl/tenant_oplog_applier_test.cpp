@@ -27,32 +27,38 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
-
 #include "mongo/platform/basic.h"
 
 #include <algorithm>
-#include <boost/optional/optional_io.hpp>
 #include <vector>
 
-#include "mongo/db/logical_session_id_helpers.h"
-#include "mongo/db/op_observer_noop.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/op_observer/op_observer_noop.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/repl/oplog_applier_impl_test_fixture.h"
 #include "mongo/db/repl/oplog_batcher_test_fixture.h"
 #include "mongo/db/repl/oplog_entry_test_helpers.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_registry.h"
 #include "mongo/db/repl/tenant_migration_decoration.h"
+#include "mongo/db/repl/tenant_migration_recipient_access_blocker.h"
 #include "mongo/db/repl/tenant_migration_recipient_service.h"
 #include "mongo/db/repl/tenant_oplog_applier.h"
 #include "mongo/db/repl/tenant_oplog_batcher.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
+#include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/logv2/log.h"
 #include "mongo/unittest/log_test.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
 
@@ -86,7 +92,7 @@ public:
         } else {
             oplogEntry.setOpTime(getNextOpTime(opCtx));
         }
-        const auto& recipientInfo = tenantMigrationRecipientInfo(opCtx);
+        const auto& recipientInfo = tenantMigrationInfo(opCtx);
         if (recipientInfo) {
             oplogEntry.setFromTenantMigration(recipientInfo->uuid);
         }
@@ -114,8 +120,6 @@ private:
     std::vector<MutableOplogEntry> _entries;
 };
 
-constexpr auto dbName = "tenant_test"_sd;
-
 class TenantOplogApplierTest : public ServiceContextMongoDTest {
 public:
     void setUp() override {
@@ -136,7 +140,9 @@ public:
         auto network = std::make_unique<executor::NetworkInterfaceMock>();
         _net = network.get();
         executor::ThreadPoolMock::Options thread_pool_options;
-        thread_pool_options.onCreateThread = [] { Client::initThread("TenantOplogApplier"); };
+        thread_pool_options.onCreateThread = [] {
+            Client::initThread("TenantOplogApplier");
+        };
         _executor = makeSharedThreadPoolTestExecutor(std::move(network), thread_pool_options);
         _executor->startup();
         _oplogBuffer.startup(nullptr);
@@ -151,6 +157,11 @@ public:
         // for a write.
         _opCtx = cc().makeOperationContext();
         repl::createOplog(_opCtx.get());
+
+        MongoDSessionCatalog::set(
+            service,
+            std::make_unique<MongoDSessionCatalog>(
+                std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
 
         // Ensure that we are primary.
         auto replCoord = ReplicationCoordinator::get(_opCtx.get());
@@ -185,7 +196,8 @@ protected:
     OplogBufferMock _oplogBuffer;
     executor::NetworkInterfaceMock* _net;
     std::shared_ptr<executor::ThreadPoolTaskExecutor> _executor;
-    std::string _tenantId = "tenant";
+    std::string _tenantId = OID::gen().toString();
+    DatabaseName _dbName = DatabaseName(TenantId(OID(_tenantId)), "test");
     UUID _migrationUuid = UUID::gen();
     ServiceContext::UniqueOperationContext _opCtx;
     TenantOplogApplierTestOpObserver* _opObserver;  // Owned by service context opObserverRegistry
@@ -197,16 +209,30 @@ private:
         logv2::LogComponent::kTenantMigration, logv2::LogSeverity::Debug(1)};
 };
 
+// TODO SERVER-70007: Construct the DatabaseName object for these tests with the tenantId as the
+// prefix.
 TEST_F(TenantOplogApplierTest, NoOpsForSingleBatch) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "foo"), UUID::gen()));
-    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar"), UUID::gen()));
+    srcOps.push_back(makeInsertOplogEntry(
+        1,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "foo"),
+        UUID::gen()));
+    srcOps.push_back(makeInsertOplogEntry(
+        2,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar"),
+        UUID::gen()));
     pushOps(srcOps);
 
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     // Even if we wait for the first op in a batch, it is the last op we should be notified on.
     auto lastBatchTimes = applier->getNotificationForOpTime(srcOps.front().getOpTime()).get();
@@ -225,14 +251,23 @@ TEST_F(TenantOplogApplierTest, NoOpsForLargeBatch) {
     std::vector<OplogEntry> srcOps;
     // This should be big enough to use several threads to do the writing
     for (int i = 0; i < 64; i++) {
-        srcOps.push_back(makeInsertOplogEntry(i + 1, NamespaceString(dbName, "foo"), UUID::gen()));
+        srcOps.push_back(makeInsertOplogEntry(
+            i + 1,
+            NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "foo"),
+            UUID::gen()));
     }
     pushOps(srcOps);
 
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     // Even if we wait for the first op in a batch, it is the last op we should be notified on.
     auto lastBatchTimes = applier->getNotificationForOpTime(srcOps.front().getOpTime()).get();
@@ -250,15 +285,33 @@ TEST_F(TenantOplogApplierTest, NoOpsForLargeBatch) {
 
 TEST_F(TenantOplogApplierTest, NoOpsForMultipleBatches) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "foo"), UUID::gen()));
-    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar"), UUID::gen()));
-    srcOps.push_back(makeInsertOplogEntry(3, NamespaceString(dbName, "baz"), UUID::gen()));
-    srcOps.push_back(makeInsertOplogEntry(4, NamespaceString(dbName, "bif"), UUID::gen()));
+    srcOps.push_back(makeInsertOplogEntry(
+        1,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "foo"),
+        UUID::gen()));
+    srcOps.push_back(makeInsertOplogEntry(
+        2,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar"),
+        UUID::gen()));
+    srcOps.push_back(makeInsertOplogEntry(
+        3,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "baz"),
+        UUID::gen()));
+    srcOps.push_back(makeInsertOplogEntry(
+        4,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bif"),
+        UUID::gen()));
 
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
 
     tenantApplierBatchSizeBytes.store(100 * 1024 /* bytes */);
     tenantApplierBatchSizeOps.store(2 /* ops */);
@@ -283,24 +336,48 @@ TEST_F(TenantOplogApplierTest, NoOpsForMultipleBatches) {
 
 TEST_F(TenantOplogApplierTest, NoOpsForLargeTransaction) {
     std::vector<OplogEntry> innerOps1;
-    innerOps1.push_back(makeInsertOplogEntry(11, NamespaceString(dbName, "bar"), UUID::gen()));
-    innerOps1.push_back(makeInsertOplogEntry(12, NamespaceString(dbName, "bar"), UUID::gen()));
+    innerOps1.push_back(makeInsertOplogEntry(
+        11,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar"),
+        UUID::gen()));
+    innerOps1.push_back(makeInsertOplogEntry(
+        12,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar"),
+        UUID::gen()));
     std::vector<OplogEntry> innerOps2;
-    innerOps2.push_back(makeInsertOplogEntry(21, NamespaceString(dbName, "bar"), UUID::gen()));
-    innerOps2.push_back(makeInsertOplogEntry(22, NamespaceString(dbName, "bar"), UUID::gen()));
+    innerOps2.push_back(makeInsertOplogEntry(
+        21,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar"),
+        UUID::gen()));
+    innerOps2.push_back(makeInsertOplogEntry(
+        22,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar"),
+        UUID::gen()));
     std::vector<OplogEntry> innerOps3;
-    innerOps3.push_back(makeInsertOplogEntry(31, NamespaceString(dbName, "bar"), UUID::gen()));
-    innerOps3.push_back(makeInsertOplogEntry(32, NamespaceString(dbName, "bar"), UUID::gen()));
+    innerOps3.push_back(makeInsertOplogEntry(
+        31,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar"),
+        UUID::gen()));
+    innerOps3.push_back(makeInsertOplogEntry(
+        32,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar"),
+        UUID::gen()));
 
     // Makes entries with ts from range [2, 5).
     std::vector<OplogEntry> srcOps = makeMultiEntryTransactionOplogEntries(
-        2, dbName, /* prepared */ false, {innerOps1, innerOps2, innerOps3});
+        2, _dbName.db(), /* prepared */ false, {innerOps1, innerOps2, innerOps3});
     pushOps(srcOps);
 
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     // The first two ops should come in the first batch.
     auto firstBatchFuture = applier->getNotificationForOpTime(srcOps[0].getOpTime());
@@ -320,7 +397,13 @@ TEST_F(TenantOplogApplierTest, NoOpsForLargeTransaction) {
 
 TEST_F(TenantOplogApplierTest, CommitUnpreparedTransaction_DataPartiallyApplied) {
     createCollectionWithUuid(_opCtx.get(), NamespaceString::kSessionTransactionsTableNamespace);
-    NamespaceString nss(dbName, "bar");
+    {
+        DBDirectClient client(_opCtx.get());
+        client.createIndexes(NamespaceString::kSessionTransactionsTableNamespace,
+                             {MongoDSessionCatalog::getConfigTxnPartialIndexSpec()});
+    }
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
     auto lsid = makeLogicalSessionId(_opCtx.get());
     TxnNumber txnNum(0);
@@ -357,8 +440,14 @@ TEST_F(TenantOplogApplierTest, CommitUnpreparedTransaction_DataPartiallyApplied)
     pushOps({partialOp, commitOp});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(commitOp.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -372,16 +461,26 @@ TEST_F(TenantOplogApplierTest, CommitUnpreparedTransaction_DataPartiallyApplied)
 }
 
 TEST_F(TenantOplogApplierTest, ApplyInsert_DatabaseMissing) {
-    auto entry = makeInsertOplogEntry(1, NamespaceString(dbName, "bar"), UUID::gen());
+    auto entry = makeInsertOplogEntry(
+        1,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar"),
+        UUID::gen());
     bool onInsertsCalled = false;
-    _opObserver->onInsertsFn = [&](OperationContext* opCtx,
-                                   const NamespaceString&,
-                                   const std::vector<BSONObj>&) { onInsertsCalled = true; };
+    _opObserver->onInsertsFn =
+        [&](OperationContext* opCtx, const NamespaceString&, const std::vector<BSONObj>&) {
+            onInsertsCalled = true;
+        };
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -393,17 +492,27 @@ TEST_F(TenantOplogApplierTest, ApplyInsert_DatabaseMissing) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyInsert_CollectionMissing) {
-    createDatabase(_opCtx.get(), dbName);
-    auto entry = makeInsertOplogEntry(1, NamespaceString(dbName, "bar"), UUID::gen());
+    createDatabase(_opCtx.get(), _dbName.toString());
+    auto entry = makeInsertOplogEntry(
+        1,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar"),
+        UUID::gen());
     bool onInsertsCalled = false;
-    _opObserver->onInsertsFn = [&](OperationContext* opCtx,
-                                   const NamespaceString&,
-                                   const std::vector<BSONObj>&) { onInsertsCalled = true; };
+    _opObserver->onInsertsFn =
+        [&](OperationContext* opCtx, const NamespaceString&, const std::vector<BSONObj>&) {
+            onInsertsCalled = true;
+        };
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -415,7 +524,8 @@ TEST_F(TenantOplogApplierTest, ApplyInsert_CollectionMissing) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyInsert_InsertExisting) {
-    NamespaceString nss(dbName, "bar");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
     ASSERT_OK(getStorageInterface()->insertDocument(_opCtx.get(),
                                                     nss,
@@ -425,17 +535,23 @@ TEST_F(TenantOplogApplierTest, ApplyInsert_InsertExisting) {
     auto entry = makeInsertOplogEntry(1, nss, uuid);
     bool onInsertsCalled = false;
     bool onUpdateCalled = false;
-    _opObserver->onInsertsFn = [&](OperationContext* opCtx,
-                                   const NamespaceString&,
-                                   const std::vector<BSONObj>&) { onInsertsCalled = true; };
+    _opObserver->onInsertsFn =
+        [&](OperationContext* opCtx, const NamespaceString&, const std::vector<BSONObj>&) {
+            onInsertsCalled = true;
+        };
     _opObserver->onUpdateFn = [&](OperationContext* opCtx, const OplogUpdateEntryArgs&) {
         onUpdateCalled = true;
     };
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
-
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -448,7 +564,8 @@ TEST_F(TenantOplogApplierTest, ApplyInsert_InsertExisting) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyInsert_UniqueKey_InsertExisting) {
-    NamespaceString nss(dbName, "bar");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
 
     // Create unique key index on the collection.
@@ -464,14 +581,21 @@ TEST_F(TenantOplogApplierTest, ApplyInsert_UniqueKey_InsertExisting) {
     auto entry =
         makeOplogEntry(repl::OpTypeEnum::kInsert, nss, uuid, BSON("_id" << 1 << "data" << 2));
     bool onInsertsCalled = false;
-    _opObserver->onInsertsFn = [&](OperationContext* opCtx,
-                                   const NamespaceString&,
-                                   const std::vector<BSONObj>&) { onInsertsCalled = true; };
+    _opObserver->onInsertsFn =
+        [&](OperationContext* opCtx, const NamespaceString&, const std::vector<BSONObj>&) {
+            onInsertsCalled = true;
+        };
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -483,7 +607,8 @@ TEST_F(TenantOplogApplierTest, ApplyInsert_UniqueKey_InsertExisting) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyInsert_Success) {
-    NamespaceString nss(dbName, "bar");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
     auto entry = makeInsertOplogEntry(1, nss, uuid);
     bool onInsertsCalled = false;
@@ -491,7 +616,9 @@ TEST_F(TenantOplogApplierTest, ApplyInsert_Success) {
         [&](OperationContext* opCtx, const NamespaceString& nss, const std::vector<BSONObj>& docs) {
             ASSERT_FALSE(onInsertsCalled);
             onInsertsCalled = true;
-            ASSERT_EQUALS(nss.db(), dbName);
+            // TODO Check that (nss.dbName() == _dbName) once the OplogEntry deserializer passes
+            // "tid" to the NamespaceString constructor
+            ASSERT_EQUALS(nss.dbName().db(), _dbName.toStringWithTenantId());
             ASSERT_EQUALS(nss.coll(), "bar");
             ASSERT_EQUALS(1, docs.size());
             ASSERT_BSONOBJ_EQ(docs[0], entry.getObject());
@@ -499,8 +626,14 @@ TEST_F(TenantOplogApplierTest, ApplyInsert_Success) {
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -513,9 +646,11 @@ TEST_F(TenantOplogApplierTest, ApplyInsert_Success) {
 TEST_F(TenantOplogApplierTest, ApplyInserts_Grouped) {
     // TODO(SERVER-50256): remove nss_workaround, which is used to work around a bug where
     // the first operation assigned to a worker cannot be grouped.
-    NamespaceString nss_workaround(dbName, "a");
-    NamespaceString nss1(dbName, "bar");
-    NamespaceString nss2(dbName, "baz");
+    NamespaceString nss_workaround(_dbName.toStringWithTenantId(), "a");
+    NamespaceString nss1 =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar");
+    NamespaceString nss2 =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "baz");
     auto uuid1 = createCollectionWithUuid(_opCtx.get(), nss1);
     auto uuid2 = createCollectionWithUuid(_opCtx.get(), nss2);
     std::vector<OplogEntry> entries;
@@ -554,8 +689,14 @@ TEST_F(TenantOplogApplierTest, ApplyInserts_Grouped) {
     // Make sure all ops end up in a single thread so they can be batched.
     auto writerPool = makeTenantMigrationWriterPool(1);
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entries.back().getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -567,23 +708,35 @@ TEST_F(TenantOplogApplierTest, ApplyInserts_Grouped) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyUpdate_MissingDocument) {
-    NamespaceString nss(dbName, "bar");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
-    auto entry = makeOplogEntry(
-        repl::OpTypeEnum::kUpdate, nss, uuid, BSON("$set" << BSON("a" << 1)), BSON("_id" << 0));
+    auto entry = makeOplogEntry(repl::OpTypeEnum::kUpdate,
+                                nss,
+                                uuid,
+                                update_oplog_entry::makeDeltaOplogEntry(
+                                    BSON(doc_diff::kUpdateSectionFieldName << fromjson("{a: 1}"))),
+                                BSON("_id" << 0));
     bool onInsertsCalled = false;
     bool onUpdateCalled = false;
-    _opObserver->onInsertsFn = [&](OperationContext* opCtx,
-                                   const NamespaceString& nss,
-                                   const std::vector<BSONObj>& docs) { onInsertsCalled = true; };
+    _opObserver->onInsertsFn =
+        [&](OperationContext* opCtx, const NamespaceString& nss, const std::vector<BSONObj>& docs) {
+            onInsertsCalled = true;
+        };
     _opObserver->onUpdateFn = [&](OperationContext* opCtx, const OplogUpdateEntryArgs&) {
         onUpdateCalled = true;
     };
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -596,22 +749,33 @@ TEST_F(TenantOplogApplierTest, ApplyUpdate_MissingDocument) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyUpdate_Success) {
-    NamespaceString nss(dbName, "bar");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
     ASSERT_OK(getStorageInterface()->insertDocument(_opCtx.get(), nss, {BSON("_id" << 0)}, 0));
-    auto entry = makeOplogEntry(
-        repl::OpTypeEnum::kUpdate, nss, uuid, BSON("$set" << BSON("a" << 1)), BSON("_id" << 0));
+    auto entry = makeOplogEntry(repl::OpTypeEnum::kUpdate,
+                                nss,
+                                uuid,
+                                update_oplog_entry::makeDeltaOplogEntry(
+                                    BSON(doc_diff::kUpdateSectionFieldName << fromjson("{a: 1}"))),
+                                BSON("_id" << 0));
     bool onUpdateCalled = false;
     _opObserver->onUpdateFn = [&](OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
         onUpdateCalled = true;
-        ASSERT_EQUALS(nss, args.nss);
-        ASSERT_EQUALS(uuid, args.uuid);
+        ASSERT_EQUALS(nss, args.coll->ns());
+        ASSERT_EQUALS(uuid, args.coll->uuid());
     };
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -622,18 +786,26 @@ TEST_F(TenantOplogApplierTest, ApplyUpdate_Success) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyDelete_DatabaseMissing) {
-    auto entry = makeOplogEntry(OpTypeEnum::kDelete, NamespaceString(dbName, "bar"), UUID::gen());
+    auto entry = makeOplogEntry(
+        OpTypeEnum::kDelete,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar"),
+        UUID::gen());
     bool onDeleteCalled = false;
-    _opObserver->onDeleteFn = [&](OperationContext* opCtx,
-                                  const NamespaceString&,
-                                  boost::optional<UUID>,
-                                  StmtId,
-                                  const OplogDeleteEntryArgs&) { onDeleteCalled = true; };
+    _opObserver->onDeleteFn =
+        [&](OperationContext* opCtx, const CollectionPtr&, StmtId, const OplogDeleteEntryArgs&) {
+            onDeleteCalled = true;
+        };
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -645,19 +817,27 @@ TEST_F(TenantOplogApplierTest, ApplyDelete_DatabaseMissing) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyDelete_CollectionMissing) {
-    createDatabase(_opCtx.get(), dbName);
-    auto entry = makeOplogEntry(OpTypeEnum::kDelete, NamespaceString(dbName, "bar"), UUID::gen());
+    createDatabase(_opCtx.get(), _dbName.toString());
+    auto entry = makeOplogEntry(
+        OpTypeEnum::kDelete,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar"),
+        UUID::gen());
     bool onDeleteCalled = false;
-    _opObserver->onDeleteFn = [&](OperationContext* opCtx,
-                                  const NamespaceString&,
-                                  boost::optional<UUID>,
-                                  StmtId,
-                                  const OplogDeleteEntryArgs&) { onDeleteCalled = true; };
+    _opObserver->onDeleteFn =
+        [&](OperationContext* opCtx, const CollectionPtr&, StmtId, const OplogDeleteEntryArgs&) {
+            onDeleteCalled = true;
+        };
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -669,20 +849,26 @@ TEST_F(TenantOplogApplierTest, ApplyDelete_CollectionMissing) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyDelete_DocumentMissing) {
-    NamespaceString nss(dbName, "bar");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
     auto entry = makeOplogEntry(OpTypeEnum::kDelete, nss, uuid, BSON("_id" << 0));
     bool onDeleteCalled = false;
-    _opObserver->onDeleteFn = [&](OperationContext* opCtx,
-                                  const NamespaceString&,
-                                  boost::optional<UUID>,
-                                  StmtId,
-                                  const OplogDeleteEntryArgs&) { onDeleteCalled = true; };
+    _opObserver->onDeleteFn =
+        [&](OperationContext* opCtx, const CollectionPtr&, StmtId, const OplogDeleteEntryArgs&) {
+            onDeleteCalled = true;
+        };
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -694,31 +880,39 @@ TEST_F(TenantOplogApplierTest, ApplyDelete_DocumentMissing) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyDelete_Success) {
-    NamespaceString nss(dbName, "bar");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
     ASSERT_OK(getStorageInterface()->insertDocument(_opCtx.get(), nss, {BSON("_id" << 0)}, 0));
     auto entry = makeOplogEntry(OpTypeEnum::kDelete, nss, uuid, BSON("_id" << 0));
     bool onDeleteCalled = false;
     _opObserver->onDeleteFn = [&](OperationContext* opCtx,
-                                  const NamespaceString& nss,
-                                  const boost::optional<UUID>& observer_uuid,
+                                  const CollectionPtr& coll,
                                   StmtId,
                                   const OplogDeleteEntryArgs& args) {
         onDeleteCalled = true;
         ASSERT_TRUE(opCtx);
-        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
+        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.dbName(), MODE_IX));
         ASSERT_TRUE(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IX));
         ASSERT_TRUE(opCtx->writesAreReplicated());
         ASSERT_FALSE(args.fromMigrate);
-        ASSERT_EQUALS(nss.db(), dbName);
+        // TODO SERVER-70007 Check that (nss.dbName() == _dbName) once the OplogEntry deserializer
+        // passes "tid" to the NamespaceString constructor
+        ASSERT_EQUALS(nss.dbName().db(), _dbName.toStringWithTenantId());
         ASSERT_EQUALS(nss.coll(), "bar");
-        ASSERT_EQUALS(uuid, observer_uuid);
+        ASSERT_EQUALS(uuid, coll->uuid());
     };
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -729,7 +923,8 @@ TEST_F(TenantOplogApplierTest, ApplyDelete_Success) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyCreateCollCommand_CollExisting) {
-    NamespaceString nss(dbName, "bar");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
     auto op = BSON("op"
                    << "c"
@@ -740,13 +935,21 @@ TEST_F(TenantOplogApplierTest, ApplyCreateCollCommand_CollExisting) {
                                             const CollectionPtr&,
                                             const NamespaceString& collNss,
                                             const CollectionOptions&,
-                                            const BSONObj&) { applyCmdCalled = true; };
+                                            const BSONObj&) {
+        applyCmdCalled = true;
+    };
     auto entry = OplogEntry(op);
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -758,8 +961,10 @@ TEST_F(TenantOplogApplierTest, ApplyCreateCollCommand_CollExisting) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyRenameCollCommand_CollExisting) {
-    NamespaceString nss1(dbName, "foo");
-    NamespaceString nss2(dbName, "bar");
+    NamespaceString nss1 =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "foo");
+    NamespaceString nss2 =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss2);
     auto op =
         BSON("op"
@@ -774,13 +979,21 @@ TEST_F(TenantOplogApplierTest, ApplyRenameCollCommand_CollExisting) {
                                             const boost::optional<UUID>& uuid,
                                             const boost::optional<UUID>& dropTargetUUID,
                                             std::uint64_t numRecords,
-                                            bool stayTemp) { applyCmdCalled = true; };
+                                            bool stayTemp) {
+        applyCmdCalled = true;
+    };
     auto entry = OplogEntry(op);
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -792,7 +1005,8 @@ TEST_F(TenantOplogApplierTest, ApplyRenameCollCommand_CollExisting) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyCreateCollCommand_Success) {
-    NamespaceString nss(dbName, "t");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "t");
     auto op =
         BSON("op"
              << "c"
@@ -806,7 +1020,7 @@ TEST_F(TenantOplogApplierTest, ApplyCreateCollCommand_Success) {
                                             const BSONObj&) {
         applyCmdCalled = true;
         ASSERT_TRUE(opCtx);
-        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
+        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.dbName(), MODE_IX));
         ASSERT_TRUE(opCtx->writesAreReplicated());
         ASSERT_EQUALS(nss, collNss);
     };
@@ -814,8 +1028,14 @@ TEST_F(TenantOplogApplierTest, ApplyCreateCollCommand_Success) {
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -826,7 +1046,8 @@ TEST_F(TenantOplogApplierTest, ApplyCreateCollCommand_Success) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyCreateIndexesCommand_Success) {
-    NamespaceString nss(dbName, "t");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "t");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
     auto op =
         BSON("op"
@@ -843,7 +1064,7 @@ TEST_F(TenantOplogApplierTest, ApplyCreateIndexesCommand_Success) {
                                        bool fromMigrate) {
         ASSERT_FALSE(applyCmdCalled);
         applyCmdCalled = true;
-        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
+        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(nss.dbName(), MODE_IX));
         ASSERT_TRUE(opCtx->writesAreReplicated());
         ASSERT_BSONOBJ_EQ(indexDoc,
                           BSON("v" << 2 << "key" << BSON("a" << 1) << "name"
@@ -855,8 +1076,14 @@ TEST_F(TenantOplogApplierTest, ApplyCreateIndexesCommand_Success) {
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -867,7 +1094,8 @@ TEST_F(TenantOplogApplierTest, ApplyCreateIndexesCommand_Success) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyStartIndexBuildCommand_Failure) {
-    NamespaceString nss(dbName, "t");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "t");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
     auto op = BSON("op"
                    << "c"
@@ -880,8 +1108,14 @@ TEST_F(TenantOplogApplierTest, ApplyStartIndexBuildCommand_Failure) {
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_EQUALS(opAppliedFuture.getNoThrow().getStatus().code(), 5434700);
@@ -892,7 +1126,7 @@ TEST_F(TenantOplogApplierTest, ApplyStartIndexBuildCommand_Failure) {
 
 TEST_F(TenantOplogApplierTest, ApplyCreateCollCommand_WrongNSS) {
     // Should not be able to apply a command in the wrong namespace.
-    NamespaceString nss("notmytenant", "t");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("notmytenant", "t");
     auto op =
         BSON("op"
              << "c"
@@ -903,13 +1137,21 @@ TEST_F(TenantOplogApplierTest, ApplyCreateCollCommand_WrongNSS) {
                                             const CollectionPtr&,
                                             const NamespaceString& collNss,
                                             const CollectionOptions&,
-                                            const BSONObj&) { applyCmdCalled = true; };
+                                            const BSONObj&) {
+        applyCmdCalled = true;
+    };
     auto entry = OplogEntry(op);
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_NOT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -919,8 +1161,45 @@ TEST_F(TenantOplogApplierTest, ApplyCreateCollCommand_WrongNSS) {
     applier->join();
 }
 
+TEST_F(TenantOplogApplierTest, ApplyCreateCollCommand_WrongNSS_Merge) {
+    // Should not be able to apply a command in the wrong namespace.
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("noTenantDB", "t");
+    auto op =
+        BSON("op"
+             << "c"
+             << "ns" << nss.getCommandNS().ns() << "wall" << Date_t() << "o"
+             << BSON("create" << nss.coll()) << "ts" << Timestamp(1, 1) << "ui" << UUID::gen());
+    bool applyCmdCalled = false;
+    _opObserver->onCreateCollectionFn = [&](OperationContext* opCtx,
+                                            const CollectionPtr&,
+                                            const NamespaceString& collNss,
+                                            const CollectionOptions&,
+                                            const BSONObj&) {
+        applyCmdCalled = true;
+    };
+    auto entry = OplogEntry(op);
+    pushOps({entry});
+    auto writerPool = makeTenantMigrationWriterPool();
+
+    auto applier = std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                                        MigrationProtocolEnum::kShardMerge,
+                                                        boost::none,
+                                                        OpTime(),
+                                                        &_oplogBuffer,
+                                                        _executor,
+                                                        writerPool.get());
+    ASSERT_OK(applier->startup());
+    auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
+    ASSERT_EQ(opAppliedFuture.getNoThrow().getStatus().code(), ErrorCodes::InvalidTenantId);
+    ASSERT_FALSE(applyCmdCalled);
+    applier->shutdown();
+    _oplogBuffer.shutdown(_opCtx.get());
+    applier->join();
+}
+
 TEST_F(TenantOplogApplierTest, ApplyDropIndexesCommand_IndexNotFound) {
-    NamespaceString nss(dbName, "bar");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
     auto op = BSON("op"
                    << "c"
@@ -933,14 +1212,22 @@ TEST_F(TenantOplogApplierTest, ApplyDropIndexesCommand_IndexNotFound) {
                                      const NamespaceString& nss,
                                      const boost::optional<UUID>& uuid,
                                      const std::string& indexName,
-                                     const BSONObj& idxDescriptor) { applyCmdCalled = true; };
+                                     const BSONObj& idxDescriptor) {
+        applyCmdCalled = true;
+    };
 
     auto entry = OplogEntry(op);
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -952,7 +1239,8 @@ TEST_F(TenantOplogApplierTest, ApplyDropIndexesCommand_IndexNotFound) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyCollModCommand_IndexNotFound) {
-    NamespaceString nss(dbName, "bar");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
     auto op = BSON("op"
                    << "c"
@@ -976,8 +1264,14 @@ TEST_F(TenantOplogApplierTest, ApplyCollModCommand_IndexNotFound) {
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -989,8 +1283,9 @@ TEST_F(TenantOplogApplierTest, ApplyCollModCommand_IndexNotFound) {
 }
 
 TEST_F(TenantOplogApplierTest, ApplyCollModCommand_CollectionMissing) {
-    createDatabase(_opCtx.get(), dbName);
-    NamespaceString nss(dbName, "bar");
+    createDatabase(_opCtx.get(), _dbName.toString());
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "bar");
     UUID uuid(UUID::gen());
     auto op = BSON("op"
                    << "c"
@@ -1014,8 +1309,14 @@ TEST_F(TenantOplogApplierTest, ApplyCollModCommand_CollectionMissing) {
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -1028,18 +1329,25 @@ TEST_F(TenantOplogApplierTest, ApplyCollModCommand_CollectionMissing) {
 
 TEST_F(TenantOplogApplierTest, ApplyCRUD_WrongNSS) {
     // Should not be able to apply a CRUD operation to a namespace not belonging to us.
-    NamespaceString nss("notmytenant", "bar");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("notmytenant", "bar");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
     auto entry = makeInsertOplogEntry(1, nss, uuid);
     bool onInsertsCalled = false;
-    _opObserver->onInsertsFn = [&](OperationContext* opCtx,
-                                   const NamespaceString& nss,
-                                   const std::vector<BSONObj>& docs) { onInsertsCalled = true; };
+    _opObserver->onInsertsFn =
+        [&](OperationContext* opCtx, const NamespaceString& nss, const std::vector<BSONObj>& docs) {
+            onInsertsCalled = true;
+        };
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_NOT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -1049,22 +1357,61 @@ TEST_F(TenantOplogApplierTest, ApplyCRUD_WrongNSS) {
     applier->join();
 }
 
-TEST_F(TenantOplogApplierTest, ApplyCRUD_WrongUUID) {
-    // Should not be able to apply a CRUD operation to a namespace not belonging to us, even if
-    // we claim it does in the nss field.
-    NamespaceString nss("notmytenant", "bar");
-    NamespaceString nss_to_apply(dbName, "bar");
+TEST_F(TenantOplogApplierTest, ApplyCRUD_WrongNSS_Merge) {
+    auto invalidTenant = TenantId(OID::gen());
+
+    // Should not be able to apply a CRUD operation to a namespace not belonging to us.
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(DatabaseName(invalidTenant, "test"), "bar");
     auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
-    auto entry = makeInsertOplogEntry(1, nss_to_apply, uuid);
+    auto entry = makeInsertOplogEntry(1, nss, uuid);
     bool onInsertsCalled = false;
-    _opObserver->onInsertsFn = [&](OperationContext* opCtx,
-                                   const NamespaceString& nss,
-                                   const std::vector<BSONObj>& docs) { onInsertsCalled = true; };
+    _opObserver->onInsertsFn =
+        [&](OperationContext* opCtx, const NamespaceString& nss, const std::vector<BSONObj>& docs) {
+            onInsertsCalled = true;
+        };
     pushOps({entry});
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier = std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                                        MigrationProtocolEnum::kShardMerge,
+                                                        boost::none,
+                                                        OpTime(),
+                                                        &_oplogBuffer,
+                                                        _executor,
+                                                        writerPool.get());
+    ASSERT_OK(applier->startup());
+    auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
+    ASSERT_EQ(opAppliedFuture.getNoThrow().getStatus().code(), ErrorCodes::InvalidTenantId);
+    ASSERT_FALSE(onInsertsCalled);
+    applier->shutdown();
+    _oplogBuffer.shutdown(_opCtx.get());
+    applier->join();
+}
+
+TEST_F(TenantOplogApplierTest, ApplyCRUD_WrongUUID) {
+    // Should not be able to apply a CRUD operation to a namespace not belonging to us, even if
+    // we claim it does in the nss field.
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("notmytenant", "bar");
+    NamespaceString nss_to_apply = NamespaceString::createNamespaceString_forTest(_dbName, "bar");
+    auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
+    auto entry = makeInsertOplogEntry(1, nss_to_apply, uuid);
+    bool onInsertsCalled = false;
+    _opObserver->onInsertsFn =
+        [&](OperationContext* opCtx, const NamespaceString& nss, const std::vector<BSONObj>& docs) {
+            onInsertsCalled = true;
+        };
+    pushOps({entry});
+    auto writerPool = makeTenantMigrationWriterPool();
+
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(entry.getOpTime());
     ASSERT_NOT_OK(opAppliedFuture.getNoThrow().getStatus());
@@ -1080,8 +1427,14 @@ TEST_F(TenantOplogApplierTest, ApplyNoop_Success) {
     pushOps(srcOps);
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(srcOps[0].getOpTime());
     auto futureRes = opAppliedFuture.getNoThrow();
@@ -1104,8 +1457,14 @@ TEST_F(TenantOplogApplierTest, ApplyResumeTokenNoop_Success) {
     pushOps(srcOps);
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(srcOps[0].getOpTime());
     auto futureRes = opAppliedFuture.getNoThrow();
@@ -1124,13 +1483,22 @@ TEST_F(TenantOplogApplierTest, ApplyResumeTokenNoop_Success) {
 
 TEST_F(TenantOplogApplierTest, ApplyInsertThenResumeTokenNoopInDifferentBatch_Success) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "foo"), UUID::gen()));
+    srcOps.push_back(makeInsertOplogEntry(
+        1,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "foo"),
+        UUID::gen()));
     srcOps.push_back(makeNoopOplogEntry(2, TenantMigrationRecipientService::kNoopMsg));
     pushOps(srcOps);
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
 
     tenantApplierBatchSizeBytes.store(100 * 1024 /* bytes */);
     tenantApplierBatchSizeOps.store(1 /* ops */);
@@ -1155,12 +1523,21 @@ TEST_F(TenantOplogApplierTest, ApplyInsertThenResumeTokenNoopInDifferentBatch_Su
 TEST_F(TenantOplogApplierTest, ApplyResumeTokenNoopThenInsertInSameBatch_Success) {
     std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeNoopOplogEntry(1, TenantMigrationRecipientService::kNoopMsg));
-    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "foo"), UUID::gen()));
+    srcOps.push_back(makeInsertOplogEntry(
+        2,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "foo"),
+        UUID::gen()));
     pushOps(srcOps);
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(srcOps[1].getOpTime());
     auto futureRes = opAppliedFuture.getNoThrow();
@@ -1180,14 +1557,23 @@ TEST_F(TenantOplogApplierTest, ApplyResumeTokenNoopThenInsertInSameBatch_Success
 
 TEST_F(TenantOplogApplierTest, ApplyResumeTokenInsertThenNoopSameTimestamp_Success) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "foo"), UUID::gen()));
+    srcOps.push_back(makeInsertOplogEntry(
+        1,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "foo"),
+        UUID::gen()));
     srcOps.push_back(makeNoopOplogEntry(1, TenantMigrationRecipientService::kNoopMsg));
     pushOps(srcOps);
     ASSERT_EQ(srcOps[0].getOpTime(), srcOps[1].getOpTime());
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(srcOps[1].getOpTime());
     auto futureRes = opAppliedFuture.getNoThrow();
@@ -1207,13 +1593,22 @@ TEST_F(TenantOplogApplierTest, ApplyResumeTokenInsertThenNoopSameTimestamp_Succe
 
 TEST_F(TenantOplogApplierTest, ApplyResumeTokenInsertThenNoop_Success) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "foo"), UUID::gen()));
+    srcOps.push_back(makeInsertOplogEntry(
+        1,
+        NamespaceString::createNamespaceString_forTest(_dbName.toStringWithTenantId(), "foo"),
+        UUID::gen()));
     srcOps.push_back(makeNoopOplogEntry(2, TenantMigrationRecipientService::kNoopMsg));
     pushOps(srcOps);
     auto writerPool = makeTenantMigrationWriterPool();
 
-    auto applier = std::make_shared<TenantOplogApplier>(
-        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
     ASSERT_OK(applier->startup());
     auto opAppliedFuture = applier->getNotificationForOpTime(srcOps[1].getOpTime());
     auto futureRes = opAppliedFuture.getNoThrow();
@@ -1225,6 +1620,54 @@ TEST_F(TenantOplogApplierTest, ApplyResumeTokenInsertThenNoop_Success) {
     ASSERT_OK(futureRes.getStatus());
     ASSERT_EQUALS(futureRes.getValue().donorOpTime, srcOps[1].getOpTime());
     ASSERT_EQUALS(futureRes.getValue().recipientOpTime, entries[0].getOpTime());
+
+    applier->shutdown();
+    _oplogBuffer.shutdown(_opCtx.get());
+    applier->join();
+}
+
+TEST_F(TenantOplogApplierTest, ApplyInsert_MultiKeyIndex) {
+    createCollectionWithUuid(_opCtx.get(), NamespaceString::kSessionTransactionsTableNamespace);
+    NamespaceString indexedNss(_dbName.toStringWithTenantId(), "indexedColl");
+    NamespaceString nonIndexedNss(_dbName.toStringWithTenantId(), "nonIndexedColl");
+    auto indexedCollUUID = createCollectionWithUuid(_opCtx.get(), indexedNss);
+    createCollection(_opCtx.get(), nonIndexedNss, CollectionOptions());
+
+    // Create index on the collection.
+    auto indexKey = BSON("val" << 1);
+    auto spec = BSON("v" << int(IndexDescriptor::kLatestIndexVersion) << "key" << indexKey << "name"
+                         << "val_1");
+    createIndex(_opCtx.get(), indexedNss, indexedCollUUID, spec);
+
+    const BSONObj multiKeyDoc = BSON("_id" << 1 << "val" << BSON_ARRAY(1 << 2));
+    const BSONObj singleKeyDoc = BSON("_id" << 2 << "val" << 1);
+
+    auto indexedOp =
+        makeInsertDocumentOplogEntry(OpTime(Timestamp(1, 1), 1LL), indexedNss, multiKeyDoc);
+    auto unindexedOp =
+        makeInsertDocumentOplogEntry(OpTime(Timestamp(2, 1), 1LL), nonIndexedNss, singleKeyDoc);
+
+    pushOps({indexedOp, unindexedOp});
+
+    // Use a writer pool size of 1 to ensure that both ops from the batch are applied in the same
+    // writer worker thread to ensure that the same opCtx is used.
+    auto writerPool = makeTenantMigrationWriterPool(1);
+
+    auto applier =
+        std::make_shared<TenantOplogApplier>(_migrationUuid,
+                                             MigrationProtocolEnum::kMultitenantMigrations,
+                                             _tenantId,
+                                             OpTime(),
+                                             &_oplogBuffer,
+                                             _executor,
+                                             writerPool.get());
+    ASSERT_OK(applier->startup());
+
+    auto opAppliedFuture = applier->getNotificationForOpTime(unindexedOp.getOpTime());
+    ASSERT_OK(opAppliedFuture.getNoThrow().getStatus());
+
+    ASSERT_TRUE(docExists(_opCtx.get(), indexedNss, multiKeyDoc));
+    ASSERT_TRUE(docExists(_opCtx.get(), nonIndexedNss, singleKeyDoc));
 
     applier->shutdown();
     _oplogBuffer.shutdown(_opCtx.get());

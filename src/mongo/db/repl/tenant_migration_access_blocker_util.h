@@ -40,30 +40,35 @@ namespace mongo {
 
 namespace tenant_migration_access_blocker {
 
-std::shared_ptr<TenantMigrationDonorAccessBlocker> getTenantMigrationDonorAccessBlocker(
-    ServiceContext* serviceContext, StringData tenantId);
+std::shared_ptr<TenantMigrationDonorAccessBlocker> getDonorAccessBlockerForMigration(
+    ServiceContext* serviceContext, const UUID& migrationId);
+
+std::shared_ptr<TenantMigrationRecipientAccessBlocker> getRecipientAccessBlockerForMigration(
+    ServiceContext* serviceContext, const UUID& migrationId);
 
 std::shared_ptr<TenantMigrationRecipientAccessBlocker> getTenantMigrationRecipientAccessBlocker(
     ServiceContext* serviceContext, StringData tenantId);
 
 /**
- * For "shard merge" protocol: tell all recipient access blockers to reject reads before ts.
- */
-void startRejectingReadsBefore(OperationContext* opCtx, UUID migrationId, mongo::Timestamp ts);
-
-/**
  * Add an access blocker if one does not already exist.
  */
 void addTenantMigrationRecipientAccessBlocker(ServiceContext* serviceContext,
-                                              StringData tenantId,
-                                              UUID migrationId,
-                                              MigrationProtocolEnum protocol,
-                                              StringData donorConnectionString);
+                                              const StringData& tenantId,
+                                              const UUID& migrationId);
 
 /**
  * Parse the tenantId from a database name, or return boost::none if there is no tenantId.
  */
-boost::optional<std::string> parseTenantIdFromDB(StringData dbName);
+boost::optional<std::string> parseTenantIdFromDB(const DatabaseName& dbName);
+
+/**
+ * Validates that the tenant that owns nss belongs to the migration identified by migrationId. The
+ * function throws ErrorCodes::InvalidTenant if there is no tenantId or if the tenant is not being
+ * migrated by the expected migration.
+ */
+void validateNssIsBeingMigrated(const boost::optional<TenantId>& tenantId,
+                                const NamespaceString& nss,
+                                const UUID& migrationId);
 
 /**
  * Returns a TenantMigrationDonorDocument constructed from the given bson doc and validate the
@@ -79,30 +84,32 @@ TenantMigrationDonorDocument parseDonorStateDocument(const BSONObj& doc);
  * will be set for the returned future when the migration is committed or aborted. Note: for better
  * performance, check if the future is immediately ready.
  */
-SemiFuture<void> checkIfCanReadOrBlock(OperationContext* opCtx, const OpMsgRequest& request);
+SemiFuture<void> checkIfCanReadOrBlock(OperationContext* opCtx,
+                                       const DatabaseName& dbName,
+                                       const OpMsgRequest& request);
 
 /**
  * If the operation has read concern "linearizable", throws TenantMigrationCommitted error if the
  * database has been migrated to a different replica set.
  */
-void checkIfLinearizableReadWasAllowedOrThrow(OperationContext* opCtx, StringData dbName);
+void checkIfLinearizableReadWasAllowedOrThrow(OperationContext* opCtx, const DatabaseName& dbName);
 
 /**
  * Throws TenantMigrationConflict if the database is being migrated and the migration is in the
  * blocking state. Throws TenantMigrationCommitted if it is in committed.
  */
-void checkIfCanWriteOrThrow(OperationContext* opCtx, StringData dbName, Timestamp writeTs);
+void checkIfCanWriteOrThrow(OperationContext* opCtx, const DatabaseName& dbName, Timestamp writeTs);
 
 /**
  * Returns TenantMigrationConflict if the database is being migrated (even if migration is not yet
  * in the blocking state). Returns TenantMigrationCommitted if it is in committed.
  */
-Status checkIfCanBuildIndex(OperationContext* opCtx, StringData dbName);
+Status checkIfCanBuildIndex(OperationContext* opCtx, const DatabaseName& dbName);
 
 /**
  * Returns true if there is either a donor or recipient access blocker for the given dbName.
  */
-bool hasActiveTenantMigration(OperationContext* opCtx, StringData dbName);
+bool hasActiveTenantMigration(OperationContext* opCtx, const DatabaseName& dbName);
 
 /**
  * Scan config.tenantMigrationDonors and creates the necessary TenantMigrationAccessBlockers for
@@ -128,6 +135,21 @@ void performNoopWrite(OperationContext* opCtx, StringData msg);
  * by tenant_migration_access_blocker::recoverTenantMigrationAccessBlockers.
  */
 bool inRecoveryMode(OperationContext* opCtx);
+
+/*
+ * Returns true if a read should be excluded from access blocker filtering.
+ */
+bool shouldExcludeRead(OperationContext* opCtx);
+
+/**
+ * Parse the 'TenantId' from the provided DatabaseName.
+ */
+boost::optional<TenantId> parseTenantIdFromDatabaseName(const DatabaseName& dbName);
+
+/**
+ * Retrieves the 'tenant id' from the provided DatabaseName.
+ */
+boost::optional<std::string> extractTenantFromDatabaseName(const DatabaseName& dbName);
 
 }  // namespace tenant_migration_access_blocker
 

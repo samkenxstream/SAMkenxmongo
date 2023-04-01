@@ -30,8 +30,8 @@
 #pragma once
 
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/s/shard_key_pattern.h"
 
 namespace mongo {
@@ -56,9 +56,11 @@ public:
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
     DocumentSource::GetModPathsReturn getModifiedPaths() const final;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final;
 

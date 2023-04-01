@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_checks.h"
@@ -41,28 +39,40 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/exec/disk_use_options_gen.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/fle_crud.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/cqf_command_utils.h"
+#include "mongo/db/query/cqf_get_executor.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/telemetry.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/query_analysis_writer.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/db/stats/server_read_concern_metrics.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/query_analysis_sampler_util.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
 #include "mongo/util/fail_point.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 namespace {
@@ -71,65 +81,21 @@ MONGO_FAIL_POINT_DEFINE(allowExternalReadsForReverseOplogScanRule);
 
 const auto kTermField = "term"_sd;
 
-// Older client code before FCV 5.1 could still send 'ntoreturn' to mean a 'limit' or 'batchSize'.
-// This helper translates an 'ntoreturn' to an appropriate combination of 'limit', 'singleBatch',
-// and 'batchSize'. The translation rules are as follows: when 'ntoreturn' < 0 we have 'singleBatch'
-// semantics so we set 'limit= -ntoreturn' and 'singleBatch=true' flag to 'true'. When 'ntoreturn'
-// == 1 this is a limit-1 case so we set the 'limit' accordingly. Lastly when 'ntoreturn' > 1, it's
-// interpreted as a 'batchSize'. When the cluster is fully upgraded to v5.1 'ntoreturn' should no
-// longer be used on incoming requests.
-//
-// This helper can be removed when we no longer have to interoperate with 5.0 or older nodes.
-// longer have to interoperate with 5.0 or older nodes.
-std::unique_ptr<FindCommandRequest> translateNtoReturnToLimitOrBatchSize(
-    std::unique_ptr<FindCommandRequest> findCmd) {
-    const auto& fcvState = serverGlobalParams.featureCompatibility;
-    uassert(5746102,
-            "the ntoreturn find command parameter is not supported when FCV >= 5.1",
-            !(fcvState.isVersionInitialized() &&
-              fcvState.isGreaterThanOrEqualTo(
-                  multiversion::FeatureCompatibilityVersion::kVersion_5_1) &&
-              findCmd->getNtoreturn()));
-
-    const auto ntoreturn = findCmd->getNtoreturn().get_value_or(0);
-    if (ntoreturn) {
-        if (ntoreturn < 0) {
-            uassert(5746100,
-                    "bad ntoreturn value in query",
-                    ntoreturn != std::numeric_limits<int>::min());
-            findCmd->setLimit(-ntoreturn);
-            findCmd->setSingleBatch(true);
-        } else if (ntoreturn == 1) {
-            findCmd->setLimit(1);
-        } else {
-            findCmd->setBatchSize(ntoreturn);
-        }
-    }
-    findCmd->setNtoreturn(boost::none);
-    return findCmd;
-}
-
-// Parses the command object to a FindCommandRequest. If the client request did not specify any
-// runtime constants, make them available to the query here.
-std::unique_ptr<FindCommandRequest> parseCmdObjectToFindCommandRequest(OperationContext* opCtx,
-                                                                       NamespaceString nss,
-                                                                       BSONObj cmdObj) {
-    auto findCommand = query_request_helper::makeFromFindCommand(
-        std::move(cmdObj),
-        std::move(nss),
-        APIParameters::get(opCtx).getAPIStrict().value_or(false));
-
-    return translateNtoReturnToLimitOrBatchSize(std::move(findCommand));
-}
 
 boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
     OperationContext* opCtx,
     const FindCommandRequest& findCommand,
+    const CollectionPtr& collPtr,
     boost::optional<ExplainOptions::Verbosity> verbosity) {
     std::unique_ptr<CollatorInterface> collator;
     if (!findCommand.getCollation().isEmpty()) {
         collator = uassertStatusOK(CollatorFactoryInterface::get(opCtx->getServiceContext())
                                        ->makeFromBSON(findCommand.getCollation()));
+    } else if (collPtr && collPtr->getDefaultCollator()) {
+        // The 'collPtr' will be null for views, but we don't need to worry about views here. The
+        // views will get rewritten into aggregate command and will regenerate the
+        // ExpressionContext.
+        collator = collPtr->getDefaultCollator()->clone();
     }
 
     // Although both 'find' and 'aggregate' commands have an ExpressionContext, some of the data
@@ -151,7 +117,7 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
         verbosity,
         false,  // fromMongos
         false,  // needsMerge
-        findCommand.getAllowDiskUse(),
+        findCommand.getAllowDiskUse().value_or(allowDiskUseByDefault.load()),
         false,  // bypassDocumentValidation
         false,  // isMapReduceCommand
         findCommand.getNamespaceOrUUID().nss().value_or(NamespaceString()),
@@ -166,6 +132,9 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
     expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
     expCtx->startExpressionCounters();
 
+    // Set the value of $$USER_ROLES for the find command.
+    expCtx->setUserRoles();
+
     return expCtx;
 }
 
@@ -176,7 +145,7 @@ void beginQueryOp(OperationContext* opCtx, const NamespaceString& nss, const BSO
     auto curOp = CurOp::get(opCtx);
     stdx::lock_guard<Client> lk(*opCtx->getClient());
     curOp->setOpDescription_inlock(queryObj);
-    curOp->setNS_inlock(nss.ns());
+    curOp->setNS_inlock(nss);
 }
 
 /**
@@ -193,13 +162,16 @@ public:
     std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
                                              const OpMsgRequest& opMsgRequest) override {
         // TODO: Parse into a QueryRequest here.
-        return std::make_unique<Invocation>(this, opMsgRequest, opMsgRequest.getDatabase());
+        return std::make_unique<Invocation>(this, opMsgRequest);
     }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext* context) const override {
         return AllowedOnSecondary::kOptIn;
     }
 
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
     bool maintenanceOk() const override {
         return false;
     }
@@ -240,10 +212,18 @@ public:
         return true;
     }
 
+    bool allowedInTransactions() const final {
+        return true;
+    }
+
     class Invocation final : public CommandInvocation {
     public:
-        Invocation(const FindCmd* definition, const OpMsgRequest& request, StringData dbName)
-            : CommandInvocation(definition), _request(request), _dbName(dbName) {
+        Invocation(const FindCmd* definition, const OpMsgRequest& request)
+            : CommandInvocation(definition),
+              _request(request),
+              _dbName(DatabaseNameUtil::deserialize(_request.getValidatedTenantId(),
+                                                    _request.getDatabase())),
+              _ns(CommandHelpers::parseNsFromCommand(_dbName, _request.body)) {
             invariant(_request.body.isOwned());
         }
 
@@ -273,8 +253,7 @@ public:
         }
 
         NamespaceString ns() const override {
-            // TODO get the ns from the parsed QueryRequest.
-            return NamespaceString(CommandHelpers::parseNsFromCommand(_dbName, _request.body));
+            return _ns;
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const final {
@@ -300,15 +279,29 @@ public:
             boost::optional<AutoGetCollectionForReadCommandMaybeLockFree> ctx;
             ctx.emplace(opCtx,
                         CommandHelpers::parseNsCollectionRequired(_dbName, _request.body),
-                        AutoGetCollectionViewMode::kViewsPermitted);
+                        AutoGetCollection::Options{}.viewMode(
+                            auto_get_collection::ViewMode::kViewsPermitted));
             const auto nss = ctx->getNss();
 
+            // Going forward this operation must never ignore interrupt signals while waiting for
+            // lock acquisition. This InterruptibleLockGuard will ensure that waiting for lock
+            // re-acquisition after yielding will not ignore interrupt signals. This is necessary to
+            // avoid deadlocking with replication rollback, which at the storage layer waits for all
+            // cursors to be closed under the global MODE_X lock, after having sent interrupt
+            // signals to read operations. This operation must never hold open storage cursors while
+            // ignoring interrupt.
+            InterruptibleLockGuard interruptibleLockAcquisition(opCtx->lockState());
+
             // Parse the command BSON to a FindCommandRequest.
-            auto findCommand = parseCmdObjectToFindCommandRequest(opCtx, nss, _request.body);
+            auto findCommand = _parseCmdObjectToFindCommandRequest(opCtx, nss, _request.body);
 
             // Finish the parsing step by using the FindCommandRequest to create a CanonicalQuery.
             const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-            auto expCtx = makeExpressionContext(opCtx, *findCommand, verbosity);
+
+            // The collection may be NULL. If so, getExecutor() should handle it by returning an
+            // execution tree with an EOFStage.
+            const auto& collection = ctx->getCollection();
+            auto expCtx = makeExpressionContext(opCtx, *findCommand, collection, verbosity);
             const bool isExplain = true;
             auto cq = uassertStatusOK(
                 CanonicalQuery::canonicalize(opCtx,
@@ -318,12 +311,9 @@ public:
                                              extensionsCallback,
                                              MatchExpressionParser::kAllowAllSpecialFeatures));
 
-            // If we are running a query against a view, or if we are trying to test the new
-            // optimizer, redirect this query through the aggregation system.
-            if (ctx->getView() ||
-                (feature_flags::gfeatureFlagCommonQueryFramework.isEnabled(
-                     serverGlobalParams.featureCompatibility) &&
-                 internalQueryEnableCascadesOptimizer.load())) {
+            // If we are running a query against a view redirect this query through the aggregation
+            // system.
+            if (ctx->getView()) {
                 // Relinquish locks. The aggregation command will re-acquire them.
                 ctx.reset();
 
@@ -333,10 +323,15 @@ public:
                 auto viewAggregationCommand =
                     uassertStatusOK(query_request_helper::asAggregationCommand(findCommand));
 
-                auto viewAggCmd = OpMsgRequest::fromDBAndBody(_dbName, viewAggregationCommand).body;
+                auto viewAggCmd =
+                    OpMsgRequestBuilder::createWithValidatedTenancyScope(
+                        _dbName, _request.validatedTenancyScope, viewAggregationCommand)
+                        .body;
+
                 // Create the agg request equivalent of the find operation, with the explain
                 // verbosity included.
                 auto aggRequest = aggregation_request_helper::parseFromBSON(
+                    opCtx,
                     nss,
                     viewAggCmd,
                     verbosity,
@@ -358,9 +353,7 @@ public:
                 return;
             }
 
-            // The collection may be NULL. If so, getExecutor() should handle it by returning an
-            // execution tree with an EOFStage.
-            const auto& collection = ctx->getCollection();
+            cq->setUseCqfIfEligible(true);
 
             // Get the execution plan for the query.
             bool permitYield = true;
@@ -395,11 +388,10 @@ public:
 
             // Parse the command BSON to a FindCommandRequest. Pass in the parsedNss in case cmdObj
             // does not have a UUID.
-            auto parsedNss = NamespaceString{CommandHelpers::parseNsFromCommand(_dbName, cmdObj)};
             const bool isExplain = false;
-            const bool isOplogNss = (parsedNss == NamespaceString::kRsOplogNamespace);
-            auto findCommand =
-                parseCmdObjectToFindCommandRequest(opCtx, std::move(parsedNss), cmdObj);
+            const bool isOplogNss = (_ns == NamespaceString::kRsOplogNamespace);
+            auto findCommand = _parseCmdObjectToFindCommandRequest(opCtx, _ns, cmdObj);
+            CurOp::get(opCtx)->beginQueryPlanningTimer();
 
             // Only allow speculative majority for internal commands that specify the correct flag.
             uassert(ErrorCodes::ReadConcernMajorityNotEnabled,
@@ -433,11 +425,11 @@ public:
             // The presence of a term in the request indicates that this is an internal replication
             // oplog read request.
             if (term && isOplogNss) {
-                // We do not want to take tickets for internal (replication) oplog reads. Stalling
-                // on ticket acquisition can cause complicated deadlocks. Primaries may depend on
-                // data reaching secondaries in order to proceed; and secondaries may get stalled
-                // replicating because of an inability to acquire a read ticket.
-                opCtx->lockState()->skipAcquireTicket();
+                // We do not want to wait to take tickets for internal (replication) oplog reads.
+                // Stalling on ticket acquisition can cause complicated deadlocks. Primaries may
+                // depend on data reaching secondaries in order to proceed; and secondaries may get
+                // stalled replicating because of an inability to acquire a read ticket.
+                opCtx->lockState()->setAdmissionPriority(AdmissionContext::Priority::kImmediate);
             }
 
             // If this read represents a reverse oplog scan, we want to bypass oplog visibility
@@ -476,31 +468,54 @@ public:
             boost::optional<AutoGetCollectionForReadCommandMaybeLockFree> ctx;
             ctx.emplace(opCtx,
                         CommandHelpers::parseNsOrUUID(_dbName, _request.body),
-                        AutoGetCollectionViewMode::kViewsPermitted);
+                        AutoGetCollection::Options{}
+                            .viewMode(auto_get_collection::ViewMode::kViewsPermitted)
+                            .expectedUUID(findCommand->getCollectionUUID()));
             const auto& nss = ctx->getNss();
 
-            uassert(ErrorCodes::NamespaceNotFound,
-                    str::stream() << "UUID " << findCommand->getNamespaceOrUUID().uuid().get()
-                                  << " specified in query request not found",
-                    ctx || !findCommand->getNamespaceOrUUID().uuid());
-
-            checkCollectionUUIDMismatch(
-                opCtx, nss, ctx->getCollection(), findCommand->getCollectionUUID());
-
-            // Set the namespace if a collection was found, as opposed to nothing or a view.
-            if (ctx) {
-                query_request_helper::refreshNSS(ctx->getNss(), findCommand.get());
+            if (!findCommand->getMirrored()) {
+                if (auto sampleId = analyze_shard_key::getOrGenerateSampleId(
+                        opCtx,
+                        ns(),
+                        analyze_shard_key::SampledCommandNameEnum::kFind,
+                        *findCommand)) {
+                    analyze_shard_key::QueryAnalysisWriter::get(opCtx)
+                        ->addFindQuery(*sampleId,
+                                       nss,
+                                       findCommand->getFilter(),
+                                       findCommand->getCollation(),
+                                       findCommand->getLet())
+                        .getAsync([](auto) {});
+                }
             }
 
-            // Tailing a replicated capped clustered collection requires majority read concern.
-            const auto coll = ctx->getCollection().get();
-            if (coll) {
+            // Going forward this operation must never ignore interrupt signals while waiting for
+            // lock acquisition. This InterruptibleLockGuard will ensure that waiting for lock
+            // re-acquisition after yielding will not ignore interrupt signals. This is necessary to
+            // avoid deadlocking with replication rollback, which at the storage layer waits for all
+            // cursors to be closed under the global MODE_X lock, after having sent interrupt
+            // signals to read operations. This operation must never hold open storage cursors while
+            // ignoring interrupt.
+            InterruptibleLockGuard interruptibleLockAcquisition(opCtx->lockState());
+
+            const auto& collection = ctx->getCollection();
+
+            uassert(ErrorCodes::NamespaceNotFound,
+                    str::stream() << "UUID " << findCommand->getNamespaceOrUUID().uuid().value()
+                                  << " specified in query request not found",
+                    collection || !findCommand->getNamespaceOrUUID().uuid());
+
+            if (collection) {
+                // Set the namespace if a collection was found, as opposed to nothing or a view.
+                query_request_helper::refreshNSS(ctx->getNss(), findCommand.get());
+
+                // Tailing a replicated capped clustered collection requires majority read concern.
                 const bool isTailable = findCommand->getTailable();
                 const bool isMajorityReadConcern = repl::ReadConcernArgs::get(opCtx).getLevel() ==
                     repl::ReadConcernLevel::kMajorityReadConcern;
-                const bool isClusteredCollection = coll->isClustered();
-                const bool isCapped = coll->isCapped();
-                const bool isReplicated = coll->ns().isReplicated();
+                const bool isClusteredCollection = collection->isClustered();
+                const bool isCapped = collection->isCapped();
+                const bool isReplicated = collection->ns().isReplicated();
                 if (isClusteredCollection && isCapped && isReplicated && isTailable) {
                     uassert(ErrorCodes::Error(6049203),
                             "A tailable cursor on a capped clustered collection requires majority "
@@ -514,7 +529,9 @@ public:
 
             // Finish the parsing step by using the FindCommandRequest to create a CanonicalQuery.
             const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-            auto expCtx = makeExpressionContext(opCtx, *findCommand, boost::none /* verbosity */);
+
+            auto expCtx =
+                makeExpressionContext(opCtx, *findCommand, collection, boost::none /* verbosity */);
             auto cq = uassertStatusOK(
                 CanonicalQuery::canonicalize(opCtx,
                                              std::move(findCommand),
@@ -523,12 +540,9 @@ public:
                                              extensionsCallback,
                                              MatchExpressionParser::kAllowAllSpecialFeatures));
 
-            // If we are running a query against a view, or if we are trying to test the new
-            // optimizer, redirect this query through the aggregation system.
-            if (ctx->getView() ||
-                (feature_flags::gfeatureFlagCommonQueryFramework.isEnabled(
-                     serverGlobalParams.featureCompatibility) &&
-                 internalQueryEnableCascadesOptimizer.load())) {
+            // If we are running a query against a view redirect this query through the aggregation
+            // system.
+            if (ctx->getView()) {
                 // Relinquish locks. The aggregation command will re-acquire them.
                 ctx.reset();
 
@@ -537,9 +551,9 @@ public:
                 const auto& findCommand = cq->getFindCommandRequest();
                 auto viewAggregationCommand =
                     uassertStatusOK(query_request_helper::asAggregationCommand(findCommand));
-
-                BSONObj aggResult = CommandHelpers::runCommandDirectly(
-                    opCtx, OpMsgRequest::fromDBAndBody(_dbName, std::move(viewAggregationCommand)));
+                auto aggRequest = OpMsgRequestBuilder::createWithValidatedTenancyScope(
+                    _dbName, _request.validatedTenancyScope, std::move(viewAggregationCommand));
+                BSONObj aggResult = CommandHelpers::runCommandDirectly(opCtx, aggRequest);
                 auto status = getStatusFromCommandResult(aggResult);
                 if (status.code() == ErrorCodes::InvalidPipelineOperator) {
                     uasserted(ErrorCodes::InvalidPipelineOperator,
@@ -550,16 +564,30 @@ public:
                 return;
             }
 
+            if (!cq->getFindCommandRequest().getAllowDiskUse().value_or(true)) {
+                allowDiskUseFalseCounter.increment();
+            }
+
             // Check whether we are allowed to read from this node after acquiring our locks.
             uassertStatusOK(replCoord->checkCanServeReadsFor(
                 opCtx, nss, ReadPreferenceSetting::get(opCtx).canRunOnSecondary()));
-
-            const auto& collection = ctx->getCollection();
 
             if (cq->getFindCommandRequest().getReadOnce()) {
                 // The readOnce option causes any storage-layer cursors created during plan
                 // execution to assume read data will not be needed again and need not be cached.
                 opCtx->recoveryUnit()->setReadOnce(true);
+            }
+
+            cq->setUseCqfIfEligible(true);
+
+            if (collection) {
+                // Collect telemetry. Exclude queries against collections with encrypted fields.
+                if (!collection.get()->getCollectionOptions().encryptedFieldConfig) {
+                    telemetry::registerFindRequest(cq->getFindCommandRequest(),
+                                                   collection.get()->ns(),
+                                                   opCtx,
+                                                   cq->getExpCtx());
+                }
             }
 
             // Get the execution plan for the query.
@@ -573,9 +601,7 @@ public:
 
             // If the executor supports it, find operations will maintain the storage engine state
             // across commands.
-            if (gYieldingSupportForSBE && !opCtx->inMultiDocumentTransaction() &&
-                repl::ReadConcernArgs::get(opCtx).getLevel() !=
-                    repl::ReadConcernLevel::kSnapshotReadConcern) {
+            if (gMaintainValidCursorsAcrossReadCommands && !opCtx->inMultiDocumentTransaction()) {
                 exec->enableSaveRecoveryUnitAcrossCommandsIfSupported();
             }
 
@@ -589,10 +615,9 @@ public:
                 // there is no ClientCursor id, and then return.
                 const long long numResults = 0;
                 const CursorId cursorId = 0;
-                endQueryOp(opCtx, collection, *exec, numResults, cursorId);
+                endQueryOp(opCtx, collection, *exec, numResults, boost::none, cmdObj);
                 auto bodyBuilder = result->getBodyBuilder();
-                appendCursorResponseObject(
-                    cursorId, nss.ns(), BSONArray(), boost::none, &bodyBuilder);
+                appendCursorResponseObject(cursorId, nss, BSONArray(), boost::none, &bodyBuilder);
                 return;
             }
 
@@ -620,7 +645,7 @@ public:
                     // If we can't fit this result inside the current batch, then we stash it for
                     // later.
                     if (!FindCommon::haveSpaceForNext(obj, numResults, firstBatch.bytesUsed())) {
-                        exec->enqueue(obj);
+                        exec->stashResult(obj);
                         stashedResult = true;
                         break;
                     }
@@ -667,7 +692,7 @@ public:
                     opCtx,
                     {std::move(exec),
                      nss,
-                     AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                     AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserName(),
                      APIParameters::get(opCtx),
                      opCtx->getWriteConcern(),
                      repl::ReadConcernArgs::get(opCtx),
@@ -690,11 +715,9 @@ public:
                     pinnedCursor.getCursor()->setLeftoverMaxTimeMicros(
                         opCtx->getRemainingMaxTimeMicros());
                 }
-                pinnedCursor.getCursor()->setNReturnedSoFar(numResults);
-                pinnedCursor.getCursor()->incNBatches();
 
                 // Fill out curop based on the results.
-                endQueryOp(opCtx, collection, *cursorExec, numResults, cursorId);
+                endQueryOp(opCtx, collection, *cursorExec, numResults, pinnedCursor, cmdObj);
 
                 if (stashResourcesForGetMore) {
                     // Collect storage stats now before we stash the recovery unit. These stats are
@@ -706,20 +729,24 @@ public:
                     // The stats collected here will not get overwritten, as the service entry
                     // point layer will only set these stats when they're not empty.
                     CurOp::get(opCtx)->debug().storageStats =
-                        opCtx->recoveryUnit()->getOperationStatistics();
+                        opCtx->recoveryUnit()->computeOperationStatisticsSinceLastCall();
                 }
             } else {
-                endQueryOp(opCtx, collection, *exec, numResults, cursorId);
+                endQueryOp(opCtx, collection, *exec, numResults, boost::none, cmdObj);
+                // We want to destroy executor as soon as possible to release any resources locks it
+                // may hold.
+                exec.reset();
             }
 
             // Generate the response object to send to the client.
-            firstBatch.done(cursorId, nss.ns());
+            firstBatch.done(cursorId, nss);
 
             // Increment this metric once we have generated a response and we know it will return
             // documents.
             auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
-            metricsCollector.incrementDocUnitsReturned(docUnitsReturned);
-            query_request_helper::validateCursorResponse(result->getBodyBuilder().asTempObj());
+            metricsCollector.incrementDocUnitsReturned(nss.ns(), docUnitsReturned);
+            query_request_helper::validateCursorResponse(result->getBodyBuilder().asTempObj(),
+                                                         nss.tenantId());
         }
 
         void appendMirrorableRequest(BSONObjBuilder* bob) const override {
@@ -748,7 +775,38 @@ public:
 
     private:
         const OpMsgRequest _request;
-        const StringData _dbName;
+        const DatabaseName _dbName;
+        const NamespaceString _ns;
+
+        // Parses the command object to a FindCommandRequest. If the client request did not specify
+        // any runtime constants, make them available to the query here.
+        std::unique_ptr<FindCommandRequest> _parseCmdObjectToFindCommandRequest(
+            OperationContext* opCtx, NamespaceString nss, BSONObj cmdObj) {
+            auto findCommand = query_request_helper::makeFromFindCommand(
+                std::move(cmdObj),
+                std::move(nss),
+                APIParameters::get(opCtx).getAPIStrict().value_or(false));
+
+            // Rewrite any FLE find payloads that exist in the query if this is a FLE 2 query.
+            if (shouldDoFLERewrite(findCommand)) {
+                invariant(findCommand->getNamespaceOrUUID().nss());
+                if (!findCommand->getEncryptionInformation()->getCrudProcessed().value_or(false)) {
+                    processFLEFindD(
+                        opCtx, findCommand->getNamespaceOrUUID().nss().value(), findCommand.get());
+                }
+                // Set the telemetryStoreKey to none so telemetry isn't collected when we've done a
+                // FLE rewrite.
+                CurOp::get(opCtx)->debug().telemetryStoreKey = boost::none;
+                CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation = true;
+            }
+
+            if (findCommand->getMirrored().value_or(false)) {
+                const auto& invocation = CommandInvocation::get(opCtx);
+                invocation->markMirrored();
+            }
+
+            return findCommand;
+        }
     };
 
 } findCmd;

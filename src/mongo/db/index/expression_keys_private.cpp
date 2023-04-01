@@ -27,10 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/db/index/expression_keys_private.h"
 
+#include <s2cell.h>
+#include <s2regioncoverer.h>
 #include <utility>
 
 #include "mongo/bson/bsonelement_comparator_interface.h"
@@ -54,8 +55,8 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
-#include "third_party/s2/s2cell.h"
-#include "third_party/s2/s2regioncoverer.h"
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
+
 
 namespace {
 
@@ -431,21 +432,30 @@ void ExpressionKeysPrivate::validateDocumentCommon(const CollectionPtr& collecti
                                                    const BSONObj& keyPattern) {
     // If we have a timeseries collection, check that indexed metric fields do not have expanded
     // array values
-    if (feature_flags::gTimeseriesMetricIndexes.isEnabledAndIgnoreFCV() &&
-        collection->getTimeseriesOptions()) {
+    if (auto tsOptions = collection->getTimeseriesOptions(); tsOptions &&
+        feature_flags::gTimeseriesMetricIndexes.isEnabled(
+            serverGlobalParams.featureCompatibility)) {
         // Each user metric field will be included twice, as both control.min.<field> and
         // control.max.<field>, so we'll want to keep track that we've checked data.<field> to avoid
-        // scanning it twice.
+        // scanning it twice. The time field can be excluded as it is guaranteed to be a date at
+        // insertion time.
         StringSet userFieldsChecked;
 
         for (const auto& keyElem : keyPattern) {
             if (keyElem.isNumber()) {
                 StringData field = keyElem.fieldName();
                 StringData userField;
+
                 if (field.startsWith(timeseries::kControlMaxFieldNamePrefix)) {
                     userField = field.substr(timeseries::kControlMaxFieldNamePrefix.size());
                 } else if (field.startsWith(timeseries::kControlMinFieldNamePrefix)) {
                     userField = field.substr(timeseries::kControlMinFieldNamePrefix.size());
+                }
+
+                if (!userField.empty() && userField == tsOptions->getTimeField()) {
+                    // Exclude checking the time field. Time values are explicitly dates and not
+                    // arrays.
+                    continue;
                 }
 
                 if (!userField.empty() && !userFieldsChecked.contains(userField)) {
@@ -478,7 +488,7 @@ void ExpressionKeysPrivate::get2DKeys(SharedBufferFragmentBuilder& pooledBufferB
                                       KeyStringSet* keys,
                                       KeyString::Version keyStringVersion,
                                       Ordering ordering,
-                                      boost::optional<RecordId> id) {
+                                      const boost::optional<RecordId>& id) {
     BSONElementMultiSet bSet;
 
     // Get all the nested location fields, but don't return individual elements from
@@ -570,7 +580,7 @@ void ExpressionKeysPrivate::getFTSKeys(SharedBufferFragmentBuilder& pooledBuffer
                                        KeyStringSet* keys,
                                        KeyString::Version keyStringVersion,
                                        Ordering ordering,
-                                       boost::optional<RecordId> id) {
+                                       const boost::optional<RecordId>& id) {
     fts::FTSIndexFormat::getKeys(
         pooledBufferBuilder, ftsSpec, obj, keys, keyStringVersion, ordering, id);
 }
@@ -587,7 +597,7 @@ void ExpressionKeysPrivate::getHashKeys(SharedBufferFragmentBuilder& pooledBuffe
                                         KeyString::Version keyStringVersion,
                                         Ordering ordering,
                                         bool ignoreArraysAlongPath,
-                                        boost::optional<RecordId> id) {
+                                        const boost::optional<RecordId>& id) {
     static const BSONObj nullObj = BSON("" << BSONNULL);
     auto hasFieldValue = false;
     KeyString::PooledBuilder keyString(pooledBufferBuilder, keyStringVersion, ordering);
@@ -661,7 +671,7 @@ void ExpressionKeysPrivate::getS2Keys(SharedBufferFragmentBuilder& pooledBufferB
                                       KeyString::Version keyStringVersion,
                                       SortedDataIndexAccessMethod::GetKeysContext context,
                                       Ordering ordering,
-                                      boost::optional<RecordId> id) {
+                                      const boost::optional<RecordId>& id) {
     std::vector<KeyString::HeapBuilder> keysToAdd;
 
     // Does one of our documents have a geo field?
@@ -698,12 +708,13 @@ void ExpressionKeysPrivate::getS2Keys(SharedBufferFragmentBuilder& pooledBufferB
             std::vector<KeyString::HeapBuilder> updatedKeysToAdd;
 
             if (IndexNames::GEO_2DSPHERE_BUCKET == keyElem.str()) {
-                timeseries::dotted_path_support::extractAllElementsAlongBucketPath(
-                    obj,
-                    keyElem.fieldName(),
-                    fieldElements,
-                    expandArrayOnTrailingField,
-                    arrayComponents);
+                auto elementStorage =
+                    timeseries::dotted_path_support::extractAllElementsAlongBucketPath(
+                        obj,
+                        keyElem.fieldName(),
+                        fieldElements,
+                        expandArrayOnTrailingField,
+                        arrayComponents);
 
                 // null, undefined, {} and [] should all behave like there is no geo field. So we
                 // look for these cases and ignore those measurements if we find them.

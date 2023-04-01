@@ -75,27 +75,40 @@ public:
     /**
      * Returns a ShardEndpoint for a single document write or throws ShardKeyNotFound if 'doc' is
      * malformed with respect to the shard key pattern of the collection.
+     * If 'chunkRanges' is not null, populates it with ChunkRanges that would be targeted by the
+     * insert.
      */
-    virtual ShardEndpoint targetInsert(OperationContext* opCtx, const BSONObj& doc) const = 0;
+    virtual ShardEndpoint targetInsert(OperationContext* opCtx,
+                                       const BSONObj& doc,
+                                       std::set<ChunkRange>* chunkRanges = nullptr) const = 0;
 
     /**
      * Returns a vector of ShardEndpoints for a potentially multi-shard update or throws
      * ShardKeyNotFound if 'updateOp' misses a shard key, but the type of update requires it.
+     * If 'chunkRanges' is not null, populates it with ChunkRanges that would be targeted by the
+     * update.
      */
-    virtual std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
-                                                    const BatchItemRef& itemRef) const = 0;
+    virtual std::vector<ShardEndpoint> targetUpdate(
+        OperationContext* opCtx,
+        const BatchItemRef& itemRef,
+        std::set<ChunkRange>* chunkRanges = nullptr) const = 0;
 
     /**
      * Returns a vector of ShardEndpoints for a potentially multi-shard delete or throws
      * ShardKeyNotFound if 'deleteOp' misses a shard key, but the type of delete requires it.
+     * If 'chunkRanges' is not null, populates it with ChunkRanges that would be targeted by the
+     * delete.
      */
-    virtual std::vector<ShardEndpoint> targetDelete(OperationContext* opCtx,
-                                                    const BatchItemRef& itemRef) const = 0;
+    virtual std::vector<ShardEndpoint> targetDelete(
+        OperationContext* opCtx,
+        const BatchItemRef& itemRef,
+        std::set<ChunkRange>* chunkRanges = nullptr) const = 0;
 
     /**
      * Returns a vector of ShardEndpoints for all shards.
      */
-    virtual std::vector<ShardEndpoint> targetAllShards(OperationContext* opCtx) const = 0;
+    virtual std::vector<ShardEndpoint> targetAllShards(
+        OperationContext* opCtx, std::set<ChunkRange>* chunkRanges = nullptr) const = 0;
 
     /**
      * Informs the targeter that a targeting failure occurred during one of the last targeting

@@ -66,7 +66,7 @@ public:
     QueryStageAndBase() : _client(&_opCtx) {}
 
     virtual ~QueryStageAndBase() {
-        _client.dropCollection(ns());
+        _client.dropCollection(nss());
     }
 
     void addIndex(const BSONObj& obj) {
@@ -75,7 +75,8 @@ public:
 
     const IndexDescriptor* getIndex(const BSONObj& obj, const CollectionPtr& coll) {
         std::vector<const IndexDescriptor*> indexes;
-        coll->getIndexCatalog()->findIndexesByKeyPattern(&_opCtx, obj, false, &indexes);
+        coll->getIndexCatalog()->findIndexesByKeyPattern(
+            &_opCtx, obj, IndexCatalog::InclusionPolicy::kReady, &indexes);
         if (indexes.empty()) {
             FAIL(str::stream() << "Unable to find index with key pattern " << obj);
         }
@@ -101,11 +102,11 @@ public:
     }
 
     void insert(const BSONObj& obj) {
-        _client.insert(ns(), obj);
+        _client.insert(nss(), obj);
     }
 
     void remove(const BSONObj& obj) {
-        _client.remove(ns(), obj);
+        _client.remove(nss(), obj);
     }
 
     /**
@@ -148,11 +149,11 @@ public:
         return BSONObj();
     }
 
-    static const char* ns() {
-        return "unittests.QueryStageAnd";
+    const char* ns() {
+        return _nss.ns().c_str();
     }
-    NamespaceString nss() {
-        return NamespaceString(ns());
+    const NamespaceString& nss() {
+        return _nss;
     }
 
 protected:
@@ -164,6 +165,8 @@ protected:
 
 private:
     DBDirectClient _client;
+    const NamespaceString _nss =
+        NamespaceString::createNamespaceString_forTest("unittests.QueryStageAnd");
 };
 
 //
@@ -179,10 +182,10 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            db->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -192,6 +195,8 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+
+        CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
         auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
@@ -264,11 +269,9 @@ class QueryStageAndHashDeleteLookaheadDuringYield : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -279,6 +282,7 @@ public:
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
         addIndex(BSON("baz" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
         auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
@@ -345,11 +349,10 @@ class QueryStageAndHashTwoLeaf : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -359,6 +362,7 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
         auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
@@ -389,11 +393,9 @@ class QueryStageAndHashTwoLeafFirstChildLargeKeys : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -405,6 +407,7 @@ public:
 
         addIndex(BSON("foo" << 1 << "big" << 1));
         addIndex(BSON("bar" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         // Lower buffer limit to 20 * sizeof(big) to force memory error
         // before hashed AND is done reading the first child (stage has to
@@ -438,11 +441,9 @@ class QueryStageAndHashTwoLeafLastChildLargeKeys : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -454,6 +455,7 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1 << "big" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         // Lower buffer limit to 5 * sizeof(big) to ensure that
         // keys in last child's index are not buffered. There are 6 keys
@@ -484,11 +486,9 @@ class QueryStageAndHashThreeLeaf : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -499,6 +499,7 @@ public:
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
         addIndex(BSON("baz" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
         auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
@@ -537,11 +538,10 @@ class QueryStageAndHashThreeLeafMiddleChildLargeKeys : public QueryStageAndBase 
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -554,6 +554,7 @@ public:
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1 << "big" << 1));
         addIndex(BSON("baz" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         // Lower buffer limit to 10 * sizeof(big) to force memory error
         // before hashed AND is done reading the second child (stage has to
@@ -590,11 +591,10 @@ class QueryStageAndHashWithNothing : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -604,6 +604,7 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
         auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
@@ -646,11 +647,9 @@ class QueryStageAndHashProducesNothing : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -661,6 +660,7 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
         auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
@@ -694,11 +694,10 @@ class QueryStageAndHashFirstChildFetched : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -708,6 +707,7 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
         auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
@@ -747,11 +747,10 @@ class QueryStageAndHashSecondChildFetched : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -761,6 +760,7 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
         auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
@@ -801,7 +801,7 @@ public:
         CollectionPtr coll = ctx.getCollection();
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
 
@@ -919,11 +919,9 @@ class QueryStageAndSortedDeleteDuringYield : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -933,6 +931,7 @@ public:
         }
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
         auto ah = std::make_unique<AndSortedStage>(_expCtx.get(), &ws);
@@ -1027,11 +1026,10 @@ class QueryStageAndSortedThreeLeaf : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -1050,6 +1048,7 @@ public:
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
         addIndex(BSON("baz" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
         auto ah = std::make_unique<AndSortedStage>(_expCtx.get(), &ws);
@@ -1081,11 +1080,10 @@ class QueryStageAndSortedWithNothing : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -1095,6 +1093,7 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
         auto ah = std::make_unique<AndSortedStage>(_expCtx.get(), &ws);
@@ -1120,11 +1119,10 @@ class QueryStageAndSortedProducesNothing : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -1138,6 +1136,7 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
         auto ah = std::make_unique<AndSortedStage>(_expCtx.get(), &ws);
@@ -1163,11 +1162,10 @@ class QueryStageAndSortedByLastChild : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -1177,6 +1175,7 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
         auto ah = std::make_unique<AndHashStage>(_expCtx.get(), &ws);
@@ -1224,11 +1223,10 @@ class QueryStageAndSortedFirstChildFetched : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -1239,6 +1237,7 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
         unique_ptr<AndSortedStage> as = std::make_unique<AndSortedStage>(_expCtx.get(), &ws);
@@ -1277,11 +1276,10 @@ class QueryStageAndSortedSecondChildFetched : public QueryStageAndBase {
 public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        Database* db = ctx.db();
-        CollectionPtr coll = ctx.getCollection();
-        if (!coll) {
+
+        if (!ctx.getCollection()) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            ctx.db()->createCollection(&_opCtx, nss());
             wuow.commit();
         }
 
@@ -1292,6 +1290,7 @@ public:
 
         addIndex(BSON("foo" << 1));
         addIndex(BSON("bar" << 1));
+        CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
         unique_ptr<AndSortedStage> as = std::make_unique<AndSortedStage>(_expCtx.get(), &ws);

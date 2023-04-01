@@ -32,12 +32,14 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/persistent_task_store.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/resharding/donor_document_gen.h"
 #include "mongo/db/s/resharding/resharding_donor_recipient_common.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
+#include "mongo/s/shard_version_factory.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/util/fail_point.h"
 
@@ -54,10 +56,11 @@ class ReshardingDonorRecipientCommonInternalsTest : public ShardServerTestFixtur
 public:
     const UUID kExistingUUID = UUID::gen();
     const Timestamp kExistingTimestamp = Timestamp(10, 5);
-    const NamespaceString kOriginalNss = NamespaceString("db", "foo");
+    const NamespaceString kOriginalNss =
+        NamespaceString::createNamespaceString_forTest("db", "foo");
 
     const NamespaceString kTemporaryReshardingNss =
-        constructTemporaryReshardingNss("db", kExistingUUID);
+        resharding::constructTemporaryReshardingNss("db", kExistingUUID);
     const std::string kOriginalShardKey = "oldKey";
     const BSONObj kOriginalShardKeyPattern = BSON(kOriginalShardKey << 1);
     const std::string kReshardingKey = "newKey";
@@ -110,8 +113,10 @@ protected:
                                            const OID& epoch,
                                            const ShardId& shardThatChunkExistsOn) {
         auto range = ChunkRange(BSON(shardKey << MINKEY), BSON(shardKey << MAXKEY));
-        auto chunk = ChunkType(
-            uuid, std::move(range), ChunkVersion(1, 0, epoch, timestamp), shardThatChunkExistsOn);
+        auto chunk = ChunkType(uuid,
+                               std::move(range),
+                               ChunkVersion({epoch, timestamp}, {1, 0}),
+                               shardThatChunkExistsOn);
         ChunkManager cm(kThisShard.getShardId(),
                         DatabaseVersion(uuid, timestamp),
                         makeStandaloneRoutingTableHistory(
@@ -123,31 +128,27 @@ protected:
                                                          epoch,
                                                          timestamp,
                                                          boost::none /* timeseriesFields */,
-                                                         boost::none,
-                                                         boost::none /* chunkSizeBytes */,
+                                                         boost::none /* reshardingFields */,
+
                                                          true,
                                                          {std::move(chunk)})),
                         boost::none);
 
-        if (!OperationShardingState::isOperationVersioned(opCtx)) {
-            OperationShardingState::setShardRole(
-                opCtx, nss, cm.getVersion(kThisShard.getShardId()), boost::none);
-        }
-
         return CollectionMetadata(std::move(cm), kThisShard.getShardId());
     }
 
-    ReshardingDonorDocument makeDonorStateDoc() {
+    ReshardingDonorDocument makeDonorStateDoc(NamespaceString sourceNss,
+                                              NamespaceString tempReshardingNss,
+                                              BSONObj reshardingKey,
+                                              std::vector<mongo::ShardId> recipientShards) {
         DonorShardContext donorCtx;
         donorCtx.setState(DonorStateEnum::kPreparingToDonate);
 
-        ReshardingDonorDocument doc(std::move(donorCtx),
-                                    {kThisShard.getShardId(), kOtherShard.getShardId()});
+        ReshardingDonorDocument doc(std::move(donorCtx), recipientShards);
 
-        NamespaceString sourceNss = kOriginalNss;
         auto sourceUUID = UUID::gen();
         auto commonMetadata = CommonReshardingMetadata(
-            UUID::gen(), sourceNss, sourceUUID, kTemporaryReshardingNss, kReshardingKeyPattern);
+            UUID::gen(), sourceNss, sourceUUID, tempReshardingNss, reshardingKey);
 
         doc.setCommonReshardingMetadata(std::move(commonMetadata));
         return doc;
@@ -198,7 +199,7 @@ protected:
         const boost::optional<Timestamp>& cloneTimestamp = boost::none) {
         auto recipientFields =
             TypeCollectionRecipientFields(donorShards, existingUUID, originalNss, 5000);
-        emplaceCloneTimestampIfExists(recipientFields, cloneTimestamp);
+        resharding::emplaceCloneTimestampIfExists(recipientFields, cloneTimestamp);
         fields.setRecipientFields(std::move(recipientFields));
     }
 
@@ -266,6 +267,20 @@ protected:
         ASSERT(donorShardMap.empty());
     }
 
+    void addFilteringMetadata(OperationContext* opCtx, NamespaceString sourceNss, ShardId shardId) {
+        AutoGetCollection autoColl(opCtx, sourceNss, LockMode::MODE_IS);
+        const auto metadata{makeShardedMetadataForOriginalCollection(opCtx, shardId)};
+        ScopedSetShardRole scopedSetShardRole{
+            opCtx,
+            sourceNss,
+            ShardVersionFactory::make(
+                metadata, boost::optional<CollectionIndexes>(boost::none)) /* shardVersion */,
+            boost::none /* databaseVersion */};
+
+        CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(opCtx, sourceNss)
+            ->setFilteringMetadata(opCtx, metadata);
+    }
+
 private:
     DonorShardFetchTimestamp makeDonorShardFetchTimestamp(
         ShardId shardId, boost::optional<Timestamp> fetchTimestamp) {
@@ -320,8 +335,11 @@ public:
 
         ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
         ASSERT_OK(replCoord->updateTerm(operationContext(), _term));
-        replCoord->setMyLastAppliedOpTimeAndWallTime(
-            repl::OpTimeAndWallTime(repl::OpTime(Timestamp(1, 1), _term), Date_t()));
+
+        WriteUnitOfWork wuow{operationContext()};
+        replCoord->setMyLastAppliedOpTimeAndWallTime(repl::OpTimeAndWallTime(
+            repl::OpTime(repl::getNextOpTime(operationContext()).getTimestamp(), _term), Date_t()));
+        wuow.commit();
 
         _primaryOnlyServiceRegistry->onStepUpComplete(operationContext(), _term);
     }
@@ -334,6 +352,12 @@ protected:
 TEST_F(ReshardingDonorRecipientCommonInternalsTest, ConstructDonorDocumentFromReshardingFields) {
     OperationContext* opCtx = operationContext();
     auto metadata = makeShardedMetadataForOriginalCollection(opCtx, kThisShard.getShardId());
+    ScopedSetShardRole scopedSetShardRole{
+        opCtx,
+        kOriginalNss,
+        ShardVersionFactory::make(
+            metadata, boost::optional<CollectionIndexes>(boost::none)) /* shardVersion */,
+        boost::none /* databaseVersion */};
 
     auto reshardingFields =
         createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kPreparingToDonate);
@@ -349,6 +373,12 @@ TEST_F(ReshardingDonorRecipientCommonInternalsTest,
     OperationContext* opCtx = operationContext();
     auto metadata =
         makeShardedMetadataForTemporaryReshardingCollection(opCtx, kThisShard.getShardId());
+    ScopedSetShardRole scopedSetShardRole{
+        opCtx,
+        kTemporaryReshardingNss,
+        ShardVersionFactory::make(
+            metadata, boost::optional<CollectionIndexes>(boost::none)) /* shardVersion */,
+        boost::none /* databaseVersion */};
 
     auto reshardingFields =
         createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kPreparingToDonate);
@@ -363,6 +393,12 @@ TEST_F(ReshardingDonorRecipientCommonInternalsTest,
 TEST_F(ReshardingDonorRecipientCommonTest, CreateDonorServiceInstance) {
     OperationContext* opCtx = operationContext();
     auto metadata = makeShardedMetadataForOriginalCollection(opCtx, kThisShard.getShardId());
+    ScopedSetShardRole scopedSetShardRole{
+        opCtx,
+        kOriginalNss,
+        ShardVersionFactory::make(
+            metadata, boost::optional<CollectionIndexes>(boost::none)) /* shardVersion */,
+        boost::none /* databaseVersion */};
 
     auto reshardingFields =
         createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kPreparingToDonate);
@@ -378,13 +414,19 @@ TEST_F(ReshardingDonorRecipientCommonTest, CreateDonorServiceInstance) {
 
     ASSERT(donorStateMachine != boost::none);
 
-    donorStateMachine.get()->interrupt({ErrorCodes::InternalError, "Shut down for test"});
+    donorStateMachine.value()->interrupt({ErrorCodes::InternalError, "Shut down for test"});
 }
 
 TEST_F(ReshardingDonorRecipientCommonTest, CreateRecipientServiceInstance) {
     OperationContext* opCtx = operationContext();
     auto metadata =
         makeShardedMetadataForTemporaryReshardingCollection(opCtx, kThisShard.getShardId());
+    ScopedSetShardRole scopedSetShardRole{
+        opCtx,
+        kTemporaryReshardingNss,
+        ShardVersionFactory::make(
+            metadata, boost::optional<CollectionIndexes>(boost::none)) /* shardVersion */,
+        boost::none /* databaseVersion */};
 
     auto reshardingFields =
         createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kPreparingToDonate);
@@ -401,13 +443,19 @@ TEST_F(ReshardingDonorRecipientCommonTest, CreateRecipientServiceInstance) {
 
     ASSERT(recipientStateMachine != boost::none);
 
-    recipientStateMachine.get()->interrupt({ErrorCodes::InternalError, "Shut down for test"});
+    recipientStateMachine.value()->interrupt({ErrorCodes::InternalError, "Shut down for test"});
 }
 
 TEST_F(ReshardingDonorRecipientCommonTest,
        CreateDonorServiceInstanceWithIncorrectCoordinatorState) {
     OperationContext* opCtx = operationContext();
     auto metadata = makeShardedMetadataForOriginalCollection(opCtx, kThisShard.getShardId());
+    ScopedSetShardRole scopedSetShardRole{
+        opCtx,
+        kOriginalNss,
+        ShardVersionFactory::make(
+            metadata, boost::optional<CollectionIndexes>(boost::none)) /* shardVersion */,
+        boost::none /* databaseVersion */};
 
     auto reshardingFields =
         createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kCommitting);
@@ -425,6 +473,12 @@ TEST_F(ReshardingDonorRecipientCommonTest,
     OperationContext* opCtx = operationContext();
     auto metadata =
         makeShardedMetadataForTemporaryReshardingCollection(opCtx, kThisShard.getShardId());
+    ScopedSetShardRole scopedSetShardRole{
+        opCtx,
+        kTemporaryReshardingNss,
+        ShardVersionFactory::make(
+            metadata, boost::optional<CollectionIndexes>(boost::none)) /* shardVersion */,
+        boost::none /* databaseVersion */};
 
     auto reshardingFields =
         createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kCommitting);
@@ -448,6 +502,12 @@ TEST_F(ReshardingDonorRecipientCommonTest,
 TEST_F(ReshardingDonorRecipientCommonTest, ProcessDonorFieldsWhenShardDoesntOwnAnyChunks) {
     OperationContext* opCtx = operationContext();
     auto metadata = makeShardedMetadataForOriginalCollection(opCtx, kOtherShard.getShardId());
+    ScopedSetShardRole scopedSetShardRole{
+        opCtx,
+        kOriginalNss,
+        ShardVersionFactory::make(
+            metadata, boost::optional<CollectionIndexes>(boost::none)) /* shardVersion */,
+        boost::none /* databaseVersion */};
 
     auto reshardingFields =
         createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kPreparingToDonate);
@@ -468,6 +528,12 @@ TEST_F(ReshardingDonorRecipientCommonTest, ProcessRecipientFieldsWhenShardDoesnt
     OperationContext* opCtx = operationContext();
     auto metadata =
         makeShardedMetadataForTemporaryReshardingCollection(opCtx, kOtherShard.getShardId());
+    ScopedSetShardRole scopedSetShardRole{
+        opCtx,
+        kTemporaryReshardingNss,
+        ShardVersionFactory::make(
+            metadata, boost::optional<CollectionIndexes>(boost::none)) /* shardVersion */,
+        boost::none /* databaseVersion */};
 
     auto reshardingFields =
         createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kPreparingToDonate);
@@ -489,6 +555,12 @@ TEST_F(ReshardingDonorRecipientCommonTest, ProcessReshardingFieldsWithoutDonorOr
     OperationContext* opCtx = operationContext();
     auto metadata =
         makeShardedMetadataForTemporaryReshardingCollection(opCtx, kThisShard.getShardId());
+    ScopedSetShardRole scopedSetShardRole{
+        opCtx,
+        kTemporaryReshardingNss,
+        ShardVersionFactory::make(
+            metadata, boost::optional<CollectionIndexes>(boost::none)) /* shardVersion */,
+        boost::none /* databaseVersion */};
 
     auto reshardingFields =
         createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kPreparingToDonate);
@@ -507,34 +579,22 @@ TEST_F(ReshardingDonorRecipientCommonInternalsTest, ClearReshardingFilteringMeta
         // Clear out the resharding donor/recipient metadata collections.
         for (auto const& nss : {NamespaceString::kDonorReshardingOperationsNamespace,
                                 NamespaceString::kRecipientReshardingOperationsNamespace}) {
-            dropDatabase(opCtx, nss.db().toString()).ignore();
+            dropDatabase(opCtx, nss.dbName()).ignore();
         }
 
         // Assert the prestate has no filtering metadata.
         for (auto const& nss : {kOriginalNss, kTemporaryReshardingNss}) {
             AutoGetCollection autoColl(opCtx, nss, LockMode::MODE_IS);
-            auto csr = CollectionShardingRuntime::get(opCtx, nss);
+            const auto csr =
+                CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, nss);
             ASSERT(csr->getCurrentMetadataIfKnown() == boost::none);
         }
 
         // Add filtering metadata for the collection being resharded.
-        {
-            AutoGetCollection autoColl(opCtx, kOriginalNss, LockMode::MODE_IS);
-            auto csr = CollectionShardingRuntime::get(opCtx, kOriginalNss);
-            csr->setFilteringMetadata(
-                opCtx, makeShardedMetadataForOriginalCollection(opCtx, kThisShard.getShardId()));
-            ASSERT(csr->getCurrentMetadataIfKnown());
-        }
+        addFilteringMetadata(opCtx, kOriginalNss, kThisShard.getShardId());
 
         // Add filtering metadata for the temporary resharding namespace.
-        {
-            AutoGetCollection autoColl(opCtx, kTemporaryReshardingNss, LockMode::MODE_IS);
-            auto csr = CollectionShardingRuntime::get(opCtx, kTemporaryReshardingNss);
-            csr->setFilteringMetadata(opCtx,
-                                      makeShardedMetadataForTemporaryReshardingCollection(
-                                          opCtx, kThisShard.getShardId()));
-            ASSERT(csr->getCurrentMetadataIfKnown());
-        }
+        addFilteringMetadata(opCtx, kTemporaryReshardingNss, kThisShard.getShardId());
 
         // Prior to adding a resharding document, assert that attempting to clear filtering does
         // nothing.
@@ -542,14 +602,19 @@ TEST_F(ReshardingDonorRecipientCommonInternalsTest, ClearReshardingFilteringMeta
 
         for (auto const& nss : {kOriginalNss, kTemporaryReshardingNss}) {
             AutoGetCollection autoColl(opCtx, nss, LockMode::MODE_IS);
-            auto csr = CollectionShardingRuntime::get(opCtx, nss);
+            const auto csr =
+                CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, nss);
             ASSERT(csr->getCurrentMetadataIfKnown());
         }
     };
 
     doSetupFunc();
     // Add a resharding donor document that targets the namespaces involved in resharding.
-    ReshardingDonorDocument donorDoc = makeDonorStateDoc();
+    ReshardingDonorDocument donorDoc =
+        makeDonorStateDoc(kOriginalNss,
+                          kTemporaryReshardingNss,
+                          kReshardingKeyPattern,
+                          {kThisShard.getShardId(), kOtherShard.getShardId()});
     ReshardingDonorService::DonorStateMachine::insertStateDocument(opCtx, donorDoc);
 
     // Clear the filtering metadata (without scheduling a refresh) and assert the metadata is gone.
@@ -557,7 +622,8 @@ TEST_F(ReshardingDonorRecipientCommonInternalsTest, ClearReshardingFilteringMeta
 
     for (auto const& nss : {kOriginalNss, kTemporaryReshardingNss}) {
         AutoGetCollection autoColl(opCtx, nss, LockMode::MODE_IS);
-        auto csr = CollectionShardingRuntime::get(opCtx, nss);
+        const auto csr =
+            CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, nss);
         ASSERT(csr->getCurrentMetadataIfKnown() == boost::none);
     }
 
@@ -571,10 +637,57 @@ TEST_F(ReshardingDonorRecipientCommonInternalsTest, ClearReshardingFilteringMeta
 
     for (auto const& nss : {kOriginalNss, kTemporaryReshardingNss}) {
         AutoGetCollection autoColl(opCtx, nss, LockMode::MODE_IS);
-        auto csr = CollectionShardingRuntime::get(opCtx, nss);
+        const auto csr =
+            CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, nss);
         ASSERT(csr->getCurrentMetadataIfKnown() == boost::none);
     }
 }
-}  // namespace
 
+TEST_F(ReshardingDonorRecipientCommonInternalsTest, ClearReshardingFilteringMetaDataForActiveOp) {
+    OperationContext* opCtx = operationContext();
+    NamespaceString sourceNss1 = NamespaceString::createNamespaceString_forTest("db", "one");
+    NamespaceString tempReshardingNss1 =
+        resharding::constructTemporaryReshardingNss(sourceNss1.db(), UUID::gen());
+    NamespaceString sourceNss2 = NamespaceString::createNamespaceString_forTest("db", "two");
+    NamespaceString tempReshardingNss2 =
+        resharding::constructTemporaryReshardingNss(sourceNss2.db(), UUID::gen());
+    ShardId shardId1 = ShardId{"recipient1"};
+    ShardId shardId2 = ShardId{"recipient2"};
+    ReshardingDonorDocument doc1 =
+        makeDonorStateDoc(sourceNss1, tempReshardingNss1, BSON("newKey1" << 1), {shardId1});
+    ReshardingDonorDocument doc2 =
+        makeDonorStateDoc(sourceNss2, tempReshardingNss2, BSON("newKey2" << 1), {shardId2});
+
+    ReshardingDonorService::DonorStateMachine::insertStateDocument(opCtx, doc1);
+    ReshardingDonorService::DonorStateMachine::insertStateDocument(opCtx, doc2);
+
+    // Add filtering metadata for the collection being resharded.
+    addFilteringMetadata(opCtx, sourceNss1, {shardId1});
+    addFilteringMetadata(opCtx, sourceNss2, {shardId2});
+
+    // Add filtering metadata for the temporary resharding namespace.
+    addFilteringMetadata(opCtx, tempReshardingNss1, {shardId1});
+    addFilteringMetadata(opCtx, tempReshardingNss2, {shardId2});
+
+    // Clear the filtering metadata (without scheduling a refresh) for only on single operation
+    // related namespaces
+    resharding::clearFilteringMetadata(opCtx, {sourceNss1, tempReshardingNss1}, false);
+
+    for (auto const& nss : {sourceNss1, tempReshardingNss1}) {
+        AutoGetCollection autoColl(opCtx, nss, LockMode::MODE_IS);
+        const auto csr =
+            CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, nss);
+        ASSERT(csr->getCurrentMetadataIfKnown() == boost::none);
+    }
+
+    // Assert that the filtering metadata is not cleared for other operation
+    for (auto const& nss : {sourceNss2, tempReshardingNss2}) {
+        AutoGetCollection autoColl(opCtx, nss, LockMode::MODE_IS);
+        const auto csr =
+            CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, nss);
+        ASSERT(csr->getCurrentMetadataIfKnown() != boost::none);
+    }
+}
+
+}  // namespace
 }  // namespace mongo

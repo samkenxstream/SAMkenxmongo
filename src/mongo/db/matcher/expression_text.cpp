@@ -57,7 +57,7 @@ TextMatchExpression::TextMatchExpression(OperationContext* opCtx,
     fts::TextIndexVersion version;
     {
         // Find text index.
-        AutoGetDb autoDb(opCtx, nss.db(), MODE_IS);
+        AutoGetDb autoDb(opCtx, nss.dbName(), MODE_IS);
         Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
         Database* db = autoDb.getDb();
 
@@ -66,8 +66,8 @@ TextMatchExpression::TextMatchExpression(OperationContext* opCtx,
                               << nss.ns() << "')",
                 db);
 
-        CollectionPtr collection =
-            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
+        CollectionPtr collection(
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss));
 
         uassert(ErrorCodes::IndexNotFound,
                 str::stream() << "text index required for $text query (no such collection '"
@@ -100,7 +100,7 @@ TextMatchExpression::TextMatchExpression(OperationContext* opCtx,
     uassertStatusOK(parseStatus);
 }
 
-std::unique_ptr<MatchExpression> TextMatchExpression::shallowClone() const {
+std::unique_ptr<MatchExpression> TextMatchExpression::clone() const {
     auto expr = std::make_unique<TextMatchExpression>(_ftsQuery);
     // We use the query-only constructor here directly rather than using the full constructor, to
     // avoid needing to examine

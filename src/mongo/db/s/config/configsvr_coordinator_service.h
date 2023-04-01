@@ -67,6 +67,9 @@ public:
         const std::vector<const PrimaryOnlyService::Instance*>& existingInstances) override{};
 
     std::shared_ptr<Instance> constructInstance(BSONObj initialState) override;
+
+    bool areAllCoordinatorsOfTypeFinished(OperationContext* opCtx,
+                                          ConfigsvrCoordinatorTypeEnum coordinatorType);
 };
 
 }  // namespace mongo

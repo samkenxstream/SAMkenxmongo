@@ -37,6 +37,7 @@
 #include "mongo/db/concurrency/lock_stats.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/concurrency/admission_context.h"
 
 namespace mongo {
 
@@ -51,8 +52,11 @@ class Locker {
     Locker& operator=(const Locker&) = delete;
 
     friend class UninterruptibleLockGuard;
+    friend class InterruptibleLockGuard;
 
 public:
+    using LockTimeoutCallback = std::function<void()>;
+
     virtual ~Locker() {}
 
     /**
@@ -114,6 +118,8 @@ public:
      * deadline and 'maxTimeout' is reached. Presumably these callers do not expect to handle lock
      * acquisition failure, so this is done to ensure the caller does not proceed as if the lock
      * were successfully acquired.
+     *
+     * Note that this max lock timeout will not apply to ticket acquisition.
      */
     virtual void setMaxLockTimeout(Milliseconds maxTimeout) = 0;
 
@@ -181,7 +187,10 @@ public:
      *
      * It may throw an exception if it is interrupted.
      */
-    virtual void lockRSTLComplete(OperationContext* opCtx, LockMode mode, Date_t deadline) = 0;
+    virtual void lockRSTLComplete(OperationContext* opCtx,
+                                  LockMode mode,
+                                  Date_t deadline,
+                                  const LockTimeoutCallback& onTimeout = nullptr) = 0;
 
     /**
      * Unlocks the RSTL when the transaction becomes prepared. This is used to bypass two-phase
@@ -289,7 +298,7 @@ public:
     // These are shortcut methods for the above calls. They however check that the entire
     // hierarchy is properly locked and because of this they are very expensive to call.
     // Do not use them in performance critical code paths.
-    virtual bool isDbLockedForMode(StringData dbName, LockMode mode) const = 0;
+    virtual bool isDbLockedForMode(const DatabaseName& dbName, LockMode mode) const = 0;
     virtual bool isCollectionLockedForMode(const NamespaceString& nss, LockMode mode) const = 0;
 
     /**
@@ -395,7 +404,6 @@ public:
      * @param opCtx An operation context that enables the restoration to be interrupted.
      */
     virtual void restoreLockState(OperationContext* opCtx, const LockSnapshot& stateToRestore) = 0;
-    virtual void restoreLockState(const LockSnapshot& stateToRestore) = 0;
 
     /**
      * releaseWriteUnitOfWorkAndUnlock opts out of two-phase locking and yields the locks after a
@@ -424,8 +432,12 @@ public:
     /**
      * Reacquires a ticket for the Locker. This must only be called after releaseTicket(). It
      * restores the ticket under its previous LockMode.
-     * An OperationContext is required to interrupt the ticket acquisition to prevent deadlocks.
-     * A dead lock is possible when a ticket is reacquired while holding a lock.
+     *
+     * Requires that all locks granted to this locker are modes IS or IX.
+     *
+     * Note that this ticket acquisition will not time out due to a max lock timeout set on the
+     * locker. However, it may time out if a potential deadlock scenario is detected due to ticket
+     * exhaustion and pending S or X locks.
      */
     virtual void reacquireTicket(OperationContext* opCtx) = 0;
 
@@ -485,6 +497,18 @@ public:
     }
 
     /**
+     * If set to false, this opts out of conflicting with the barrier created by the
+     * setFeatureCompatibilityVersion command. Code that opts-out must be ok with writes being able
+     * to start under one FCV and complete under a different FCV.
+     */
+    void setShouldConflictWithSetFeatureCompatibilityVersion(bool newValue) {
+        _shouldConflictWithSetFeatureCompatibilityVersion = newValue;
+    }
+    bool shouldConflictWithSetFeatureCompatibilityVersion() const {
+        return _shouldConflictWithSetFeatureCompatibilityVersion;
+    }
+
+    /**
      * If set to true, this opts out of a fatal assertion where operations which are holding open an
      * oplog hole cannot try to acquire subsequent locks.
      */
@@ -496,22 +520,18 @@ public:
     }
 
     /**
-     * This will opt in or out of the ticket mechanism. This should be used sparingly for special
-     * purpose threads, such as FTDC and committing or aborting prepared transactions.
+     * This will set the admission priority for the ticket mechanism.
      */
-    void skipAcquireTicket() {
-        // Should not hold or wait for the ticket.
-        invariant(isNoop() || getClientState() == Locker::ClientState::kInactive);
-        _shouldAcquireTicket = false;
-    }
-    void setAcquireTicket() {
-        // Should hold or wait for the ticket.
-        invariant(isNoop() || getClientState() == Locker::ClientState::kInactive);
-        _shouldAcquireTicket = true;
+    void setAdmissionPriority(AdmissionContext::Priority priority) {
+        _admCtx.setPriority(priority);
     }
 
-    bool shouldAcquireTicket() const {
-        return _shouldAcquireTicket;
+    AdmissionContext::Priority getAdmissionPriority() {
+        return _admCtx.getPriority();
+    }
+
+    bool shouldWaitForTicket() const {
+        return _admCtx.getPriority() != AdmissionContext::Priority::kImmediate;
     }
 
     /**
@@ -554,15 +574,25 @@ protected:
     int _uninterruptibleLocksRequested = 0;
 
     /**
+     * The number of callers that are guarding against uninterruptible lock requests. An int,
+     * instead of a boolean, to support multiple simultaneous requests. When > 0, ensures that
+     * _uninterruptibleLocksRequested above is _not_ used.
+     */
+    int _keepInterruptibleRequests = 0;
+
+    /**
      * The number of LockRequests to unlock at the end of this WUOW. This is used for locks
      * participating in two-phase locking.
      */
     unsigned _numResourcesToUnlockAtEndUnitOfWork = 0;
 
+    // Keeps state and statistics related to admission control.
+    AdmissionContext _admCtx;
+
 private:
     bool _shouldConflictWithSecondaryBatchApplication = true;
+    bool _shouldConflictWithSetFeatureCompatibilityVersion = true;
     bool _shouldAllowLockAcquisitionOnTimestampedUnitOfWork = false;
-    bool _shouldAcquireTicket = true;
     std::string _debugInfo;  // Extra info about this locker for debugging purpose
 };
 
@@ -585,6 +615,7 @@ public:
      */
     explicit UninterruptibleLockGuard(Locker* locker) : _locker(locker) {
         invariant(_locker);
+        invariant(_locker->_keepInterruptibleRequests == 0);
         invariant(_locker->_uninterruptibleLocksRequested >= 0);
         invariant(_locker->_uninterruptibleLocksRequested < std::numeric_limits<int>::max());
         _locker->_uninterruptibleLocksRequested += 1;
@@ -593,6 +624,38 @@ public:
     ~UninterruptibleLockGuard() {
         invariant(_locker->_uninterruptibleLocksRequested > 0);
         _locker->_uninterruptibleLocksRequested -= 1;
+    }
+
+private:
+    Locker* const _locker;
+};
+
+/**
+ * This RAII type ensures that there are no uninterruptible lock acquisitions while in scope. If an
+ * UninterruptibleLockGuard is held at a higher level, or taken at a lower level, an invariant will
+ * occur. This protects against UninterruptibleLockGuard uses on code paths that must be
+ * interruptible. Safe to nest InterruptibleLockGuard instances.
+ */
+class InterruptibleLockGuard {
+    InterruptibleLockGuard(const InterruptibleLockGuard& other) = delete;
+    InterruptibleLockGuard(InterruptibleLockGuard&& other) = delete;
+
+public:
+    /*
+     * Accepts a Locker, and increments the Locker's _keepInterruptibleRequests counter. Decrements
+     * the counter when destroyed.
+     */
+    explicit InterruptibleLockGuard(Locker* locker) : _locker(locker) {
+        invariant(_locker);
+        invariant(_locker->_uninterruptibleLocksRequested == 0);
+        invariant(_locker->_keepInterruptibleRequests >= 0);
+        invariant(_locker->_keepInterruptibleRequests < std::numeric_limits<int>::max());
+        _locker->_keepInterruptibleRequests += 1;
+    }
+
+    ~InterruptibleLockGuard() {
+        invariant(_locker->_keepInterruptibleRequests > 0);
+        _locker->_keepInterruptibleRequests -= 1;
     }
 
 private:
@@ -617,6 +680,26 @@ public:
 
     ~ShouldNotConflictWithSecondaryBatchApplicationBlock() {
         _lockState->setShouldConflictWithSecondaryBatchApplication(_originalShouldConflict);
+    }
+
+private:
+    Locker* const _lockState;
+    const bool _originalShouldConflict;
+};
+
+/**
+ * RAII-style class to opt out the FeatureCompatibilityVersion lock.
+ */
+class ShouldNotConflictWithSetFeatureCompatibilityVersionBlock {
+public:
+    explicit ShouldNotConflictWithSetFeatureCompatibilityVersionBlock(Locker* lockState)
+        : _lockState(lockState),
+          _originalShouldConflict(_lockState->shouldConflictWithSetFeatureCompatibilityVersion()) {
+        _lockState->setShouldConflictWithSetFeatureCompatibilityVersion(false);
+    }
+
+    ~ShouldNotConflictWithSetFeatureCompatibilityVersionBlock() {
+        _lockState->setShouldConflictWithSetFeatureCompatibilityVersion(_originalShouldConflict);
     }
 
 private:
@@ -655,6 +738,34 @@ public:
 private:
     Locker* const _lockState;
     bool _originalValue;
+};
+
+/**
+ * RAII-style class to set the priority for the ticket admission mechanism when acquiring a global
+ * lock.
+ */
+class ScopedAdmissionPriorityForLock {
+public:
+    ScopedAdmissionPriorityForLock(Locker* lockState, AdmissionContext::Priority priority)
+        : _lockState(lockState), _originalPriority(_lockState->getAdmissionPriority()) {
+        uassert(ErrorCodes::IllegalOperation,
+                "It is illegal for an operation to demote a high priority to a lower priority "
+                "operation",
+                _originalPriority != AdmissionContext::Priority::kImmediate ||
+                    priority == AdmissionContext::Priority::kImmediate);
+        _lockState->setAdmissionPriority(priority);
+    }
+
+    ScopedAdmissionPriorityForLock(const ScopedAdmissionPriorityForLock&) = delete;
+    ScopedAdmissionPriorityForLock& operator=(const ScopedAdmissionPriorityForLock&) = delete;
+
+    ~ScopedAdmissionPriorityForLock() {
+        _lockState->setAdmissionPriority(_originalPriority);
+    }
+
+private:
+    Locker* _lockState;
+    AdmissionContext::Priority _originalPriority;
 };
 
 }  // namespace mongo

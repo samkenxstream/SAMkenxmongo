@@ -34,13 +34,14 @@
 #include <map>
 #include <string>
 
-#include <third_party/murmurhash3/MurmurHash3.h>
+#include <MurmurHash3.h>
 
 #include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_view.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/base/string_data.h"
 #include "mongo/config.h"
+#include "mongo/db/namespace_string.h"
 
 namespace mongo {
 
@@ -155,12 +156,6 @@ enum LockResult {
 enum ResourceType {
     RESOURCE_INVALID = 0,
 
-    /** Parallel batch writer mode lock */
-    RESOURCE_PBWM,
-
-    /** Replication state transition lock. */
-    RESOURCE_RSTL,
-
     /**  Used for global exclusive operations */
     RESOURCE_GLOBAL,
 
@@ -169,7 +164,10 @@ enum ResourceType {
     RESOURCE_COLLECTION,
     RESOURCE_METADATA,
 
-    /** Resource type used for locking general resources not related to the storage hierarchy. */
+    /**
+     * Resource type used for locking general resources not related to the storage hierarchy. These
+     * can't be created manually, use Lock::ResourceMutex::ResourceMutex() instead.
+     */
     RESOURCE_MUTEX,
 
     /** Counts the rest. Always insert new resource types above this entry. */
@@ -177,26 +175,54 @@ enum ResourceType {
 };
 
 /**
+ * IDs for usages of RESOURCE_GLOBAL.
+ */
+enum class ResourceGlobalId : uint8_t {
+    kParallelBatchWriterMode,
+    kFeatureCompatibilityVersion,
+    kReplicationStateTransitionLock,
+    kGlobal,
+
+    // The number of global resource ids. Always insert new ids above this entry.
+    kNumIds
+};
+
+/**
  * Maps the resource id to a human-readable string.
  */
-static const char* ResourceTypeNames[] = {"Invalid",
-                                          "ParallelBatchWriterMode",
-                                          "ReplicationStateTransition",
-                                          "Global",
-                                          "Database",
-                                          "Collection",
-                                          "Metadata",
-                                          "Mutex"};
+static const char* ResourceTypeNames[] = {
+    "Invalid", "Global", "Database", "Collection", "Metadata", "Mutex"};
+
+/**
+ * Maps the global resource id to a human-readable string.
+ */
+static const char* ResourceGlobalIdNames[] = {
+    "ParallelBatchWriterMode",
+    "FeatureCompatibilityVersion",
+    "ReplicationStateTransition",
+    "Global",
+};
 
 // Ensure we do not add new types without updating the names array.
 MONGO_STATIC_ASSERT((sizeof(ResourceTypeNames) / sizeof(ResourceTypeNames[0])) ==
                     ResourceTypesCount);
+
+// Ensure we do not add new global resource ids without updating the names array.
+MONGO_STATIC_ASSERT((sizeof(ResourceGlobalIdNames) / sizeof(ResourceGlobalIdNames[0])) ==
+                    static_cast<uint8_t>(ResourceGlobalId::kNumIds));
 
 /**
  * Returns a human-readable name for the specified resource type.
  */
 static const char* resourceTypeName(ResourceType resourceType) {
     return ResourceTypeNames[resourceType];
+}
+
+/**
+ * Returns a human-readable name for the specified global resource.
+ */
+static const char* resourceGlobalIdName(ResourceGlobalId id) {
+    return ResourceGlobalIdNames[static_cast<uint8_t>(id)];
 }
 
 /**
@@ -209,10 +235,23 @@ class ResourceId {
 
 public:
     ResourceId() : _fullHash(0) {}
-    ResourceId(ResourceType type, StringData ns) : _fullHash(fullHash(type, hashStringData(ns))) {}
-    ResourceId(ResourceType type, const std::string& ns)
-        : _fullHash(fullHash(type, hashStringData(ns))) {}
-    ResourceId(ResourceType type, uint64_t hashId) : _fullHash(fullHash(type, hashId)) {}
+    ResourceId(ResourceType type, const NamespaceString& nss)
+        : _fullHash(fullHash(type, hashStringData(nss.toStringWithTenantId()))) {
+        verifyNoResourceMutex(type);
+    }
+    ResourceId(ResourceType type, const DatabaseName& dbName)
+        : _fullHash(fullHash(type, hashStringData(dbName.toStringWithTenantId()))) {
+        verifyNoResourceMutex(type);
+    }
+    ResourceId(ResourceType type, const std::string& str)
+        : _fullHash(fullHash(type, hashStringData(str))) {
+        // Resources of type database or collection must never be passed as a raw string
+        invariant(type != RESOURCE_DATABASE && type != RESOURCE_COLLECTION);
+        verifyNoResourceMutex(type);
+    }
+    ResourceId(ResourceType type, uint64_t hashId) : _fullHash(fullHash(type, hashId)) {
+        verifyNoResourceMutex(type);
+    }
 
     bool isValid() const {
         return getType() != RESOURCE_INVALID;
@@ -243,6 +282,20 @@ public:
     }
 
 private:
+    ResourceId(uint64_t fullHash) : _fullHash(fullHash) {}
+
+    // Used to allow Lock::ResourceMutex to create ResourceIds with RESOURCE_MUTEX type
+    static ResourceId makeMutexResourceId(uint64_t hashId) {
+        return ResourceId(fullHash(ResourceType::RESOURCE_MUTEX, hashId));
+    }
+    friend class Lock;
+
+    void verifyNoResourceMutex(ResourceType type) {
+        invariant(
+            type != RESOURCE_MUTEX,
+            "Can't create a ResourceMutex directly, use Lock::ResourceMutex::ResourceMutex().");
+    }
+
     /**
      * The top 'resourceTypeBits' bits of '_fullHash' represent the resource type,
      * while the remaining bits contain the bottom bits of the hashId. This avoids false
@@ -275,7 +328,6 @@ typedef uint64_t LockerId;
 // Hardcoded resource id for the oplog collection, which is special-cased both for resource
 // acquisition purposes and for statistics reporting.
 extern const ResourceId resourceIdLocalDB;
-extern const ResourceId resourceIdOplog;
 
 // Hardcoded resource id for admin db. This is to ensure direct writes to auth collections
 // are serialized (see SERVER-16092)
@@ -291,9 +343,14 @@ extern const ResourceId resourceIdGlobal;
 // this lock.
 extern const ResourceId resourceIdParallelBatchWriterMode;
 
+// Hardcoded resource id for a full FCV transition from start -> upgrading -> upgraded (or
+// equivalent for downgrading). This lock is used as a barrier to prevent writes from spanning an
+// FCV change. This lock is acquired after the PBWM but before the RSTL and resourceIdGlobal.
+extern const ResourceId resourceIdFeatureCompatibilityVersion;
+
 // Hardcoded resource id for the ReplicationStateTransitionLock (RSTL). This lock is acquired in
 // mode X for any replication state transition and is acquired by all other reads and writes in mode
-// IX. This lock is acquired after the PBWM but before the resourceIdGlobal.
+// IX. This lock is acquired after the PBWM and FCV locks but before the resourceIdGlobal.
 extern const ResourceId resourceIdReplicationStateTransitionLock;
 
 /**

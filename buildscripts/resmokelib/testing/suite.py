@@ -59,7 +59,7 @@ def synchronized(method):
     return synced
 
 
-class Suite(object):  # pylint: disable=too-many-instance-attributes,too-many-public-methods
+class Suite(object):
     """A suite of tests of a particular kind (e.g. C++ unit tests, dbtests, jstests)."""
 
     def __init__(self, suite_name, suite_config, suite_options=_config.SuiteOptions.ALL_INHERITED):
@@ -373,11 +373,19 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes,too-many-pu
                 sb.append("    %s (%d %s)" % (test_info.test_file, test_info.return_code,
                                               translate_exit_code(test_info.return_code)))
 
+                for exception_extractor in test_info.exception_extractors:
+                    for log_line in exception_extractor.get_exception():
+                        sb.append("        %s" % (log_line))
+
         if report.num_errored > 0:
             sb.append("The following tests had errors:")
             for test_info in report.get_errored():
                 test_names.append(test_info.test_file)
                 sb.append("    %s" % (test_info.test_file))
+
+                if test_info.error:
+                    for log_line in test_info.error:
+                        sb.append("        %s" % (log_line))
 
         if num_failed > 0 or report.num_errored > 0:
             test_names.sort(key=_report.test_order)
@@ -414,3 +422,12 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes,too-many-pu
             for test_name in self.tests:
                 test_case_names.append(test_name)
         return test_case_names
+
+    def is_matrix_suite(self):
+        return "matrix_suite" in self.get_config()
+
+    def get_description(self):
+        if "description" not in self.get_config():
+            return None
+
+        return self.get_config()["description"]

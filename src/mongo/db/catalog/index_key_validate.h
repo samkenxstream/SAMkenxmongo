@@ -43,23 +43,81 @@ class StatusWith;
 
 namespace index_key_validate {
 
+// TTL indexes with 'expireAfterSeconds' are repaired with this duration, which is chosen to be
+// the largest possible value for the 'safeInt' type that can be returned in the listIndexes
+// response.
+constexpr auto kExpireAfterSecondsForInactiveTTLIndex =
+    Seconds(std::numeric_limits<int32_t>::max());
+
+static std::set<StringData> allowedFieldNames = {
+    IndexDescriptor::k2dIndexBitsFieldName,
+    IndexDescriptor::k2dIndexMaxFieldName,
+    IndexDescriptor::k2dIndexMinFieldName,
+    IndexDescriptor::k2dsphereCoarsestIndexedLevel,
+    IndexDescriptor::k2dsphereFinestIndexedLevel,
+    IndexDescriptor::k2dsphereVersionFieldName,
+    IndexDescriptor::kBackgroundFieldName,
+    IndexDescriptor::kCollationFieldName,
+    IndexDescriptor::kDefaultLanguageFieldName,
+    IndexDescriptor::kDropDuplicatesFieldName,
+    IndexDescriptor::kExpireAfterSecondsFieldName,
+    IndexDescriptor::kHiddenFieldName,
+    IndexDescriptor::kIndexNameFieldName,
+    IndexDescriptor::kIndexVersionFieldName,
+    IndexDescriptor::kKeyPatternFieldName,
+    IndexDescriptor::kLanguageOverrideFieldName,
+    IndexDescriptor::kNamespaceFieldName,
+    IndexDescriptor::kPartialFilterExprFieldName,
+    IndexDescriptor::kWildcardProjectionFieldName,
+    IndexDescriptor::kColumnStoreProjectionFieldName,
+    IndexDescriptor::kSparseFieldName,
+    IndexDescriptor::kStorageEngineFieldName,
+    IndexDescriptor::kTextVersionFieldName,
+    IndexDescriptor::kUniqueFieldName,
+    IndexDescriptor::kWeightsFieldName,
+    IndexDescriptor::kOriginalSpecFieldName,
+    IndexDescriptor::kPrepareUniqueFieldName,
+    IndexDescriptor::kColumnStoreCompressorFieldName,
+    // Index creation under legacy writeMode can result in an index spec with an _id field.
+    "_id"};
+
 /**
  * Checks if the key is valid for building an index according to the validation rules for the given
- * index version.
+ * index version. If 'inCollValidation' is true we skip checking FCV for compound wildcard indexes
+ * validation.
+ *
+ * TODO SERVER-68303: Consider removing 'inCollValidation' flag when 'CompoundWildcardIndexes'
+ * feature flag is removed.
  */
-Status validateKeyPattern(const BSONObj& key, IndexDescriptor::IndexVersion indexVersion);
+Status validateKeyPattern(const BSONObj& key,
+                          IndexDescriptor::IndexVersion indexVersion,
+                          bool inCollValidation = false);
 
 /**
  * Validates the index specification 'indexSpec' and returns an equivalent index specification that
  * has any missing attributes filled in. If the index specification is malformed, then an error
- * status is returned.
+ * status is returned. If 'inCollValidation' is true we skip checking FCV for compound wildcard
+ * indexes validation.
+ *
+ * TODO SERVER-68303: Consider removing 'inCollValidation' flag when 'CompoundWildcardIndexes'
+ * feature flag is removed.
  */
-StatusWith<BSONObj> validateIndexSpec(OperationContext* opCtx, const BSONObj& indexSpec);
+StatusWith<BSONObj> validateIndexSpec(OperationContext* opCtx,
+                                      const BSONObj& indexSpec,
+                                      bool inCollValidation = false);
 
 /**
  * Returns a new index spec with any unknown field names removed from 'indexSpec'.
  */
-BSONObj removeUnknownFields(const BSONObj& indexSpec);
+BSONObj removeUnknownFields(const NamespaceString& ns, const BSONObj& indexSpec);
+
+/**
+ * Returns a new index spec with boolean values in correct types and unkown field names removed.
+ */
+BSONObj repairIndexSpec(
+    const NamespaceString& ns,
+    const BSONObj& indexSpec,
+    const std::set<StringData>& allowedFieldNames = index_key_validate::allowedFieldNames);
 
 /**
  * Performs additional validation for _id index specifications. This should be called after
@@ -83,10 +141,17 @@ StatusWith<BSONObj> validateIndexSpecCollation(OperationContext* opCtx,
                                                const CollatorInterface* defaultCollator);
 
 /**
- * Validates the the 'expireAfterSeconds' value for a TTL index..
+ * Validates the the 'expireAfterSeconds' value for a TTL index or clustered collection.
  */
-Status validateExpireAfterSeconds(std::int64_t expireAfterSeconds);
+enum class ValidateExpireAfterSecondsMode {
+    kSecondaryTTLIndex,
+    kClusteredTTLIndex,
+};
+Status validateExpireAfterSeconds(std::int64_t expireAfterSeconds,
+                                  ValidateExpireAfterSecondsMode mode);
 
+Status validateExpireAfterSeconds(BSONElement expireAfterSeconds,
+                                  ValidateExpireAfterSecondsMode mode);
 /**
  * Returns true if 'indexSpec' refers to a TTL index.
  */
@@ -102,6 +167,13 @@ Status validateIndexSpecTTL(const BSONObj& indexSpec);
  * Returns whether an index is allowed in API version 1.
  */
 bool isIndexAllowedInAPIVersion1(const IndexDescriptor& indexDesc);
+
+/**
+ * Parses the index specifications from 'indexSpecObj', validates them, and returns equivalent index
+ * specifications that have any missing attributes filled in. If any index specification is
+ * malformed, then an error status is returned.
+ */
+BSONObj parseAndValidateIndexSpecs(OperationContext* opCtx, const BSONObj& indexSpecObj);
 
 /**
  * Optional filtering function to adjust allowed index field names at startup.

@@ -15,9 +15,8 @@ class CPPLibfuzzerTestCase(interface.ProcessTestCase):
     REGISTERED_NAME = "cpp_libfuzzer_test"
     DEFAULT_TIMEOUT = datetime.timedelta(hours=1)
 
-    def __init__(  # pylint: disable=too-many-arguments
-            self, logger, program_executable, program_options=None, runs=1000000,
-            corpus_directory_stem="corpora"):
+    def __init__(self, logger, program_executable, program_options=None, runs=1000000,
+                 corpus_directory_stem="corpora"):
         """Initialize the CPPLibfuzzerTestCase with the executable to run."""
 
         interface.ProcessTestCase.__init__(self, logger, "C++ libfuzzer test", program_executable)
@@ -41,6 +40,4 @@ class CPPLibfuzzerTestCase(interface.ProcessTestCase):
             f"-runs={self.runs}",
             self.corpus_directory,
         ]
-        self.program_options["job_num"] = self.fixture.job_num
-        self.program_options["test_id"] = self._id
         return core.programs.make_process(self.logger, default_args, **self.program_options)

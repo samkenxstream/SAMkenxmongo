@@ -44,8 +44,10 @@ namespace mongo {
  */
 class DocumentSourceSingleDocumentTransformation final : public DocumentSource {
 public:
-    virtual boost::intrusive_ptr<DocumentSource> clone() const {
-        auto list = DocumentSource::parse(pExpCtx, serialize().getDocument().toBson());
+    virtual boost::intrusive_ptr<DocumentSource> clone(
+        const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const {
+        auto list = DocumentSource::parse(newExpCtx ? newExpCtx : pExpCtx,
+                                          serialize().getDocument().toBson());
         invariant(list.size() == 1);
         return list.front();
     }
@@ -60,8 +62,9 @@ public:
     const char* getSourceName() const final;
 
     boost::intrusive_ptr<DocumentSource> optimize() final;
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
     GetModPathsReturn getModifiedPaths() const final;
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         StageConstraints constraints(StreamType::kStreaming,
@@ -91,6 +94,9 @@ public:
     }
 
     const auto& getTransformer() const {
+        return *_parsedTransform;
+    }
+    auto& getTransformer() {
         return *_parsedTransform;
     }
 

@@ -29,60 +29,11 @@
 
 #include "mongo/db/pipeline/abt/utils.h"
 
+#include "mongo/db/exec/docval_to_sbeval.h"
+#include "mongo/db/exec/sbe/values/bson.h"
+#include "mongo/db/query/optimizer/utils/path_utils.h"
+
 namespace mongo::optimizer {
-
-template <bool isConjunction, typename... Args>
-ABT generateConjunctionOrDisjunction(Args&... args) {
-    ABTVector elements;
-    (elements.emplace_back(args), ...);
-
-    if (elements.size() == 0) {
-        return Constant::boolean(isConjunction);
-    }
-
-    ABT result = std::move(elements.at(0));
-    for (size_t i = 1; i < elements.size(); i++) {
-        result = make<BinaryOp>(isConjunction ? Operations::And : Operations::Or,
-                                std::move(elements.at(i)),
-                                std::move(result));
-    }
-    return result;
-}
-
-ABT generateCoerceToBool(ABT input, const std::string& varName) {
-    // Adapted from sbe_stage_builder_expression.cpp::generateCoerceToBoolExpression.
-
-    const auto makeNeqCheckFn = [&varName](ABT valExpr) {
-        return make<BinaryOp>(
-            Operations::Neq,
-            make<BinaryOp>(Operations::Cmp3w, make<Variable>(varName), std::move(valExpr)),
-            Constant::int64(0));
-    };
-
-    // If any of these are false, the branch is considered false for the purposes of the
-    // any logical expression.
-    ABT checkExists = make<FunctionCall>("exists", makeSeq(input));
-    ABT checkNotNull = make<UnaryOp>(Operations::Not, make<FunctionCall>("isNull", makeSeq(input)));
-    ABT checkNotFalse = makeNeqCheckFn(Constant::boolean(false));
-    ABT checkNotZero = makeNeqCheckFn(Constant::int64(0));
-
-    return make<Let>(varName,
-                     std::move(input),
-                     generateConjunctionOrDisjunction<true /*isConjunction*/>(
-                         checkExists, checkNotNull, checkNotFalse, checkNotZero));
-};
-
-std::pair<sbe::value::TypeTags, sbe::value::Value> convertFrom(const Value val) {
-    // TODO: Either make this conversion unnecessary by changing the value representation in
-    // ExpressionConstant, or provide a nicer way to convert directly from Document/Value to
-    // sbe::Value.
-    BSONObjBuilder bob;
-    val.addToBsonObj(&bob, ""_sd);
-    auto obj = bob.done();
-    auto be = obj.objdata();
-    auto end = be + ConstDataView(be).read<LittleEndian<uint32_t>>();
-    return sbe::bson::convertFrom<false>(be + 4, end, 0);
-}
 
 ABT translateFieldPath(const FieldPath& fieldPath,
                        ABT initial,
@@ -93,12 +44,216 @@ ABT translateFieldPath(const FieldPath& fieldPath,
     const size_t fieldPathLength = fieldPath.getPathLength();
     bool isLastElement = true;
     for (size_t i = fieldPathLength; i-- > skipFromStart;) {
-        result =
-            fieldNameFn(fieldPath.getFieldName(i).toString(), isLastElement, std::move(result));
+        result = fieldNameFn(
+            FieldNameType{fieldPath.getFieldName(i).toString()}, isLastElement, std::move(result));
         isLastElement = false;
     }
 
     return result;
+}
+
+ABT translateFieldRef(const FieldRef& fieldRef, ABT initial) {
+    ABT result = std::move(initial);
+
+    const size_t fieldPathLength = fieldRef.numParts();
+
+    // Handle empty field paths separately.
+    if (fieldPathLength == 0) {
+        return make<PathGet>("", std::move(result));
+    }
+
+    for (size_t i = fieldPathLength; i-- > 0;) {
+        // A single empty field path will parse to a FieldRef with 0 parts but should
+        // logically be considered a single part with an empty string.
+        if (i != fieldPathLength - 1) {
+            // For field paths with empty elements such as 'x.', we should traverse the
+            // array 'x' but not reach into any sub-objects. So a predicate such as {'x.':
+            // {$eq: 5}} should match {x: [5]} and {x: {"": 5}} but not {x: [{"": 5}]}.
+            const bool trailingEmptyPath =
+                (fieldPathLength >= 2u && i == fieldPathLength - 2u) && (fieldRef[i + 1] == ""_sd);
+            if (trailingEmptyPath) {
+                auto arrCase = make<PathArr>();
+                maybeComposePath(arrCase, result.cast<PathGet>()->getPath());
+                maybeComposePath<PathComposeA>(result, arrCase);
+            } else {
+                result = make<PathTraverse>(PathTraverse::kSingleLevel, std::move(result));
+            }
+        }
+        result = make<PathGet>(FieldNameType{fieldRef[i].toString()}, std::move(result));
+    }
+
+    return result;
+}
+
+std::pair<boost::optional<ABT>, bool> getMinMaxBoundForType(const bool isMin,
+                                                            const sbe::value::TypeTags& tag) {
+    switch (tag) {
+        case sbe::value::TypeTags::NumberInt32:
+        case sbe::value::TypeTags::NumberInt64:
+        case sbe::value::TypeTags::NumberDouble:
+        case sbe::value::TypeTags::NumberDecimal:
+            if (isMin) {
+                return {Constant::fromDouble(std::numeric_limits<double>::quiet_NaN()), true};
+            } else {
+                return {Constant::str(""), false};
+            }
+
+        case sbe::value::TypeTags::StringSmall:
+        case sbe::value::TypeTags::StringBig:
+        case sbe::value::TypeTags::bsonString:
+        case sbe::value::TypeTags::bsonSymbol:
+            if (isMin) {
+                return {Constant::str(""), true};
+            } else {
+                return {Constant::emptyObject(), false};
+            }
+
+        case sbe::value::TypeTags::Date:
+            if (isMin) {
+                return {Constant::date(Date_t::min()), true};
+            } else {
+                return {Constant::date(Date_t::max()), true};
+            }
+
+        case sbe::value::TypeTags::Timestamp:
+            if (isMin) {
+                return {Constant::timestamp(Timestamp::min()), true};
+            } else {
+                return {Constant::timestamp(Timestamp::max()), true};
+            }
+
+        case sbe::value::TypeTags::Null:
+            return {Constant::null(), true};
+
+        case sbe::value::TypeTags::bsonUndefined: {
+            const auto [tag1, val1] = sbe::value::makeValue(Value(BSONUndefined));
+            return {make<Constant>(sbe::value::TypeTags::bsonUndefined, val1), true};
+        }
+
+        case sbe::value::TypeTags::Object:
+        case sbe::value::TypeTags::bsonObject:
+            if (isMin) {
+                return {Constant::emptyObject(), true};
+            } else {
+                return {Constant::emptyArray(), false};
+            }
+
+        case sbe::value::TypeTags::Array:
+        case sbe::value::TypeTags::ArraySet:
+        case sbe::value::TypeTags::bsonArray:
+            if (isMin) {
+                return {Constant::emptyArray(), true};
+            } else {
+                const auto [tag1, val1] = sbe::value::makeValue(Value(BSONBinData()));
+                return {make<Constant>(sbe::value::TypeTags::bsonBinData, val1), false};
+            }
+
+        case sbe::value::TypeTags::bsonBinData:
+            if (isMin) {
+                const auto [tag1, val1] = sbe::value::makeValue(Value(BSONBinData()));
+                return {make<Constant>(sbe::value::TypeTags::bsonBinData, val1), true};
+            } else {
+                auto [tag1, val1] = sbe::value::makeValue(Value(OID()));
+                return {make<Constant>(sbe::value::TypeTags::ObjectId, val1), false};
+            }
+
+        case sbe::value::TypeTags::Boolean:
+            if (isMin) {
+                return {Constant::boolean(false), true};
+            } else {
+                return {Constant::boolean(true), true};
+            }
+
+        case sbe::value::TypeTags::ObjectId:
+        case sbe::value::TypeTags::bsonObjectId:
+            if (isMin) {
+                const auto [tag1, val1] = sbe::value::makeValue(Value(OID()));
+                return {make<Constant>(sbe::value::TypeTags::ObjectId, val1), true};
+            } else {
+                const auto [tag1, val1] = sbe::value::makeValue(Value(OID::max()));
+                return {make<Constant>(sbe::value::TypeTags::ObjectId, val1), true};
+            }
+
+        case sbe::value::TypeTags::bsonRegex:
+            if (isMin) {
+                const auto [tag1, val1] = sbe::value::makeValue(Value(BSONRegEx("", "")));
+                return {make<Constant>(sbe::value::TypeTags::bsonRegex, val1), true};
+            } else {
+                const auto [tag1, val1] = sbe::value::makeValue(Value(BSONDBRef()));
+                return {make<Constant>(sbe::value::TypeTags::bsonDBPointer, val1), false};
+            }
+
+        case sbe::value::TypeTags::bsonDBPointer:
+            if (isMin) {
+                const auto [tag1, val1] = sbe::value::makeValue(Value(BSONDBRef()));
+                return {make<Constant>(sbe::value::TypeTags::bsonDBPointer, val1), true};
+            } else {
+                const auto [tag1, val1] = sbe::value::makeCopyBsonJavascript(StringData(""));
+                return {make<Constant>(sbe::value::TypeTags::bsonJavascript, val1), false};
+            }
+
+        case sbe::value::TypeTags::bsonJavascript:
+            if (isMin) {
+                const auto [tag1, val1] = sbe::value::makeCopyBsonJavascript(StringData(""));
+                return {make<Constant>(sbe::value::TypeTags::bsonJavascript, val1), true};
+            } else {
+                const auto [tag1, val1] = sbe::value::makeValue(Value(BSONCodeWScope()));
+                return {make<Constant>(sbe::value::TypeTags::bsonCodeWScope, val1), false};
+            }
+
+        case sbe::value::TypeTags::bsonCodeWScope:
+            if (isMin) {
+                const auto [tag1, val1] = sbe::value::makeValue(Value(BSONCodeWScope()));
+                return {make<Constant>(sbe::value::TypeTags::bsonCodeWScope, val1), true};
+            } else {
+                return {Constant::maxKey(), false};
+            }
+
+        default:
+            return {boost::none, false};
+    }
+
+    MONGO_UNREACHABLE;
+}
+
+class PathToIntervalTransport {
+public:
+    using ResultType = boost::optional<IntervalReqExpr::Node>;
+
+    PathToIntervalTransport() {}
+
+    template <sbe::value::TypeTags tag>
+    ResultType getBoundsForNode() {
+        auto [lowBound, lowInclusive] = getMinMaxBoundForType(true /*isMin*/, tag);
+        invariant(lowBound);
+
+        auto [highBound, highInclusive] = getMinMaxBoundForType(false /*isMin*/, tag);
+        invariant(highBound);
+
+        return IntervalReqExpr::makeSingularDNF(IntervalRequirement{
+            {lowInclusive, std::move(*lowBound)}, {highInclusive, std::move(*highBound)}});
+    }
+
+    ResultType transport(const ABT& /*n*/, const PathArr& /*node*/) {
+        return getBoundsForNode<sbe::value::TypeTags::Array>();
+    }
+
+    ResultType transport(const ABT& /*n*/, const PathObj& /*node*/) {
+        return getBoundsForNode<sbe::value::TypeTags::Object>();
+    }
+
+    template <typename T, typename... Ts>
+    ResultType transport(const ABT& /*n*/, const T& /*node*/, Ts&&...) {
+        return {};
+    }
+
+    ResultType convert(const ABT& path) {
+        return algebra::transport<true>(path, *this);
+    }
+};
+
+boost::optional<IntervalReqExpr::Node> defaultConvertPathToInterval(const ABT& node) {
+    return PathToIntervalTransport{}.convert(node);
 }
 
 }  // namespace mongo::optimizer

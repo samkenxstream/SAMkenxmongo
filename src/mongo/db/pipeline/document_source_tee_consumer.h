@@ -77,9 +77,11 @@ public:
         return DepsTracker::State::SEE_NEXT;
     }
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
     const char* getSourceName() const override;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
 protected:
     GetNextResult doGetNext() final;

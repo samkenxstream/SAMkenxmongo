@@ -27,14 +27,12 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/json.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/s/concurrency/locker_mongos_client_observer.h"
-#include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/shard_key_pattern_query_util.h"
 #include "mongo/unittest/death_test.h"
 
 namespace mongo {
@@ -50,9 +48,9 @@ protected:
     }
 
     BSONObj queryKey(const ShardKeyPattern& pattern, const BSONObj& query) {
-        const NamespaceString nss("foo");
+        const NamespaceString nss = NamespaceString::createNamespaceString_forTest("foo");
 
-        StatusWith<BSONObj> status = pattern.extractShardKeyFromQuery(_opCtx, nss, query);
+        StatusWith<BSONObj> status = extractShardKeyFromBasicQuery(_opCtx, nss, pattern, query);
         if (!status.isOK())
             return BSONObj();
         return status.getValue();
@@ -62,43 +60,13 @@ protected:
     OperationContext* _opCtx;
 };
 
-/**
- * Creates OplogEntry with given field values.
- */
-repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
-                                repl::OpTypeEnum opType,
-                                NamespaceString nss,
-                                BSONObj oField,
-                                boost::optional<BSONObj> o2Field = boost::none) {
-    return {
-        repl::DurableOplogEntry(opTime,                           // optime
-                                boost::none,                      // hash
-                                opType,                           // opType
-                                boost::none,                      // tenant id
-                                nss,                              // namespace
-                                boost::none,                      // uuid
-                                boost::none,                      // fromMigrate
-                                repl::OplogEntry::kOplogVersion,  // version
-                                oField,                           // o
-                                o2Field,                          // o2
-                                {},                               // sessionInfo
-                                boost::none,                      // upsert
-                                Date_t(),                         // wall clock time
-                                {},                               // statement ids
-                                boost::none,    // optime of previous write within same transaction
-                                boost::none,    // pre-image optime
-                                boost::none,    // post-image optime
-                                boost::none,    // ShardId of resharding recipient
-                                boost::none,    // _id
-                                boost::none)};  // needsRetryImage
-}
-
 TEST_F(ShardKeyPatternTest, SingleFieldShardKeyPatternsValidityCheck) {
     ShardKeyPattern s1(BSON("a" << 1));
     ShardKeyPattern s2(BSON("a" << 1.0f));
     ShardKeyPattern s3(BSON("a" << (long long)1L));
     ShardKeyPattern s4(BSON("a"
                             << "hashed"));
+    ShardKeyPattern s5(BSON("a$" << 1));
 
     ASSERT_THROWS(ShardKeyPattern(BSONObj()), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << -1)), DBException);
@@ -111,6 +79,9 @@ TEST_F(ShardKeyPatternTest, SingleFieldShardKeyPatternsValidityCheck) {
                   DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("" << 1)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("." << 1)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("$" << 1)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("$a" << 1)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("$**" << 1)), DBException);
 }
 
 TEST_F(ShardKeyPatternTest, CompositeShardKeyPatternsValidityCheck) {
@@ -124,6 +95,9 @@ TEST_F(ShardKeyPatternTest, CompositeShardKeyPatternsValidityCheck) {
                   DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "b." << 1.0)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "" << 1.0)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "$" << 1.0)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "$b" << 1.0)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "$**" << 1.0)), DBException);
 }
 
 TEST_F(ShardKeyPatternTest, NestedShardKeyPatternsValidtyCheck) {
@@ -131,6 +105,7 @@ TEST_F(ShardKeyPatternTest, NestedShardKeyPatternsValidtyCheck) {
     ShardKeyPattern s2(BSON("a.b.c.d" << 1.0));
     ShardKeyPattern s3(BSON("a" << 1 << "c.d" << 1.0 << "e.f.g" << 1.0f));
     ShardKeyPattern s4(BSON("a" << 1 << "a.b" << 1.0 << "a.b.c" << 1.0f));
+    ShardKeyPattern s6(BSON("a.b$" << 1));
 
     ASSERT_THROWS(ShardKeyPattern(BSON("a.b" << -1)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << BSON("b" << 1))), DBException);
@@ -139,6 +114,9 @@ TEST_F(ShardKeyPatternTest, NestedShardKeyPatternsValidtyCheck) {
     ASSERT_THROWS(ShardKeyPattern(BSON("a..b" << 1)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "a.b." << 1.0)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << BSON("b" << 1) << "c.d" << 1.0)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("a.$" << 1)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("a.$b" << 1)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("a.$**" << 1)), DBException);
 }
 
 TEST_F(ShardKeyPatternTest, IsShardKey) {
@@ -174,10 +152,6 @@ TEST_F(ShardKeyPatternTest, NormalizeShardKey) {
 
 static BSONObj docKey(const ShardKeyPattern& pattern, const BSONObj& doc) {
     return pattern.extractShardKeyFromDoc(doc);
-}
-
-static BSONObj docKeyFromOplog(const ShardKeyPattern& pattern, const repl::OplogEntry& entry) {
-    return pattern.extractShardKeyFromOplogEntry(entry);
 }
 
 TEST_F(ShardKeyPatternTest, ExtractDocShardKeySingle) {
@@ -269,76 +243,6 @@ TEST_F(ShardKeyPatternTest, ExtractDocShardKeyNested) {
     ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:[{b:10}, {b:20}], c:30}")), BSONObj());
 
     ASSERT_BSONOBJ_EQ(docKey(pattern, fromjson("{a:{b:[10, 20]}, c:30}")), BSONObj());
-}
-
-TEST_F(ShardKeyPatternTest, ExtractShardKeyFromOplogUnnested) {
-    //
-    // Unnested ShardKeyPatterns from oplog entries with CRUD operation
-    //
-
-    ShardKeyPattern pattern(BSON("a" << 1));
-    auto deleteOplog = makeOplogEntry(repl::OpTime(Timestamp(50, 10), 1),  // optime
-                                      repl::OpTypeEnum::kDelete,           // op type
-                                      NamespaceString("a"),                // namespace
-                                      BSON("_id" << 1 << "a" << 5));       // o
-    auto insertOplog = makeOplogEntry(repl::OpTime(Timestamp(60, 10), 1),  // optime
-                                      repl::OpTypeEnum::kInsert,           // op type
-                                      NamespaceString("a"),                // namespace
-                                      BSON("_id" << 2 << "a" << 6));       // o
-    auto updateOplog = makeOplogEntry(repl::OpTime(Timestamp(70, 10), 1),  // optime
-                                      repl::OpTypeEnum::kUpdate,           // op type
-                                      NamespaceString("a"),                // namespace
-                                      BSON("_id" << 3),                    // o
-                                      BSON("_id" << 3 << "a" << 7));       // o2
-
-    ASSERT_BSONOBJ_EQ(docKeyFromOplog(pattern, deleteOplog), fromjson("{a: 5}"));
-    ASSERT_BSONOBJ_EQ(docKeyFromOplog(pattern, insertOplog), fromjson("{a: 6}"));
-    ASSERT_BSONOBJ_EQ(docKeyFromOplog(pattern, updateOplog), fromjson("{a: 7}"));
-}
-
-TEST_F(ShardKeyPatternTest, ExtractShardKeyFromOplogNested) {
-    //
-    // Nested ShardKeyPatterns from oplog entries with CRUD operation
-    //
-
-    ShardKeyPattern pattern(BSON("a.b" << 1));
-    auto deleteOplog = makeOplogEntry(repl::OpTime(Timestamp(50, 10), 1),          // optime
-                                      repl::OpTypeEnum::kDelete,                   // op type
-                                      NamespaceString("a.b"),                      // namespace
-                                      BSON("_id" << 1 << "a.b" << 5));             // o
-    auto insertOplog = makeOplogEntry(repl::OpTime(Timestamp(60, 10), 1),          // optime
-                                      repl::OpTypeEnum::kInsert,                   // op type
-                                      NamespaceString("a.b"),                      // namespace
-                                      BSON("_id" << 2 << "a" << BSON("b" << 6)));  // o
-    auto updateOplog = makeOplogEntry(repl::OpTime(Timestamp(70, 10), 1),          // optime
-                                      repl::OpTypeEnum::kUpdate,                   // op type
-                                      NamespaceString("a.b"),                      // namespace
-                                      BSON("_id" << 3),                            // o
-                                      BSON("_id" << 3 << "a.b" << 7));             // o2
-
-    ASSERT_BSONOBJ_EQ(docKeyFromOplog(pattern, deleteOplog), fromjson("{'a.b': 5}"));
-    ASSERT_BSONOBJ_EQ(docKeyFromOplog(pattern, insertOplog), fromjson("{'a.b': 6}"));
-    ASSERT_BSONOBJ_EQ(docKeyFromOplog(pattern, updateOplog), fromjson("{'a.b': 7}"));
-}
-
-TEST_F(ShardKeyPatternTest, ExtractShardKeyFromOplogNonCRUD) {
-    //
-    // Oplogs with non-CRUD op types
-    //
-
-    ShardKeyPattern pattern(BSON("a.b" << 1));
-    auto noopOplog = makeOplogEntry(repl::OpTime(Timestamp(50, 10), 1),     // optime
-                                    repl::OpTypeEnum::kNoop,                // op type
-                                    NamespaceString("a.b"),                 // namespace
-                                    BSON("_id" << 1 << "a.b" << 5));        // o
-    auto commandOplog = makeOplogEntry(repl::OpTime(Timestamp(60, 10), 1),  // optime
-                                       repl::OpTypeEnum::kCommand,          // op type
-                                       NamespaceString("a.b"),              // namespace
-                                       BSON("create"
-                                            << "c"));  // o
-
-    ASSERT_BSONOBJ_EQ(docKeyFromOplog(pattern, noopOplog), BSONObj());
-    ASSERT_BSONOBJ_EQ(docKeyFromOplog(pattern, commandOplog), BSONObj());
 }
 
 TEST_F(ShardKeyPatternTest, ExtractDocShardKeyDeepNested) {
@@ -608,7 +512,7 @@ TEST_F(ShardKeyPatternTest, ExtractQueryShardKeyHashed) {
 }
 
 static bool indexComp(const ShardKeyPattern& pattern, const BSONObj& indexPattern) {
-    return pattern.isUniqueIndexCompatible(indexPattern);
+    return pattern.isIndexUniquenessCompatible(indexPattern);
 }
 
 TEST_F(ShardKeyPatternTest, UniqueIndexCompatibleSingle) {
@@ -1014,6 +918,84 @@ TEST_F(ShardKeyPatternTest, ExtractShardKeyFromDocumentKey_Hashed) {
         shardKeyPattern.extractShardKeyFromDocumentKey(getDocumentKey(
             BSON("a" << BSON("b" << BSON_ARRAY(value)) << "c" << 20), shardKeyPattern)),
         BSONObj());
+}
+
+TEST_F(ShardKeyPatternTest, IsExtendedBy) {
+
+    // NumberOfFields
+    ShardKeyPattern shardKeyPattern1(BSON("a" << 1));
+    ShardKeyPattern shardKeyPattern2(BSON("a" << 1 << "b" << 1));
+    ShardKeyPattern shardKeyPattern3(BSON("a" << 1 << "b" << 1 << "c" << 1));
+
+    // NumberOfFields_PositionOfHash
+    ShardKeyPattern shardKeyPatternHashed1_0(BSON("a"
+                                                  << "hashed"));
+    ShardKeyPattern shardKeyPatternHashed2_0(BSON("a"
+                                                  << "hashed"
+                                                  << "b" << 1));
+    ShardKeyPattern shardKeyPatternHashed2_1(BSON("a" << 1 << "b"
+                                                      << "hashed"));
+    ShardKeyPattern shardKeyPatternHashed3_0(BSON("a"
+                                                  << "hashed"
+                                                  << "b" << 1 << "c" << 1));
+    ShardKeyPattern shardKeyPatternHashed3_1(BSON("a" << 1 << "b"
+                                                      << "hashed"
+                                                      << "c" << 1));
+    ShardKeyPattern shardKeyPatternHashed3_2(BSON("a" << 1 << "b" << 1 << "c"
+                                                      << "hashed"));
+
+    // same pattern, always true
+    ASSERT_TRUE(shardKeyPattern1.isExtendedBy(shardKeyPattern1));
+    ASSERT_TRUE(shardKeyPattern2.isExtendedBy(shardKeyPattern2));
+    ASSERT_TRUE(shardKeyPattern3.isExtendedBy(shardKeyPattern3));
+    ASSERT_TRUE(shardKeyPatternHashed1_0.isExtendedBy(shardKeyPatternHashed1_0));
+    ASSERT_TRUE(shardKeyPatternHashed2_0.isExtendedBy(shardKeyPatternHashed2_0));
+    ASSERT_TRUE(shardKeyPatternHashed2_1.isExtendedBy(shardKeyPatternHashed2_1));
+    ASSERT_TRUE(shardKeyPatternHashed3_0.isExtendedBy(shardKeyPatternHashed3_0));
+    ASSERT_TRUE(shardKeyPatternHashed3_1.isExtendedBy(shardKeyPatternHashed3_1));
+    ASSERT_TRUE(shardKeyPatternHashed3_2.isExtendedBy(shardKeyPatternHashed3_2));
+
+    // different number of fields, same values
+    ASSERT_TRUE(shardKeyPattern1.isExtendedBy(shardKeyPattern2));
+    ASSERT_TRUE(shardKeyPattern2.isExtendedBy(shardKeyPattern3));
+    ASSERT_TRUE(shardKeyPattern1.isExtendedBy(shardKeyPattern3));
+
+    ASSERT_FALSE(shardKeyPattern2.isExtendedBy(shardKeyPattern1));
+    ASSERT_FALSE(shardKeyPattern3.isExtendedBy(shardKeyPattern2));
+    ASSERT_FALSE(shardKeyPattern3.isExtendedBy(shardKeyPattern1));
+
+    // different number of fields, different values
+    // { a : 1 } is not extended by { a : "hashed" } and viceversa
+    ASSERT_FALSE(shardKeyPattern1.isExtendedBy(shardKeyPatternHashed1_0));
+    ASSERT_FALSE(shardKeyPatternHashed1_0.isExtendedBy(shardKeyPattern1));
+
+    // { a : 1, b : 1 } is not extended by { a : 1, b : "hashed" } and viceversa
+    ASSERT_FALSE(shardKeyPattern2.isExtendedBy(shardKeyPatternHashed2_1));
+    ASSERT_FALSE(shardKeyPatternHashed2_1.isExtendedBy(shardKeyPattern2));
+
+    // { a : 1 } is extended by { a : 1, b : "hashed" } but not viceversa
+    ASSERT_TRUE(shardKeyPattern1.isExtendedBy(shardKeyPatternHashed2_1));
+    ASSERT_FALSE(shardKeyPatternHashed2_1.isExtendedBy(shardKeyPattern1));
+
+    // { a : 1, b : 1 } is extended by { a : 1, b : 1, c : "hashed" } but not viceversa
+    ASSERT_TRUE(shardKeyPattern2.isExtendedBy(shardKeyPatternHashed3_2));
+    ASSERT_FALSE(shardKeyPatternHashed3_2.isExtendedBy(shardKeyPattern2));
+
+    // { a : 1, b : 1, c : 1 } is not extended by { a : 1, b : 1, c : "hashed" } and viceversa
+    ASSERT_FALSE(shardKeyPattern3.isExtendedBy(shardKeyPatternHashed3_2));
+    ASSERT_FALSE(shardKeyPatternHashed3_2.isExtendedBy(shardKeyPattern3));
+
+    // { a: "hashed", b : 1 } is not extended by { a : 1, b : 1, c : "hashed" } and viceversa
+    ASSERT_FALSE(shardKeyPatternHashed2_1.isExtendedBy(shardKeyPatternHashed3_2));
+    ASSERT_FALSE(shardKeyPatternHashed3_2.isExtendedBy(shardKeyPatternHashed2_1));
+
+    // { a : "hashed", b : 1 } is extended by { a : "hashed", b : 1, c : "1" } but not viceversa
+    ASSERT_TRUE(shardKeyPatternHashed2_0.isExtendedBy(shardKeyPatternHashed3_0));
+    ASSERT_FALSE(shardKeyPatternHashed3_0.isExtendedBy(shardKeyPatternHashed2_0));
+
+    // { a : 1, b : "hashed " } is extended by { a : 1, b : "hashed", c : "1" } but not viceversa
+    ASSERT_TRUE(shardKeyPatternHashed2_1.isExtendedBy(shardKeyPatternHashed3_1));
+    ASSERT_FALSE(shardKeyPatternHashed3_1.isExtendedBy(shardKeyPatternHashed2_1));
 }
 
 }  // namespace

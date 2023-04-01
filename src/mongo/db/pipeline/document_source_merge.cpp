@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -41,8 +40,12 @@
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/variable_validation.h"
+#include "mongo/db/query/allowed_contexts.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 using namespace fmt::literals;
@@ -60,7 +63,7 @@ using MergeStrategy = MergeStrategyDescriptor::MergeStrategy;
 using MergeStrategyDescriptorsMap = std::map<const MergeMode, const MergeStrategyDescriptor>;
 using WhenMatched = MergeStrategyDescriptor::WhenMatched;
 using WhenNotMatched = MergeStrategyDescriptor::WhenNotMatched;
-using BatchTransform = std::function<void(DocumentSourceMerge::BatchedObjects&)>;
+using BatchTransform = DocumentSourceMerge::BatchTransform;
 using UpdateModification = write_ops::UpdateModification;
 using UpsertType = MongoProcessInterface::UpsertType;
 
@@ -84,17 +87,15 @@ const auto kDefaultPipelineLet = BSON("new"
                                       << "$$ROOT");
 
 /**
- * Creates a merge strategy which uses update semantics to perform a merge operation. If
- * 'BatchTransform' function is provided, it will be called to transform batched objects before
- * passing them to the 'update'.
+ * Creates a merge strategy which uses update semantics to perform a merge operation.
  */
-MergeStrategy makeUpdateStrategy(UpsertType upsert, BatchTransform transform) {
-    return [upsert, transform](
-               const auto& expCtx, const auto& ns, const auto& wc, auto epoch, auto&& batch) {
-        if (transform) {
-            transform(batch);
-        }
-
+MergeStrategy makeUpdateStrategy() {
+    return [](const auto& expCtx,
+              const auto& ns,
+              const auto& wc,
+              auto epoch,
+              auto&& batch,
+              UpsertType upsert) {
         constexpr auto multi = false;
         uassertStatusOK(expCtx->mongoProcessInterface->update(
             expCtx, ns, std::move(batch), wc, upsert, multi, epoch));
@@ -106,16 +107,15 @@ MergeStrategy makeUpdateStrategy(UpsertType upsert, BatchTransform transform) {
  * that each document in the batch has a matching document in the 'ns' collection (note that a
  * matching document may not be modified as a result of an update operation, yet it still will be
  * counted as matching). If at least one document doesn't have a match, this strategy returns an
- * error. If 'BatchTransform' function is provided, it will be called to transform batched objects
- * before passing them to the 'update'.
+ * error.
  */
-MergeStrategy makeStrictUpdateStrategy(UpsertType upsert, BatchTransform transform) {
-    return [upsert, transform](
-               const auto& expCtx, const auto& ns, const auto& wc, auto epoch, auto&& batch) {
-        if (transform) {
-            transform(batch);
-        }
-
+MergeStrategy makeStrictUpdateStrategy() {
+    return [](const auto& expCtx,
+              const auto& ns,
+              const auto& wc,
+              auto epoch,
+              auto&& batch,
+              UpsertType upsert) {
         const int64_t batchSize = batch.size();
         constexpr auto multi = false;
         auto updateResult = uassertStatusOK(expCtx->mongoProcessInterface->update(
@@ -131,7 +131,12 @@ MergeStrategy makeStrictUpdateStrategy(UpsertType upsert, BatchTransform transfo
  * Creates a merge strategy which uses insert semantics to perform a merge operation.
  */
 MergeStrategy makeInsertStrategy() {
-    return [](const auto& expCtx, const auto& ns, const auto& wc, auto epoch, auto&& batch) {
+    return [](const auto& expCtx,
+              const auto& ns,
+              const auto& wc,
+              auto epoch,
+              auto&& batch,
+              UpsertType upsertType) {
         std::vector<BSONObj> objectsToInsert(batch.size());
         // The batch stores replacement style updates, but for this "insert" style of $merge we'd
         // like to just insert the new document without attempting any sort of replacement.
@@ -144,15 +149,13 @@ MergeStrategy makeInsertStrategy() {
 }
 
 /**
- * Creates a batched objects transformation function which wraps each element of the
- * 'batch.modifications' array into the given 'updateOp' operator.
+ * Creates a batched object transformation function which wraps 'obj' into the given 'updateOp'
+ * operator.
  */
 BatchTransform makeUpdateTransform(const std::string& updateOp) {
-    return [updateOp](auto& batch) {
-        for (auto&& obj : batch) {
-            std::get<UpdateModification>(obj) = UpdateModification::parseFromClassicUpdate(
-                BSON(updateOp << std::get<UpdateModification>(obj).getUpdateReplacement()));
-        }
+    return [updateOp](auto& obj) {
+        std::get<UpdateModification>(obj) = UpdateModification::parseFromClassicUpdate(
+            BSON(updateOp << std::get<UpdateModification>(obj).getUpdateReplacement()));
     };
 }
 
@@ -176,48 +179,67 @@ const MergeStrategyDescriptorsMap& getDescriptors() {
         {kReplaceInsertMode,
          {kReplaceInsertMode,
           {ActionType::insert, ActionType::update},
-          makeUpdateStrategy(UpsertType::kGenerateNewDoc, {})}},
+          makeUpdateStrategy(),
+          {},
+          UpsertType::kGenerateNewDoc}},
         // whenMatched: replace, whenNotMatched: fail
         {kReplaceFailMode,
-         {kReplaceFailMode, {ActionType::update}, makeStrictUpdateStrategy(UpsertType::kNone, {})}},
+         {kReplaceFailMode,
+          {ActionType::update},
+          makeStrictUpdateStrategy(),
+          {},
+          UpsertType::kNone}},
         // whenMatched: replace, whenNotMatched: discard
         {kReplaceDiscardMode,
-         {kReplaceDiscardMode, {ActionType::update}, makeUpdateStrategy(UpsertType::kNone, {})}},
+         {kReplaceDiscardMode, {ActionType::update}, makeUpdateStrategy(), {}, UpsertType::kNone}},
         // whenMatched: merge, whenNotMatched: insert
         {kMergeInsertMode,
          {kMergeInsertMode,
           {ActionType::insert, ActionType::update},
-          makeUpdateStrategy(UpsertType::kGenerateNewDoc, makeUpdateTransform("$set"))}},
+          makeUpdateStrategy(),
+          makeUpdateTransform("$set"),
+          UpsertType::kGenerateNewDoc}},
         // whenMatched: merge, whenNotMatched: fail
         {kMergeFailMode,
          {kMergeFailMode,
           {ActionType::update},
-          makeStrictUpdateStrategy(UpsertType::kNone, makeUpdateTransform("$set"))}},
+          makeStrictUpdateStrategy(),
+          makeUpdateTransform("$set"),
+          UpsertType::kNone}},
         // whenMatched: merge, whenNotMatched: discard
         {kMergeDiscardMode,
          {kMergeDiscardMode,
           {ActionType::update},
-          makeUpdateStrategy(UpsertType::kNone, makeUpdateTransform("$set"))}},
+          makeUpdateStrategy(),
+          makeUpdateTransform("$set"),
+          UpsertType::kNone}},
         // whenMatched: keepExisting, whenNotMatched: insert
         {kKeepExistingInsertMode,
          {kKeepExistingInsertMode,
           {ActionType::insert, ActionType::update},
-          makeUpdateStrategy(UpsertType::kGenerateNewDoc, makeUpdateTransform("$setOnInsert"))}},
+          makeUpdateStrategy(),
+          makeUpdateTransform("$setOnInsert"),
+          UpsertType::kGenerateNewDoc}},
         // whenMatched: [pipeline], whenNotMatched: insert
         {kPipelineInsertMode,
          {kPipelineInsertMode,
           {ActionType::insert, ActionType::update},
-          makeUpdateStrategy(UpsertType::kInsertSuppliedDoc, {})}},
+          makeUpdateStrategy(),
+          {},
+          UpsertType::kInsertSuppliedDoc}},
         // whenMatched: [pipeline], whenNotMatched: fail
         {kPipelineFailMode,
          {kPipelineFailMode,
           {ActionType::update},
-          makeStrictUpdateStrategy(UpsertType::kNone, {})}},
+          makeStrictUpdateStrategy(),
+          {},
+          UpsertType::kNone}},
         // whenMatched: [pipeline], whenNotMatched: discard
         {kPipelineDiscardMode,
-         {kPipelineDiscardMode, {ActionType::update}, makeUpdateStrategy(UpsertType::kNone, {})}},
+         {kPipelineDiscardMode, {ActionType::update}, makeUpdateStrategy(), {}, UpsertType::kNone}},
         // whenMatched: fail, whenNotMatched: insert
-        {kFailInsertMode, {kFailInsertMode, {ActionType::insert}, makeInsertStrategy()}}};
+        {kFailInsertMode,
+         {kFailInsertMode, {ActionType::insert}, makeInsertStrategy(), {}, UpsertType::kNone}}};
     return mergeStrategyDescriptors;
 }
 
@@ -255,7 +277,7 @@ BSONObj extractMergeOnFieldsFromDoc(const Document& doc, const std::set<FieldPat
  * explicitly specified, it will be defaulted to 'defaultDb'.
  */
 DocumentSourceMergeSpec parseMergeSpecAndResolveTargetNamespace(const BSONElement& spec,
-                                                                StringData defaultDb) {
+                                                                const DatabaseName& defaultDb) {
     NamespaceString targetNss;
     DocumentSourceMergeSpec mergeSpec;
 
@@ -264,9 +286,12 @@ DocumentSourceMergeSpec parseMergeSpecAndResolveTargetNamespace(const BSONElemen
     // database name using the shortcut syntax (to match the semantics of the $out stage), the
     // target database will use the default name provided.
     if (spec.type() == BSONType::String) {
-        targetNss = {defaultDb, spec.valueStringData()};
+        targetNss =
+            NamespaceStringUtil::parseNamespaceFromRequest(defaultDb, spec.valueStringData());
     } else {
-        mergeSpec = DocumentSourceMergeSpec::parse({kStageName}, spec.embeddedObject());
+        mergeSpec = DocumentSourceMergeSpec::parse(
+            IDLParserContext(kStageName, false /* apiStrict */, defaultDb.tenantId()),
+            spec.embeddedObject());
         targetNss = mergeSpec.getTargetNss();
         if (targetNss.coll().empty()) {
             // If the $merge spec is an object, the target namespace can be specified as a string
@@ -275,10 +300,10 @@ DocumentSourceMergeSpec parseMergeSpecAndResolveTargetNamespace(const BSONElemen
             // from the NamespaceString semantics which treats it as a database name. So, if the
             // target namespace collection is empty, we'll use the default database name as a target
             // database, and the provided namespace value as a collection name.
-            targetNss = {defaultDb, targetNss.ns()};
-        } else if (targetNss.db().empty()) {
+            targetNss = NamespaceStringUtil::parseNamespaceFromRequest(defaultDb, targetNss.ns());
+        } else if (targetNss.dbName().db().empty()) {
             // Use the default database name if it wasn't specified explicilty.
-            targetNss = {defaultDb, targetNss.coll()};
+            targetNss = NamespaceStringUtil::parseNamespaceFromRequest(defaultDb, targetNss.coll());
         }
     }
 
@@ -314,7 +339,7 @@ std::unique_ptr<DocumentSourceMerge::LiteParsed> DocumentSourceMerge::LiteParsed
                                                                            typeName(spec.type())),
             spec.type() == BSONType::String || spec.type() == BSONType::Object);
 
-    auto mergeSpec = parseMergeSpecAndResolveTargetNamespace(spec, nss.db());
+    auto mergeSpec = parseMergeSpecAndResolveTargetNamespace(spec, nss.dbName());
     auto targetNss = mergeSpec.getTargetNss();
 
     uassert(ErrorCodes::InvalidNamespace,
@@ -355,15 +380,16 @@ PrivilegeVector DocumentSourceMerge::LiteParsed::requiredPrivileges(
     return {{ResourcePattern::forExactNamespace(*_foreignNss), actions}};
 }
 
-DocumentSourceMerge::DocumentSourceMerge(NamespaceString outputNs,
-                                         const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                         const MergeStrategyDescriptor& descriptor,
-                                         boost::optional<BSONObj> letVariables,
-                                         boost::optional<std::vector<BSONObj>> pipeline,
-                                         std::set<FieldPath> mergeOnFields,
-                                         boost::optional<ChunkVersion> targetCollectionVersion)
+DocumentSourceMerge::DocumentSourceMerge(
+    NamespaceString outputNs,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const MergeStrategyDescriptor& descriptor,
+    boost::optional<BSONObj> letVariables,
+    boost::optional<std::vector<BSONObj>> pipeline,
+    std::set<FieldPath> mergeOnFields,
+    boost::optional<ChunkVersion> targetCollectionPlacementVersion)
     : DocumentSourceWriter(kStageName.rawData(), std::move(outputNs), expCtx),
-      _targetCollectionVersion(targetCollectionVersion),
+      _targetCollectionPlacementVersion(targetCollectionPlacementVersion),
       _descriptor(descriptor),
       _pipeline(std::move(pipeline)),
       _mergeOnFields(std::move(mergeOnFields)),
@@ -390,7 +416,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceMerge::create(
     boost::optional<BSONObj> letVariables,
     boost::optional<std::vector<BSONObj>> pipeline,
     std::set<FieldPath> mergeOnFields,
-    boost::optional<ChunkVersion> targetCollectionVersion) {
+    boost::optional<ChunkVersion> targetCollectionPlacementVersion) {
     uassert(51189,
             "Combination of {} modes 'whenMatched: {}' and 'whenNotMatched: {}' "
             "is not supported"_format(kStageName,
@@ -406,13 +432,15 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceMerge::create(
             "{} cannot be used in a transaction"_format(kStageName),
             !expCtx->opCtx->inMultiDocumentTransaction());
 
-    uassert(31319,
-            "Cannot {} to special collection: {}"_format(kStageName, outputNs.coll()),
-            !outputNs.isSystem());
+    uassert(
+        31319,
+        "Cannot {} to special collection: {}"_format(kStageName, outputNs.coll()),
+        !outputNs.isSystem() ||
+            (outputNs.isSystemStatsCollection() && isInternalClient(expCtx->opCtx->getClient())));
 
     uassert(31320,
             "Cannot {} to internal database: {}"_format(kStageName, outputNs.db()),
-            !outputNs.isOnInternalDb());
+            !outputNs.isOnInternalDb() || isInternalClient(expCtx->opCtx->getClient()));
 
     if (whenMatched == WhenMatched::kPipeline) {
         // If unspecified, 'letVariables' defaults to {new: "$$ROOT"}.
@@ -440,7 +468,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceMerge::create(
                                    std::move(letVariables),
                                    std::move(pipeline),
                                    std::move(mergeOnFields),
-                                   targetCollectionVersion);
+                                   targetCollectionPlacementVersion);
 }
 
 boost::intrusive_ptr<DocumentSource> DocumentSourceMerge::createFromBson(
@@ -449,14 +477,14 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceMerge::createFromBson(
             "{} only supports a string or object argument, not {}"_format(kStageName, spec.type()),
             spec.type() == BSONType::String || spec.type() == BSONType::Object);
 
-    auto mergeSpec = parseMergeSpecAndResolveTargetNamespace(spec, expCtx->ns.db());
+    auto mergeSpec = parseMergeSpecAndResolveTargetNamespace(spec, expCtx->ns.dbName());
     auto targetNss = mergeSpec.getTargetNss();
     auto whenMatched =
         mergeSpec.getWhenMatched() ? mergeSpec.getWhenMatched()->mode : kDefaultWhenMatched;
     auto whenNotMatched = mergeSpec.getWhenNotMatched().value_or(kDefaultWhenNotMatched);
     auto pipeline = mergeSpec.getWhenMatched() ? mergeSpec.getWhenMatched()->pipeline : boost::none;
     auto fieldPaths = convertToFieldPaths(mergeSpec.getOn());
-    auto [mergeOnFields, targetCollectionVersion] =
+    auto [mergeOnFields, targetCollectionPlacementVersion] =
         expCtx->mongoProcessInterface->ensureFieldsUniqueOrResolveDocumentKey(
             expCtx, std::move(fieldPaths), mergeSpec.getTargetCollectionVersion(), targetNss);
 
@@ -467,7 +495,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceMerge::createFromBson(
                                        mergeSpec.getLet(),
                                        std::move(pipeline),
                                        std::move(mergeOnFields),
-                                       targetCollectionVersion);
+                                       targetCollectionPlacementVersion);
 }
 
 StageConstraints DocumentSourceMerge::constraints(Pipeline::SplitState pipeState) const {
@@ -504,7 +532,12 @@ boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceMerge::distr
     return DocumentSourceWriter::distributedPlanLogic();
 }
 
-Value DocumentSourceMerge::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceMerge::serialize(SerializationOptions opts) const {
+    auto explain = opts.verbosity;
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484324);
+    }
+
     DocumentSourceMergeSpec spec;
     spec.setTargetNss(_outputNs);
     spec.setLet([&]() -> boost::optional<BSONObj> {
@@ -514,7 +547,7 @@ Value DocumentSourceMerge::serialize(boost::optional<ExplainOptions::Verbosity> 
 
         BSONObjBuilder bob;
         for (auto&& [name, expr] : *_letVariables) {
-            bob << name << expr->serialize(static_cast<bool>(explain));
+            bob << name << expr->serialize(explain);
         }
         return bob.obj();
     }());
@@ -522,12 +555,12 @@ Value DocumentSourceMerge::serialize(boost::optional<ExplainOptions::Verbosity> 
     spec.setWhenNotMatched(_descriptor.mode.second);
     spec.setOn([&]() {
         std::vector<std::string> mergeOnFields;
-        for (auto path : _mergeOnFields) {
+        for (const auto& path : _mergeOnFields) {
             mergeOnFields.push_back(path.fullPath());
         }
         return mergeOnFields;
     }());
-    spec.setTargetCollectionVersion(_targetCollectionVersion);
+    spec.setTargetCollectionVersion(_targetCollectionPlacementVersion);
     return Value(Document{{getSourceName(), spec.toBSON()}});
 }
 
@@ -543,17 +576,24 @@ std::pair<DocumentSourceMerge::BatchObject, int> DocumentSourceMerge::makeBatchO
     auto mergeOnFields = extractMergeOnFieldsFromDoc(doc, _mergeOnFields);
     auto mod = makeBatchUpdateModification(doc);
     auto vars = resolveLetVariablesIfNeeded(doc);
-    auto modSize = mod.objsize() + (vars ? vars->objsize() : 0);
-    return {{std::move(mergeOnFields), std::move(mod), std::move(vars)}, modSize};
+    BatchObject batchObject{std::move(mergeOnFields), std::move(mod), std::move(vars)};
+    if (_descriptor.transform) {
+        _descriptor.transform(batchObject);
+    }
+
+    tassert(6628901, "_writeSizeEstimator should be initialized", _writeSizeEstimator);
+    return {batchObject,
+            _writeSizeEstimator->estimateUpdateSizeBytes(batchObject, _descriptor.upsertType)};
 }
 
 void DocumentSourceMerge::spill(BatchedObjects&& batch) try {
     DocumentSourceWriteBlock writeBlock(pExpCtx->opCtx);
-    auto targetEpoch = _targetCollectionVersion
-        ? boost::optional<OID>(_targetCollectionVersion->epoch())
+    auto targetEpoch = _targetCollectionPlacementVersion
+        ? boost::optional<OID>(_targetCollectionPlacementVersion->epoch())
         : boost::none;
 
-    _descriptor.strategy(pExpCtx, _outputNs, _writeConcern, targetEpoch, std::move(batch));
+    _descriptor.strategy(
+        pExpCtx, _outputNs, _writeConcern, targetEpoch, std::move(batch), _descriptor.upsertType);
 } catch (const ExceptionFor<ErrorCodes::ImmutableField>& ex) {
     uassertStatusOKWithContext(ex.toStatus(),
                                "$merge failed to update the matching document, did you "

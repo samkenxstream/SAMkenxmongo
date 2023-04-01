@@ -1,6 +1,10 @@
 /**
  * Tests that detailed debug information is excluded from new plan cache entries once the estimated
  * cumulative size of the system's plan caches exceeds a pre-configured threshold.
+ * @tags: [
+ *   # TODO SERVER-67607: Test plan cache with CQF enabled.
+ *   cqf_incompatible,
+ * ]
  */
 (function() {
 "use strict";
@@ -41,6 +45,8 @@ function getPlanCacheEntryForFilter(coll, filter) {
 }
 
 function assertExistenceOfRequiredCacheEntryFields(entry) {
+    assert(entry.hasOwnProperty("version"), entry);
+    assert.eq(entry["version"], "1", entry);
     assert(entry.hasOwnProperty("queryHash"), entry);
     assert(entry.hasOwnProperty("planCacheKey"), entry);
     assert(entry.hasOwnProperty("isActive"), entry);
@@ -77,11 +83,12 @@ assert.neq(conn, null, "mongod failed to start");
 const db = conn.getDB("test");
 const coll = db.plan_cache_memory_debug_info;
 
-if (checkSBEEnabled(db, ["featureFlagSbePlanCache"])) {
-    jsTest.log("Skipping test because SBE and SBE plan cache are both enabled.");
+if (checkSBEEnabled(db)) {
+    jsTest.log("Skipping test because SBE is enabled");
     MongoRunner.stopMongod(conn);
     return;
 }
+
 coll.drop();
 createIndexesForColl(coll);
 

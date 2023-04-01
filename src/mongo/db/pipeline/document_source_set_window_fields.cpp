@@ -41,7 +41,7 @@
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/sort_pattern.h"
-#include "mongo/util/visit_helper.h"
+#include "mongo/util/overloaded_visitor.h"
 
 using boost::intrusive_ptr;
 using boost::optional;
@@ -75,19 +75,15 @@ bool modifiedSortPaths(const SortPattern& pat, const DocumentSource::GetModPaths
 }
 }  // namespace
 
-REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION(
-    setWindowFields,
-    LiteParsedDocumentSourceDefault::parse,
-    document_source_set_window_fields::createFromBson,
-    AllowedWithApiStrict::kNeverInVersion1,
-    multiversion::FeatureCompatibilityVersion::kFullyDowngradedTo_5_0);
+REGISTER_DOCUMENT_SOURCE(setWindowFields,
+                         LiteParsedDocumentSourceDefault::parse,
+                         document_source_set_window_fields::createFromBson,
+                         AllowedWithApiStrict::kAlways);
 
-REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION(
-    _internalSetWindowFields,
-    LiteParsedDocumentSourceDefault::parse,
-    DocumentSourceInternalSetWindowFields::createFromBson,
-    AllowedWithApiStrict::kNeverInVersion1,
-    multiversion::FeatureCompatibilityVersion::kFullyDowngradedTo_5_0);
+REGISTER_DOCUMENT_SOURCE(_internalSetWindowFields,
+                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceInternalSetWindowFields::createFromBson,
+                         AllowedWithApiStrict::kAlways);
 
 list<intrusive_ptr<DocumentSource>> document_source_set_window_fields::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {
@@ -97,8 +93,7 @@ list<intrusive_ptr<DocumentSource>> document_source_set_window_fields::createFro
                           << typeName(elem.type()),
             elem.type() == BSONType::Object);
 
-    auto spec =
-        SetWindowFieldsSpec::parse(IDLParserErrorContext(kStageName), elem.embeddedObject());
+    auto spec = SetWindowFieldsSpec::parse(IDLParserContext(kStageName), elem.embeddedObject());
     auto partitionBy = [&]() -> boost::optional<boost::intrusive_ptr<Expression>> {
         if (auto partitionBy = spec.getPartitionBy())
             return Expression::parseOperand(
@@ -144,8 +139,8 @@ WindowFunctionStatement WindowFunctionStatement::parse(BSONElement elem,
         window_function::Expression::parse(elem.embeddedObject(), sortBy, expCtx));
 }
 void WindowFunctionStatement::serialize(MutableDocument& outputFields,
-                                        boost::optional<ExplainOptions::Verbosity> explain) const {
-    outputFields[fieldName] = expr->serialize(explain);
+                                        SerializationOptions opts) const {
+    outputFields[opts.serializeFieldName(fieldName)] = expr->serialize(opts);
 }
 
 list<intrusive_ptr<DocumentSource>> document_source_set_window_fields::create(
@@ -244,7 +239,7 @@ list<intrusive_ptr<DocumentSource>> document_source_set_window_fields::create(
         combined.emplace_back(std::move(part));
     }
     if (sortBy) {
-        for (auto part : *sortBy) {
+        for (const auto& part : *sortBy) {
             combined.push_back(part);
         }
     }
@@ -288,39 +283,38 @@ intrusive_ptr<DocumentSource> DocumentSourceInternalSetWindowFields::optimize() 
     return this;
 }
 
-Value DocumentSourceInternalSetWindowFields::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceInternalSetWindowFields::serialize(SerializationOptions opts) const {
     MutableDocument spec;
     spec[SetWindowFieldsSpec::kPartitionByFieldName] =
-        _partitionBy ? (*_partitionBy)->serialize(false) : Value();
+        _partitionBy ? (*_partitionBy)->serialize(opts) : Value();
 
-    auto sortKeySerialization = explain
+    auto sortKeySerialization = opts.verbosity
         ? SortPattern::SortKeySerialization::kForExplain
         : SortPattern::SortKeySerialization::kForPipelineSerialization;
     spec[SetWindowFieldsSpec::kSortByFieldName] =
-        _sortBy ? Value(_sortBy->serialize(sortKeySerialization)) : Value();
+        _sortBy ? Value(_sortBy->serialize(sortKeySerialization, opts)) : Value();
 
     MutableDocument output;
     for (auto&& stmt : _outputFields) {
-        stmt.serialize(output, explain);
+        stmt.serialize(output, opts);
     }
     spec[SetWindowFieldsSpec::kOutputFieldName] = output.freezeToValue();
 
     MutableDocument out;
     out[getSourceName()] = Value(spec.freeze());
 
-    if (explain && *explain >= ExplainOptions::Verbosity::kExecStats) {
+    if (opts.verbosity && *opts.verbosity >= ExplainOptions::Verbosity::kExecStats) {
         MutableDocument md;
 
         for (auto&& [fieldName, function] : _executableOutputs) {
-            md[fieldName] =
-                Value(static_cast<long long>(_memoryTracker[fieldName].maxMemoryBytes()));
+            md[opts.serializeFieldName(fieldName)] = opts.serializeLiteralValue(
+                static_cast<long long>(_memoryTracker[fieldName].maxMemoryBytes()));
         }
 
         out["maxFunctionMemoryUsageBytes"] = Value(md.freezeToValue());
         out["maxTotalMemoryUsageBytes"] =
-            Value(static_cast<long long>(_memoryTracker.maxMemoryBytes()));
-        out["usedDisk"] = Value(_iterator.usedDisk());
+            opts.serializeLiteralValue(static_cast<long long>(_memoryTracker.maxMemoryBytes()));
+        out["usedDisk"] = opts.serializeLiteralValue(_iterator.usedDisk());
     }
 
     return Value(out.freezeToValue());
@@ -334,8 +328,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalSetWindowFields::crea
                           << typeName(elem.type()),
             elem.type() == BSONType::Object);
 
-    auto spec =
-        SetWindowFieldsSpec::parse(IDLParserErrorContext(kStageName), elem.embeddedObject());
+    auto spec = SetWindowFieldsSpec::parse(IDLParserContext(kStageName), elem.embeddedObject());
     auto partitionBy = [&]() -> boost::optional<boost::intrusive_ptr<Expression>> {
         if (auto partitionBy = spec.getPartitionBy())
             return Expression::parseOperand(
@@ -464,8 +457,12 @@ DocumentSource::GetNextResult DocumentSourceInternalSetWindowFields::doGetNext()
         return DocumentSource::GetNextResult::makeEOF();
 
     auto curDoc = _iterator.current();
-    // The only way we hit this case is if there are no documents, since otherwise _eof will be set.
     if (!curDoc) {
+        if (_iterator.isPaused()) {
+            return DocumentSource::GetNextResult::makePauseExecution();
+        }
+        // The only way we hit this case is if there are no documents, since otherwise _eof will be
+        // set.
         _eof = true;
         return DocumentSource::GetNextResult::makeEOF();
     }
@@ -485,14 +482,11 @@ DocumentSource::GetNextResult DocumentSourceInternalSetWindowFields::doGetNext()
             throw;
         }
 
-        if (_memoryTracker.currentMemoryBytes() >=
-                static_cast<long long>(_memoryTracker._maxAllowedMemoryUsageBytes) &&
-            _memoryTracker._allowDiskUse) {
+        if (!_memoryTracker.withinMemoryLimit() && _memoryTracker._allowDiskUse) {
             // Attempt to spill where possible.
             _iterator.spillToDisk();
         }
-        if (_memoryTracker.currentMemoryBytes() >
-            static_cast<long long>(_memoryTracker._maxAllowedMemoryUsageBytes)) {
+        if (!_memoryTracker.withinMemoryLimit()) {
             _iterator.finalize();
             uasserted(5414201,
                       str::stream()

@@ -56,7 +56,7 @@ protected:
     }
 
     void addWildcardIndex(BSONObj keyPattern,
-                          const std::set<std::string>& multikeyPathSet = {},
+                          const OrderedPathSet& multikeyPathSet = {},
                           BSONObj wildcardProjection = BSONObj{},
                           MatchExpression* partialFilterExpr = nullptr,
                           CollatorInterface* collator = nullptr,
@@ -95,7 +95,9 @@ protected:
 // General planning tests.
 //
 
-DEATH_TEST_F(QueryPlannerWildcardTest, CannotExpandPreExpandedWildcardIndexEntry, "Invariant") {
+DEATH_TEST_F(QueryPlannerWildcardTest,
+             CannotExpandPreExpandedWildcardIndexEntry,
+             "Tripwire assertion") {
     addWildcardIndex(BSON("$**" << 1));
     ASSERT_EQ(params.indices.size(), 2U);
 
@@ -105,7 +107,7 @@ DEATH_TEST_F(QueryPlannerWildcardTest, CannotExpandPreExpandedWildcardIndexEntry
     ASSERT_EQ(expandedIndex.size(), 1U);
     params.indices.push_back(expandedIndex.front());
 
-    // Now run a query. This will invariant when the planner expands the expanded index.
+    // Now run a query. This will tassert when the planner expands the expanded index.
     runQuery(fromjson("{a: 1}"));
 }
 
@@ -418,25 +420,18 @@ TEST_F(QueryPlannerWildcardTest, EqualityIndexScanOverNestedField) {
         "bounds: {'$_path': [['a.b','a.b',true,true]], 'a.b': [[5,5,true,true]]}}}}}");
 }
 
-TEST_F(QueryPlannerWildcardTest, ExprEqCanUseIndex) {
+TEST_F(QueryPlannerWildcardTest, ExprEqCannotUseIndex) {
     addWildcardIndex(BSON("$**" << 1));
     runQuery(fromjson("{a: {$_internalExprEq: 1}}"));
 
-    assertNumSolutions(1U);
-    assertSolutionExists(
-        "{fetch: {filter: null, node: {ixscan: {pattern: {'$_path': 1, a: 1},"
-        "bounds: {'$_path': [['a','a',true,true]], a: [[1,1,true,true]]}}}}}");
+    assertHasOnlyCollscan();
 }
 
-TEST_F(QueryPlannerWildcardTest, ExprEqCanUseSparseIndexForEqualityToNull) {
+TEST_F(QueryPlannerWildcardTest, ExprEqCannotUseSparseIndexForEqualityToNull) {
     addWildcardIndex(BSON("$**" << 1));
     runQuery(fromjson("{a: {$_internalExprEq: null}}"));
 
-    assertNumSolutions(1U);
-    assertSolutionExists(
-        "{fetch: {filter: {a: {$_internalExprEq: null}}, node: {ixscan: {pattern: {'$_path': 1, a: "
-        "1}, bounds: {'$_path': [['a','a',true,true]], a: [[undefined,undefined,true,true], "
-        "[null,null,true,true]]}}}}}");
+    assertHasOnlyCollscan();
 }
 
 TEST_F(QueryPlannerWildcardTest, PrefixRegex) {
@@ -629,7 +624,8 @@ TEST_F(QueryPlannerWildcardTest, DottedFieldCovering) {
 }
 
 TEST_F(QueryPlannerWildcardTest, CoveredIxscanForCountOnIndexedPath) {
-    params.options = QueryPlannerParams::IS_COUNT;
+    params.options = QueryPlannerParams::DEFAULT;
+    setIsCountLike();
     addWildcardIndex(BSON("$**" << 1));
     runQuery(fromjson("{a: 5}"));
 

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -58,8 +57,14 @@
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/view_response_formatter.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/query_analysis_writer.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/logv2/log.h"
+#include "mongo/s/query_analysis_sampler_util.h"
+#include "mongo/util/database_name_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 namespace {
@@ -117,7 +122,7 @@ public:
     }
 
     Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
+                                 const DatabaseName& dbname,
                                  const BSONObj& cmdObj) const override {
         AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
 
@@ -132,18 +137,28 @@ public:
                                       hasTerm);
     }
 
+    bool allowedInTransactions() const final {
+        return true;
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
     Status explain(OperationContext* opCtx,
                    const OpMsgRequest& request,
                    ExplainOptions::Verbosity verbosity,
                    rpc::ReplyBuilderInterface* result) const override {
-        std::string dbname = request.getDatabase().toString();
+        const DatabaseName dbName =
+            DatabaseNameUtil::deserialize(request.getValidatedTenantId(), request.getDatabase());
         const BSONObj& cmdObj = request.body;
         // Acquire locks. The RAII object is optional, because in the case of a view, the locks
         // need to be released.
         boost::optional<AutoGetCollectionForReadCommandMaybeLockFree> ctx;
-        ctx.emplace(opCtx,
-                    CommandHelpers::parseNsCollectionRequired(dbname, cmdObj),
-                    AutoGetCollectionViewMode::kViewsPermitted);
+        ctx.emplace(
+            opCtx,
+            CommandHelpers::parseNsCollectionRequired(dbName, cmdObj),
+            AutoGetCollection::Options{}.viewMode(auto_get_collection::ViewMode::kViewsPermitted));
         const auto nss = ctx->getNss();
 
         const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
@@ -162,8 +177,11 @@ public:
             }
 
             auto viewAggCmd =
-                OpMsgRequest::fromDBAndBody(nss.db(), viewAggregation.getValue()).body;
+                OpMsgRequestBuilder::createWithValidatedTenancyScope(
+                    nss.dbName(), request.validatedTenancyScope, viewAggregation.getValue())
+                    .body;
             auto viewAggRequest = aggregation_request_helper::parseFromBSON(
+                opCtx,
                 nss,
                 viewAggCmd,
                 verbosity,
@@ -187,16 +205,17 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
         // Acquire locks and resolve possible UUID. The RAII object is optional, because in the case
         // of a view, the locks need to be released.
         boost::optional<AutoGetCollectionForReadCommandMaybeLockFree> ctx;
-        ctx.emplace(opCtx,
-                    CommandHelpers::parseNsOrUUID(dbname, cmdObj),
-                    AutoGetCollectionViewMode::kViewsPermitted);
+        ctx.emplace(
+            opCtx,
+            CommandHelpers::parseNsOrUUID(dbName, cmdObj),
+            AutoGetCollection::Options{}.viewMode(auto_get_collection::ViewMode::kViewsPermitted));
         const auto& nss = ctx->getNss();
 
         if (!ctx->getView()) {
@@ -224,6 +243,21 @@ public:
         auto parsedDistinct = uassertStatusOK(
             ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, false, defaultCollation));
 
+        if (parsedDistinct.isMirrored()) {
+            const auto& invocation = CommandInvocation::get(opCtx);
+            invocation->markMirrored();
+        } else if (auto sampleId = analyze_shard_key::getOrGenerateSampleId(
+                       opCtx,
+                       nss,
+                       analyze_shard_key::SampledCommandNameEnum::kDistinct,
+                       parsedDistinct)) {
+            auto cq = parsedDistinct.getQuery();
+            analyze_shard_key::QueryAnalysisWriter::get(opCtx)
+                ->addDistinctQuery(
+                    *sampleId, nss, cq->getQueryObj(), cq->getFindCommandRequest().getCollation())
+                .getAsync([](auto) {});
+        }
+
         if (ctx->getView()) {
             // Relinquish locks. The aggregation command will re-acquire them.
             ctx.reset();
@@ -231,9 +265,17 @@ public:
             auto viewAggregation = parsedDistinct.asAggregationCommand();
             uassertStatusOK(viewAggregation.getStatus());
 
-            BSONObj aggResult = CommandHelpers::runCommandDirectly(
-                opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(viewAggregation.getValue())));
-            uassertStatusOK(ViewResponseFormatter(aggResult).appendAsDistinctResponse(&result));
+            using VTS = auth::ValidatedTenancyScope;
+            boost::optional<VTS> vts = boost::none;
+            if (dbName.tenantId()) {
+                vts = VTS(dbName.tenantId().value(), VTS::TrustedForInnerOpMsgRequestTag{});
+            }
+            auto aggRequest = OpMsgRequestBuilder::createWithValidatedTenancyScope(
+                dbName, vts, std::move(viewAggregation.getValue()));
+
+            BSONObj aggResult = CommandHelpers::runCommandDirectly(opCtx, aggRequest);
+            uassertStatusOK(ViewResponseFormatter(aggResult).appendAsDistinctResponse(
+                &result, dbName.tenantId()));
             return true;
         }
 
@@ -318,7 +360,7 @@ public:
         }
         curOp->debug().setPlanSummaryMetrics(stats);
 
-        if (curOp->shouldDBProfile(opCtx)) {
+        if (curOp->shouldDBProfile()) {
             auto&& [stats, _] =
                 explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
             curOp->debug().execStats = std::move(stats);

@@ -3,49 +3,15 @@ Import("env")
 
 env = env.Clone()
 
-env.Command(
-    target=[
-        'feature_flag_test.idl',
-    ],
-    source=[
-        '#buildscripts/cheetah_source_generator.py',
-        'feature_flag_test.idl.tpl',
-        '$BUILD_DIR/mongo/util/version/releases.yml',
-    ],
-    action=[
-        '$PYTHON ${SOURCES[0]} -o ${TARGETS[0]} ${SOURCES[1]} ${SOURCES[2]} ${MONGO_VERSION}',
-    ],
-    # Ensure that that SCons is used to produce this file rather than Ninja, to avoid spurious
-    # dependency cycles due to how we manage generated sources with Ninja.
-    NINJA_TEMPLATE=True,
-)
-
 env.Library(
-    target="idl_parser",
+    target='idl_parser',
     source=[
         'command_generic_argument.cpp',
         'generic_argument.idl',
-        'idl_parser.cpp'
+        'idl_parser.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/commands/server_status_core',
-    ]
-)
-
-env.Library(
-    target='server_parameter',
-    source=[
-        'server_parameter.cpp',
-        'server_parameter.idl',
-        'server_parameter_with_storage.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        'idl_parser',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/util/options_parser/options_parser',
     ],
 )
 
@@ -54,14 +20,34 @@ env.Library(
     source=[
         'cluster_server_parameter.idl',
     ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/logical_time',
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/server_base',
+    ],
+)
+
+env.Library(
+    target='cluster_server_parameter_initializer',
+    source=[
+        'cluster_server_parameter_initializer.cpp',
     ],
     LIBDEPS_PRIVATE=[
-        'feature_flag',
-        'idl_parser',
-        'server_parameter',
+        '$BUILD_DIR/mongo/db/catalog/collection_catalog',
+        '$BUILD_DIR/mongo/db/repl/replica_set_aware_service',
+        '$BUILD_DIR/mongo/db/server_base',
+        'cluster_parameter_synchronization_helpers',
+    ],
+)
+
+env.Library(
+    target='cluster_parameter_synchronization_helpers',
+    source=[
+        'cluster_parameter_synchronization_helpers.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/audit',
+        '$BUILD_DIR/mongo/db/catalog/collection_catalog',
+        '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/mongo/db/shard_role',
     ],
 )
 
@@ -70,91 +56,116 @@ env.Library(
     source=[
         'cluster_server_parameter_op_observer.cpp',
     ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/dbdirectclient',
+        '$BUILD_DIR/mongo/db/op_observer/op_observer',
+        '$BUILD_DIR/mongo/db/server_base',
+        'cluster_parameter_synchronization_helpers',
+        'cluster_server_parameter_initializer',
+    ],
+)
+
+env.Library(
+    target='cluster_server_parameter_common',
+    source=[
+        'cluster_server_parameter_common.cpp',
+    ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/dbdirectclient',
-        '$BUILD_DIR/mongo/db/op_observer',
+        '$BUILD_DIR/mongo/db/commands/list_databases_for_all_tenants_command',
+        '$BUILD_DIR/mongo/s/grid',
+    ],
+)
+
+env.Library(
+    target='cluster_server_parameter_refresher',
+    source=[
+        'cluster_server_parameter_refresher.cpp',
+        'cluster_server_parameter_refresher.idl',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/audit',
+        '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/mongo/s/grid',
+        'cluster_server_parameter',
+        'cluster_server_parameter_common',
     ],
 )
 
 env.CppUnitTest(
     target='cluster_server_parameter_test',
     source=[
-        'cluster_server_parameter_test.idl',
+        'cluster_server_parameter_common_test.cpp',
+        'cluster_server_parameter_initializer_test.cpp',
         'cluster_server_parameter_op_observer_test.cpp',
+        'cluster_server_parameter_test_util.cpp',
+        'cluster_server_parameter_test.idl',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/auth/authmocks',
+        '$BUILD_DIR/mongo/db/catalog/catalog_helpers',
+        '$BUILD_DIR/mongo/db/change_stream_options_manager',
+        '$BUILD_DIR/mongo/db/commands/create_command',
+        '$BUILD_DIR/mongo/db/op_observer/op_observer',
         '$BUILD_DIR/mongo/db/repl/oplog',
         '$BUILD_DIR/mongo/db/repl/oplog_interface_local',
         '$BUILD_DIR/mongo/db/repl/replmocks',
         '$BUILD_DIR/mongo/db/repl/storage_interface_impl',
+        '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
         '$BUILD_DIR/mongo/util/signal_handlers',
+        'cluster_parameter_synchronization_helpers',
         'cluster_server_parameter',
+        'cluster_server_parameter_common',
+        'cluster_server_parameter_initializer',
         'cluster_server_parameter_op_observer',
     ],
 )
 
 env.Library(
-    target='feature_flag',
+    target='generic_args_with_types_idl',
     source=[
-        'feature_flag.cpp',
-        'feature_flag_test.idl',
+        'generic_args_with_types.idl',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        'server_parameter',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/commands/feature_compatibility_parsers',
-        '$BUILD_DIR/mongo/util/options_parser/options_parser',
-    ],
-)
-
-env.Library(
-    target='basic_types',
-    source=[
-        'basic_types.idl',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        'idl_parser',
+        '$BUILD_DIR/mongo/client/read_preference',
+        '$BUILD_DIR/mongo/db/repl/read_concern_args',
+        '$BUILD_DIR/mongo/db/s/forwardable_operation_metadata',
+        '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/mongo/db/session/logical_session_id',
+        '$BUILD_DIR/mongo/rpc/client_metadata',
+        '$BUILD_DIR/mongo/s/common_s',
     ],
 )
 
 env.CppUnitTest(
     target='idl_test',
     source=[
-        'config_option_test.cpp',
         'command_generic_argument_test.cpp',
+        'config_option_no_init_test.idl',
+        'config_option_test.cpp',
+        'config_option_test.idl',
         'feature_flag_test.cpp',
         'idl_test.cpp',
         'server_parameter_specialized_test.cpp',
-        'server_parameter_with_storage_test.cpp',
-        'config_option_no_init_test.idl',
-        'config_option_test.idl',
         'server_parameter_specialized_test.idl',
-        'server_parameter_with_storage_test.idl',
         'server_parameter_with_storage_test_structs.idl',
-        'unittest.idl',
+        'server_parameter_with_storage_test.cpp',
+        'server_parameter_with_storage_test.idl',
         'unittest_import.idl',
+        'unittest.idl',
     ],
-
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/auth/authprivilege',
-        '$BUILD_DIR/mongo/db/namespace_string',
-        '$BUILD_DIR/mongo/db/server_options_core',
-        '$BUILD_DIR/mongo/idl/idl_parser',
+        '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/mongo/db/server_feature_flags',
+        '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/rpc/message',
         '$BUILD_DIR/mongo/util/cmdline_utils/cmdline_utils',
+        '$BUILD_DIR/mongo/util/namespace_string_database_name_util',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
-        'basic_types',
         'cluster_server_parameter',
-        'feature_flag',
-        'server_parameter',
     ],
 )

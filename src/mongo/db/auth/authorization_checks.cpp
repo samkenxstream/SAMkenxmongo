@@ -43,7 +43,8 @@ namespace {
 // Checks if this connection has the privileges necessary to create or modify the view 'viewNs'
 // to be a view on 'viewOnNs' with pipeline 'viewPipeline'. Call this function after verifying
 // that the user has the 'createCollection' or 'collMod' action, respectively.
-Status checkAuthForCreateOrModifyView(AuthorizationSession* authzSession,
+Status checkAuthForCreateOrModifyView(OperationContext* opCtx,
+                                      AuthorizationSession* authzSession,
                                       const NamespaceString& viewNs,
                                       const NamespaceString& viewOnNs,
                                       const BSONArray& viewPipeline,
@@ -54,6 +55,7 @@ Status checkAuthForCreateOrModifyView(AuthorizationSession* authzSession,
     }
 
     auto request = aggregation_request_helper::parseFromBSON(
+        opCtx,
         viewNs,
         BSON("aggregate" << viewOnNs.coll() << "pipeline" << viewPipeline << "cursor" << BSONObj()
                          << "$db" << viewOnNs.db()),
@@ -173,7 +175,7 @@ Status checkAuthForDelete(AuthorizationSession* authSession,
 
 Status checkAuthForKillCursors(AuthorizationSession* authSession,
                                const NamespaceString& ns,
-                               UserNameIterator cursorOwner) {
+                               const boost::optional<UserName>& cursorOwner) {
     if (authSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
                                                       ActionType::killAnyCursor)) {
         return Status::OK();
@@ -198,7 +200,8 @@ Status checkAuthForKillCursors(AuthorizationSession* authSession,
                   str::stream() << "not authorized to kill cursor on " << ns.ns());
 }
 
-Status checkAuthForCreate(AuthorizationSession* authSession,
+Status checkAuthForCreate(OperationContext* opCtx,
+                          AuthorizationSession* authSession,
                           const CreateCommand& cmd,
                           bool isMongos) {
     auto ns = cmd.getNamespace();
@@ -222,14 +225,15 @@ Status checkAuthForCreate(AuthorizationSession* authSession,
 
         // Parse the viewOn namespace and the pipeline. If no pipeline was specified, use the empty
         // pipeline.
-        NamespaceString viewOnNs(ns.db(), optViewOn.get());
+        NamespaceString viewOnNs(
+            NamespaceStringUtil::parseNamespaceFromRequest(ns.dbName(), optViewOn.value()));
         auto pipeline = cmd.getPipeline().get_value_or(std::vector<BSONObj>());
         BSONArrayBuilder pipelineArray;
         for (const auto& stage : pipeline) {
             pipelineArray.append(stage);
         }
         return checkAuthForCreateOrModifyView(
-            authSession, ns, viewOnNs, pipelineArray.arr(), isMongos);
+            opCtx, authSession, ns, viewOnNs, pipelineArray.arr(), isMongos);
     }
 
     // To create a regular collection, ActionType::createCollection or ActionType::insert are
@@ -242,7 +246,8 @@ Status checkAuthForCreate(AuthorizationSession* authSession,
     return Status(ErrorCodes::Unauthorized, "unauthorized");
 }
 
-Status checkAuthForCollMod(AuthorizationSession* authSession,
+Status checkAuthForCollMod(OperationContext* opCtx,
+                           AuthorizationSession* authSession,
                            const NamespaceString& ns,
                            const BSONObj& cmdObj,
                            bool isMongos) {
@@ -262,9 +267,11 @@ Status checkAuthForCollMod(AuthorizationSession* authSession,
             "Must specify both 'viewOn' and 'pipeline' when modifying a view and auth is enabled");
     }
     if (hasViewOn) {
-        NamespaceString viewOnNs(ns.db(), cmdObj["viewOn"].checkAndGetStringData());
+        NamespaceString viewOnNs(NamespaceStringUtil::parseNamespaceFromRequest(
+            ns.dbName(), cmdObj["viewOn"].checkAndGetStringData()));
         auto viewPipeline = BSONArray(cmdObj["pipeline"].Obj());
-        return checkAuthForCreateOrModifyView(authSession, ns, viewOnNs, viewPipeline, isMongos);
+        return checkAuthForCreateOrModifyView(
+            opCtx, authSession, ns, viewOnNs, viewPipeline, isMongos);
     }
 
     return Status::OK();

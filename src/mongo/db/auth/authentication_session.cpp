@@ -27,20 +27,24 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/db/auth/authentication_session.h"
-
 #include "mongo/client/authenticate.h"
 #include "mongo/db/audit.h"
+#include "mongo/db/auth/authentication_metrics.h"
 #include "mongo/db/client.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 namespace mongo {
 namespace {
 constexpr auto kDiagnosticLogLevel = 3;
 
-Status crossVerifyUserNames(const UserName& oldUser, const UserName& newUser) noexcept {
+Status crossVerifyUserNames(const UserName& oldUser,
+                            const UserName& newUser,
+                            const bool isMechX509) noexcept {
     if (oldUser.empty()) {
         return Status::OK();
     }
@@ -62,7 +66,11 @@ Status crossVerifyUserNames(const UserName& oldUser, const UserName& newUser) no
         return Status::OK();
     }
 
-    if (oldUser.getUser() != newUser.getUser()) {
+    // In the case where we are executing X509 authentication, we want to allow the user to change
+    // from __system (which, if this is the case, means that the initial hello command specified
+    // the saslSupportedMechs field) to the user specified in the certificate for X509.
+    bool isSystemX509BypassingNameConstraints = oldUser.getUser() == "__system" && isMechX509;
+    if (oldUser.getUser() != newUser.getUser() && !isSystemX509BypassingNameConstraints) {
         return {ErrorCodes::ProtocolError,
                 str::stream() << "Attempt to switch user during SASL authentication from "
                               << oldUser << " to " << newUser};
@@ -105,6 +113,24 @@ auto makeAppender(ServerMechanismBase* mech) {
 }
 }  // namespace
 
+void AuthMetricsRecorder::appendMetric(const BSONObj& metric) {
+    _appendedMetrics.append(metric);
+}
+
+BSONObj AuthMetricsRecorder::capture() {
+
+    Duration<std::micro> _duration = _timer.elapsed();
+
+    authCounter.incAuthenticationCumulativeTime(_duration.count());
+
+    return BSON("conversation_duration"
+                << BSON("micros" << _duration.count() << "summary" << _appendedMetrics.done()));
+}
+
+void AuthMetricsRecorder::restart() {
+    _timer.reset();
+}
+
 AuthenticationSession::StepGuard::StepGuard(OperationContext* opCtx, StepType currentStep)
     : _opCtx(opCtx), _currentStep(currentStep) {
     auto client = _opCtx->getClient();
@@ -129,12 +155,13 @@ AuthenticationSession::StepGuard::StepGuard(OperationContext* opCtx, StepType cu
         maybeSession.emplace(client);
     };
 
-    auto startActiveSession = [&] {
+    auto startActiveSession = [&](const std::vector<StepType>& allowedLastSteps) {
         if (maybeSession) {
             invariant(maybeSession->_lastStep);
             auto lastStep = *maybeSession->_lastStep;
-            if (lastStep == StepType::kSaslSupportedMechanisms) {
-                // We can follow saslSupportedMechanisms with saslStart or authenticate.
+
+            if (std::find(allowedLastSteps.begin(), allowedLastSteps.end(), lastStep) !=
+                allowedLastSteps.end()) {
                 return;
             }
         }
@@ -149,12 +176,27 @@ AuthenticationSession::StepGuard::StepGuard(OperationContext* opCtx, StepType cu
         } break;
         case StepType::kSpeculativeAuthenticate:
         case StepType::kSpeculativeSaslStart: {
-            startActiveSession();
+            std::vector<StepType> allowedLastSteps{StepType::kSaslSupportedMechanisms};
+            startActiveSession(allowedLastSteps);
             maybeSession->_isSpeculative = true;
         } break;
         case StepType::kAuthenticate:
         case StepType::kSaslStart: {
-            startActiveSession();
+            std::vector<StepType> allowedLastSteps{StepType::kSaslSupportedMechanisms,
+                                                   StepType::kSpeculativeAuthenticate,
+                                                   StepType::kSpeculativeSaslStart};
+            startActiveSession(allowedLastSteps);
+
+            // If the last step was speculative auth, then we reset the session such that it
+            // persists from a failed speculative auth to the conclusion of a normal authentication.
+            bool lastStepWasSpec = maybeSession->_lastStep &&
+                (*maybeSession->_lastStep == StepType::kSpeculativeAuthenticate ||
+                 *maybeSession->_lastStep == StepType::kSpeculativeSaslStart);
+            if (lastStepWasSpec) {
+                maybeSession->_isSpeculative = false;
+                maybeSession->_mechName = "";
+                maybeSession->_mech = nullptr;
+            }
         } break;
         case StepType::kSaslContinue: {
             uassert(ErrorCodes::ProtocolError, "No SASL session state found", maybeSession);
@@ -201,8 +243,9 @@ void AuthenticationSession::setMechanismName(StringData mechanismName) {
     }
 }
 
-void AuthenticationSession::_verifyUserNameFromSaslSupportedMechanisms(const UserName& userName) {
-    if (auto status = crossVerifyUserNames(_ssmUserName, userName); !status.isOK()) {
+void AuthenticationSession::_verifyUserNameFromSaslSupportedMechanisms(const UserName& userName,
+                                                                       const bool isMechX509) {
+    if (auto status = crossVerifyUserNames(_ssmUserName, userName, isMechX509); !status.isOK()) {
         LOGV2(5286202,
               "Different user name was supplied to saslSupportedMechs",
               "error"_attr = status);
@@ -224,20 +267,20 @@ void AuthenticationSession::setUserNameForSaslSupportedMechanisms(UserName userN
                 "Set user name for session",
                 "userName"_attr = userName,
                 "oldName"_attr = _userName);
-    _verifyUserNameFromSaslSupportedMechanisms(userName);
+    _verifyUserNameFromSaslSupportedMechanisms(userName, false /* isMechX509 */);
 
     _ssmUserName = userName;
 }
 
-void AuthenticationSession::updateUserName(UserName userName) {
+void AuthenticationSession::updateUserName(UserName userName, bool isMechX509) {
     LOGV2_DEBUG(5286203,
                 kDiagnosticLogLevel,
                 "Updating user name for session",
                 "userName"_attr = userName,
                 "oldName"_attr = _userName);
 
-    _verifyUserNameFromSaslSupportedMechanisms(userName);
-    uassertStatusOK(crossVerifyUserNames(_userName, userName));
+    _verifyUserNameFromSaslSupportedMechanisms(userName, isMechX509);
+    uassertStatusOK(crossVerifyUserNames(_userName, userName, isMechX509));
     _userName = userName;
 }
 
@@ -272,7 +315,8 @@ void AuthenticationSession::_finish() {
         if (_mech->isClusterMember()) {
             setAsClusterMember();
         }
-        updateUserName({_mech->getPrincipalName(), _mech->getAuthenticationDatabase()});
+        updateUserName({_mech->getPrincipalName(), _mech->getAuthenticationDatabase()},
+                       _mechName == auth::kMechanismMongoX509);
     }
 }
 
@@ -294,37 +338,60 @@ void AuthenticationSession::markSuccessful() {
                                           ErrorCodes::OK);
     audit::logAuthentication(_client, event);
 
-    LOGV2_DEBUG(5286306,
-                kDiagnosticLogLevel,
-                "Successfully authenticated",
-                "client"_attr = _client->getRemote(),
-                "isSpeculative"_attr = _isSpeculative,
-                "isClusterMember"_attr = _isClusterMember,
-                "mechanism"_attr = _mechName,
-                "user"_attr = _userName.getUser(),
-                "db"_attr = _userName.getDB());
+    BSONObj metrics = _metricsRecorder.capture();
+
+    if (gEnableDetailedConnectionHealthMetricLogLines) {
+        BSONObjBuilder extraInfoBob;
+        if (_mech) {
+            _mech->appendExtraInfo(&extraInfoBob);
+        }
+
+        LOGV2(5286306,
+              "Successfully authenticated",
+              "client"_attr = _client->getRemote(),
+              "isSpeculative"_attr = _isSpeculative,
+              "isClusterMember"_attr = _isClusterMember,
+              "mechanism"_attr = _mechName,
+              "user"_attr = _userName.getUser(),
+              "db"_attr = _userName.getDB(),
+              "result"_attr = Status::OK().code(),
+              "metrics"_attr = metrics,
+              "extraInfo"_attr = extraInfoBob.obj());
+    }
 }
 
 void AuthenticationSession::markFailed(const Status& status) {
     _finish();
 
-    auto event = audit::AuthenticateEvent(_mechName,
-                                          _userName.getDB(),
-                                          _userName.getUser(),
-                                          makeAppender(_mech.get()),
-                                          status.code());
-    audit::logAuthentication(_client, event);
+    if (!_isSpeculative) {
+        auto event = audit::AuthenticateEvent(_mechName,
+                                              _userName.getDB(),
+                                              _userName.getUser(),
+                                              makeAppender(_mech.get()),
+                                              status.code());
+        audit::logAuthentication(_client, event);
+    }
 
-    LOGV2_DEBUG(5286307,
-                kDiagnosticLogLevel,
-                "Failed to authenticate",
-                "client"_attr = _client->getRemote(),
-                "isSpeculative"_attr = _isSpeculative,
-                "isClusterMember"_attr = _isClusterMember,
-                "mechanism"_attr = _mechName,
-                "user"_attr = _userName.getUser(),
-                "db"_attr = _userName.getDB(),
-                "error"_attr = status);
+    BSONObj metrics = _metricsRecorder.capture();
+
+    if (gEnableDetailedConnectionHealthMetricLogLines) {
+        BSONObjBuilder extraInfoBob;
+        if (_mech) {
+            _mech->appendExtraInfo(&extraInfoBob);
+        }
+
+        LOGV2(5286307,
+              "Failed to authenticate",
+              "client"_attr = _client->getRemote(),
+              "isSpeculative"_attr = _isSpeculative,
+              "isClusterMember"_attr = _isClusterMember,
+              "mechanism"_attr = _mechName,
+              "user"_attr = _userName.getUser(),
+              "db"_attr = _userName.getDB(),
+              "error"_attr = redact(status),
+              "result"_attr = status.code(),
+              "metrics"_attr = metrics,
+              "extraInfo"_attr = extraInfoBob.obj());
+    }
 }
-
 }  // namespace mongo

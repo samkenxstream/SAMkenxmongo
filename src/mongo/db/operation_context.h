@@ -29,16 +29,18 @@
 
 #pragma once
 
+#include "mongo/util/assert_util.h"
 #include <boost/optional.hpp>
+#include <cstddef>
 #include <memory>
 
 #include "mongo/base/status.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/locker.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_id.h"
 #include "mongo/db/query/datetime/date_time_support.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/write_unit_of_work.h"
@@ -106,14 +108,6 @@ public:
     OperationContext(Client* client, OperationIdSlot&& opIdSlot);
     virtual ~OperationContext();
 
-    bool shouldParticipateInFlowControl() const {
-        return _shouldParticipateInFlowControl;
-    }
-
-    void setShouldParticipateInFlowControl(bool target) {
-        _shouldParticipateInFlowControl = target;
-    }
-
     /**
      * Interface for durability.  Caller DOES NOT own pointer.
      */
@@ -129,10 +123,17 @@ public:
     std::unique_ptr<RecoveryUnit> releaseRecoveryUnit();
 
     /*
-     * Similar to releaseRecoveryUnit(), but sets up a new, inactive RecoveryUnit after releasing
-     * the existing one.
+     * Sets up a new, inactive RecoveryUnit in the OperationContext. Destroys any previous recovery
+     * unit and executes its rollback handlers.
+     */
+    void replaceRecoveryUnit();
+
+    /*
+     * Similar to replaceRecoveryUnit(), but returns the previous recovery unit like
+     * releaseRecoveryUnit().
      */
     std::unique_ptr<RecoveryUnit> releaseAndReplaceRecoveryUnit();
+
 
     /**
      * Associates the OperatingContext with a different RecoveryUnit for getMore or
@@ -343,7 +344,8 @@ public:
      * global shutdown.
      *
      * This should only be called from the registered task of global shutdown and is not
-     * recoverable.
+     * recoverable. May only be called by the thread executing on behalf of this OperationContext,
+     * and only while it has the Client that owns this OperationContext locked.
      */
     void setIsExecutingShutdown();
 
@@ -453,7 +455,8 @@ public:
 
     bool isRetryableWrite() const {
         return _txnNumber &&
-            (!_inMultiDocumentTransaction || isInternalSessionForRetryableWrite(*_lsid));
+            (!_inMultiDocumentTransaction ||
+             isInternalSessionForRetryableWrite(*getLogicalSessionId()));
     }
 
     /**
@@ -493,8 +496,14 @@ public:
     /**
      * Sets that this operation should always get killed during stepDown and stepUp, regardless of
      * whether or not it's taken a write lock.
+     *
+     * Note: This function is NOT synchronized with the ReplicationStateTransitionLock!  This means
+     * that the node's view of it's replication state can change concurrently with this function
+     * running - in which case your operation may _not_ be interrupted by that concurrent
+     * replication state change. If you need to ensure that your node does not change
+     * replication-state while calling this function, take the RSTL. See SERVER-66353 for more info.
      */
-    void setAlwaysInterruptAtStepDownOrUp() {
+    void setAlwaysInterruptAtStepDownOrUp_UNSAFE() {
         _alwaysInterruptAtStepDownOrUp.store(true);
     }
 
@@ -504,14 +513,6 @@ public:
      */
     bool shouldAlwaysInterruptAtStepDownOrUp() {
         return _alwaysInterruptAtStepDownOrUp.load();
-    }
-
-    /**
-     * Sets that this operation should ignore interruption except for replication state change. Can
-     * only be called by the thread executing this on behalf of this OperationContext.
-     */
-    void setIgnoreInterruptsExceptForReplStateChange(bool target) {
-        _ignoreInterruptsExceptForReplStateChange = target;
     }
 
     /**
@@ -526,6 +527,7 @@ public:
         _lsid = boost::none;
         _txnNumber = boost::none;
         _txnRetryCounter = boost::none;
+        _killOpsExempt = false;
     }
 
     /**
@@ -588,28 +590,106 @@ public:
      */
     void restoreMaxTimeMS();
 
+    /**
+     * Returns whether this operation must run in read-only mode.
+     *
+     * If the read-only flag is set on the ServiceContext then:
+     * - Internal operations are allowed to perform writes.
+     * - User originating operations are not allowed to perform writes.
+     */
+    bool readOnly() const {
+        if (!(getClient() && getClient()->isFromUserConnection()))
+            return false;
+        return !getServiceContext()->userWritesAllowed();
+    }
+
+    /**
+     * Sets whether this operation was started by a compressed command.
+     */
+    void setOpCompressed(bool opCompressed) {
+        _opCompressed = opCompressed;
+    }
+
+    /**
+     * Returns whether this operation was started by a compressed command.
+     */
+    bool isOpCompressed() const {
+        return _opCompressed;
+    }
+
+    /**
+     * Returns whether or not a local killOps may kill this opCtx.
+     */
+    bool isKillOpsExempt() const {
+        return _killOpsExempt;
+    }
+
+    /**
+     * Set to prevent killOps from killing this opCtx even when an LSID is set.
+     * You may only call this method prior to setting an LSID on this opCtx.
+     * Calls to resetMultiDocumentTransactionState will reset _killOpsExempt to false.
+     */
+    void setKillOpsExempt() {
+        invariant(!getLogicalSessionId());
+        _killOpsExempt = true;
+    }
+
+    // The query sampling options for operations on this opCtx. 'optIn' makes the operations
+    // eligible for query sampling regardless of whether the client is considered as internal by
+    // the sampler. 'optOut' does the opposite.
+    enum QuerySamplingOptions { kOptIn, kOptOut };
+
+    boost::optional<QuerySamplingOptions> getQuerySamplingOptions() {
+        return _querySamplingOpts;
+    }
+
+    void setQuerySamplingOptions(QuerySamplingOptions option) {
+        _querySamplingOpts = option;
+    }
+
+    /**
+     * Invokes the passed callback while ignoring interrupts. Note that this causes the deadline to
+     * be reset to Date_t::max(), but that it can also subsequently be reduced in size after the
+     * fact. Additionally handles the dance of try/catching the invocation and checking
+     * checkForInterrupt with the guard inactive (to allow a higher level timeout to override a
+     * lower level one, or for top level interruption to propagate).
+     *
+     * This should only be called from the thread executing on behalf of this OperationContext.
+     * The Client for this OperationContext should not be locked by the thread calling this
+     * function, as this function will acquire the lock internally to modify the OperationContext's
+     * interrupt state.
+     */
+    template <typename Callback>
+    decltype(auto) runWithoutInterruptionExceptAtGlobalShutdown(Callback&& cb) {
+        try {
+            bool prevIgnoringInterrupts = _ignoreInterrupts;
+            DeadlineState prevDeadlineState{_deadline, _timeoutError, _hasArtificialDeadline};
+            ScopeGuard guard([&] {
+                // Restore the original interruption and deadline state.
+                stdx::lock_guard lg(*_client);
+                _ignoreInterrupts = prevIgnoringInterrupts;
+                setDeadlineByDate(prevDeadlineState.deadline, prevDeadlineState.error);
+                _hasArtificialDeadline = prevDeadlineState.hasArtificialDeadline;
+                _markKilledIfDeadlineRequires();
+            });
+            // Ignore interrupts until the callback completes.
+            {
+                stdx::lock_guard lg(*_client);
+                _hasArtificialDeadline = true;
+                setDeadlineByDate(Date_t::max(), ErrorCodes::ExceededTimeLimit);
+                _ignoreInterrupts = true;
+            }
+            return std::forward<Callback>(cb)();
+        } catch (const ExceptionForCat<ErrorCategory::ExceededTimeLimitError>&) {
+            // May throw replacement exception
+            checkForInterrupt();
+            throw;
+        }
+    }
+
 private:
     StatusWith<stdx::cv_status> waitForConditionOrInterruptNoAssertUntil(
         stdx::condition_variable& cv, BasicLockableAdapter m, Date_t deadline) noexcept override;
-
-    IgnoreInterruptsState pushIgnoreInterrupts() override {
-        IgnoreInterruptsState iis{_ignoreInterrupts,
-                                  {_deadline, _timeoutError, _hasArtificialDeadline}};
-        _hasArtificialDeadline = true;
-        setDeadlineByDate(Date_t::max(), ErrorCodes::ExceededTimeLimit);
-        _ignoreInterrupts = true;
-
-        return iis;
-    }
-
-    void popIgnoreInterrupts(IgnoreInterruptsState iis) override {
-        _ignoreInterrupts = iis.ignoreInterrupts;
-
-        setDeadlineByDate(iis.deadline.deadline, iis.deadline.error);
-        _hasArtificialDeadline = iis.deadline.hasArtificialDeadline;
-
-        _markKilledIfDeadlineRequires();
-    }
 
     DeadlineState pushArtificialDeadline(Date_t deadline, ErrorCodes::Error error) override {
         DeadlineState ds{_deadline, _timeoutError, _hasArtificialDeadline};
@@ -632,16 +712,6 @@ private:
             !isKillPending()) {
             markKilled(_timeoutError);
         }
-    }
-
-    /**
-     * Returns true if ignoring interrupts other than repl state change and no repl state change
-     * has occurred.
-     */
-    bool _noReplStateChangeWhileIgnoringOtherInterrupts() const {
-        return _ignoreInterruptsExceptForReplStateChange &&
-            getKillStatus() != ErrorCodes::InterruptedDueToReplStateChange &&
-            !_killRequestedForReplStateChange.loadRelaxed();
     }
 
     /**
@@ -745,10 +815,8 @@ private:
 
     bool _writesAreReplicated = true;
     bool _shouldIncrementLatencyStats = true;
-    bool _shouldParticipateInFlowControl = true;
     bool _inMultiDocumentTransaction = false;
     bool _isStartingMultiDocumentTransaction = false;
-    bool _ignoreInterruptsExceptForReplStateChange = false;
     // Commands from user applications must run validations and enforce constraints. Operations from
     // a trusted source, such as initial sync or consuming an oplog entry generated by a primary
     // typically desire to ignore constraints.
@@ -771,6 +839,20 @@ private:
 
     // Whether this operation is an exhaust command.
     bool _exhaust = false;
+
+    // Whether this operation was started by a compressed command.
+    bool _opCompressed = false;
+
+    // Prevent this opCtx from being killed by killSessionsLocalKillOps if an LSID is attached.
+    // Normally, the presence of an LSID implies kill-eligibility as it uniquely identifies a
+    // session and can thus be passed into a killSessions command to target that session and its
+    // operations. However, there are some cases where we want the opCtx to have both an LSID and
+    // kill-immunity. Current examples include checking out sessions on replica set step up in order
+    // to refresh locks for prepared tranasctions or abort in-progress transactions.
+    bool _killOpsExempt = false;
+
+    // The query sampling options for operations on this opCtx.
+    boost::optional<QuerySamplingOptions> _querySamplingOpts;
 };
 
 // Gets a TimeZoneDatabase pointer from the ServiceContext.

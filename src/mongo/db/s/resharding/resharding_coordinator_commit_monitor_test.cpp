@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include <algorithm>
 #include <boost/optional.hpp>
@@ -43,14 +42,17 @@
 #include "mongo/db/s/resharding/resharding_coordinator_commit_monitor.h"
 #include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/cancellation.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/functional.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace resharding {
@@ -92,6 +94,8 @@ protected:
     void tearDown() override;
 
     void mockCommandForRecipients(Milliseconds remainingOperationTime);
+    void mockOmitRemainingMillisForRecipients();
+    void mockOmitRemainingMillisForOneRecipient();
     void mockRemaingOperationTimesCommandForRecipients(
         CoordinatorCommitMonitor::RemainingOperationTimes remainingOperationTimes);
 
@@ -105,22 +109,22 @@ private:
     std::shared_ptr<CoordinatorCommitMonitor> _commitMonitor;
 
     boost::optional<Callback> _runOnMockingNextResponse;
+
+    ReshardingCumulativeMetrics _cumulativeMetrics;
+    std::shared_ptr<ReshardingMetrics> _metrics;
 };
 
 auto makeExecutor() {
     executor::ThreadPoolMock::Options options;
-    options.onCreateThread = [] { Client::initThread("executor", nullptr); };
+    options.onCreateThread = [] {
+        Client::initThread("executor", nullptr);
+    };
     auto net = std::make_unique<executor::NetworkInterfaceMock>();
     return executor::makeSharedThreadPoolTestExecutor(std::move(net), std::move(options));
 }
 
 void CoordinatorCommitMonitorTest::setUp() {
     ConfigServerTestFixture::setUp();
-
-    auto metrics = ReshardingMetrics::get(getServiceContext());
-    metrics->onStart(ReshardingMetrics::Role::kCoordinator,
-                     getServiceContext()->getFastClockSource()->now());
-    metrics->setCoordinatorState(CoordinatorStateEnum::kApplying);
 
     auto hostNameForShard = [](const ShardId& shard) -> std::string {
         return fmt::format("{}:1234", shard.toString());
@@ -149,8 +153,23 @@ void CoordinatorCommitMonitorTest::setUp() {
     _futureExecutor->startup();
 
     _cancellationSource = std::make_unique<CancellationSource>();
-    _commitMonitor = std::make_shared<CoordinatorCommitMonitor>(
-        _ns, _recipientShards, _futureExecutor, _cancellationSource->token(), Milliseconds(0));
+
+    auto clockSource = getServiceContext()->getFastClockSource();
+    _metrics = std::make_shared<ReshardingMetrics>(
+        UUID::gen(),
+        BSON("y" << 1),
+        _ns,
+        ShardingDataTransformInstanceMetrics::Role::kCoordinator,
+        clockSource->now(),
+        clockSource,
+        &_cumulativeMetrics);
+
+    _commitMonitor = std::make_shared<CoordinatorCommitMonitor>(_metrics,
+                                                                _ns,
+                                                                _recipientShards,
+                                                                _futureExecutor,
+                                                                _cancellationSource->token(),
+                                                                Milliseconds(0));
     _commitMonitor->setNetworkExecutorForTest(executor());
 }
 
@@ -178,6 +197,31 @@ void CoordinatorCommitMonitorTest::mockCommandForRecipients(Milliseconds remaini
 
     std::for_each(
         _recipientShards.begin(), _recipientShards.end(), [&](const ShardId&) { onCommand(func); });
+}
+
+void CoordinatorCommitMonitorTest::mockOmitRemainingMillisForRecipients() {
+    // Omit remainingMillis from all shard responses.
+    std::for_each(_recipientShards.begin(), _recipientShards.end(), [this](const ShardId&) {
+        onCommand([](const executor::RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+            // Return an empty BSON object.
+            return BSONObj();
+        });
+    });
+}
+
+void CoordinatorCommitMonitorTest::mockOmitRemainingMillisForOneRecipient() {
+    // Omit remainingMillis from a single recipient.
+    for (const auto& shard : _recipientShards) {
+        onCommand([&](const executor::RemoteCommandRequest&) -> StatusWith<BSONObj> {
+            if (shard == _recipientShards.front()) {
+                // Return an empty BSON object.
+                return BSONObj();
+            }
+            auto threshold = Milliseconds(gRemainingReshardingOperationTimeThresholdMillis.load());
+            return BSON("remainingMillis"
+                        << durationCount<Milliseconds>(threshold - Milliseconds(1)));
+        });
+    }
 }
 
 void CoordinatorCommitMonitorTest::mockRemaingOperationTimesCommandForRecipients(
@@ -260,6 +304,20 @@ TEST_F(CoordinatorCommitMonitorTest, RetriesWhenEncountersErrorsWhileQueryingRec
     }
 
     ASSERT(!future.isReady());
+    respondWithReadyToCommit();
+    future.get();
+}
+
+TEST_F(CoordinatorCommitMonitorTest, BlocksWhenRemainingMillisIsOmitted) {
+    auto future = getCommitMonitor()->waitUntilRecipientsAreWithinCommitThreshold();
+
+    mockOmitRemainingMillisForRecipients();
+    ASSERT(!future.isReady());
+
+    // If even a single shard omits remainingMillis, we cannot begin the critical section.
+    mockOmitRemainingMillisForOneRecipient();
+    ASSERT(!future.isReady());
+
     respondWithReadyToCommit();
     future.get();
 }

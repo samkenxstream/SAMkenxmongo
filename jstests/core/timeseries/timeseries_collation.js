@@ -2,9 +2,11 @@
  * Tests that time-series collections respect collations for metadata and min/max.
  *
  * @tags: [
+ *   # This test depends on certain writes ending up in the same bucket. Stepdowns may result in
+ *   # writes splitting between two primaries, and thus different buckets.
  *   does_not_support_stepdowns,
- *   does_not_support_transactions,
- *   requires_getmore,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 (function() {
@@ -64,7 +66,7 @@ TimeseriesTest.run((insert) => {
     const results = coll.find().sort({_id: 1}).toArray();
     assert.eq(docs.length, results.length);
     for (let i = 0; i < results.length; i++) {
-        assert.docEq(results[i], docs[i]);
+        assert.docEq(docs[i], results[i]);
     }
 
     // Now let's check that min and max appropriately ignore collation for field names, but not

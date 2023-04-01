@@ -35,10 +35,10 @@
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/generic_cursor.h"
-#include "mongo/db/kill_sessions.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
-#include "mongo/db/session_killer.h"
+#include "mongo/db/session/kill_sessions.h"
+#include "mongo/db/session/session_killer.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/clock_source.h"
@@ -142,10 +142,7 @@ public:
      * operation next checks for interruption.
      * Case (2) will only occur if the cursor is pinned.
      *
-     * Returns ErrorCodes::CursorNotFound if the cursor id is not owned by this manager. Returns
-     * ErrorCodes::OperationFailed if attempting to erase a pinned cursor.
-     *
-     * If 'shouldAudit' is true, will perform audit logging.
+     * Returns ErrorCodes::CursorNotFound if the cursor id is not owned by this manager.
      */
     Status killCursor(OperationContext* opCtx, CursorId id);
 
@@ -194,6 +191,17 @@ public:
                                                            const SessionKiller::Matcher& matcher);
 
     /**
+     * Returns a vector of open cursor ids registered on the `nss`. The result doesn't include
+     * cursors registered for a different namespace but also acting on `nss` (e.g. in presence of
+     * sub-pipelines).
+     *
+     * Locks/inspects one partition at a time, hence the result might not include new cursors being
+     * opened on the namespace. The only guarantee is that the result will include any cursor opened
+     * before calling this method and not closed before iterating the partition holding it.
+     */
+    std::vector<CursorId> getCursorIdsForNamespace(const NamespaceString& nss);
+
+    /**
      * Set the CursorManager's ClockSource*.
      */
     void setPreciseClockSource(ClockSource* preciseClockSource) {
@@ -204,14 +212,17 @@ private:
     static constexpr int kNumPartitions = 16;
     friend class ClientCursorPin;
 
-    ClientCursorPin _registerCursor(
-        OperationContext* opCtx, std::unique_ptr<ClientCursor, ClientCursor::Deleter> clientCursor);
-
-    void deregisterCursor(ClientCursor* cursor);
+    // deregisterAndDestroyCursor deregisters the cursor from the manager's cursorMap, then safely
+    // destroys the cursor. The first overload requires having acquired the cursor manager partition
+    // lock already.
     void deregisterAndDestroyCursor(
-        Partitioned<stdx::unordered_map<CursorId, ClientCursor*>>::OnePartition&&,
+        Partitioned<stdx::unordered_map<CursorId, ClientCursor*>>::OnePartition&& lk,
         OperationContext* opCtx,
         std::unique_ptr<ClientCursor, ClientCursor::Deleter> cursor);
+    void deregisterAndDestroyCursor(OperationContext* opCtx,
+                                    std::unique_ptr<ClientCursor, ClientCursor::Deleter> cursor);
+    void _destroyCursor(OperationContext* opCtx,
+                        std::unique_ptr<ClientCursor, ClientCursor::Deleter> cursor);
 
     void unpin(OperationContext* opCtx,
                std::unique_ptr<ClientCursor, ClientCursor::Deleter> cursor);

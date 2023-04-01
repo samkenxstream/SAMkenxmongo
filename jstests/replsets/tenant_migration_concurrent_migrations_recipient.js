@@ -5,7 +5,6 @@
  *
  * @tags: [
  *   incompatible_with_amazon_linux,
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
@@ -15,13 +14,9 @@
  * ]
  */
 
-(function() {
-"use strict";
-
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");  // for 'extractUUIDFromObject'
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
 TestData.logComponentVerbosity = {
     accessControl: {verbosity: 3}
@@ -31,7 +26,8 @@ const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 
 // Set up tenant data for the 50 migrations.
-const tenantIds = [...Array(50).keys()].map((i) => `testTenantId-${i}`);
+// todo fix this
+const tenantIds = [...Array(50).keys()].map(() => ObjectId().str);
 let migrationOptsArray = [];
 tenantIds.forEach((tenantId) => {
     const dbName = tenantMigrationTest.tenantDB(tenantId, "testDB");
@@ -79,4 +75,3 @@ migrationOptsArray.forEach((migrationOpts) => {
 });
 
 tenantMigrationTest.stop();
-})();

@@ -29,6 +29,11 @@
 
 #include "mongo/db/query/optimizer/cascades/logical_rewriter.h"
 
+#include "mongo/db/query/optimizer/cascades/rewriter_rules.h"
+#include "mongo/db/query/optimizer/reference_tracker.h"
+#include "mongo/db/query/optimizer/utils/path_utils.h"
+#include "mongo/db/query/optimizer/utils/reftracker_utils.h"
+
 
 namespace mongo::optimizer::cascades {
 
@@ -75,13 +80,32 @@ LogicalRewriter::RewriteSet LogicalRewriter::_substitutionSet = {
     {LogicalRewriteType::EvaluationSubstitute, 2},
     {LogicalRewriteType::SargableMerge, 2}};
 
-LogicalRewriter::LogicalRewriter(Memo& memo, PrefixId& prefixId, RewriteSet rewriteSet)
-    : _activeRewriteSet(std::move(rewriteSet)), _groupsPending(), _memo(memo), _prefixId(prefixId) {
+LogicalRewriter::LogicalRewriter(const Metadata& metadata,
+                                 Memo& memo,
+                                 PrefixId& prefixId,
+                                 const RewriteSet rewriteSet,
+                                 const DebugInfo& debugInfo,
+                                 const QueryHints& hints,
+                                 const PathToIntervalFn& pathToInterval,
+                                 const ConstFoldFn& constFold,
+                                 const LogicalPropsInterface& logicalPropsDerivation,
+                                 const CardinalityEstimator& cardinalityEstimator)
+    : _activeRewriteSet(std::move(rewriteSet)),
+      _groupsPending(),
+      _metadata(metadata),
+      _memo(memo),
+      _prefixId(prefixId),
+      _debugInfo(debugInfo),
+      _hints(hints),
+      _pathToInterval(pathToInterval),
+      _constFold(constFold),
+      _logicalPropsDerivation(logicalPropsDerivation),
+      _cardinalityEstimator(cardinalityEstimator) {
     initializeRewrites();
 
     if (_activeRewriteSet.count(LogicalRewriteType::SargableSplit) > 0) {
         // If we are performing SargableSplit exploration rewrite, populate helper map.
-        for (const auto& [scanDefName, scanDef] : _memo.getMetadata()._scanDefs) {
+        for (const auto& [scanDefName, scanDef] : _metadata._scanDefs) {
             for (const auto& [indexDefName, indexDef] : scanDef.getIndexDefs()) {
                 for (const IndexCollationEntry& entry : indexDef.getCollationSpec()) {
                     if (auto pathPtr = entry._path.cast<PathGet>(); pathPtr != nullptr) {
@@ -94,11 +118,12 @@ LogicalRewriter::LogicalRewriter(Memo& memo, PrefixId& prefixId, RewriteSet rewr
 }
 
 GroupIdType LogicalRewriter::addRootNode(const ABT& node) {
-    return addNode(node, -1, false /*addExistingNodeWithNewChild*/).first;
+    return addNode(node, -1, LogicalRewriteType::Root, false /*addExistingNodeWithNewChild*/).first;
 }
 
 std::pair<GroupIdType, NodeIdSet> LogicalRewriter::addNode(const ABT& node,
                                                            const GroupIdType targetGroupId,
+                                                           const LogicalRewriteType rule,
                                                            const bool addExistingNodeWithNewChild) {
     NodeIdSet insertNodeIds;
 
@@ -108,7 +133,12 @@ std::pair<GroupIdType, NodeIdSet> LogicalRewriter::addNode(const ABT& node,
     }
 
     const GroupIdType resultGroupId = _memo.integrate(
-        node, std::move(targetGroupMap), insertNodeIds, addExistingNodeWithNewChild);
+        Memo::Context{&_metadata, &_debugInfo, &_logicalPropsDerivation, &_cardinalityEstimator},
+        node,
+        std::move(targetGroupMap),
+        insertNodeIds,
+        rule,
+        addExistingNodeWithNewChild);
 
     uassert(6624046,
             "Result group is not the same as target group",
@@ -120,7 +150,7 @@ std::pair<GroupIdType, NodeIdSet> LogicalRewriter::addNode(const ABT& node,
         }
 
         for (const auto [type, priority] : _activeRewriteSet) {
-            auto& groupQueue = _memo.getGroup(nodeMemoId._groupId)._logicalRewriteQueue;
+            auto& groupQueue = _memo.getLogicalRewriteQueue(nodeMemoId._groupId);
             groupQueue.push(std::make_unique<LogicalRewriteEntry>(priority, type, nodeMemoId));
 
             _groupsPending.insert(nodeMemoId._groupId);
@@ -137,12 +167,15 @@ void LogicalRewriter::clearGroup(const GroupIdType groupId) {
 class RewriteContext {
 public:
     RewriteContext(LogicalRewriter& rewriter,
+                   const LogicalRewriteType rule,
                    const MemoLogicalNodeId aboveNodeId,
                    const MemoLogicalNodeId belowNodeId)
-        : RewriteContext(rewriter, aboveNodeId, true /*hasBelowNodeId*/, belowNodeId){};
+        : RewriteContext(rewriter, rule, aboveNodeId, true /*hasBelowNodeId*/, belowNodeId){};
 
-    RewriteContext(LogicalRewriter& rewriter, const MemoLogicalNodeId aboveNodeId)
-        : RewriteContext(rewriter, aboveNodeId, false /*hasBelowNodeId*/, {}){};
+    RewriteContext(LogicalRewriter& rewriter,
+                   const LogicalRewriteType rule,
+                   const MemoLogicalNodeId aboveNodeId)
+        : RewriteContext(rewriter, rule, aboveNodeId, false /*hasBelowNodeId*/, {}){};
 
     std::pair<GroupIdType, NodeIdSet> addNode(const ABT& node,
                                               const bool substitute,
@@ -156,7 +189,7 @@ public:
                 _rewriter.clearGroup(_belowNodeId._groupId);
             }
         }
-        return _rewriter.addNode(node, _aboveNodeId._groupId, addExistingNodeWithNewChild);
+        return _rewriter.addNode(node, _aboveNodeId._groupId, _rule, addExistingNodeWithNewChild);
     }
 
     Memo& getMemo() const {
@@ -164,11 +197,15 @@ public:
     }
 
     const Metadata& getMetadata() const {
-        return _rewriter._memo.getMetadata();
+        return _rewriter._metadata;
     }
 
     PrefixId& getPrefixId() const {
         return _rewriter._prefixId;
+    }
+
+    const QueryHints& getHints() const {
+        return _rewriter._hints;
     }
 
     auto& getIndexFieldPrefixMap() const {
@@ -176,7 +213,7 @@ public:
     }
 
     const properties::LogicalProps& getAboveLogicalProps() const {
-        return getMemo().getGroup(_aboveNodeId._groupId)._logicalProperties;
+        return getMemo().getLogicalProps(_aboveNodeId._groupId);
     }
 
     bool hasSubstituted() const {
@@ -191,8 +228,17 @@ public:
         return _rewriter._sargableSplitCountMap;
     }
 
+    const auto& getPathToInterval() const {
+        return _rewriter._pathToInterval;
+    }
+
+    const auto& getConstFold() const {
+        return _rewriter._constFold;
+    }
+
 private:
     RewriteContext(LogicalRewriter& rewriter,
+                   const LogicalRewriteType rule,
                    const MemoLogicalNodeId aboveNodeId,
                    const bool hasBelowNodeId,
                    const MemoLogicalNodeId belowNodeId)
@@ -200,7 +246,8 @@ private:
           _hasBelowNodeId(hasBelowNodeId),
           _belowNodeId(belowNodeId),
           _rewriter(rewriter),
-          _hasSubstituted(false){};
+          _hasSubstituted(false),
+          _rule(rule){};
 
     const MemoLogicalNodeId _aboveNodeId;
     const bool _hasBelowNodeId;
@@ -210,45 +257,14 @@ private:
     LogicalRewriter& _rewriter;
 
     bool _hasSubstituted;
+
+    const LogicalRewriteType _rule;
 };
 
 struct ReorderDependencies {
     bool _hasNodeRef = false;
     bool _hasChildRef = false;
     bool _hasNodeAndChildRef = false;
-};
-
-template <class NodeType>
-struct DefaultChildAccessor {
-    const ABT& operator()(const ABT& node) const {
-        return node.cast<NodeType>()->getChild();
-    }
-
-    ABT& operator()(ABT& node) const {
-        return node.cast<NodeType>()->getChild();
-    }
-};
-
-template <class NodeType>
-struct LeftChildAccessor {
-    const ABT& operator()(const ABT& node) const {
-        return node.cast<NodeType>()->getLeftChild();
-    }
-
-    ABT& operator()(ABT& node) const {
-        return node.cast<NodeType>()->getLeftChild();
-    }
-};
-
-template <class NodeType>
-struct RightChildAccessor {
-    const ABT& operator()(const ABT& node) const {
-        return node.cast<NodeType>()->getRightChild();
-    }
-
-    ABT& operator()(ABT& node) const {
-        return node.cast<NodeType>()->getRightChild();
-    }
 };
 
 template <class AboveType,
@@ -271,7 +287,7 @@ ReorderDependencies computeDependencies(ABT::reference_type aboveNodeRef,
         env.hasDefinitions(belowChild) ? env.getDefinitions(belowChild) : DefinitionsMap{};
 
     ReorderDependencies dependencies;
-    for (const std::string& varName : aboveNodeVarNames) {
+    for (const ProjectionName& varName : aboveNodeVarNames) {
         auto it = belowNodeDefs.find(varName);
         // Variable is exclusively defined in the below node.
         const bool refersToNode = it != belowNodeDefs.cend() && it->second.definedBy == belowNode;
@@ -301,7 +317,7 @@ static ABT createEmptyValueScanNode(const RewriteContext& ctx) {
         getPropertyConst<ProjectionAvailability>(ctx.getAboveLogicalProps()).getProjections();
     ProjectionNameVector projNameVector;
     projNameVector.insert(projNameVector.begin(), projNameSet.cbegin(), projNameSet.cend());
-    return make<ValueScanNode>(std::move(projNameVector));
+    return make<ValueScanNode>(std::move(projNameVector), ctx.getAboveLogicalProps());
 }
 
 static void addEmptyValueScanNode(RewriteContext& ctx) {
@@ -526,6 +542,7 @@ struct SubstituteMerge<LimitSkipNode, LimitSkipNode> {
 
 static boost::optional<ABT> mergeSargableNodes(
     const properties::IndexingAvailability& indexingAvailability,
+    const MultikeynessTrie& multikeynessTrie,
     const SargableNode& aboveNode,
     const SargableNode& belowNode,
     RewriteContext& ctx) {
@@ -537,29 +554,31 @@ static boost::optional<ABT> mergeSargableNodes(
     }
 
     PartialSchemaRequirements mergedReqs = belowNode.getReqMap();
-    ProjectionRenames projectionRenames;
-    if (!intersectPartialSchemaReq(mergedReqs, aboveNode.getReqMap(), projectionRenames)) {
+    if (!intersectPartialSchemaReq(mergedReqs, aboveNode.getReqMap())) {
         return {};
     }
-    if (mergedReqs.size() > LogicalRewriter::kMaxPartialSchemaReqCount) {
+
+    const ProjectionName& scanProjName = indexingAvailability.getScanProjection();
+    ProjectionRenames projectionRenames;
+    const bool hasEmptyInterval = simplifyPartialSchemaReqPaths(
+        scanProjName, multikeynessTrie, mergedReqs, projectionRenames, ctx.getConstFold());
+    if (hasEmptyInterval) {
+        return createEmptyValueScanNode(ctx);
+    }
+
+    if (PSRExpr::numLeaves(mergedReqs.getRoot()) > SargableNode::kMaxPartialSchemaReqs) {
         return {};
     }
 
     const ScanDefinition& scanDef =
         ctx.getMetadata()._scanDefs.at(indexingAvailability.getScanDefName());
-    bool hasEmptyInterval = false;
-    auto candidateIndexMap = computeCandidateIndexMap(ctx.getPrefixId(),
-                                                      indexingAvailability.getScanProjection(),
-                                                      mergedReqs,
-                                                      scanDef,
-                                                      hasEmptyInterval);
+    auto candidateIndexes = computeCandidateIndexes(
+        ctx.getPrefixId(), scanProjName, mergedReqs, scanDef, ctx.getHints(), ctx.getConstFold());
 
-    if (hasEmptyInterval) {
-        return createEmptyValueScanNode(ctx);
-    }
-
+    auto scanParams = computeScanParams(ctx.getPrefixId(), mergedReqs, scanProjName);
     ABT result = make<SargableNode>(std::move(mergedReqs),
-                                    std::move(candidateIndexMap),
+                                    std::move(candidateIndexes),
+                                    std::move(scanParams),
                                     IndexReqTarget::Complete,
                                     belowNode.getChild());
     applyProjectionRenames(std::move(projectionRenames), result);
@@ -572,11 +591,22 @@ struct SubstituteMerge<SargableNode, SargableNode> {
                     ABT::reference_type belowNode,
                     RewriteContext& ctx) const {
         using namespace properties;
-        const auto& result =
-            mergeSargableNodes(getPropertyConst<IndexingAvailability>(ctx.getAboveLogicalProps()),
-                               *aboveNode.cast<SargableNode>(),
-                               *belowNode.cast<SargableNode>(),
-                               ctx);
+
+        const LogicalProps& props = ctx.getAboveLogicalProps();
+        tassert(6624170,
+                "At this point we should have IndexingAvailability",
+                hasProperty<IndexingAvailability>(props));
+
+        const auto& indexingAvailability = getPropertyConst<IndexingAvailability>(props);
+        const ScanDefinition& scanDef =
+            ctx.getMetadata()._scanDefs.at(indexingAvailability.getScanDefName());
+        tassert(6624171, "At this point the collection must exist", scanDef.exists());
+
+        const auto& result = mergeSargableNodes(indexingAvailability,
+                                                scanDef.getMultikeynessTrie(),
+                                                *aboveNode.cast<SargableNode>(),
+                                                *belowNode.cast<SargableNode>(),
+                                                ctx);
         if (result) {
             ctx.addNode(*result, true /*substitute*/);
         }
@@ -597,15 +627,10 @@ struct SubstituteConvert<LimitSkipNode> {
     }
 };
 
-static void addElemMatchAndSargableNode(const ABT& node, ABT sargableNode, RewriteContext& ctx) {
-    ABT newNode = node;
-    newNode.cast<FilterNode>()->getChild() = std::move(sargableNode);
-    ctx.addNode(newNode, false /*substitute*/, true /*addExistingNodeWithNewChild*/);
-}
-
-void convertFilterToSargableNode(ABT::reference_type node,
-                                 const FilterNode& filterNode,
-                                 RewriteContext& ctx) {
+static void convertFilterToSargableNode(ABT::reference_type node,
+                                        const FilterNode& filterNode,
+                                        RewriteContext& ctx,
+                                        const ProjectionName& scanProjName) {
     using namespace properties;
 
     const LogicalProps& props = ctx.getAboveLogicalProps();
@@ -613,7 +638,6 @@ void convertFilterToSargableNode(ABT::reference_type node,
         // Can only convert to sargable node if we have indexing availability.
         return;
     }
-
     const auto& indexingAvailability = getPropertyConst<IndexingAvailability>(props);
     const ScanDefinition& scanDef =
         ctx.getMetadata()._scanDefs.at(indexingAvailability.getScanDefName());
@@ -622,51 +646,325 @@ void convertFilterToSargableNode(ABT::reference_type node,
         return;
     }
 
-    PartialSchemaReqConversion conversion = convertExprToPartialSchemaReq(filterNode.getFilter());
-    if (!conversion._success) {
-        return;
-    }
-    if (conversion._hasEmptyInterval) {
-        addEmptyValueScanNode(ctx);
+    auto conversion = convertExprToPartialSchemaReq(
+        filterNode.getFilter(), true /*isFilterContext*/, ctx.getPathToInterval());
+    if (!conversion) {
         return;
     }
 
-    for (const auto& entry : conversion._reqMap) {
+    // Remove any partial schema requirements which do not constrain their input.
+
+    conversion->_reqMap.simplify([](const PartialSchemaKey& key, PartialSchemaRequirement& req) {
         uassert(6624111,
                 "Filter partial schema requirement must contain a variable name.",
-                !entry.first._projectionName.empty());
+                key._projectionName);
         uassert(6624112,
                 "Filter partial schema requirement cannot bind.",
-                !entry.second.hasBoundProjectionName());
-        uassert(6624113,
-                "Filter partial schema requirement must have a range.",
-                !isIntervalReqFullyOpenDNF(entry.second.getIntervals()));
-    }
+                !req.getBoundProjectionName());
+        return true;
+    });
 
-    bool hasEmptyInterval = false;
-    auto candidateIndexMap = computeCandidateIndexMap(ctx.getPrefixId(),
-                                                      indexingAvailability.getScanProjection(),
-                                                      conversion._reqMap,
-                                                      scanDef,
-                                                      hasEmptyInterval);
+    ProjectionRenames projectionRenames_unused;
+    const bool hasEmptyInterval = simplifyPartialSchemaReqPaths(scanProjName,
+                                                                scanDef.getMultikeynessTrie(),
+                                                                conversion->_reqMap,
+                                                                projectionRenames_unused,
+                                                                ctx.getConstFold());
+    tassert(6624156,
+            "We should not be seeing renames from a converted Filter",
+            projectionRenames_unused.empty());
 
     if (hasEmptyInterval) {
         addEmptyValueScanNode(ctx);
-    } else {
-        ABT sargableNode = make<SargableNode>(std::move(conversion._reqMap),
-                                              std::move(candidateIndexMap),
-                                              IndexReqTarget::Complete,
-                                              filterNode.getChild());
+        return;
+    }
+    if (PSRExpr::numLeaves(conversion->_reqMap.getRoot()) > SargableNode::kMaxPartialSchemaReqs) {
+        // Too many requirements.
+        return;
+    }
+    if (conversion->_reqMap.isNoop()) {
+        // If the filter has no constraints after removing no-ops, then replace with its child. We
+        // need to copy the child since we hold it by reference from the memo, and during
+        // subtitution the current group will be erased.
 
+        ABT newNode = filterNode.getChild();
+        ctx.addNode(newNode, true /*substitute*/);
+        return;
+    }
+
+    auto candidateIndexes = computeCandidateIndexes(ctx.getPrefixId(),
+                                                    scanProjName,
+                                                    conversion->_reqMap,
+                                                    scanDef,
+                                                    ctx.getHints(),
+                                                    ctx.getConstFold());
+
+    auto scanParams = computeScanParams(ctx.getPrefixId(), conversion->_reqMap, scanProjName);
+    ABT sargableNode = make<SargableNode>(std::move(conversion->_reqMap),
+                                          std::move(candidateIndexes),
+                                          std::move(scanParams),
+                                          IndexReqTarget::Complete,
+                                          filterNode.getChild());
+    if (conversion->_retainPredicate) {
+        ABT newNode = node;
+        newNode.cast<FilterNode>()->getChild() = std::move(sargableNode);
+        ctx.addNode(newNode, true /*substitute*/, true /*addExistingNodeWithNewChild*/);
+    } else {
         ctx.addNode(sargableNode, true /*substitute*/);
     }
 }
 
-static ABT appendFieldPath(const FieldPathType& fieldPath, ABT input) {
-    for (size_t index = fieldPath.size(); index-- > 0;) {
-        input = make<PathGet>(fieldPath.at(index), std::move(input));
+/**
+ * Takes an expression or path and attempts to remove Not nodes by pushing them
+ * down toward the leaves. We only remove a Not if we can combine it into a
+ * PathCompare, or cancel it out with another Not.
+ *
+ * Caller provides:
+ * - an input ABT
+ * - 'negate': true if we want the new ABT to be the negation of the input.
+ *
+ * Callee can reply with either:
+ * - boost::none, meaning we can't make the ABT any simpler.
+ * - struct Simplified, which means we can make the ABT simpler.
+ *     - 'newNode' is the replacement.
+ *     - 'negated' says whether 'newNode' is the negation of the original.
+ *       For example, we can simplify the child of Traverse but not push
+ *       a Not through it.
+ */
+class NotPushdown {
+public:
+    struct Simplified {
+        // True if 'newNode' is the negation of the original node.
+        bool negated;
+        ABT newNode;
+    };
+    using Result = boost::optional<Simplified>;
+
+    Result operator()(const ABT& /*n*/, const PathGet& get, const bool negate) {
+        if (auto simplified = get.getPath().visit(*this, negate)) {
+            return {
+                {simplified->negated, make<PathGet>(get.name(), std::move(simplified->newNode))}};
+        }
+        return {};
     }
-    return input;
+
+    Result operator()(const ABT& /*n*/, const PathCompare& comp, const bool negate) {
+        if (!negate) {
+            // No rewrite necessary.
+            return {};
+        }
+
+        if (auto op = negateComparisonOp(comp.op())) {
+            return {{true, make<PathCompare>(*op, comp.getVal())}};
+        }
+        return {};
+    }
+
+    Result operator()(const ABT& /*n*/, const UnaryOp& unary, const bool negate) {
+        // Only handle Not.
+        if (unary.op() != Operations::Not) {
+            return {};
+        }
+
+        const bool negateChild = !negate;
+        if (auto simplified = unary.getChild().visit(*this, negateChild)) {
+            // Remove the 'Not' if either:
+            // - it can cancel with a Not in some ancestor ('negate')
+            // - it can cancel with a Not in the child ('simplified->negated')
+            // The 'either' is exclusive because the child is only 'negated' if we
+            // requested it ('negateChild').
+            const bool removeNot = negate || simplified->negated;
+            if (removeNot) {
+                // We cancelled with a Not in some ancestor iff the caller asked us to.
+                simplified->negated = negate;
+            } else {
+                simplified->newNode =
+                    make<UnaryOp>(Operations::Not, std::move(simplified->newNode));
+            }
+            return simplified;
+        } else {
+            // We failed to simplify the child.
+            if (negate) {
+                // But we can still simplify 'n' by unwrapping the 'Not'.
+                return {{true, unary.getChild()}};
+            } else {
+                // Therefore we failed to simplify 'n'.
+                return {};
+            }
+        }
+    }
+
+    Result operator()(const ABT& /*n*/, const PathLambda& pathLambda, const bool negate) {
+        const LambdaAbstraction* lambda = pathLambda.getLambda().cast<LambdaAbstraction>();
+        if (!lambda) {
+            // Shouldn't happen; just don't simplify.
+            return {};
+        }
+
+        // Try to simplify the lambda body.
+        // If that succeeds, it may expose 'PathLambda Lambda [x] EvalFilter p (Variable [x])',
+        // which we can simplify to just 'p'. That's only valid if the Variable [x] is the
+        // only occurrence of 'x'.
+
+        if (auto simplified = lambda->getBody().visit(*this, negate)) {
+            auto&& [negated, newBody] = std::move(*simplified);
+            // If the lambda var is used only once, simplifying the body may have exposed
+            // 'PathLambda Lambda [x] EvalFilter p (Variable [x])', which we can replace
+            // with just 'p'.
+            if (auto iter = _varCounts.find(lambda->varName());
+                iter != _varCounts.end() && iter->second == 1) {
+                if (EvalFilter* evalF = newBody.cast<EvalFilter>()) {
+                    if (Variable* input = evalF->getInput().cast<Variable>();
+                        input && input->name() == lambda->varName()) {
+                        return {{negated, std::exchange(evalF->getPath(), make<Blackhole>())}};
+                    }
+                }
+            }
+            return {{
+                negated,
+                make<PathLambda>(make<LambdaAbstraction>(lambda->varName(), std::move(newBody))),
+            }};
+        }
+        return {};
+    }
+
+    Result operator()(const ABT& /*n*/, const PathTraverse& traverse, bool /*negate*/) {
+        // We actually don't care whether the caller is asking us to negate.
+        // We can't negate a Traverse; the best we can do is simplify the child.
+        if (auto simplified = traverse.getPath().visit(*this, false /*negate*/)) {
+            tassert(7022400,
+                    "NotPushdown unexpectedly negated when asked only to simplify",
+                    !simplified->negated);
+            simplified->newNode =
+                make<PathTraverse>(traverse.getMaxDepth(), std::move(simplified->newNode));
+            return simplified;
+        } else {
+            return {};
+        }
+    }
+
+    Result operator()(const ABT& /*n*/, const PathComposeM& compose, const bool negate) {
+        auto simplified1 = compose.getPath1().visit(*this, negate);
+        auto simplified2 = compose.getPath2().visit(*this, negate);
+        if (!simplified1 && !simplified2) {
+            // Neither child is simplified.
+            return {};
+        }
+        // At least one child is simplified, so we're going to rebuild a node.
+        // If either child was not simplified, we're going to copy the original
+        // unsimplified child.
+        if (!simplified1) {
+            simplified1 = {{false, compose.getPath1()}};
+        }
+        if (!simplified2) {
+            simplified2 = {{false, compose.getPath2()}};
+        }
+
+        if (!simplified1->negated && !simplified2->negated) {
+            // Neither is negated: keep the ComposeM.
+            return {{false,
+                     make<PathComposeM>(std::move(simplified1->newNode),
+                                        std::move(simplified2->newNode))}};
+        }
+        // At least one child is negated, so we're going to rewrite to ComposeA.
+        // If either child was not able to aborb a Not, we'll add an explicit Not to its root.
+        if (!simplified1->negated) {
+            simplified1 = {{true, negatePath(std::move(simplified1->newNode))}};
+        }
+        if (!simplified2->negated) {
+            simplified2 = {{true, negatePath(std::move(simplified2->newNode))}};
+        }
+        return {
+            {true,
+             make<PathComposeA>(std::move(simplified1->newNode), std::move(simplified2->newNode))}};
+    }
+
+    Result operator()(const ABT& /*n*/, const EvalFilter& evalF, const bool negate) {
+        if (auto simplified = evalF.getPath().visit(*this, negate)) {
+            simplified->newNode =
+                make<EvalFilter>(std::move(simplified->newNode), evalF.getInput());
+            return simplified;
+        }
+        return {};
+    }
+
+    template <typename T>
+    Result operator()(const ABT& /*n*/, const T& /*nodeSubclass*/, bool /*negate*/) {
+        // We don't know how to simplify this node.
+        return {};
+    }
+
+    static boost::optional<ABT> simplify(const ABT& n, PrefixId& prefixId) {
+        ProjectionNameMap<size_t> varCounts;
+        VariableEnvironment::walkVariables(n,
+                                           [&](const Variable& var) { ++varCounts[var.name()]; });
+
+
+        NotPushdown instance{varCounts, prefixId};
+        if (auto simplified = n.visit(instance, false /*negate*/)) {
+            auto&& [negated, newNode] = std::move(*simplified);
+            tassert(7022401,
+                    "NotPushdown unexpectedly negated when asked only to simplify",
+                    !simplified->negated);
+            return newNode;
+        }
+        return {};
+    }
+
+private:
+    NotPushdown(const ProjectionNameMap<size_t>& varCounts, PrefixId& prefixId)
+        : _varCounts(varCounts), _prefixId(prefixId) {}
+
+    // Take a Path and negate it.  Use Lambda / EvalFilter to toggle between expressions and paths.
+    ABT negatePath(ABT path) {
+        ProjectionName freshVar = _prefixId.getNextId("tmp_bool");
+        return make<PathLambda>(make<LambdaAbstraction>(
+            freshVar,
+            make<UnaryOp>(Operations::Not,
+                          make<EvalFilter>(std::move(path), make<Variable>(freshVar)))));
+    }
+
+    const ProjectionNameMap<size_t>& _varCounts;
+    PrefixId& _prefixId;
+};
+
+/**
+ * Attempt to remove Traverse nodes from a FilterNode.
+ *
+ * If we succeed, add a replacement node to the RewriteContext and return true.
+ */
+static bool simplifyFilterPath(const FilterNode& filterNode,
+                               RewriteContext& ctx,
+                               const ProjectionName& scanProjName,
+                               const MultikeynessTrie& trie) {
+    // Expect the filter to be EvalFilter, or UnaryOp [Not] EvalFilter.
+    const ABT& filter = filterNode.getFilter();
+    const bool toplevelNot =
+        filter.is<UnaryOp>() && filter.cast<UnaryOp>()->op() == Operations::Not;
+    const ABT& argument = toplevelNot ? filter.cast<UnaryOp>()->getChild() : filter;
+    if (const auto* evalFilter = argument.cast<EvalFilter>()) {
+        if (const auto* variable = evalFilter->getInput().cast<Variable>()) {
+            // If EvalFilter is applied to the whole-document binding then
+            // we can simplify the path using what we know about the multikeyness
+            // of the collection.
+            if (variable->name() != scanProjName) {
+                return false;
+            }
+
+            ABT path = evalFilter->getPath();
+            if (simplifyTraverseNonArray(path, trie)) {
+                ABT newPredicate = make<EvalFilter>(std::move(path), evalFilter->getInput());
+                if (toplevelNot) {
+                    newPredicate = make<UnaryOp>(Operations::Not, std::move(newPredicate));
+                }
+                ctx.addNode(make<FilterNode>(std::move(newPredicate), filterNode.getChild()),
+                            true /*substitute*/);
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 template <>
@@ -674,39 +972,44 @@ struct SubstituteConvert<FilterNode> {
     void operator()(ABT::reference_type node, RewriteContext& ctx) {
         const FilterNode& filterNode = *node.cast<FilterNode>();
 
-        // Sub-rewrite: attempt to de-compose filter. If we have a path with a prefix of PathGet's
-        // followed by a PathComposeM, then split into two filter nodes at the composition and
-        // retain the prefix for each.
-        // TODO: consider using a standalone rewrite.
-        if (auto evalFilter = filterNode.getFilter().cast<EvalFilter>(); evalFilter != nullptr) {
-            ABT::reference_type pathRef = evalFilter->getPath().ref();
-            FieldPathType fieldPath;
-            for (;;) {
-                if (auto newPath = pathRef.cast<PathGet>(); newPath != nullptr) {
-                    fieldPath.push_back(newPath->name());
-                    pathRef = newPath->getPath().ref();
-                } else {
-                    break;
-                }
-            }
-
-            if (auto composition = pathRef.cast<PathComposeM>(); composition != nullptr) {
-                // Remove the path composition and insert two filter nodes.
-                ABT filterNode1 = make<FilterNode>(
-                    make<EvalFilter>(appendFieldPath(fieldPath, composition->getPath1()),
-                                     evalFilter->getInput()),
-                    filterNode.getChild());
-                ABT filterNode2 = make<FilterNode>(
-                    make<EvalFilter>(appendFieldPath(fieldPath, composition->getPath2()),
-                                     evalFilter->getInput()),
-                    std::move(filterNode1));
-
-                ctx.addNode(filterNode2, true /*substitute*/);
+        // Sub-rewrite: attempt to de-compose filter into at least two new filter nodes.
+        if (auto* evalFilter = filterNode.getFilter().cast<EvalFilter>()) {
+            if (auto result = decomposeToFilterNodes(filterNode.getChild(),
+                                                     evalFilter->getPath(),
+                                                     evalFilter->getInput(),
+                                                     2 /*minDepth*/)) {
+                ctx.addNode(*result, true /*substitute*/);
                 return;
             }
         }
 
-        convertFilterToSargableNode(node, filterNode, ctx);
+
+        using namespace properties;
+        const LogicalProps& props = ctx.getAboveLogicalProps();
+        if (!hasProperty<IndexingAvailability>(props)) {
+            return;
+        }
+        const auto& indexingAvailability = getPropertyConst<IndexingAvailability>(props);
+        const ProjectionName& scanProjName = indexingAvailability.getScanProjection();
+
+        const ScanDefinition& scanDef =
+            ctx.getMetadata()._scanDefs.at(indexingAvailability.getScanDefName());
+        if (!scanDef.exists()) {
+            return;
+        }
+        const MultikeynessTrie& trie = scanDef.getMultikeynessTrie();
+
+        if (simplifyFilterPath(filterNode, ctx, scanProjName, trie)) {
+            return;
+        }
+
+        if (auto filter = NotPushdown::simplify(filterNode.getFilter(), ctx.getPrefixId())) {
+            ctx.addNode(make<FilterNode>(std::move(*filter), filterNode.getChild()),
+                        true /*substitute*/);
+            return;
+        }
+
+        convertFilterToSargableNode(node, filterNode, ctx, scanProjName);
     }
 };
 
@@ -739,7 +1042,8 @@ struct SubstituteConvert<EvaluationNode> {
             if (auto inputPtr = evalPathPtr->getInput().cast<Variable>();
                 inputPtr != nullptr && inputPtr->name() == scanProjName) {
                 if (auto pathKeepPtr = evalPathPtr->getPath().cast<PathKeep>();
-                    pathKeepPtr != nullptr) {
+                    pathKeepPtr != nullptr &&
+                    pathKeepPtr->getNames().size() < SargableNode::kMaxPartialSchemaReqs) {
                     // Optimization. If we are retaining fields on the root level, generate
                     // EvalNodes with the intention of converting later to a SargableNode after
                     // reordering, in order to be able to cover the fields using a physical scan or
@@ -748,12 +1052,12 @@ struct SubstituteConvert<EvaluationNode> {
                     ABT result = evalNode.getChild();
                     ABT keepPath = make<PathIdentity>();
 
-                    std::set<std::string> orderedSet;
-                    for (const std::string& fieldName : pathKeepPtr->getNames()) {
+                    FieldNameOrderedSet orderedSet;
+                    for (const FieldNameType& fieldName : pathKeepPtr->getNames()) {
                         orderedSet.insert(fieldName);
                     }
-                    for (const std::string& fieldName : orderedSet) {
-                        ProjectionName projName = ctx.getPrefixId().getNextId("fieldProj");
+                    for (const FieldNameType& fieldName : orderedSet) {
+                        ProjectionName projName{ctx.getPrefixId().getNextId("fieldProj")};
                         result = make<EvaluationNode>(
                             projName,
                             make<EvalPath>(make<PathGet>(fieldName, make<PathIdentity>()),
@@ -777,58 +1081,190 @@ struct SubstituteConvert<EvaluationNode> {
         }
 
         // We still want to extract sargable nodes from EvalNode to use for PhysicalScans.
-        PartialSchemaReqConversion conversion =
-            convertExprToPartialSchemaReq(evalNode.getProjection());
-        if (!conversion._success || conversion._reqMap.size() != 1) {
+        auto conversion = convertExprToPartialSchemaReq(
+            evalNode.getProjection(), false /*isFilterContext*/, ctx.getPathToInterval());
+        if (!conversion) {
+            return;
+        }
+        uassert(6624165,
+                "Should not be getting retainPredicate set for EvalNodes",
+                !conversion->_retainPredicate);
+        if (PSRExpr::numLeaves(conversion->_reqMap.getRoot()) != 1) {
             // For evaluation nodes we expect to create a single entry.
             return;
         }
-        if (conversion._hasEmptyInterval) {
+
+        PSRExpr::visitDNF(conversion->_reqMap.getRoot(), [&](PartialSchemaEntry& entry) {
+            auto& [key, req] = entry;
+            req = {
+                evalNode.getProjectionName(), std::move(req.getIntervals()), req.getIsPerfOnly()};
+
+            uassert(6624114,
+                    "Eval partial schema requirement must contain a variable name.",
+                    key._projectionName);
+            uassert(6624115,
+                    "Eval partial schema requirement cannot have a range",
+                    isIntervalReqFullyOpenDNF(req.getIntervals()));
+        });
+
+        ProjectionRenames projectionRenames_unused;
+        const bool hasEmptyInterval = simplifyPartialSchemaReqPaths(scanProjName,
+                                                                    scanDef.getMultikeynessTrie(),
+                                                                    conversion->_reqMap,
+                                                                    projectionRenames_unused,
+                                                                    ctx.getConstFold());
+        if (hasEmptyInterval) {
             addEmptyValueScanNode(ctx);
             return;
         }
 
-        for (auto& entry : conversion._reqMap) {
-            PartialSchemaRequirement& req = entry.second;
-            req.setBoundProjectionName(evalNode.getProjectionName());
+        auto candidateIndexes = computeCandidateIndexes(ctx.getPrefixId(),
+                                                        scanProjName,
+                                                        conversion->_reqMap,
+                                                        scanDef,
+                                                        ctx.getHints(),
+                                                        ctx.getConstFold());
 
-            uassert(6624114,
-                    "Eval partial schema requirement must contain a variable name.",
-                    !entry.first._projectionName.empty());
-            uassert(6624115,
-                    "Eval partial schema requirement cannot have a range",
-                    isIntervalReqFullyOpenDNF(req.getIntervals()));
-        }
-
-        bool hasEmptyInterval = false;
-        auto candidateIndexMap = computeCandidateIndexMap(
-            ctx.getPrefixId(), scanProjName, conversion._reqMap, scanDef, hasEmptyInterval);
-
-        if (hasEmptyInterval) {
-            addEmptyValueScanNode(ctx);
-        } else {
-            ABT newNode = make<SargableNode>(std::move(conversion._reqMap),
-                                             std::move(candidateIndexMap),
-                                             IndexReqTarget::Complete,
-                                             evalNode.getChild());
-            ctx.addNode(newNode, true /*substitute*/);
-        }
+        auto scanParams = computeScanParams(ctx.getPrefixId(), conversion->_reqMap, scanProjName);
+        ABT newNode = make<SargableNode>(std::move(conversion->_reqMap),
+                                         std::move(candidateIndexes),
+                                         std::move(scanParams),
+                                         IndexReqTarget::Complete,
+                                         evalNode.getChild());
+        ctx.addNode(newNode, true /*substitute*/);
     }
 };
 
 static void lowerSargableNode(const SargableNode& node, RewriteContext& ctx) {
-    ABT n = node.getChild();
-    const auto reqMap = node.getReqMap();
-    for (const auto& [key, req] : reqMap) {
-        lowerPartialSchemaRequirement(key, req, n);
-    }
-    ctx.addNode(n, true /*clear*/);
+    PhysPlanBuilder builder{node.getChild()};
+    const auto& reqMap = node.getReqMap();
+    lowerPartialSchemaRequirements(boost::none /*scanGroupCE*/,
+                                   {} /*indexPredSels*/,
+                                   createResidualReqsWithEmptyCE(reqMap.getRoot()),
+                                   ctx.getPathToInterval(),
+                                   builder);
+    ctx.addNode(builder._node, true /*clear*/);
 }
 
 template <class Type>
 struct ExploreConvert {
     void operator()(ABT::reference_type nodeRef, RewriteContext& ctx) = delete;
 };
+
+/**
+ * Used to pre-compute properties of a PSR.
+ */
+struct RequirementProps {
+    bool _isFullyOpen;
+    bool _mayReturnNull;
+};
+
+/**
+ * Holds result of splitting requirements into left and right sides to support index+fetch and index
+ * intersection.
+ */
+struct SplitRequirementsResult {
+    PSRExprBuilder _leftReqsBuilder;
+    PSRExprBuilder _rightReqsBuilder;
+
+    bool _hasFieldCoverage = true;
+};
+
+/**
+ * Used to split requirements into left and right side. If "isIndex" is false, this is a separation
+ * between "index" and "fetch" predicates, otherwise it is a separation between the two sides of
+ * index intersection. The separation handles cases where we may have intervals which include Null
+ * and return the value, in which case instead of moving the requirement on the left, we insert a
+ * copy on the right side which will fetch the value from the collection. We convert perf-only
+ * requirements to non-perf when inserting on the left under "isIndex", otherwise we drop them. The
+ * mask parameter represents a bitmask indicating which requirements go on the left (bit is 1) and
+ * which go on the right.
+ */
+static SplitRequirementsResult splitRequirements(
+    const size_t mask,
+    const bool isIndex,
+    const QueryHints& hints,
+    const std::vector<RequirementProps>& reqProps,
+    const boost::optional<FieldNameSet>& indexFieldPrefixMapForScanDef,
+    const PartialSchemaRequirements& reqMap) {
+    SplitRequirementsResult result;
+
+    result._leftReqsBuilder.pushDisj().pushConj();
+    result._rightReqsBuilder.pushDisj().pushConj();
+
+    const auto addRequirement = [&](const bool left,
+                                    PartialSchemaKey key,
+                                    boost::optional<ProjectionName> boundProjectionName,
+                                    IntervalReqExpr::Node intervals) {
+        // We always strip out the perf-only flag.
+        auto& builder = left ? result._leftReqsBuilder : result._rightReqsBuilder;
+        builder.atom(std::move(key),
+                     PartialSchemaRequirement{std::move(boundProjectionName),
+                                              std::move(intervals),
+                                              false /*isPerfOnly*/});
+    };
+
+    size_t index = 0;
+    for (const auto& [key, req] : reqMap.conjuncts()) {
+        const auto& intervals = req.getIntervals();
+        const auto& outputBinding = req.getBoundProjectionName();
+        const bool perfOnly = req.getIsPerfOnly();
+        const auto& reqProp = reqProps.at(index);
+
+        if (((1ull << index) & mask) == 0) {
+            // Predicate should go on the right side.
+            if (isIndex || !perfOnly) {
+                addRequirement(false /*left*/, key, outputBinding, intervals);
+            }
+            index++;
+            continue;
+        }
+
+        // Predicate should go on the left side.
+        bool addedToLeft = false;
+        if (isIndex || hints._fastIndexNullHandling || !reqProp._mayReturnNull) {
+            // We can never return Null values from the requirement.
+            if (isIndex || hints._disableYieldingTolerantPlans || perfOnly) {
+                // Insert into left side unchanged.
+                addRequirement(true /*left*/, key, outputBinding, intervals);
+            } else {
+                // Insert a requirement on the right side too, left side is non-binding.
+                addRequirement(true /*left*/, key, boost::none /*boundProjectionName*/, intervals);
+                addRequirement(false /*left*/, key, outputBinding, intervals);
+            }
+            addedToLeft = true;
+        } else {
+            // At this point we should not be seeing perf-only predicates.
+            invariant(!perfOnly);
+
+            // We cannot return index values if our interval can possibly contain Null. Instead,
+            // we remove the output binding for the left side, and return the value from the
+            // right (seek) side.
+            if (!reqProp._isFullyOpen) {
+                addRequirement(true /*left*/, key, boost::none /*boundProjectionName*/, intervals);
+                addedToLeft = true;
+            }
+            addRequirement(false /*left*/,
+                           key,
+                           outputBinding,
+                           hints._disableYieldingTolerantPlans ? IntervalReqExpr::makeSingularDNF()
+                                                               : intervals);
+        }
+
+        if (addedToLeft && indexFieldPrefixMapForScanDef) {
+            if (auto pathPtr = key._path.cast<PathGet>();
+                pathPtr != nullptr && indexFieldPrefixMapForScanDef->count(pathPtr->name()) == 0) {
+                // We have found a left requirement which cannot be covered with an
+                // index.
+                result._hasFieldCoverage = false;
+                break;
+            }
+        }
+        index++;
+    }
+
+    return result;
+}
 
 template <>
 struct ExploreConvert<SargableNode> {
@@ -844,15 +1280,21 @@ struct ExploreConvert<SargableNode> {
         const LogicalProps& props = ctx.getAboveLogicalProps();
         const auto& indexingAvailability = getPropertyConst<IndexingAvailability>(props);
         const GroupIdType scanGroupId = indexingAvailability.getScanGroupId();
-        if (sargableNode.getChild().cast<MemoLogicalDelegatorNode>()->getGroupId() != scanGroupId) {
+        if (sargableNode.getChild().cast<MemoLogicalDelegatorNode>()->getGroupId() != scanGroupId ||
+            !ctx.getMemo().getLogicalNodes(scanGroupId).front().is<ScanNode>()) {
+            // We are not sitting above a ScanNode.
             lowerSargableNode(sargableNode, ctx);
+            return;
+        }
+
+        // SERVER-69026: Support "splitting" a top-level disjunction for index ORing.
+        if (!PSRExpr::isSingletonDisjunction(sargableNode.getReqMap().getRoot())) {
             return;
         }
 
         const std::string& scanDefName = indexingAvailability.getScanDefName();
         const ScanDefinition& scanDef = ctx.getMetadata()._scanDefs.at(scanDefName);
-        const size_t indexCount = scanDef.getIndexDefs().size();
-        if (indexCount == 0) {
+        if (scanDef.getIndexDefs().empty()) {
             // Do not insert RIDIntersect if we do not have indexes available.
             return;
         }
@@ -860,14 +1302,13 @@ struct ExploreConvert<SargableNode> {
         const auto aboveNodeId = ctx.getAboveNodeId();
         auto& sargableSplitCountMap = ctx.getSargableSplitCountMap();
         const size_t splitCount = sargableSplitCountMap[aboveNodeId];
-        if ((1ull << splitCount) >
-            roundUpToNextPow2(indexCount, LogicalRewriter::kMaxSargableNodeSplitCount)) {
+        if (splitCount > LogicalRewriter::kMaxSargableNodeSplitCount) {
             // We cannot split this node further.
             return;
         }
 
         const ProjectionName& scanProjectionName = indexingAvailability.getScanProjection();
-        if (collectVariableReferences(node) != VariableNameSetType{scanProjectionName}) {
+        if (collectVariableReferences(node) != ProjectionNameSet{scanProjectionName}) {
             // Rewrite not applicable if we refer projections other than the scan projection.
             return;
         }
@@ -875,94 +1316,115 @@ struct ExploreConvert<SargableNode> {
         const bool isIndex = target == IndexReqTarget::Index;
 
         const auto& indexFieldPrefixMap = ctx.getIndexFieldPrefixMap();
-        const auto indexFieldPrefixMapIt =
-            isIndex ? indexFieldPrefixMap.cend() : indexFieldPrefixMap.find(scanDefName);
-        const bool indexFieldMapHasScanDef = indexFieldPrefixMapIt != indexFieldPrefixMap.cend();
+        boost::optional<FieldNameSet> indexFieldPrefixMapForScanDef;
+        if (auto it = indexFieldPrefixMap.find(scanDefName);
+            it != indexFieldPrefixMap.cend() && !isIndex) {
+            indexFieldPrefixMapForScanDef = it->second;
+        }
 
         const auto& reqMap = sargableNode.getReqMap();
-        const size_t reqSize = reqMap.size();
+        const auto& hints = ctx.getHints();
+
+        // Pre-computed properties of the requirements.
+        std::vector<RequirementProps> reqProps;
+        for (const auto& [key, req] : reqMap.conjuncts()) {
+            // Pre-compute if a requirement's interval is fully open.
+            const bool fullyOpen = isIntervalReqFullyOpenDNF(req.getIntervals());
+
+            // Pre-compute if a requirement's interval may contain nulls, and also has an output
+            // binding. Do use constant folding if we do not have to.
+            const bool mayReturnNull =
+                !hints._fastIndexNullHandling && !isIndex && req.mayReturnNull(ctx.getConstFold());
+
+            reqProps.push_back({fullyOpen, mayReturnNull});
+        }
+
+        // We iterate over the possible ways to split N predicates into 2^N subsets, one goes to the
+        // left, and the other to the right side. If splitting into Index+Seek (isIndex = false), we
+        // try having at least one predicate on the left (mask = 1), and we try all possible
+        // subsets. For index intersection however (isIndex = true), we try symmetric partitioning
+        // (thus the high bound is 2^(N-1)).
+        const size_t reqSize = PSRExpr::numLeaves(reqMap.getRoot());  // assumes singular DNF
         const size_t highMask = isIndex ? (1ull << (reqSize - 1)) : (1ull << reqSize);
         for (size_t mask = 1; mask < highMask; mask++) {
-            PartialSchemaRequirements leftReqs;
-            PartialSchemaRequirements rightReqs;
-            bool hasFieldCoverage = true;
-            bool hasLeftIntervals = false;
-            bool hasRightIntervals = false;
+            SplitRequirementsResult splitResult = splitRequirements(
+                mask, isIndex, hints, reqProps, indexFieldPrefixMapForScanDef, reqMap);
 
-            size_t index = 0;
-            for (const auto& [key, req] : reqMap) {
-                const bool fullyOpenInterval = isIntervalReqFullyOpenDNF(req.getIntervals());
+            auto leftReqs = splitResult._leftReqsBuilder.finish();
+            auto rightReqs = splitResult._rightReqsBuilder.finish();
 
-                if (((1ull << index) & mask) != 0) {
-                    leftReqs.emplace(key, req);
-
-                    if (!fullyOpenInterval) {
-                        hasLeftIntervals = true;
-                    }
-                    if (indexFieldMapHasScanDef) {
-                        if (auto pathPtr = key._path.cast<PathGet>(); pathPtr != nullptr &&
-                            indexFieldPrefixMapIt->second.count(pathPtr->name()) == 0) {
-                            // We have found a left requirement which cannot be covered with an
-                            // index.
-                            hasFieldCoverage = false;
-                            break;
-                        }
-                    }
-                } else {
-                    rightReqs.emplace(key, req);
-
-                    if (!fullyOpenInterval) {
-                        hasRightIntervals = true;
-                    }
-                }
-                index++;
-            }
-
-            if (isIndex && (!hasLeftIntervals || !hasRightIntervals)) {
-                // Reject. Must have at least one proper interval on either side.
+            if (!leftReqs) {
+                // Can happen if we have intervals containing null.
+                invariant(!hints._fastIndexNullHandling && !isIndex);
                 continue;
             }
-            if (!hasFieldCoverage) {
+
+            const bool hasLeftintervals = hasProperIntervals(*leftReqs);
+            const bool hasRightIntervals = rightReqs && hasProperIntervals(*rightReqs);
+            if (isIndex) {
+                if (!hasLeftintervals || !hasRightIntervals) {
+                    // Reject. Must have at least one proper interval on either side.
+                    continue;
+                }
+            } else if (hints._forceIndexScanForPredicates && hasRightIntervals) {
+                // Reject. We must satisfy all intervals via indexes.
+                continue;
+            }
+
+            if (!splitResult._hasFieldCoverage) {
                 // Reject rewrite. No suitable indexes.
                 continue;
             }
 
-            bool hasEmptyLeftInterval = false;
-            auto leftCandidateIndexMap = computeCandidateIndexMap(
-                ctx.getPrefixId(), scanProjectionName, leftReqs, scanDef, hasEmptyLeftInterval);
-            if (isIndex && leftCandidateIndexMap.empty()) {
+            auto leftCandidateIndexes = computeCandidateIndexes(ctx.getPrefixId(),
+                                                                scanProjectionName,
+                                                                *leftReqs,
+                                                                scanDef,
+                                                                hints,
+                                                                ctx.getConstFold());
+            if (isIndex && leftCandidateIndexes.empty()) {
                 // Reject rewrite.
                 continue;
             }
 
-            bool hasEmptyRightInterval = false;
-            auto rightCandidateIndexMap = computeCandidateIndexMap(
-                ctx.getPrefixId(), scanProjectionName, rightReqs, scanDef, hasEmptyRightInterval);
-            if (isIndex && rightCandidateIndexMap.empty()) {
+            CandidateIndexes rightCandidateIndexes;
+            if (rightReqs) {
+                rightCandidateIndexes = computeCandidateIndexes(ctx.getPrefixId(),
+                                                                scanProjectionName,
+                                                                *rightReqs,
+                                                                scanDef,
+                                                                hints,
+                                                                ctx.getConstFold());
+            }
+
+            if (isIndex && rightCandidateIndexes.empty()) {
                 // With empty candidate map, reject only if we cannot implement as Seek.
                 continue;
             }
-            uassert(6624116,
-                    "Empty intervals should already be rewritten to empty ValueScan nodes",
-                    !hasEmptyLeftInterval && !hasEmptyRightInterval);
 
             ABT scanDelegator = make<MemoLogicalDelegatorNode>(scanGroupId);
-            ABT leftChild = make<SargableNode>(std::move(leftReqs),
-                                               std::move(leftCandidateIndexMap),
+            ABT leftChild = make<SargableNode>(std::move(*leftReqs),
+                                               std::move(leftCandidateIndexes),
+                                               boost::none,
                                                IndexReqTarget::Index,
                                                scanDelegator);
-            ABT rightChild = rightReqs.empty()
-                ? scanDelegator
-                : make<SargableNode>(std::move(rightReqs),
-                                     std::move(rightCandidateIndexMap),
-                                     isIndex ? IndexReqTarget::Index : IndexReqTarget::Seek,
-                                     scanDelegator);
 
-            ABT newRoot = make<RIDIntersectNode>(scanProjectionName,
-                                                 hasLeftIntervals,
-                                                 hasRightIntervals,
-                                                 std::move(leftChild),
-                                                 std::move(rightChild));
+            boost::optional<ScanParams> rightScanParams;
+            if (rightReqs) {
+                rightScanParams =
+                    computeScanParams(ctx.getPrefixId(), *rightReqs, scanProjectionName);
+            }
+
+            ABT rightChild = rightReqs
+                ? make<SargableNode>(std::move(*rightReqs),
+                                     std::move(rightCandidateIndexes),
+                                     std::move(rightScanParams),
+                                     isIndex ? IndexReqTarget::Index : IndexReqTarget::Seek,
+                                     scanDelegator)
+                : scanDelegator;
+
+            ABT newRoot = make<RIDIntersectNode>(
+                scanProjectionName, std::move(leftChild), std::move(rightChild));
 
             const auto& result = ctx.addNode(newRoot, false /*substitute*/);
             for (const MemoLogicalNodeId nodeId : result.second) {
@@ -1052,14 +1514,27 @@ void reorderAgainstRIDIntersectNode(ABT::reference_type aboveNode,
     }
 
     const RIDIntersectNode& node = *belowNode.cast<RIDIntersectNode>();
-    if (node.hasLeftIntervals() && hasLeftRef) {
+    const GroupIdType groupIdLeft =
+        node.getLeftChild().cast<MemoLogicalDelegatorNode>()->getGroupId();
+    const bool hasProperIntervalLeft =
+        properties::getPropertyConst<properties::IndexingAvailability>(
+            ctx.getMemo().getLogicalProps(groupIdLeft))
+            .hasProperInterval();
+    if (hasProperIntervalLeft && hasLeftRef) {
         defaultReorder<AboveNode,
                        RIDIntersectNode,
                        DefaultChildAccessor,
                        LeftChildAccessor,
                        false /*substitute*/>(aboveNode, belowNode, ctx);
     }
-    if (node.hasRightIntervals() && hasRightRef) {
+
+    const GroupIdType groupIdRight =
+        node.getRightChild().cast<MemoLogicalDelegatorNode>()->getGroupId();
+    const bool hasProperIntervalRight =
+        properties::getPropertyConst<properties::IndexingAvailability>(
+            ctx.getMemo().getLogicalProps(groupIdRight))
+            .hasProperInterval();
+    if (hasProperIntervalRight && hasRightRef) {
         defaultReorder<AboveNode,
                        RIDIntersectNode,
                        DefaultChildAccessor,
@@ -1088,7 +1563,8 @@ struct ExploreReorder<EvaluationNode, RIDIntersectNode> {
 
 void LogicalRewriter::registerRewrite(const LogicalRewriteType rewriteType, RewriteFn fn) {
     if (_activeRewriteSet.find(rewriteType) != _activeRewriteSet.cend()) {
-        _rewriteMap.emplace(rewriteType, fn);
+        const bool inserted = _rewriteMap.emplace(rewriteType, fn).second;
+        invariant(inserted);
     }
 }
 
@@ -1184,7 +1660,7 @@ bool LogicalRewriter::rewriteToFixPoint() {
 
     while (!_groupsPending.empty()) {
         iterationCount++;
-        if (_memo.getDebugInfo().exceedsIterationLimit(iterationCount)) {
+        if (_debugInfo.exceedsIterationLimit(iterationCount)) {
             // Iteration limit exceeded.
             return false;
         }
@@ -1198,18 +1674,19 @@ bool LogicalRewriter::rewriteToFixPoint() {
 }
 
 void LogicalRewriter::rewriteGroup(const GroupIdType groupId) {
-    auto& queue = _memo.getGroup(groupId)._logicalRewriteQueue;
+    auto& queue = _memo.getLogicalRewriteQueue(groupId);
     while (!queue.empty()) {
         LogicalRewriteEntry rewriteEntry = std::move(*queue.top());
         // TODO: check if rewriteEntry is different than previous (remove duplicates).
         queue.pop();
 
-        _rewriteMap.at(rewriteEntry._type)(this, rewriteEntry._nodeId);
+        _rewriteMap.at(rewriteEntry._type)(this, rewriteEntry._nodeId, rewriteEntry._type);
     }
 }
 
 template <class AboveType, class BelowType, template <class, class> class R>
-void LogicalRewriter::bindAboveBelow(const MemoLogicalNodeId nodeMemoId) {
+void LogicalRewriter::bindAboveBelow(const MemoLogicalNodeId nodeMemoId,
+                                     const LogicalRewriteType rule) {
     // Get a reference to the node instead of the node itself.
     // Rewrites insert into the memo and can move it.
     ABT::reference_type node = _memo.getNode(nodeMemoId);
@@ -1222,11 +1699,11 @@ void LogicalRewriter::bindAboveBelow(const MemoLogicalNodeId nodeMemoId) {
                                               .template cast<MemoLogicalDelegatorNode>()
                                               ->getGroupId();
 
-        for (size_t i = 0; i < _memo.getGroup(targetGroupId)._logicalNodes.size(); i++) {
+        for (size_t i = 0; i < _memo.getLogicalNodes(targetGroupId).size(); i++) {
             const MemoLogicalNodeId targetNodeId{targetGroupId, i};
             auto targetNode = _memo.getNode(targetNodeId);
             if (targetNode.is<BelowType>()) {
-                RewriteContext ctx(*this, nodeMemoId, targetNodeId);
+                RewriteContext ctx(*this, rule, nodeMemoId, targetNodeId);
                 R<AboveType, BelowType>()(node, targetNode, ctx);
                 if (ctx.hasSubstituted()) {
                     return;
@@ -1256,7 +1733,7 @@ void LogicalRewriter::bindAboveBelow(const MemoLogicalNodeId nodeMemoId) {
                                 .template cast<MemoLogicalDelegatorNode>()
                                 ->getGroupId() == currentGroupId);
 
-                RewriteContext ctx(*this, parentNodeId, nodeMemoId);
+                RewriteContext ctx(*this, rule, parentNodeId, nodeMemoId);
                 R<AboveType, BelowType>()(targetNode, node, ctx);
                 if (ctx.hasSubstituted()) {
                     return;
@@ -1267,12 +1744,13 @@ void LogicalRewriter::bindAboveBelow(const MemoLogicalNodeId nodeMemoId) {
 }
 
 template <class Type, template <class> class R>
-void LogicalRewriter::bindSingleNode(const MemoLogicalNodeId nodeMemoId) {
+void LogicalRewriter::bindSingleNode(const MemoLogicalNodeId nodeMemoId,
+                                     const LogicalRewriteType rule) {
     // Get a reference to the node instead of the node itself.
     // Rewrites insert into the memo and can move it.
     ABT::reference_type node = _memo.getNode(nodeMemoId);
     if (node.is<Type>()) {
-        RewriteContext ctx(*this, nodeMemoId);
+        RewriteContext ctx(*this, rule, nodeMemoId);
         R<Type>()(node, ctx);
     }
 }

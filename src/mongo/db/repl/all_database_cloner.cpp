@@ -27,19 +27,25 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
 
 #include "mongo/platform/basic.h"
 
 #include <algorithm>
 
 #include "mongo/base/string_data.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/multitenancy_gen.h"
 #include "mongo/db/repl/all_database_cloner.h"
 #include "mongo/db/repl/replication_consistency_markers_gen.h"
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
+
 namespace mongo {
 namespace repl {
 
@@ -129,7 +135,7 @@ BaseCloner::AfterStageBehavior AllDatabaseCloner::getInitialSyncIdStage() {
             "Cannot retrieve sync source initial sync ID",
             !initialSyncId.isEmpty());
     InitialSyncIdDocument initialSyncIdDoc =
-        InitialSyncIdDocument::parse(IDLParserErrorContext("initialSyncId"), initialSyncId);
+        InitialSyncIdDocument::parse(IDLParserContext("initialSyncId"), initialSyncId);
     {
         stdx::lock_guard<InitialSyncSharedData> lk(*getSharedData());
         getSharedData()->setInitialSyncSourceId(lk, initialSyncIdDoc.get_id());
@@ -138,7 +144,18 @@ BaseCloner::AfterStageBehavior AllDatabaseCloner::getInitialSyncIdStage() {
 }
 
 BaseCloner::AfterStageBehavior AllDatabaseCloner::listDatabasesStage() {
-    auto databasesArray = getClient()->getDatabaseInfos(BSONObj(), true /* nameOnly */);
+    std::vector<mongo::BSONObj> databasesArray;
+    const bool multiTenancyAndRequireTenantIdEnabled = gMultitenancySupport &&
+        serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility);
+
+    databasesArray = getClient()->getDatabaseInfos(
+        BSONObj(),
+        true /* nameOnly */,
+        false /*authorizedDatabases*/,
+        multiTenancyAndRequireTenantIdEnabled /*useListDatabsesForAllTenants*/);
+
+    size_t idxToInsertNextAdmin = 0;
     for (const auto& dbBSON : databasesArray) {
         if (!dbBSON.hasField("name")) {
             LOGV2_DEBUG(21055,
@@ -150,8 +167,13 @@ BaseCloner::AfterStageBehavior AllDatabaseCloner::listDatabasesStage() {
                         "db"_attr = dbBSON);
             continue;
         }
-        const auto& dbName = dbBSON["name"].str();
-        if (dbName == "local") {
+
+        boost::optional<TenantId> tenantId = dbBSON.hasField("tenantId")
+            ? boost::make_optional<TenantId>(TenantId::parseFromBSON(dbBSON["tenantId"]))
+            : boost::none;
+        DatabaseName dbName = DatabaseNameUtil::deserialize(tenantId, dbBSON["name"].str());
+
+        if (dbName.db() == "local") {
             LOGV2_DEBUG(21056,
                         1,
                         "Excluding database from the 'listDatabases' response: {db}",
@@ -160,13 +182,39 @@ BaseCloner::AfterStageBehavior AllDatabaseCloner::listDatabasesStage() {
             continue;
         } else {
             _databases.emplace_back(dbName);
-            // Make sure "admin" comes first.
-            if (dbName == "admin" && _databases.size() > 1) {
-                std::swap(_databases.front(), _databases.back());
+
+            // Put admin dbs in the front of the vector.
+            if (dbName.db() == "admin") {
+                if (_databases.size() > 1) {
+                    std::iter_swap(_databases.begin() + idxToInsertNextAdmin, _databases.end() - 1);
+                }
+                // Index to track where the last admin db is in the list. If the first db returned
+                // is an admin db, we still must bump this.
+                idxToInsertNextAdmin++;
             }
         }
     }
+
+    // Ensure the global admin comes first. We inserted all admin dbs at the front of '_databases',
+    // find the global admin and move it to the front.
+    for (auto i = _databases.begin(); size_t(i - _databases.begin()) != idxToInsertNextAdmin; ++i) {
+        if (!(*i).tenantId()) {
+            std::iter_swap(_databases.begin(), i);
+            break;
+        }
+    }
+
+
     return kContinueNormally;
+}
+
+void AllDatabaseCloner::handleAdminDbNotValid(const Status& errorStatus) {
+    LOGV2_DEBUG(21059,
+                1,
+                "Validation failed on 'admin' db due to {error}",
+                "Validation failed on 'admin' db",
+                "error"_attr = errorStatus);
+    setSyncFailedStatus(errorStatus);
 }
 
 void AllDatabaseCloner::postStage() {
@@ -179,8 +227,18 @@ void AllDatabaseCloner::postStage() {
             _stats.databaseStats.emplace_back();
             _stats.databaseStats.back().dbname = dbName;
 
+            BSONObj cmdObj = BSON("dbStats" << 1);
+            BSONObjBuilder b(cmdObj);
+            if (gMultitenancySupport &&
+                serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+                gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility) &&
+                dbName.tenantId()) {
+                dbName.tenantId()->serializeToBSON("$tenant", &b);
+            }
+
             BSONObj res;
-            getClient()->runCommand(dbName, BSON("dbStats" << 1), res);
+            getClient()->runCommand(dbName, b.obj(), res);
+
             // It is possible for the call to 'dbStats' to fail if the sync source contains invalid
             // views. We should not fail initial sync in this case due to the situation where the
             // replica set may have lost majority availability and therefore have no access to a
@@ -193,11 +251,13 @@ void AllDatabaseCloner::postStage() {
                             1,
                             "Skipping the recording of initial sync data size metrics due "
                             "to failure in the 'dbStats' command",
-                            "db"_attr = dbName,
+                            logAttrs(dbName),
                             "status"_attr = status);
             }
         }
     }
+    bool foundAuthSchemaDoc = false;
+    bool foundUser = false;
     for (const auto& dbName : _databases) {
         {
             stdx::lock_guard<Latch> lk(_mutex);
@@ -228,10 +288,9 @@ void AllDatabaseCloner::postStage() {
             setSyncFailedStatus(dbStatus);
             return;
         }
-        if (StringData(dbName).equalCaseInsensitive("admin")) {
+        if (!foundUser && StringData(dbName.db()).equalCaseInsensitive("admin")) {
             LOGV2_DEBUG(21058, 1, "Finished the 'admin' db, now validating it");
             // Do special checks for the admin database because of auth. collections.
-            auto adminStatus = Status(ErrorCodes::NotYetInitialized, "");
             {
                 OperationContext* opCtx = cc().getOperationContext();
                 ServiceContext::UniqueOperationContext opCtxPtr;
@@ -239,15 +298,41 @@ void AllDatabaseCloner::postStage() {
                     opCtxPtr = cc().makeOperationContext();
                     opCtx = opCtxPtr.get();
                 }
-                adminStatus = getStorageInterface()->isAdminDbValid(opCtx);
+                auto authzManager = AuthorizationManager::get(opCtx->getServiceContext());
+
+                // Check if global admin has a valid auth schema version document.
+                if (!dbName.tenantId() && !foundAuthSchemaDoc) {
+                    auto status =
+                        authzManager->hasValidAuthSchemaVersionDocumentForInitialSync(opCtx);
+                    if (status == ErrorCodes::AuthSchemaIncompatible) {
+                        handleAdminDbNotValid(status);
+                        return;
+                    }
+
+                    foundAuthSchemaDoc = status.isOK();
+                }
+
+                // We haven't yet found a user document, look for one. In a multitenant environment,
+                // user documents will live in tenant-specific admin collections.
+                foundUser = authzManager->hasUser(opCtx, dbName.tenantId());
             }
-            if (!adminStatus.isOK()) {
-                LOGV2_DEBUG(21059,
-                            1,
-                            "Validation failed on 'admin' db due to {error}",
-                            "Validation failed on 'admin' db",
-                            "error"_attr = adminStatus);
-                setSyncFailedStatus(adminStatus);
+
+            // The global admin db sorts first even in a multitenant environemnt, so if we've found
+            // a user and haven't found an auth schema doc, we can fail early.
+            if (!foundAuthSchemaDoc && foundUser) {
+                std::string msg = str::stream()
+                    << "During initial sync, found documents in "
+                    << NamespaceString::kAdminUsersNamespace.ns()
+                    << " but could not find an auth schema version document in "
+                    << NamespaceString::kServerConfigurationNamespace.ns() << ".  "
+                    << "This indicates that the primary of this replica set was not "
+                       "successfully "
+                       "upgraded to schema version "
+                    << AuthorizationManager::schemaVersion26Final
+                    << ", which is the minimum supported schema version in this version of "
+                       "MongoDB";
+                auto errorStatus = Status(ErrorCodes::AuthSchemaIncompatible, msg);
+                handleAdminDbNotValid(errorStatus);
                 return;
             }
         }
@@ -293,7 +378,7 @@ void AllDatabaseCloner::Stats::append(BSONObjBuilder* builder) const {
     builder->appendNumber("databasesToClone", static_cast<long long>(databasesToClone));
     builder->appendNumber("databasesCloned", static_cast<long long>(databasesCloned));
     for (auto&& db : databaseStats) {
-        BSONObjBuilder dbBuilder(builder->subobjStart(db.dbname));
+        BSONObjBuilder dbBuilder(builder->subobjStart(DatabaseNameUtil::serialize(db.dbname)));
         db.append(&dbBuilder);
         dbBuilder.doneFast();
     }

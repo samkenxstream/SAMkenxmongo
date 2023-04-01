@@ -31,28 +31,29 @@
 
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/pipeline.h"
-#include "mongo/db/pipeline/visitors/document_source_visitor.h"
+#include "mongo/db/pipeline/visitors/document_source_visitor_registry.h"
 
 namespace mongo {
 
 /**
- * A document source walker.
- * TODO: SERVER-62027. Implement a hash-table based resolution instead of sequential dynamic casts.
+ * A walker over a DocumentSource pipeline. See the DocumentSourceVisitorRegistry header for details
+ * about why this walker does not use the typical "visitor" interface.
  */
 class DocumentSourceWalker final {
 public:
-    DocumentSourceWalker(DocumentSourceConstVisitor* preVisitor,
-                         DocumentSourceConstVisitor* postVisitor)
-        : _preVisitor{preVisitor}, _postVisitor{postVisitor} {}
+    DocumentSourceWalker(const DocumentSourceVisitorRegistry& registry,
+                         DocumentSourceVisitorContextBase* ctx)
+        : _registry(registry), _visitorCtx(ctx) {}
 
+    /**
+     * Perform an pre-order traversal of the top-level document sources in the given pipeline (i.e.
+     * does not walk $lookup/$unionWith subpipelines).
+     */
     void walk(const Pipeline& pipeline);
 
 private:
-    template <class T>
-    bool visitHelper(const DocumentSource* source);
-
-    DocumentSourceConstVisitor* _preVisitor;
-    DocumentSourceConstVisitor* _postVisitor;
+    const DocumentSourceVisitorRegistry& _registry;
+    DocumentSourceVisitorContextBase* _visitorCtx;
 };
 
 }  // namespace mongo

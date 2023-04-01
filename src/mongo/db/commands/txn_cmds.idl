@@ -29,7 +29,7 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/s/sharding_types.idl"
 
 structs:
@@ -42,6 +42,10 @@ structs:
                 description: "True if the shard has the transaction in progress but has not done a
                               write for it"
                 type: bool
+            additionalParticipants:
+                description: "Additional participants in the transaction"
+                optional: true
+                type: array<object>
 
     TxnRecoveryToken:
         description: "Contains info for retrying the commit of a sharded transaction"
@@ -50,7 +54,7 @@ structs:
                 description: "The id of the shard that can make progress committing the transaction"
                 type: shard_id
                 optional: true
-                unstable: false
+                stability: stable
 
     CommitTransactionOplogObject:
         description: A document representing the 'o' field of a 'commitTransaction' oplog entry.
@@ -93,13 +97,13 @@ commands:
                               transactions and illegal for non-prepared ones."
                 optional: true
                 type: timestamp
-                unstable: false
+                stability: stable
             recoveryToken:
                 description: "A mongos that doesn't know about this transaction can attempt to make
                               progress on commit by processing using the info in the recoveryToken."
                 optional: true
                 type: TxnRecoveryToken
-                unstable: false
+                stability: stable
         reply_type: OkReply
 
     abortTransaction:
@@ -117,5 +121,5 @@ commands:
                               progress on abort by processing using the info in the recoveryToken."
                 optional: true
                 type: TxnRecoveryToken
-                unstable: false
+                stability: stable
         reply_type: OkReply

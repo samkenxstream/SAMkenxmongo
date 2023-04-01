@@ -33,6 +33,7 @@
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/resharding/donor_document_gen.h"
 #include "mongo/db/s/resharding/resharding_metrics.h"
+#include "mongo/db/service_context.h"
 #include "mongo/s/resharding/type_collection_fields_gen.h"
 
 namespace mongo {
@@ -42,7 +43,7 @@ public:
     static constexpr StringData kServiceName = "ReshardingDonorService"_sd;
 
     explicit ReshardingDonorService(ServiceContext* serviceContext)
-        : PrimaryOnlyService(serviceContext) {}
+        : PrimaryOnlyService(serviceContext), _serviceContext(serviceContext) {}
     ~ReshardingDonorService() = default;
 
     class DonorStateMachine;
@@ -66,6 +67,9 @@ public:
         const std::vector<const Instance*>& existingInstances) override {}
 
     std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialState) override;
+
+private:
+    ServiceContext* _serviceContext;
 };
 
 /**
@@ -77,7 +81,8 @@ class ReshardingDonorService::DonorStateMachine final
 public:
     explicit DonorStateMachine(const ReshardingDonorService* donorService,
                                const ReshardingDonorDocument& donorDoc,
-                               std::unique_ptr<DonorStateMachineExternalState> externalState);
+                               std::unique_ptr<DonorStateMachineExternalState> externalState,
+                               ServiceContext* serviceContext);
 
     ~DonorStateMachine() = default;
 
@@ -100,6 +105,9 @@ public:
 
     void onReshardingFieldsChanges(OperationContext* opCtx,
                                    const TypeCollectionReshardingFields& reshardingFields);
+
+    void onReadDuringCriticalSection();
+    void onWriteDuringCriticalSection();
 
     SharedSemiFuture<void> awaitCriticalSectionAcquired();
 
@@ -129,6 +137,8 @@ public:
      * Initiates the cancellation of the resharding operation.
      */
     void abort(bool isUserCancelled);
+
+    void checkIfOptionsConflict(const BSONObj& stateDoc) const final {}
 
 private:
     /**
@@ -205,12 +215,6 @@ private:
     // Removes the local donor document from disk.
     void _removeDonorDocument(const CancellationToken& stepdownToken, bool aborted);
 
-    // Accesses the ReshardingMetrics module for this donor's underlying mongod process.
-    ReshardingMetrics* _metrics() const;
-
-    // Starts the metrics subsystem for this donor's underlying mongod process.
-    void _startMetrics();
-
     // Initializes the _abortSource and generates a token from it to return back the caller. If an
     // abort was reported prior to the initialization, automatically cancels the _abortSource before
     // returning the token.
@@ -220,6 +224,10 @@ private:
 
     // The primary-only service instance corresponding to the donor instance. Not owned.
     const ReshardingDonorService* const _donorService;
+
+    ServiceContext* const _serviceContext;
+
+    std::unique_ptr<ReshardingMetrics> _metrics;
 
     // The in-memory representation of the immutable portion of the document in
     // config.localReshardingOperations.donor.
@@ -298,7 +306,9 @@ public:
                                            const BSONObj& query,
                                            const BSONObj& update) = 0;
 
-    virtual void clearFilteringMetadata(OperationContext* opCtx) = 0;
+    virtual void clearFilteringMetadata(OperationContext* opCtx,
+                                        const NamespaceString& sourceNss,
+                                        const NamespaceString& tempReshardingNss) = 0;
 };
 
 }  // namespace mongo

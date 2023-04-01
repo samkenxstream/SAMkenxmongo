@@ -26,12 +26,11 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/db/exec/write_stage_common.h"
 
+#include "mongo/base/shim.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/shard_filterer_impl.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -40,38 +39,31 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/logv2/log.h"
 #include "mongo/logv2/redaction.h"
-#include "mongo/s/pm2423_feature_flags_gen.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
+
 
 namespace mongo {
-
-namespace {
-
-bool computeIsStandaloneOrPrimary(OperationContext* opCtx) {
-    const auto replCoord{repl::ReplicationCoordinator::get(opCtx)};
-    return replCoord->canAcceptWritesForDatabase(opCtx, "admin");
-}
-
-}  // namespace
 
 namespace write_stage_common {
 
 PreWriteFilter::PreWriteFilter(OperationContext* opCtx, NamespaceString nss)
-    : _opCtx(opCtx),
-      _nss(std::move(nss)),
-      _isEnabled([] {
-          auto& fcv = serverGlobalParams.featureCompatibility;
-          return fcv.isVersionInitialized() &&
-              feature_flags::gFeatureFlagNoChangeStreamEventsDueToOrphans.isEnabled(fcv);
-      }()),
-      _isStandaloneOrPrimary(computeIsStandaloneOrPrimary(_opCtx)) {}
+    : _opCtx(opCtx), _nss(std::move(nss)), _skipFiltering([&] {
+          // Always allow writes on replica sets.
+          if (serverGlobalParams.clusterRole.has(ClusterRole::None)) {
+              return true;
+          }
+
+          // Always allow writes on standalone and secondary nodes.
+          const auto replCoord{repl::ReplicationCoordinator::get(opCtx)};
+          return !replCoord->canAcceptWritesForDatabase(opCtx, DatabaseName::kAdmin.toString());
+      }()) {}
 
 PreWriteFilter::Action PreWriteFilter::computeAction(const Document& doc) {
-    // Skip the checks if the Filter is not enabled.
-    if (!_isEnabled)
-        return Action::kWrite;
-
-    if (!_isStandaloneOrPrimary) {
+    if (_skipFiltering) {
         // Secondaries do not apply any filtering logic as the primary already did.
         return Action::kWrite;
     }
@@ -80,15 +72,16 @@ PreWriteFilter::Action PreWriteFilter::computeAction(const Document& doc) {
     if (docBelongsToMe)
         return Action::kWrite;
     else
-        return OperationShardingState::isOperationVersioned(_opCtx) ? Action::kSkip
-                                                                    : Action::kWriteAsFromMigrate;
+        return OperationShardingState::isComingFromRouter(_opCtx) ? Action::kSkip
+                                                                  : Action::kWriteAsFromMigrate;
 }
 
 bool PreWriteFilter::_documentBelongsToMe(const BSONObj& doc) {
     if (!_shardFilterer) {
         _shardFilterer = [&] {
-            const auto css{CollectionShardingState::get(_opCtx, _nss)};
-            return std::make_unique<ShardFiltererImpl>(css->getOwnershipFilter(
+            auto scopedCss =
+                CollectionShardingState::assertCollectionLockedAndAcquire(_opCtx, _nss);
+            return std::make_unique<ShardFiltererImpl>(scopedCss->getOwnershipFilter(
                 _opCtx,
                 CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup,
                 true /*supportNonVersionedOperations*/));
@@ -112,6 +105,45 @@ bool PreWriteFilter::_documentBelongsToMe(const BSONObj& doc) {
 
 void PreWriteFilter::restoreState() {
     _shardFilterer.reset();
+}
+
+void PreWriteFilter::logSkippingDocument(const Document& doc,
+                                         StringData opKind,
+                                         const NamespaceString& collNs) {
+    LOGV2_DEBUG(5983201,
+                3,
+                "Skipping the operation to orphan document to prevent a wrong change "
+                "stream event",
+                "op"_attr = opKind,
+                logAttrs(collNs),
+                "record"_attr = doc);
+}
+
+void PreWriteFilter::logFromMigrate(const Document& doc,
+                                    StringData opKind,
+                                    const NamespaceString& collNs) {
+    LOGV2_DEBUG(6184700,
+                3,
+                "Marking the operation to orphan document with the fromMigrate flag to "
+                "prevent a wrong change stream event",
+                "op"_attr = opKind,
+                logAttrs(collNs),
+                "record"_attr = doc);
+}
+
+void CachedShardingDescription::restoreState() {
+    _collectionDescription.reset();
+}
+
+const ScopedCollectionDescription& CachedShardingDescription::getCollectionDescription(
+    OperationContext* opCtx) {
+    if (!_collectionDescription) {
+        const auto scopedCss =
+            CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, _nss);
+        _collectionDescription = scopedCss->getCollectionDescription(opCtx);
+    }
+
+    return *_collectionDescription;
 }
 
 bool ensureStillMatches(const CollectionPtr& collection,
@@ -141,6 +173,11 @@ bool ensureStillMatches(const CollectionPtr& collection,
         member->makeObjOwnedIfNeeded();
     }
     return true;
+}
+
+bool isRetryableWrite(OperationContext* opCtx) {
+    const auto replCoord{repl::ReplicationCoordinator::get(opCtx)};
+    return replCoord->isRetryableWrite(opCtx);
 }
 
 }  // namespace write_stage_common

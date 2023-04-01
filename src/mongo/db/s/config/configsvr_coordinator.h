@@ -29,10 +29,10 @@
 
 #pragma once
 
-#include "mongo/db/internal_session_pool.h"
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/config/set_user_write_block_mode_coordinator_document_gen.h"
+#include "mongo/db/session/internal_session_pool.h"
 
 namespace mongo {
 
@@ -56,6 +56,12 @@ public:
 
     virtual bool hasSameOptions(const BSONObj&) const = 0;
 
+    ConfigsvrCoordinatorTypeEnum coordinatorType() const {
+        return _coordId.getCoordinatorType();
+    }
+
+    void checkIfOptionsConflict(const BSONObj& stateDoc) const override {}
+
 protected:
     const ConfigsvrCoordinatorId _coordId;
 
@@ -65,9 +71,46 @@ protected:
     virtual ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                           const CancellationToken& token) noexcept = 0;
 
+    virtual const ConfigsvrCoordinatorMetadata& metadata() const = 0;
+
     void interrupt(Status status) noexcept override final;
 
     void _removeStateDocument(OperationContext* opCtx);
+
+    template <typename StateDoc>
+    void _updateStateDocument(OperationContext* opCtx, const StateDoc& newDoc) {
+        PersistentTaskStore<StateDoc> store(NamespaceString::kConfigsvrCoordinatorsNamespace);
+        store.update(opCtx,
+                     BSON(StateDoc::kIdFieldName << newDoc.getId().toBSON()),
+                     newDoc.toBSON(),
+                     WriteConcerns::kMajorityWriteConcernNoTimeout);
+    }
+
+    template <typename StateDoc>
+    StateDoc _updateSession(OperationContext* opCtx, const StateDoc& doc) {
+        const auto newCoordinatorMetadata = [&] {
+            ConfigsvrCoordinatorMetadata newMetadata = doc.getConfigsvrCoordinatorMetadata();
+
+            const auto optPrevSession = doc.getSession();
+            if (optPrevSession) {
+                newMetadata.setSession(ConfigsvrCoordinatorSession(
+                    optPrevSession->getLsid(), optPrevSession->getTxnNumber() + 1));
+            } else {
+                const auto newSession = InternalSessionPool::get(opCtx)->acquireSystemSession();
+                newMetadata.setSession(ConfigsvrCoordinatorSession(newSession.getSessionId(),
+                                                                   newSession.getTxnNumber()));
+            }
+
+            return newMetadata;
+        }();
+
+        StateDoc newDoc(doc);
+        newDoc.setConfigsvrCoordinatorMetadata(std::move(newCoordinatorMetadata));
+        _updateStateDocument(opCtx, newDoc);
+        return newDoc;
+    }
+
+    OperationSessionInfo _getCurrentSession() const;
 
     Mutex _mutex = MONGO_MAKE_LATCH("ConfigsvrCoordinator::_mutex");
     SharedPromise<void> _completionPromise;

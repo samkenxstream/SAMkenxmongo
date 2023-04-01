@@ -5,10 +5,10 @@
  *
  * Runs defragmentation on collections with concurrent operations.
  *
- * @tags: [requires_sharding, assumes_balancer_on]
+ * @tags: [requires_sharding, assumes_balancer_on, antithesis_incompatible]
  */
 
-const dbPrefix = 'fsmDB_';
+const dbPrefix = jsTestName() + '_DB_';
 const dbCount = 2;
 const collPrefix = 'sharded_coll_';
 const collCount = 2;
@@ -36,6 +36,19 @@ function getExtendedCollectionShardKey(configDB, ns) {
     const newCount = Object.keys(currentShardKey).length;
     currentShardKey["key" + newCount] = 1;
     return currentShardKey;
+}
+
+function getAllChunks(configDB, ns, keyPattern) {
+    let chunksCursor = findChunksUtil.findChunksByNs(configDB, ns).sort(keyPattern);
+    let chunkArray = [];
+    while (!chunksCursor.isExhausted()) {
+        while (chunksCursor.objsLeftInBatch()) {
+            chunkArray.push(chunksCursor.next());
+        }
+        chunksCursor =
+            findChunksUtil.findChunksByNs(configDB, ns).sort(keyPattern).skip(chunkArray.length);
+    }
+    return chunkArray;
 }
 
 var $config = (function() {
@@ -98,12 +111,10 @@ var $config = (function() {
             const configDB = randomDB.getSiblingDB('config');
             const keyPattern = getCollectionShardKey(configDB, randomColl.getFullName());
 
-            // Get all the chunks
-            const chunks = findChunksUtil.findChunksByNs(configDB, randomColl.getFullName())
-                               .sort(keyPattern)
-                               .toArray();
+            // Get all the chunks without using getMore so the test can run with stepdowns.
+            const chunks = getAllChunks(configDB, randomColl.getFullName(), keyPattern);
 
-            // No chunks to merge is there are less than 2 chunks
+            // No possible merges if there are less than 2 chunks.
             if (chunks.length < 2) {
                 return;
             }
@@ -181,7 +192,27 @@ var $config = (function() {
         refineShardKey: {moveChunk: 0.33, mergeChunks: 0.33, splitChunks: 0.33},
     };
 
+    let defaultChunkDefragmentationThrottlingMS;
+    let defaultBalancerShouldReturnRandomMigrations;
+
     function setup(db, collName, cluster) {
+        cluster.executeOnConfigNodes((db) => {
+            defaultBalancerShouldReturnRandomMigrations =
+                assert
+                    .commandWorked(db.adminCommand({
+                        getParameter: 1,
+                        'failpoint.balancerShouldReturnRandomMigrations': 1
+                    }))['failpoint.balancerShouldReturnRandomMigrations']
+                    .mode;
+
+            // If the failpoint is enabled on this suite, disable it because this test relies on the
+            // balancer taking correct decisions.
+            if (defaultBalancerShouldReturnRandomMigrations === 1) {
+                assert.commandWorked(db.adminCommand(
+                    {configureFailPoint: 'balancerShouldReturnRandomMigrations', mode: 'off'}));
+            }
+        });
+
         const mongos = cluster.getDB('config').getMongo();
         // Create all fragmented collections
         for (let i = 0; i < dbCount; i++) {
@@ -204,10 +235,31 @@ var $config = (function() {
                     true /* disableCollectionBalancing*/);
             }
         }
+        // Remove throttling to speed up test execution
+        cluster.executeOnConfigNodes((db) => {
+            const res = db.adminCommand({setParameter: 1, chunkDefragmentationThrottlingMS: 0});
+            assert.commandWorked(res);
+            defaultChunkDefragmentationThrottlingMS = res.was;
+        });
     }
 
     function teardown(db, collName, cluster) {
         const mongos = cluster.getDB('config').getMongo();
+
+        let defaultOverrideBalanceRoundInterval;
+        cluster.executeOnConfigNodes((db) => {
+            defaultOverrideBalanceRoundInterval = assert.commandWorked(db.adminCommand({
+                getParameter: 1,
+                'failpoint.overrideBalanceRoundInterval': 1
+            }))['failpoint.overrideBalanceRoundInterval'];
+
+            assert.commandWorked(db.adminCommand({
+                configureFailPoint: 'overrideBalanceRoundInterval',
+                mode: 'alwaysOn',
+                data: {intervalMs: 100}
+            }));
+        });
+
         for (let i = 0; i < dbCount; i++) {
             const dbName = dbPrefix + i;
             for (let j = 0; j < collCount; j++) {
@@ -217,11 +269,7 @@ var $config = (function() {
                 // Enable balancing and wait for balanced
                 assertAlways.commandWorked(mongos.getDB('config').collections.update(
                     {_id: fullNs}, {$set: {"noBalance": false}}));
-                assertAlways.soon(function() {
-                    let res = mongos.adminCommand({balancerCollectionStatus: fullNs});
-                    assertAlways.commandWorked(res);
-                    return res.balancerCompliant;
-                });
+                sh.awaitCollectionBalance(mongos.getCollection(fullNs), 300000 /* 5 minutes */);
                 // Begin defragmentation again
                 assertAlways.commandWorked(mongos.adminCommand({
                     configureCollectionBalancing: fullNs,
@@ -231,14 +279,45 @@ var $config = (function() {
                 // Wait for defragmentation to complete and check final state
                 defragmentationUtil.waitForEndOfDefragmentation(mongos, fullNs);
                 defragmentationUtil.checkPostDefragmentationState(
-                    mongos, fullNs, maxChunkSizeMB, "key");
+                    cluster.getConfigPrimaryNode(), mongos, fullNs, maxChunkSizeMB, "key");
+                // Resume original throttling value
+                cluster.executeOnConfigNodes((db) => {
+                    assert.commandWorked(db.adminCommand({
+                        setParameter: 1,
+                        chunkDefragmentationThrottlingMS: defaultChunkDefragmentationThrottlingMS
+                    }));
+                });
             }
         }
+
+        cluster.executeOnConfigNodes((db) => {
+            // Reset the failpoint to its original value.
+            if (defaultBalancerShouldReturnRandomMigrations === 1) {
+                defaultBalancerShouldReturnRandomMigrations =
+                    assert
+                        .commandWorked(db.adminCommand({
+                            configureFailPoint: 'balancerShouldReturnRandomMigrations',
+                            mode: 'alwaysOn'
+                        }))
+                        .was;
+            }
+
+            if (defaultOverrideBalanceRoundInterval.mode === 0) {
+                assert.commandWorked(db.adminCommand(
+                    {configureFailPoint: 'overrideBalanceRoundInterval', mode: 'off'}));
+            } else if (defaultOverrideBalanceRoundInterval.mode === 1) {
+                assert.commandWorked(db.adminCommand({
+                    configureFailPoint: 'overrideBalanceRoundInterval',
+                    mode: 'alwaysOn',
+                    data: {intervalMs: defaultOverrideBalanceRoundInterval.data.intervalMs}
+                }));
+            }
+        });
     }
 
     return {
         threadCount: 5,
-        iterations: 10,
+        iterations: 25,
         states: states,
         transitions: transitions,
         setup: setup,

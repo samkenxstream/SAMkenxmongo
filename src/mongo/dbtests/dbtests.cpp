@@ -101,13 +101,12 @@ Status createIndex(OperationContext* opCtx, StringData ns, const BSONObj& keys, 
 
 Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj& spec) {
     NamespaceString nss(ns);
-    AutoGetDb autoDb(opCtx, nsToDatabaseSubstring(ns), MODE_IX);
-    Collection* coll;
+    AutoGetDb autoDb(opCtx, nss.dbName(), MODE_IX);
     {
         Lock::CollectionLock collLock(opCtx, nss, MODE_X);
         WriteUnitOfWork wunit(opCtx);
-        coll = CollectionCatalog::get(opCtx)->lookupCollectionByNamespaceForMetadataWrite(
-            opCtx, CollectionCatalog::LifetimeMode::kInplace, NamespaceString(ns));
+        auto coll =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespaceForMetadataWrite(opCtx, nss);
         if (!coll) {
             auto db = autoDb.ensureDbExists(opCtx);
             invariant(db);
@@ -117,14 +116,17 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
         wunit.commit();
     }
     MultiIndexBlock indexer;
-    CollectionWriter collection(coll);
     ScopeGuard abortOnExit([&] {
         Lock::CollectionLock collLock(opCtx, nss, MODE_X);
+        CollectionWriter collection(opCtx, nss);
+        WriteUnitOfWork wunit(opCtx);
         indexer.abortIndexBuild(opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
+        wunit.commit();
     });
     auto status = Status::OK();
     {
         Lock::CollectionLock collLock(opCtx, nss, MODE_X);
+        CollectionWriter collection(opCtx, nss);
         status = indexer
                      .init(opCtx,
                            collection,
@@ -145,25 +147,30 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
     }
     {
         Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
-        status = indexer.insertAllDocumentsInCollection(opCtx, coll);
+        // Using CollectionWriter for convenience here.
+        CollectionWriter collection(opCtx, nss);
+        status = indexer.insertAllDocumentsInCollection(opCtx, collection.get());
         if (!status.isOK()) {
             return status;
         }
     }
     {
         Lock::CollectionLock collLock(opCtx, nss, MODE_X);
-        status = indexer.retrySkippedRecords(opCtx, coll);
+        CollectionWriter collection(opCtx, nss);
+        status = indexer.retrySkippedRecords(opCtx, collection.get());
         if (!status.isOK()) {
             return status;
         }
 
-        status = indexer.checkConstraints(opCtx, coll);
+        status = indexer.checkConstraints(opCtx, collection.get());
         if (!status.isOK()) {
             return status;
         }
         WriteUnitOfWork wunit(opCtx);
-        ASSERT_OK(indexer.commit(
-            opCtx, coll, MultiIndexBlock::kNoopOnCreateEachFn, MultiIndexBlock::kNoopOnCommitFn));
+        ASSERT_OK(indexer.commit(opCtx,
+                                 collection.getWritableCollection(opCtx),
+                                 MultiIndexBlock::kNoopOnCreateEachFn,
+                                 MultiIndexBlock::kNoopOnCommitFn));
         ASSERT_OK(opCtx->recoveryUnit()->setTimestamp(Timestamp(1, 1)));
         wunit.commit();
     }
@@ -179,7 +186,7 @@ WriteContextForTests::WriteContextForTests(OperationContext* opCtx, StringData n
 
     const bool doShardVersionCheck = false;
 
-    _clientContext.emplace(opCtx, _nss.ns(), doShardVersionCheck);
+    _clientContext.emplace(opCtx, _nss, doShardVersionCheck);
     auto db = _autoDb->ensureDbExists(opCtx);
     invariant(db, _nss.ns());
     invariant(db == _clientContext->db());

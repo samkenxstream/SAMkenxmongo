@@ -101,47 +101,78 @@ server_parameters:
         cpp_varname: gValidateTimeseriesCompression
         default: true
 
-    roundtripBsonColumnOnValidate:
-        description: 'Roundtrips collections content to BSONColumn to verify that we can compress/decompress without data loss.'
+    maintainValidCursorsAcrossSBEReadCommands:
+        description: "Enable maintaining valid cursors across SBE read commands (find, agg, getMore)"
         set_at: startup
+        cpp_varname: gMaintainValidCursorsAcrossReadCommands
         cpp_vartype: bool
-        cpp_varname: gRoundtripBsonColumnOnValidate
         default: false
-    maintainValidCursorsAcrossSBEYieldandReadCommands:
-        description: "Enable retaining valid cursor across SBE query yield and getMore"
+
+    maintainValidCursorsAcrossSBEYield:
+        description: "Enable retaining valid cursors across SBE query yield"
         set_at: startup
         cpp_varname: gYieldingSupportForSBE
         cpp_vartype: bool
         default: false
 
+    maxNumberOfBatchedOperationsInSingleOplogEntry:
+        description: >-
+            Maximum number of operations to pack into a single oplog entry, when multi-oplog
+            format for batched writes is in use. See batchedDeletesTargetBatchDocs and
+            maxNumberOfTransactionOperationsInSingleOplogEntry.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: gMaxNumberOfBatchedOperationsInSingleOplogEntry
+        default: 2147483647  # INT_MAX
+        validator: { gte: 1 }
+
+    maxSizeOfBatchedOperationsInSingleOplogEntryBytes:
+        description: >-
+            Maximum size (bytes) of operations to pack into a single oplog entry, when multi-oplog
+            format for batched writes is in use.
+            See batchedDeletesTargetStagedDocBytes and BSONObjMaxUserSize.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: gMaxSizeOfBatchedOperationsInSingleOplogEntryBytes
+        default: 16777216  # 16 MB
+        validator: { gte: 1 }
+
+    maxNumberOfInsertsBatchInsertsForRenameAcrossDatabases:
+        description: >-
+            Maximum number of inserts that cross-db collection renames can batch into one applyOps
+            oplog entry.
+        set_at: [ startup, runtime ]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: gMaxNumberOfInsertsBatchInsertsForRenameAcrossDatabases
+        default: 500
+
+    maxSizeOfBatchedInsertsForRenameAcrossDatabasesBytes:
+        description: >-
+            Maximum size (bytes) of each batched applyOps oplog entry for cross-db collection renames.
+        set_at: [ startup, runtime ]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: gMaxSizeOfBatchedInsertsForRenameAcrossDatabasesBytes
+        default: 16776216 # BSONObjMaxUserSize - 1000
+
+    collectionSamplingLogIntervalSeconds:
+        description: 'The approximate interval between log messages indicating collection sampling progress. Once interval seconds have elapsed since the last log message, a progress message will be logged after the current sample is completed. A value of zero will disable this logging.'
+        set_at: [ startup, runtime ]
+        cpp_vartype: 'AtomicWord<int>'
+        cpp_varname: gCollectionSamplingLogIntervalSeconds
+        deprecated_name:
+        - oplogSamplingLogIntervalSeconds
+        default: 10
+        validator: { gte: 0 }
+
 feature_flags:
-    featureFlagClusteredIndexes:
-        description: "When enabled, support non time-series collections with clustered indexes"
-        cpp_varname: feature_flags::gClusteredIndexes
-        default: true
-        version: 5.3
-    featureFlagTimeseriesUpdatesAndDeletes:
-        description: "When enabled, support for updates and deletes on time-series collections"
-        cpp_varname: feature_flags::gTimeseriesUpdatesAndDeletes
-        default: true
-        version: 5.0
     featureFlagTimeseriesMetricIndexes:
         description: "When enabled, support secondary indexes on time-series measurements"
         cpp_varname: feature_flags::gTimeseriesMetricIndexes
-        default: false
-    featureFlagTimeseriesBucketCompression:
-        description: "Enable bucket compression on time-series collections"
-        cpp_varname: feature_flags::gTimeseriesBucketCompression
         default: true
-        version: 5.2
+        version: 6.0
     featureFlagCollModIndexUnique:
         description: "When enabled, collMod supports making an index unique"
         cpp_varname: feature_flags::gCollModIndexUnique
-        default: true
-        version: 6.0
-    featureFlagCommandsAcceptCollectionUUID:
-        description: "When enabled, support specifying collection UUID for commands"
-        cpp_varname: feature_flags::gCommandsAcceptCollectionUUID
         default: true
         version: 6.0
     featureFlagSelectiveBackup:
@@ -152,17 +183,45 @@ feature_flags:
     featureFlagBatchMultiDeletes:
         description: "When enabled, support batching multi-document deletions"
         cpp_varname: feature_flags::gBatchMultiDeletes
-        default: false
+        default: true
+        version: 6.1
     featureFlagDocumentSourceListCatalog:
         description: "When enabled, allow the use of the $listCatalog aggregation stage"
         cpp_varname: feature_flags::gDocumentSourceListCatalog
         default: true
         version: 6.0
-    featureFlagDatabaseRenameDuringRestore:
-        description: "When enabled, allow renaming databases during restore"
-        cpp_varname: feature_flags::gDatabaseRenameDuringRestore
+    featureFlagDerivedMetadata:
+        description: "When enabled, support storing derived collection and index metadata"
+        cpp_varname: feature_flags::gDerivedMetadata
         default: false
-    featureFlagTimeseriesBucketCompressionWithArrays:
-        description: "Enable array compression support for time-series bucket compression"
-        cpp_varname: feature_flags::gTimeseriesBucketCompressionWithArrays
+    featureFlagTimeseriesScalabilityImprovements:
+        description: "Enable scalability and usability improvements for time-series collections"
+        cpp_varname: feature_flags::gTimeseriesScalabilityImprovements
+        default: true
+        version: 6.3
+    featureFlagExtendValidateCommand:
+        description: "Enable checks on more types of inconsistencies for the validate command"
+        cpp_varname: feature_flags::gExtendValidateCommand
+        default: true
+        version: 6.2
+    featureFlagPointInTimeCatalogLookups:
+        description: "Support reads when in-memory catalog is out-of-sync with storage transaction"
+        cpp_varname: feature_flags::gPointInTimeCatalogLookups
+        default: true
+        version: 7.0
+    featureFlagInternalWritesAreReplicatedTransactionally:
+        description: Feature flag to enable internal writes to use the transactionally replicated WriteUnitOfWork API by default.
+        cpp_varname: gFeatureFlagInternalWritesAreReplicatedTransactionally
+        default: false
+    featureFlagTimeseriesDeletesSupport:
+        description: "Enable support for arbitrary deletes on time-series collections"
+        cpp_varname: feature_flags::gTimeseriesDeletesSupport
+        default: false
+    featureFlagTimeseriesUpdatesSupport:
+        description: "Enable support for arbitrary updates on time-series collections"
+        cpp_varname: feature_flags::gTimeseriesUpdatesSupport
+        default: false
+    featureFlagIndexBuildGracefulErrorHandling:
+        description: "Enable index build error handling improvements"
+        cpp_varname: feature_flags::gIndexBuildGracefulErrorHandling
         default: false

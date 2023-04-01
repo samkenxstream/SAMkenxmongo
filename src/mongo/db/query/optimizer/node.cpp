@@ -31,6 +31,7 @@
 #include <stack>
 
 #include "mongo/db/query/optimizer/node.h"
+#include "mongo/db/query/optimizer/utils/path_utils.h"
 #include "mongo/db/query/optimizer/utils/utils.h"
 
 namespace mongo::optimizer {
@@ -47,9 +48,13 @@ static ABT buildSimpleBinder(const ProjectionNameVector& names) {
     return make<ExpressionBinder>(names, std::move(sources));
 }
 
+/**
+ * Builds References from the provided projection names. Equality of References is sensitive
+ * to order, so the projections are sorted first.
+ */
 static ABT buildReferences(const ProjectionNameSet& projections) {
     ABTVector variables;
-    ProjectionNameOrderedSet ordered = convertToOrderedSet(projections);
+    ProjectionNameOrderedSet ordered{projections.cbegin(), projections.cend()};
     for (const ProjectionName& projection : ordered) {
         variables.emplace_back(make<Variable>(projection));
     }
@@ -61,10 +66,6 @@ ScanNode::ScanNode(ProjectionName projectionName, std::string scanDefName)
 
 const ProjectionName& ScanNode::getProjectionName() const {
     return binder().names()[0];
-}
-
-const ProjectionType& ScanNode::getProjection() const {
-    return binder().exprs()[0];
 }
 
 const std::string& ScanNode::getScanDefName() const {
@@ -79,11 +80,11 @@ static ProjectionNameVector extractProjectionNamesForScan(
     const FieldProjectionMap& fieldProjectionMap) {
     ProjectionNameVector result;
 
-    if (!fieldProjectionMap._ridProjection.empty()) {
-        result.push_back(fieldProjectionMap._ridProjection);
+    if (const auto& projName = fieldProjectionMap._ridProjection) {
+        result.push_back(*projName);
     }
-    if (!fieldProjectionMap._rootProjection.empty()) {
-        result.push_back(fieldProjectionMap._rootProjection);
+    if (const auto& projName = fieldProjectionMap._rootProjection) {
+        result.push_back(*projName);
     }
     for (const auto& entry : fieldProjectionMap._fieldProjections) {
         result.push_back(entry.second);
@@ -117,31 +118,52 @@ bool PhysicalScanNode::useParallelScan() const {
     return _useParallelScan;
 }
 
-ValueScanNode::ValueScanNode(ProjectionNameVector projections)
-    : ValueScanNode(std::move(projections), Constant::emptyArray()) {}
+ValueScanNode::ValueScanNode(ProjectionNameVector projections,
+                             boost::optional<properties::LogicalProps> props)
+    : ValueScanNode(
+          std::move(projections), std::move(props), Constant::emptyArray(), false /*hasRID*/) {}
 
-ValueScanNode::ValueScanNode(ProjectionNameVector projections, ABT valueArray)
-    : Base(buildSimpleBinder(std::move(projections))), _valueArray(std::move(valueArray)) {
+ValueScanNode::ValueScanNode(ProjectionNameVector projections,
+                             boost::optional<properties::LogicalProps> props,
+                             ABT valueArray,
+                             const bool hasRID)
+    : Base(buildSimpleBinder(std::move(projections))),
+      _props(std::move(props)),
+      _valueArray(std::move(valueArray)),
+      _hasRID(hasRID) {
     const auto constPtr = _valueArray.cast<Constant>();
-    uassert(6624081, "Expected a constant", constPtr != nullptr);
+    tassert(6624081, "ValueScan must be initialized with a constant", constPtr != nullptr);
 
     const auto [tag, val] = constPtr->get();
-    uassert(6624082, "Expected an array constant.", tag == sbe::value::TypeTags::Array);
+    tassert(
+        6624082, "ValueScan must be initialized with an array", tag == sbe::value::TypeTags::Array);
 
     const auto arr = sbe::value::getArrayView(val);
     _arraySize = arr->size();
     const size_t projectionCount = binder().names().size();
     for (size_t i = 0; i < _arraySize; i++) {
         const auto [tag1, val1] = arr->getAt(i);
-        uassert(6624083, "Expected an array element.", tag1 == sbe::value::TypeTags::Array);
-        const size_t innerSize = sbe::value::getArrayView(val1)->size();
-        uassert(6624084, "Invalid array size.", innerSize == projectionCount);
+        tassert(6624083,
+                "ValueScan must be initialized with an array",
+                tag1 == sbe::value::TypeTags::Array);
+
+        const auto innerArray = sbe::value::getArrayView(val1);
+        tassert(6624084,
+                "Unexpected number of elements in inner array",
+                innerArray->size() == projectionCount + (_hasRID ? 1 : 0));
+        tassert(6624177,
+                "First element must be a RecordId",
+                !_hasRID || innerArray->getAt(0).first == sbe::value::TypeTags::RecordId);
     }
 }
 
 bool ValueScanNode::operator==(const ValueScanNode& other) const {
-    return binder() == other.binder() && _arraySize == other._arraySize &&
-        _valueArray == other._valueArray;
+    return binder() == other.binder() && _props == other._props && _arraySize == other._arraySize &&
+        _valueArray == other._valueArray && _hasRID == other._hasRID;
+}
+
+const boost::optional<properties::LogicalProps>& ValueScanNode::getProps() const {
+    return _props;
 }
 
 const ABT& ValueScanNode::getValueArray() const {
@@ -152,28 +174,53 @@ size_t ValueScanNode::getArraySize() const {
     return _arraySize;
 }
 
+bool ValueScanNode::getHasRID() const {
+    return _hasRID;
+}
+
 CoScanNode::CoScanNode() : Base() {}
 
 bool CoScanNode::operator==(const CoScanNode& other) const {
     return true;
 }
 
-IndexScanNode::IndexScanNode(FieldProjectionMap fieldProjectionMap, IndexSpecification indexSpec)
+IndexScanNode::IndexScanNode(FieldProjectionMap fieldProjectionMap,
+                             std::string scanDefName,
+                             std::string indexDefName,
+                             CompoundIntervalRequirement indexInterval,
+                             bool isIndexReverseOrder)
     : Base(buildSimpleBinder(extractProjectionNamesForScan(fieldProjectionMap))),
       _fieldProjectionMap(std::move(fieldProjectionMap)),
-      _indexSpec(std::move(indexSpec)) {}
+      _scanDefName(std::move(scanDefName)),
+      _indexDefName(std::move(indexDefName)),
+      _indexInterval(std::move(indexInterval)),
+      _isIndexReverseOrder(isIndexReverseOrder) {}
 
 bool IndexScanNode::operator==(const IndexScanNode& other) const {
     // Scan spec does not participate, the indexSpec by itself should determine equality.
-    return _fieldProjectionMap == other._fieldProjectionMap && _indexSpec == other._indexSpec;
+    return _fieldProjectionMap == other._fieldProjectionMap && _scanDefName == other._scanDefName &&
+        _indexDefName == other._indexDefName && _indexInterval == other._indexInterval &&
+        _isIndexReverseOrder == other._isIndexReverseOrder;
 }
 
 const FieldProjectionMap& IndexScanNode::getFieldProjectionMap() const {
     return _fieldProjectionMap;
 }
 
-const IndexSpecification& IndexScanNode::getIndexSpecification() const {
-    return _indexSpec;
+const std::string& IndexScanNode::getScanDefName() const {
+    return _scanDefName;
+}
+
+const std::string& IndexScanNode::getIndexDefName() const {
+    return _indexDefName;
+}
+
+const CompoundIntervalRequirement& IndexScanNode::getIndexInterval() const {
+    return _indexInterval;
+}
+
+bool IndexScanNode::isIndexReverseOrder() const {
+    return _isIndexReverseOrder;
 }
 
 SeekNode::SeekNode(ProjectionName ridProjectionName,
@@ -260,15 +307,9 @@ bool EvaluationNode::operator==(const EvaluationNode& other) const {
         getChild() == other.getChild();
 }
 
-RIDIntersectNode::RIDIntersectNode(ProjectionName scanProjectionName,
-                                   const bool hasLeftIntervals,
-                                   const bool hasRightIntervals,
-                                   ABT leftChild,
-                                   ABT rightChild)
+RIDIntersectNode::RIDIntersectNode(ProjectionName scanProjectionName, ABT leftChild, ABT rightChild)
     : Base(std::move(leftChild), std::move(rightChild)),
-      _scanProjectionName(std::move(scanProjectionName)),
-      _hasLeftIntervals(hasLeftIntervals),
-      _hasRightIntervals(hasRightIntervals) {
+      _scanProjectionName(std::move(scanProjectionName)) {
     assertNodeSort(getLeftChild());
     assertNodeSort(getRightChild());
 }
@@ -291,85 +332,153 @@ ABT& RIDIntersectNode::getRightChild() {
 
 bool RIDIntersectNode::operator==(const RIDIntersectNode& other) const {
     return _scanProjectionName == other._scanProjectionName &&
-        _hasLeftIntervals == other._hasLeftIntervals &&
-        _hasRightIntervals == other._hasRightIntervals && getLeftChild() == other.getLeftChild() &&
-        getRightChild() == other.getRightChild();
+        getLeftChild() == other.getLeftChild() && getRightChild() == other.getRightChild();
 }
 
 const ProjectionName& RIDIntersectNode::getScanProjectionName() const {
     return _scanProjectionName;
 }
 
-bool RIDIntersectNode::hasLeftIntervals() const {
-    return _hasLeftIntervals;
+RIDUnionNode::RIDUnionNode(ProjectionName scanProjectionName, ABT leftChild, ABT rightChild)
+    : Base(std::move(leftChild), std::move(rightChild)),
+      _scanProjectionName(std::move(scanProjectionName)) {
+    assertNodeSort(getLeftChild());
+    assertNodeSort(getRightChild());
 }
 
-bool RIDIntersectNode::hasRightIntervals() const {
-    return _hasRightIntervals;
+const ABT& RIDUnionNode::getLeftChild() const {
+    return get<0>();
+}
+
+ABT& RIDUnionNode::getLeftChild() {
+    return get<0>();
+}
+
+const ABT& RIDUnionNode::getRightChild() const {
+    return get<1>();
+}
+
+ABT& RIDUnionNode::getRightChild() {
+    return get<1>();
+}
+
+bool RIDUnionNode::operator==(const RIDUnionNode& other) const {
+    return _scanProjectionName == other._scanProjectionName &&
+        getLeftChild() == other.getLeftChild() && getRightChild() == other.getRightChild();
+}
+
+const ProjectionName& RIDUnionNode::getScanProjectionName() const {
+    return _scanProjectionName;
 }
 
 static ProjectionNameVector createSargableBindings(const PartialSchemaRequirements& reqMap) {
     ProjectionNameVector result;
-    for (const auto& entry : reqMap) {
-        if (entry.second.hasBoundProjectionName()) {
-            result.push_back(entry.second.getBoundProjectionName());
+    PSRExpr::visitDNF(reqMap.getRoot(), [&](const PartialSchemaEntry& e) {
+        if (auto binding = e.second.getBoundProjectionName()) {
+            result.push_back(*binding);
         }
-    }
+    });
     return result;
 }
 
 static ProjectionNameVector createSargableReferences(const PartialSchemaRequirements& reqMap) {
     ProjectionNameOrderPreservingSet result;
-    for (const auto& entry : reqMap) {
-        result.emplace_back(entry.first._projectionName);
-    }
+    PSRExpr::visitDNF(reqMap.getRoot(), [&](const PartialSchemaEntry& e) {
+        result.emplace_back(*e.first._projectionName);
+    });
     return result.getVector();
 }
 
 SargableNode::SargableNode(PartialSchemaRequirements reqMap,
-                           CandidateIndexMap candidateIndexMap,
+                           CandidateIndexes candidateIndexes,
+                           boost::optional<ScanParams> scanParams,
                            const IndexReqTarget target,
                            ABT child)
     : Base(std::move(child),
            buildSimpleBinder(createSargableBindings(reqMap)),
            make<References>(createSargableReferences(reqMap))),
       _reqMap(std::move(reqMap)),
-      _candidateIndexMap(std::move(candidateIndexMap)),
+      _candidateIndexes(std::move(candidateIndexes)),
+      _scanParams(std::move(scanParams)),
       _target(target) {
     assertNodeSort(getChild());
-    uassert(6624085, "Empty requirements map", !_reqMap.empty());
-    // We currently use a 64-bit mask when splitting into left and right requirements.
-    uassert(6624086, "Requirements map too large", _reqMap.size() < 64);
-
-    // Assert merged map does not contain duplicate bound projections.
-    ProjectionNameSet boundsProjectionNameSet;
-    for (const auto& entry : _reqMap) {
-        if (entry.second.hasBoundProjectionName() &&
-            !boundsProjectionNameSet.insert(entry.second.getBoundProjectionName()).second) {
-            uasserted(6624087, "Duplicate bound projection");
-        }
+    tassert(6624085, "SargableNode requires at least one predicate", !_reqMap.isNoop());
+    tassert(
+        7447500, "SargableNode requirements should be in DNF", PSRExpr::isDNF(_reqMap.getRoot()));
+    if (const size_t numLeaves = PSRExpr::numLeaves(_reqMap.getRoot());
+        numLeaves > kMaxPartialSchemaReqs) {
+        tasserted(6624086,
+                  str::stream() << "SargableNode has too many predicates: " << numLeaves
+                                << ". We allow at most " << kMaxPartialSchemaReqs);
     }
 
-    // Assert there are no references to internally bound projections.
-    for (const auto& entry : _reqMap) {
-        if (boundsProjectionNameSet.find(entry.first._projectionName) !=
-            boundsProjectionNameSet.cend()) {
-            uasserted(6624088, "We are binding to an internal projection");
-        }
-    }
+    auto bindings = createSargableBindings(_reqMap);
+    tassert(7410100,
+            "SargableNode with top-level OR cannot bind",
+            bindings.empty() || PSRExpr::isSingletonDisjunction(_reqMap.getRoot()));
+
+    ProjectionNameSet boundsProjectionNameSet(bindings.begin(), bindings.end());
+
+    // Assert there are no perf-only binding requirements, references to internally bound
+    // projections, or non-trivial multikey requirements which also bind. Further assert that under
+    // a conjunction 1) non-multikey paths have at most one req and 2) there are no duplicate bound
+    // projection names.
+    PSRExpr::visitDisjuncts(_reqMap.getRoot(), [&](const PSRExpr::Node& disjunct, const size_t) {
+        PartialSchemaKeySet seenKeys;
+        ProjectionNameSet seenProjNames;
+        PSRExpr::visitConjuncts(disjunct, [&](const PSRExpr::Node& conjunct, const size_t) {
+            PSRExpr::visitAtom(conjunct, [&](const PartialSchemaEntry& e) {
+                const auto& [key, req] = e;
+                if (auto projName = req.getBoundProjectionName()) {
+                    tassert(
+                        6624094,
+                        "SargableNode has a multikey requirement with a non-trivial interval which "
+                        "also binds",
+                        isIntervalReqFullyOpenDNF(req.getIntervals()) ||
+                            !checkPathContainsTraverse(key._path));
+                    tassert(6624095,
+                            "SargableNode has a perf only binding requirement",
+                            !req.getIsPerfOnly());
+
+                    auto insertedBoundProj = seenProjNames.insert(*projName).second;
+                    tassert(6624087,
+                            "PartialSchemaRequirements has duplicate bound projection names in "
+                            "a conjunction",
+                            insertedBoundProj);
+                }
+
+                tassert(6624088,
+                        "SargableNode cannot reference an internally bound projection",
+                        boundsProjectionNameSet.count(*key._projectionName) == 0);
+
+                if (!checkPathContainsTraverse(key._path)) {
+                    auto insertedKey = seenKeys.insert(key).second;
+                    tassert(7155020,
+                            "PartialSchemaRequirements has two predicates on the same non-multikey "
+                            "path in a conjunction",
+                            insertedKey);
+                }
+            });
+        });
+    });
 }
 
 bool SargableNode::operator==(const SargableNode& other) const {
-    return _reqMap == other._reqMap && _candidateIndexMap == other._candidateIndexMap &&
-        _target == other._target && getChild() == other.getChild();
+    // Specifically not comparing the candidate indexes and ScanParams. Those are derivative of the
+    // requirements, and can have temp projection names.
+    return _reqMap == other._reqMap && _target == other._target && getChild() == other.getChild();
 }
 
 const PartialSchemaRequirements& SargableNode::getReqMap() const {
     return _reqMap;
 }
 
-const CandidateIndexMap& SargableNode::getCandidateIndexMap() const {
-    return _candidateIndexMap;
+const CandidateIndexes& SargableNode::getCandidateIndexes() const {
+    return _candidateIndexes;
+}
+
+const boost::optional<ScanParams>& SargableNode::getScanParams() const {
+    return _scanParams;
 }
 
 IndexReqTarget SargableNode::getTarget() const {
@@ -447,8 +556,9 @@ HashJoinNode::HashJoinNode(JoinType joinType,
       _joinType(joinType),
       _leftKeys(std::move(leftKeys)),
       _rightKeys(std::move(rightKeys)) {
-    uassert(
-        6624089, "Invalid key sizes", !_leftKeys.empty() && _leftKeys.size() == _rightKeys.size());
+    tassert(6624089,
+            "Mismatched number of left and right join keys",
+            !_leftKeys.empty() && _leftKeys.size() == _rightKeys.size());
     assertNodeSort(getLeftChild());
     assertNodeSort(getRightChild());
 }
@@ -498,11 +608,18 @@ MergeJoinNode::MergeJoinNode(ProjectionNameVector leftKeys,
       _collation(std::move(collation)),
       _leftKeys(std::move(leftKeys)),
       _rightKeys(std::move(rightKeys)) {
-    uassert(
-        6624090, "Invalid key sizes", !_leftKeys.empty() && _leftKeys.size() == _rightKeys.size());
-    uassert(6624091, "Invalid collation size", _collation.size() == _leftKeys.size());
+    tassert(6624090,
+            "Mismatched number of left and right join keys",
+            !_leftKeys.empty() && _leftKeys.size() == _rightKeys.size());
+    tassert(
+        6624091, "Mismatched collation and join key size", _collation.size() == _leftKeys.size());
     assertNodeSort(getLeftChild());
     assertNodeSort(getRightChild());
+    for (const auto& collReq : _collation) {
+        tassert(7063704,
+                "MergeJoin collation requirement must be ascending or descending",
+                collReq == CollationOp::Ascending || collReq == CollationOp::Descending);
+    }
 }
 
 bool MergeJoinNode::operator==(const MergeJoinNode& other) const {
@@ -539,13 +656,61 @@ ABT& MergeJoinNode::getRightChild() {
     return get<1>();
 }
 
+NestedLoopJoinNode::NestedLoopJoinNode(JoinType joinType,
+                                       ProjectionNameSet correlatedProjectionNames,
+                                       FilterType filter,
+                                       ABT leftChild,
+                                       ABT rightChild)
+    : Base(std::move(leftChild), std::move(rightChild), std::move(filter)),
+      _joinType(joinType),
+      _correlatedProjectionNames(std::move(correlatedProjectionNames)) {
+    assertExprSort(getFilter());
+    assertNodeSort(getLeftChild());
+    assertNodeSort(getRightChild());
+}
+
+JoinType NestedLoopJoinNode::getJoinType() const {
+    return _joinType;
+}
+
+const ProjectionNameSet& NestedLoopJoinNode::getCorrelatedProjectionNames() const {
+    return _correlatedProjectionNames;
+}
+
+bool NestedLoopJoinNode::operator==(const NestedLoopJoinNode& other) const {
+    return _joinType == other._joinType &&
+        _correlatedProjectionNames == other._correlatedProjectionNames &&
+        getLeftChild() == other.getLeftChild() && getRightChild() == other.getRightChild();
+}
+
+const ABT& NestedLoopJoinNode::getLeftChild() const {
+    return get<0>();
+}
+
+ABT& NestedLoopJoinNode::getLeftChild() {
+    return get<0>();
+}
+
+const ABT& NestedLoopJoinNode::getRightChild() const {
+    return get<1>();
+}
+
+ABT& NestedLoopJoinNode::getRightChild() {
+    return get<1>();
+}
+
+const ABT& NestedLoopJoinNode::getFilter() const {
+    return get<2>();
+}
+
 /**
- * A helper that builds References object of UnionNode for reference tracking purposes.
+ * A helper that builds References object of UnionNode or SortedMergeNode for reference tracking
+ * purposes.
  *
  * Example: union outputs 3 projections: A,B,C and it has 4 children. Then the References object is
  * a vector of variables A,B,C,A,B,C,A,B,C,A,B,C. One group of variables per child.
  */
-static ABT buildUnionReferences(const ProjectionNameVector& names, const size_t numOfChildren) {
+static ABT buildUnionTypeReferences(const ProjectionNameVector& names, const size_t numOfChildren) {
     ABTVector variables;
     for (size_t outerIdx = 0; outerIdx < numOfChildren; ++outerIdx) {
         for (size_t idx = 0; idx < names.size(); ++idx) {
@@ -556,11 +721,56 @@ static ABT buildUnionReferences(const ProjectionNameVector& names, const size_t 
     return make<References>(std::move(variables));
 }
 
+// Helper function to get the projection names from a CollationRequirement as a vector instead of a
+// set, since we would like to keep the order.
+static ProjectionNameVector getAffectedProjectionNamesOrdered(
+    const properties::CollationRequirement& collReq) {
+    ProjectionNameVector result;
+    for (const auto& entry : collReq.getCollationSpec()) {
+        result.push_back(entry.first);
+    }
+    return result;
+}
+
+SortedMergeNode::SortedMergeNode(properties::CollationRequirement collReq, ABTVector children)
+    : SortedMergeNode(std::move(collReq), NodeChildrenHolder{std::move(children)}) {}
+
+SortedMergeNode::SortedMergeNode(properties::CollationRequirement collReq,
+                                 NodeChildrenHolder children)
+    : Base(std::move(children._nodes),
+           buildSimpleBinder(getAffectedProjectionNamesOrdered(collReq)),
+           buildUnionTypeReferences(getAffectedProjectionNamesOrdered(collReq),
+                                    children._numOfNodes)),
+      _collationReq(collReq) {
+    for (auto& n : nodes()) {
+        assertNodeSort(n);
+    }
+    for (const auto& collReq : _collationReq.getCollationSpec()) {
+        tassert(7063703,
+                "SortedMerge collation requirement must be ascending or descending",
+                collReq.second == CollationOp::Ascending ||
+                    collReq.second == CollationOp::Descending);
+    }
+}
+
+const properties::CollationRequirement& SortedMergeNode::getCollationReq() const {
+    return _collationReq;
+}
+
+bool SortedMergeNode::operator==(const SortedMergeNode& other) const {
+    return _collationReq == other._collationReq && binder() == other.binder() &&
+        nodes() == other.nodes();
+}
+
 UnionNode::UnionNode(ProjectionNameVector unionProjectionNames, ABTVector children)
-    : Base(std::move(children),
+    : UnionNode(std::move(unionProjectionNames), NodeChildrenHolder{std::move(children)}) {}
+
+UnionNode::UnionNode(ProjectionNameVector unionProjectionNames, NodeChildrenHolder children)
+    : Base(std::move(children._nodes),
            buildSimpleBinder(unionProjectionNames),
-           buildUnionReferences(unionProjectionNames, children.size())) {
-    uassert(6624007, "Empty union", !unionProjectionNames.empty());
+           buildUnionTypeReferences(unionProjectionNames, children._numOfNodes)) {
+    tassert(
+        6624007, "UnionNode must have a non-empty projection list", !unionProjectionNames.empty());
 
     for (auto& n : nodes()) {
         assertNodeSort(n);
@@ -593,8 +803,8 @@ GroupByNode::GroupByNode(ProjectionNameVector groupByProjectionNames,
            make<References>(groupByProjectionNames)),
       _type(type) {
     assertNodeSort(getChild());
-    uassert(6624300,
-            "Mismatched number of agg expressions and names",
+    tassert(6624300,
+            "Mismatched number of agg expressions and projection names",
             getAggregationExpressions().size() == getAggregationProjectionNames().size());
 }
 
@@ -653,7 +863,7 @@ UniqueNode::UniqueNode(ProjectionNameVector projections, ABT child)
     : Base(std::move(child), make<References>(ProjectionNameVector{projections})),
       _projections(std::move(projections)) {
     assertNodeSort(getChild());
-    uassert(6624092, "Empty projections", !_projections.empty());
+    tassert(6624092, "UniqueNode must have a non-empty projection list", !_projections.empty());
 }
 
 bool UniqueNode::operator==(const UniqueNode& other) const {
@@ -666,6 +876,75 @@ const ProjectionNameVector& UniqueNode::getProjections() const {
 
 const ABT& UniqueNode::getChild() const {
     return get<0>();
+}
+
+ABT& UniqueNode::getChild() {
+    return get<0>();
+}
+
+SpoolProducerNode::SpoolProducerNode(const SpoolProducerType type,
+                                     const int64_t spoolId,
+                                     ProjectionNameVector projections,
+                                     ABT filter,
+                                     ABT child)
+    : Base(std::move(child),
+           std::move(filter),
+           buildSimpleBinder(projections),
+           make<References>(projections)),
+      _type(type),
+      _spoolId(spoolId) {
+    assertNodeSort(getChild());
+    assertExprSort(getFilter());
+    tassert(
+        6624155, "Spool producer must have a non-empty projection list", !binder().names().empty());
+    tassert(6624120,
+            "Invalid combination of spool producer type and spool filter",
+            _type == SpoolProducerType::Lazy || getFilter() == Constant::boolean(true));
+}
+
+bool SpoolProducerNode::operator==(const SpoolProducerNode& other) const {
+    return _type == other._type && _spoolId == other._spoolId && getFilter() == other.getFilter() &&
+        binder() == other.binder();
+}
+
+SpoolProducerType SpoolProducerNode::getType() const {
+    return _type;
+}
+
+int64_t SpoolProducerNode::getSpoolId() const {
+    return _spoolId;
+}
+
+const ABT& SpoolProducerNode::getFilter() const {
+    return get<1>();
+}
+
+const ABT& SpoolProducerNode::getChild() const {
+    return get<0>();
+}
+
+ABT& SpoolProducerNode::getChild() {
+    return get<0>();
+}
+
+SpoolConsumerNode::SpoolConsumerNode(const SpoolConsumerType type,
+                                     const int64_t spoolId,
+                                     ProjectionNameVector projections)
+    : Base(buildSimpleBinder(projections)), _type(type), _spoolId(spoolId) {
+    tassert(
+        6624125, "Spool consumer must have a non-empty projection list", !binder().names().empty());
+}
+
+bool SpoolConsumerNode::operator==(const SpoolConsumerNode& other) const {
+    return _type == other._type && _spoolId == other._spoolId && binder() == other.binder();
+}
+
+SpoolConsumerType SpoolConsumerNode::getType() const {
+    return _type;
+}
+
+int64_t SpoolConsumerNode::getSpoolId() const {
+    return _spoolId;
 }
 
 CollationNode::CollationNode(properties::CollationRequirement property, ABT child)
@@ -724,9 +1003,9 @@ ExchangeNode::ExchangeNode(const properties::DistributionRequirement distributio
     : Base(std::move(child), buildReferences(distribution.getAffectedProjectionNames())),
       _distribution(std::move(distribution)) {
     assertNodeSort(getChild());
-    uassert(6624008,
+    tassert(6624008,
             "Cannot exchange towards an unknown distribution",
-            distribution.getDistributionAndProjections()._type !=
+            _distribution.getDistributionAndProjections()._type !=
                 DistributionType::UnknownPartitioning);
 }
 

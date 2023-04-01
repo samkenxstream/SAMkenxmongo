@@ -36,6 +36,7 @@
 #include "mongo/base/initializer.h"
 #include "mongo/bson/json.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
 
@@ -284,7 +285,7 @@ protected:
         return std::string(stitch_support_v1_status_get_explanation(updateStatus));
     }
 
-    const std::string getModifiedPaths() {
+    std::string getModifiedPaths() {
         ASSERT(updateDetails);
 
         std::stringstream ss;
@@ -385,11 +386,17 @@ TEST_F(StitchSupportTest, CheckMatchWorksWithStatus) {
               checkMatchStatus("{$where: 'this.a == 1'}", "{a: 1}"));
     ASSERT_EQ("$text is not allowed in this context",
               checkMatchStatus("{$text: {$search: 'stitch'}}", "{a: 'stitch lib'}"));
-    ASSERT_EQ("$geoNear, $near, and $nearSphere are not allowed in this context",
-              checkMatchStatus(
-                  "{location: {$near: {$geometry: {type: 'Point', "
-                  "coordinates: [ -73.9667, 40.78 ] }, $minDistance: 10, $maxDistance: 500}}}",
-                  "{type: 'Point', 'coordinates': [100.0, 0.0]}"));
+    ASSERT_EQ(
+        "$geoNear, $near, and $nearSphere are not allowed in this context, "
+        "as these operators require sorting geospatial data. If you do not "
+        "need sort, consider using $geoWithin instead. Check out "
+        "https://dochub.mongodb.org/core/near-sort-operation and "
+        "https://dochub.mongodb.org/core/nearSphere-sort-operation"
+        "for more details.",
+        checkMatchStatus(
+            "{location: {$near: {$geometry: {type: 'Point', "
+            "coordinates: [ -73.9667, 40.78 ] }, $minDistance: 10, $maxDistance: 500}}}",
+            "{type: 'Point', 'coordinates': [100.0, 0.0]}"));
 
     // 'check_match' cannot actually fail so we do not test it with a status.
 }
@@ -637,13 +644,13 @@ int main(const int argc, const char* const* const argv) {
     auto ret = mongo::runGlobalInitializers(std::vector<std::string>{argv, argv + argc});
     if (!ret.isOK()) {
         std::cerr << "Global initilization failed";
-        return EXIT_FAILURE;
+        return static_cast<int>(mongo::ExitCode::fail);
     }
 
     ret = mongo::runGlobalDeinitializers();
     if (!ret.isOK()) {
         std::cerr << "Global deinitilization failed";
-        return EXIT_FAILURE;
+        return static_cast<int>(mongo::ExitCode::fail);
     }
 
     const auto result = ::mongo::unittest::Suite::run(std::vector<std::string>(), "", "", 1);

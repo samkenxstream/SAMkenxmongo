@@ -34,6 +34,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/dbmessage.h"
+#include "mongo/logv2/log_severity.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/future.h"
 
@@ -56,7 +57,7 @@ public:
     /**
      * Begin running a new Session. This method returns immediately.
      */
-    virtual void startSession(transport::SessionHandle session) = 0;
+    virtual void startSession(std::shared_ptr<transport::Session> session) = 0;
 
     /**
      * End all sessions that do not match the mask in tags.
@@ -91,6 +92,13 @@ public:
     }
 
     /**
+     * Returns the current severity to log slow SessionWorkflow lifecycles. Returns a suppressed
+     * severity every X seconds (defined in SEP::impl) to prevent logs from overwhelming the rest
+     * of the system.
+     */
+    virtual logv2::LogSeverity slowSessionWorkflowLogSeverity() = 0;
+
+    /**
      * Processes a request and fills out a DbResponse.
      */
     virtual Future<DbResponse> handleRequest(OperationContext* opCtx,
@@ -101,7 +109,7 @@ public:
      *
      * This function implies that the Session itself will soon be destructed.
      */
-    virtual void onEndSession(const transport::SessionHandle&) {}
+    virtual void onEndSession(const std::shared_ptr<transport::Session>&) {}
 
     /**
      * Optional handler which is invoked after a client connects.
@@ -111,7 +119,7 @@ public:
     /**
      * Optional handler which is invoked after a client disconnect. A client disconnect occurs when
      * the connection between the mongo process and client is closed for any reason, and is defined
-     * by the destruction and cleanup of the ServiceStateMachine that manages the client.
+     * by the destruction and cleanup of the SessionWorkflow that manages the client.
      */
     virtual void onClientDisconnect(Client* client) {}
 

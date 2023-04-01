@@ -51,7 +51,7 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrEnsureChunkVersionIsGreaterThan can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
             ShardingCatalogManager::get(opCtx)->ensureChunkVersionIsGreaterThan(
@@ -64,7 +64,7 @@ public:
 
     private:
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
 
         bool supportsWriteConcern() const override {

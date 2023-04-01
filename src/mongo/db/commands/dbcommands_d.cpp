@@ -27,11 +27,10 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
-#include <time.h>
+#include <ctime>
 
 #include "mongo/base/simple_string_data_comparator.h"
 #include "mongo/base/status_with.h"
@@ -57,7 +56,8 @@
 #include "mongo/db/commands/profile_common.h"
 #include "mongo/db/commands/profile_gen.h"
 #include "mongo/db/commands/server_status.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/commands/set_profiling_filter_globally_cmd.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -70,7 +70,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/profile_filter_impl.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
@@ -92,6 +92,9 @@
 #include "mongo/util/md5.hpp"
 #include "mongo/util/scopeguard.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
 namespace mongo {
 namespace {
 
@@ -100,7 +103,7 @@ MONGO_FAIL_POINT_DEFINE(waitInFilemd5DuringManualYield);
 
 Status _setProfileSettings(OperationContext* opCtx,
                            Database* db,
-                           StringData dbName,
+                           const DatabaseName& dbName,
                            mongo::CollectionCatalog::ProfileSettings newSettings) {
     invariant(db);
 
@@ -148,13 +151,9 @@ public:
 protected:
     CollectionCatalog::ProfileSettings _applyProfilingLevel(
         OperationContext* opCtx,
-        const std::string& dbName,
+        const DatabaseName& dbName,
         const ProfileCmdRequest& request) const final {
         const auto profilingLevel = request.getCommandParameter();
-
-        // The system.profile collection is non-replicated, so writes to it do not cause
-        // replication lag. As such, they should be excluded from Flow Control.
-        opCtx->setShouldParticipateInFlowControl(false);
 
         // An invalid profiling level (outside the range [0, 2]) represents a request to read the
         // current profiling level. Similarly, if the request does not include a filter, we only
@@ -166,7 +165,8 @@ protected:
         // Accessing system.profile collection should not conflict with oplog application.
         ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
             opCtx->lockState());
-        AutoGetDb ctx(opCtx, dbName, dbMode);
+        NamespaceString nss(NamespaceString::makeSystemDotProfileNamespace(dbName));
+        AutoGetCollection ctx(opCtx, nss, dbMode);
         Database* db = ctx.getDb();
 
         // Fetches the database profiling level + filter or the server default if the db does not
@@ -178,9 +178,7 @@ protected:
                 // When setting the profiling level, create the database if it didn't already exist.
                 // When just reading the profiling level, we do not create the database.
                 auto databaseHolder = DatabaseHolder::get(opCtx);
-                // TODO SERVER-63109 Make _setProfileSettings pass TenantDatabaseName.
-                const TenantDatabaseName tenantDbName(boost::none, dbName);
-                db = databaseHolder->openDb(opCtx, tenantDbName);
+                db = databaseHolder->openDb(opCtx, dbName);
             }
 
             auto newSettings = oldSettings;
@@ -204,6 +202,8 @@ protected:
 
 } cmdProfile;
 
+SetProfilingFilterGloballyCmd cmdSetProfilingFilterGlobally;
+
 class CmdFileMD5 : public BasicCommand {
 public:
     CmdFileMD5() : BasicCommand("filemd5") {}
@@ -217,7 +217,7 @@ public:
     }
 
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -225,7 +225,7 @@ public:
         return true;
     }
 
-    virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
         std::string collectionName;
         if (const auto rootElt = cmdObj["root"]) {
             uassert(ErrorCodes::InvalidNamespace,
@@ -236,20 +236,30 @@ public:
         if (collectionName.empty())
             collectionName = "fs";
         collectionName += ".chunks";
-        return NamespaceString(dbname, collectionName).ns();
+        return NamespaceStringUtil::parseNamespaceFromRequest(dbName, collectionName);
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), ActionType::find));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::find)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName& dbName,
              const BSONObj& jsobj,
-             BSONObjBuilder& result) {
-        const NamespaceString nss(parseNs(dbname, jsobj));
+             BSONObjBuilder& result) override {
+        const NamespaceString nss(parseNs(dbName, jsobj));
 
         md5digest d;
         md5_state_t st;
@@ -282,7 +292,7 @@ public:
         BSONObj query = BSON("files_id" << jsobj["filemd5"] << "n" << GTE << n);
         BSONObj sort = BSON("files_id" << 1 << "n" << 1);
 
-        return writeConflictRetry(opCtx, "filemd5", dbname, [&] {
+        return writeConflictRetry(opCtx, "filemd5", dbName.toString(), [&] {
             auto findCommand = std::make_unique<FindCommandRequest>(nss);
             findCommand->setFilter(query.getOwned());
             findCommand->setSort(sort.getOwned());
@@ -308,29 +318,6 @@ public:
                                                     PlanYieldPolicy::YieldPolicy::YIELD_MANUAL,
                                                     QueryPlannerParams::NO_TABLE_SCAN));
 
-            // We need to hold a lock to clean up the PlanExecutor, so make sure we have one when we
-            // exit this block. Because we use an AutoGetCollectionForReadCommand and manual
-            // yielding, we may throw when trying to re-acquire the lock. For example, this can
-            // happen if our operation has been interrupted.
-            ON_BLOCK_EXIT([&]() {
-                if (ctx) {
-                    // We still have the lock. No special action required.
-                    return;
-                }
-
-                // We need to be careful to not use AutoGetCollection or AutoGetDb here, since we
-                // only need the lock to protect potential access to the Collection's CursorManager
-                // and those helpers may throw if something has changed since the last time we took
-                // a lock. For example, AutoGetCollection will throw if this namespace has since
-                // turned into a view and AutoGetDb will throw if the database version is stale.
-                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-                Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
-                invariant(dbLock.isLocked(),
-                          "Expected lock acquisition to succeed due to UninterruptibleLockGuard");
-                Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
-                exec.reset();
-            });
-
             try {
                 BSONObj obj;
                 while (PlanExecutor::ADVANCED == exec->getNext(&obj, nullptr)) {
@@ -346,7 +333,7 @@ public:
                               "Unexpected chunk",
                               "expected"_attr = n,
                               "observed"_attr = myn);
-                        dumpChunks(opCtx, nss.ns(), query, sort);
+                        dumpChunks(opCtx, nss, query, sort);
                         uassert(10040, "chunks out of order", n == myn);
                     }
 
@@ -409,11 +396,11 @@ public:
     }
 
     void dumpChunks(OperationContext* opCtx,
-                    const std::string& ns,
+                    const NamespaceString& ns,
                     const BSONObj& query,
                     const BSONObj& sort) {
         DBDirectClient client(opCtx);
-        FindCommandRequest findRequest{NamespaceString{ns}};
+        FindCommandRequest findRequest{ns};
         findRequest.setFilter(query);
         findRequest.setSort(sort);
         std::unique_ptr<DBClientCursor> c = client.find(std::move(findRequest));
@@ -423,31 +410,6 @@ public:
     }
 
 } cmdFileMD5;
-
-class AvailableQueryOptions : public BasicCommand {
-public:
-    AvailableQueryOptions() : BasicCommand("availableQueryOptions", "availablequeryoptions") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kAlways;
-    }
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return Status::OK();
-    }
-
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& dbname,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-        result << "options" << QueryOption_AllSupported;
-        return true;
-    }
-} availableQueryOptionsCmd;
 
 }  // namespace
 }  // namespace mongo

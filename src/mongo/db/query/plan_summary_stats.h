@@ -29,12 +29,25 @@
 
 #pragma once
 
+#include "mongo/util/duration.h"
 #include <optional>
+#include <set>
 #include <string>
 
 #include "mongo/util/container_size_helper.h"
 
 namespace mongo {
+
+// The precision of 'executionTime'. Note that 'kNanos' precision requires a precise timer which
+// is also slower than the default timer.
+enum class QueryExecTimerPrecision { kNoTiming = 0, kNanos, kMillis };
+
+struct QueryExecTime {
+    // Precision/unit of 'executionTimeEstimate'.
+    QueryExecTimerPrecision precision = QueryExecTimerPrecision::kNoTiming;
+    // Time elapsed while executing this plan.
+    Nanoseconds executionTimeEstimate{0};
+};
 
 /**
  * A container for the summary statistics that the profiler, slow query log, and
@@ -71,13 +84,22 @@ struct PlanSummaryStats {
     long long collectionScansNonTailable = 0;
 
     // Time elapsed while executing this plan.
-    long long executionTimeMillisEstimate = 0;
+    QueryExecTime executionTime;
 
     // Did this plan use an in-memory sort stage?
     bool hasSortStage = false;
 
     // Did this plan use disk space?
     bool usedDisk = false;
+
+    // The total number of spills to disk from sort stages
+    long long sortSpills = 0;
+
+    // The amount of data we've sorted in bytes
+    size_t sortTotalDataSizeBytes = 0;
+
+    // The number of keys that we've sorted.
+    long long keysSorted = 0;
 
     // Did this plan failed during execution?
     bool planFailed = false;
@@ -89,6 +111,8 @@ struct PlanSummaryStats {
     // candidates?
     bool fromMultiPlanner = false;
 
+    // Was this plan recovered from the cache?
+    bool fromPlanCache = false;
     // Was a replan triggered during the execution of this query?
     boost::optional<std::string> replanReason;
 

@@ -8,6 +8,7 @@ from buildscripts.resmokelib.discovery import DiscoveryPlugin
 from buildscripts.resmokelib.generate_fcv_constants import \
     GenerateFCVConstantsPlugin
 from buildscripts.resmokelib.hang_analyzer import HangAnalyzerPlugin
+from buildscripts.resmokelib.multiversion import MultiversionPlugin
 from buildscripts.resmokelib.powercycle import PowercyclePlugin
 from buildscripts.resmokelib.run import RunPlugin
 from buildscripts.resmokelib.symbolizer import SymbolizerPlugin
@@ -21,12 +22,12 @@ _PLUGINS = [
     SymbolizerPlugin(),
     GenerateFCVConstantsPlugin(),
     DiscoveryPlugin(),
+    MultiversionPlugin(),
 ]
 
 
-def parse(sys_args, usage=None):
-    """Parse the CLI args."""
-
+def get_parser(usage=None):
+    """Get the resmoke parser."""
     parser = argparse.ArgumentParser(usage=usage)
     subparsers = parser.add_subparsers(dest="command")
     parser.add_argument("--configDir", dest="config_dir", metavar="CONFIG_DIR",
@@ -36,6 +37,13 @@ def parse(sys_args, usage=None):
     for plugin in _PLUGINS:
         plugin.add_subcommand(subparsers)
 
+    return parser
+
+
+def parse(sys_args, usage=None):
+    """Parse the CLI args."""
+
+    parser = get_parser(usage=usage)
     parsed_args = parser.parse_args(sys_args)
 
     return parser, parsed_args

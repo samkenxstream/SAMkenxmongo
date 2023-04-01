@@ -221,7 +221,7 @@ public:
 
     const char* getSourceName() const final;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     /**
      * DocumentSourceExchange does not have a direct source (it is reading through the shared
@@ -245,6 +245,11 @@ public:
 
     auto getConsumerId() const {
         return _consumerId;
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {
+        // Any correlation analysis should have happened before this stage was created.
+        MONGO_UNREACHABLE;
     }
 
 private:

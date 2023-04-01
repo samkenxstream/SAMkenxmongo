@@ -27,20 +27,24 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/session_update_tracker.h"
 
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/ops/write_ops_retryability.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/session.h"
-#include "mongo/db/session_txn_record_gen.h"
-#include "mongo/db/transaction_participant_gen.h"
+#include "mongo/db/session/session.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/transaction/transaction_participant_gen.h"
+#include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
@@ -53,12 +57,8 @@ OplogEntry createOplogEntryForTransactionTableUpdate(repl::OpTime opTime,
                                                      const BSONObj& updateBSON,
                                                      const BSONObj& o2Field,
                                                      Date_t wallClockTime) {
-    // The transaction table (config.transactions) is currently shared by all tenants, so an update
-    // to it is not expected to have a tenant id
     return {repl::DurableOplogEntry(opTime,
-                                    boost::none,  // hash
                                     repl::OpTypeEnum::kUpdate,
-                                    boost::none,  // tenant id
                                     NamespaceString::kSessionTransactionsTableNamespace,
                                     boost::none,  // uuid
                                     false,        // fromMigrate
@@ -212,7 +212,8 @@ boost::optional<std::vector<OplogEntry>> SessionUpdateTracker::_updateSessionInf
             return {};
         }
 
-        if (!entry.getObject2()) {
+        if (!entry.getObject2() ||
+            (entry.getObject2()->isEmpty() && !isWouldChangeOwningShardSentinelOplogEntry(entry))) {
             return {};
         }
     }
@@ -266,6 +267,13 @@ std::vector<OplogEntry> SessionUpdateTracker::_flush(const OplogEntry& entry) {
 
         case OpTypeEnum::kCommand:
             return flushAll();
+
+        // The following cases should never be hit, we break to hit MONGO_UNREACHABLE. Reason:
+        // SessionUpdateTracker should only be called when the ns target is config.transactions or
+        // config.$cmd. This should never be the case with global index operations.
+        case OpTypeEnum::kInsertGlobalIndexKey:
+        case OpTypeEnum::kDeleteGlobalIndexKey:
+            break;
     }
 
     MONGO_UNREACHABLE;
@@ -287,7 +295,7 @@ std::vector<OplogEntry> SessionUpdateTracker::flushAll() {
 std::vector<OplogEntry> SessionUpdateTracker::_flushForQueryPredicate(
     const BSONObj& queryPredicate) {
     auto idField = queryPredicate["_id"].Obj();
-    auto lsid = LogicalSessionId::parse(IDLParserErrorContext("lsidInOplogQuery"), idField);
+    auto lsid = LogicalSessionId::parse(IDLParserContext("lsidInOplogQuery"), idField);
     auto iter = _sessionsToUpdate.find(lsid);
 
     if (iter == _sessionsToUpdate.end()) {
@@ -344,9 +352,10 @@ boost::optional<OplogEntry> SessionUpdateTracker::_createTransactionTableUpdateF
                         // The prepare oplog entry is the first operation of the transaction.
                         newTxnRecord.setStartOpTime(entry.getOpTime());
                     } else {
-                        // Update the transaction record using $set to avoid overwriting the
-                        // startOpTime.
-                        return BSON("$set" << newTxnRecord.toBSON());
+                        // Update the transaction record using a delta oplog entry to avoid
+                        // overwriting the startOpTime.
+                        return update_oplog_entry::makeDeltaOplogEntry(
+                            BSON(doc_diff::kUpdateSectionFieldName << newTxnRecord.toBSON()));
                     }
                 } else {
                     newTxnRecord.setState(DurableTxnStateEnum::kCommitted);

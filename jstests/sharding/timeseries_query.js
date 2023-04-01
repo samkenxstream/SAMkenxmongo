@@ -4,7 +4,6 @@
  *
  * @tags: [
  *   requires_fcv_51,
- *   requires_find_command,
  * ]
  */
 
@@ -122,7 +121,7 @@ function runQuery(
                 if (expectCollScan) {
                     assert(isCollscan(sDB, winningPlan));
                 } else {
-                    assert(isIxscan(sDB, winningPlan));
+                    assert(isIxscan(sDB, winningPlan) || isClusteredIxscan(sDB, winningPlan));
                 }
             });
         });

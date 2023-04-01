@@ -50,7 +50,11 @@ public:
             auto* as = AuthorizationSession::get(opCtx->getClient());
 
             ConnectionStatusReplyAuthInfo info;
-            info.setAuthenticatedUsers(iteratorToVector<UserName>(as->getAuthenticatedUserNames()));
+            std::vector<UserName> userNames;
+            if (auto userName = as->getAuthenticatedUserName()) {
+                userNames.push_back(std::move(userName.value()));
+            }
+            info.setAuthenticatedUsers(std::move(userNames));
             info.setAuthenticatedUserRoles(
                 iteratorToVector<RoleName>(as->getAuthenticatedRoleNames()));
             if (request().getShowPrivileges()) {
@@ -77,9 +81,8 @@ public:
             // entries in the connection status output.
             User::ResourcePrivilegeMap unified;
 
-            for (auto nameIt = as->getAuthenticatedUserNames(); nameIt.more(); nameIt.next()) {
-                auto* authUser = as->lookupUser(*nameIt);
-                for (const auto& privIter : authUser->getPrivileges()) {
+            if (auto authUser = as->getAuthenticatedUser()) {
+                for (const auto& privIter : authUser.value()->getPrivileges()) {
                     auto it = unified.find(privIter.first);
                     if (it == unified.end()) {
                         unified[privIter.first] = privIter.second;
@@ -106,7 +109,7 @@ public:
         }
 
         NamespaceString ns() const final {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 

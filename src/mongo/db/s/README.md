@@ -9,6 +9,12 @@ of horizontal scaling or "sharding", the
 and the concept of a
 [**shard key in MongoDB**](https://docs.mongodb.com/manual/sharding/#shard-keys).
 
+## Sharding acronyms
+
+* CSRS: **C**onfig **S**erver as a **R**eplica **S**et. This is a fancy name for the [Config server](https://www.mongodb.com/docs/manual/core/sharded-cluster-config-servers/). Comes from the times of version 3.2 and earlier, when there was a legacy type of Config server called [SCCC](https://www.mongodb.com/docs/manual/release-notes/3.4-compatibility/#removal-of-support-for-sccc-config-servers).
+* Config Shard: Same as CSRS.
+* ConfigData: The set of collections residing on the CSRS, which contain state about the cluster.
+
 ---
 
 # Routing
@@ -22,10 +28,10 @@ corresponding data.
 The authoritative routing table is stored in a set of unsharded collections in the config database
 on the config server replica set. The schemas of the relevant collections are:
 
-* [**config.databases**](https://docs.mongodb.com/manual/reference/config-database/#config.databases)
-* [**config.collections**](https://docs.mongodb.com/manual/reference/config-database/#config.collections)
-* [**config.chunks**](https://docs.mongodb.com/manual/reference/config-database/#config.chunks)
-* [**config.shards**](https://docs.mongodb.com/manual/reference/config-database/#config.shards)
+* [**config.databases**](https://www.mongodb.com/docs/manual/reference/config-database/#mongodb-data-config.databases)
+* [**config.collections**](https://www.mongodb.com/docs/manual/reference/config-database/#mongodb-data-config.collections)
+* [**config.chunks**](https://www.mongodb.com/docs/manual/reference/config-database/#mongodb-data-config.chunks)
+* [**config.shards**](https://www.mongodb.com/docs/manual/reference/config-database/#mongodb-data-config.shards)
 
 #### Code references
 
@@ -41,6 +47,8 @@ copy of the routing table cache exists on each router and shard.
 
 Operations consult the routing table cache in order to route requests to shards that hold data for
 a collection.
+
+This [section](README_routing_info_cache_consistency_model.md#consistency-model-of-the-routing-table-cache) describes the conceptual consistency model of the routing table cache.
 
 ### How the routing table cache refreshes
 
@@ -63,17 +71,17 @@ will update its in-memory state with its corresponding source.
 
 ### When the routing table cache will refresh
 
-The routing table cache is “lazy.” It does not refresh from its source unless necessary. The cache
+The routing table cache is "lazy." It does not refresh from its source unless necessary. The cache
 will refresh in two scenarios:
 
 1. A request sent to a shard returns an error indicating that the shard’s known routing information for that request doesn't match the sender's routing information.
 2. The cache attempts to access information for a collection that has been locally marked as having out-of-date routing information (stale).
 
 Operations that change a collection’s routing information (for example, a moveChunk command that
-updates a chunk’s location) will mark the local node’s routing table cache as “stale” for affected
+updates a chunk’s location) will mark the local node’s routing table cache as "stale" for affected
 shards. Subsequent attempts to access routing information for affected shards will block on a
 routing table cache refresh. Some operations, such as dropCollection, will affect all shards. In
-this case, the entire collection will be marked as “stale.” Accordingly, subsequent attempts to
+this case, the entire collection will be marked as "stale." Accordingly, subsequent attempts to
 access any routing information for the collection will block on a routing table cache refresh.
 
 ### Types of refreshes
@@ -121,29 +129,31 @@ databases for unsharded collections.
 
 The shard versioning protocol tracks the placement of chunks for sharded collections.
 
-Each chunk has a version called the "chunk version." A chunk version is represented as C<M, m, E> and consists of three elements:
+Each chunk has a version called the "chunk version." A chunk version is represented as C<E, T, M, m> and consists of four elements:
 
-1. The *M* major version - an integer incremented when a chunk moves shards.
-1. The *m* minor version - an integer incremented when a chunk is split.
-1. The *E* epoch  - an object ID shared among all chunks for a collection that distinguishes a unique instance of the collection. The epoch remains unchanged for the lifetime of the chunk, unless the collection is dropped or the collection's shard key has been refined using the refineCollectionShardKey command.
+1. The *E* epoch  - an object ID shared among all chunks for a collection that distinguishes a unique instance of the collection.
+1. The *T* timestamp - a new unique identifier for a collection introduced in version 5.0. The difference between epoch and timestamp is that timestamps are comparable, allowing for distinguishing between two instances of a collection in which the epoch/timestamp do not match.
+1. The *M* major version - an integer used to specify a change on the data placement (i.e. chunk migration).
+1. The *m* minor version - An integer used to specify that a chunk has been resized (i.e. split or merged).
 
 To completely define the shard versioning protocol, we introduce two extra terms - the "shard
 version" and "collection version."
 
-1. Shard version - For a sharded collection, this is the highest chunk version seen on a particular shard. The version of the *i* shard is represented as SV<sub>i</sub><M<sub>SV<sub>i</sub></sub>, m<sub>SV<sub>i</sub></sub>, E<sub>SV<sub>i</sub></sub>>.
-1. Collection version - For a sharded collection, this is the highest chunk version seen across all shards. The collection version is represented as CV<M<sub>cv</sub>, m<sub>cv</sub>, E<sub>cv</sub>>.
+1. Shard version - For a sharded collection, this is the highest chunk version seen on a particular shard. The version of the *i* shard is represented as SV<sub>i</sub><E<sub>SV<sub>i</sub></sub>, T<sub>SV<sub>i</sub></sub>, M<sub>SV<sub>i</sub></sub>, m<sub>SV<sub>i</sub></sub>>.
+1. Collection version - For a sharded collection, this is the highest chunk version seen across all shards. The collection version is represented as CV<E<sub>cv</sub>, T<sub>cv</sub>, M<sub>cv</sub>, m<sub>cv</sub>>.
 
 ### Database versioning
 
 The database versioning protocol tracks the placement of databases for unsharded collections. The
-"database version" indicates on which shard a database currently exists. A database version is represented as DBV<uuid, Mod> and consists of two elements:
+"database version" indicates on which shard a database currently exists. A database version is represented as DBV<uuid, T, Mod> and consists of two elements:
 
 1. The UUID - a unique identifier to distinguish different instances of the database. The UUID remains unchanged for the lifetime of the database, unless the database is dropped and recreated.
+1. The *T* timestamp - a new unique identifier introduced in version 5.0. Unlike the UUID, the timestamp allows for ordering database versions in which the UUID/Timestamp do not match.
 1. The last modified field - an integer incremented when the database changes its primary shard.
 
 ### Versioning updates
 
-Nodes that track chunk/database versions “lazily” load versioning information. A router or shard
+Nodes that track chunk/database versions "lazily" load versioning information. A router or shard
 will only find out that its internally-stored versioning information is stale via receiving changed
 version information from another node.
 
@@ -156,36 +166,36 @@ scenarios:
 
 ### Types of operations that will cause the versioning information to become stale
 
-Before going through the table that explains which operations modify the versioning information and how, it is important to give a bit more information about the move chunk operation. When we move a chunk C from the *i* shard to the *j* shard, where *i* and *j* are different, we end up updating the shard version of both shards. For the recipient shard (i.e. *j* shard), the version of the migrated chunk defines its shard version. For the donor shard (i.e. *i* shard) what we do is look for another chunk of that collection on that shard and update its version. That chunk is called the control chunk and its version defines the *i* shard version. If there are no other chunks, the shard version is updated to SV<sub>i</sub><0, 0, E<sub>cv</sub>>.
+Before going through the table that explains which operations modify the versioning information and how, it is important to give a bit more information about the move chunk operation. When we move a chunk C from the *i* shard to the *j* shard, where *i* and *j* are different, we end up updating the shard version of both shards. For the recipient shard (i.e. *j* shard), the version of the migrated chunk defines its shard version. For the donor shard (i.e. *i* shard) what we do is look for another chunk of that collection on that shard and update its version. That chunk is called the control chunk and its version defines the *i* shard version. If there are no other chunks, the shard version is updated to SV<sub>i</sub><E<sub>cv</sub>, T<sub>cv</sub>, 0, 0>.
 
 Operation Type                                      | Version Modification Behavior                                                                                |
 --------------                                      | -----------------------------                                                                                |
-Moving a chunk C <br> C<M, m, E>                    | C<M<sub>cv</sub> + 1, 0, E<sub>cv</sub>> <br> ControlChunk<M<sub>cv</sub> + 1, 1, E<sub>cv</sub>> if any      |
-Splitting a chunk C into n pieces <br> C<M, m, E>   | C<sub>new 1</sub><M<sub>cv</sub>, m<sub>cv</sub> + 1, E<sub>cv</sub>> <br> ... <br> C<sub>new n</sub><M<sub>cv</sub>, m<sub>cv</sub> + n, E<sub>cv</sub>>                                                         |
-Merging chunks C<sub>1</sub>, ..., C<sub>n</sub> <br> C<sub>1</sub><M<sub>1</sub>, m<sub>1</sub>, E<sub>1</sub>> <br> ... <br> C<sub>n</sub><M<sub>n</sub>, m<sub>n</sub>, E<sub>n</sub>> <br> | C<sub>new</sub><M<sub>cv</sub>, m<sub>cv</sub> + 1, E<sub>cv</sub>>    |
-Dropping a collection                               | SV<sub>i</sub><0, 0, objectid()> forall i in 1 <= i  <= #Shards                                              |
-Refining a collection's shard key                   | C<sub>i</sub><M<sub>i</sub>, m<sub>i</sub>, E<sub>new</sub>>  forall i in 1 <= i  <= #Chunks                 |
-Changing the primary shard for a DB <br> DBV<uuid, Mod> | DBV<uuid, Mod + 1>                                                                                       |
+Moving a chunk C <br> C<E, T, M, m>                    | C<E<sub>cv</sub>, T<sub>cv</sub>, M<sub>cv</sub> + 1, 0> <br> ControlChunk<E<sub>cv</sub>, T<sub>cv</sub>, M<sub>cv</sub> + 1, 1> if any      |
+Splitting a chunk C into n pieces <br> C<E, T, M, m>   | C<sub>new 1</sub><E<sub>cv</sub>, T<sub>cv</sub>, M<sub>cv</sub>, m<sub>cv</sub> + 1> <br> ... <br> C<sub>new n</sub><E<sub>cv</sub>, T<sub>cv</sub>, M<sub>cv</sub>, m<sub>cv</sub> + n>                                                         |
+Merging chunks C<sub>1</sub>, ..., C<sub>n</sub> <br> C<sub>1</sub><E<sub>1</sub>, T<sub>1</sub>, M<sub>1</sub>, m<sub>1</sub>> <br> ... <br> C<sub>n</sub><E<sub>n</sub>, T<sub>n</sub>, M<sub>n</sub>, m<sub>n</sub>> <br> | C<sub>new</sub><E<sub>cv</sub>, T<sub>cv</sub>, M<sub>cv</sub>, m<sub>cv</sub> + 1>    |
+Dropping a collection                               | The dropped collection doesn't have a SV - all chunks are deleted                                              |
+Refining a collection's shard key                   | C<sub>i</sub><E<sub>new</sub>, T<sub>now</sub>, M<sub>i</sub>, m<sub>i</sub>>  forall i in 1 <= i  <= #Chunks                 |
+Changing the primary shard for a DB <br> DBV<uuid, T, Mod> | DBV<uuid, T, Mod + 1>                                                                                       |
 Dropping a database                                 | The dropped DB doesn't have a DBV                                                                            |
 
 ### Special versioning conventions
 
 Chunk versioning conventions
 
-Convention Type                           | Major Version | Minor Version | Epoch        |
----------------                           | ------------- | ------------- | -----        |
-First chunk for sharded collection        | 1             | 0             | ObjectId()   |
-Collection is unsharded                   | 0             | 0             | ObjectId()   |
-Collection was dropped                    | 0             | 0             | ObjectId()   |
-Ignore the chunk version for this request | 0             | 0             | Max DateTime |
+Convention Type                           | Epoch        | Timestamp        | Major Version | Minor Version |
+---------------                           | -----        |--------------    | ------------- | ------------- |
+First chunk for sharded collection        | ObjectId()   | current time     | 1             | 0             |
+Collection is unsharded                   | ObjectId()   | Timestamp()      | 0             | 0             |
+Collection was dropped                    | ObjectId()   | Timestamp()      | 0             | 0             |
+Ignore the chunk version for this request | Max DateTime | Timestamp::max() | 0             | 0             |
 
 Database version conventions
 
-Convention Type | UUID   | Last Modified |
---------------- | ----   | ------------- |
-New database    | UUID() | 1             |
-Config database | UUID() | 0             |
-Admin database  | UUID() | 0             |
+Convention Type | UUID   | Timestamp | Last Modified |
+--------------- | ----   | --------- | ------------- |
+New database    | UUID() | current time | 1          |
+Config database | UUID() | current time | 0          |
+Admin database  | UUID() | current time | 0          |
 
 #### Code references
 
@@ -257,7 +267,7 @@ A chunk is moved from one shard to another by the moveChunk command. This comman
 1. **Start the migration** - The ActiveMigrationsRegistry is [updated on the donor side](https://github.com/mongodb/mongo/blob/3f849d508692c038afb643b1acb99b8a8cb98d38/src/mongo/db/s/move_chunk_command.cpp#L138) to reflect that a specific chunk is being moved. This prevents any other chunk migrations from happening on this shard until the migration is completed. If an existing incoming or outgoing migration is in flight then the registration will fail and the migration will be aborted. If the inflight operation is for the same chunk then the the registration call will return an object that the moveChunk command can use to join the current operation.
 1. **Start cloning the chunk** - After validating the migration parameters, the donor starts the migration process by sending the _recvChunkStart message to the recipient. This causes the recipient to then [initiate the transfer of documents](https://github.com/mongodb/mongo/blob/5c72483523561c0331769abc3250cf623817883f/src/mongo/db/s/migration_destination_manager.cpp#L955) from the donor. The initial transfer of documents is done by [repeatedly sending the _migrateClone command to the donor](https://github.com/mongodb/mongo/blob/5c72483523561c0331769abc3250cf623817883f/src/mongo/db/s/migration_destination_manager.cpp#L1042) and inserting the fetched documents on the recipient.
 1. **Transfer queued modifications** - Once the initial batch of documents are copied, the recipient then needs to retrieve any modifications that have been queued up on the donor. This is done by  [repeatedly sending the _transferMods command to the donor](https://github.com/mongodb/mongo/blob/5c72483523561c0331769abc3250cf623817883f/src/mongo/db/s/migration_destination_manager.cpp#L1060-L1111). These are [inserts, updates and deletes](https://github.com/mongodb/mongo/blob/11eddfac181ff6ff9faf3e1d55c050373bc6fc24/src/mongo/db/s/migration_chunk_cloner_source_legacy.cpp#L534-L550) that occurred on the donor while the initial batch was being transferred.
-1. **Wait for recipient to clone documents** - The donor [polls the recipient](https://github.com/mongodb/mongo/blob/3f849d508692c038afb643b1acb99b8a8cb98d38/src/mongo/db/s/migration_chunk_cloner_source_legacy.cpp#L984) to see when the transfer of documents has been completed or the timeout has been exceeded. This is indicated when the recipient returns a state of “steady” as a result of the _recvChunkStatus command.
+1. **Wait for recipient to clone documents** - The donor [polls the recipient](https://github.com/mongodb/mongo/blob/3f849d508692c038afb643b1acb99b8a8cb98d38/src/mongo/db/s/migration_chunk_cloner_source_legacy.cpp#L984) to see when the transfer of documents has been completed or the timeout has been exceeded. This is indicated when the recipient returns a state of "steady" as a result of the _recvChunkStatus command.
 1. **Enter the critical section** - Once the recipient has cloned the initial documents, the donor then [declares that it is in a critical section](https://github.com/mongodb/mongo/blob/3f849d508692c038afb643b1acb99b8a8cb98d38/src/mongo/db/s/migration_source_manager.cpp#L344). This indicates that the next operations must not be interrupted and will require recovery actions if they are interrupted. Writes to the donor shard will be suspended while the critical section is in effect. The mechanism to implement the critical section writes the ShardingStateRecovery document to store the minimum optime of the sharding config metadata. If this document exists on stepup it is used to update the optime so that the correct metadata is used.
 1. **Commit on the recipient** - While in the critical section, the [_recvChunkCommit](https://github.com/mongodb/mongo/blob/3f849d508692c038afb643b1acb99b8a8cb98d38/src/mongo/db/s/migration_chunk_cloner_source_legacy.cpp#L360) command is sent to the recipient directing it to fetch any remaining documents for this chunk. The recipient responds by sending _transferMods to fetch the remaining documents while writes are blocked on the donor. Once the documents are transferred successfully, the _recvChunkCommit command returns its status to unblock the donor.
 1. **Commit on the config server** - The donor sends the _configsvrCommitChunkMigration command to the config server. Before the command is sent, [reads are also suspended](https://github.com/mongodb/mongo/blob/3f849d508692c038afb643b1acb99b8a8cb98d38/src/mongo/db/s/migration_source_manager.cpp#L436) on the donor shard.
@@ -266,7 +276,7 @@ A chunk is moved from one shard to another by the moveChunk command. This comman
 * [ActiveMigrationRegistry](https://github.com/mongodb/mongo/blob/9be1041342b666e979aaea483c2fdb929c801796/src/mongo/db/s/active_migrations_registry.h#L52) class
 * [MigrationSourceManager](https://github.com/mongodb/mongo/blob/2c87953010c2c1ec2d39dc9a7dbbd5f7d49dab10/src/mongo/db/s/migration_source_manager.h#L70) class
 * [MigrationDestinationManager](https://github.com/mongodb/mongo/blob/2c87953010c2c1ec2d39dc9a7dbbd5f7d49dab10/src/mongo/db/s/migration_destination_manager.h#L71) class
-* [MigrationChunkClonerSourceLegacy](https://github.com/mongodb/mongo/blob/11eddfac181ff6ff9faf3e1d55c050373bc6fc24/src/mongo/db/s/migration_chunk_cloner_source_legacy.h#L82) class
+* [MigrationChunkClonerSource](https://github.com/mongodb/mongo/blob/11eddfac181ff6ff9faf3e1d55c050373bc6fc24/src/mongo/db/s/migration_chunk_cloner_source.h#L82) class
 * [ShardingStateRecovery](https://github.com/mongodb/mongo/blob/2c87953010c2c1ec2d39dc9a7dbbd5f7d49dab10/src/mongo/db/s/sharding_state_recovery.h#L47) class
 
 ## Orphaned range deletion
@@ -512,8 +522,7 @@ collections, such as config.shards, config.chunks, and config.tags. For example,
 mergeChunks, and moveChunk all take the chunk ResourceMutex.
 
 #### Code references
-* [**DistLockManager class**](https://github.com/mongodb/mongo/blob/master/src/mongo/db/s/dist_lock_manager.h)
-* [**DistLockCatalog class**](https://github.com/mongodb/mongo/blob/master/src/mongo/db/s/dist_lock_catalog.h)
+* [**DDLLockManager class**](https://github.com/mongodb/mongo/blob/master/src/mongo/db/s/ddl_lock_manager.h)
 * The
 [**global ResourceMutexes**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/s/config/sharding_catalog_manager.h#L555-L581)
 
@@ -752,10 +761,14 @@ operations. The metadata is reaped if the cluster does not receive a new operati
 session for a reasonably long time (the default is 30 minutes).
 
 A logical session is identified by its "logical session id," or `lsid`. An `lsid` is a combination
-of two pieces of information:
+of up to four pieces of information:
 
 1. `id` - A globally unique id (UUID) generated by the mongo shell, driver, or the `startSession` server command
 1. `uid` (user id) - The identification information for the logged-in user (if authentication is enabled)
+1. `txnNumber` - An optional parameter set only for internal transactions spawned from retryable writes. Strictly-increasing counter set by the transaction API to match the txnNumber of the corresponding retryable write.
+1. `txnUUID` - An optional parameter set only for internal transactions spawned inside client sessions. The txnUUID is a globally unique id generated by the transaction API.
+
+A logical session with a `txnNumber` and `txnUUID` is considered a child of the session with matching `id` and `uid` values. There may be multiple child sessions per parent session, and checking out a child/parents session checks out the other and updates the `lastUsedTime` of both. Killing a parent session also kills all of its child sessions.
 
 The order of operations in the logical session that need to durably store metadata is defined by an
 integer counter, called the `txnNumber`. When the cluster receives a retryable write or transaction
@@ -790,7 +803,7 @@ thirty (30) minutes out by default, but is user-configurable. This means that if
 in that use a session for thirty minutes, the TTL index will remove the session from the sessions
 collection. When the logical session cache performs its periodic refresh (defined below), it will
 find all sessions that currently exist in the cache that no longer exist in the sessions
-collection. This is the set of sessions that we consider “expired.” The expired sessions are then
+collection. This is the set of sessions that we consider "expired". The expired sessions are then
 removed from the in-memory cache.
 
 ### How a session gets placed into the logical session cache
@@ -835,7 +848,7 @@ the following steps will be performed:
 * [Place where a session is placed (or replaced) in the logical session cache](https://github.com/mongodb/mongo/blob/1f94484d52064e12baedc7b586a8238d63560baf/src/mongo/db/logical_session_cache.h#L71-L75)
 * [The logical session cache refresh function](https://github.com/mongodb/mongo/blob/1f94484d52064e12baedc7b586a8238d63560baf/src/mongo/db/logical_session_cache_impl.cpp#L207-L355)
 * [The periodic job to clean up the session catalog and transactions table (the "reap" function)](https://github.com/mongodb/mongo/blob/1f94484d52064e12baedc7b586a8238d63560baf/src/mongo/db/logical_session_cache_impl.cpp#L141-L205)
-* [Location of the session catalog and transactions table cleanup code on mongod](https://github.com/mongodb/mongo/blob/1f94484d52064e12baedc7b586a8238d63560baf/src/mongo/db/session_catalog_mongod.cpp#L331-L398)
+* [Location of the session catalog and transactions table cleanup code on mongod](https://github.com/mongodb/mongo/blob/1f94484d52064e12baedc7b586a8238d63560baf/src/mongo/db/session/session_catalog_mongod.cpp#L331-L398)
 
 ## The logical session catalog
 
@@ -848,8 +861,12 @@ and to check the session back in upon completion. When a session is checked out,
 until it is checked back in, forcing other operations to wait for the ongoing operation to complete
 or yield the session.
 
+Checking out an internal/child session additionally checks out its parent session (the session with the same `id` and `uid` value in the lsid, but without a `txnNumber` or `txnUUID` value), and vice versa.
+
 The runtime state for a session consists of the last checkout time and operation, the number of operations
-waiting to check out the session, and the number of kills requested. The last checkout time is used by
+waiting to check out the session, and the number of kills requested. Retryable internal sessions are reaped from the logical session catalog [eagerly](https://github.com/mongodb/mongo/blob/67e37f8e806a6a5d402e20eee4b3097e2b11f820/src/mongo/db/session/session_catalog.cpp#L342), meaning that if a transaction session with a higher transaction number has successfully started, sessions with lower txnNumbers are removed from the session catalog and inserted into an in-memory buffer by the [InternalTransactionsReapService](https://github.com/mongodb/mongo/blob/67e37f8e806a6a5d402e20eee4b3097e2b11f820/src/mongo/db/internal_transactions_reap_service.h#L42) until a configurable threshold is met (1000 by default), after which they are deleted from the transactions table (`config.transactions`) and `config.image_collection` all at once. Eager reaping is best-effort, in that the in-memory buffer is cleared on stepdown or restart.
+
+The last checkout time is used by
 the [periodic job inside the logical session cache](#periodic-cleanup-of-the-session-catalog-and-transactions-table)
 to determine when a session should be reaped from the session catalog, whereas the number of
 operations waiting to check out a session is used to block reaping of sessions that are still in
@@ -862,15 +879,15 @@ the first kill request.
 The runtime state in a node's in-memory session catalog is made durable in the node's
 `config.transactions` collection, also called its transactions table. The in-memory session catalog
  is
-[invalidated](https://github.com/mongodb/mongo/blob/56655b06ac46825c5937ccca5947dc84ccbca69c/src/mongo/db/session_catalog_mongod.cpp#L324)
+[invalidated](https://github.com/mongodb/mongo/blob/56655b06ac46825c5937ccca5947dc84ccbca69c/src/mongo/db/session/session_catalog_mongod.cpp#L324)
 if the `config.transactions` collection is dropped and whenever there is a rollback. When
 invalidation occurs, all active sessions are killed, and the in-memory transaction state is marked
 as invalid to force it to be
-[reloaded from storage the next time a session is checked out](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session_catalog_mongod.cpp#L426).
+[reloaded from storage the next time a session is checked out](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session/session_catalog_mongod.cpp#L426).
 
 #### Code references
-* [**SessionCatalog class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session_catalog.h)
-* [**MongoDSessionCatalog class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session_catalog_mongod.h)
+* [**SessionCatalog class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session/session_catalog.h)
+* [**MongoDSessionCatalog class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session/session_catalog_mongod.h)
 * [**RouterSessionCatalog class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/s/session_catalog_router.h)
 * How [**mongod**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/service_entry_point_common.cpp#L537) and [**mongos**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/s/commands/strategy.cpp#L412) check out a session prior to executing a command.
 
@@ -949,30 +966,22 @@ For retry images saved in the image collection, the source will "downconvert" op
 `needsRetryImage: true` into two oplog entries, simulating the old format. As chunk migrations use
 internal commands, [this downconverting procedure](https://github.com/mongodb/mongo/blob/0beb0cacfcaf7b24259207862e1d0d489e1c16f1/src/mongo/db/s/session_catalog_migration_source.cpp#L58-L97)
 is installed under the hood. For resharding and tenant migrations, a new aggregation stage,
-[_internalFindAndModifyImageLookup](https://github.com/10gen/mongo/blob/e27dfa10b994f6deff7c59a122b87771cdfa8aba/src/mongo/db/pipeline/document_source_find_and_modify_image_lookup.cpp#L61),
+[_internalFindAndModifyImageLookup](https://github.com/mongodb/mongo/blob/e27dfa10b994f6deff7c59a122b87771cdfa8aba/src/mongo/db/pipeline/document_source_find_and_modify_image_lookup.cpp#L61),
 was introduced to perform the identical substitution. In order for this stage to have a valid timestamp
 to assign to the forged no-op oplog entry as result of the "downconvert", we must always assign an
 extra oplog slot when writing the original retryable findAndModify oplog entry with
 `needsRetryImage: true`.
 
-The server also supports [collection-level pre-images](https://docs.mongodb.com/realm/mongodb/trigger-preimages/#overview), a feature used by MongoDB Realm. This feature continues to store document pre-images in
-the oplog, and is expected to work with the new retryable findAndModify behavior described above.
-With this, it's possible that for a particular update operation, we must store a pre-image
-(for collection-level pre-images) in the oplog while storing the post-image
-(for retryable findAndModify) in `config.image_collection`. In order to avoid certain WiredTiger
-constraints surrounding setting multiple timestamps in a single storage transaction, we must reserve
+In order to avoid certain WiredTiger constraints surrounding setting multiple timestamps in a single storage transaction, we must reserve
 oplog slots before entering the OpObserver, which is where we would normally create an oplog entry
 and assign it the next available timestamp. Here, we have a table that describes the different
 scenarios, along with the timestamps that are reserved and the oplog entries assigned to each of
 those timestamps:
-| Parameters | NumSlotsReserved | TS - 2 | TS - 1 | TS | Oplog fields for entry with timestamp: TS |
-| --- | --- | --- | --- | --- | --- |
-| Update, NeedsRetryImage=postImage, preImageRecordingEnabled = True | 3 | No-op oplog entry storing the pre-image|Reserved for forged no-op entry eventually used by tenant migrations/resharding | Update oplog entry | NeedsRetryImage: postImage, preImageOpTime: \{TS - 2} |
-| Update, NeedsRetryImage=preImage, preImageRecordingEnabled=True | 3 |No-op oplog entry storing the pre-image | Reserved but will not be used|Update Oplog entry | preImageOpTime: \{TS - 2} |
-| Update, NeedsRetryImage=preImage, preImageRecordingEnabled=False | 2 | N/A | Reserved for forged no-op entry eventually used by tenant migrations/resharding|Update oplog entry|NeedsRetryImage: preImage |
-| Update, NeedsRetryImage=postImage, preImageRecordingEnabled=False | 2 | N/A | Reserved for forged no-op entry eventually used by tenant migrations/resharding|Update oplog entry | NeedsRetryImage: postImage |
-| Delete, NeedsRetryImage=preImage, preImageRecordingEnabled = True | 0. Note that the OpObserver will still create a no-op entry along with the delete oplog entry, assigning them the next two available timestamps (TS - 1 and TS respectively). | N/A | No-op oplog entry storing the pre-image|Delete oplog entry | preImageOpTime: \{TS - 1} |
-|Delete, NeedsRetryImage=preImage, preImageRecordingEnabled = False|2|N/A|Reserved for forged no-op entry eventually used by tenant migrations/resharding|Delete oplog entry|NeedsRetryImage: preImage|
+| Parameters | NumSlotsReserved | TS - 1 | TS | Oplog fields for entry with timestamp: TS |
+| --- | --- | --- | --- | --- |
+| Update, NeedsRetryImage=preImage | 2 | Reserved for forged no-op entry eventually used by tenant migrations/resharding|Update oplog entry|NeedsRetryImage: preImage |
+| Update, NeedsRetryImage=postImage | 2 | Reserved for forged no-op entry eventually used by tenant migrations/resharding|Update oplog entry | NeedsRetryImage: postImage |
+|Delete, NeedsRetryImage=preImage |2|Reserved for forged no-op entry eventually used by tenant migrations/resharding|Delete oplog entry|NeedsRetryImage: preImage|
 
 #### Code references
 * [**TransactionParticipant class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/transaction_participant.h)
@@ -1027,7 +1036,7 @@ the commit path for the transaction.
 
 * If the number of participant shards is zero, the mongos skips the commit and returns immediately.
 * If the number of participant shards is one, the mongos forwards `commitTransaction` directly to that shard.
-* If the number of pariticipant shards is greater than one:
+* If the number of participant shards is greater than one:
    * If the number of write shards is zero, the mongos forwards `commitTransaction` to each shard individually.
    * Otherwise, the mongos sends `coordinateCommitTransaction` with the participant list to the coordinator shard to
    initiate two-phase commit.
@@ -1077,6 +1086,100 @@ to all participant shards.
 * [**TransactionRouter class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/s/transaction_router.h)
 * [**TransactionCoordinatorService class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/s/transaction_coordinator_service.h)
 * [**TransactionCoordinator class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/s/transaction_coordinator.h)
+
+## Internal Transactions
+
+Internal transactions are transactions that mongos and mongod can run on behalf of a client command regardless of a client's session option configuration. These transactions are started and managed internally by mongos/mongod, thus clients are unaware of the execution of internal transactions. All internal transactions will be run within an a session started internally, which we will refer to as `internal sessions`, except for in the case where the client is already running a transaction within a session, to which we let the transaction execute as a regular client transaction.
+
+An internal transaction started on behalf of a client command is subject to the client command's constraints such as terminating execution if the command's `$maxTimeMS` is reached, or guaranteeing retryability if the issued command was a retryable write. These constraints lead to the following concepts.
+
+### Non-Retryable Internal Transactions
+
+If a client runs a command in a without a session or with session where retryable writes are disabled I.E. `retryWrites: false`, the server will start a non-retryable internal transaction.
+
+### Retryable Internal Transactions
+
+If a client runs a command in a session where retryable writes are enabled I.E. `retryWrites: true`, the server will start a retryable internal transaction.
+
+**Note**: The distinction between **Retryable** and **Non-Retryable** here is the requirement that Retryable Internal Transactions must fulfill the retryable write contract, which is described below. Both types of transactions will be [retried internally on transient errors](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_api.cpp#L207-L227). The only exception is an internal transaction that is started on behalf of a `client transaction`, which can only be retried by the client.
+
+#### How retryability is guaranteed
+
+We expect that retryable write commands that start retryable internal transactions conform to the retryable write contract which has the following stipulations:
+
+1. Write statements within the command are guaranteed to apply only once regardless of how many times a client retries.
+2. The response for the command is guaranteed to be reconstructable on retry.
+
+To do this, retryable write statements executed inside of a retryable internal transaction try to emulate the behavior of ordinary retryable writes. 
+
+Each statement inside of a retryable write command should have a corresponding entry within a retryable internal transaction with the same `stmtId` as the original write statement. When a transaction participant for a retryable internal transaction notices a write statement with a previously seen `stmtId`, it will not execute the statement and instead generate the original response for the already executed statement using the oplog entry generated by the initial execution. The check for previously executed statements is done using the `retriedStmtIds` array, which contains the `stmtIds` of already retried statements, inside of a write command's response. 
+
+In cases where a client retryable write command implicitly expects an auxiliary operation to be executed atomically with its current request, a retryable internal transaction may contain additional write statements that are not explicitly requested by a client retryable write command. An example could be that the client expects to atomically update an index when executing a write. Since these auxiliary write statements do not have a corresponding entry within the original client command, the `stmtId` field for these statements will be set to `{stmtId: kUninitializedStmtId}`. These auxiliary write statements are non-retryable, thus it is crucial that we use the `retriedStmtIds` to determine which client write statements were already successfully retried to avoid re-applying the corresponding auxilary write statements. Additionally, these statements will be excluded from the history check involving `retriedStmtIds`. 
+
+To guarantee that we can reconstruct the response regardless of retries, we do a "cross sectional" write history check for retryable writes and retryable internal transactions prior to running a client retryable write/retryable internal transaction command. This ensures we do not double apply non-idempotent operations, and instead recover the response for a successful execution when appropriate. To support this, the [RetryableWriteTransactionParticipantCatalog](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.h#L1221-L1299) was added as a decoration on an external session and it stores the transaction participants for all active retryable writes on the session, which we use to do our [write history check](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.cpp#L3205-L3208).
+
+#### Reconstructing write responses
+
+To reconstruct responses for retryable internal transactions, we use the applyOps oplog entry, which contains an inner entry with the operation run under the `o` field that has a corresponding `stmtId`. We use the `stmtId` and `opTime` cached in the `TransactionParticipant` to lookup the operation in the applyOps oplog entry, which gives us the necessary details to reconstruct the original write response. The process for reconstructing retryable write responses works the same way.
+
+
+#### Special considerations for findAndModify
+
+`findAndModify` additionally, requires the storage of pre/post images. The behavior of recovery differs based on the setting of `storeFindAndModifyImagesInSideCollection`.
+
+If `storeFindAndModifyImagesInSideCollection` is **false**, then upon committing or preparing an internal transaction, we generate a no-op oplog entry that stores either stores the pre or post image of the document involved. The operation entry for the `findAndModify` statement inside the applyOps oplog entry will have a `preImageOpTime` or a `postImageOpTime` field that is set to the opTime of the no-op oplog entry. That opTime will be used to lookup the pre/post image when reconstructing the write response.
+
+If `storeFindAndModifyImagesInSideCollection` is **true**, then upon committing or preparing an internal transaction, we insert a document into `config.image_collection` containing the pre/post image. The operation entry for the findAndModify statement inside the applyOps oplog entry will have a `needsRetryImage` field that is set to `true` to indicate that a pre/post image should be loaded from the side collection when reconstructing the write response. We can do the lookup using a transaction's `lsid` and `txnNumber`.
+
+Currently, a retryable internal transaction can only support a **single** `findAndModify` statement at a time, due to the limitation that `config.image_collection` can only support storing one pre/post image entry for a given `(lsid, txnNumber)`. 
+
+#### Retryability across failover and restart
+
+To be able to guarantee retryability under failover, we need to make sure that a mongod **always** has all the necessary transaction state loaded while executing a retryable write command. To do this, we recover the transaction state of the client and internal sessions [when checking out sessions](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/session/session_catalog_mongod.cpp#L694) on recovery. During checkout, we call [refreshFromStorageIfNeeded()](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.cpp#L2901) on the current client session (if we are running in one) to refresh the TransactionParticipant for that session. We then [fetch any relevant active internal sessions associated with the current client session and refresh the TransactionParticipants for those sessions](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.cpp#L2987).
+
+#### Handling retry conflicts
+
+Due to the use of `txnUUID` in the lsid for de-duplication purposes, retries of client write statements will always spawn a different internal session/transaction than the one originally used to do the initial attempt. This has two implications for conflict resolution:
+
+1. If the client retries on the same mongos/mongod that the original write was run on, retries are blocked by mongos/mongod until the original attempt finishes execution. This is due to the [session checkout mechanism](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/service_entry_point_common.cpp#L973) that prevents checkout of an in-use session, which in this case would block the retry attempt from checking out the parent session. Once the original write finishes execution, the retry would either retry(if necessary) or recover the write response as described above.
+
+2. If the client retries on a different mongos than the original write was run on, the new mongos will not have visibility over in-progress internal transactions run by another mongos, so this retry will not be blocked and legally begin execution. When the new mongos begins execution of the retried command, it will send commands with `startTransaction` to relevant transaction participants. The transaction participants will then [check if there is already an in-progress internal transaction that will conflict](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.cpp#L2827-L2846) with the new internal transaction that is attempting to start. If so, then the transaction participant will throw `RetryableTransactionInProgress`, which will be caught and cause the new transaction to [block until the existing transaction is finished](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/service_entry_point_common.cpp#L1029-L1036).
+
+
+#### Supporting retryability across chunk migration and resharding
+
+ The session history, oplog entries, and image collection entries involving the chunk being migrated are cloned from the donor shard to the recipient shard during chunk migration. Once the recipient receives the relevant oplog entries from the donor, it will [nest and apply the each of the received oplog entries in a no-op oplog entry](https://github.com/mongodb/mongo/blob/0d84f4bab0945559abcd5b00be5ec322c5214642/src/mongo/db/s/session_catalog_migration_destination.cpp#L204-L347). Depending on the type of operation run, the behavior will differ as such. 
+
+* If a non-retryable write/non-retryable internal transaction is run, then the donor shard will [send a sentinel no-op oplog entry](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/s/session_catalog_migration_destination.cpp#L204-L354), which when parsed by the TransactionParticipant upon getting a retry against the recipient shard will [throw IncompleteTransactionHistory](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.cpp#L323-L331). 
+
+* If a retryable write/retryable internal transaction is run, then the donor shard will send a ["downconverted" oplog entry](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/s/session_catalog_migration_source.cpp#L669-L680), which when parsed by the TransactionParticipant upon getting a retry against the recipient shard will return the original write response.
+
+`Note`: "Downconverting" in this context, is the process of extracting the operation information inside an applyOps entry for an internal transaction and constructing a new retryable write oplog entry with `lsid` and `txnNumber` set to the associated client's session id and txnNumber. 
+
+For resharding, the process is similar to how chunk migrations are handled. The session history, oplog entries, and image collection entries for operations run during resharding are cloned from the donor shard to the recipient shard. The only difference is that the recipient in this case will handle the "downconverting", nesting, and applying of the received oplog entries. The two cases discussed above apply to resharding as well.
+
+
+#### Code References
+
+* [**Session checkout logic**](https://github.com/mongodb/mongo/blob/0d84f4bab0945559abcd5b00be5ec322c5214642/src/mongo/db/session/session_catalog_mongod.cpp#L694)
+* [**Cross-section history check logic**](https://github.com/mongodb/mongo/blob/0d84f4bab0945559abcd5b00be5ec322c5214642/src/mongo/db/transaction/transaction_participant.cpp#L3206)
+* [**Conflicting internal transaction check logic**](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.cpp#L2827-L2846)
+* [**Refreshing client and internal sessions logic**](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.cpp#L2889-L2899)
+* [**RetryableWriteTransactionParticipantCatalog**](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.h#L1221-L1299)
+
+### Transaction API
+
+The [transaction API](https://github.com/mongodb/mongo/blob/master/src/mongo/db/transaction/transaction_api.h) is used to initiate transactions from within the server. The API starts an internal transaction on its local process, executes transaction statements specified in a callback, and completes the transaction by committing/aborting/retrying on transient errors. By default, a transaction can be retried 120 times to mirror the 2 minute timeout used by the [driver’s convenient transactions API](https://github.com/mongodb/specifications/blob/92d77a6d/source/transactions-convenient-api/transactions-convenient-api.rst).
+
+Additionally, the API can use router commands when running on a mongod. Each command will execute as if on a mongos, targeting remote shards and initiating a two phase commit if necessary. To enable this router behavior the [`cluster_transaction_api`](https://github.com/mongodb/mongo/blob/master/src/mongo/db/cluster_transaction_api.h) defines an additional set of behaviors to rename commands to their [cluster command names](https://github.com/mongodb/mongo/blob/63f99193df82777239f038666270e4bfb2be3567/src/mongo/db/cluster_transaction_api.cpp#L44-L52).
+
+Transactions for non-retryable operations or operations without a session initiated through the API use sessions from the [InternalSessionPool](https://github.com/mongodb/mongo/blob/master/src/mongo/db/internal_session_pool.h) to prevent the creation and maintenance of many single-use sessions.
+
+To use the transaction API, [instantiate a transaction client](https://github.com/mongodb/mongo/blob/63f99193df82777239f038666270e4bfb2be3567/src/mongo/s/commands/cluster_find_and_modify_cmd.cpp#L250-L253) by providing the opCtx, an executor, and resource yielder. Then, run the commands to be grouped in the same transaction session on the transaction object. Some examples of this are listed below. 
+
+* [Cluster Find and Modify Command](https://github.com/mongodb/mongo/blob/63f99193df82777239f038666270e4bfb2be3567/src/mongo/s/commands/cluster_find_and_modify_cmd.cpp#L255-L265)
+* [Queryable Encryption](https://github.com/mongodb/mongo/blob/63f99193df82777239f038666270e4bfb2be3567/src/mongo/db/commands/fle2_compact.cpp#L636-L648)
+* [Cluster Write Command - WouldChangeOwningShard Error](https://github.com/mongodb/mongo/blob/63f99193df82777239f038666270e4bfb2be3567/src/mongo/s/commands/cluster_write_cmd.cpp#L162-L190)
 
 ## The historical routing table
 
@@ -1201,7 +1304,7 @@ consistent. When a DDL request is received by a router, it gets forwarded to the
 of the targeted database. For the sake of clarity, createDatabase is the only DDL operation that cannot possibly get forwarded to the
 database primary but is instead routed to the config server, as the database may not exist yet.
 
-##### Serialization and joinability of DDL operations 
+##### Serialization and joinability of DDL operations
 When a primary shard receives a DDL request, it tries to construct a DDL coordinator performing the following steps:
 - Acquire the [distributed lock for the database](https://github.com/mongodb/mongo/blob/908e394d39b223ce498fde0d40e18c9200c188e2/src/mongo/db/s/sharding_ddl_coordinator.cpp#L155). This ensures that at most one DDL operation at a time will run for namespaces belonging to the same database on that particular primary node.
 - Acquire the distributed lock for the [collection](https://github.com/mongodb/mongo/blob/908e394d39b223ce498fde0d40e18c9200c188e2/src/mongo/db/s/sharding_ddl_coordinator.cpp#L171) (or [collections](https://github.com/mongodb/mongo/blob/908e394d39b223ce498fde0d40e18c9200c188e2/src/mongo/db/s/sharding_ddl_coordinator.cpp#L181)) involved in the operation.
@@ -1214,7 +1317,7 @@ on the shard in order to join the ongoing operation if the options match (same o
 Once the distributed locks have been acquired, it is guaranteed that no other concurrent DDLs are happening for the same database,
 hence a DDL coordinator can safely start [executing the operation](https://github.com/mongodb/mongo/blob/master/src/mongo/db/s/sharding_ddl_coordinator.cpp#L207).
 
-As first step, each coordinator is required to [majority commit a document](https://github.com/mongodb/mongo/blob/2ae2bcedfb7d48e64843dd56b9e4f107c56944b6/src/mongo/db/s/sharding_ddl_coordinator.h#L105-L116) - 
+As first step, each coordinator is required to [majority commit a document](https://github.com/mongodb/mongo/blob/2ae2bcedfb7d48e64843dd56b9e4f107c56944b6/src/mongo/db/s/sharding_ddl_coordinator.h#L105-L116) -
 that we will refer to as state document - containing all information regarding the running operation such as name of the DDL, namespaces
 involved and other metadata identifying the original request. At this point, the coordinator is entitled to start making both local and
 remote catalog modifications, eventually after blocking CRUD operations on the changing namespaces; when the execution reaches relevant
@@ -1248,3 +1351,90 @@ waiting for pre-existing DDL coordinators to be re-instantiated in order to avoi
 If a [recoverable error](https://github.com/mongodb/mongo/blob/a1752a0f5300b3a4df10c0a704c07e597c3cd291/src/mongo/db/s/sharding_ddl_coordinator.cpp#L216-L226)
 is caught at execution-time, it will be retried indefinitely; all other errors errors have the effect of stopping and destructing the DDL coordinator and -
 because of that - are never expected to happen after a coordinator performs destructive operations.
+
+# User Write Blocking
+
+User write blocking prevents user initiated writes from being performed on C2C source and destination
+clusters during certain phases of C2C replication, allowing durable state to be propagated from the
+source without experiencing conflicts. Because the source and destination clusters are different
+administrative domains and thus can have separate configurations and metadata, operations which
+affect metadata, such as replset reconfig, are permitted. Also, internal operations which affect user
+collections but leave user data logically unaffected, such as chunk migration, are still permitted.
+Finally, users with certain privileges can bypass user write blocking; this is necessary so that the
+C2C sync daemon itself can write to user data.
+
+User write blocking is enabled and disabled by the command `{setUserWriteBlockMode: 1, global:
+<true/false>}`. On replica sets, this command is invoked on the primary, and enables/disables user
+write blocking replica-set-wide. On sharded clusters, this command is invoked on `mongos`, and
+enables/disables user write blocking cluster-wide. We define a write as a "user write" if the target
+database is not internal (the `admin`, `local`, and `config` databases being defined as internal),
+and if the user that initiated the write cannot perform the `bypassWriteBlockingMode` action on the
+`cluster` resource. By default, only the `restore`, `root`, and `__system` built-in roles have this
+privilege.
+
+The `UserWriteBlockModeOpObserver` is responsible for blocking disallowed writes. Upon any operation
+which writes, this `OpObserver` checks whether the `GlobalUserWriteBlockState` [allows writes to the
+target
+namespace](https://github.com/mongodb/mongo/blob/387f8c0e26a352b95ecfc6bc51f749d26a929390/src/mongo/db/op_observer/user_write_block_mode_op_observer.cpp#L281-L288).
+The `GlobalUserWriteBlockState` stores whether user write blocking is enabled in a given
+`ServiceContext`. As part of its write access check, it [checks whether the `WriteBlockBypass`
+associated with the given `OperationContext` is
+enabled](https://github.com/mongodb/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/s/global_user_write_block_state.cpp#L59-L67).
+The `WriteBlockBypass` stores whether the user that initiated the write is able to perform writes
+when user write blocking is enabled.  On internal requests (i.e. from other `mongod` or `mongos`
+instances in the sharded cluster/replica set), the request originator propagates `WriteBlockBypass`
+[through the request
+metadata](https://github.com/mongodb/mongo/blob/182616b7b45a1e360839c612c9ee8acaa130fe17/src/mongo/rpc/metadata.cpp#L115).
+On external requests, `WriteBlockBypass` is enabled [if the authenticated user is privileged to
+bypass user
+writes](https://github.com/mongodb/mongo/blob/07c3d2ebcd3ca8127ed5a5aaabf439b57697b530/src/mongo/db/write_block_bypass.cpp#L60-L63).
+The `AuthorizationSession`, which is responsible for maintaining the authorization state, keeps track
+of whether the user has the privilege to bypass user write blocking by [updating a cached variable
+upon any changes to the authorization
+state](https://github.com/mongodb/mongo/blob/e4032fe5c39f1974c76de4cefdc07d98ab25aeef/src/mongo/db/auth/authorization_session_impl.cpp#L1119-L1121).
+This structure enables, for example, sharded writes to work correctly with user write blocking,
+because the `WriteBlockBypass` state is initially set on the `mongos` based on the
+`AuthorizationSession`, which knows the privileges of the user making the write request, and then
+propagates from the `mongos` to the shards involved in the write. Note that this means on requests
+from `mongos`, shard servers don't check their own `AuthorizationSession`s when setting
+`WriteBlockBypass`. This would be incorrect behavior since internal requests have internal
+authorization, which confers all privileges, including the privilege to bypass user write blocking.
+
+The `setUserWriteBlockMode` command, before enabling user write blocking, blocks creation of new
+index builds and aborts all currently running index builds on non-internal databases, and drains the
+index builds it cannot abort. This upholds the invariant that while user write blocking is enabled,
+all running index builds are allowed to bypass write blocking and therefore can commit without
+additional checks.
+
+In sharded clusters, enabling user write blocking is a two-phase operation, coordinated by the config
+server. The first phase disallows creation of new `ShardingDDLCoordinator`s and drains all currently
+running `DDLCoordinator`s. The config server waits for all shards to complete this phase before
+moving onto the second phase, which aborts index builds and enables write blocking. This structure is
+used because enabling write blocking while there are ongoing `ShardingDDLCoordinator`s would prevent
+those operations from completing.
+
+#### Code references
+* The [`UserWriteBlockModeOpObserver`
+  class](https://github.com/mongodb/mongo/blob/387f8c0e26a352b95ecfc6bc51f749d26a929390/src/mongo/db/op_observer/user_write_block_mode_op_observer.h#L40)
+* The [`GlobalUserWriteBlockState`
+  class](https://github.com/mongodb/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/s/global_user_write_block_state.h#L37)
+* The [`WriteBlockBypass`
+  class](https://github.com/mongodb/mongo/blob/07c3d2ebcd3ca8127ed5a5aaabf439b57697b530/src/mongo/db/write_block_bypass.h#L38)
+* The [`abortUserIndexBuildsForUserWriteBlocking`
+  function](https://github.com/mongodb/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/index_builds_coordinator.cpp#L850),
+  used to abort and drain all current user index builds
+* The [`SetUserWriteBlockModeCoordinator`
+  class](https://github.com/mongodb/mongo/blob/ce908a66890bcdd87e709b584682c6b3a3a851be/src/mongo/db/s/config/set_user_write_block_mode_coordinator.h#L38),
+  used to coordinate the `setUserWriteBlockMode` command for sharded clusters
+* The [`UserWritesRecoverableCriticalSectionService`
+  class](https://github.com/mongodb/mongo/blob/1c4e5ba241829145026f8aa0db70707f15fbe7b3/src/mongo/db/s/user_writes_recoverable_critical_section_service.h#L88),
+  used to manage and persist the user write blocking state
+* The `setUserWriteBlockMode` command invocation:
+    - [On a non-sharded
+      `mongod`](https://github.com/mongodb/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/commands/set_user_write_block_mode_command.cpp#L68)
+    - [On a shard
+      server](https://github.com/mongodb/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/s/shardsvr_set_user_write_block_mode_command.cpp#L61)
+    - [On a config
+      server](https://github.com/mongodb/mongo/blob/c96f8dacc4c71b4774c932a07be4fac71b6db628/src/mongo/db/s/config/configsvr_set_user_write_block_mode_command.cpp#L56)
+    - [On a
+      `mongos`](https://github.com/mongodb/mongo/blob/4ba31bc8627426538307848866d3165a17aa29fb/src/mongo/s/commands/cluster_set_user_write_block_mode_command.cpp#L61)

@@ -33,6 +33,7 @@
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/query/serialization_options.h"
 
 namespace mongo {
 class SortPattern {
@@ -72,7 +73,8 @@ public:
     /**
      * Write out a Document whose contents are the sort key pattern.
      */
-    Document serialize(SortKeySerialization) const;
+    Document serialize(SortKeySerialization serializationMode,
+                       SerializationOptions options = {}) const;
 
     /**
      * Serializes the document to BSON, only keeping the paths specified in the sort pattern.
@@ -126,6 +128,13 @@ public:
         return _sortPattern.cend();
     }
 
+    SortPatternPart front() const {
+        return _sortPattern.front();
+    }
+    SortPatternPart back() const {
+        return _sortPattern.back();
+    }
+
     /**
      * Returns the types of metadata depended on by this sort.
      *
@@ -140,6 +149,6 @@ private:
     std::vector<SortPatternPart> _sortPattern;
 
     // The set of paths on which we're sorting.
-    std::set<std::string> _paths;
+    OrderedPathSet _paths;
 };
 }  // namespace mongo

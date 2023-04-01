@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include <cstdlib>
 #include <ctime>
@@ -38,6 +37,9 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/errno_util.h"
 #include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace {
@@ -100,7 +102,8 @@ MONGO_INITIALIZER(SetTimeZoneToEasternForTest)(InitializerContext*) {
     int ret = putenv(tzEnvString);
 #endif
     if (ret == -1) {
-        uasserted(ErrorCodes::BadValue, errnoWithDescription());
+        auto ec = lastPosixError();
+        uasserted(ErrorCodes::BadValue, errorMessage(ec));
     }
     tzset();
 }
@@ -413,7 +416,7 @@ TEST(TimeParsing, InvalidDates) {
         "1970-01-01T00:00:00.x00Z",
     };
 
-    for (const std::string& s : badDates) {
+    for (const char* s : badDates) {
         ASSERT_NOT_OK(dateFromISOString(s)) << s;
     }
 }

@@ -346,9 +346,9 @@ DEATH_TEST_F(PartitionIteratorTest, SingleConsumerEndpointPolicy, "Requested exp
     const auto mock = DocumentSourceMock::createForTest(docs, getExpCtx());
     auto accessor = makeEndpointAccessor(mock, boost::none);
     // Mock a window with documents [1, 2].
-    auto bounds = WindowBounds::parse(BSON("documents" << BSON_ARRAY(1 << 2)),
-                                      SortPattern(BSON("a" << 1), getExpCtx()),
-                                      getExpCtx().get());
+    auto windowObj = BSON("window" << BSON("documents" << BSON_ARRAY(1 << 2)));
+    auto bounds = WindowBounds::parse(
+        windowObj.firstElement(), SortPattern(BSON("a" << 1), getExpCtx()), getExpCtx().get());
     // Retrieving the endpoints triggers the expiration, with the assumption that all documents
     // below the lower bound are not needed.
     auto endpoints = accessor.getEndpoints(bounds);
@@ -377,12 +377,12 @@ DEATH_TEST_F(PartitionIteratorTest, MultipleConsumerEndpointPolicy, "Requested e
     // be (newCurrent - 2).
     auto lookBehindAccessor = makeEndpointAccessor(mock, boost::none);
     auto lookAheadAccessor = makeEndpointAccessor(mock, boost::none);
-    auto negBounds = WindowBounds::parse(BSON("documents" << BSON_ARRAY(-1 << 0)),
-                                         SortPattern(BSON("a" << 1), getExpCtx()),
-                                         getExpCtx().get());
-    auto posBounds = WindowBounds::parse(BSON("documents" << BSON_ARRAY(0 << 1)),
-                                         SortPattern(BSON("a" << 1), getExpCtx()),
-                                         getExpCtx().get());
+    auto windowObj = BSON("window" << BSON("documents" << BSON_ARRAY(-1 << 0)));
+    auto negBounds = WindowBounds::parse(
+        windowObj.firstElement(), SortPattern(BSON("a" << 1), getExpCtx()), getExpCtx().get());
+    windowObj = BSON("window" << BSON("documents" << BSON_ARRAY(0 << 1)));
+    auto posBounds = WindowBounds::parse(
+        windowObj.firstElement(), SortPattern(BSON("a" << 1), getExpCtx()), getExpCtx().get());
 
     auto endpoints = lookBehindAccessor.getEndpoints(negBounds);
     ASSERT_DOCUMENT_EQ(docs[0].getDocument(), *lookBehindAccessor[endpoints->first]);
@@ -426,9 +426,9 @@ DEATH_TEST_F(PartitionIteratorTest,
         PartitionIterator(getExpCtx().get(), mock.get(), &_tracker, boost::none, boost::none);
     auto accessor = PartitionAccessor(&partIter, PartitionAccessor::Policy::kRightEndpoint);
     // Use a window of 'documents: [-2, -1]'.
-    auto bounds = WindowBounds::parse(BSON("documents" << BSON_ARRAY(-2 << -1)),
-                                      SortPattern(BSON("a" << 1), getExpCtx()),
-                                      getExpCtx().get());
+    auto windowObj = BSON("window" << BSON("documents" << BSON_ARRAY(-2 << -1)));
+    auto bounds = WindowBounds::parse(
+        windowObj.firstElement(), SortPattern(BSON("a" << 1), getExpCtx()), getExpCtx().get());
 
     // Advance until {a: 3} is the current document.
     partIter.advance();
@@ -460,9 +460,9 @@ DEATH_TEST_F(PartitionIteratorTest, MixedPolicy, "Requested expired document") {
     auto endpointAccessor = makeEndpointAccessor(mock, boost::none);
     auto defaultAccessor = makeDefaultAccessor(mock, boost::none);
     // Mock a window with documents [1, 2].
-    auto bounds = WindowBounds::parse(BSON("documents" << BSON_ARRAY(1 << 2)),
-                                      SortPattern(BSON("a" << 1), getExpCtx()),
-                                      getExpCtx().get());
+    auto windowObj = BSON("window" << BSON("documents" << BSON_ARRAY(1 << 2)));
+    auto bounds = WindowBounds::parse(
+        windowObj.firstElement(), SortPattern(BSON("a" << 1), getExpCtx()), getExpCtx().get());
 
     // Before advancing, ensure that both accessors expire the first document.
     auto endpoints = endpointAccessor.getEndpoints(bounds);
@@ -499,7 +499,7 @@ TEST_F(PartitionIteratorTest, MemoryUsageAccountsForDocumentIteratorCache) {
     const auto mock = DocumentSourceMock::createForTest(docs, getExpCtx());
 
     [[maybe_unused]] auto accessor = makeDefaultAccessor(mock, boost::none);
-    size_t initialDocSize = docs[0].getDocument().getApproximateSize();
+    size_t initialDocSize = docs[0].getDocument().getCurrentApproximateSize();
 
     // Pull in the first document, and verify the reported size of the iterator is roughly double
     // the size of the document. The size of the iterator is double the size of the document because
@@ -525,7 +525,7 @@ TEST_F(PartitionIteratorTest, MemoryUsageAccountsForArraysInDocumentIteratorCach
     const auto mock = DocumentSourceMock::createForTest(docs, getExpCtx());
 
     [[maybe_unused]] auto accessor = makeDefaultAccessor(mock, boost::none);
-    size_t initialDocSize = docs[0].getDocument().getApproximateSize();
+    size_t initialDocSize = docs[0].getDocument().getCurrentApproximateSize();
 
     // Pull in the first document, and verify the reported size of the iterator is roughly
     // triple the size of the document. The reason for this is that 'largeStr' is cached twice; once
@@ -550,7 +550,7 @@ TEST_F(PartitionIteratorTest, MemoryUsageAccountsForNestedArraysInDocumentIterat
     const auto mock = DocumentSourceMock::createForTest(docs, getExpCtx());
 
     [[maybe_unused]] auto accessor = makeDefaultAccessor(mock, boost::none);
-    size_t initialDocSize = docs[0].getDocument().getApproximateSize();
+    size_t initialDocSize = docs[0].getDocument().getCurrentApproximateSize();
 
     // Pull in the first document, and verify the reported size of the iterator is roughly
     // triple the size of the document. The reason for this is that 'largeStr' is cached twice; once
@@ -575,7 +575,7 @@ TEST_F(PartitionIteratorTest, MemoryUsageAccountsForNestedObjInDocumentIteratorC
     const auto mock = DocumentSourceMock::createForTest(docs, getExpCtx());
 
     [[maybe_unused]] auto accessor = makeDefaultAccessor(mock, boost::none);
-    size_t initialDocSize = docs[0].getDocument().getApproximateSize();
+    size_t initialDocSize = docs[0].getDocument().getCurrentApproximateSize();
 
     // Pull in the first document, and verify the reported size. TODO SERVER-57011: The approximate
     // size should not double count the nested strings.
@@ -592,7 +592,7 @@ TEST_F(PartitionIteratorTest, MemoryUsageAccountsForReleasedDocuments) {
     const auto mock = DocumentSourceMock::createForTest(docs, getExpCtx());
 
     auto accessor = makeDefaultAccessor(mock, boost::none);
-    size_t initialDocSize = docs[0].getDocument().getApproximateSize();
+    size_t initialDocSize = docs[0].getDocument().getCurrentApproximateSize();
 
     // Pull in the first document, and verify the reported size of the iterator is roughly double
     // the size of the document.

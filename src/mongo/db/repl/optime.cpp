@@ -56,7 +56,7 @@ void OpTime::append(BSONObjBuilder* builder, const std::string& subObjName) cons
 
 StatusWith<OpTime> OpTime::parseFromOplogEntry(const BSONObj& obj) {
     try {
-        OpTimeBase base = OpTimeBase::parse(IDLParserErrorContext("OpTimeBase"), obj);
+        OpTimeBase base = OpTimeBase::parse(IDLParserContext("OpTimeBase"), obj);
         long long term = base.getTerm().value_or(kUninitializedTerm);
         return OpTime(base.getTimestamp(), term);
     } catch (...) {
@@ -91,11 +91,9 @@ std::ostream& operator<<(std::ostream& out, const OpTimeAndWallTime& opTime) {
 void OpTime::appendAsQuery(BSONObjBuilder* builder) const {
     builder->append(kTimestampFieldName, _timestamp);
     if (_term == kUninitializedTerm) {
-        // pv0 oplogs don't actually have the term field so don't query for {t: -1}.
-        builder->append(kTermFieldName, BSON("$exists" << false));
-    } else {
-        builder->append(kTermFieldName, _term);
+        fassertFailedWithStatus(7356000, Status(ErrorCodes::BadValue, toString()));
     }
+    builder->append(kTermFieldName, _term);
 }
 
 BSONObj OpTime::asQuery() const {

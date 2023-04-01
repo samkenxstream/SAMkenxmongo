@@ -6,25 +6,21 @@
  * @tags: [
  *   requires_majority_read_concern,
  *   requires_persistence,
- *   incompatible_with_eft,
  *   incompatible_with_windows_tls,
  *   incompatible_with_macos,
  *   serverless,
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {runMigrationAsync} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+load("jstests/replsets/rslib.js");  // 'createRstArgs'
 
-const kTenantId = "testTenantId";
-const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
-
+const kTenantId = ObjectId().str;
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
 const donorRst = tenantMigrationTest.getDonorRst();
@@ -44,11 +40,9 @@ const migrationOpts = {
     tenantId: kTenantId,
     recipientConnString: tenantMigrationTest.getRecipientConnString(),
 };
-const donorRstArgs = TenantMigrationUtil.createRstArgs(donorRst);
-const runMigrationThread = new Thread(TenantMigrationUtil.runMigrationAsync,
-                                      migrationOpts,
-                                      donorRstArgs,
-                                      {retryOnRetryableErrors: true});
+const donorRstArgs = createRstArgs(donorRst);
+const runMigrationThread =
+    new Thread(runMigrationAsync, migrationOpts, donorRstArgs, {retryOnRetryableErrors: true});
 runMigrationThread.start();
 
 TenantMigrationTest.assertAborted(runMigrationThread.returnData());
@@ -57,4 +51,3 @@ tenantMigrationTest.waitForDonorNodesToReachState(
 assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 
 tenantMigrationTest.stop();
-})();

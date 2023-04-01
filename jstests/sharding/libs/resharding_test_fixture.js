@@ -34,7 +34,10 @@ var ReshardingTest = class {
         enableElections: enableElections = false,
         logComponentVerbosity: logComponentVerbosity = undefined,
         storeFindAndModifyImagesInSideCollection: storeFindAndModifyImagesInSideCollection = true,
-        oplogSize: oplogSize = undefined
+        oplogSize: oplogSize = undefined,
+        maxNumberOfTransactionOperationsInSingleOplogEntry:
+            maxNumberOfTransactionOperationsInSingleOplogEntry = undefined,
+        catalogShard: catalogShard = false,
     } = {}) {
         // The @private JSDoc comments cause VS Code to not display the corresponding properties and
         // methods in its autocomplete list. This makes it simpler for test authors to know what the
@@ -64,6 +67,9 @@ var ReshardingTest = class {
         /** @private */
         this._storeFindAndModifyImagesInSideCollection = storeFindAndModifyImagesInSideCollection;
         this._oplogSize = oplogSize;
+        this._maxNumberOfTransactionOperationsInSingleOplogEntry =
+            maxNumberOfTransactionOperationsInSingleOplogEntry;
+        this._catalogShard = catalogShard || jsTestOptions().catalogShard;
 
         // Properties set by setup().
         /** @private */
@@ -85,11 +91,11 @@ var ReshardingTest = class {
         /** @private */
         this._newShardKey = undefined;
         /** @private */
-        this._pauseCoordinatorBeforeBlockingWrites = undefined;
+        this._pauseCoordinatorBeforeBlockingWritesFailpoints = [];
         /** @private */
-        this._pauseCoordinatorBeforeDecisionPersistedFailpoint = undefined;
+        this._pauseCoordinatorBeforeDecisionPersistedFailpoints = [];
         /** @private */
-        this._pauseCoordinatorBeforeCompletionFailpoint = undefined;
+        this._pauseCoordinatorBeforeCompletionFailpoints = [];
         /** @private */
         this._reshardingThread = undefined;
         /** @private */
@@ -113,7 +119,8 @@ var ReshardingTest = class {
         const configReplSetTestOptions = {};
 
         let nodesPerShard = 2;
-        let nodesPerConfigRs = 1;
+        // Use the shard default in catalog shard mode since the config server will be a shard.
+        let nodesPerConfigRs = this._catalogShard ? 2 : 1;
 
         if (this._enableElections) {
             nodesPerShard = 3;
@@ -165,6 +172,11 @@ var ReshardingTest = class {
             mongosOptions.setParameter.logComponentVerbosity = this._logComponentVerbosity;
         }
 
+        if (this._maxNumberOfTransactionOperationsInSingleOplogEntry !== undefined) {
+            rsOptions.setParameter.maxNumberOfTransactionOperationsInSingleOplogEntry =
+                this._maxNumberOfTransactionOperationsInSingleOplogEntry;
+        }
+
         this._st = new ShardingTest({
             mongos: 1,
             mongosOptions,
@@ -175,6 +187,7 @@ var ReshardingTest = class {
             rsOptions,
             configReplSetTestOptions,
             manualAddShard: true,
+            catalogShard: this._catalogShard,
         });
 
         for (let i = 0; i < this._numShards; ++i) {
@@ -197,9 +210,14 @@ var ReshardingTest = class {
             }
 
             const shard = this._st[`shard${i}`];
-            const res = assert.commandWorked(
-                this._st.s.adminCommand({addShard: shard.host, name: shardName}));
-            shard.shardName = res.shardAdded;
+            if (this._catalogShard && i == 0) {
+                assert.commandWorked(this._st.s.adminCommand({transitionToCatalogShard: 1}));
+                shard.shardName = "config";
+            } else {
+                const res = assert.commandWorked(
+                    this._st.s.adminCommand({addShard: shard.host, name: shardName}));
+                shard.shardName = res.shardAdded;
+            }
         }
 
         // In order to enable random failovers, initialize Random's seed if it has not already been
@@ -283,6 +301,11 @@ var ReshardingTest = class {
         return sourceCollection;
     }
 
+    get tempNs() {
+        assert.neq(undefined, this._tempNs, "createShardedCollection must be called first");
+        return this._tempNs;
+    }
+
     /**
      * Reshards an existing collection using the specified new shard key and new chunk ranges.
      *
@@ -316,19 +339,24 @@ var ReshardingTest = class {
 
         this._newShardKey = Object.assign({}, newShardKeyPattern);
 
-        const configPrimary = this._st.configRS.getPrimary();
-        this._pauseCoordinatorBeforeBlockingWrites =
-            configureFailPoint(configPrimary, "reshardingPauseCoordinatorBeforeBlockingWrites");
-        this._pauseCoordinatorBeforeDecisionPersistedFailpoint =
-            configureFailPoint(configPrimary, "reshardingPauseCoordinatorBeforeDecisionPersisted");
-        this._pauseCoordinatorBeforeCompletionFailpoint = configureFailPoint(
-            configPrimary, "reshardingPauseCoordinatorBeforeCompletion", {}, {times: 1});
+        this._pauseCoordinatorBeforeBlockingWritesFailpoints = [];
+        this._pauseCoordinatorBeforeDecisionPersistedFailpoints = [];
+        this._pauseCoordinatorBeforeCompletionFailpoints = [];
+        this._st.forEachConfigServer((configServer) => {
+            this._pauseCoordinatorBeforeBlockingWritesFailpoints.push(
+                configureFailPoint(configServer, "reshardingPauseCoordinatorBeforeBlockingWrites"));
+            this._pauseCoordinatorBeforeDecisionPersistedFailpoints.push(configureFailPoint(
+                configServer, "reshardingPauseCoordinatorBeforeDecisionPersisted"));
+            this._pauseCoordinatorBeforeCompletionFailpoints.push(
+                configureFailPoint(configServer,
+                                   "reshardingPauseCoordinatorBeforeCompletion",
+                                   {"sourceNamespace": this._ns}));
+        });
 
         this._commandDoneSignal = new CountDownLatch(1);
 
-        this._reshardingThread = new Thread(
-            function(
-                host, ns, newShardKeyPattern, newChunks, commandDoneSignal, expectedErrorCode) {
+        this._reshardingThread =
+            new Thread(function(host, ns, newShardKeyPattern, newChunks, commandDoneSignal) {
                 const conn = new Mongo(host);
 
                 // We allow the client to retry the reshardCollection a large but still finite
@@ -359,18 +387,8 @@ var ReshardingTest = class {
                     }
                 }
 
-                if (expectedErrorCode === ErrorCodes.OK) {
-                    assert.commandWorked(res);
-                } else {
-                    assert.commandFailedWithCode(res, expectedErrorCode);
-                }
-            },
-            this._st.s.host,
-            this._ns,
-            newShardKeyPattern,
-            newChunks,
-            this._commandDoneSignal,
-            expectedErrorCode);
+                return res;
+            }, this._st.s.host, this._ns, newShardKeyPattern, newChunks, this._commandDoneSignal);
 
         this._reshardingThread.start();
         this._isReshardingActive = true;
@@ -452,14 +470,14 @@ var ReshardingTest = class {
         try {
             fn();
         } catch (duringReshardingError) {
-            for (const fp of [this._pauseCoordinatorBeforeBlockingWrites,
-                              this._pauseCoordinatorBeforeDecisionPersistedFailpoint,
-                              this._pauseCoordinatorBeforeCompletionFailpoint]) {
+            for (const fp of [...this._pauseCoordinatorBeforeBlockingWritesFailpoints,
+                              ...this._pauseCoordinatorBeforeDecisionPersistedFailpoints,
+                              ...this._pauseCoordinatorBeforeCompletionFailpoints]) {
                 try {
                     fp.off();
                 } catch (disableFailpointError) {
                     print(`Ignoring error from disabling the resharding coordinator failpoint: ${
-                        tojson(disableFailpointError)}`);
+                        tojsononeline(disableFailpointError)}`);
 
                     print(
                         "The config server primary and the mongo shell along with it are expected" +
@@ -476,13 +494,16 @@ var ReshardingTest = class {
                 try {
                     this._reshardingThread.join();
                 } catch (joinError) {
-                    print(`Ignoring error from the resharding thread: ${tojson(joinError)}`);
+                    print(`Ignoring error from the resharding thread: ${tojsononeline(joinError)}`);
+                } finally {
+                    print(`Ignoring response from the resharding thread: ${
+                        tojsononeline(this._reshardingThread.returnData())}`);
                 }
 
                 this._isReshardingActive = false;
             } catch (killOpError) {
                 print(`Ignoring error from sending killOp to the reshardCollection command: ${
-                    tojson(killOpError)}`);
+                    tojsononeline(killOpError)}`);
 
                 print("The mongo shell is expected to abort due to the resharding thread being" +
                       " left unjoined");
@@ -503,7 +524,9 @@ var ReshardingTest = class {
      * proceeding to the next stage. This helper returns after either:
      *
      * 1) The node's waitForFailPoint returns successfully or
-     * 2) The `reshardCollection` command has returned a response.
+     * 2) The `reshardCollection` command has returned a response or
+     * 3) The ReshardingCoordinator is blocked on the reshardingPauseCoordinatorBeforeCompletion
+     *    failpoint and won't ever satisfy the supplied failpoint.
      *
      * The function returns true when we returned because the server reached the failpoint. The
      * function returns false when the `reshardCollection` command is no longer running.
@@ -512,9 +535,20 @@ var ReshardingTest = class {
      * @private
      */
     _waitForFailPoint(fp) {
+        const completionFailpoint = this._pauseCoordinatorBeforeCompletionFailpoints.find(
+            completionFailpoint => completionFailpoint.conn.host === fp.conn.host);
+
         assert.soon(
             () => {
-                return this._commandDoneSignal.getCount() === 0 || fp.waitWithTimeout(1000);
+                if (this._commandDoneSignal.getCount() === 0 || fp.waitWithTimeout(1000)) {
+                    return true;
+                }
+
+                if (completionFailpoint !== fp && completionFailpoint.waitWithTimeout(1000)) {
+                    completionFailpoint.off();
+                }
+
+                return false;
             },
             "Timed out waiting for failpoint to be hit. Failpoint: " + fp.failPointName,
             undefined,
@@ -529,6 +563,19 @@ var ReshardingTest = class {
                                   postCheckConsistencyFn = () => {},
                                   postDecisionPersistedFn = () => {},
                                   afterReshardingFn = () => {}) {
+        // The CSRS primary may have changed as a result of running the duringReshardingFn()
+        // callback function. The failpoints will only be triggered on the new CSRS primary so we
+        // detect which node that is here.
+        const configPrimary = this._st.configRS.getPrimary();
+        const primaryIdx = this._pauseCoordinatorBeforeBlockingWritesFailpoints.findIndex(
+            fp => fp.conn.host === configPrimary.host);
+        // The CSRS secondaries may be going through replication rollback which closes their
+        // connections to the test client. We wait for any replication rollbacks to complete and for
+        // the test client to have reconnected so the failpoints can be turned off on all of the
+        // nodes later on.
+        this._st.configRS.awaitSecondaryNodes();
+        this._st.configRS.awaitReplication();
+
         let performCorrectnessChecks = true;
         if (expectedErrorCode === ErrorCodes.OK) {
             this._callFunctionSafely(() => {
@@ -539,17 +586,18 @@ var ReshardingTest = class {
                 // reshardingPauseCoordinatorBeforeDecisionPersisted failpoint to wait for all of
                 // the recipient shards to have applied through all of the oplog entries from all of
                 // the donor shards.
-                if (!this._waitForFailPoint(this._pauseCoordinatorBeforeBlockingWrites)) {
+                if (!this._waitForFailPoint(
+                        this._pauseCoordinatorBeforeBlockingWritesFailpoints[primaryIdx])) {
                     performCorrectnessChecks = false;
                 }
-                this._pauseCoordinatorBeforeBlockingWrites.off();
+                this._pauseCoordinatorBeforeBlockingWritesFailpoints.forEach(fp => fp.off());
 
                 // A resharding command that returned a failure will not hit the "Decision
                 // Persisted" failpoint. If the command has returned, don't require that the
                 // failpoint was entered. This ensures that following up by joining the
                 // `_reshardingThread` will succeed.
                 if (!this._waitForFailPoint(
-                        this._pauseCoordinatorBeforeDecisionPersistedFailpoint)) {
+                        this._pauseCoordinatorBeforeDecisionPersistedFailpoints[primaryIdx])) {
                     performCorrectnessChecks = false;
                 }
 
@@ -562,22 +610,21 @@ var ReshardingTest = class {
                     postCheckConsistencyFn();
                 }
 
-                this._pauseCoordinatorBeforeDecisionPersistedFailpoint.off();
+                this._pauseCoordinatorBeforeDecisionPersistedFailpoints.forEach(fp => fp.off());
                 postDecisionPersistedFn();
-                this._pauseCoordinatorBeforeCompletionFailpoint.off();
+                this._pauseCoordinatorBeforeCompletionFailpoints.forEach(fp => fp.off());
             });
         } else {
             this._callFunctionSafely(() => {
-                this.retryOnceOnNetworkError(  //
-                    () => this._pauseCoordinatorBeforeBlockingWrites.off());
-
+                this._pauseCoordinatorBeforeBlockingWritesFailpoints.forEach(
+                    fp => this.retryOnceOnNetworkError(fp.off));
                 postCheckConsistencyFn();
-                this.retryOnceOnNetworkError(
-                    () => this._pauseCoordinatorBeforeDecisionPersistedFailpoint.off());
+                this._pauseCoordinatorBeforeDecisionPersistedFailpoints.forEach(
+                    fp => this.retryOnceOnNetworkError(fp.off));
 
                 postDecisionPersistedFn();
-                this.retryOnceOnNetworkError(
-                    () => this._pauseCoordinatorBeforeCompletionFailpoint.off());
+                this._pauseCoordinatorBeforeCompletionFailpoints.forEach(
+                    fp => this.retryOnceOnNetworkError(fp.off));
             });
         }
 
@@ -585,6 +632,12 @@ var ReshardingTest = class {
             this._reshardingThread.join();
         } finally {
             this._isReshardingActive = false;
+        }
+
+        if (expectedErrorCode === ErrorCodes.OK) {
+            assert.commandWorked(this._reshardingThread.returnData());
+        } else {
+            assert.commandFailedWithCode(this._reshardingThread.returnData(), expectedErrorCode);
         }
 
         // Reaching this line implies the `_reshardingThread` has successfully exited without
@@ -600,7 +653,11 @@ var ReshardingTest = class {
 
     /** @private */
     _checkConsistency() {
-        const nsCursor = this._st.s.getCollection(this._ns).find().sort({_id: 1});
+        // The "available" read concern level won't block this find cmd behind the critical section.
+        // Tests for resharding are not expected to have unowned documents in the collection being
+        // resharded.
+        const nsCursor =
+            this._st.s.getCollection(this._ns).find().readConcern("available").sort({_id: 1});
         const tempNsCursor = this._st.s.getCollection(this._tempNs).find().sort({_id: 1});
 
         const diff = ((diff) => {
@@ -618,7 +675,8 @@ var ReshardingTest = class {
                       docsExtraAfterResharding: [],
                       docsMissingAfterResharding: [],
                   },
-                  "existing sharded collection and temporary resharding collection had different" +
+                  "existing sharded collection " + this._ns +
+                      " and temporary resharding collection " + this._tempNs + " had different" +
                       " contents");
     }
 

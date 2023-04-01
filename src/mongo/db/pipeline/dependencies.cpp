@@ -37,6 +37,34 @@
 
 namespace mongo {
 
+OrderedPathSet DepsTracker::simplifyDependencies(OrderedPathSet dependencies,
+                                                 TruncateToRootLevel truncateToRootLevel) {
+    // The key operation here is folding dependencies into ancestor dependencies, wherever possible.
+    // This is assisted by a special sort in OrderedPathSet that treats '.'
+    // as the first char and thus places parent paths directly before their children.
+    OrderedPathSet returnSet;
+    std::string last;
+    for (const auto& path : dependencies) {
+        if (!last.empty() && str::startsWith(path, last)) {
+            // We are including a parent of this field, so we can skip this field.
+            continue;
+        }
+
+        // Check that the field requested is a valid field name in the agg language. This
+        // constructor will throw if it isn't.
+        FieldPath fp(path);
+
+        if (truncateToRootLevel == TruncateToRootLevel::yes) {
+            last = fp.front().toString() + '.';
+            returnSet.insert(fp.front().toString());
+        } else {
+            last = path + '.';
+            returnSet.insert(path);
+        }
+    }
+    return returnSet;
+}
+
 BSONObj DepsTracker::toProjectionWithoutMetadata(
     TruncateToRootLevel truncationBehavior /*= TruncateToRootLevel::no*/) const {
     BSONObjBuilder bb;
@@ -52,31 +80,16 @@ BSONObj DepsTracker::toProjectionWithoutMetadata(
         return bb.obj();
     }
 
+    // Create a projection from the simplified dependencies (absorbing descendants into parents).
+    // For example, the dependencies ["a.b", "a.b.c.g", "c", "c.d", "f"] would be
+    // minimally covered by the projection {"a.b": 1, "c": 1, "f": 1}.
     bool idSpecified = false;
-    std::string last;
-    for (const auto& field : fields) {
-        if (str::startsWith(field, "_id") && (field.size() == 3 || field[3] == '.')) {
+    for (auto& path : simplifyDependencies(fields, truncationBehavior)) {
+        // Remember if _id was specified.  If not, we'll later explicitly add {_id: 0}
+        if (str::startsWith(path, "_id") && (path.size() == 3 || path[3] == '.')) {
             idSpecified = true;
         }
-
-        if (!last.empty() && str::startsWith(field, last)) {
-            // we are including a parent of *it so we don't need to include this field
-            // explicitly. This logic relies on on set iterators going in lexicographic order so
-            // that a string is always directly before of all fields it prefixes.
-            continue;
-        }
-
-        // Check that the field requested is a valid field name in the agg language. This
-        // constructor will throw if it isn't.
-        FieldPath fp(field);
-
-        if (truncationBehavior == TruncateToRootLevel::yes) {
-            last = fp.front().toString() + '.';
-            bb.append(fp.front(), 1);
-        } else {
-            last = field + '.';
-            bb.append(field, 1);
-        }
+        bb.append(path, 1);
     }
 
     if (!idSpecified) {
@@ -96,4 +109,36 @@ void DepsTracker::setNeedsMetadata(DocumentMetadataFields::MetaType type, bool r
     invariant(required || !_metadataDeps[type]);
     _metadataDeps[type] = required;
 }
+
+// Returns true if the lhs value should sort before the rhs, false otherwise.
+bool PathComparator::operator()(const std::string& lhs, const std::string& rhs) const {
+    constexpr char dot = '.';
+
+    for (size_t pos = 0, len = std::min(lhs.size(), rhs.size()); pos < len; ++pos) {
+        // Below, we explicitly choose unsigned char because the usual const char& returned by
+        // operator[] is actually signed on x86 and will incorrectly order unicode characters.
+        unsigned char lchar = lhs[pos], rchar = rhs[pos];
+        if (lchar == rchar) {
+            continue;
+        }
+
+        // Consider the path delimiter '.' as being less than all other characters, so that
+        // paths sort directly before any paths they prefix and directly after any paths
+        // which prefix them.
+        if (lchar == dot) {
+            return true;
+        } else if (rchar == dot) {
+            return false;
+        }
+
+        // Otherwise, default to normal character comparison.
+        return lchar < rchar;
+    }
+
+    // If we get here, then we have reached the end of lhs and/or rhs and all of their path
+    // segments up to this point match. If lhs is shorter than rhs, then lhs prefixes rhs
+    // and should sort before it.
+    return lhs.size() < rhs.size();
+}
+
 }  // namespace mongo

@@ -116,7 +116,7 @@ StitchSupportStatusImpl* getStatusImpl(stitch_support_v1_status* status) {
 using StitchSupportException = ExceptionForAPI<stitch_support_v1_error>;
 
 ServiceContext* initialize() {
-    srand(static_cast<unsigned>(curTimeMicros64()));
+    srand(static_cast<unsigned>(curTimeMicros64()));  // NOLINT
 
     // The global initializers can take arguments, which would normally be supplied on the command
     // line, but we assume that clients of this library will never want anything other than the
@@ -536,8 +536,7 @@ bool MONGO_API_CALL
 stitch_support_v1_projection_requires_match(stitch_support_v1_projection* const projection) {
     return [projection]() noexcept {
         return projection->requiresMatch;
-    }
-    ();
+    }();
 }
 
 stitch_support_v1_update* MONGO_API_CALL
@@ -663,7 +662,9 @@ uint8_t* MONGO_API_CALL stitch_support_v1_update_upsert(stitch_support_v1_update
 
 bool MONGO_API_CALL
 stitch_support_v1_update_requires_match(stitch_support_v1_update* const update) {
-    return [update]() { return update->updateDriver.needMatchDetails(); }();
+    return [update]() {
+        return update->updateDriver.needMatchDetails();
+    }();
 }
 
 stitch_support_v1_update_details* MONGO_API_CALL stitch_support_v1_update_details_create(void) {

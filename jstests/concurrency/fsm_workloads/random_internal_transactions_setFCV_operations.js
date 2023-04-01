@@ -21,7 +21,6 @@ load('jstests/concurrency/fsm_workloads/random_moveChunk_update_shard_key.js');
 load('jstests/libs/override_methods/retry_on_killed_session.js');
 
 var $config = extendWorkload($config, function($config, $super) {
-    $config.data.areInternalTransactionsEnabled = true;
     // Sessions of open transactions can be killed and throw "Interrupted" if we run it concurrently
     // with a setFCV command, so we want to be able to catch those as acceptable killSession errors.
     $config.data.retryOnKilledSession = true;
@@ -37,6 +36,15 @@ var $config = extendWorkload($config, function($config, $super) {
             if (e.code === 5147403) {
                 // Invalid fcv transition (e.g lastContinuous -> lastLTS)
                 jsTestLog('setFCV: Invalid transition');
+                return;
+            }
+            if (e.code === 7428200) {
+                // Cannot upgrade FCV if a previous FCV downgrade stopped in the middle of cleaning
+                // up internal server metadata.
+                assertAlways.eq(latestFCV, targetFCV);
+                jsTestLog(
+                    'setFCV: Cannot upgrade FCV if a previous FCV downgrade stopped in the middle \
+                    of cleaning up internal server metadata');
                 return;
             }
             throw e;

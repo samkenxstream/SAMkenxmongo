@@ -21,7 +21,7 @@ class BenchmarkTestCase(interface.ProcessTestCase):
         self.suite_bm_options = program_options
         self.bm_options = {}
 
-    def validate_benchmark_options(self):  # pylint: disable=no-self-use
+    def validate_benchmark_options(self):
         """Error out early if any options are incompatible with benchmark test suites.
 
         :return: None
@@ -81,6 +81,4 @@ class BenchmarkTestCase(interface.ProcessTestCase):
         return self.bm_executable + ".json"
 
     def _make_process(self):
-        return core.programs.generic_program(self.logger, [self.bm_executable],
-                                             self.fixture.job_num, test_id=self._id,
-                                             **self.bm_options)
+        return core.programs.generic_program(self.logger, [self.bm_executable], **self.bm_options)

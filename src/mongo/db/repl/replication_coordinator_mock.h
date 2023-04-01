@@ -241,6 +241,8 @@ public:
 
     virtual bool getMaintenanceMode();
 
+    virtual bool shouldDropSyncSourceAfterShardSplit(OID replicaSetId) const;
+
     virtual Status processReplSetSyncFrom(OperationContext* opCtx,
                                           const HostAndPort& target,
                                           BSONObjBuilder* resultObj);
@@ -259,7 +261,9 @@ public:
 
     virtual Status doOptimizedReconfig(OperationContext* opCtx, GetNewConfigFn getNewConfig);
 
-    Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment);
+    Status awaitConfigCommitment(OperationContext* opCtx,
+                                 bool waitForOplogCommitment,
+                                 long long term);
 
     virtual Status processReplSetInitiate(OperationContext* opCtx,
                                           const BSONObj& configObj,
@@ -389,8 +393,8 @@ public:
         const SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> clientTopologyVersion) override;
 
-    virtual StatusWith<OpTime> getLatestWriteOpTime(OperationContext* opCtx) const
-        noexcept override;
+    virtual StatusWith<OpTime> getLatestWriteOpTime(
+        OperationContext* opCtx) const noexcept override;
 
     virtual HostAndPort getCurrentPrimaryHostAndPort() const override;
 
@@ -404,7 +408,41 @@ public:
 
     virtual void recordIfCWWCIsSetOnConfigServerOnStartup(OperationContext* opCtx) final;
 
+    class WriteConcernTagChangesMock : public WriteConcernTagChanges {
+        virtual ~WriteConcernTagChangesMock() = default;
+        virtual bool reserveDefaultWriteConcernChange() {
+            return false;
+        };
+        virtual void releaseDefaultWriteConcernChange() {}
+
+        virtual bool reserveConfigWriteConcernTagChange() {
+            return false;
+        };
+        virtual void releaseConfigWriteConcernTagChange() {}
+    };
+
+    virtual WriteConcernTagChanges* getWriteConcernTagChanges() override;
+
+    virtual SplitPrepareSessionManager* getSplitPrepareSessionManager() override;
+
+    /**
+     * If this is true, the mock will update the "committed snapshot" everytime the "last applied"
+     * is updated. That behavior can be disabled for tests that need more control over what's
+     * majority committed.
+     */
+    void setUpdateCommittedSnapshot(bool val) {
+        _updateCommittedSnapshot = val;
+    }
+
+    bool isRetryableWrite(OperationContext* opCtx) const override {
+        return false;
+    }
+
 private:
+    void _setMyLastAppliedOpTimeAndWallTime(WithLock lk,
+                                            const OpTimeAndWallTime& opTimeAndWallTime);
+    void _setCurrentCommittedSnapshotOpTime(WithLock lk, OpTime time);
+
     ServiceContext* const _service;
     ReplSettings _settings;
     StorageInterface* _storage = nullptr;
@@ -429,6 +467,9 @@ private:
     bool _resetLastOpTimesCalled = false;
     bool _alwaysAllowWrites = false;
     bool _canAcceptNonLocalWrites = false;
+
+    SplitPrepareSessionManager _splitSessionManager;
+    bool _updateCommittedSnapshot = true;
 };
 
 }  // namespace repl

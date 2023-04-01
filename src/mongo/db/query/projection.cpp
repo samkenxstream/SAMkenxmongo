@@ -30,6 +30,8 @@
 #include "mongo/db/query/projection.h"
 
 #include "mongo/base/exact_cast.h"
+#include "mongo/db/matcher/match_expression_dependencies.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
 #include "mongo/db/query/projection_ast_path_tracking_visitor.h"
 #include "mongo/db/query/tree_walker.h"
 #include "mongo/db/query/util/make_data_structure.h"
@@ -44,13 +46,18 @@ namespace {
  */
 struct DepsAnalysisData {
     DepsTracker fieldDependencyTracker;
+    OrderedPathSet excludedPaths;
 
-    void addRequiredField(const std::string& fieldName) {
-        fieldDependencyTracker.fields.insert(fieldName);
+    void addRequiredField(std::string fieldName) {
+        fieldDependencyTracker.fields.insert(std::move(fieldName));
     }
 
-    std::vector<std::string> requiredFields() const {
-        return {fieldDependencyTracker.fields.begin(), fieldDependencyTracker.fields.end()};
+    void addExcludedPath(std::string path) {
+        excludedPaths.insert(std::move(path));
+    }
+
+    OrderedPathSet requiredFields() const {
+        return fieldDependencyTracker.fields;
     }
 };
 
@@ -104,6 +111,7 @@ public:
     void visit(const ProjectionElemMatchASTNode* node) final {
         _deps->requiresDocument = true;
         _deps->hasExpressions = true;
+        _deps->containsElemMatch = true;
     }
 
     void visit(const ExpressionASTNode* node) final {
@@ -130,7 +138,8 @@ public:
     }
 
     void visit(const MatchExpressionASTNode* node) final {
-        node->matchExpression()->addDependencies(&_context->data().fieldDependencyTracker);
+        match_expression::addDependencies(&(*node->matchExpression()),
+                                          &_context->data().fieldDependencyTracker);
     }
 
     void visit(const ProjectionPositionalASTNode* node) final {
@@ -152,7 +161,8 @@ public:
     void visit(const ExpressionASTNode* node) final {
         // The output of an expression on a dotted path depends on whether that field is an array.
         invariant(node->parent());
-        node->expressionRaw()->addDependencies(&_context->data().fieldDependencyTracker);
+        expression::addDependencies(node->expressionRaw(),
+                                    &_context->data().fieldDependencyTracker);
 
         if (_context->fullPath().getPathLength() > 1) {
             // If assigning to a top-level field, the value of that field is not actually required.
@@ -167,6 +177,8 @@ public:
         // For inclusions, we depend on the field.
         if (node->value()) {
             addFullPathAsDependency();
+        } else {
+            _context->data().addExcludedPath(_context->fullPath().fullPath());
         }
     }
 
@@ -201,10 +213,11 @@ auto analyzeProjection(const ProjectionPathASTNode* root, ProjectType type) {
     const auto& tracker = userData.fieldDependencyTracker;
 
     if (type == ProjectType::kInclusion) {
-        deps.requiredFields = userData.requiredFields();
+        deps.paths = userData.requiredFields();
     } else {
         invariant(type == ProjectType::kExclusion);
         deps.requiresDocument = true;
+        deps.paths = std::move(userData.excludedPaths);
     }
 
     deps.metadataRequested = tracker.metadataDeps();

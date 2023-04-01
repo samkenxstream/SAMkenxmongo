@@ -35,7 +35,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/db/shard_id.h"
 
 namespace mongo {
 
@@ -62,36 +62,20 @@ public:
             explicit use_bytes_t() = default;
         };
         ShardStatistics(ShardId shardId,
-                        uint64_t maxSizeBytes,
                         uint64_t currSizeBytes,
                         bool isDraining,
-                        std::set<std::string> shardTags,
+                        std::set<std::string> shardZones,
                         std::string mongoVersion,
                         use_bytes_t t);
 
         ShardStatistics(ShardId shardId,
-                        uint64_t maxSizeMB,
                         uint64_t currSizeMB,
                         bool isDraining,
-                        std::set<std::string> shardTags,
+                        std::set<std::string> shardZones,
                         std::string mongoVersion);
-
-        /**
-         * Returns true if a shard is not allowed to receive any new chunks because it has reached
-         * the per-shard data size limit.
-         */
-        bool isSizeMaxed() const;
-
-        /**
-         * Returns BSON representation of this shard's statistics, for reporting purposes.
-         */
-        BSONObj toBSON() const;
 
         // The id of the shard for which this statistic applies
         ShardId shardId;
-
-        // The maximum storage size allowed for the shard. Zero means no maximum specified.
-        uint64_t maxSizeBytes{0};
 
         // The current storage size of the shard.
         uint64_t currSizeBytes{0};
@@ -99,8 +83,8 @@ public:
         // Whether the shard is in draining mode
         bool isDraining{false};
 
-        // Set of tags for the shard
-        std::set<std::string> shardTags;
+        // Set of zones for the shard
+        std::set<std::string> shardZones;
 
         // Version of mongod, which runs on this shard's primary
         std::string mongoVersion;

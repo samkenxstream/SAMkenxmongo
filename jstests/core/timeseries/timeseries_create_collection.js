@@ -4,8 +4,10 @@
  * in that case.
  *
  * @tags: [
- *   does_not_support_transactions,
- *   requires_getmore,
+ *   # "Overriding safe failed response for :: create"
+ *   does_not_support_stepdowns,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 (function() {

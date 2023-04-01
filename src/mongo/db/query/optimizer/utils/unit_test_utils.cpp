@@ -29,38 +29,55 @@
 
 #include "mongo/db/query/optimizer/utils/unit_test_utils.h"
 
-#include "mongo/db/pipeline/abt/abt_document_source_visitor.h"
-#include "mongo/db/pipeline/expression_context_for_test.h"
+#include <fstream>
+
+#include "mongo/db/pipeline/abt/utils.h"
+#include "mongo/db/query/ce/heuristic_estimator.h"
+#include "mongo/db/query/ce/hinted_estimator.h"
+#include "mongo/db/query/cost_model/cost_estimator_impl.h"
+#include "mongo/db/query/cost_model/cost_model_manager.h"
 #include "mongo/db/query/optimizer/explain.h"
 #include "mongo/db/query/optimizer/metadata.h"
 #include "mongo/db/query/optimizer/node.h"
-#include "mongo/unittest/temp_dir.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/query/optimizer/rewrites/const_eval.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/str_escape.h"
+
 
 namespace mongo::optimizer {
 
 static constexpr bool kDebugAsserts = false;
 
+
 void maybePrintABT(const ABT& abt) {
     // Always print using the supported versions to make sure we don't crash.
     const std::string strV1 = ExplainGenerator::explain(abt);
     const std::string strV2 = ExplainGenerator::explainV2(abt);
-    auto [tag, val] = ExplainGenerator::explainBSON(abt);
-    sbe::value::ValueGuard vg(tag, val);
+    const std::string strV2Compact = ExplainGenerator::explainV2Compact(abt);
+    const std::string strBSON = ExplainGenerator::explainBSONStr(abt);
 
     if constexpr (kDebugAsserts) {
         std::cout << "V1: " << strV1 << "\n";
         std::cout << "V2: " << strV2 << "\n";
-        std::cout << "BSON: " << ExplainGenerator::printBSON(tag, val) << "\n";
+        std::cout << "V2Compact: " << strV2Compact << "\n";
+        std::cout << "BSON: " << strBSON << "\n";
     }
 }
+
+std::string getPropsStrForExplain(const OptPhaseManager& phaseManager) {
+    return ExplainGenerator::explainV2(
+        make<MemoPhysicalDelegatorNode>(phaseManager.getPhysicalNodeId()),
+        true /*displayPhysicalProperties*/,
+        &phaseManager.getMemo());
+}
+
 
 ABT makeIndexPath(FieldPathType fieldPath, bool isMultiKey) {
     ABT result = make<PathIdentity>();
 
     for (size_t i = fieldPath.size(); i-- > 0;) {
         if (isMultiKey) {
-            result = make<PathTraverse>(std::move(result));
+            result = make<PathTraverse>(PathTraverse::kSingleLevel, std::move(result));
         }
         result = make<PathGet>(std::move(fieldPath.at(i)), std::move(result));
     }
@@ -96,62 +113,88 @@ IndexDefinition makeCompositeIndexDefinition(std::vector<TestIndexField> indexFi
     return IndexDefinition{std::move(idxCollSpec), isMultiKey};
 }
 
-std::unique_ptr<mongo::Pipeline, mongo::PipelineDeleter> parsePipeline(
-    const NamespaceString& nss,
-    const std::string& inputPipeline,
-    OperationContextNoop& opCtx,
-    const std::vector<ExpressionContext::ResolvedNamespace>& involvedNss) {
-    const BSONObj inputBson = fromjson("{pipeline: " + inputPipeline + "}");
-
-    std::vector<BSONObj> rawPipeline;
-    for (auto&& stageElem : inputBson["pipeline"].Array()) {
-        ASSERT_EQUALS(stageElem.type(), BSONType::Object);
-        rawPipeline.push_back(stageElem.embeddedObject());
-    }
-
-    AggregateCommandRequest request(nss, rawPipeline);
-    boost::intrusive_ptr<ExpressionContextForTest> ctx(
-        new ExpressionContextForTest(&opCtx, request));
-
-    // Setup the resolved namespaces for other involved collections.
-    for (const auto& resolvedNss : involvedNss) {
-        ctx->setResolvedNamespace(resolvedNss.ns, resolvedNss);
-    }
-
-    unittest::TempDir tempDir("ABTPipelineTest");
-    ctx->tempDir = tempDir.path();
-
-    return Pipeline::parse(request.getPipeline(), ctx);
+std::unique_ptr<CardinalityEstimator> makeHeuristicCE() {
+    return std::make_unique<ce::HeuristicEstimator>();
 }
 
-ABT translatePipeline(const Metadata& metadata,
-                      const std::string& pipelineStr,
-                      ProjectionName scanProjName,
-                      std::string scanDefName,
-                      PrefixId& prefixId,
-                      const std::vector<ExpressionContext::ResolvedNamespace>& involvedNss) {
-    OperationContextNoop opCtx;
-    auto pipeline =
-        parsePipeline(NamespaceString("a." + scanDefName), pipelineStr, opCtx, involvedNss);
-    return translatePipelineToABT(metadata,
-                                  *pipeline.get(),
-                                  scanProjName,
-                                  make<ScanNode>(scanProjName, std::move(scanDefName)),
-                                  prefixId);
+std::unique_ptr<CardinalityEstimator> makeHintedCE(ce::PartialSchemaSelHints hints) {
+    return std::make_unique<ce::HintedEstimator>(std::move(hints));
 }
 
-ABT translatePipeline(Metadata& metadata,
-                      const std::string& pipelineStr,
-                      std::string scanDefName,
-                      PrefixId& prefixId) {
-    return translatePipeline(
-        metadata, pipelineStr, prefixId.getNextId("scan"), scanDefName, prefixId);
+cost_model::CostModelCoefficients getTestCostModel() {
+    return cost_model::CostModelManager::getDefaultCoefficients();
 }
 
-ABT translatePipeline(const std::string& pipelineStr, std::string scanDefName) {
-    PrefixId prefixId;
-    Metadata metadata{{}};
-    return translatePipeline(metadata, pipelineStr, std::move(scanDefName), prefixId);
+std::unique_ptr<CostEstimator> makeCostEstimator() {
+    return makeCostEstimator(getTestCostModel());
 }
 
+std::unique_ptr<CostEstimator> makeCostEstimator(
+    const cost_model::CostModelCoefficients& costModel) {
+    return std::make_unique<cost_model::CostEstimatorImpl>(costModel);
+}
+
+
+OptPhaseManager makePhaseManager(
+    OptPhaseManager::PhaseSet phaseSet,
+    PrefixId& prefixId,
+    Metadata metadata,
+    const boost::optional<cost_model::CostModelCoefficients>& costModel,
+    DebugInfo debugInfo,
+    QueryHints queryHints) {
+    return OptPhaseManager{std::move(phaseSet),
+                           prefixId,
+                           false /*requireRID*/,
+                           std::move(metadata),
+                           makeHeuristicCE(),  // primary CE
+                           makeHeuristicCE(),  // substitution phase CE, same as primary
+                           makeCostEstimator(costModel ? *costModel : getTestCostModel()),
+                           defaultConvertPathToInterval,
+                           ConstEval::constFold,
+                           true /*supportExplain*/,
+                           std::move(debugInfo),
+                           std::move(queryHints)};
+}
+
+OptPhaseManager makePhaseManager(
+    OptPhaseManager::PhaseSet phaseSet,
+    PrefixId& prefixId,
+    Metadata metadata,
+    std::unique_ptr<CardinalityEstimator> ce,
+    const boost::optional<cost_model::CostModelCoefficients>& costModel,
+    DebugInfo debugInfo,
+    QueryHints queryHints) {
+    return OptPhaseManager{std::move(phaseSet),
+                           prefixId,
+                           false /*requireRID*/,
+                           std::move(metadata),
+                           std::move(ce),      // primary CE
+                           makeHeuristicCE(),  // substitution phase CE
+                           makeCostEstimator(costModel ? *costModel : getTestCostModel()),
+                           defaultConvertPathToInterval,
+                           ConstEval::constFold,
+                           true /*supportExplain*/,
+                           std::move(debugInfo),
+                           std::move(queryHints)};
+}
+
+
+OptPhaseManager makePhaseManagerRequireRID(OptPhaseManager::PhaseSet phaseSet,
+                                           PrefixId& prefixId,
+                                           Metadata metadata,
+                                           DebugInfo debugInfo,
+                                           QueryHints queryHints) {
+    return OptPhaseManager{std::move(phaseSet),
+                           prefixId,
+                           true /*requireRID*/,
+                           std::move(metadata),
+                           makeHeuristicCE(),  // primary CE
+                           makeHeuristicCE(),  // substitution phase CE, same as primary
+                           makeCostEstimator(),
+                           defaultConvertPathToInterval,
+                           ConstEval::constFold,
+                           true /*supportExplain*/,
+                           std::move(debugInfo),
+                           std::move(queryHints)};
+}
 }  // namespace mongo::optimizer

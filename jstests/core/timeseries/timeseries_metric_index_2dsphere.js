@@ -4,12 +4,15 @@
  * Tests index creation, document insertion, index utilization for queries, and index drop.
  *
  * @tags: [
- *   does_not_support_stepdowns,
- *   does_not_support_transactions,
- *   requires_fcv_51,
- *   requires_getmore,
  *   # Explain of a resolved view must be executed by mongos.
  *   directly_against_shardsvrs_incompatible,
+ *   # Time series geo functionality requires optimization.
+ *   requires_pipeline_optimization,
+ *   # Refusing to run a test that issues an aggregation command with explain because it may return
+ *   # incomplete results if interrupted by a stepdown.
+ *   does_not_support_stepdowns,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 
@@ -18,8 +21,9 @@
 
 load("jstests/core/timeseries/libs/timeseries.js");
 load("jstests/libs/analyze_plan.js");
+load("jstests/libs/feature_flag_util.js");
 
-if (!TimeseriesTest.timeseriesMetricIndexesEnabled(db.getMongo())) {
+if (!FeatureFlagUtil.isEnabled(db, "TimeseriesMetricIndexes")) {
     return;
 }
 
@@ -66,33 +70,52 @@ TimeseriesTest.run((insert) => {
     const twoDSphereDocs = [
         {
             _id: 0,
-            [timeFieldName]: ISODate(),
+            [timeFieldName]: ISODate("2022-04-01T00:00:00.000Z"),
             [metaFieldName]: "m1",
             location: {type: "Point", coordinates: [40, -70]}
         },
         {
             _id: 1,
-            [timeFieldName]: ISODate(),
+            [timeFieldName]: ISODate("2022-04-01T00:01:00.000Z"),  // should land in same bucket
             [metaFieldName]: "m1",
             location: {type: "Point", coordinates: [40.1, -70.1]}
         },
         {
             _id: 2,
-            [timeFieldName]: ISODate(),
+            [timeFieldName]: ISODate("2022-04-01T00:00:00.000Z"),
             [metaFieldName]: "m2",
             location: {type: "Point", coordinates: [40.2, -70.2]}
         },
         {
             _id: 3,
-            [timeFieldName]: ISODate(),
+            [timeFieldName]: ISODate("2022-04-01T00:01:00.000Z"),  // should land in same bucket
             [metaFieldName]: "m2",
-            location: {type: "Point", coordinates: [40.2, -70.2]}
+            location: {type: "Point", coordinates: [40.3, -70.3]}
         },
-        {_id: 4, [timeFieldName]: ISODate(), [metaFieldName]: "m2"},
-        {_id: 5, [timeFieldName]: ISODate(), [metaFieldName]: "m3"},
+        {
+            _id: 4,
+            [timeFieldName]: ISODate("2022-04-01T00:02:00.000Z"),  // should land in same bucket
+            [metaFieldName]: "m2",
+            location: {type: "Point", coordinates: [40.4, -70.4]}
+        },
+        {
+            _id: 5,
+            [timeFieldName]:
+                ISODate("2022-04-01T02:00:00.000Z"),  // should open new bucket and compress old one
+            [metaFieldName]: "m2",
+            location: {type: "Point", coordinates: [40.5, -70.5]}
+        },
+        {
+            _id: 6,
+            [timeFieldName]: ISODate("2022-04-01T02:01:00.000Z"),  // should land in same bucket
+            [metaFieldName]: "m2"
+        },
+        {_id: 7, [timeFieldName]: ISODate("2022-04-01T00:00:00.000Z"), [metaFieldName]: "m3"},
     ];
     assert.commandWorked(insert(timeseriescoll, twoDSphereDocs),
                          'Failed to insert twoDSphereDocs: ' + tojson(twoDSphereDocs));
+    assert.eq(bucketscoll.count(), 4);
+    printjson(bucketscoll.find({}).toArray());
 
     // Test invalid documents
     const docWithInvalidCoordinates = {
@@ -140,7 +163,7 @@ TimeseriesTest.run((insert) => {
         timeseriescoll.find({location: {$geoWithin: {$center: [[40, -70], .15]}}}).toArray().length,
         geoWithinPlan2d);
 
-    assert.eq(4,
+    assert.eq(6,
               timeseriescoll
                   .aggregate([{
                       $geoNear: {

@@ -27,18 +27,18 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/client/sdam/sdam_test_base.h"
 #include "mongo/client/sdam/topology_description.h"
-
-#include <boost/optional/optional_io.hpp>
 
 #include "mongo/client/sdam/server_description.h"
 #include "mongo/client/sdam/server_description_builder.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/logv2/log.h"
 #include "mongo/unittest/death_test.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
@@ -254,7 +254,7 @@ TEST_F(TopologyDescriptionTestFixture, ShouldSetLogicalSessionTimeoutToMinOfAllS
             return newInstanceBuilder.instance();
         });
 
-    for (auto description : serverDescriptionsWithTimeouts) {
+    for (const auto& description : serverDescriptionsWithTimeouts) {
         topologyDescription->installServerDescription(description);
     }
 
@@ -289,7 +289,7 @@ TEST_F(TopologyDescriptionTestFixture,
             return newInstance;
         });
 
-    for (auto description : serverDescriptionsWithTimeouts) {
+    for (const auto& description : serverDescriptionsWithTimeouts) {
         topologyDescription->installServerDescription(description);
     }
 

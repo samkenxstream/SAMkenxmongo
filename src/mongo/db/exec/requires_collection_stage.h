@@ -31,8 +31,6 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/util/uuid.h"
 
@@ -51,19 +49,12 @@ class RequiresCollectionStage : public PlanStage {
 public:
     RequiresCollectionStage(const char* stageType,
                             ExpressionContext* expCtx,
-                            const CollectionPtr& coll,
-                            bool relaxCappedConstraints)
+                            const CollectionPtr& coll)
         : PlanStage(stageType, expCtx),
-          _relaxCappedConstraints(relaxCappedConstraints),
           _collection(&coll),
           _collectionUUID(coll->uuid()),
           _catalogEpoch(getCatalogEpoch()),
           _nss(coll->ns()) {}
-
-    RequiresCollectionStage(const char* stageType,
-                            ExpressionContext* expCtx,
-                            const CollectionPtr& coll)
-        : RequiresCollectionStage(stageType, expCtx, coll, false /* relaxCappedConstraints */) {}
 
     virtual ~RequiresCollectionStage() = default;
 
@@ -89,11 +80,6 @@ protected:
     UUID uuid() const {
         return _collectionUUID;
     }
-
-    // Whether this collection scan should be exempted from capped collection constratints, like
-    // forbidding cursor repositioning across yield restore. Ignored if this is not a capped
-    // collection.
-    const bool _relaxCappedConstraints;
 
 private:
     // This can only be called when the plan stage is attached to an operation context.

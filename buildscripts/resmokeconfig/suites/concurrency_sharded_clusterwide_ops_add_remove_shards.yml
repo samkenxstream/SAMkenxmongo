@@ -15,13 +15,17 @@ executor:
     hooks:
       - CheckReplDBHashInBackground
       - CheckReplDBHash
+      - CheckMetadataConsistencyInBackground
       - ValidateCollections
     tests: true
   config: {}
   hooks:
   - class: CheckReplDBHashInBackground
   - class: CheckReplDBHash
+  - class: CheckMetadataConsistencyInBackground
   - class: CheckOrphansDeleted
+  - class: CheckRoutingTableConsistency
+  - class: CheckShardFilteringMetadata
   - class: ValidateCollections # Validation can interfere with other operations, so this goes last.
   - class: CleanupConcurrencyWorkloads
   fixture:
@@ -29,6 +33,7 @@ executor:
     mongos_options:
       set_parameters:
         enableTestCommands: 1
+        queryAnalysisSamplerConfigurationRefreshSecs: 1
     shard_options:
       mongod_options:
         oplogSize: 1024
@@ -37,6 +42,7 @@ executor:
         enableTestCommands: 1
         roleGraphInvalidationIsFatal: 1
         receiveChunkWaitForRangeDeleterTimeoutMS: 90000
+        queryAnalysisWriterIntervalSecs: 1
     num_rs_nodes_per_shard: 3
     num_shards: 2
     num_mongos: 2

@@ -875,7 +875,7 @@ TEST_F(ServiceContextTest, ValidateConfigForHeartbeatReconfig_NewConfigInvalid) 
     presentOnceExternalState.addSelf(HostAndPort("h2"));
     ASSERT_EQUALS(ErrorCodes::BadValue,
                   validateConfigForHeartbeatReconfig(
-                      &presentOnceExternalState, newConfig, getServiceContext())
+                      &presentOnceExternalState, newConfig, HostAndPort(), getServiceContext())
                       .getStatus());
 }
 
@@ -894,7 +894,7 @@ TEST_F(ServiceContextTest, ValidateConfigForHeartbeatReconfig_NewConfigValid) {
     ReplicationCoordinatorExternalStateMock presentOnceExternalState;
     presentOnceExternalState.addSelf(HostAndPort("h2"));
     ASSERT_OK(validateConfigForHeartbeatReconfig(
-                  &presentOnceExternalState, newConfig, getServiceContext())
+                  &presentOnceExternalState, newConfig, HostAndPort(), getServiceContext())
                   .getStatus());
 }
 
@@ -917,7 +917,7 @@ DEATH_TEST_REGEX_F(ServiceContextTest,
     ReplicationCoordinatorExternalStateMock presentOnceExternalState;
     presentOnceExternalState.addSelf(HostAndPort("h2"));
     ASSERT_THROWS_CODE(validateConfigForHeartbeatReconfig(
-                           &presentOnceExternalState, newConfig, getServiceContext())
+                           &presentOnceExternalState, newConfig, HostAndPort(), getServiceContext())
                            .getStatus(),
                        AssertionException,
                        5624103);
@@ -1286,6 +1286,87 @@ TEST_F(ServiceContextTest, FindSelfInConfig) {
         ErrorCodes::NodeNotElectable,
         findSelfInConfigIfElectable(&presentOnceExternalState, newConfig, getServiceContext())
             .getStatus());
+}
+
+TEST_F(ServiceContextTest, FindSelfInConfigFastAndSlow) {
+    ReplSetConfig newConfig;
+    newConfig = ReplSetConfig::parse(BSON("_id"
+                                          << "rs0"
+                                          << "version" << 2 << "protocolVersion" << 1 << "members"
+                                          << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                   << "h1")
+                                                        << BSON("_id" << 2 << "host"
+                                                                      << "h2")
+                                                        << BSON("_id" << 3 << "host"
+                                                                      << "h3"))));
+
+    {
+        // Present once only on the slow path, but fast enough to be found
+        ReplicationCoordinatorExternalStateMock presentOnceExternalState;
+        presentOnceExternalState.addSelfSlow(HostAndPort("h2"), Seconds(29));
+        ASSERT_EQUALS(1,
+                      unittest::assertGet(findSelfInConfig(
+                          &presentOnceExternalState, newConfig, getServiceContext())));
+    }
+
+    {
+        // Present twice only on the slow path, but fast enough to be found both times.
+        ReplicationCoordinatorExternalStateMock presentTwiceExternalState;
+        presentTwiceExternalState.addSelfSlow(HostAndPort("h2"), Seconds(29));
+        presentTwiceExternalState.addSelfSlow(HostAndPort("h3"), Seconds(29));
+        ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
+                      findSelfInConfig(&presentTwiceExternalState, newConfig, getServiceContext())
+                          .getStatus());
+    }
+
+    {
+        // Present once on the fast path, once on the slow path. This is expected to erroneously
+        // succeed, because we should not check the slow path if we got a unique result on the fast
+        // path.
+        ReplicationCoordinatorExternalStateMock presentFastAndSlowExternalState;
+        presentFastAndSlowExternalState.addSelf(HostAndPort("h2"));
+        presentFastAndSlowExternalState.addSelfSlow(HostAndPort("h3"), Seconds(29));
+        ASSERT_EQUALS(1,
+                      unittest::assertGet(findSelfInConfig(
+                          &presentFastAndSlowExternalState, newConfig, getServiceContext())));
+    }
+
+    {
+        // Present only on the slow path, with a long timeout.  This will fail.
+        ReplicationCoordinatorExternalStateMock presentLongTimeoutExternalState;
+        presentLongTimeoutExternalState.addSelfSlow(HostAndPort("h2"), Seconds(31));
+        ASSERT_EQUALS(
+            ErrorCodes::NodeNotFound,
+            findSelfInConfig(&presentLongTimeoutExternalState, newConfig, getServiceContext())
+                .getStatus());
+    }
+}
+
+TEST_F(ServiceContextTest, FindOwnHostInConfigQuick) {
+    ReplSetConfig newConfig;
+    newConfig = ReplSetConfig::parse(BSON("_id"
+                                          << "rs0"
+                                          << "version" << 2 << "protocolVersion" << 1 << "members"
+                                          << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                   << "h1:1234")
+                                                        << BSON("_id" << 2 << "host"
+                                                                      << "h2:1234")
+                                                        << BSON("_id" << 3 << "host"
+                                                                      << "h3:1234")
+                                                        << BSON("_id" << 4 << "host"
+                                                                      << "h2:1234"))));
+
+    // Does not exist.
+    ASSERT_EQUALS(-1, findOwnHostInConfigQuick(newConfig, HostAndPort("non-existent")));
+
+    // First in config, not duplicated.
+    ASSERT_EQUALS(0, findOwnHostInConfigQuick(newConfig, HostAndPort("h1:1234")));
+
+    // Not first in config but also not duplicated.
+    ASSERT_EQUALS(2, findOwnHostInConfigQuick(newConfig, HostAndPort("h3:1234")));
+
+    // First match in a tie.
+    ASSERT_EQUALS(1, findOwnHostInConfigQuick(newConfig, HostAndPort("h2:1234")));
 }
 
 }  // namespace

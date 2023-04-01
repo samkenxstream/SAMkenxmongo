@@ -27,34 +27,36 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/split_vector.h"
 
-#include "mongo/base/status_with.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/keypattern.h"
-#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/plan_executor.h"
-#include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/shard_key_index_util.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 namespace {
 
 const int kMaxObjectPerChunk{250000};
-const int estimatedAdditionalBytesPerItemInBSONArray{2};
+const int kEstimatedAdditionalBytesPerItemInBSONArray{2};
 
 BSONObj prettyKey(const BSONObj& keyPattern, const BSONObj& key) {
     return key.replaceFieldNames(keyPattern).clientReadable();
+}
+
+/*
+ * Reshuffle fields according to the shard key pattern.
+ */
+auto orderShardKeyFields(const BSONObj& keyPattern, const BSONObj& key) {
+    // Note: It is correct to hydrate the indexKey 'key' with 'keyPattern', because the index key
+    // pattern is a prefix of 'keyPattern'.
+    return dotted_path_support::extractElementsBasedOnTemplate(key.replaceFieldNames(keyPattern),
+                                                               keyPattern);
 }
 
 }  // namespace
@@ -78,18 +80,14 @@ std::vector<BSONObj> splitVector(OperationContext* opCtx,
 
     {
         AutoGetCollection collection(opCtx, nss, MODE_IS);
-
-        CollectionShardingState::get(opCtx, nss)->checkShardVersionOrThrow(opCtx);
-
         uassert(ErrorCodes::NamespaceNotFound, "ns not found", collection);
 
         // Allow multiKey based on the invariant that shard keys must be single-valued. Therefore,
         // any multi-key index prefixed by shard key cannot be multikey over the shard key fields.
-        auto shardKeyIdx = findShardKeyPrefixedIndex(opCtx,
-                                                     *collection,
-                                                     collection->getIndexCatalog(),
-                                                     keyPattern,
-                                                     /*requireSingleKey=*/false);
+        const auto shardKeyIdx = findShardKeyPrefixedIndex(opCtx,
+                                                           *collection,
+                                                           keyPattern,
+                                                           /*requireSingleKey=*/false);
         uassert(ErrorCodes::IndexNotFound,
                 str::stream() << "couldn't find index over splitting key "
                               << keyPattern.clientReadable().toString(),
@@ -122,12 +120,12 @@ std::vector<BSONObj> splitVector(OperationContext* opCtx,
         }
 
         // We need a maximum size for the chunk.
-        if (!maxChunkSizeBytes || maxChunkSizeBytes.get() <= 0) {
+        if (!maxChunkSizeBytes || maxChunkSizeBytes.value() <= 0) {
             uasserted(ErrorCodes::InvalidOptions, "need to specify the desired max chunk size");
         }
 
         // If there's not enough data for more than one chunk, no point continuing.
-        if (dataSize < maxChunkSizeBytes.get() || recCount == 0) {
+        if (dataSize < maxChunkSizeBytes.value() || recCount == 0) {
             std::vector<BSONObj> emptyVector;
             return emptyVector;
         }
@@ -135,7 +133,7 @@ std::vector<BSONObj> splitVector(OperationContext* opCtx,
         LOGV2(22107,
               "Requested split points lookup for chunk {namespace} {minKey} -->> {maxKey}",
               "Requested split points lookup for chunk",
-              "namespace"_attr = nss.toString(),
+              logAttrs(nss),
               "minKey"_attr = redact(prettyKey(keyPattern, minKey)),
               "maxKey"_attr = redact(prettyKey(keyPattern, maxKey)));
 
@@ -144,18 +142,18 @@ std::vector<BSONObj> splitVector(OperationContext* opCtx,
         // maxChunkObjects, if provided.
         const long long avgRecSize = dataSize / recCount;
 
-        long long keyCount = maxChunkSizeBytes.get() / (2 * avgRecSize);
+        long long keyCount = maxChunkSizeBytes.value() / (2 * avgRecSize);
 
-        if (maxChunkObjects.get() && (maxChunkObjects.get() < keyCount)) {
+        if (maxChunkObjects.value() && (maxChunkObjects.value() < keyCount)) {
             LOGV2(22108,
                   "Limiting the number of documents per chunk to {maxChunkObjects} based "
                   "on the maxChunkObjects parameter for split vector command (compared to maximum "
                   "possible: {maxPossibleDocumentsPerChunk})",
                   "Limiting the number of documents per chunk for split vector command based on "
                   "the maxChunksObject parameter",
-                  "maxChunkObjects"_attr = maxChunkObjects.get(),
+                  "maxChunkObjects"_attr = maxChunkObjects.value(),
                   "maxPossibleDocumentsPerChunk"_attr = keyCount);
-            keyCount = maxChunkObjects.get();
+            keyCount = maxChunkObjects.value();
         }
 
         //
@@ -210,7 +208,7 @@ std::vector<BSONObj> splitVector(OperationContext* opCtx,
                 "Possible low cardinality key detected in {namespace} - range {minKey} -->> "
                 "{maxKey} contains only the key {key}",
                 "Possible low cardinality key detected in range. Range contains only a single key.",
-                "namespace"_attr = nss.toString(),
+                logAttrs(nss),
                 "minKey"_attr = redact(prettyKey(shardKeyIdx->keyPattern(), minKey)),
                 "maxKey"_attr = redact(prettyKey(shardKeyIdx->keyPattern(), maxKey)),
                 "key"_attr = redact(prettyKey(shardKeyIdx->keyPattern(), currKey)));
@@ -222,17 +220,14 @@ std::vector<BSONObj> splitVector(OperationContext* opCtx,
         // to be removed at the end. If a key appears more times than entries allowed on a
         // chunk, we issue a warning and split on the following key.
         auto tooFrequentKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-        splitKeys.push_back(dotted_path_support::extractElementsBasedOnTemplate(
-            prettyKey(shardKeyIdx->keyPattern(), currKey.getOwned()), keyPattern));
+        splitKeys.push_back(orderShardKeyFields(keyPattern, currKey.getOwned()));
 
         while (1) {
             while (PlanExecutor::ADVANCED == state) {
                 currCount++;
 
                 if (currCount > keyCount && !force) {
-                    currKey = dotted_path_support::extractElementsBasedOnTemplate(
-                        prettyKey(shardKeyIdx->keyPattern(), currKey.getOwned()), keyPattern);
-
+                    currKey = orderShardKeyFields(keyPattern, currKey.getOwned());
 
                     const auto compareWithPreviousSplitPoint = currKey.woCompare(splitKeys.back());
                     dassert(compareWithPreviousSplitPoint >= 0,
@@ -243,7 +238,7 @@ std::vector<BSONObj> splitVector(OperationContext* opCtx,
                         tooFrequentKeys.insert(currKey.getOwned());
                     } else {
                         auto additionalKeySize =
-                            currKey.objsize() + estimatedAdditionalBytesPerItemInBSONArray;
+                            currKey.objsize() + kEstimatedAdditionalBytesPerItemInBSONArray;
                         if (splitVectorResponseSize + additionalKeySize > BSONObjMaxUserSize) {
                             if (splitKeys.empty()) {
                                 // Keep trying until we get at least one split point that isn't
@@ -257,7 +252,7 @@ std::vector<BSONObj> splitVector(OperationContext* opCtx,
                                   "of chunk {namespace} {minKey} -->> {maxKey}",
                                   "Max BSON response size reached for split vector before the end "
                                   "of chunk",
-                                  "namespace"_attr = nss.toString(),
+                                  logAttrs(nss),
                                   "minKey"_attr =
                                       redact(prettyKey(shardKeyIdx->keyPattern(), minKey)),
                                   "maxKey"_attr =
@@ -278,13 +273,14 @@ std::vector<BSONObj> splitVector(OperationContext* opCtx,
                 }
 
                 // Stop if we have enough split points.
-                if (maxSplitPoints && maxSplitPoints.get() && (numChunks >= maxSplitPoints.get())) {
+                if (maxSplitPoints && maxSplitPoints.value() &&
+                    (numChunks >= maxSplitPoints.value())) {
                     LOGV2(22111,
                           "Max number of requested split points reached ({numSplitPoints}) before "
                           "the end of chunk {namespace} {minKey} -->> {maxKey}",
                           "Max number of requested split points reached before the end of chunk",
                           "numSplitPoints"_attr = numChunks,
-                          "namespace"_attr = nss.toString(),
+                          logAttrs(nss),
                           "minKey"_attr = redact(prettyKey(shardKeyIdx->keyPattern(), minKey)),
                           "maxKey"_attr = redact(prettyKey(shardKeyIdx->keyPattern(), maxKey)));
                     break;
@@ -332,20 +328,20 @@ std::vector<BSONObj> splitVector(OperationContext* opCtx,
                           "Possible low cardinality key detected in {namespace} - key is "
                           "{key}",
                           "Possible low cardinality key detected",
-                          "namespace"_attr = nss.toString(),
+                          logAttrs(nss),
                           "key"_attr = redact(prettyKey(shardKeyIdx->keyPattern(), *it)));
         }
 
         // Remove the sentinel at the beginning before returning
         splitKeys.erase(splitKeys.begin());
 
-        if (timer.millis() > serverGlobalParams.slowMS) {
-            LOGV2_WARNING(
+        if (timer.millis() > serverGlobalParams.slowMS.load()) {
+            LOGV2_INFO(
                 22115,
                 "Finding the split vector for {namespace} over {keyPattern} keyCount: {keyCount} "
                 "numSplits: {numSplits} lookedAt: {currCount} took {duration}",
                 "Finding the split vector completed",
-                "namespace"_attr = nss.toString(),
+                logAttrs(nss),
                 "keyPattern"_attr = redact(keyPattern),
                 "keyCount"_attr = keyCount,
                 "numSplits"_attr = splitKeys.size(),

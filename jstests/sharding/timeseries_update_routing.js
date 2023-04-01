@@ -3,7 +3,6 @@
  *
  * @tags: [
  *   requires_fcv_51,
- *   requires_find_command,
  * ]
  */
 
@@ -29,13 +28,6 @@ const bucketCollFullName = `${dbName}.${bucketCollName}`;
 
 if (!TimeseriesTest.shardedtimeseriesCollectionsEnabled(st.shard0)) {
     jsTestLog("Skipping test because the sharded time-series collection feature flag is disabled");
-    st.stop();
-    return;
-}
-
-if (!TimeseriesTest.timeseriesUpdatesAndDeletesEnabled(st.shard0)) {
-    jsTestLog(
-        "Skipping test because the updates and deletes on time-series collection feature flag is disabled");
     st.stop();
     return;
 }
@@ -142,7 +134,7 @@ function testUpdateRouting({updates, nModified, shardsTargetedCount}) {
             temperature: 20,
         },
     ];
-    assert.commandWorked(testColl.insertMany(data));
+    assert.commandWorked(testColl.insertMany(data, {ordered: false}));
 })();
 
 (function defineChunks() {

@@ -31,6 +31,7 @@
 
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/s/balancer_stats_registry.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/migration_coordinator_document_gen.h"
 #include "mongo/db/s/migration_recipient_recovery_document_gen.h"
@@ -46,26 +47,51 @@ class ShardId;
 
 namespace migrationutil {
 
-constexpr auto kRangeDeletionThreadName = "range-deleter"_sd;
+/**
+ * Creates a report document with the provided parameters:
+ *
+ * {
+ *     source:                          "shard0000"
+ *     destination:                     "shard0001"
+ *     isDonorShard:                    true or false
+ *     chunk:                           {"min": <MinKey>, "max": <MaxKey>}
+ *     collection:                      "dbName.collName"
+ *     sessionOplogEntriesToBeMigratedSoFar: <Number>
+ *     sessionOplogEntriesSkipped:      <Number>
+ * }
+ *
+ */
+BSONObj makeMigrationStatusDocumentSource(
+    const NamespaceString& nss,
+    const ShardId& fromShard,
+    const ShardId& toShard,
+    const bool& isDonorShard,
+    const BSONObj& min,
+    const BSONObj& max,
+    boost::optional<long long> sessionOplogEntriesToBeMigratedSoFar,
+    boost::optional<long long> sessionOplogEntriesSkippedSoFarLowerBound);
 
 /**
  * Creates a report document with the provided parameters:
  *
  * {
- *     source:          "shard0000"
- *     destination:     "shard0001"
- *     isDonorShard:    true or false
- *     chunk:           {"min": <MinKey>, "max": <MaxKey>}
- *     collection:      "dbName.collName"
+ *     source:                      "shard0000"
+ *     destination:                 "shard0001"
+ *     isDonorShard:                true or false
+ *     chunk:                       {"min": <MinKey>, "max": <MaxKey>}
+ *     collection:                  "dbName.collName"
+ *     sessionOplogEntriesMigrated: <Number>
  * }
  *
  */
-BSONObj makeMigrationStatusDocument(const NamespaceString& nss,
-                                    const ShardId& fromShard,
-                                    const ShardId& toShard,
-                                    const bool& isDonorShard,
-                                    const BSONObj& min,
-                                    const BSONObj& max);
+BSONObj makeMigrationStatusDocumentDestination(
+    const NamespaceString& nss,
+    const ShardId& fromShard,
+    const ShardId& toShard,
+    const bool& isDonorShard,
+    const BSONObj& min,
+    const BSONObj& max,
+    boost::optional<long long> sessionOplogEntriesMigrated);
 
 /**
  * Returns a chunk range with extended or truncated boundaries to match the number of fields in the
@@ -121,13 +147,6 @@ void submitPendingDeletions(OperationContext* opCtx);
  */
 void resubmitRangeDeletionsOnStepUp(ServiceContext* serviceContext);
 
-void dropRangeDeletionsCollection(OperationContext* opCtx);
-
-/**
- * Find and submit all orphan ranges for deletion.
- */
-void submitOrphanRangesForCleanup(OperationContext* opCtx);
-
 /**
  * Writes the migration coordinator document to config.migrationCoordinators and waits for majority
  * write concern.
@@ -144,18 +163,16 @@ void persistRangeDeletionTaskLocally(OperationContext* opCtx,
                                      const WriteConcernOptions& writeConcern);
 
 /**
- * Updates the range deletion task document to increase or decrease numOrphanedDocs and waits for
- * write concern.
- */
-void persistUpdatedNumOrphans(OperationContext* opCtx,
-                              const BSONObj& rangeDeletionQuery,
-                              const int& changeInOrphans);
-
-/**
  * Retrieves the value of 'numOrphanedDocs' from the recipient shard's range deletion task document.
  */
-int retrieveNumOrphansFromRecipient(OperationContext* opCtx,
-                                    const MigrationCoordinatorDocument& migrationInfo);
+long long retrieveNumOrphansFromRecipient(OperationContext* opCtx,
+                                          const MigrationCoordinatorDocument& migrationInfo);
+
+/**
+ * Retrieves the shard key pattern from the local range deletion task.
+ */
+boost::optional<KeyPattern> getShardKeyPatternFromRangeDeletionTask(
+    OperationContext* opCtx, const MigrationCoordinatorDocument& migrationInfo);
 
 /**
  * Updates the migration coordinator document to set the decision field to "committed" and waits for
@@ -177,7 +194,8 @@ void persistAbortDecision(OperationContext* opCtx,
  */
 void deleteRangeDeletionTaskLocally(
     OperationContext* opCtx,
-    const UUID& deletionTaskId,
+    const UUID& collectionUuid,
+    const ChunkRange& range,
     const WriteConcernOptions& writeConcern = WriteConcerns::kMajorityWriteConcernShardingTimeout);
 
 /**
@@ -186,6 +204,8 @@ void deleteRangeDeletionTaskLocally(
  */
 void deleteRangeDeletionTaskOnRecipient(OperationContext* opCtx,
                                         const ShardId& recipientId,
+                                        const UUID& collectionUuid,
+                                        const ChunkRange& range,
                                         const UUID& migrationId);
 
 /**
@@ -202,7 +222,9 @@ void advanceTransactionOnRecipient(OperationContext* opCtx,
  * config.rangeDeletions and waits for majority write concern. This marks the range as ready for
  * deletion.
  */
-void markAsReadyRangeDeletionTaskLocally(OperationContext* opCtx, const UUID& migrationId);
+void markAsReadyRangeDeletionTaskLocally(OperationContext* opCtx,
+                                         const UUID& collectionUuid,
+                                         const ChunkRange& range);
 
 
 /**
@@ -212,21 +234,9 @@ void markAsReadyRangeDeletionTaskLocally(OperationContext* opCtx, const UUID& mi
  */
 void markAsReadyRangeDeletionTaskOnRecipient(OperationContext* opCtx,
                                              const ShardId& recipientId,
+                                             const UUID& collectionUuid,
+                                             const ChunkRange& range,
                                              const UUID& migrationId);
-
-/**
- * Deletes the migration coordinator document with the specified id from
- * config.migrationCoordinators without waiting for majority writeConcern.
- */
-void deleteMigrationCoordinatorDocumentLocally(OperationContext* opCtx, const UUID& migrationId);
-
-/**
- * Sends _configsvrEnsureChunkVersionIsGreaterThan for the range and preMigrationChunkVersion until
- * hearing success or the node steps down or shuts down.
- */
-void ensureChunkVersionIsGreaterThan(OperationContext* opCtx,
-                                     const ChunkRange& range,
-                                     const ChunkVersion& preMigrationChunkVersion);
 
 /**
  * Submits an asynchronous task to scan config.migrationCoordinators and drive each unfinished

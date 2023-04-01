@@ -33,6 +33,9 @@
 #include <vector>
 
 #include "mongo/db/exec/bucket_unpacker.h"
+#include "mongo/db/exec/collection_scan.h"
+#include "mongo/db/exec/index_scan.h"
+#include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_match.h"
 
@@ -44,9 +47,12 @@ public:
     static constexpr StringData kInclude = "include"_sd;
     static constexpr StringData kExclude = "exclude"_sd;
     static constexpr StringData kAssumeNoMixedSchemaData = "assumeNoMixedSchemaData"_sd;
+    static constexpr StringData kUsesExtendedRange = "usesExtendedRange"_sd;
     static constexpr StringData kBucketMaxSpanSeconds = "bucketMaxSpanSeconds"_sd;
     static constexpr StringData kIncludeMinTimeAsMetadata = "includeMinTimeAsMetadata"_sd;
     static constexpr StringData kIncludeMaxTimeAsMetadata = "includeMaxTimeAsMetadata"_sd;
+    static constexpr StringData kWholeBucketFilter = "wholeBucketFilter"_sd;
+    static constexpr StringData kEventFilter = "eventFilter"_sd;
 
     static boost::intrusive_ptr<DocumentSource> createFromBsonInternal(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
@@ -58,19 +64,25 @@ public:
                                        int bucketMaxSpanSeconds,
                                        bool assumeNoMixedSchemaData = false);
 
+    DocumentSourceInternalUnpackBucket(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                       BucketUnpacker bucketUnpacker,
+                                       int bucketMaxSpanSeconds,
+                                       const boost::optional<BSONObj>& eventFilterBson,
+                                       const boost::optional<BSONObj>& wholeBucketFilterBson,
+                                       bool assumeNoMixedSchemaData = false);
+
     const char* getSourceName() const override {
         return kStageNameInternal.rawData();
     }
 
-    void serializeToArray(
-        std::vector<Value>& array,
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    void serializeToArray(std::vector<Value>& array,
+                          SerializationOptions opts = SerializationOptions()) const final override;
 
     /**
      * Use 'serializeToArray' above.
      */
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final {
-        MONGO_UNREACHABLE;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override {
+        MONGO_UNREACHABLE_TASSERT(7484305);
     }
 
     bool includeMetaField() const {
@@ -92,6 +104,8 @@ public:
                                      UnionRequirement::kAllowed,
                                      ChangeStreamRequirement::kDenylist};
         constraints.canSwapWithMatch = true;
+        // The user cannot specify multiple $unpackBucket stages in the pipeline.
+        constraints.canAppearOnlyOnceInPipeline = true;
         return constraints;
     }
 
@@ -101,6 +115,20 @@ public:
         }
         deps->needWholeDocument = true;
         return DepsTracker::State::EXHAUSTIVE_ALL;
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
+    int getBucketMaxSpanSeconds() const {
+        return _bucketMaxSpanSeconds;
+    }
+
+    std::string getMinTimeField() const {
+        return _bucketUnpacker.getMinField(_bucketUnpacker.getTimeField());
+    }
+
+    std::string getMaxTimeField() const {
+        return _bucketUnpacker.getMaxField(_bucketUnpacker.getTimeField());
     }
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
@@ -140,7 +168,7 @@ public:
     /**
      * Convenience wrapper around BucketSpec::createPredicatesOnBucketLevelField().
      */
-    std::unique_ptr<MatchExpression> createPredicatesOnBucketLevelField(
+    BucketSpec::BucketPredicate createPredicatesOnBucketLevelField(
         const MatchExpression* matchExpr) const;
 
     /**
@@ -162,6 +190,14 @@ public:
     void setSampleParameters(long long n, int bucketMaxCount) {
         _sampleSize = n;
         _bucketMaxCount = bucketMaxCount;
+    }
+
+    void setIncludeMinTimeAsMetadata() {
+        _bucketUnpacker.setIncludeMinTimeAsMetadata();
+    }
+
+    void setIncludeMaxTimeAsMetadata() {
+        _bucketUnpacker.setIncludeMaxTimeAsMetadata();
     }
 
     boost::optional<long long> sampleSize() const {
@@ -193,6 +229,13 @@ public:
         Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container);
 
     /**
+     * Helper method which checks if we can replace DocumentSourceGroup with
+     * DocumentSourceStreamingGroup. Returns true if the optimization is performed.
+     */
+    bool enableStreamingGroupIfPossible(Pipeline::SourceContainer::iterator itr,
+                                        Pipeline::SourceContainer* container);
+
+    /**
      * If the current aggregation is a lastpoint-type query (ie. with a $sort on meta and time
      * fields, and a $group with a meta _id and only $first or $last accumulators) we can rewrite
      * it to avoid unpacking all buckets.
@@ -203,29 +246,38 @@ public:
      *  {$group: {_id: "$myMeta.a", otherFields: {$first: {$otherFields}}}}]
      *
      * will be rewritten into:
-     * [{$sort: {meta.a: 1, time: -1}},
-     *  {$group: {_id: "$meta.a": 1, bucket: {$first: "$_id"}}},
-     *  {$lookup: {
-     *      from: <bucketColl>,
-     *      as: "metrics",
-     *      localField: "bucket",
-     *      foreignField: "_id"
-     *      pipeline: [{$_internalUnpackBucket: {...}}, {$sort: {myTime: -1}}, {$limit: 1}]}},
-     *  {$unwind: "$metrics"},
-     *  {$replaceWith: {_id: "$_id", otherFields: {$metrics.otherFields}}}]
+     * [{$sort: {meta.a: 1, 'control.max.myTime': -1, 'control.min.myTime': -1}},
+     *  {$group: {_id: "$meta.a": 1, control: {$first: "$control"}, meta: {$first: "$meta"},
+     *    data: {$first: "$data"}}},
+     *  {$_internalUnpackBucket: {...}},
+     *  {$sort: {myMeta.a: 1, myTime: -1}},
+     *  {$group: {_id: "$myMeta.a", otherFields: {$first: {$otherFields}}}}]
+     *
+     * Note that the first $group includes all fields so we can avoid fetching the bucket twice.
      */
     bool optimizeLastpoint(Pipeline::SourceContainer::iterator itr,
                            Pipeline::SourceContainer* container);
 
     GetModPathsReturn getModifiedPaths() const final override;
 
+    DepsTracker getRestPipelineDependencies(Pipeline::SourceContainer::iterator itr,
+                                            Pipeline::SourceContainer* container,
+                                            bool includeEventFilter) const;
+
 private:
     GetNextResult doGetNext() final;
+
+    boost::optional<Document> getNextMatchingMeasure();
+
     bool haveComputedMetaField() const;
 
     // If buckets contained a mixed type schema along some path, we have to push down special
     // predicates in order to ensure correctness.
     bool _assumeNoMixedSchemaData = false;
+
+    // If any bucket contains dates outside the range of 1970-2038, we are unable to rely on
+    // the _id index, as _id is truncates to 32 bits
+    bool _usesExtendedRange = false;
 
     BucketUnpacker _bucketUnpacker;
     int _bucketMaxSpanSeconds;
@@ -233,10 +285,17 @@ private:
     int _bucketMaxCount = 0;
     boost::optional<long long> _sampleSize;
 
-    // Used to avoid infinite loops after we step backwards to optimize a $match on bucket level
-    // fields, otherwise we may do an infinite number of $match pushdowns.
-    bool _triedBucketLevelFieldsPredicatesPushdown = false;
+    // Filters pushed from the later $match stages
+    std::unique_ptr<MatchExpression> _eventFilter;
+    BSONObj _eventFilterBson;
+    DepsTracker _eventFilterDeps;
+    std::unique_ptr<MatchExpression> _wholeBucketFilter;
+    BSONObj _wholeBucketFilterBson;
+
+    bool _unpackToBson = false;
+
     bool _optimizedEndOfPipeline = false;
     bool _triedInternalizeProject = false;
+    bool _triedLastpointRewrite = false;
 };
 }  // namespace mongo

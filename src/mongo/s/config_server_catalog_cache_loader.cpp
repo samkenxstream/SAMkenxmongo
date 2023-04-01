@@ -27,47 +27,38 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/s/config_server_catalog_cache_loader.h"
 
-#include <memory>
-
+#include "mongo/db/catalog_shard_feature_flag_gen.h"
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/grid.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 namespace mongo {
+namespace {
 
 using CollectionAndChangedChunks = CatalogCacheLoader::CollectionAndChangedChunks;
-
-namespace {
 
 /**
  * Blocking method, which returns the chunks which changed since the specified version.
  */
 CollectionAndChangedChunks getChangedChunks(OperationContext* opCtx,
                                             const NamespaceString& nss,
-                                            ChunkVersion sinceVersion,
-                                            bool avoidSnapshotForRefresh) {
+                                            ChunkVersion sinceVersion) {
     const auto readConcern = [&]() -> repl::ReadConcernArgs {
-        // TODO SERVER-54394 always use snapshot read concern once
-        // ephemeral storage engine supports it
-        const auto readConcernLevel = !avoidSnapshotForRefresh
-            ? repl::ReadConcernLevel::kSnapshotReadConcern
-            : repl::ReadConcernLevel::kLocalReadConcern;
-
-        if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-            return {readConcernLevel};
+        if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer) &&
+            !gFeatureFlagCatalogShard.isEnabledAndIgnoreFCV()) {
+            // When the feature flag is on, the config server may read from a secondary which may
+            // need to wait for replication, so we should use afterClusterTime.
+            return {repl::ReadConcernLevel::kSnapshotReadConcern};
         } else {
             const auto vcTime = VectorClock::get(opCtx)->getTime();
-            return {vcTime.configTime(), readConcernLevel};
+            return {vcTime.configTime(), repl::ReadConcernLevel::kSnapshotReadConcern};
         }
     }();
 
@@ -83,8 +74,6 @@ CollectionAndChangedChunks getChangedChunks(OperationContext* opCtx,
                                       coll.getUnique(),
                                       coll.getTimeseriesFields(),
                                       coll.getReshardingFields(),
-                                      coll.getMaxChunkSizeBytes(),
-                                      coll.getAllowAutoSplit(),
                                       coll.getAllowMigrations(),
                                       std::move(collAndChunks.second)};
 }
@@ -119,7 +108,8 @@ void ConfigServerCatalogCacheLoader::shutDown() {
     _executor->join();
 }
 
-void ConfigServerCatalogCacheLoader::notifyOfCollectionVersionUpdate(const NamespaceString& nss) {
+void ConfigServerCatalogCacheLoader::notifyOfCollectionPlacementVersionUpdate(
+    const NamespaceString& nss) {
     MONGO_UNREACHABLE;
 }
 
@@ -142,7 +132,7 @@ SemiFuture<CollectionAndChangedChunks> ConfigServerCatalogCacheLoader::getChunks
                             getGlobalServiceContext());
             auto opCtx = tc->makeOperationContext();
 
-            return getChangedChunks(opCtx.get(), nss, version, _avoidSnapshotForRefresh);
+            return getChangedChunks(opCtx.get(), nss, version);
         })
         .semi();
 }
@@ -158,10 +148,6 @@ SemiFuture<DatabaseType> ConfigServerCatalogCacheLoader::getDatabase(StringData 
                 ->getDatabase(opCtx.get(), name, repl::ReadConcernLevel::kMajorityReadConcern);
         })
         .semi();
-}
-
-void ConfigServerCatalogCacheLoader::setAvoidSnapshotForRefresh_ForTest() {
-    _avoidSnapshotForRefresh = true;
 }
 
 }  // namespace mongo

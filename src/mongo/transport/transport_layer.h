@@ -36,7 +36,7 @@
 #include "mongo/config.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/wire_version.h"
-#include "mongo/transport/session.h"
+#include "mongo/executor/connection_metrics.h"
 #include "mongo/transport/ssl_connection_context.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/future.h"
@@ -87,17 +87,18 @@ public:
 
     virtual ~TransportLayer() = default;
 
-    virtual StatusWith<SessionHandle> connect(
+    virtual StatusWith<std::shared_ptr<Session>> connect(
         HostAndPort peer,
         ConnectSSLMode sslMode,
         Milliseconds timeout,
         boost::optional<TransientSSLParams> transientSSLParams = boost::none) = 0;
 
-    virtual Future<SessionHandle> asyncConnect(
+    virtual Future<std::shared_ptr<Session>> asyncConnect(
         HostAndPort peer,
         ConnectSSLMode sslMode,
         const ReactorHandle& reactor,
         Milliseconds timeout,
+        std::shared_ptr<ConnectionMetrics> connectionMetrics,
         std::shared_ptr<const SSLConnectionContext> transientSSLContext) = 0;
 
     /**
@@ -120,6 +121,12 @@ public:
      * connections.
      */
     virtual Status setup() = 0;
+
+    /** Allows a `TransportLayer` to contribute to a serverStatus readout. */
+    virtual void appendStatsForServerStatus(BSONObjBuilder* bob) const {}
+
+    /** Allows a `TransportLayer` to contribute to a FTDC readout. */
+    virtual void appendStatsForFTDC(BSONObjBuilder& bob) const {}
 
     enum WhichReactor { kIngress, kEgress, kNewReactor };
     virtual ReactorHandle getReactor(WhichReactor which) = 0;

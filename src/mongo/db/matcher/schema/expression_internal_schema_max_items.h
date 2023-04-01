@@ -40,7 +40,7 @@ namespace mongo {
 class InternalSchemaMaxItemsMatchExpression final
     : public InternalSchemaNumArrayItemsMatchExpression {
 public:
-    InternalSchemaMaxItemsMatchExpression(StringData path,
+    InternalSchemaMaxItemsMatchExpression(boost::optional<StringData> path,
                                           long long numItems,
                                           clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : InternalSchemaNumArrayItemsMatchExpression(INTERNAL_SCHEMA_MAX_ITEMS,
@@ -53,7 +53,7 @@ public:
         return (anArray.nFields() <= numItems());
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<InternalSchemaMaxItemsMatchExpression> maxItems =
             std::make_unique<InternalSchemaMaxItemsMatchExpression>(
                 path(), numItems(), _errorAnnotation);

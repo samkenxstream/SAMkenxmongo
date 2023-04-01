@@ -9,7 +9,6 @@
  * 4) That the default unix socket doesn't get created if --nounixsocket is specified
  */
 // @tags: [
-//   live_record_incompatible,
 //   requires_sharding,
 // ]
 (function() {
@@ -22,10 +21,16 @@ if (_isWindows()) {
 // Checking index consistency involves reconnecting to the mongos.
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
+TestData.skipCheckRoutingTableConsistency = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
 // Do not fail if this test leaves unterminated processes because testSockOptions
 // is expected to throw before it calls stopMongod.
 TestData.failIfUnterminatedProcesses = false;
+
+// Do not check metadata consistency as it would require a connection to the mongos and this is
+// bound to a specific socket for testing purposes.
+TestData.skipCheckMetadataConsistency = true;
 
 var doesLogMatchRegex = function(logArray, regex) {
     for (let i = (logArray.length - 1); i >= 0; i--) {

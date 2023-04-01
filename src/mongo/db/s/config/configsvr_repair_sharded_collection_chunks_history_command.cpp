@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -40,6 +39,9 @@
 #include "mongo/db/vector_clock.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -66,27 +68,29 @@ public:
         return true;
     }
 
-    std::string parseNs(const std::string& unusedDbName, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(cmdObj);
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return NamespaceStringUtil::parseNamespaceFromRequest(
+            dbName.tenantId(), CommandHelpers::parseNsFullyQualified(cmdObj));
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                    ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& unusedDbName,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         uassert(ErrorCodes::IllegalOperation,
                 "_configsvrRepairShardedCollectionChunksHistory can only be run on config servers",
-                serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 
         // Set the operation context read concern level to local for reads into the config database.
         repl::ReadConcernArgs::get(opCtx) =
@@ -94,7 +98,7 @@ public:
 
         CommandHelpers::uassertCommandRunWithMajority(getName(), opCtx->getWriteConcern());
 
-        const NamespaceString nss{parseNs(unusedDbName, cmdObj)};
+        const NamespaceString nss{parseNs(dbName, cmdObj)};
 
         auto currentTime = VectorClock::get(opCtx)->getTime();
         auto validAfter = currentTime.configTime().asTimestamp();

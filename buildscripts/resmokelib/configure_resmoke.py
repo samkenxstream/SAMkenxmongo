@@ -9,9 +9,13 @@ import distutils.spawn
 import sys
 import platform
 import random
+import glob
+import textwrap
+import shlex
 
 import pymongo.uri_parser
 
+from buildscripts.idl import gen_all_feature_flag_list
 from buildscripts.idl.lib import ALL_FEATURE_FLAG_FILE
 
 from buildscripts.resmokelib import config as _config
@@ -24,6 +28,7 @@ def validate_and_update_config(parser, args):
     """Validate inputs and update config module."""
     _validate_options(parser, args)
     _update_config_vars(args)
+    _update_symbolizer_secrets()
     _validate_config(parser)
     _set_logging_config()
 
@@ -48,14 +53,9 @@ def _validate_options(parser, args):
             "Cannot use --replayFile with additional test files listed on the command line invocation."
         )
 
-    if args.run_all_feature_flag_tests or args.run_all_feature_flags_no_tests:
-        if not os.path.isfile(ALL_FEATURE_FLAG_FILE):
-            parser.error(
-                "To run tests with all feature flags, the %s file must exist and be placed in"
-                " your working directory. The file can be downloaded from the artifacts tarball"
-                " in Evergreen. Alternatively, if you know which feature flags you want to enable,"
-                " you can use the --additionalFeatureFlags command line argument" %
-                ALL_FEATURE_FLAG_FILE)
+    if args.additional_feature_flags_file and not os.path.isfile(
+            args.additional_feature_flags_file):
+        parser.error("The specified additional feature flags file does not exist.")
 
     def get_set_param_errors(process_params):
         agg_set_params = collections.defaultdict(list)
@@ -93,7 +93,7 @@ def _validate_options(parser, args):
         parser.error(str(error_msgs))
 
 
-def _validate_config(parser):  # pylint: disable=too-many-branches
+def _validate_config(parser):
     """Do validation on the config settings."""
 
     if _config.REPEAT_TESTS_MAX:
@@ -133,7 +133,20 @@ def _validate_config(parser):  # pylint: disable=too-many-branches
             parser.error(f"Found '{resolved_path}', but it is not an executable file")
 
 
-def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many-locals,too-many-branches
+def _find_resmoke_wrappers():
+    # This is technically incorrect. PREFIX_BINDIR defaults to $PREFIX/bin, so
+    # if the user changes it to any some other value, this glob will fail to
+    # detect the resmoke wrapper.
+    # Additionally, the resmoke wrapper will not be found if a user performs
+    # their builds outside of the git repository root, (ex checkout at
+    # /data/mongo, build-dir at /data/build)
+    # We assume that users who fall under either case will explicitly pass the
+    # --installDir argument.
+    candidate_installs = glob.glob("**/bin/resmoke.py", recursive=True)
+    return list(candidate_installs)
+
+
+def _update_config_vars(values):
     """Update the variables of the config module."""
 
     config = _config.DEFAULTS.copy()
@@ -147,34 +160,56 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
         if cmdline_vars[cmdline_key] is not None:
             config[cmdline_key] = cmdline_vars[cmdline_key]
 
-    if os.path.isfile("resmoke.ini"):
+    if values.command == "run" and os.path.isfile("resmoke.ini"):
+        err = textwrap.dedent("""\
+Support for resmoke.ini has been removed. You must delete
+resmoke.ini and rerun your build to run resmoke. If only one testable
+installation is present, resmoke will automatically locate that installation.
+If you have multiple installations, you must either pass an explicit
+--installDir argument to the run subcommand to identify the installation you
+would like to test, or invoke the customized resmoke.py wrapper script staged
+into the bin directory of each installation.""")
         config_parser = configparser.ConfigParser()
         config_parser.read("resmoke.ini")
         if "resmoke" in config_parser.sections():
             user_config = dict(config_parser["resmoke"])
-            config.update(user_config)
+            err += textwrap.dedent(f"""
+
+Based on the current value of resmoke.ini, after rebuilding, resmoke.py should
+be invoked as either:
+- {shlex.quote(f"{user_config['install_dir']}/resmoke.py")}
+- buildscripts/resmoke.py --installDir {shlex.quote(user_config['install_dir'])}""")
+        raise RuntimeError(err)
+
+    def process_feature_flag_file(path):
+        with open(path) as fd:
+            return fd.read().split()
 
     def setup_feature_flags():
         _config.RUN_ALL_FEATURE_FLAG_TESTS = config.pop("run_all_feature_flag_tests")
-        _config.RUN_ALL_FEATURE_FLAGS = config.pop("run_all_feature_flags_no_tests")
+        _config.RUN_NO_FEATURE_FLAG_TESTS = config.pop("run_no_feature_flag_tests")
+        _config.ADDITIONAL_FEATURE_FLAGS_FILE = config.pop("additional_feature_flags_file")
 
-        # Running all feature flag tests implies running the fixtures with feature flags.
         if _config.RUN_ALL_FEATURE_FLAG_TESTS:
-            _config.RUN_ALL_FEATURE_FLAGS = True
+            print("Generating: ", ALL_FEATURE_FLAG_FILE)
+            gen_all_feature_flag_list.gen_all_feature_flags_file()
 
         all_ff = []
         enabled_feature_flags = []
         try:
-            with open(ALL_FEATURE_FLAG_FILE) as fd:
-                all_ff = fd.read().split()
+            all_ff = process_feature_flag_file(ALL_FEATURE_FLAG_FILE)
         except FileNotFoundError:
             # If we ask resmoke to run with all feature flags, the feature flags file
             # needs to exist.
-            if _config.RUN_ALL_FEATURE_FLAGS:
+            if _config.RUN_ALL_FEATURE_FLAG_TESTS or _config.RUN_NO_FEATURE_FLAG_TESTS:
                 raise
 
-        if _config.RUN_ALL_FEATURE_FLAGS:
+        if _config.RUN_ALL_FEATURE_FLAG_TESTS:
             enabled_feature_flags = all_ff[:]
+
+        if _config.ADDITIONAL_FEATURE_FLAGS_FILE:
+            enabled_feature_flags.extend(
+                process_feature_flag_file(_config.ADDITIONAL_FEATURE_FLAGS_FILE))
 
         # Specify additional feature flags from the command line.
         # Set running all feature flag tests to True if this options is specified.
@@ -187,6 +222,7 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.ENABLED_FEATURE_FLAGS, all_feature_flags = setup_feature_flags()
     not_enabled_feature_flags = list(set(all_feature_flags) - set(_config.ENABLED_FEATURE_FLAGS))
 
+    _config.AUTO_KILL = config.pop("auto_kill")
     _config.ALWAYS_USE_LOG_FILES = config.pop("always_use_log_files")
     _config.BASE_PORT = int(config.pop("base_port"))
     _config.BACKUP_ON_RESTART_DIR = config.pop("backup_on_restart_dir")
@@ -199,7 +235,7 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.EXCLUDE_WITH_ANY_TAGS.extend(
         utils.default_if_none(_tags_from_list(config.pop("exclude_with_any_tags")), []))
 
-    if _config.RUN_ALL_FEATURE_FLAGS and not _config.RUN_ALL_FEATURE_FLAG_TESTS:
+    if _config.RUN_NO_FEATURE_FLAG_TESTS:
         # Don't run any feature flag tests.
         _config.EXCLUDE_WITH_ANY_TAGS.extend(all_feature_flags)
     else:
@@ -224,6 +260,18 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.MULTIVERSION_BIN_VERSION = config.pop("old_bin_version")
 
     _config.INSTALL_DIR = config.pop("install_dir")
+    if values.command == "run" and _config.INSTALL_DIR is None:
+        resmoke_wrappers = _find_resmoke_wrappers()
+        if len(resmoke_wrappers) == 1:
+            _config.INSTALL_DIR = os.path.dirname(resmoke_wrappers[0])
+        elif len(resmoke_wrappers) > 1:
+            err = textwrap.dedent(f"""\
+Multiple testable installations were found, but installDir was not specified.
+You must either call resmoke via one of the following scripts:
+{os.linesep.join(map(shlex.quote, resmoke_wrappers))}
+
+or explicitly pass --installDir to the run subcommand of buildscripts/resmoke.py.""")
+            raise RuntimeError(err)
     if _config.INSTALL_DIR is not None:
         # Normalize the path so that on Windows dist-test/bin
         # translates to .\dist-test\bin then absolutify it since the
@@ -259,7 +307,9 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
             _config.CONFIG_FUZZ_SEED = int(_config.CONFIG_FUZZ_SEED)
         _config.MONGOD_SET_PARAMETERS, _config.WT_ENGINE_CONFIG, _config.WT_COLL_CONFIG, \
         _config.WT_INDEX_CONFIG = mongod_fuzzer_configs.fuzz_set_parameters(
-            _config.CONFIG_FUZZ_SEED, _config.MONGOD_SET_PARAMETERS)
+            _config.FUZZ_MONGOD_CONFIGS, _config.CONFIG_FUZZ_SEED, _config.MONGOD_SET_PARAMETERS)
+        _config.EXCLUDE_WITH_ANY_TAGS.extend(["uses_compact"])
+        _config.EXCLUDE_WITH_ANY_TAGS.extend(["requires_emptycapped"])
 
     _config.MONGOS_EXECUTABLE = _expand_user(config.pop("mongos_executable"))
     mongos_set_parameters = config.pop("mongos_set_parameters")
@@ -272,6 +322,8 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.NUM_CLIENTS_PER_FIXTURE = config.pop("num_clients_per_fixture")
     _config.NUM_REPLSET_NODES = config.pop("num_replset_nodes")
     _config.NUM_SHARDS = config.pop("num_shards")
+    _config.CATALOG_SHARD = utils.pick_catalog_shard_node(
+        config.pop("catalog_shard"), _config.NUM_SHARDS)
     _config.PERF_REPORT_FILE = config.pop("perf_report_file")
     _config.CEDAR_REPORT_FILE = config.pop("cedar_report_file")
     _config.RANDOM_SEED = config.pop("seed")
@@ -283,7 +335,6 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.REPORT_FAILURE_STATUS = config.pop("report_failure_status")
     _config.REPORT_FILE = config.pop("report_file")
     _config.SERVICE_EXECUTOR = config.pop("service_executor")
-    _config.SPAWN_USING = config.pop("spawn_using")
     _config.EXPORT_MONGOD_CONFIG = config.pop("export_mongod_config")
     _config.STAGGER_JOBS = config.pop("stagger_jobs") == "on"
     _config.STORAGE_ENGINE = config.pop("storage_engine")
@@ -313,9 +364,8 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     _config.EVERGREEN_VARIANT_NAME = config.pop("variant_name")
     _config.EVERGREEN_VERSION_ID = config.pop("version_id")
 
-    # Cedar options.
-    _config.CEDAR_URL = config.pop("cedar_url")
-    _config.CEDAR_RPC_PORT = config.pop("cedar_rpc_port")
+    # Force invalid suite config
+    _config.FORCE_EXCLUDED_TESTS = config.pop("force_excluded_tests")
 
     # Archival options. Archival is enabled only when running on evergreen.
     if not _config.EVERGREEN_TASK_ID:
@@ -331,13 +381,13 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements,too-many
     # Wiredtiger options. Prevent fuzzed wt configs from being overwritten unless user specifies it.
     wt_engine_config = config.pop("wt_engine_config")
     if wt_engine_config:
-        _config.WT_ENGINE_CONFIG = config.pop("wt_engine_config")
+        _config.WT_ENGINE_CONFIG = wt_engine_config
     wt_coll_config = config.pop("wt_coll_config")
     if wt_coll_config:
-        _config.WT_COLL_CONFIG = config.pop("wt_coll_config")
+        _config.WT_COLL_CONFIG = wt_coll_config
     wt_index_config = config.pop("wt_index_config")
     if wt_index_config:
-        _config.WT_INDEX_CONFIG = config.pop("wt_index_config")
+        _config.WT_INDEX_CONFIG = wt_index_config
 
     # Benchmark/Benchrun options.
     _config.BENCHMARK_FILTER = config.pop("benchmark_filter")
@@ -465,3 +515,13 @@ def _tags_from_list(tags_list):
             tags.extend([t for t in tag.split(",") if t != ""])
         return tags
     return None
+
+
+def _update_symbolizer_secrets():
+    """Open `expansions.yml`, get values for symbolizer secrets and update their values inside config.py ."""
+    if not _config.EVERGREEN_TASK_ID:
+        # not running on Evergreen
+        return
+    yml_data = utils.load_yaml_file(_config.EXPANSIONS_FILE)
+    _config.SYMBOLIZER_CLIENT_SECRET = yml_data.get("symbolizer_client_secret")
+    _config.SYMBOLIZER_CLIENT_ID = yml_data.get("symbolizer_client_id")

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -39,10 +38,15 @@
 #include "mongo/db/catalog/index_consistency.h"
 #include "mongo/db/catalog/validate_adaptor.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/index/columns_access_method.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
@@ -54,12 +58,12 @@ ValidateState::ValidateState(OperationContext* opCtx,
                              const NamespaceString& nss,
                              ValidateMode mode,
                              RepairMode repairMode,
-                             bool turnOnExtraLoggingForTest)
+                             bool logDiagnostics)
     : _nss(nss),
       _mode(mode),
       _repairMode(repairMode),
       _dataThrottle(opCtx),
-      _extraLoggingForTest(turnOnExtraLoggingForTest) {
+      _logDiagnostics(logDiagnostics) {
 
     // Subsequent re-locks will use the UUID when 'background' is true.
     if (isBackground()) {
@@ -67,25 +71,45 @@ ValidateState::ValidateState(OperationContext* opCtx,
         // being validated.
         _noPBWM.emplace(opCtx->lockState());
 
-        _globalLock.emplace(opCtx, MODE_IS);
-        _databaseLock.emplace(opCtx, _nss.db(), MODE_IS);
+        _databaseLock.emplace(opCtx, _nss.dbName(), MODE_IS);
         _collectionLock.emplace(opCtx, _nss, MODE_IS);
     } else {
-        _databaseLock.emplace(opCtx, _nss.db(), MODE_IX);
+        _databaseLock.emplace(opCtx, _nss.dbName(), MODE_IX);
         _collectionLock.emplace(opCtx, _nss, MODE_X);
     }
 
     _database = _databaseLock->getDb() ? _databaseLock->getDb() : nullptr;
     if (_database)
-        _collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, _nss);
+        _collection =
+            CollectionPtr(CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, _nss));
 
     if (!_collection) {
-        if (CollectionCatalog::get(opCtx)->lookupView(opCtx, _nss)) {
-            uasserted(ErrorCodes::CommandNotSupportedOnView, "Cannot validate a view");
+        auto view = CollectionCatalog::get(opCtx)->lookupView(opCtx, _nss);
+        if (!view) {
+            uasserted(ErrorCodes::NamespaceNotFound,
+                      str::stream() << "Collection '" << _nss << "' does not exist to validate.");
+        } else {
+            // Uses the bucket collection in place of the time-series collection view.
+            if (!view->timeseries() ||
+                !feature_flags::gExtendValidateCommand.isEnabled(
+                    serverGlobalParams.featureCompatibility)) {
+                uasserted(ErrorCodes::CommandNotSupportedOnView, "Cannot validate a view");
+            }
+            _nss = _nss.makeTimeseriesBucketsNamespace();
+            if (isBackground()) {
+                _collectionLock.emplace(opCtx, _nss, MODE_IS);
+            } else {
+                _collectionLock.emplace(opCtx, _nss, MODE_X);
+            }
+            _collection = CollectionPtr(
+                CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, _nss));
+            uassert(
+                ErrorCodes::NamespaceNotFound,
+                fmt::format(
+                    "Cannot validate a time-series collection without its bucket collection {}.",
+                    _nss.toString()),
+                _collection);
         }
-
-        uasserted(ErrorCodes::NamespaceNotFound,
-                  str::stream() << "Collection '" << _nss << "' does not exist to validate.");
     }
 
     // RepairMode is incompatible with the ValidateModes kBackground and
@@ -105,11 +129,13 @@ ValidateState::ValidateState(OperationContext* opCtx,
 
 bool ValidateState::shouldEnforceFastCount() const {
     if (_mode == ValidateMode::kForegroundFullEnforceFastCount) {
-        if (_nss.isOplog()) {
+        if (_nss.isOplog() || _nss.isChangeCollection()) {
             // Oplog writers only take a global IX lock, so the oplog can still be written to even
             // during full validation despite its collection X lock. This can cause validate to
             // incorrectly report an incorrect fast count on the oplog when run in enforceFastCount
             // mode.
+            // The oplog entries are also written to the change collections and are prone to fast
+            // count failures.
             return false;
         } else if (_nss == NamespaceString::kIndexBuildEntryNamespace) {
             // Do not enforce fast count on the 'config.system.indexBuilds' collection. This is an
@@ -169,17 +195,18 @@ void ValidateState::_yieldCursors(OperationContext* opCtx) {
     for (const auto& indexCursor : _indexCursors) {
         indexCursor.second->save();
     }
+    for (const auto& indexCursor : _columnStoreIndexCursors) {
+        indexCursor.second->save();
+    }
 
     _traverseRecordStoreCursor->save();
     _seekRecordStoreCursor->save();
 
-    if (isBackground() && _validateTs) {
-        // Reset snapshot to help ameliorate WiredTiger cache pressure.
-        opCtx->recoveryUnit()->refreshSnapshot();
-    }
-
     // Restore all the cursors.
     for (const auto& indexCursor : _indexCursors) {
+        indexCursor.second->restore();
+    }
+    for (const auto& indexCursor : _columnStoreIndexCursors) {
         indexCursor.second->restore();
     }
 
@@ -193,27 +220,14 @@ void ValidateState::_yieldCursors(OperationContext* opCtx) {
 
 void ValidateState::initializeCursors(OperationContext* opCtx) {
     invariant(!_traverseRecordStoreCursor && !_seekRecordStoreCursor && _indexCursors.size() == 0 &&
-              _indexes.size() == 0);
+              _columnStoreIndexCursors.size() == 0 && _indexes.size() == 0);
 
-    // Background validation (on replica sets) will read from a snapshot opened on the kNoOverlap
-    // read source, which is the minimum of the last applied and all durable timestamps, instead of
-    // the latest data. Using the kNoOverlap read source prevents us from having to take the PBWM
-    // lock, which blocks replication. We cannot solely rely on the all durable timestamp as it can
-    // be set while we're in the middle of applying a batch on secondary nodes.
-    // Background validation on standalones uses the kNoTimestamp read source because standalones
-    // have no timestamps to use for maintaining a consistent snapshot.
+    // Background validation reads from the last stable checkpoint instead of the latest data. This
+    // allows concurrent writes to go ahead without interfering with validation's view of the data.
     RecoveryUnit::ReadSource rs = RecoveryUnit::ReadSource::kNoTimestamp;
     if (isBackground()) {
         opCtx->recoveryUnit()->abandonSnapshot();
-        // Background validation is expecting to read from the no overlap timestamp, but
-        // standalones do not support timestamps. Therefore, if this process is currently running as
-        // a standalone, don't use a timestamp.
-
-        if (repl::ReplicationCoordinator::get(opCtx)->isReplEnabled()) {
-            rs = RecoveryUnit::ReadSource::kNoOverlap;
-        } else {
-            rs = RecoveryUnit::ReadSource::kNoTimestamp;
-        }
+        rs = RecoveryUnit::ReadSource::kCheckpoint;
         opCtx->recoveryUnit()->setTimestampReadSource(rs);
     }
 
@@ -224,35 +238,125 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
         _dataThrottle.turnThrottlingOff();
     }
 
-    _traverseRecordStoreCursor = std::make_unique<SeekableRecordThrottleCursor>(
-        opCtx, _collection->getRecordStore(), &_dataThrottle);
-    _seekRecordStoreCursor = std::make_unique<SeekableRecordThrottleCursor>(
-        opCtx, _collection->getRecordStore(), &_dataThrottle);
+    // For background validation, keep retrying if any table's cursor is opened on a different
+    // checkpoint due to the background system-wide checkpoint happens during opening the cursors.
+    // The retry should happen at most once since the checkpoint happens every 60 seconds.
+    uint64_t checkpointId = 0;
+    uint64_t currCheckpointId = 0;
+    do {
+        _indexCursors.clear();
+        _indexes.clear();
+        StringSet readyDurableIndexes;
+        try {
+            _traverseRecordStoreCursor = std::make_unique<SeekableRecordThrottleCursor>(
+                opCtx, _collection->getRecordStore(), &_dataThrottle);
+            _seekRecordStoreCursor = std::make_unique<SeekableRecordThrottleCursor>(
+                opCtx, _collection->getRecordStore(), &_dataThrottle);
+            DurableCatalog::get(opCtx)->getReadyIndexes(
+                opCtx, _collection->getCatalogId(), &readyDurableIndexes);
+            checkpointId = _traverseRecordStoreCursor->getCheckpointId();
+            currCheckpointId = _seekRecordStoreCursor->getCheckpointId();
+        } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
+            invariant(isBackground());
+            // End the validation if we can't open a checkpoint cursor on the collection.
+            LOGV2(
+                6868900,
+                "Skipping background validation because the collection is not yet in a checkpoint",
+                "nss"_attr = _nss,
+                "ex"_attr = ex);
+            throw;
+        }
+
+        const IndexCatalog* indexCatalog = _collection->getIndexCatalog();
+        // The index iterator for ready indexes is timestamp-aware and will only return indexes that
+        // are visible at our read time.
+        const auto it =
+            indexCatalog->getIndexIterator(opCtx, IndexCatalog::InclusionPolicy::kReady);
+        while (it->more() && checkpointId == currCheckpointId) {
+            const IndexCatalogEntry* entry = it->next();
+            const IndexDescriptor* desc = entry->descriptor();
+
+            // Filter out any in-memory index in the collection that is not in our PIT view of the
+            // MDB catalog. This is only important when background:true because we are then reading
+            // from the checkpoint's view of the MDB catalog and data.
+            if (isBackground() &&
+                readyDurableIndexes.find(desc->indexName()) == readyDurableIndexes.end()) {
+                LOGV2(
+                    6868901,
+                    "Skipping background validation on the index because the index is not yet in a "
+                    "checkpoint.",
+                    "desc_indexName"_attr = desc->indexName(),
+                    "nss"_attr = _nss);
+                _skippedIndexes.emplace(desc->indexName());
+                continue;
+            }
+
+            // Read the index's ident from disk (the checkpoint if background:true). If it does not
+            // match the in-memory ident saved in the IndexCatalogEntry, then our PIT view of the
+            // index is old and the index has been dropped and recreated. In this case we will skip
+            // it since there is no utility in checking a dropped index (we also cannot currently
+            // access it because its in-memory representation is gone).
+            auto diskIndexIdent =
+                opCtx->getServiceContext()->getStorageEngine()->getCatalog()->getIndexIdent(
+                    opCtx, _collection->getCatalogId(), desc->indexName());
+            if (entry->getIdent() != diskIndexIdent) {
+                LOGV2(6868902,
+                      "Skipping validation on the index because the index was recreated and is not "
+                      "yet in a checkpoint.",
+                      "desc_indexName"_attr = desc->indexName(),
+                      "nss"_attr = _nss);
+                _skippedIndexes.emplace(desc->indexName());
+                continue;
+            }
+
+            try {
+                if (entry->descriptor()->getAccessMethodName() == IndexNames::COLUMN) {
+                    const auto iam = entry->accessMethod();
+                    auto indexCursor =
+                        static_cast<ColumnStoreAccessMethod*>(iam)->storage()->newCursor(opCtx);
+                    currCheckpointId = indexCursor->getCheckpointId();
+                    _columnStoreIndexCursors.emplace(desc->indexName(), std::move(indexCursor));
+                } else {
+                    const auto iam = entry->accessMethod()->asSortedData();
+                    if (!iam) {
+                        LOGV2(6325100,
+                              "[Debugging] skipping index {index_name} because it isn't SortedData",
+                              "index_name"_attr = desc->indexName());
+                        _skippedIndexes.emplace(desc->indexName());
+                        continue;
+                    }
+
+                    auto indexCursor = std::make_unique<SortedDataInterfaceThrottleCursor>(
+                        opCtx, iam, &_dataThrottle);
+                    currCheckpointId = indexCursor->getCheckpointId();
+                    _indexCursors.emplace(desc->indexName(), std::move(indexCursor));
+                }
+            } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
+                invariant(isBackground());
+                LOGV2(7359900,
+                      "Skipping validation on the index because the index's checkpoint is not "
+                      "consistent with the system-wide checkpoint.",
+                      "indexName"_attr = desc->indexName(),
+                      "nss"_attr = _nss,
+                      "ex"_attr = ex);
+                _skippedIndexes.emplace(desc->indexName());
+                continue;
+            }
+
+            _indexes.push_back(indexCatalog->getEntryShared(desc));
+        }
+        // For foreground validation which doesn't use checkpoint cursors, the checkpoint id will
+        // always be zero.
+        if (!isBackground()) {
+            invariant(!checkpointId && !currCheckpointId);
+        }
+    } while (checkpointId != currCheckpointId);
 
     if (rs != RecoveryUnit::ReadSource::kNoTimestamp) {
-        invariant(rs == RecoveryUnit::ReadSource::kNoOverlap);
+        invariant(rs == RecoveryUnit::ReadSource::kCheckpoint);
         invariant(isBackground());
-        _validateTs = opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx);
-    }
-
-    const IndexCatalog* indexCatalog = _collection->getIndexCatalog();
-    // The index iterator for ready indexes is timestamp-aware and will only return indexes that
-    // are visible at our read time.
-    const std::unique_ptr<IndexCatalog::IndexIterator> it =
-        indexCatalog->getIndexIterator(opCtx, /*includeUnfinished*/ false);
-    while (it->more()) {
-        const IndexCatalogEntry* entry = it->next();
-        const IndexDescriptor* desc = entry->descriptor();
-
-        auto iam = entry->accessMethod()->asSortedData();
-        if (!iam)
-            continue;
-
-        _indexCursors.emplace(
-            desc->indexName(),
-            std::make_unique<SortedDataInterfaceThrottleCursor>(opCtx, iam, &_dataThrottle));
-
-        _indexes.push_back(indexCatalog->getEntryShared(desc));
+        auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+        _validateTs = storageEngine->getLastStableRecoveryTimestamp();
     }
 
     // Because SeekableRecordCursors don't have a method to reset to the start, we save and then
@@ -262,8 +366,8 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
     // use cursor->next() to get subsequent Records. However, if the Record Store is empty,
     // there is no first record. In this case, we set the first Record Id to an invalid RecordId
     // (RecordId()), which will halt iteration at the initialization step.
-    const boost::optional<Record> record = _traverseRecordStoreCursor->next(opCtx);
-    _firstRecordId = record ? record->id : RecordId();
+    auto record = _traverseRecordStoreCursor->next(opCtx);
+    _firstRecordId = record ? std::move(record->id) : RecordId();
 }
 
 void ValidateState::_relockDatabaseAndCollection(OperationContext* opCtx) {
@@ -281,10 +385,8 @@ void ValidateState::_relockDatabaseAndCollection(OperationContext* opCtx) {
         << "Interrupted due to: database drop: " << _nss.db()
         << " while validating collection: " << _nss << " (" << *_uuid << ")";
 
-    _databaseLock.emplace(opCtx, _nss.db(), MODE_IS);
-    // TODO SERVER-63106 Have the ValidateState implementation use TenantNamespace
-    const TenantDatabaseName tenantDbName(boost::none, _nss.db());
-    _database = DatabaseHolder::get(opCtx)->getDb(opCtx, tenantDbName);
+    _databaseLock.emplace(opCtx, _nss.dbName(), MODE_IS);
+    _database = DatabaseHolder::get(opCtx)->getDb(opCtx, _nss.dbName());
     uassert(ErrorCodes::Interrupted, dbErrMsg, _database);
     uassert(ErrorCodes::Interrupted, dbErrMsg, !_database->isDropPending(opCtx));
 
@@ -292,13 +394,14 @@ void ValidateState::_relockDatabaseAndCollection(OperationContext* opCtx) {
                                            << " (" << *_uuid << ") while validating the collection";
 
     try {
-        NamespaceStringOrUUID nssOrUUID(std::string(_nss.db()), *_uuid);
+        NamespaceStringOrUUID nssOrUUID(_nss.dbName(), *_uuid);
         _collectionLock.emplace(opCtx, nssOrUUID, MODE_IS);
     } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
         uasserted(ErrorCodes::Interrupted, collErrMsg);
     }
 
-    _collection = CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, *_uuid);
+    _collection =
+        CollectionPtr(CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, *_uuid));
     uassert(ErrorCodes::Interrupted, collErrMsg, _collection);
 
     // The namespace of the collection can be changed during a same database collection rename.

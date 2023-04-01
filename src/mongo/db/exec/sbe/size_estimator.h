@@ -84,12 +84,21 @@ inline size_t estimate(S) {
     return 0;
 }
 
+inline size_t estimate(const StringData& str) {
+    return 0;
+}
+
 // Calculate the size of a SpecificStats's derived class.
 // We need a template argument here rather than passing const SpecificStats&
 // as we need to know the exact type to properly compute the size of the object.
 template <typename S, std::enable_if_t<std::is_base_of_v<SpecificStats, S>, bool> = true>
 inline size_t estimate(const S& stats) {
     return stats.estimateObjectSizeInBytes() - sizeof(S);
+}
+
+template <typename A, typename B>
+inline size_t estimate(const std::pair<A, B>& pair) {
+    return estimate(pair.first) + estimate(pair.second);
 }
 
 // Calculate the size of the inlined vector's elements.
@@ -157,5 +166,14 @@ size_t estimate(const absl::flat_hash_map<K, V, Args...>& map) {
 template <class BufferAllocator>
 size_t estimate(const BasicBufBuilder<BufferAllocator>& ba) {
     return static_cast<size_t>(ba.capacity());
+}
+
+inline size_t estimate(const value::MaterializedRow& row) {
+    size_t size = 0;
+    for (size_t idx = 0; idx < row.size(); ++idx) {
+        auto [tag, val] = row.getViewOfValue(idx);
+        size += estimate(tag, val);
+    }
+    return size;
 }
 }  // namespace mongo::sbe::size_estimator

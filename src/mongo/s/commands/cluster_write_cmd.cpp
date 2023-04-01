@@ -27,14 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-#include "mongo/platform/basic.h"
+#include "mongo/s/commands/cluster_write_cmd.h"
 
 #include "mongo/base/error_codes.h"
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/fle_crud.h"
 #include "mongo/db/internal_transactions_feature_flag_gen.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/stats/counters.h"
@@ -42,13 +42,12 @@
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/chunk_manager_targeter.h"
 #include "mongo/s/client/num_hosts_targeted_metrics.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/cluster_write.h"
+#include "mongo/s/collection_routing_info_targeter.h"
 #include "mongo/s/commands/cluster_explain.h"
-#include "mongo/s/commands/cluster_write_cmd.h"
 #include "mongo/s/commands/document_shard_key_update_util.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/session_catalog_router.h"
@@ -58,8 +57,13 @@
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/timer.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
+
 namespace mongo {
 namespace {
+
+using QuerySamplingOptions = OperationContext::QuerySamplingOptions;
 
 MONGO_FAIL_POINT_DEFINE(hangAfterThrowWouldChangeOwningShardRetryableWrite);
 
@@ -68,28 +72,27 @@ void batchErrorToNotPrimaryErrorTracker(const BatchedCommandRequest& request,
                                         NotPrimaryErrorTracker* tracker) {
     tracker->reset();
 
-    std::unique_ptr<WriteErrorDetail> commandError;
-    WriteErrorDetail* lastBatchError = nullptr;
+    boost::optional<Status> commandStatus;
+    Status const* lastBatchStatus = nullptr;
 
     if (!response.getOk()) {
         // Command-level error, all writes failed
-        commandError = std::make_unique<WriteErrorDetail>();
-        commandError->setStatus(response.getTopLevelStatus());
-        lastBatchError = commandError.get();
+        commandStatus = response.getTopLevelStatus();
+        lastBatchStatus = commandStatus.get_ptr();
     } else if (response.isErrDetailsSet()) {
         // The last error in the batch is always reported - this matches expected COE semantics for
         // insert batches. For updates and deletes, error is only reported if the error was on the
         // last item.
-        const bool lastOpErrored = response.getErrDetails().back()->getIndex() ==
+        const bool lastOpErrored = response.getErrDetails().back().getIndex() ==
             static_cast<int>(request.sizeWriteOps() - 1);
         if (request.getBatchType() == BatchedCommandRequest::BatchType_Insert || lastOpErrored) {
-            lastBatchError = response.getErrDetails().back();
+            lastBatchStatus = &response.getErrDetails().back().getStatus();
         }
     }
 
     // Record an error if one exists
-    if (lastBatchError) {
-        tracker->recordError(lastBatchError->toStatus().code());
+    if (lastBatchStatus) {
+        tracker->recordError(lastBatchStatus->code());
     }
 }
 
@@ -102,7 +105,6 @@ boost::optional<WouldChangeOwningShardInfo> getWouldChangeOwningShardErrorInfo(
     const BatchedCommandRequest& request,
     BatchedCommandResponse* response,
     bool originalCmdInTxn) {
-
     if (!response->getOk() || !response->isErrDetailsSet()) {
         return boost::none;
     }
@@ -112,9 +114,8 @@ boost::optional<WouldChangeOwningShardInfo> getWouldChangeOwningShardErrorInfo(
     // change any WouldChangeOwningShard errors in this batch to InvalidOptions to be reported
     // to the user.
     if (request.sizeWriteOps() != 1U) {
-        for (auto it = response->getErrDetails().begin(); it != response->getErrDetails().end();
-             ++it) {
-            if ((*it)->toStatus() != ErrorCodes::WouldChangeOwningShard) {
+        for (auto& err : response->getErrDetails()) {
+            if (err.getStatus() != ErrorCodes::WouldChangeOwningShard) {
                 continue;
             }
 
@@ -123,29 +124,29 @@ boost::optional<WouldChangeOwningShardInfo> getWouldChangeOwningShardErrorInfo(
                           "Document shard key value updates that cause the doc to move shards "
                           "must be sent with write batch of size 1");
 
-            (*it)->setStatus({ErrorCodes::InvalidOptions,
-                              "Document shard key value updates that cause the doc to move shards "
-                              "must be sent with write batch of size 1"});
+            err.setStatus({ErrorCodes::InvalidOptions,
+                           "Document shard key value updates that cause the doc to move shards "
+                           "must be sent with write batch of size 1"});
         }
 
         return boost::none;
     } else {
         for (const auto& err : response->getErrDetails()) {
-            if (err->toStatus() != ErrorCodes::WouldChangeOwningShard) {
+            if (err.getStatus() != ErrorCodes::WouldChangeOwningShard) {
                 continue;
             }
 
             BSONObjBuilder extraInfoBuilder;
-            err->toStatus().extraInfo()->serialize(&extraInfoBuilder);
+            err.getStatus().extraInfo()->serialize(&extraInfoBuilder);
             auto extraInfo = extraInfoBuilder.obj();
             return WouldChangeOwningShardInfo::parseFromCommandError(extraInfo);
         }
-    }
 
-    return boost::none;
+        return boost::none;
+    }
 }
 
-void handleWouldChangeOwningShardErrorRetryableWrite(OperationContext* opCtx,
+void handleWouldChangeOwningShardErrorNonTransaction(OperationContext* opCtx,
                                                      BatchedCommandRequest* request,
                                                      BatchedCommandResponse* response) {
     // Strip write concern because this command will be sent as part of a
@@ -161,9 +162,9 @@ void handleWouldChangeOwningShardErrorRetryableWrite(OperationContext* opCtx,
     response->unsetErrDetails();
 
     auto txn =
-        txn_api::TransactionWithRetries(opCtx,
-                                        Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
-                                        TransactionRouterResourceYielder::make());
+        txn_api::SyncTransactionWithRetries(opCtx,
+                                            Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
+                                            nullptr /* resourceYielder */);
 
     // Shared state for the transaction API use below.
     struct SharedBlock {
@@ -177,9 +178,9 @@ void handleWouldChangeOwningShardErrorRetryableWrite(OperationContext* opCtx,
     cmdWithStmtId.append(write_ops::WriteCommandRequestBase::kStmtIdFieldName, 0);
     auto sharedBlock = std::make_shared<SharedBlock>(cmdWithStmtId.obj(), request->getNS());
 
-    auto swCommitResult = txn.runSyncNoThrow(
+    auto swCommitResult = txn.runNoThrow(
         opCtx, [sharedBlock](const txn_api::TransactionClient& txnClient, ExecutorPtr txnExec) {
-            return txnClient.runCommand(sharedBlock->nss.db(), sharedBlock->cmdObj)
+            return txnClient.runCommand(sharedBlock->nss.dbName(), sharedBlock->cmdObj)
                 .thenRunOn(txnExec)
                 .then([sharedBlock](auto res) {
                     uassertStatusOK(getStatusFromWriteCommandReply(res));
@@ -196,12 +197,9 @@ void handleWouldChangeOwningShardErrorRetryableWrite(OperationContext* opCtx,
             (bodyStatus == ErrorCodes::DuplicateKey &&
              !bodyStatus.extraInfo<DuplicateKeyErrorInfo>()->getKeyPattern().hasField("_id"))) {
             bodyStatus.addContext(documentShardKeyUpdateUtil::kNonDuplicateKeyErrorContext);
-        };
+        }
 
-        auto error = std::make_unique<WriteErrorDetail>();
-        error->setIndex(0);
-        error->setStatus(bodyStatus);
-        response->addToErrDetails(error.release());
+        response->addToErrDetails({0, bodyStatus});
         return;
     }
 
@@ -242,23 +240,23 @@ UpdateShardKeyResult handleWouldChangeOwningShardErrorTransaction(
     };
     auto sharedBlock = std::make_shared<SharedBlock>(changeInfo, request->getNS());
 
-    auto txn =
-        txn_api::TransactionWithRetries(opCtx,
-                                        Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
-                                        TransactionRouterResourceYielder::make());
+    auto txn = txn_api::SyncTransactionWithRetries(
+        opCtx,
+        Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
+        TransactionRouterResourceYielder::makeForLocalHandoff());
 
     try {
-        txn.runSync(opCtx,
-                    [sharedBlock](const txn_api::TransactionClient& txnClient,
-                                  ExecutorPtr txnExec) -> SemiFuture<void> {
-                        return documentShardKeyUpdateUtil::updateShardKeyForDocument(
-                                   txnClient, txnExec, sharedBlock->nss, sharedBlock->changeInfo)
-                            .thenRunOn(txnExec)
-                            .then([sharedBlock](bool updatedShardKey) {
-                                sharedBlock->updatedShardKey = updatedShardKey;
-                            })
-                            .semi();
-                    });
+        txn.run(opCtx,
+                [sharedBlock](const txn_api::TransactionClient& txnClient,
+                              ExecutorPtr txnExec) -> SemiFuture<void> {
+                    return documentShardKeyUpdateUtil::updateShardKeyForDocument(
+                               txnClient, txnExec, sharedBlock->nss, sharedBlock->changeInfo)
+                        .thenRunOn(txnExec)
+                        .then([sharedBlock](bool updatedShardKey) {
+                            sharedBlock->updatedShardKey = updatedShardKey;
+                        })
+                        .semi();
+                });
     } catch (const ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
         Status status = ex->getKeyPattern().hasField("_id")
             ? ex.toStatus().withContext(documentShardKeyUpdateUtil::kDuplicateKeyErrorContext)
@@ -272,155 +270,6 @@ UpdateShardKeyResult handleWouldChangeOwningShardErrorTransaction(
         upsertedId = sharedBlock->changeInfo.getPostImage()["_id"].wrap();
     }
     return UpdateShardKeyResult{sharedBlock->updatedShardKey, std::move(upsertedId)};
-}
-
-/**
- * Changes the shard key for the document if the response object contains a WouldChangeOwningShard
- * error. If the original command was sent as a retryable write, starts a transaction on the same
- * session and txnNum, deletes the original document, inserts the new one, and commits the
- * transaction. If the original command is part of a transaction, deletes the original document and
- * inserts the new one. Returns whether or not we actually complete the delete and insert.
- */
-bool handleWouldChangeOwningShardError(OperationContext* opCtx,
-                                       BatchedCommandRequest* request,
-                                       BatchedCommandResponse* response,
-                                       BatchWriteExecStats stats) {
-    auto txnRouter = TransactionRouter::get(opCtx);
-    bool isRetryableWrite = opCtx->getTxnNumber() && !txnRouter;
-
-    auto wouldChangeOwningShardErrorInfo =
-        getWouldChangeOwningShardErrorInfo(opCtx, *request, response, !isRetryableWrite);
-    if (!wouldChangeOwningShardErrorInfo)
-        return false;
-
-    bool updatedShardKey = false;
-    boost::optional<BSONObj> upsertedId;
-    if (feature_flags::gFeatureFlagInternalTransactions.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
-        if (isRetryableWrite) {
-            if (MONGO_unlikely(hangAfterThrowWouldChangeOwningShardRetryableWrite.shouldFail())) {
-                LOGV2(5918603, "Hit hangAfterThrowWouldChangeOwningShardRetryableWrite failpoint");
-                hangAfterThrowWouldChangeOwningShardRetryableWrite.pauseWhileSet(opCtx);
-            }
-
-            handleWouldChangeOwningShardErrorRetryableWrite(opCtx, request, response);
-        } else {
-            auto updateResult = handleWouldChangeOwningShardErrorTransaction(
-                opCtx, request, response, *wouldChangeOwningShardErrorInfo);
-            updatedShardKey = updateResult.updatedShardKey;
-            upsertedId = std::move(updateResult.upsertedId);
-        }
-    } else {
-        // TODO SERVER-62375: Delete this branch.
-        if (isRetryableWrite) {
-            if (MONGO_unlikely(hangAfterThrowWouldChangeOwningShardRetryableWrite.shouldFail())) {
-                LOGV2(22759, "Hit hangAfterThrowWouldChangeOwningShardRetryableWrite failpoint");
-                hangAfterThrowWouldChangeOwningShardRetryableWrite.pauseWhileSet(opCtx);
-            }
-            RouterOperationContextSession routerSession(opCtx);
-            try {
-                // Start transaction and re-run the original update command
-                auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-                readConcernArgs = repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
-
-                // Ensure the retried operation does not include WC inside the transaction.  The
-                // transaction commit will still use the WC, because it uses the WC from the opCtx
-                // (which has been set previously in Strategy).
-                request->unsetWriteConcern();
-
-                documentShardKeyUpdateUtil::startTransactionForShardKeyUpdate(opCtx);
-                // Clear the error details from the response object before sending the write again
-                response->unsetErrDetails();
-                cluster::write(opCtx, *request, &stats, response);
-                wouldChangeOwningShardErrorInfo = getWouldChangeOwningShardErrorInfo(
-                    opCtx, *request, response, !isRetryableWrite);
-                if (!wouldChangeOwningShardErrorInfo)
-                    uassertStatusOK(response->toStatus());
-
-                // If we do not get WouldChangeOwningShard when re-running the update, the document
-                // has been modified or deleted concurrently and we do not need to delete it and
-                // insert a new one.
-                updatedShardKey =
-                    wouldChangeOwningShardErrorInfo &&
-                    documentShardKeyUpdateUtil::updateShardKeyForDocumentLegacy(
-                        opCtx, request->getNS(), wouldChangeOwningShardErrorInfo.get());
-
-                // If the operation was an upsert, record the _id of the new document.
-                if (updatedShardKey && wouldChangeOwningShardErrorInfo->getShouldUpsert()) {
-                    upsertedId = wouldChangeOwningShardErrorInfo->getPostImage()["_id"].wrap();
-                }
-
-                // Commit the transaction
-                auto commitResponse =
-                    documentShardKeyUpdateUtil::commitShardKeyUpdateTransaction(opCtx);
-
-                uassertStatusOK(getStatusFromCommandResult(commitResponse));
-
-                auto writeConcernDetail = getWriteConcernErrorDetailFromBSONObj(commitResponse);
-                if (writeConcernDetail && !writeConcernDetail->toStatus().isOK())
-                    response->setWriteConcernError(writeConcernDetail.release());
-            } catch (DBException& e) {
-                if (e.code() == ErrorCodes::DuplicateKey &&
-                    e.extraInfo<DuplicateKeyErrorInfo>()->getKeyPattern().hasField("_id")) {
-                    e.addContext(documentShardKeyUpdateUtil::kDuplicateKeyErrorContext);
-                } else {
-                    e.addContext(documentShardKeyUpdateUtil::kNonDuplicateKeyErrorContext);
-                }
-
-                if (!response->isErrDetailsSet() || !response->getErrDetails().back()) {
-                    auto error = std::make_unique<WriteErrorDetail>();
-                    error->setIndex(0);
-                    response->addToErrDetails(error.release());
-                }
-
-                // Set the error status to the status of the failed command and abort the
-                // transaction.
-                auto status = e.toStatus();
-                response->getErrDetails().back()->setStatus(status);
-
-                auto txnRouterForAbort = TransactionRouter::get(opCtx);
-                if (txnRouterForAbort)
-                    txnRouterForAbort.implicitlyAbortTransaction(opCtx, status);
-
-                return false;
-            }
-        } else {
-            try {
-                // Delete the original document and insert the new one
-                updatedShardKey = documentShardKeyUpdateUtil::updateShardKeyForDocumentLegacy(
-                    opCtx, request->getNS(), wouldChangeOwningShardErrorInfo.get());
-
-                // If the operation was an upsert, record the _id of the new document.
-                if (updatedShardKey && wouldChangeOwningShardErrorInfo->getShouldUpsert()) {
-                    upsertedId = wouldChangeOwningShardErrorInfo->getPostImage()["_id"].wrap();
-                }
-            } catch (const ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
-                Status status = ex->getKeyPattern().hasField("_id")
-                    ? ex.toStatus().withContext(
-                          documentShardKeyUpdateUtil::kDuplicateKeyErrorContext)
-                    : ex.toStatus();
-                uassertStatusOK(status);
-            }
-        }
-    }
-
-    if (updatedShardKey) {
-        // If we get here, the batch size is 1 and we have successfully deleted the old doc
-        // and inserted the new one, so it is safe to unset the error details.
-        response->unsetErrDetails();
-        response->setN(response->getN() + 1);
-
-        if (upsertedId) {
-            auto upsertDetail = std::make_unique<BatchedUpsertDetail>();
-            upsertDetail->setIndex(0);
-            upsertDetail->setUpsertedID(upsertedId.get());
-            response->addToUpsertDetails(upsertDetail.release());
-        } else {
-            response->setNModified(response->getNModified() + 1);
-        }
-    }
-
-    return updatedShardKey;
 }
 
 void updateHostsTargetedMetrics(OperationContext* opCtx,
@@ -446,7 +295,166 @@ void updateHostsTargetedMetrics(OperationContext* opCtx,
         opCtx, nShardsTargeted, nShardsOwningChunks);
     NumHostsTargetedMetrics::get(opCtx).addNumHostsTargeted(writeType, targetType);
 }
+
 }  // namespace
+
+bool ClusterWriteCmd::handleWouldChangeOwningShardError(OperationContext* opCtx,
+                                                        BatchedCommandRequest* request,
+                                                        BatchedCommandResponse* response,
+                                                        BatchWriteExecStats stats) {
+    auto txnRouter = TransactionRouter::get(opCtx);
+    bool isRetryableWrite = opCtx->getTxnNumber() && !txnRouter;
+
+    auto wouldChangeOwningShardErrorInfo =
+        getWouldChangeOwningShardErrorInfo(opCtx, *request, response, !isRetryableWrite);
+    if (!wouldChangeOwningShardErrorInfo)
+        return false;
+
+    bool updatedShardKey = false;
+    boost::optional<BSONObj> upsertedId;
+
+    if (feature_flags::gFeatureFlagUpdateDocumentShardKeyUsingTransactionApi.isEnabled(
+            serverGlobalParams.featureCompatibility)) {
+        if (txnRouter) {
+            auto updateResult = handleWouldChangeOwningShardErrorTransaction(
+                opCtx, request, response, *wouldChangeOwningShardErrorInfo);
+            updatedShardKey = updateResult.updatedShardKey;
+            upsertedId = std::move(updateResult.upsertedId);
+        } else {
+            // Updating a document's shard key such that its owning shard changes must be run in a
+            // transaction. If this update is not already in a transaction, complete the update
+            // using an internal transaction.
+            if (isRetryableWrite) {
+                if (MONGO_unlikely(
+                        hangAfterThrowWouldChangeOwningShardRetryableWrite.shouldFail())) {
+                    LOGV2(5918603,
+                          "Hit hangAfterThrowWouldChangeOwningShardRetryableWrite failpoint");
+                    hangAfterThrowWouldChangeOwningShardRetryableWrite.pauseWhileSet(opCtx);
+                }
+            }
+            handleWouldChangeOwningShardErrorNonTransaction(opCtx, request, response);
+        }
+    } else {
+        // TODO SERVER-67429: Delete this branch.
+        if (!txnRouter && !isRetryableWrite) {
+            response->getErrDetails().back().setStatus(Status(
+                ErrorCodes::IllegalOperation,
+                "Must run update to document shard key in a transaction or as a retryable write."));
+            return false;
+        }
+
+        opCtx->setQuerySamplingOptions(QuerySamplingOptions::kOptOut);
+
+        if (isRetryableWrite) {
+            if (MONGO_unlikely(hangAfterThrowWouldChangeOwningShardRetryableWrite.shouldFail())) {
+                LOGV2(22759, "Hit hangAfterThrowWouldChangeOwningShardRetryableWrite failpoint");
+                hangAfterThrowWouldChangeOwningShardRetryableWrite.pauseWhileSet(opCtx);
+            }
+            RouterOperationContextSession routerSession(opCtx);
+            try {
+                // Start transaction and re-run the original update command
+                auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+                readConcernArgs = repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
+
+                // Ensure the retried operation does not include WC inside the transaction.  The
+                // transaction commit will still use the WC, because it uses the WC from the opCtx
+                // (which has been set previously in Strategy).
+                request->unsetWriteConcern();
+
+                documentShardKeyUpdateUtil::startTransactionForShardKeyUpdate(opCtx);
+                // Clear the error details from the response object before sending the write again
+                response->unsetErrDetails();
+
+                cluster::write(opCtx, *request, &stats, response);
+                wouldChangeOwningShardErrorInfo = getWouldChangeOwningShardErrorInfo(
+                    opCtx, *request, response, !isRetryableWrite);
+                if (!wouldChangeOwningShardErrorInfo)
+                    uassertStatusOK(response->toStatus());
+
+                // If we do not get WouldChangeOwningShard when re-running the update, the document
+                // has been modified or deleted concurrently and we do not need to delete it and
+                // insert a new one.
+                updatedShardKey = wouldChangeOwningShardErrorInfo &&
+                    documentShardKeyUpdateUtil::updateShardKeyForDocumentLegacy(
+                                      opCtx, request->getNS(), *wouldChangeOwningShardErrorInfo);
+
+                // If the operation was an upsert, record the _id of the new document.
+                if (updatedShardKey && wouldChangeOwningShardErrorInfo->getShouldUpsert()) {
+                    upsertedId = wouldChangeOwningShardErrorInfo->getPostImage()["_id"].wrap();
+                }
+
+                // Commit the transaction
+                auto commitResponse =
+                    documentShardKeyUpdateUtil::commitShardKeyUpdateTransaction(opCtx);
+
+                uassertStatusOK(getStatusFromCommandResult(commitResponse));
+
+                auto writeConcernDetail = getWriteConcernErrorDetailFromBSONObj(commitResponse);
+                if (writeConcernDetail && !writeConcernDetail->toStatus().isOK())
+                    response->setWriteConcernError(writeConcernDetail.release());
+            } catch (DBException& e) {
+                if (e.code() == ErrorCodes::DuplicateKey &&
+                    e.extraInfo<DuplicateKeyErrorInfo>()->getKeyPattern().hasField("_id")) {
+                    e.addContext(documentShardKeyUpdateUtil::kDuplicateKeyErrorContext);
+                } else {
+                    e.addContext(documentShardKeyUpdateUtil::kNonDuplicateKeyErrorContext);
+                }
+
+                if (!response->isErrDetailsSet()) {
+                    response->addToErrDetails(
+                        {0,
+                         Status(ErrorCodes::InternalError, "Will be replaced by the code below")});
+                }
+
+                // Set the error status to the status of the failed command and abort the
+                // transaction
+                auto status = e.toStatus();
+                response->getErrDetails().back().setStatus(status);
+
+                auto txnRouterForAbort = TransactionRouter::get(opCtx);
+                if (txnRouterForAbort)
+                    txnRouterForAbort.implicitlyAbortTransaction(opCtx, status);
+
+                return false;
+            }
+        } else {
+            try {
+                // Delete the original document and insert the new one
+                updatedShardKey = documentShardKeyUpdateUtil::updateShardKeyForDocumentLegacy(
+                    opCtx, request->getNS(), *wouldChangeOwningShardErrorInfo);
+
+                // If the operation was an upsert, record the _id of the new document.
+                if (updatedShardKey && wouldChangeOwningShardErrorInfo->getShouldUpsert()) {
+                    upsertedId = wouldChangeOwningShardErrorInfo->getPostImage()["_id"].wrap();
+                }
+            } catch (const ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
+                Status status = ex->getKeyPattern().hasField("_id")
+                    ? ex.toStatus().withContext(
+                          documentShardKeyUpdateUtil::kDuplicateKeyErrorContext)
+                    : ex.toStatus();
+                uassertStatusOK(status);
+            }
+        }
+    }
+
+    if (updatedShardKey) {
+        // If we get here, the batch size is 1 and we have successfully deleted the old doc
+        // and inserted the new one, so it is safe to unset the error details.
+        response->unsetErrDetails();
+        response->setN(response->getN() + 1);
+
+        if (upsertedId) {
+            auto upsertDetail = std::make_unique<BatchedUpsertDetail>();
+            upsertDetail->setIndex(0);
+            upsertDetail->setUpsertedID(upsertedId.value());
+            response->addToUpsertDetails(upsertDetail.release());
+        } else {
+            response->setNModified(response->getNModified() + 1);
+        }
+    }
+
+    return updatedShardKey;
+}
 
 void ClusterWriteCmd::_commandOpWrite(OperationContext* opCtx,
                                       const NamespaceString& nss,
@@ -456,7 +464,7 @@ void ClusterWriteCmd::_commandOpWrite(OperationContext* opCtx,
     auto endpoints = [&] {
         // Note that this implementation will not handle targeting retries and does not
         // completely emulate write behavior
-        ChunkManagerTargeter targeter(opCtx, nss);
+        CollectionRoutingInfoTargeter targeter(opCtx, nss);
 
         if (targetingBatchItem.getOpType() == BatchedCommandRequest::BatchType_Insert) {
             return std::vector{targeter.targetInsert(opCtx, targetingBatchItem.getDocument())};
@@ -488,7 +496,7 @@ void ClusterWriteCmd::_commandOpWrite(OperationContext* opCtx,
     MultiStatementTransactionRequestsSender ars(
         opCtx,
         Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
-        nss.db(),
+        nss.dbName(),
         requests,
         readPref,
         Shard::RetryPolicy::kNoRetry);
@@ -514,13 +522,7 @@ bool ClusterWriteCmd::InvocationBase::runImpl(OperationContext* opCtx,
     // The batched request will only have WC if it was supplied by the client. Otherwise, the
     // batched request should use the WC from the opCtx.
     if (!batchedRequest.hasWriteConcern()) {
-        if (opCtx->getWriteConcern().usedDefaultConstructedWC) {
-            // Pass writeConcern: {}, rather than {w: 1, wtimeout: 0}, so as to not override the
-            // configsvr w:majority upconvert.
-            batchedRequest.setWriteConcern(BSONObj());
-        } else {
-            batchedRequest.setWriteConcern(opCtx->getWriteConcern().toBSON());
-        }
+        batchedRequest.setWriteConcern(opCtx->getWriteConcern().toBSON());
     }
 
     // Write ops are never allowed to have writeConcern inside transactions. Normally
@@ -552,29 +554,24 @@ bool ClusterWriteCmd::InvocationBase::runImpl(OperationContext* opCtx,
     } else if (batchedRequest.getWriteCommandRequestBase().getOrdered() &&
                response.isErrDetailsSet()) {
         // Add one failed attempt
-        numAttempts = response.getErrDetailsAt(0)->getIndex() + 1;
+        numAttempts = response.getErrDetailsAt(0).getIndex() + 1;
     } else {
         numAttempts = batchedRequest.sizeWriteOps();
     }
 
     // TODO: increase opcounters by more than one
     auto& debug = CurOp::get(opCtx)->debug();
-    auto catalogCache = Grid::get(opCtx)->catalogCache();
     switch (_batchedRequest.getBatchType()) {
         case BatchedCommandRequest::BatchType_Insert:
             for (size_t i = 0; i < numAttempts; ++i) {
                 globalOpCounters.gotInsert();
             }
-            catalogCache->checkAndRecordOperationBlockedByRefresh(opCtx,
-                                                                  mongo::LogicalOp::opInsert);
             debug.additiveMetrics.ninserted = response.getN();
             break;
         case BatchedCommandRequest::BatchType_Update:
             for (size_t i = 0; i < numAttempts; ++i) {
                 globalOpCounters.gotUpdate();
             }
-            catalogCache->checkAndRecordOperationBlockedByRefresh(opCtx,
-                                                                  mongo::LogicalOp::opUpdate);
 
             // The response.getN() count is the sum of documents matched and upserted.
             if (response.isUpsertDetailsSet()) {
@@ -607,8 +604,6 @@ bool ClusterWriteCmd::InvocationBase::runImpl(OperationContext* opCtx,
             for (size_t i = 0; i < numAttempts; ++i) {
                 globalOpCounters.gotDelete();
             }
-            catalogCache->checkAndRecordOperationBlockedByRefresh(opCtx,
-                                                                  mongo::LogicalOp::opDelete);
             debug.additiveMetrics.ndeleted = response.getN();
             break;
     }
@@ -617,10 +612,10 @@ bool ClusterWriteCmd::InvocationBase::runImpl(OperationContext* opCtx,
     CurOp::get(opCtx)->debug().nShards =
         stats.getTargetedShards().size() + (updatedShardKey ? 1 : 0);
 
-    if (stats.getNumShardsOwningChunks().is_initialized())
+    if (stats.getNumShardsOwningChunks().has_value())
         updateHostsTargetedMetrics(opCtx,
                                    _batchedRequest.getBatchType(),
-                                   stats.getNumShardsOwningChunks().get(),
+                                   stats.getNumShardsOwningChunks().value(),
                                    stats.getTargetedShards().size() + (updatedShardKey ? 1 : 0));
 
     if (auto txnRouter = TransactionRouter::get(opCtx)) {
@@ -647,26 +642,42 @@ void ClusterWriteCmd::InvocationBase::run(OperationContext* opCtx,
 void ClusterWriteCmd::InvocationBase::explain(OperationContext* opCtx,
                                               ExplainOptions::Verbosity verbosity,
                                               rpc::ReplyBuilderInterface* result) {
+    preExplainImplHook(opCtx);
+
     uassert(ErrorCodes::InvalidLength,
             "explained write batches must be of size 1",
             _batchedRequest.sizeWriteOps() == 1U);
 
-    const auto explainCmd = ClusterExplain::wrapAsExplain(_request->body, verbosity);
+
+    std::unique_ptr<BatchedCommandRequest> req;
+    if (_batchedRequest.hasEncryptionInformation() &&
+        (_batchedRequest.getBatchType() == BatchedCommandRequest::BatchType_Delete ||
+         _batchedRequest.getBatchType() == BatchedCommandRequest::BatchType_Update)) {
+        req = processFLEBatchExplain(opCtx, _batchedRequest);
+        tassert(6636600,
+                "encryptionInformation should be stripped from request after rewriting for explain",
+                !req->hasEncryptionInformation());
+    }
+
+    auto nss = req ? req->getNS() : _batchedRequest.getNS();
+    auto requestBSON = req ? req->toBSON() : _request->body;
+    auto requestPtr = req ? req.get() : &_batchedRequest;
+
+    const auto explainCmd = ClusterExplain::wrapAsExplain(requestBSON, verbosity);
 
     // We will time how long it takes to run the commands on the shards.
     Timer timer;
 
     // Target the command to the shards based on the singleton batch item.
-    BatchItemRef targetingBatchItem(&_batchedRequest, 0);
+    BatchItemRef targetingBatchItem(requestPtr, 0);
     std::vector<AsyncRequestsSender::Response> shardResponses;
-    _commandOpWrite(
-        opCtx, _batchedRequest.getNS(), explainCmd, targetingBatchItem, &shardResponses);
+    _commandOpWrite(opCtx, nss, explainCmd, targetingBatchItem, &shardResponses);
     auto bodyBuilder = result->getBodyBuilder();
     uassertStatusOK(ClusterExplain::buildExplainResult(opCtx,
                                                        shardResponses,
                                                        ClusterExplain::kWriteOnShards,
                                                        timer.millis(),
-                                                       _request->body,
+                                                       requestBSON,
                                                        &bodyBuilder));
 }
 

@@ -93,18 +93,18 @@ static uint16_t
 __logmgr_get_log_version(WT_VERSION version)
 {
     if (!__wt_version_defined(version))
-        return WT_NO_VALUE;
+        return (WT_NO_VALUE);
 
     if (__wt_version_lt(version, WT_LOG_V2_VERSION))
-        return 1;
+        return (1);
     else if (__wt_version_lt(version, WT_LOG_V3_VERSION))
-        return 2;
+        return (2);
     else if (__wt_version_lt(version, WT_LOG_V4_VERSION))
-        return 3;
+        return (3);
     else if (__wt_version_lt(version, WT_LOG_V5_VERSION))
-        return 4;
+        return (4);
     else
-        return WT_LOG_VERSION;
+        return (WT_LOG_VERSION);
 }
 
 /*
@@ -309,6 +309,10 @@ __wt_logmgr_config(WT_SESSION_IMPL *session, const char **cfg, bool reconfig)
     WT_RET(__wt_config_gets(session, cfg, "log.prealloc", &cval));
     if (cval.val != 0)
         conn->log_prealloc = 1;
+
+    WT_RET(__wt_config_gets(session, cfg, "log.force_write_wait", &cval));
+    if (cval.val != 0)
+        conn->log_force_write_wait = (uint32_t)cval.val;
 
     /*
      * Note it's meaningless to reconfigure this value during runtime, it only matters on create
@@ -622,7 +626,7 @@ __log_file_server(void *arg)
         }
 
         /* Wait until the next event. */
-        __wt_cond_wait(session, conn->log_file_cond, 100000, NULL);
+        __wt_cond_wait(session, conn->log_file_cond, 100 * WT_THOUSAND, NULL);
     }
 
     if (0) {
@@ -731,8 +735,8 @@ restart:
                 /*
                  * Copy the flag for later closing.
                  */
-                if (F_ISSET(slot, WT_SLOT_CLOSEFH))
-                    F_SET(coalescing, WT_SLOT_CLOSEFH);
+                if (F_ISSET_ATOMIC_16(slot, WT_SLOT_CLOSEFH))
+                    F_SET_ATOMIC_16(coalescing, WT_SLOT_CLOSEFH);
             } else {
                 /*
                  * If this written slot is not the next LSN, try to start coalescing with later
@@ -762,7 +766,7 @@ restart:
                 /*
                  * Signal the close thread if needed.
                  */
-                if (F_ISSET(slot, WT_SLOT_CLOSEFH))
+                if (F_ISSET_ATOMIC_16(slot, WT_SLOT_CLOSEFH))
                     __wt_cond_signal(session, conn->log_file_cond);
             }
             __wt_log_slot_free(session, slot);
@@ -837,20 +841,22 @@ __log_server(void *arg)
     WT_DECL_RET;
     WT_LOG *log;
     WT_SESSION_IMPL *session;
+    uint64_t force_write_time_start, force_write_timediff;
     uint64_t time_start, time_stop, timediff;
     bool did_work, signalled;
 
     session = arg;
     conn = S2C(session);
     log = conn->log;
+    force_write_timediff = 0;
     signalled = false;
 
     /*
-     * Set this to the number of milliseconds we want to run remove and pre-allocation. Start it so
-     * that we run on the first time through.
+     * Set this to the number of milliseconds we want to run log force write, remove and
+     * pre-allocation. Start it so that we run on the first time through.
      */
     timediff = WT_THOUSAND;
-    time_start = __wt_clock(session);
+    force_write_time_start = time_start = __wt_clock(session);
 
     /*
      * The log server thread does a variety of work. It forces out any buffered log writes. It
@@ -868,8 +874,11 @@ __log_server(void *arg)
          * buffer may need to wait for the write_lsn to advance in the case of a synchronous buffer.
          * We end up with a hang.
          */
-        WT_ERR_ERROR_OK(__wt_log_force_write(session, 0, &did_work), EBUSY, false);
-
+        if (conn->log_force_write_wait == 0 ||
+          force_write_timediff >= conn->log_force_write_wait * WT_THOUSAND) {
+            WT_ERR_ERROR_OK(__wt_log_force_write(session, 0, &did_work), EBUSY, false);
+            force_write_time_start = __wt_clock(session);
+        }
         /*
          * We don't want to remove or pre-allocate files as often as we want to force out log
          * buffers. Only do it once per second or if the condition was signalled.
@@ -907,6 +916,7 @@ __log_server(void *arg)
         __wt_cond_auto_wait_signal(session, conn->log_cond, did_work, NULL, &signalled);
         time_stop = __wt_clock(session);
         timediff = WT_CLOCKDIFF_MS(time_stop, time_start);
+        force_write_timediff = WT_CLOCKDIFF_MS(time_stop, force_write_time_start);
     }
 
     if (0) {
@@ -1012,8 +1022,8 @@ __wt_logmgr_open(WT_SESSION_IMPL *session)
      */
     WT_RET(__wt_open_internal_session(
       conn, "log-wrlsn-server", false, session_flags, 0, &conn->log_wrlsn_session));
-    WT_RET(__wt_cond_auto_alloc(
-      conn->log_wrlsn_session, "log write lsn server", 10000, WT_MILLION, &conn->log_wrlsn_cond));
+    WT_RET(__wt_cond_auto_alloc(conn->log_wrlsn_session, "log write lsn server", 10 * WT_THOUSAND,
+      WT_MILLION, &conn->log_wrlsn_cond));
     WT_RET(__wt_thread_create(
       conn->log_wrlsn_session, &conn->log_wrlsn_tid, __log_wrlsn_server, conn->log_wrlsn_session));
     conn->log_wrlsn_tid_set = true;
@@ -1032,7 +1042,7 @@ __wt_logmgr_open(WT_SESSION_IMPL *session)
         WT_RET(__wt_open_internal_session(
           conn, "log-server", false, session_flags, 0, &conn->log_session));
         WT_RET(__wt_cond_auto_alloc(
-          conn->log_session, "log server", 50000, WT_MILLION, &conn->log_cond));
+          conn->log_session, "log server", 50 * WT_THOUSAND, WT_MILLION, &conn->log_cond));
 
         /*
          * Start the thread.

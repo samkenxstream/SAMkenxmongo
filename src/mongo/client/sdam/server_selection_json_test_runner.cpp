@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include <fstream>
 #include <iostream>
@@ -36,7 +35,6 @@
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <boost/format.hpp>
-#include <boost/optional/optional_io.hpp>
 
 #include "mongo/bson/json.h"
 #include "mongo/client/sdam/json_test_arg_parser.h"
@@ -48,9 +46,13 @@
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/ctype.h"
+#include "mongo/util/optional_util.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/options_parser/options_parser.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 /**
  * This program runs the Server Discover and Monitoring JSON test files located in
@@ -187,7 +189,7 @@ private:
             return;
         }
 
-        auto newAvgRtt = duration_cast<Milliseconds>(newServerDescription->getRtt().get());
+        auto newAvgRtt = duration_cast<Milliseconds>(newServerDescription->getRtt().value());
         if (newAvgRtt.compare(duration_cast<Milliseconds>(Milliseconds(_newAvgRtt))) != 0) {
             std::stringstream errorMessage;
             errorMessage << "new average RTT is incorrect, got '" << newAvgRtt
@@ -416,7 +418,9 @@ private:
         std::vector<HostAndPort> selectedHostAndPorts;
         std::vector<HostAndPort> expectedHostAndPorts;
 
-        auto extractHost = [](const ServerDescriptionPtr& s) { return s->getAddress(); };
+        auto extractHost = [](const ServerDescriptionPtr& s) {
+            return s->getAddress();
+        };
         if (selectedServers) {
             std::transform(selectedServers->begin(),
                            selectedServers->end(),
@@ -464,7 +468,7 @@ public:
     std::vector<JsonTestCase::TestCaseResult> runTests() {
         std::vector<JsonTestCase::TestCaseResult> results;
         const auto testFiles = getTestFiles();
-        for (auto jsonTest : testFiles) {
+        for (const auto& jsonTest : testFiles) {
             int restoreHeartBeatFrequencyMs = sdamHeartBeatFrequencyMs;
 
             std::unique_ptr<JsonTestCase> testCase;

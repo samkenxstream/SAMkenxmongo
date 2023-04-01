@@ -10,7 +10,16 @@
 # in alphabetical order.
 
 overrides:
+
   enterprise-macos:
+  - task: concurrency
+    idle_timeout: 15
+  - task: replica_sets_jscore_passthrough
+    exec_timeout: 150  # 2.5 hours
+
+  enterprise-macos-arm64:
+  - task: concurrency
+    idle_timeout: 15
   - task: replica_sets_jscore_passthrough
     exec_timeout: 150  # 2.5 hours
 
@@ -18,76 +27,30 @@ overrides:
   - task: replica_sets_jscore_passthrough
     exec_timeout: 150  # 2.5 hours.
 
-  enterprise-ubuntu2004-debug-tsan:
-  - task: run_unittests
-    exec_timeout: 24
-
-  enterprise-windows:
-  - task: replica_sets_jscore_passthrough
-    exec_timeout: 180  # 3 hours.
-
-  enterprise-windows-all-feature-flags-suggested:
-  - task: replica_sets_jscore_passthrough
-    exec_timeout: 180  # 3 hours.
-  - task: replica_sets_update_v1_oplog_jscore_passthrough
-    exec_timeout: 150  # 2.5 hours.
-
-  enterprise-windows-inmem:
-  - task: replica_sets_jscore_passthrough
-    exec_timeout: 180  # 3 hours.
-
-  enterprise-windows-required:
-  - task: replica_sets_jscore_passthrough
-    exec_timeout: 180  # 3 hours.
-  - task: replica_sets_update_v1_oplog_jscore_passthrough
-    exec_timeout: 150  # 2.5 hours.
-
-  linux-64-debug:
-  - task: auth
-    exec_timeout: 60  # 1 hour.
-
-  linux-64-debug-repeated-execution:
-  - task: run_unittests
-    exec_timeout: 120  # 2 hours.
-
   macos:
+  - task: concurrency
+    idle_timeout: 15
   - task: replica_sets_jscore_passthrough
     exec_timeout: 150  # 2.5 hours
 
-  ubuntu1804-asan:
-  - task: run_unittests
-    exec_timeout: 24
+  macos-arm64:
+  - task: concurrency
+    idle_timeout: 15
+  - task: replica_sets_jscore_passthrough
+    exec_timeout: 150  # 2.5 hours
 
-  ubuntu1804-debug-asan:
-  - task: run_unittests
-    exec_timeout: 24
+  rhel80-debug-ubsan:
+  - task: update_timeseries_fuzzer
+    exec_timeout: 150  # 2.5 hours
 
-  ubuntu1804-debug-aubsan-lite:
-  - task: run_unittests
-    exec_timeout: 24
-
-  ubuntu1804-debug-ubsan:
-  - task: run_unittests
-    exec_timeout: 24
-
-  ubuntu1804-debug-suggested:
+  rhel80-debug-suggested:
   - task: replica_sets_jscore_passthrough
     exec_timeout: 180  # 3 hours.
 
-  ubuntu1804-ubsan:
-  - task: run_unittests
-    exec_timeout: 24
+  rhel80-debug-ubsan-classic-engine:
+  - task: update_timeseries_fuzzer
+    exec_timeout: 150  # 2.5 hours
 
-  windows:
-  - task: replica_sets
-    exec_timeout: 180  # 3 hours.
-  - task: replica_sets_jscore_passthrough
-    exec_timeout: 150  # 2.5 hours.
-
-  windows-debug-suggested:
-  - task: replica_sets_initsync_jscore_passthrough
-    exec_timeout: 150  # 2.5 hours.
-  - task: replica_sets_jscore_passthrough
-    exec_timeout: 180  # 3 hours.
-  - task: replica_sets_update_v1_oplog_jscore_passthrough
-    exec_timeout: 150  # 2.5 hours.
+  rhel80-debug-aubsan-all-feature-flags:
+  - task: update_timeseries_fuzzer
+    exec_timeout: 150  # 2.5 hours

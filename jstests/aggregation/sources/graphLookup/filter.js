@@ -4,22 +4,11 @@
 (function() {
 "use strict";
 
-load("jstests/libs/fixture_helpers.js");  // For isSharded.
-
 var local = db.local;
 var foreign = db.foreign;
 
 local.drop();
 foreign.drop();
-
-// Do not run the rest of the tests if the foreign collection is implicitly sharded but the flag to
-// allow $lookup/$graphLookup into a sharded collection is disabled.
-const getShardedLookupParam = db.adminCommand({getParameter: 1, featureFlagShardedLookup: 1});
-const isShardedLookupEnabled = getShardedLookupParam.hasOwnProperty("featureFlagShardedLookup") &&
-    getShardedLookupParam.featureFlagShardedLookup.value;
-if (FixtureHelpers.isSharded(foreign) && !isShardedLookupEnabled) {
-    return;
-}
 
 var bulk = foreign.initializeUnorderedBulkOp();
 for (var i = 0; i < 100; i++) {
@@ -122,4 +111,17 @@ res = local
                 .toArray()[0];
 
 assert.eq(res.array[0].results.length, 1);
+
+// Geo operators are not allowed within a $match as they require a sort on the data.
+assert.throwsWithCode(() => local
+                .aggregate([{
+                        $graphLookup: {
+                            from: "foreign",
+                            startWith: "$starting",
+                            connectFromField: "neighbors",
+                            connectToField: "_id",
+                            as: "integers",
+                            restrictSearchWithMatch: {neighbors: {$near: [10, 20]}}
+                            }
+                        }]), 5626500);
 })();

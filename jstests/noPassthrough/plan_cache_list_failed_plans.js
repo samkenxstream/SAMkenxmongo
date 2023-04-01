@@ -8,10 +8,9 @@ const conn = MongoRunner.runMongod();
 assert.neq(null, conn, "mongod was unable to start up");
 const testDB = conn.getDB("jstests_plan_cache_list_failed_plans");
 const coll = testDB.test;
-const isSBEEnabled = checkSBEEnabled(testDB);
 
-if (checkSBEEnabled(testDB, ["featureFlagSbePlanCache"])) {
-    jsTest.log("Skipping test because SBE and SBE plan cache are both enabled.");
+if (checkSBEEnabled(testDB)) {
+    jsTest.log("Skipping test because SBE is enabled");
     MongoRunner.stopMongod(conn);
     return;
 }
@@ -23,6 +22,7 @@ const numDocs = 32;
 const smallNumber = 10;
 assert.commandWorked(testDB.adminCommand(
     {setParameter: 1, internalQueryMaxBlockingSortMemoryUsageBytes: smallNumber}));
+assert.commandWorked(testDB.adminCommand({setParameter: 1, allowDiskUseByDefault: false}));
 for (let i = 0; i < numDocs * 2; ++i)
     assert.commandWorked(coll.insert({a: ((i >= (numDocs * 2) - smallNumber) ? 1 : 0), d: i}));
 
@@ -43,12 +43,7 @@ const creationExecStats = planCacheEntry.creationExecStats;
 assert.eq(creationExecStats.length, 2, planCacheEntry);
 // We expect that the first plan succeed, and the second failed.
 assert(!creationExecStats[0].hasOwnProperty("failed"), planCacheEntry);
-// SBE will not report the 'failed' field.
-if (isSBEEnabled) {
-    assert(!creationExecStats[1].hasOwnProperty("failed"), planCacheEntry);
-} else {
-    assert.eq(creationExecStats[1].failed, true, planCacheEntry);
-}
+assert.eq(creationExecStats[1].failed, true, planCacheEntry);
 
 // The failing plan should have a score of 0.
 const candidatePlanScores = planCacheEntry.candidatePlanScores;

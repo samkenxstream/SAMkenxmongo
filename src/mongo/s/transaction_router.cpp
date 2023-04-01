@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
@@ -40,10 +39,9 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/commands/txn_two_phase_commit_cmds_gen.h"
-#include "mongo/db/internal_transactions_feature_flag_gen.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/db/transaction_validation.h"
 #include "mongo/db/txn_retry_counter_too_old_info.h"
 #include "mongo/db/vector_clock.h"
@@ -57,9 +55,13 @@
 #include "mongo/s/router_transactions_metrics.h"
 #include "mongo/s/shard_cannot_refresh_due_to_locks_held_exception.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/log_with_sampling.h"
 #include "mongo/util/net/socket_utils.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
+
 
 namespace mongo {
 namespace {
@@ -183,7 +185,7 @@ BSONObj sendCommitDirectlyToShards(OperationContext* opCtx, const std::vector<Sh
     std::vector<AsyncRequestsSender::Request> requests;
     for (const auto& shardId : shardIds) {
         CommitTransaction commitCmd;
-        commitCmd.setDbName(NamespaceString::kAdminDb);
+        commitCmd.setDbName(DatabaseName::kAdmin);
         const auto commitCmdObj = commitCmd.toBSON(
             BSON(WriteConcernOptions::kWriteConcernField << opCtx->getWriteConcern().toBSON()));
         requests.emplace_back(shardId, commitCmdObj);
@@ -193,7 +195,7 @@ BSONObj sendCommitDirectlyToShards(OperationContext* opCtx, const std::vector<Sh
     MultiStatementTransactionRequestsSender ars(
         opCtx,
         Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
-        NamespaceString::kAdminDb,
+        DatabaseName::kAdmin,
         requests,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         Shard::RetryPolicy::kIdempotent);
@@ -407,7 +409,7 @@ void TransactionRouter::Observer::_reportTransactionState(OperationContext* opCt
 }
 
 bool TransactionRouter::Observer::_atClusterTimeHasBeenSet() const {
-    return o().atClusterTime.is_initialized() && o().atClusterTime->timeHasBeenSet();
+    return o().atClusterTime.has_value() && o().atClusterTime->timeHasBeenSet();
 }
 
 const LogicalSessionId& TransactionRouter::Observer::_sessionId() const {
@@ -442,11 +444,13 @@ BSONObj TransactionRouter::Participant::attachTxnFieldsIfNeeded(
     auto cmdName = cmd.firstElement().fieldNameStringData();
     bool mustStartTransaction = isFirstStatementInThisParticipant && !isTransactionCommand(cmdName);
 
+    // Strip the command of its read concern if it should not have one.
     if (!mustStartTransaction) {
         auto readConcernFieldName = repl::ReadConcernArgs::kReadConcernFieldName;
-        dassert(!cmd.hasField(readConcernFieldName) ||
-                cmd.getObjectField(readConcernFieldName).isEmpty() ||
-                sharedOptions.isInternalTransactionForRetryableWrite);
+        if (cmd.hasField(readConcernFieldName) &&
+            !sharedOptions.isInternalTransactionForRetryableWrite) {
+            cmd = cmd.removeField(readConcernFieldName);
+        }
     }
 
     BSONObjBuilder newCmd = mustStartTransaction
@@ -468,18 +472,15 @@ BSONObj TransactionRouter::Participant::attachTxnFieldsIfNeeded(
         newCmd.append(OperationSessionInfo::kTxnNumberFieldName,
                       sharedOptions.txnNumberAndRetryCounter.getTxnNumber());
     } else {
-        auto osi =
-            OperationSessionInfoFromClient::parse("OperationSessionInfo"_sd, newCmd.asTempObj());
+        auto osi = OperationSessionInfoFromClient::parse(IDLParserContext{"OperationSessionInfo"},
+                                                         newCmd.asTempObj());
         invariant(sharedOptions.txnNumberAndRetryCounter.getTxnNumber() == *osi.getTxnNumber());
     }
 
-    if (feature_flags::gFeatureFlagInternalTransactions.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
-        if (auto txnRetryCounter = sharedOptions.txnNumberAndRetryCounter.getTxnRetryCounter();
-            txnRetryCounter && !isDefaultTxnRetryCounter(*txnRetryCounter)) {
-            newCmd.append(OperationSessionInfoFromClient::kTxnRetryCounterFieldName,
-                          *sharedOptions.txnNumberAndRetryCounter.getTxnRetryCounter());
-        }
+    if (auto txnRetryCounter = sharedOptions.txnNumberAndRetryCounter.getTxnRetryCounter();
+        txnRetryCounter && !isDefaultTxnRetryCounter(*txnRetryCounter)) {
+        newCmd.append(OperationSessionInfoFromClient::kTxnRetryCounterFieldName,
+                      *sharedOptions.txnNumberAndRetryCounter.getTxnRetryCounter());
     }
 
     return newCmd.obj();
@@ -513,7 +514,7 @@ void TransactionRouter::Router::processParticipantResponse(OperationContext* opC
     }
 
     auto txnResponseMetadata =
-        TxnResponseMetadata::parse("processParticipantResponse"_sd, responseObj);
+        TxnResponseMetadata::parse(IDLParserContext{"processParticipantResponse"}, responseObj);
 
     if (txnResponseMetadata.getReadOnly()) {
         if (participant->readOnly == Participant::ReadOnly::kUnset) {
@@ -521,7 +522,7 @@ void TransactionRouter::Router::processParticipantResponse(OperationContext* opC
                         3,
                         "{sessionId}:{txnNumber} Marking {shardId} as read-only",
                         "Marking shard as read-only participant",
-                        "sessionId"_attr = _sessionId().getId(),
+                        "sessionId"_attr = _sessionId(),
                         "txnNumber"_attr = o().txnNumberAndRetryCounter.getTxnNumber(),
                         "txnRetryCounter"_attr = o().txnNumberAndRetryCounter.getTxnRetryCounter(),
                         "shardId"_attr = shardId);
@@ -544,7 +545,7 @@ void TransactionRouter::Router::processParticipantResponse(OperationContext* opC
                     3,
                     "{sessionId}:{txnNumber} Marking {shardId} as having done a write",
                     "Marking shard has having done a write",
-                    "sessionId"_attr = _sessionId().getId(),
+                    "sessionId"_attr = _sessionId(),
                     "txnNumber"_attr = o().txnNumberAndRetryCounter.getTxnNumber(),
                     "txnRetryCounter"_attr = o().txnNumberAndRetryCounter.getTxnRetryCounter(),
                     "shardId"_attr = shardId);
@@ -556,11 +557,28 @@ void TransactionRouter::Router::processParticipantResponse(OperationContext* opC
                         3,
                         "{sessionId}:{txnNumber} Choosing {shardId} as recovery shard",
                         "Choosing shard as recovery shard",
-                        "sessionId"_attr = _sessionId().getId(),
+                        "sessionId"_attr = _sessionId(),
                         "txnNumber"_attr = o().txnNumberAndRetryCounter.getTxnNumber(),
                         "txnRetryCounter"_attr = o().txnNumberAndRetryCounter.getTxnRetryCounter(),
                         "shardId"_attr = shardId);
             p().recoveryShardId = shardId;
+        }
+    }
+
+    if (txnResponseMetadata.getAdditionalParticipants()) {
+        auto additionalParticipants = *txnResponseMetadata.getAdditionalParticipants();
+        for (auto&& participantElem : additionalParticipants) {
+            mongo::ShardId addingParticipant = ShardId(std::string(
+                participantElem.getField(StringData{"shardId"}).checkAndGetStringData()));
+            _createParticipant(opCtx, addingParticipant);
+            _setReadOnlyForParticipant(
+                opCtx, addingParticipant, Participant::ReadOnly::kNotReadOnly);
+
+            if (!p().isRecoveringCommit) {
+                // Don't update participant stats during recovery since the participant list isn't
+                // known.
+                RouterTransactionsMetrics::get(opCtx)->incrementTotalContactedParticipants();
+            }
         }
     }
 }
@@ -586,7 +604,7 @@ bool TransactionRouter::AtClusterTime::canChange(StmtId currentStmtId) const {
 }
 
 bool TransactionRouter::Router::mustUseAtClusterTime() const {
-    return o().atClusterTime.is_initialized();
+    return o().atClusterTime.has_value();
 }
 
 LogicalTime TransactionRouter::Router::getSelectedAtClusterTime() const {
@@ -612,7 +630,7 @@ BSONObj TransactionRouter::Router::attachTxnFieldsIfNeeded(OperationContext* opC
             4,
             "{sessionId}:{txnNumber} Sending transaction fields to existing participant: {shardId}",
             "Attaching transaction fields to request for existing participant shard",
-            "sessionId"_attr = _sessionId().getId(),
+            "sessionId"_attr = _sessionId(),
             "txnNumber"_attr = o().txnNumberAndRetryCounter.getTxnNumber(),
             "txnRetryCounter"_attr = o().txnNumberAndRetryCounter.getTxnRetryCounter(),
             "shardId"_attr = shardId,
@@ -625,7 +643,7 @@ BSONObj TransactionRouter::Router::attachTxnFieldsIfNeeded(OperationContext* opC
                 4,
                 "{sessionId}:{txnNumber} Sending transaction fields to new participant: {shardId}",
                 "Attaching transaction fields to request for new participant shard",
-                "sessionId"_attr = _sessionId().getId(),
+                "sessionId"_attr = _sessionId(),
                 "txnNumber"_attr = o().txnNumberAndRetryCounter.getTxnNumber(),
                 "txnRetryCounter"_attr = o().txnNumberAndRetryCounter.getTxnRetryCounter(),
                 "shardId"_attr = shardId,
@@ -753,7 +771,7 @@ void TransactionRouter::Router::_clearPendingParticipants(OperationContext* opCt
                                             << WriteConcernOptions().toBSON()));
         }
         auto responses = gatherResponses(opCtx,
-                                         NamespaceString::kAdminDb,
+                                         DatabaseName::kAdmin.db(),
                                          ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                                          Shard::RetryPolicy::kIdempotent,
                                          abortRequests);
@@ -827,7 +845,7 @@ void TransactionRouter::Router::onStaleShardOrDbError(OperationContext* opCtx,
         3,
         "{sessionId}:{txnNumber} Clearing pending participants after stale version error: {error}",
         "Clearing pending participants after stale version error",
-        "sessionId"_attr = _sessionId().getId(),
+        "sessionId"_attr = _sessionId(),
         "txnNumber"_attr = o().txnNumberAndRetryCounter.getTxnNumber(),
         "txnRetryCounter"_attr = o().txnNumberAndRetryCounter.getTxnRetryCounter(),
         "error"_attr = redact(status));
@@ -847,10 +865,10 @@ void TransactionRouter::Router::onViewResolutionError(OperationContext* opCtx,
         "{sessionId}:{txnNumber} Clearing pending participants after view resolution error on "
         "namespace: {namespace}",
         "Clearing pending participants after view resolution error",
-        "sessionId"_attr = _sessionId().getId(),
+        "sessionId"_attr = _sessionId(),
         "txnNumber"_attr = o().txnNumberAndRetryCounter.getTxnNumber(),
         "txnRetryCounter"_attr = o().txnNumberAndRetryCounter.getTxnRetryCounter(),
-        "namespace"_attr = nss);
+        logAttrs(nss));
 
     // Requests against views are always routed to the primary shard for its database, but the retry
     // on the resolved namespace does not have to re-target the primary, so pending participants
@@ -877,7 +895,7 @@ void TransactionRouter::Router::onSnapshotError(OperationContext* opCtx, const S
         "{previousGlobalSnapshotTimestamp}",
         "Clearing pending participants and resetting global snapshot timestamp after "
         "snapshot error",
-        "sessionId"_attr = _sessionId().getId(),
+        "sessionId"_attr = _sessionId(),
         "txnNumber"_attr = o().txnNumberAndRetryCounter.getTxnNumber(),
         "txnRetryCounter"_attr = o().txnNumberAndRetryCounter.getTxnRetryCounter(),
         "error"_attr = redact(status),
@@ -925,7 +943,7 @@ void TransactionRouter::Router::_setAtClusterTime(
                 "{sessionId}:{txnNumber} Setting global snapshot timestamp to "
                 "{globalSnapshotTimestamp} on statement {latestStmtId}",
                 "Setting global snapshot timestamp for transaction",
-                "sessionId"_attr = _sessionId().getId(),
+                "sessionId"_attr = _sessionId(),
                 "txnNumber"_attr = o().txnNumberAndRetryCounter.getTxnNumber(),
                 "txnRetryCounter"_attr = o().txnNumberAndRetryCounter.getTxnRetryCounter(),
                 "globalSnapshotTimestamp"_attr = candidateTime,
@@ -957,7 +975,14 @@ void TransactionRouter::Router::_continueTxn(OperationContext* opCtx,
             APIParameters::get(opCtx) = o().apiParameters;
             repl::ReadConcernArgs::get(opCtx) = o().readConcernArgs;
 
-            ++p().latestStmtId;
+            // Don't increment latestStmtId if no shards have been targeted, since that implies no
+            // statements would have been executed inside this transaction at this point. This can
+            // occur when an internal transaction is invoked within a client's transaction that
+            // hasn't executed any statements yet.
+            if (!o().participants.empty()) {
+                ++p().latestStmtId;
+            }
+
             _onContinue(opCtx);
             break;
         }
@@ -996,7 +1021,7 @@ void TransactionRouter::Router::_beginTxn(OperationContext* opCtx,
                         3,
                         "{sessionId}:{txnNumber} Commit recovery started",
                         "Commit recovery started",
-                        "sessionId"_attr = _sessionId().getId(),
+                        "sessionId"_attr = _sessionId(),
                         "txnNumber"_attr = o().txnNumberAndRetryCounter.getTxnNumber(),
                         "txnRetryCounter"_attr = o().txnNumberAndRetryCounter.getTxnRetryCounter());
 
@@ -1038,13 +1063,18 @@ void TransactionRouter::Router::beginOrContinueTxn(OperationContext* opCtx,
     _updateLastClientInfo(opCtx->getClient());
 }
 
-void TransactionRouter::Router::stash(OperationContext* opCtx) {
+void TransactionRouter::Router::stash(OperationContext* opCtx, StashReason reason) {
     if (!isInitialized()) {
         return;
     }
 
-    auto tickSource = opCtx->getServiceContext()->getTickSource();
     stdx::lock_guard<Client> lk(*opCtx->getClient());
+
+    if (reason == StashReason::kYield) {
+        ++o(lk).activeYields;
+    }
+
+    auto tickSource = opCtx->getServiceContext()->getTickSource();
     o(lk).metricsTracker->trySetInactive(tickSource, tickSource->getTicks());
 }
 
@@ -1053,11 +1083,21 @@ void TransactionRouter::Router::unstash(OperationContext* opCtx) {
         return;
     }
 
-    // Validate that the transaction number hasn't changed.
-    if (o().txnNumberAndRetryCounter.getTxnNumber() != opCtx->getTxnNumber()) {
-        uasserted(ErrorCodes::NoSuchTransaction,
-                  "The requested operation has a different transaction number than the active "
-                  "transaction.");
+    // Validate that the transaction number hasn't changed while we were yielded. This is guaranteed
+    // by the activeYields check when beginning a new transaction.
+    invariant(opCtx->getTxnNumber(), "Cannot unstash without a transaction number");
+    invariant(o().txnNumberAndRetryCounter.getTxnNumber() == opCtx->getTxnNumber(),
+              str::stream()
+                  << "The requested operation has a different transaction number than the active "
+                     "transaction. Active: "
+                  << o().txnNumberAndRetryCounter.getTxnNumber()
+                  << ", operation: " << *opCtx->getTxnNumber());
+
+    {
+        stdx::lock_guard<Client> lg(*opCtx->getClient());
+        --o(lg).activeYields;
+        invariant(o(lg).activeYields >= 0,
+                  str::stream() << "Invalid activeYields: " << o(lg).activeYields);
     }
 
     auto tickSource = opCtx->getServiceContext()->getTickSource();
@@ -1078,7 +1118,9 @@ BSONObj TransactionRouter::Router::_handOffCommitToCoordinator(OperationContext*
     }
 
     CoordinateCommitTransaction coordinateCommitCmd;
-    coordinateCommitCmd.setDbName("admin");
+    // Empty tenant id is acceptable here as command's tenant id will not be serialized to BSON.
+    // TODO SERVER-62491: Use system tenant id.
+    coordinateCommitCmd.setDbName(DatabaseName(boost::none, "admin"));
     coordinateCommitCmd.setParticipants(participantList);
     const auto coordinateCommitCmdObj = coordinateCommitCmd.toBSON(
         BSON(WriteConcernOptions::kWriteConcernField << opCtx->getWriteConcern().toBSON()));
@@ -1088,7 +1130,7 @@ BSONObj TransactionRouter::Router::_handOffCommitToCoordinator(OperationContext*
                 "{sessionId}:{txnNumber} Committing using two-phase commit, coordinator: "
                 "{coordinatorShardId}",
                 "Committing using two-phase commit",
-                "sessionId"_attr = _sessionId().getId(),
+                "sessionId"_attr = _sessionId(),
                 "txnNumber"_attr = o().txnNumberAndRetryCounter.getTxnNumber(),
                 "txnRetryCounter"_attr = o().txnNumberAndRetryCounter.getTxnRetryCounter(),
                 "coordinatorShardId"_attr = *o().coordinatorId);
@@ -1096,7 +1138,7 @@ BSONObj TransactionRouter::Router::_handOffCommitToCoordinator(OperationContext*
     MultiStatementTransactionRequestsSender ars(
         opCtx,
         Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
-        NamespaceString::kAdminDb,
+        DatabaseName::kAdmin,
         {{*o().coordinatorId, coordinateCommitCmdObj}},
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         Shard::RetryPolicy::kIdempotent);
@@ -1197,7 +1239,7 @@ BSONObj TransactionRouter::Router::_commitTransaction(
                     "{sessionId}:{txnNumber} Committing single-shard transaction, single "
                     "participant: {shardId}",
                     "Committing single-shard transaction",
-                    "sessionId"_attr = _sessionId().getId(),
+                    "sessionId"_attr = _sessionId(),
                     "txnNumber"_attr = o().txnNumberAndRetryCounter.getTxnNumber(),
                     "txnRetryCounter"_attr = o().txnNumberAndRetryCounter.getTxnRetryCounter(),
                     "shardId"_attr = shardId);
@@ -1218,7 +1260,7 @@ BSONObj TransactionRouter::Router::_commitTransaction(
                     "{sessionId}:{txnNumber} Committing read-only transaction on "
                     "{numParticipantShards} shards",
                     "Committing read-only transaction",
-                    "sessionId"_attr = _sessionId().getId(),
+                    "sessionId"_attr = _sessionId(),
                     "txnNumber"_attr = o().txnNumberAndRetryCounter.getTxnNumber(),
                     "txnRetryCounter"_attr = o().txnNumberAndRetryCounter.getTxnRetryCounter(),
                     "numParticipantShards"_attr = readOnlyShards.size());
@@ -1240,12 +1282,29 @@ BSONObj TransactionRouter::Router::_commitTransaction(
     return _handOffCommitToCoordinator(opCtx);
 }
 
+// Returns if the opCtx has yielded its session and failed to unyield it, which may happen during
+// methods that send network requests at global shutdown when running on a mongod.
+bool failedToUnyieldSessionAtShutdown(OperationContext* opCtx) {
+    if (!TransactionRouter::get(opCtx)) {
+        invariant(globalInShutdownDeprecated());
+        return true;
+    }
+    return false;
+}
+
 BSONObj TransactionRouter::Router::abortTransaction(OperationContext* opCtx) {
     invariant(isInitialized());
 
     // Update stats on scope exit so the transaction is considered "active" while waiting on abort
     // responses.
-    ScopeGuard updateStatsGuard([&] { _onExplicitAbort(opCtx); });
+    ScopeGuard updateStatsGuard([&] {
+        if (failedToUnyieldSessionAtShutdown(opCtx)) {
+            // It's unsafe to continue without the session checked out. This should only happen at
+            // global shutdown, so it's acceptable to skip updating stats.
+            return;
+        }
+        _onExplicitAbort(opCtx);
+    });
 
     // The router has yet to send any commands to a remote shard for this transaction.
     // Return the same error that would have been returned by a shard.
@@ -1272,7 +1331,7 @@ BSONObj TransactionRouter::Router::abortTransaction(OperationContext* opCtx) {
                 "numParticipantShards"_attr = o().participants.size());
 
     const auto responses = gatherResponses(opCtx,
-                                           NamespaceString::kAdminDb,
+                                           DatabaseName::kAdmin.db(),
                                            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                                            Shard::RetryPolicy::kIdempotent,
                                            abortRequests);
@@ -1323,7 +1382,14 @@ void TransactionRouter::Router::implicitlyAbortTransaction(OperationContext* opC
 
     // Update stats on scope exit so the transaction is considered "active" while waiting on abort
     // responses.
-    ScopeGuard updateStatsGuard([&] { _onImplicitAbort(opCtx, status); });
+    ScopeGuard updateStatsGuard([&] {
+        if (failedToUnyieldSessionAtShutdown(opCtx)) {
+            // It's unsafe to continue without the session checked out. This should only happen at
+            // global shutdown, so it's acceptable to skip updating stats.
+            return;
+        }
+        _onImplicitAbort(opCtx, status);
+    });
 
     if (o().participants.empty()) {
         return;
@@ -1352,7 +1418,7 @@ void TransactionRouter::Router::implicitlyAbortTransaction(OperationContext* opC
     try {
         // Ignore the responses.
         gatherResponses(opCtx,
-                        NamespaceString::kAdminDb,
+                        DatabaseName::kAdmin.db(),
                         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                         Shard::RetryPolicy::kIdempotent,
                         abortRequests);
@@ -1370,8 +1436,7 @@ void TransactionRouter::Router::implicitlyAbortTransaction(OperationContext* opC
 }
 
 std::string TransactionRouter::Router::txnIdToString() const {
-    return str::stream() << _sessionId().getId() << ":"
-                         << o().txnNumberAndRetryCounter.getTxnNumber();
+    return str::stream() << _sessionId() << ":" << o().txnNumberAndRetryCounter.getTxnNumber();
 }
 
 void TransactionRouter::Router::appendRecoveryToken(BSONObjBuilder* builder) const {
@@ -1393,29 +1458,39 @@ void TransactionRouter::Router::appendRecoveryToken(BSONObjBuilder* builder) con
 
 void TransactionRouter::Router::_resetRouterState(
     OperationContext* opCtx, const TxnNumberAndRetryCounter& txnNumberAndRetryCounter) {
-    stdx::lock_guard<Client> lk(*opCtx->getClient());
-    o(lk).txnNumberAndRetryCounter.setTxnNumber(txnNumberAndRetryCounter.getTxnNumber());
-    o(lk).txnNumberAndRetryCounter.setTxnRetryCounter(
-        *txnNumberAndRetryCounter.getTxnRetryCounter());
-    o(lk).commitType = CommitType::kNotInitiated;
-    p().isRecoveringCommit = false;
-    o(lk).participants.clear();
-    o(lk).coordinatorId.reset();
-    p().recoveryShardId.reset();
-    o(lk).apiParameters = {};
-    o(lk).readConcernArgs = {};
-    o(lk).atClusterTime.reset();
-    o(lk).abortCause = std::string();
-    o(lk).metricsTracker.emplace(opCtx->getServiceContext());
-    p().terminationInitiated = false;
+    {
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
 
-    auto tickSource = opCtx->getServiceContext()->getTickSource();
-    o(lk).metricsTracker->trySetActive(tickSource, tickSource->getTicks());
+        uassert(ErrorCodes::ConflictingOperationInProgress,
+                "Cannot start a new transaction while the previous is yielded",
+                o(lk).activeYields == 0);
 
-    // TODO SERVER-37115: Parse statement ids from the client and remember the statement id
-    // of the command that started the transaction, if one was included.
-    p().latestStmtId = kDefaultFirstStmtId;
-    p().firstStmtId = kDefaultFirstStmtId;
+        o(lk).txnNumberAndRetryCounter.setTxnNumber(txnNumberAndRetryCounter.getTxnNumber());
+        o(lk).txnNumberAndRetryCounter.setTxnRetryCounter(
+            *txnNumberAndRetryCounter.getTxnRetryCounter());
+        o(lk).commitType = CommitType::kNotInitiated;
+        p().isRecoveringCommit = false;
+        o(lk).participants.clear();
+        o(lk).coordinatorId.reset();
+        p().recoveryShardId.reset();
+        o(lk).apiParameters = {};
+        o(lk).readConcernArgs = {};
+        o(lk).atClusterTime.reset();
+        o(lk).abortCause = std::string();
+        o(lk).metricsTracker.emplace(opCtx->getServiceContext());
+        p().terminationInitiated = false;
+
+        auto tickSource = opCtx->getServiceContext()->getTickSource();
+        o(lk).metricsTracker->trySetActive(tickSource, tickSource->getTicks());
+
+        // TODO SERVER-37115: Parse statement ids from the client and remember the statement id
+        // of the command that started the transaction, if one was included.
+        p().latestStmtId = kDefaultFirstStmtId;
+        p().firstStmtId = kDefaultFirstStmtId;
+    }
+
+    OperationContextSession::observeNewTxnNumberStarted(
+        opCtx, _sessionId(), txnNumberAndRetryCounter.getTxnNumber());
 };
 
 void TransactionRouter::Router::_resetRouterStateForStartTransaction(
@@ -1444,7 +1519,7 @@ void TransactionRouter::Router::_resetRouterStateForStartTransaction(
                 3,
                 "{sessionId}:{txnNumber} New transaction started",
                 "New transaction started",
-                "sessionId"_attr = _sessionId().getId(),
+                "sessionId"_attr = _sessionId(),
                 "txnNumber"_attr = o().txnNumberAndRetryCounter.getTxnNumber(),
                 "txnRetryCounter"_attr = txnNumberAndRetryCounter.getTxnRetryCounter());
 };
@@ -1461,7 +1536,9 @@ BSONObj TransactionRouter::Router::_commitWithRecoveryToken(OperationContext* op
 
     auto coordinateCommitCmd = [&] {
         CoordinateCommitTransaction coordinateCommitCmd;
-        coordinateCommitCmd.setDbName("admin");
+        // Empty tenant id is acceptable here as command's tenant id will not be serialized to BSON.
+        // TODO SERVER-62491: Use system tenant id.
+        coordinateCommitCmd.setDbName(DatabaseName(boost::none, "admin"));
         coordinateCommitCmd.setParticipants({});
 
         auto rawCoordinateCommit = coordinateCommitCmd.toBSON(
@@ -1651,7 +1728,7 @@ void TransactionRouter::Router::_endTransactionTrackingIfNecessary(
     if (shouldLogSlowOpWithSampling(opCtx,
                                     MONGO_LOGV2_DEFAULT_COMPONENT,
                                     opDuration,
-                                    Milliseconds(serverGlobalParams.slowMS))
+                                    Milliseconds(serverGlobalParams.slowMS.load()))
             .first) {
         _logSlowTransaction(opCtx, terminationCause);
     }

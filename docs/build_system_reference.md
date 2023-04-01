@@ -349,7 +349,7 @@ Graph Schema version:
 2
 
 Build invocation:
-"/home/ubuntu/venv/bin/python" "buildscripts/scons.py" "--variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars" "--cache=all" "--cache-dir=/home/ubuntu/scons-cache" "--link-model=dynamic" "--build-tools=next" "ICECC=icecc" "CCACHE=ccache" "-j200" "--cache-signature-mode=validate" "--cache-debug=-" "generate-libdeps-graph"
+"/home/ubuntu/venv/bin/python" "buildscripts/scons.py" "--variables-files=etc/scons/mongodbtoolchain_stable_gcc.vars" "--cache=all" "--cache-dir=/home/ubuntu/scons-cache" "--link-model=dynamic" "--build-tools=next" "ICECC=icecc" "CCACHE=ccache" "-j200" "--cache-signature-mode=validate" "--cache-debug=-" "generate-libdeps-graph"
 
 Nodes in Graph: 867
 Edges in Graph: 90706
@@ -381,7 +381,7 @@ cd buildscripts/libdeps/graph_visualizer_web_stack && npm install
 Alternatively if you are on linux, you can use the setup_node_env.sh script to automatically download node 12 and npm, setup the local environment and install the dependencies. Run the command:
 
 ```
-source buildscripts/libdeps/graph_visualizer_web_stack/setup_node_end.sh install
+source buildscripts/libdeps/graph_visualizer_web_stack/setup_node_env.sh install
 ```
 
 Assuming you are on a remote workstation and using defaults, you will need to make ssh tunnels to the web service to access the service in your local browser. The frontend and backend both use a port (this case 3000 is the frontend and 5000 is the backend), and the default host is localhost, so you will need to open two tunnels so the frontend running in your local web browser can communicate with the backend. If you are using the default host and port the tunnel command will look like this:

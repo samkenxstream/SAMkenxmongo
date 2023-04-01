@@ -27,27 +27,25 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/catalog/capped_utils.h"
 
 #include "mongo/base/error_codes.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/catalog/rename_collection.h"
+#include "mongo/db/catalog/unique_collection_name.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -55,10 +53,12 @@
 #include "mongo/db/service_context.h"
 #include "mongo/util/scopeguard.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 namespace mongo {
 
 Status emptyCapped(OperationContext* opCtx, const NamespaceString& collectionName) {
-    AutoGetDb autoDb(opCtx, collectionName.db(), MODE_X);
+    AutoGetDb autoDb(opCtx, collectionName.dbName(), MODE_X);
 
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
         !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, collectionName);
@@ -95,18 +95,19 @@ Status emptyCapped(OperationContext* opCtx, const NamespaceString& collectionNam
 
     WriteUnitOfWork wuow(opCtx);
 
-    auto writableCollection = collection.getWritableCollection();
+    auto writableCollection = collection.getWritableCollection(opCtx);
     Status status = writableCollection->truncate(opCtx);
     if (!status.isOK()) {
         return status;
     }
 
-    opCtx->recoveryUnit()->onCommit([writableCollection](auto commitTime) {
-        // Ban reading from this collection on snapshots before now.
-        if (commitTime) {
-            writableCollection->setMinimumVisibleSnapshot(commitTime.get());
-        }
-    });
+    opCtx->recoveryUnit()->onCommit(
+        [writableCollection](OperationContext*, boost::optional<Timestamp> commitTime) {
+            // Ban reading from this collection on snapshots before now.
+            if (commitTime) {
+                writableCollection->setMinimumVisibleSnapshot(commitTime.value());
+            }
+        });
 
     const auto service = opCtx->getServiceContext();
     service->getOpObserver()->onEmptyCapped(opCtx, collection->ns(), collection->uuid());
@@ -122,8 +123,8 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
                              const NamespaceString& toNss,
                              long long size,
                              bool temp) {
-    CollectionPtr fromCollection =
-        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, fromNss);
+    CollectionPtr fromCollection(
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, fromNss));
     if (!fromCollection) {
         uassert(ErrorCodes::CommandNotSupportedOnView,
                 str::stream() << "cloneCollectionAsCapped not supported for views: " << fromNss,
@@ -161,11 +162,11 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
         BSONObjBuilder cmd;
         cmd.append("create", toNss.coll());
         cmd.appendElements(options.toBSON());
-        uassertStatusOK(createCollection(opCtx, toNss.db().toString(), cmd.done()));
+        uassertStatusOK(createCollection(opCtx, toNss.dbName(), cmd.done()));
     }
 
-    CollectionPtr toCollection =
-        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, toNss);
+    CollectionPtr toCollection(
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, toNss));
     invariant(toCollection);  // we created above
 
     // how much data to ignore because it won't fit anyway
@@ -230,7 +231,6 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
             }
 
             WriteUnitOfWork wunit(opCtx);
-            OpDebug* const nullOpDebug = nullptr;
 
             InsertStatement insertStmt(objToClone);
 
@@ -245,8 +245,8 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
                 insertStmt.oplogSlot = oplogSlots.front();
             }
 
-            uassertStatusOK(toCollection->insertDocument(
-                opCtx, InsertStatement(objToClone), nullOpDebug, true));
+            uassertStatusOK(collection_internal::insertDocument(
+                opCtx, toCollection, InsertStatement(objToClone), nullptr /* OpDebug */, true));
             wunit.commit();
 
             // Go to the next document
@@ -254,7 +254,7 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
         } catch (const WriteConflictException&) {
             CurOp::get(opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
             retries++;  // logAndBackoff expects this to be 1 on first call.
-            WriteConflictException::logAndBackoff(retries, "cloneCollectionAsCapped", fromNss.ns());
+            logWriteConflictAndBackoff(retries, "cloneCollectionAsCapped", fromNss.ns());
 
             // Can't use writeConflictRetry since we need to save/restore exec around call to
             // abandonSnapshot.
@@ -268,11 +268,12 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
 }
 
 void convertToCapped(OperationContext* opCtx, const NamespaceString& ns, long long size) {
-    StringData dbname = ns.db();
+    auto dbname = ns.dbName();
     StringData shortSource = ns.coll();
 
     AutoGetCollection coll(opCtx, ns, MODE_X);
-    CollectionShardingState::get(opCtx, ns)->checkShardVersionOrThrow(opCtx);
+    CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, ns)->checkShardVersionOrThrow(
+        opCtx);
 
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
         !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns);
@@ -293,17 +294,14 @@ void convertToCapped(OperationContext* opCtx, const NamespaceString& ns, long lo
     boost::optional<Lock::CollectionLock> collLock;
     const auto tempNs = [&] {
         while (true) {
-            auto tmpNameResult =
-                db->makeUniqueCollectionNamespace(opCtx, "tmp%%%%%.convertToCapped." + shortSource);
-            uassertStatusOKWithContext(
-                tmpNameResult,
+            auto tmpName = uassertStatusOKWithContext(
+                makeUniqueCollectionName(opCtx, dbname, "tmp%%%%%.convertToCapped." + shortSource),
                 str::stream() << "Cannot generate temporary collection namespace to convert " << ns
                               << " to a capped collection");
 
-            collLock.emplace(opCtx, tmpNameResult.getValue(), MODE_X);
-            if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
-                    opCtx, tmpNameResult.getValue())) {
-                return std::move(tmpNameResult.getValue());
+            collLock.emplace(opCtx, tmpName, MODE_X);
+            if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, tmpName)) {
+                return tmpName;
             }
 
             // The temporary collection was created by someone else between the name being

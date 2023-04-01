@@ -27,35 +27,32 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/json.h"
-#include "mongo/db/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/oplog_writer_impl.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/logv2/log.h"
-#include "mongo/transport/transport_layer_asio.h"
+#include "mongo/transport/asio/asio_transport_layer.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 namespace mongo {
 namespace repl {
 namespace ReplTests {
-
-using std::string;
-using std::unique_ptr;
-using std::vector;
 
 /**
  * Creates an OplogEntry with given parameters and preset defaults for this test suite.
@@ -67,9 +64,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 boost::optional<BSONObj> object2) {
     return {
         repl::DurableOplogEntry(opTime,                     // optime
-                                0,                          // hash
                                 opType,                     // opType
-                                boost::none,                // tenant id
                                 nss,                        // namespace
                                 boost::none,                // uuid
                                 boost::none,                // fromMigrate
@@ -105,10 +100,9 @@ public:
           _defaultReplSettings(
               ReplicationCoordinator::get(_opCtx.getServiceContext())->getSettings()) {
         auto* const sc = _opCtx.getServiceContext();
-
-        transport::TransportLayerASIO::Options opts;
-        opts.mode = transport::TransportLayerASIO::Options::kEgress;
-        sc->setTransportLayer(std::make_unique<transport::TransportLayerASIO>(opts, nullptr));
+        transport::AsioTransportLayer::Options opts;
+        opts.mode = transport::AsioTransportLayer::Options::kEgress;
+        sc->setTransportLayer(std::make_unique<transport::AsioTransportLayer>(opts, nullptr));
         ASSERT_OK(sc->getTransportLayer()->setup());
         ASSERT_OK(sc->getTransportLayer()->start());
 
@@ -124,17 +118,19 @@ public:
         // to avoid the invariant in ReplClientInfo::setLastOp that the optime only goes forward.
         repl::ReplClientInfo::forClient(_opCtx.getClient()).clearLastOp();
 
-        sc->setOpObserver(std::make_unique<OpObserverImpl>());
+        sc->setOpObserver(std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
 
         createOplog(&_opCtx);
 
+        // Prevent upgrading from MODE_IX to MODE_X when deleteAll() is issued.
+        Lock::GlobalWrite lk(&_opCtx);
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         WriteUnitOfWork wuow(&_opCtx);
 
-        CollectionPtr c =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr c(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!c) {
-            c = ctx.db()->createCollection(&_opCtx, nss());
+            c = CollectionPtr(ctx.db()->createCollection(&_opCtx, nss()));
         }
 
         ASSERT(c->getIndexCatalog()->haveIdIndex(&_opCtx));
@@ -195,13 +191,13 @@ protected:
     }
     int count() const {
         Lock::GlobalWrite lk(&_opCtx);
-        OldClientContext ctx(&_opCtx, ns());
+        OldClientContext ctx(&_opCtx, nss());
         Database* db = ctx.db();
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wunit(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wunit.commit();
         }
 
@@ -219,7 +215,7 @@ protected:
     }
     void applyAllOperations() {
         Lock::GlobalWrite lk(&_opCtx);
-        vector<BSONObj> ops;
+        std::vector<BSONObj> ops;
         {
             DBDirectClient db(&_opCtx);
             auto cursor = db.find(FindCommandRequest{NamespaceString{cllNS()}});
@@ -227,34 +223,41 @@ protected:
                 ops.push_back(cursor->nextSafe());
             }
         }
-        {
-            WriteUnitOfWork wunit(&_opCtx);
-            if (!serverGlobalParams.enableMajorityReadConcern) {
-                if (ops.size() > 0) {
-                    if (auto tsElem = ops.front()["ts"]) {
-                        _opCtx.getServiceContext()->getStorageEngine()->setOldestTimestamp(
-                            tsElem.timestamp());
-                    }
-                }
-            }
-            auto lastApplied = repl::ReplicationCoordinator::get(_opCtx.getServiceContext())
-                                   ->getMyLastAppliedOpTime()
-                                   .getTimestamp();
-            auto nextTimestamp = std::max(lastApplied + 1, Timestamp(1, 1));
-            ASSERT_OK(_opCtx.recoveryUnit()->setTimestamp(nextTimestamp));
 
-            OldClientContext ctx(&_opCtx, ns());
-            for (vector<BSONObj>::iterator i = ops.begin(); i != ops.end(); ++i) {
-                if (0) {
-                    LOGV2(22501, "op: {i}", "i"_attr = *i);
+        if (!serverGlobalParams.enableMajorityReadConcern) {
+            if (ops.size() > 0) {
+                if (auto tsElem = ops.front()["ts"]) {
+                    _opCtx.getServiceContext()->getStorageEngine()->setOldestTimestamp(
+                        tsElem.timestamp());
                 }
-                repl::UnreplicatedWritesBlock uwb(&_opCtx);
-                auto entry = uassertStatusOK(OplogEntry::parse(*i));
-                const bool dataIsConsistent = true;
-                uassertStatusOK(applyOperation_inlock(
-                    &_opCtx, ctx.db(), &entry, false, getOplogApplicationMode(), dataIsConsistent));
             }
-            wunit.commit();
+        }
+
+        OldClientContext ctx(&_opCtx, nss());
+        for (std::vector<BSONObj>::iterator i = ops.begin(); i != ops.end(); ++i) {
+            repl::UnreplicatedWritesBlock uwb(&_opCtx);
+            auto entry = uassertStatusOK(OplogEntry::parse(*i));
+            // Handle the case of batched writes which generate command-type (applyOps) oplog
+            // entries.
+            if (entry.getOpType() == repl::OpTypeEnum::kCommand) {
+                uassertStatusOK(applyCommand_inlock(
+                    &_opCtx, ApplierOperation{&entry}, getOplogApplicationMode()));
+            } else {
+                WriteUnitOfWork wunit(&_opCtx);
+                auto lastApplied = repl::ReplicationCoordinator::get(_opCtx.getServiceContext())
+                                       ->getMyLastAppliedOpTime()
+                                       .getTimestamp();
+                auto nextTimestamp = std::max(lastApplied + 1, Timestamp(1, 1));
+                ASSERT_OK(_opCtx.recoveryUnit()->setTimestamp(nextTimestamp));
+                const bool dataIsConsistent = true;
+                uassertStatusOK(applyOperation_inlock(&_opCtx,
+                                                      ctx.db(),
+                                                      ApplierOperation{&entry},
+                                                      false,
+                                                      getOplogApplicationMode(),
+                                                      dataIsConsistent));
+                wunit.commit();
+            }
         }
     }
     // These deletes don't get logged.
@@ -262,12 +265,12 @@ protected:
         ::mongo::writeConflictRetry(&_opCtx, "deleteAll", ns, [&] {
             NamespaceString nss(ns);
             Lock::GlobalWrite lk(&_opCtx);
-            OldClientContext ctx(&_opCtx, ns);
+            OldClientContext ctx(&_opCtx, nss);
             WriteUnitOfWork wunit(&_opCtx);
             Database* db = ctx.db();
             Collection* coll =
                 CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespaceForMetadataWrite(
-                    &_opCtx, CollectionCatalog::LifetimeMode::kInplace, nss);
+                    &_opCtx, nss);
             if (!coll) {
                 coll = db->createCollection(&_opCtx, nss);
             }
@@ -285,13 +288,13 @@ protected:
     }
     void insert(const BSONObj& o) const {
         Lock::GlobalWrite lk(&_opCtx);
-        OldClientContext ctx(&_opCtx, ns());
+        OldClientContext ctx(&_opCtx, nss());
         WriteUnitOfWork wunit(&_opCtx);
         Database* db = ctx.db();
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
         }
 
         auto lastApplied = repl::ReplicationCoordinator::get(_opCtx.getServiceContext())
@@ -307,7 +310,8 @@ protected:
         OpDebug* const nullOpDebug = nullptr;
         if (o.hasField("_id")) {
             repl::UnreplicatedWritesBlock uwb(&_opCtx);
-            coll->insertDocument(&_opCtx, InsertStatement(o), nullOpDebug, true)
+            collection_internal::insertDocument(
+                &_opCtx, coll, InsertStatement(o), nullOpDebug, true)
                 .transitional_ignore();
             ASSERT_OK(_opCtx.recoveryUnit()->setTimestamp(nextTimestamp));
             wunit.commit();
@@ -320,7 +324,8 @@ protected:
         b.appendOID("_id", &id);
         b.appendElements(o);
         repl::UnreplicatedWritesBlock uwb(&_opCtx);
-        coll->insertDocument(&_opCtx, InsertStatement(b.obj()), nullOpDebug, true)
+        collection_internal::insertDocument(
+            &_opCtx, coll, InsertStatement(b.obj()), nullOpDebug, true)
             .transitional_ignore();
         ASSERT_OK(_opCtx.recoveryUnit()->setTimestamp(nextTimestamp));
         wunit.commit();
@@ -333,6 +338,15 @@ protected:
         b.appendElements(fromjson(json));
         return b.obj();
     }
+
+private:
+    // Disable batched deletes. We use batched writes for the delete in the Remove() case which
+    // tries to group two deletes in one applyOps. It is illegal to batch writes outside a WUOW,
+    // so we disable batching for this test.
+    // TODO SERVER-69316: When featureFlagBatchMultiDeletes is removed, we want the Remove() test
+    // to issue two different applyOps deletes, or wrap the applyOps in a WUOW.
+    RAIIServerParameterControllerForTest _featureFlagController{"featureFlagBatchMultiDeletes",
+                                                                false};
 };
 
 
@@ -340,7 +354,7 @@ class LogBasic : public Base {
 public:
     void run() {
         ASSERT_EQUALS(0, opCount());
-        _client.insert(ns(), fromjson("{\"a\":\"b\"}"));
+        _client.insert(nss(), fromjson("{\"a\":\"b\"}"));
         ASSERT_EQUALS(1, opCount());
     }
 };
@@ -374,12 +388,12 @@ protected:
     virtual void reset() const = 0;
 };
 
-// Some operations are only idempotent when in RECOVERING, not in SECONDARY.  This includes
-// duplicate inserts and deletes.
+// Some operations are only idempotent when in RECOVERING from unstable checkpoint, not in
+// SECONDARY.  This includes duplicate inserts and deletes.
 class Recovering : public Base {
 protected:
     virtual OplogApplication::Mode getOplogApplicationMode() {
-        return OplogApplication::Mode::kRecovering;
+        return OplogApplication::Mode::kUnstableRecovering;
     }
 };
 
@@ -389,7 +403,7 @@ public:
         BSONObjBuilder b;
         b.append("a", 1);
         b.appendTimestamp("t");
-        _client.insert(ns(), b.done());
+        _client.insert(nss(), b.done());
         date_ = _client.findOne(nss(), BSON("a" << 1)).getField("t").date();
     }
     void check() const {
@@ -409,7 +423,7 @@ class InsertAutoId : public Recovering {
 public:
     InsertAutoId() : o_(fromjson("{\"a\":\"b\"}")) {}
     void doIt() const {
-        _client.insert(ns(), o_);
+        _client.insert(nss(), o_);
     }
     void check() const {
         ASSERT_EQUALS(1, count());
@@ -437,10 +451,10 @@ class InsertTwo : public Recovering {
 public:
     InsertTwo() : o_(fromjson("{'_id':1,a:'b'}")), t_(fromjson("{'_id':2,c:'d'}")) {}
     void doIt() const {
-        vector<BSONObj> v;
+        std::vector<BSONObj> v;
         v.push_back(o_);
         v.push_back(t_);
-        _client.insert(ns(), v);
+        _client.insert(nss(), v);
     }
     void check() const {
         ASSERT_EQUALS(2, count());
@@ -460,8 +474,8 @@ class InsertTwoIdentical : public Recovering {
 public:
     InsertTwoIdentical() : o_(fromjson("{\"a\":\"b\"}")) {}
     void doIt() const {
-        _client.insert(ns(), o_);
-        _client.insert(ns(), o_);
+        _client.insert(nss(), o_);
+        _client.insert(nss(), o_);
     }
     void check() const {
         ASSERT_EQUALS(2, count());
@@ -480,7 +494,7 @@ public:
         BSONObjBuilder b;
         b.append("_id", 1);
         b.appendTimestamp("t");
-        _client.update(ns(), BSON("_id" << 1), b.done());
+        _client.update(nss(), BSON("_id" << 1), b.done());
         date_ = _client.findOne(nss(), BSON("_id" << 1)).getField("t").date();
     }
     void check() const {
@@ -505,7 +519,7 @@ public:
           o2_(wid("{a:'b'}")),
           u_(fromjson("{a:'c'}")) {}
     void doIt() const {
-        _client.update(ns(), q_, u_);
+        _client.update(nss(), q_, u_);
     }
     void check() const {
         ASSERT_EQUALS(2, count());
@@ -529,7 +543,7 @@ public:
           q_(fromjson("{a:'b'}")),
           u_(fromjson("{'_id':1,a:'c'}")) {}
     void doIt() const {
-        _client.update(ns(), q_, u_);
+        _client.update(nss(), q_, u_);
     }
     void check() const {
         ASSERT_EQUALS(2, count());
@@ -551,7 +565,7 @@ public:
     UpdateSameFieldExplicitId()
         : o_(fromjson("{'_id':1,a:'b'}")), u_(fromjson("{'_id':1,a:'c'}")) {}
     void doIt() const {
-        _client.update(ns(), o_, u_);
+        _client.update(nss(), o_, u_);
     }
     void check() const {
         ASSERT_EQUALS(1, count());
@@ -573,7 +587,7 @@ public:
           q_(fromjson("{'_id':1}")),
           u_(fromjson("{'_id':1,a:'c'}")) {}
     void doIt() const {
-        _client.update(ns(), q_, u_);
+        _client.update(nss(), q_, u_);
     }
     void check() const {
         ASSERT_EQUALS(1, count());
@@ -590,13 +604,13 @@ protected:
 
 class UpsertUpdateNoMods : public UpdateDifferentFieldExplicitId {
     void doIt() const {
-        _client.update(ns(), q_, u_, true);
+        _client.update(nss(), q_, u_, true);
     }
 };
 
 class UpsertInsertNoMods : public InsertAutoId {
     void doIt() const {
-        _client.update(ns(), fromjson("{a:'c'}"), o_, true);
+        _client.update(nss(), fromjson("{a:'c'}"), o_, true);
     }
 };
 
@@ -608,7 +622,7 @@ public:
           u_(fromjson("{$set:{a:7}}")),
           ou_(fromjson("{'_id':1,a:7}")) {}
     void doIt() const {
-        _client.update(ns(), q_, u_);
+        _client.update(nss(), q_, u_);
     }
     void check() const {
         ASSERT_EQUALS(1, count());
@@ -631,7 +645,7 @@ public:
           u_(fromjson("{$inc:{a:3}}")),
           ou_(fromjson("{'_id':1,a:8}")) {}
     void doIt() const {
-        _client.update(ns(), q_, u_);
+        _client.update(nss(), q_, u_);
     }
     void check() const {
         ASSERT_EQUALS(1, count());
@@ -654,7 +668,7 @@ public:
           u_(fromjson("{$inc:{a:3},$set:{x:5}}")),
           ou_(fromjson("{'_id':1,a:8,x:5}")) {}
     void doIt() const {
-        _client.update(ns(), q_, u_);
+        _client.update(nss(), q_, u_);
     }
     void check() const {
         ASSERT_EQUALS(1, count());
@@ -677,7 +691,7 @@ public:
           u_(fromjson("{$inc:{'a.b':1,'b.b':1}}")),
           ou_(fromjson("{'_id':1,a:{b:4},b:{b:2}}")) {}
     void doIt() const {
-        _client.update(ns(), q_, u_);
+        _client.update(nss(), q_, u_);
     }
     void check() const {
         ASSERT_EQUALS(1, count());
@@ -700,7 +714,7 @@ public:
           u_(fromjson("{$inc:{'a':1}}")),
           ou_(fromjson("{'_id':1,a:1}")) {}
     void doIt() const {
-        _client.update(ns(), q_, u_);
+        _client.update(nss(), q_, u_);
     }
     void check() const {
         ASSERT_EQUALS(1, count());
@@ -723,7 +737,7 @@ public:
           u_(fromjson("{$inc:{a:3}}")),
           ou_(fromjson("{'_id':5,a:7}")) {}
     void doIt() const {
-        _client.update(ns(), q_, u_, true);
+        _client.update(nss(), q_, u_, true);
     }
     void check() const {
         ASSERT_EQUALS(1, count());
@@ -742,7 +756,7 @@ public:
     UpsertInsertSet()
         : q_(fromjson("{a:5}")), u_(fromjson("{$set:{a:7}}")), ou_(fromjson("{a:7}")) {}
     void doIt() const {
-        _client.update(ns(), q_, u_, true);
+        _client.update(nss(), q_, u_, true);
     }
     void check() const {
         ASSERT_EQUALS(2, count());
@@ -762,7 +776,7 @@ public:
     UpsertInsertInc()
         : q_(fromjson("{a:5}")), u_(fromjson("{$inc:{a:3}}")), ou_(fromjson("{a:8}")) {}
     void doIt() const {
-        _client.update(ns(), q_, u_, true);
+        _client.update(nss(), q_, u_, true);
     }
     void check() const {
         ASSERT_EQUALS(1, count());
@@ -778,7 +792,7 @@ protected:
 
 class MultiInc : public Recovering {
 public:
-    string s() const {
+    std::string s() const {
         StringBuilder ss;
         FindCommandRequest findRequest{NamespaceString{ns()}};
         findRequest.setSort(BSON("_id" << 1));
@@ -797,18 +811,18 @@ public:
     }
 
     void doIt() const {
-        _client.insert(ns(), BSON("_id" << 1 << "x" << 1));
-        _client.insert(ns(), BSON("_id" << 2 << "x" << 5));
+        _client.insert(nss(), BSON("_id" << 1 << "x" << 1));
+        _client.insert(nss(), BSON("_id" << 2 << "x" << 5));
 
         ASSERT_EQUALS("1,5", s());
 
-        _client.update(ns(), BSON("_id" << 1), BSON("$inc" << BSON("x" << 1)));
+        _client.update(nss(), BSON("_id" << 1), BSON("$inc" << BSON("x" << 1)));
         ASSERT_EQUALS("2,5", s());
 
-        _client.update(ns(), BSONObj(), BSON("$inc" << BSON("x" << 1)));
+        _client.update(nss(), BSONObj(), BSON("$inc" << BSON("x" << 1)));
         ASSERT_EQUALS("3,5", s());
 
-        _client.update(ns(), BSONObj(), BSON("$inc" << BSON("x" << 1)), false, true);
+        _client.update(nss(), BSONObj(), BSON("$inc" << BSON("x" << 1)), false, true);
         check();
     }
 
@@ -826,7 +840,7 @@ public:
     UpdateWithoutPreexistingId()
         : o_(fromjson("{a:5}")), u_(fromjson("{a:5}")), ot_(fromjson("{b:4}")) {}
     void doIt() const {
-        _client.update(ns(), o_, u_);
+        _client.update(nss(), o_, u_);
     }
     void check() const {
         ASSERT_EQUALS(2, count());
@@ -850,7 +864,7 @@ public:
           o2_(f("{\"_id\":\"010101010101010101010102\",\"a\":\"b\"}")),
           q_(f("{\"a\":\"b\"}")) {}
     void doIt() const {
-        _client.remove(ns(), q_);
+        _client.remove(nss(), q_);
     }
     void check() const {
         ASSERT_EQUALS(0, count());
@@ -867,7 +881,7 @@ protected:
 
 class RemoveOne : public Remove {
     void doIt() const {
-        _client.remove(ns(), q_, false /*removeMany*/);
+        _client.remove(nss(), q_, false /*removeMany*/);
     }
     void check() const {
         ASSERT_EQUALS(1, count());
@@ -878,8 +892,8 @@ class FailingUpdate : public Recovering {
 public:
     FailingUpdate() : o_(fromjson("{'_id':1,a:'b'}")), u_(fromjson("{'_id':1,c:'d'}")) {}
     void doIt() const {
-        _client.update(ns(), o_, u_);
-        _client.insert(ns(), o_);
+        _client.update(nss(), o_, u_);
+        _client.insert(nss(), o_);
     }
     void check() const {
         ASSERT_EQUALS(1, count());
@@ -896,7 +910,7 @@ protected:
 class SetNumToStr : public Base {
 public:
     void doIt() const {
-        _client.update(ns(),
+        _client.update(nss(),
                        BSON("_id" << 0),
                        BSON("$set" << BSON("a"
                                            << "bcd")));
@@ -915,7 +929,7 @@ public:
 class Push : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), BSON("$push" << BSON("a" << 5.0)));
+        _client.update(nss(), BSON("_id" << 0), BSON("$push" << BSON("a" << 5.0)));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -931,7 +945,7 @@ public:
 class PushUpsert : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), BSON("$push" << BSON("a" << 5.0)), true);
+        _client.update(nss(), BSON("_id" << 0), BSON("$push" << BSON("a" << 5.0)), true);
     }
     using ReplTests::Base::check;
     void check() const {
@@ -947,7 +961,7 @@ public:
 class MultiPush : public Base {
 public:
     void doIt() const {
-        _client.update(ns(),
+        _client.update(nss(),
                        BSON("_id" << 0),
                        BSON("$push" << BSON("a" << 5.0) << "$push" << BSON("b.c" << 6.0)));
     }
@@ -965,7 +979,7 @@ public:
 class EmptyPush : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), BSON("$push" << BSON("a" << 5.0)));
+        _client.update(nss(), BSON("_id" << 0), BSON("$push" << BSON("a" << 5.0)));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -981,7 +995,7 @@ public:
 class PushSlice : public Base {
     void doIt() const {
         _client.update(
-            ns(),
+            nss(),
             BSON("_id" << 0),
             BSON("$push" << BSON("a" << BSON("$each" << BSON_ARRAY(3) << "$slice" << -2))));
     }
@@ -999,7 +1013,7 @@ class PushSlice : public Base {
 class PushSliceInitiallyInexistent : public Base {
     void doIt() const {
         _client.update(
-            ns(),
+            nss(),
             BSON("_id" << 0),
             BSON("$push" << BSON("a" << BSON("$each" << BSON_ARRAY(1 << 2) << "$slice" << -2))));
     }
@@ -1017,7 +1031,7 @@ class PushSliceInitiallyInexistent : public Base {
 class PushSliceToZero : public Base {
     void doIt() const {
         _client.update(
-            ns(),
+            nss(),
             BSON("_id" << 0),
             BSON("$push" << BSON("a" << BSON("$each" << BSON_ARRAY(3) << "$slice" << 0))));
     }
@@ -1035,7 +1049,7 @@ class PushSliceToZero : public Base {
 class Pull : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), BSON("$pull" << BSON("a" << 4.0)));
+        _client.update(nss(), BSON("_id" << 0), BSON("$pull" << BSON("a" << 4.0)));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -1051,7 +1065,7 @@ public:
 class PullNothing : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), BSON("$pull" << BSON("a" << 6.0)));
+        _client.update(nss(), BSON("_id" << 0), BSON("$pull" << BSON("a" << 6.0)));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -1067,7 +1081,7 @@ public:
 class PullAll : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), fromjson("{$pullAll:{a:[4,5]}}"));
+        _client.update(nss(), BSON("_id" << 0), fromjson("{$pullAll:{a:[4,5]}}"));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -1083,7 +1097,7 @@ public:
 class Pop : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), fromjson("{$pop:{a:1}}"));
+        _client.update(nss(), BSON("_id" << 0), fromjson("{$pop:{a:1}}"));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -1099,7 +1113,7 @@ public:
 class PopReverse : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), fromjson("{$pop:{a:-1}}"));
+        _client.update(nss(), BSON("_id" << 0), fromjson("{$pop:{a:-1}}"));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -1115,7 +1129,7 @@ public:
 class BitOp : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), fromjson("{$bit:{a:{and:2,or:8}}}"));
+        _client.update(nss(), BSON("_id" << 0), fromjson("{$bit:{a:{and:2,or:8}}}"));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -1131,8 +1145,8 @@ public:
 class Rename : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), fromjson("{$rename:{a:'b'}}"));
-        _client.update(ns(), BSON("_id" << 0), fromjson("{$set:{a:50}}"));
+        _client.update(nss(), BSON("_id" << 0), fromjson("{$rename:{a:'b'}}"));
+        _client.update(nss(), BSON("_id" << 0), fromjson("{$set:{a:50}}"));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -1149,8 +1163,8 @@ public:
 class RenameReplace : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), fromjson("{$rename:{a:'b'}}"));
-        _client.update(ns(), BSON("_id" << 0), fromjson("{$set:{a:50}}"));
+        _client.update(nss(), BSON("_id" << 0), fromjson("{$rename:{a:'b'}}"));
+        _client.update(nss(), BSON("_id" << 0), fromjson("{$set:{a:50}}"));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -1167,7 +1181,7 @@ public:
 class RenameOverwrite : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), fromjson("{$rename:{a:'b'}}"));
+        _client.update(nss(), BSON("_id" << 0), fromjson("{$rename:{a:'b'}}"));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -1184,7 +1198,7 @@ public:
 class NoRename : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), fromjson("{$rename:{c:'b'},$set:{z:1}}"));
+        _client.update(nss(), BSON("_id" << 0), fromjson("{$rename:{c:'b'},$set:{z:1}}"));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -1200,7 +1214,7 @@ public:
 class NestedNoRename : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), fromjson("{$rename:{'a.b':'c.d'},$set:{z:1}}"));
+        _client.update(nss(), BSON("_id" << 0), fromjson("{$rename:{'a.b':'c.d'},$set:{z:1}}"));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -1216,7 +1230,7 @@ public:
 class SingletonNoRename : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSONObj(), fromjson("{$rename:{a:'b'}}"));
+        _client.update(nss(), BSONObj(), fromjson("{$rename:{a:'b'}}"));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -1232,7 +1246,7 @@ public:
 class IndexedSingletonNoRename : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSONObj(), fromjson("{$rename:{a:'b'}}"));
+        _client.update(nss(), BSONObj(), fromjson("{$rename:{a:'b'}}"));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -1250,7 +1264,7 @@ public:
 class AddToSetEmptyMissing : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSON("_id" << 0), fromjson("{$addToSet:{a:{$each:[]}}}"));
+        _client.update(nss(), BSON("_id" << 0), fromjson("{$addToSet:{a:{$each:[]}}}"));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -1270,15 +1284,15 @@ public:
 class ReplaySetPreexistingNoOpPull : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSONObj(), fromjson("{$unset:{z:1}}"));
+        _client.update(nss(), BSONObj(), fromjson("{$unset:{z:1}}"));
 
         // This is logged as {$set:{'a.b':[]},$set:{z:1}}, which might not be
         // replayable against future versions of a document (here {_id:0,a:1,z:1}) due
         // to SERVER-4781. As a result the $set:{z:1} will not be replayed in such
         // cases (and also an exception may abort replication). If this were instead
         // logged as {$set:{z:1}}, SERVER-4781 would not be triggered.
-        _client.update(ns(), BSONObj(), fromjson("{$pull:{'a.b':1}, $set:{z:1}}"));
-        _client.update(ns(), BSONObj(), fromjson("{$set:{a:1}}"));
+        _client.update(nss(), BSONObj(), fromjson("{$pull:{'a.b':1}, $set:{z:1}}"));
+        _client.update(nss(), BSONObj(), fromjson("{$set:{a:1}}"));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -1294,8 +1308,8 @@ public:
 class ReplayArrayFieldNotAppended : public Base {
 public:
     void doIt() const {
-        _client.update(ns(), BSONObj(), fromjson("{$push:{'a.0.b':2}}"));
-        _client.update(ns(), BSONObj(), fromjson("{$set:{'a.0':1}}"));
+        _client.update(nss(), BSONObj(), fromjson("{$push:{'a.0.b':2}}"));
+        _client.update(nss(), BSONObj(), fromjson("{$set:{'a.0':1}}"));
     }
     using ReplTests::Base::check;
     void check() const {
@@ -1317,7 +1331,7 @@ public:
         insert(BSON("_id" << 0 << "a" << 10));
         insert(BSON("_id" << 1 << "a" << 11));
         insert(BSON("_id" << 3 << "a" << 10));
-        _client.remove(ns(), BSON("a" << 10));
+        _client.remove(nss(), BSON("a" << 10));
         ASSERT_EQUALS(1U, _client.count(nss(), BSONObj()));
         insert(BSON("_id" << 0 << "a" << 11));
         insert(BSON("_id" << 2 << "a" << 10));

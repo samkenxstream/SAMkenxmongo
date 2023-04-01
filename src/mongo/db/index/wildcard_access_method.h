@@ -66,6 +66,20 @@ public:
         return _keyGen.getWildcardProjection();
     }
 
+    /**
+     * Returns the Wildcard Index's key pattern.
+     */
+    const BSONObj& getKeyPattern() const {
+        return _descriptor->keyPattern();
+    }
+
+    /*
+     * We should make a new Ordering for wildcard key generator because the index keys generated for
+     * wildcard indexes include a "$_path" field prior to the wildcard field and the Ordering passed
+     * in does not account for the "$_path" field.
+     */
+    static Ordering makeOrdering(const BSONObj& pattern);
+
 private:
     void doGetKeys(OperationContext* opCtx,
                    const CollectionPtr& collection,
@@ -75,7 +89,7 @@ private:
                    KeyStringSet* keys,
                    KeyStringSet* multikeyMetadataKeys,
                    MultikeyPaths* multikeyPaths,
-                   boost::optional<RecordId> id) const final;
+                   const boost::optional<RecordId>& id) const final;
 
     const WildcardKeyGenerator _keyGen;
 };

@@ -13,9 +13,6 @@ selector:
   - jstests/concurrency/fsm_workloads/distinct_noindex.js
   - jstests/concurrency/fsm_workloads/distinct_projection.js
 
-  # SERVER-17397 Drops of sharded namespaces may not fully succeed
-  - jstests/concurrency/fsm_workloads/create_database.js
-
   # Disabled due to SERVER-33753, '.count() without a predicate can be wrong on sharded
   # collections'. This bug is problematic for these workloads because they assert on count()
   # values:
@@ -23,6 +20,7 @@ selector:
 
   # $lookup and $graphLookup are not supported on sharded collections with transactions.
   - jstests/concurrency/fsm_workloads/agg_graph_lookup.js
+  - jstests/concurrency/fsm_workloads/agg_lookup.js
   - jstests/concurrency/fsm_workloads/view_catalog_cycle_lookup.js
 
   # Disabled due to MongoDB restrictions and/or workload restrictions
@@ -104,6 +102,7 @@ selector:
   # Expects reads to die with a particular error, but other errors are possible if the read is part
   # of a transaction (e.g. ErrorCodes.LockTimeout).
   - jstests/concurrency/fsm_workloads/drop_index_during_replan.js
+  - jstests/concurrency/fsm_workloads/drop_index_during_lookup.js
 
   # Performs direct writes to system.views
   - jstests/concurrency/fsm_workloads/view_catalog_direct_system_writes.js
@@ -146,6 +145,7 @@ executor:
     hooks:
       - CheckReplDBHashInBackground
       - CheckReplDBHash
+      - CheckMetadataConsistencyInBackground
       - ValidateCollections
     tests: true
   config:
@@ -157,7 +157,6 @@ executor:
           defaultTransactionReadConcernLevel: "local"
           defaultTransactionWriteConcernW: 1
           runInsideTransaction: true
-          runningWithAutoSplit: false
           runningWithBalancer: false
           # Neither causal consistency nor majority write concern is required because tests in this
           # suite only read from primaries, only one node is electable in each shard, and they use
@@ -170,16 +169,19 @@ executor:
   hooks:
   - class: CheckReplDBHashInBackground
   - class: CheckReplDBHash
+  - class: CheckMetadataConsistencyInBackground
   - class: CheckOrphansDeleted
+  - class: CheckRoutingTableConsistency
+  - class: CheckShardFilteringMetadata
   - class: ValidateCollections # Validation can interfere with other operations, so this goes last.
   - class: CleanupConcurrencyWorkloads
   fixture:
     class: ShardedClusterFixture
     enable_balancer: false
-    enable_autosplit: false
     mongos_options:
       set_parameters:
         enableTestCommands: 1
+        queryAnalysisSamplerConfigurationRefreshSecs: 1
     shard_options:
       mongod_options:
         oplogSize: 1024
@@ -188,6 +190,7 @@ executor:
         enableTestCommands: 1
         roleGraphInvalidationIsFatal: 1
         receiveChunkWaitForRangeDeleterTimeoutMS: 90000
+        queryAnalysisWriterIntervalSecs: 1
     num_rs_nodes_per_shard: 3
     num_shards: 2
     num_mongos: 2

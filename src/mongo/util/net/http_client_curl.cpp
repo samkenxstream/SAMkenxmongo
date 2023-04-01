@@ -108,18 +108,8 @@ public:
     }
 
     Status initialize() {
-        auto status = _initializeGlobal();
-        if (!status.isOK()) {
-            return status;
-        }
-
-        return Status::OK();
-    }
-
-private:
-    Status _initializeGlobal() {
         if (_initialized) {
-            return Status::OK();
+            return {ErrorCodes::AlreadyInitialized, "CurlLibraryManager already initialized."};
         }
 
         CURLcode ret = curl_global_init(CURL_GLOBAL_ALL);
@@ -135,6 +125,10 @@ private:
 
         _initialized = true;
         return Status::OK();
+    }
+
+    bool isInitialized() const {
+        return _initialized;
     }
 
 private:
@@ -491,7 +485,7 @@ public:
     CurlHandle(CurlHandle&& other) = default;
 
     ~CurlHandle() {
-        if (!_success && _poolHandle.get() != nullptr) {
+        if (!_finished && _poolHandle.get() != nullptr) {
             _poolHandle->indicateFailure(
                 Status(ErrorCodes::HostUnreachable, "unknown curl handle failure"));
         }
@@ -509,12 +503,20 @@ public:
         // use it.
         _poolHandle->indicateUsed();
 
-        _success = true;
+        _finished = true;
+    }
+
+    void indicateFailure(const Status& status) {
+        if (_poolHandle.get() != nullptr) {
+            _poolHandle->indicateFailure(status);
+        }
+
+        _finished = true;
     }
 
 private:
     executor::ConnectionPool::ConnectionHandle _poolHandle;
-    bool _success = false;
+    bool _finished = false;
 
     // Owned by _poolHandle
     CURL* _handle;
@@ -602,14 +604,6 @@ public:
         _headers = headers;
     }
 
-    void setTimeout(Seconds timeout) final {
-        _timeout = timeout;
-    }
-
-    void setConnectTimeout(Seconds timeout) final {
-        _connectTimeout = timeout;
-    }
-
     HttpReply request(HttpMethod method,
                       StringData url,
                       ConstDataRange cdr = {nullptr, 0}) const final {
@@ -623,11 +617,14 @@ public:
             uassertStatusOK(swHandle.getStatus());
 
             CurlHandle handle(std::move(swHandle.getValue()));
-            auto reply = request(handle.get(), method, url, cdr);
-
-            // indidicateFailure will be called if indicateSuccess is not called.
-            handle.indicateSuccess();
-            return reply;
+            try {
+                auto reply = request(handle.get(), method, url, cdr);
+                handle.indicateSuccess();
+                return reply;
+            } catch (DBException& e) {
+                handle.indicateFailure(e.toStatus());
+                throw;
+            }
         } else {
             // Make a request with a non-pooled handle. This is needed during server startup when
             // thread spawning is not allowed which is required by the thread pool.
@@ -711,8 +708,6 @@ private:
     HttpConnectionPool _pool;
 
     bool _allowInsecure{false};
-    Seconds _timeout;
-    Seconds _connectTimeout;
 };
 
 class HttpClientProviderImpl : public HttpClientProvider {
@@ -722,17 +717,17 @@ public:
     }
 
     std::unique_ptr<HttpClient> create() final {
-        uassertStatusOK(curlLibraryManager.initialize());
+        invariant(curlLibraryManager.isInitialized());
         return std::make_unique<CurlHttpClient>(HttpConnectionPool::kUse);
     }
 
     std::unique_ptr<HttpClient> createWithoutConnectionPool() final {
-        uassertStatusOK(curlLibraryManager.initialize());
+        invariant(curlLibraryManager.isInitialized());
         return std::make_unique<CurlHttpClient>(HttpConnectionPool::kDoNotUse);
     }
 
     BSONObj getServerStatus() final {
-
+        invariant(curlLibraryManager.isInitialized());
         BSONObjBuilder info;
         info.append("type", "curl");
 
@@ -757,10 +752,11 @@ public:
 
 }  // namespace
 
-// Transitional API used by blockstore to trigger libcurl init
-// until it's been migrated to use the HTTPClient API.
-Status curlLibraryManager_initialize() {
-    return curlLibraryManager.initialize();
+MONGO_INITIALIZER_GENERAL(CurlLibraryManager,
+                          (),
+                          ("BeginStartupOptionParsing", "NativeSaslClientContext"))
+(InitializerContext* context) {
+    uassertStatusOK(curlLibraryManager.initialize());
 }
 
 

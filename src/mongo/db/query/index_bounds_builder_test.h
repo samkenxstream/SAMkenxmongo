@@ -32,6 +32,7 @@
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/index_bounds_builder.h"
+#include "mongo/db/query/interval_evaluation_tree.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -41,11 +42,17 @@ public:
     /**
      * Utility function to create MatchExpression
      */
-    std::unique_ptr<MatchExpression> parseMatchExpression(const BSONObj& obj) {
+    std::pair<std::unique_ptr<MatchExpression>, std::vector<const MatchExpression*>>
+    parseMatchExpression(const BSONObj& obj, bool shouldNormalize = true) {
         boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
         StatusWithMatchExpression status = MatchExpressionParser::parse(obj, std::move(expCtx));
-        ASSERT_TRUE(status.isOK());
-        return std::unique_ptr<MatchExpression>(status.getValue().release());
+        ASSERT_OK(status.getStatus()) << obj;
+        auto expr = std::move(status.getValue());
+        if (shouldNormalize) {
+            expr = MatchExpression::normalize(std::move(expr));
+        }
+        auto inputParamIdMap = MatchExpression::parameterize(expr.get());
+        return {std::move(expr), inputParamIdMap};
     }
 
     /**
@@ -88,25 +95,61 @@ public:
     }
 
     /**
+     * Make a Wildcard IndexEntry with the provided key pattern and multikey paths.
+     */
+    IndexEntry buildWildcardIndexEntry(const BSONObj& kp,
+                                       const MultikeyPaths& mkp,
+                                       const size_t wildcardPos = 0) {
+        bool isMultikey = false;
+        for (const auto& val : mkp) {
+            if (!val.empty()) {
+                isMultikey = true;
+                break;
+            }
+        }
+        return {kp,
+                IndexType::INDEX_WILDCARD,
+                IndexDescriptor::kLatestIndexVersion,
+                isMultikey,  // multikey
+                mkp,         // multikey paths
+                {},
+                false,
+                false,
+                IndexEntry::Identifier{"test_wildcard"},
+                nullptr,
+                {},
+                nullptr,
+                nullptr,
+                wildcardPos};
+    }
+
+    /**
      * Given a list of queries in 'toUnion', translate into index bounds and return
      * the union of these bounds in the out-parameter 'oilOut'.
      */
     void testTranslateAndUnion(const std::vector<BSONObj>& toUnion,
                                OrderedIntervalList* oilOut,
-                               IndexBoundsBuilder::BoundsTightness* tightnessOut) {
+                               IndexBoundsBuilder::BoundsTightness* tightnessOut,
+                               bool shouldNormalize = true) {
         auto testIndex = buildSimpleIndexEntry();
+        auto obj = BSON("$or" << toUnion);
+        auto [expr, inputParamIdMap] = parseMatchExpression(obj, shouldNormalize);
+        BSONElement elt = toUnion[0].firstElement();
+        interval_evaluation_tree::Builder ietBuilder{};
 
-        for (auto it = toUnion.begin(); it != toUnion.end(); ++it) {
-            auto expr = parseMatchExpression(*it);
-            BSONElement elt = it->firstElement();
-            if (toUnion.begin() == it) {
+        ASSERT_EQ(MatchExpression::OR, expr->matchType()) << expr->debugString();
+        for (size_t childIndex = 0; childIndex < expr->numChildren(); ++childIndex) {
+            auto child = expr->getChild(childIndex);
+            if (childIndex == 0) {
                 IndexBoundsBuilder::translate(
-                    expr.get(), elt, testIndex, oilOut, tightnessOut, /* iet::Builder */ nullptr);
+                    child, elt, testIndex, oilOut, tightnessOut, &ietBuilder);
             } else {
                 IndexBoundsBuilder::translateAndUnion(
-                    expr.get(), elt, testIndex, oilOut, tightnessOut, /* iet::Builder */ nullptr);
+                    child, elt, testIndex, oilOut, tightnessOut, &ietBuilder);
             }
         }
+
+        assertIET(inputParamIdMap, ietBuilder, elt, testIndex, *oilOut);
     }
 
     /**
@@ -117,48 +160,24 @@ public:
                                    OrderedIntervalList* oilOut,
                                    IndexBoundsBuilder::BoundsTightness* tightnessOut) {
         auto testIndex = buildSimpleIndexEntry();
+        auto obj = BSON("$and" << toIntersect);
+        auto [expr, inputParamIdMap] = parseMatchExpression(obj);
+        BSONElement elt = toIntersect[0].firstElement();
+        interval_evaluation_tree::Builder ietBuilder{};
 
-        for (auto it = toIntersect.begin(); it != toIntersect.end(); ++it) {
-            auto expr = parseMatchExpression(*it);
-            BSONElement elt = it->firstElement();
-            if (toIntersect.begin() == it) {
+        ASSERT_EQ(MatchExpression::AND, expr->matchType());
+        for (size_t childIndex = 0; childIndex < expr->numChildren(); ++childIndex) {
+            auto child = expr->getChild(childIndex);
+            if (childIndex == 0) {
                 IndexBoundsBuilder::translate(
-                    expr.get(), elt, testIndex, oilOut, tightnessOut, /* iet::Builder */ nullptr);
+                    child, elt, testIndex, oilOut, tightnessOut, &ietBuilder);
             } else {
                 IndexBoundsBuilder::translateAndIntersect(
-                    expr.get(), elt, testIndex, oilOut, tightnessOut, /* iet::Builder */ nullptr);
+                    child, elt, testIndex, oilOut, tightnessOut, &ietBuilder);
             }
         }
-    }
 
-    /**
-     * 'constraints' is a vector of BSONObj's representing match expressions, where
-     * each filter is paired with a boolean. If the boolean is true, then the filter's
-     * index bounds should be intersected with the other constraints; if false, then
-     * they should be unioned. The resulting bounds are returned in the
-     * out-parameter 'oilOut'.
-     */
-    void testTranslate(const std::vector<std::pair<BSONObj, bool>>& constraints,
-                       OrderedIntervalList* oilOut,
-                       IndexBoundsBuilder::BoundsTightness* tightnessOut) {
-        auto testIndex = buildSimpleIndexEntry();
-
-        for (auto it = constraints.begin(); it != constraints.end(); ++it) {
-            BSONObj obj = it->first;
-            bool isIntersect = it->second;
-            auto expr = parseMatchExpression(obj);
-            BSONElement elt = obj.firstElement();
-            if (constraints.begin() == it) {
-                IndexBoundsBuilder::translate(
-                    expr.get(), elt, testIndex, oilOut, tightnessOut, /* iet::Builder */ nullptr);
-            } else if (isIntersect) {
-                IndexBoundsBuilder::translateAndIntersect(
-                    expr.get(), elt, testIndex, oilOut, tightnessOut, /* iet::Builder */ nullptr);
-            } else {
-                IndexBoundsBuilder::translateAndUnion(
-                    expr.get(), elt, testIndex, oilOut, tightnessOut, /* iet::Builder */ nullptr);
-            }
-        }
+        assertIET(inputParamIdMap, ietBuilder, elt, testIndex, *oilOut);
     }
 
     /**
@@ -179,6 +198,23 @@ public:
         bob.appendNumber("", start);
         bob.appendMaxKey("");
         return bob.obj();
+    }
+
+    /**
+     * Evaluates index index intervals from the given Interval Evaluation Trees (IET) and asserts
+     * the the result is equal to the given OrderedIntervalList.
+     */
+    static void assertIET(const std::vector<const MatchExpression*>& inputParamIdMap,
+                          const interval_evaluation_tree::Builder& ietBuilder,
+                          const BSONElement& elt,
+                          const IndexEntry& index,
+                          const OrderedIntervalList& oil) {
+        auto iet = ietBuilder.done();
+        ASSERT(iet);
+
+        auto restoredOil =
+            interval_evaluation_tree::evaluateIntervals(*iet, inputParamIdMap, elt, index);
+        ASSERT(oil == restoredOil);
     }
 };
 

@@ -93,7 +93,7 @@ public:
     void shutdownComponent_forTest(const std::unique_ptr<MockAsyncComponent>& component);
 
 private:
-    Status _doStartup_inlock() noexcept override;
+    void _doStartup_inlock() override;
     void _doShutdown_inlock() noexcept override;
     void _preJoin() noexcept override {}
     Mutex* _getMutex() noexcept override;
@@ -102,7 +102,7 @@ private:
     Mutex _mutex = MONGO_MAKE_LATCH("MockAsyncComponent::_mutex");
 
 public:
-    // Returned by _doStartup_inlock(). Override for testing.
+    // Asserted to be OK by _doStartup_inlock(). Override for testing.
     Status doStartupResult = Status::OK();
 
     // Set to true when _doStartup_inlock() is called.
@@ -154,9 +154,9 @@ void MockAsyncComponent::shutdownComponent_forTest(
     _shutdownComponent(component);
 }
 
-Status MockAsyncComponent::_doStartup_inlock() noexcept {
+void MockAsyncComponent::_doStartup_inlock() {
     doStartupCalled = true;
-    return doStartupResult;
+    uassertStatusOK(doStartupResult);
 }
 
 void MockAsyncComponent::_doShutdown_inlock() noexcept {}
@@ -351,7 +351,8 @@ TEST_F(AbstractAsyncComponentTest,
     component.shutdown();
     ASSERT_EQUALS(AbstractAsyncComponent::State::kShuttingDown, component.getState_forTest());
 
-    auto callback = [](const executor::TaskExecutor::CallbackArgs&) {};
+    auto callback = [](const executor::TaskExecutor::CallbackArgs&) {
+    };
     executor::TaskExecutor::CallbackHandle handle;
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled,
                   component.scheduleWorkAndSaveHandle_forTest(callback, &handle, "mytask"));
@@ -362,9 +363,12 @@ TEST_F(AbstractAsyncComponentTest,
     TaskExecutorMock taskExecutorMock(&getExecutor());
     MockAsyncComponent component(&taskExecutorMock);
 
-    taskExecutorMock.shouldFailScheduleWorkRequest = []() { return true; };
+    taskExecutorMock.shouldFailScheduleWorkRequest = []() {
+        return true;
+    };
 
-    auto callback = [](const executor::TaskExecutor::CallbackArgs&) {};
+    auto callback = [](const executor::TaskExecutor::CallbackArgs&) {
+    };
     executor::TaskExecutor::CallbackHandle handle;
     ASSERT_EQUALS(ErrorCodes::OperationFailed,
                   component.scheduleWorkAndSaveHandle_forTest(callback, &handle, "mytask"));
@@ -394,7 +398,8 @@ TEST_F(AbstractAsyncComponentTest,
     ASSERT_EQUALS(AbstractAsyncComponent::State::kShuttingDown, component.getState_forTest());
 
     auto when = getExecutor().now() + Seconds(1);
-    auto callback = [](const executor::TaskExecutor::CallbackArgs&) {};
+    auto callback = [](const executor::TaskExecutor::CallbackArgs&) {
+    };
     executor::TaskExecutor::CallbackHandle handle;
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled,
                   component.scheduleWorkAtAndSaveHandle_forTest(when, callback, &handle, "mytask"));
@@ -405,10 +410,13 @@ TEST_F(AbstractAsyncComponentTest,
     TaskExecutorMock taskExecutorMock(&getExecutor());
     MockAsyncComponent component(&taskExecutorMock);
 
-    taskExecutorMock.shouldFailScheduleWorkAtRequest = []() { return true; };
+    taskExecutorMock.shouldFailScheduleWorkAtRequest = []() {
+        return true;
+    };
 
     auto when = getExecutor().now() + Seconds(1);
-    auto callback = [](const executor::TaskExecutor::CallbackArgs&) {};
+    auto callback = [](const executor::TaskExecutor::CallbackArgs&) {
+    };
     executor::TaskExecutor::CallbackHandle handle;
     ASSERT_EQUALS(ErrorCodes::OperationFailed,
                   component.scheduleWorkAtAndSaveHandle_forTest(when, callback, &handle, "mytask"));

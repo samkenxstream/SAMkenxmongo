@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/bsonobj.h"
@@ -52,6 +51,9 @@
 #include "mongo/s/commands/cluster_map_reduce_agg.h"
 #include "mongo/s/query/cluster_aggregation_planner.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -143,10 +145,12 @@ Document serializeToCommand(BSONObj originalCmd,
 }  // namespace
 
 bool runAggregationMapReduce(OperationContext* opCtx,
+                             const DatabaseName& dbName,
                              const BSONObj& cmd,
                              BSONObjBuilder& result,
                              boost::optional<ExplainOptions::Verbosity> verbosity) {
-    auto parsedMr = MapReduceCommandRequest::parse(IDLParserErrorContext("mapReduce"), cmd);
+    auto parsedMr = MapReduceCommandRequest::parse(
+        IDLParserContext("mapReduce", false /* apiStrict */, dbName.tenantId()), cmd);
     stdx::unordered_set<NamespaceString> involvedNamespaces{parsedMr.getNamespace()};
     auto hasOutDB = parsedMr.getOutOptions().getDatabaseName();
     auto resolvedOutNss = NamespaceString{hasOutDB ? *hasOutDB : parsedMr.getNamespace().db(),
@@ -162,9 +166,9 @@ bool runAggregationMapReduce(OperationContext* opCtx,
         involvedNamespaces.insert(resolvedOutNss);
     }
 
-    auto cm = uassertStatusOK(
+    auto cri = uassertStatusOK(
         sharded_agg_helpers::getExecutionNsRoutingInfo(opCtx, parsedMr.getNamespace()));
-    auto expCtx = makeExpressionContext(opCtx, parsedMr, cm, verbosity);
+    auto expCtx = makeExpressionContext(opCtx, parsedMr, cri.cm, verbosity);
 
     const auto pipelineBuilder = [&]() {
         return map_reduce_common::translateFromMR(parsedMr, expCtx);
@@ -184,9 +188,10 @@ bool runAggregationMapReduce(OperationContext* opCtx,
         cluster_aggregation_planner::AggregationTargeter::make(opCtx,
                                                                parsedMr.getNamespace(),
                                                                pipelineBuilder,
-                                                               cm,
+                                                               cri,
                                                                involvedNamespaces,
                                                                false,   // hasChangeStream
+                                                               false,   // startsWithDocuments
                                                                true,    // allowedToPassthrough
                                                                false);  // perShardCursor
     try {
@@ -196,14 +201,15 @@ bool runAggregationMapReduce(OperationContext* opCtx,
                 // needed in the normal aggregation path. For this translation, though, we need to
                 // build the pipeline to serialize and send to the primary shard.
                 auto serialized = serializeToCommand(cmd, parsedMr, pipelineBuilder().get());
-                uassertStatusOK(
-                    cluster_aggregation_planner::runPipelineOnPrimaryShard(expCtx,
-                                                                           namespaces,
-                                                                           *targeter.cm,
-                                                                           verbosity,
-                                                                           std::move(serialized),
-                                                                           privileges,
-                                                                           &tempResults));
+                uassertStatusOK(cluster_aggregation_planner::runPipelineOnPrimaryShard(
+                    expCtx,
+                    namespaces,
+                    targeter.cri->cm,
+                    verbosity,
+                    std::move(serialized),
+                    privileges,
+                    expCtx->eligibleForSampling(),
+                    &tempResults));
                 break;
             }
 
@@ -230,14 +236,16 @@ bool runAggregationMapReduce(OperationContext* opCtx,
                     namespaces,
                     privileges,
                     &tempResults,
-                    false));  // hasChangeStream
+                    false /* hasChangeStream */,
+                    false /* startsWithDocuments */,
+                    expCtx->eligibleForSampling()));
                 break;
             }
 
             case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::
                 kSpecificShardOnly: {
                 // It should not be possible to pass $_passthroughToShard to a map reduce command.
-                MONGO_UNREACHABLE_TASSERT(6273803);
+                MONGO_UNREACHABLE_TASSERT(6273805);
             }
         }
     } catch (DBException& e) {
@@ -245,7 +253,7 @@ bool runAggregationMapReduce(OperationContext* opCtx,
                 "mapReduce on a view is not supported",
                 e.code() != ErrorCodes::CommandOnShardedViewNotSupportedOnMongod);
 
-        e.addContext("MapReduce internal error");
+        e.addContext("MapReduce internal error xxx");
         throw;
     }
     auto aggResults = tempResults.done();

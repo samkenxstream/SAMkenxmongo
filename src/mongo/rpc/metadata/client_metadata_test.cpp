@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -48,6 +47,10 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/testing_proctor.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 
@@ -90,7 +93,7 @@ TEST(ClientMetadataTest, TestLoopbackTest) {
         auto obj = builder.obj();
         auto swParseStatus = ClientMetadata::parse(obj[kMetadataDoc]);
         ASSERT_OK(swParseStatus.getStatus());
-        ASSERT_EQUALS("g", swParseStatus.getValue().get().getApplicationName());
+        ASSERT_EQUALS("g", swParseStatus.getValue().value().getApplicationName());
 
         auto pid = ProcessId::getCurrent().toString();
 
@@ -102,8 +105,9 @@ TEST(ClientMetadataTest, TestLoopbackTest) {
                             .append(kApplication,
                                     BOB{}
                                         .append(kName, "g")
-                                        .appendElements(kDebugBuild ? BOB{}.append(kPid, pid).obj()
-                                                                    : BOB{}.obj())
+                                        .appendElements(TestingProctor::instance().isEnabled()
+                                                            ? BOB{}.append(kPid, pid).obj()
+                                                            : BOB{}.obj())
                                         .obj())
                             .append(kDriver, BOB{}.append(kName, "a").append(kVersion, "b").obj())
                             .append(kOperatingSystem,
@@ -143,7 +147,7 @@ TEST(ClientMetadataTest, TestLoopbackTest) {
 
         auto swParse = ClientMetadata::parse(obj[kMetadataDoc]);
         ASSERT_OK(swParse.getStatus());
-        ASSERT_EQUALS("f", swParse.getValue().get().getApplicationName());
+        ASSERT_EQUALS("f", swParse.getValue().value().getApplicationName());
     }
 }
 
@@ -308,12 +312,12 @@ TEST(ClientMetadataTest, TestMongoSAppend) {
     auto obj = builder.obj();
     auto swParseStatus = ClientMetadata::parse(obj[kMetadataDoc]);
     ASSERT_OK(swParseStatus.getStatus());
-    ASSERT_EQUALS("g", swParseStatus.getValue().get().getApplicationName());
+    ASSERT_EQUALS("g", swParseStatus.getValue().value().getApplicationName());
 
-    swParseStatus.getValue().get().setMongoSMetadata("h", "i", "j");
-    ASSERT_EQUALS("g", swParseStatus.getValue().get().getApplicationName());
+    swParseStatus.getValue().value().setMongoSMetadata("h", "i", "j");
+    ASSERT_EQUALS("g", swParseStatus.getValue().value().getApplicationName());
 
-    auto doc = swParseStatus.getValue().get().getDocument();
+    auto doc = swParseStatus.getValue().value().getDocument();
 
     constexpr auto kMongos = "mongos"_sd;
     constexpr auto kClient = "client"_sd;
@@ -327,7 +331,9 @@ TEST(ClientMetadataTest, TestMongoSAppend) {
             .append(kApplication,
                     BOB{}
                         .append(kName, "g")
-                        .appendElements(kDebugBuild ? BOB{}.append(kPid, pid).obj() : BOB{}.obj())
+                        .appendElements(TestingProctor::instance().isEnabled()
+                                            ? BOB{}.append(kPid, pid).obj()
+                                            : BOB{}.obj())
                         .obj())
             .append(kDriver, BOB{}.append(kName, "a").append(kVersion, "b").obj())
             .append(kOperatingSystem,

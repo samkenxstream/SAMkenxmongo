@@ -2,12 +2,16 @@
  * Tests the result of running listCollections when there are time-series collections present.
  *
  * @tags: [
- *   does_not_support_transactions,
- *   requires_getmore,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 (function() {
 'use strict';
+
+load("jstests/core/timeseries/libs/timeseries.js");
+
+const testDB = db.getSiblingDB(jsTestName());
 
 const timeFieldName = 'time';
 const metaFieldName = 'meta';
@@ -15,18 +19,10 @@ const metaFieldName = 'meta';
 const collNamePrefix = 'timeseries_list_collections_';
 let collCount = 0;
 
-const getBucketMaxSpanSeconds = function(granularity) {
-    switch (granularity) {
-        case 'seconds':
-            return 60 * 60;
-        case 'minutes':
-            return 60 * 60 * 24;
-        case 'hours':
-            return 60 * 60 * 24 * 30;
-        default:
-            assert(false, 'Invalid granularity: ' + granularity);
-    }
-};
+const bucketMaxSpanSecondsFromMinutes =
+    TimeseriesTest.getBucketMaxSpanSecondsFromGranularity('minutes');
+const buckeRoundingSecondsFromMinutes =
+    TimeseriesTest.getBucketRoundingSecondsFromGranularity('minutes');
 
 const testOptions = function(options) {
     const coll = db.getCollection(collNamePrefix + collCount++);
@@ -39,9 +35,17 @@ const testOptions = function(options) {
         Object.assign(options.timeseries, {granularity: 'seconds'});
     }
     if (!options.timeseries.hasOwnProperty('bucketMaxSpanSeconds')) {
-        Object.assign(
-            options.timeseries,
-            {bucketMaxSpanSeconds: getBucketMaxSpanSeconds(options.timeseries.granularity)});
+        Object.assign(options.timeseries, {
+            bucketMaxSpanSeconds: TimeseriesTest.getBucketMaxSpanSecondsFromGranularity(
+                options.timeseries.granularity)
+        });
+    }
+    if (TimeseriesTest.timeseriesScalabilityImprovementsEnabled(testDB)) {
+        // When we are using default 'granularity' values we won't actually set
+        // 'bucketRoundingSeconds' internally.
+        if (options.timeseries.hasOwnProperty('bucketRoundingSeconds')) {
+            delete options.timeseries.bucketRoundingSeconds;
+        }
     }
 
     if (options.hasOwnProperty('collation')) {
@@ -66,8 +70,8 @@ const testOptions = function(options) {
     assert(collections.find(entry => entry.name === 'system.views'));
     assert(collections.find(entry => entry.name === 'system.buckets.' + coll.getName()));
     assert.docEq(
-        collections.find(entry => entry.name === coll.getName()),
-        {name: coll.getName(), type: 'timeseries', options: options, info: {readOnly: false}});
+        {name: coll.getName(), type: 'timeseries', options: options, info: {readOnly: false}},
+        collections.find(entry => entry.name === coll.getName()));
 };
 
 testOptions({timeseries: {timeField: timeFieldName}});
@@ -78,13 +82,23 @@ testOptions({
         granularity: 'minutes',
     }
 });
-testOptions({
-    timeseries: {
-        timeField: timeFieldName,
-        granularity: 'minutes',
-        bucketMaxSpanSeconds: 60 * 60 * 24,
-    }
-});
+if (!TimeseriesTest.timeseriesScalabilityImprovementsEnabled(testDB)) {
+    testOptions({
+        timeseries: {
+            timeField: timeFieldName,
+            granularity: 'minutes',
+            bucketMaxSpanSeconds: bucketMaxSpanSecondsFromMinutes,
+        }
+    });
+} else {
+    testOptions({
+        timeseries: {
+            timeField: timeFieldName,
+            granularity: 'minutes',
+            bucketMaxSpanSeconds: bucketMaxSpanSecondsFromMinutes,
+        }
+    });
+}
 testOptions({
     timeseries: {
         timeField: timeFieldName,
@@ -104,16 +118,31 @@ testOptions({
     collation: {locale: 'ja'},
 });
 testOptions({timeseries: {timeField: timeFieldName}, expireAfterSeconds: NumberLong(100)});
-testOptions({
-    timeseries: {
-        timeField: timeFieldName,
-        metaField: metaFieldName,
-        granularity: 'minutes',
-        bucketMaxSpanSeconds: 60 * 60 * 24,
-    },
-    storageEngine: {wiredTiger: {}},
-    indexOptionDefaults: {storageEngine: {wiredTiger: {}}},
-    collation: {locale: 'ja'},
-    expireAfterSeconds: NumberLong(100),
-});
+if (!TimeseriesTest.timeseriesScalabilityImprovementsEnabled(testDB)) {
+    testOptions({
+        timeseries: {
+            timeField: timeFieldName,
+            metaField: metaFieldName,
+            granularity: 'minutes',
+            bucketMaxSpanSeconds: bucketMaxSpanSecondsFromMinutes,
+        },
+        storageEngine: {wiredTiger: {}},
+        indexOptionDefaults: {storageEngine: {wiredTiger: {}}},
+        collation: {locale: 'ja'},
+        expireAfterSeconds: NumberLong(100),
+    });
+} else {
+    testOptions({
+        timeseries: {
+            timeField: timeFieldName,
+            metaField: metaFieldName,
+            granularity: 'minutes',
+            bucketMaxSpanSeconds: bucketMaxSpanSecondsFromMinutes,
+        },
+        storageEngine: {wiredTiger: {}},
+        indexOptionDefaults: {storageEngine: {wiredTiger: {}}},
+        collation: {locale: 'ja'},
+        expireAfterSeconds: NumberLong(100),
+    });
+}
 })();

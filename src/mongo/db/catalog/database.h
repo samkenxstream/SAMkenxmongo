@@ -29,23 +29,20 @@
 
 #pragma once
 
-#include <memory>
-#include <string>
-
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/virtual_collection_options.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbcommands_gen.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/db/tenant_database_name.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
-
-class OperationContext;
 
 /**
  * Represents a logical database containing Collections.
@@ -65,7 +62,16 @@ public:
                                 const NamespaceString& fullns,
                                 CollectionOptions collectionOptions,
                                 bool createDefaultIndexes = true,
-                                const BSONObj& idIndex = BSONObj()) const = 0;
+                                const BSONObj& idIndex = BSONObj(),
+                                bool fromMigrate = false) const = 0;
+
+    /**
+     * Creates the virtual namespace 'fullns' according to 'opts' and 'vopts'.
+     */
+    virtual Status userCreateVirtualNS(OperationContext* opCtx,
+                                       const NamespaceString& fullns,
+                                       CollectionOptions opts,
+                                       const VirtualCollectionOptions& vopts) const = 0;
 
     Database() = default;
 
@@ -78,11 +84,9 @@ public:
     /**
      * Sets up internal memory structures.
      */
-    virtual Status init(OperationContext* opCtx) = 0;
+    virtual void init(OperationContext* opCtx) = 0;
 
-    virtual const TenantDatabaseName& name() const = 0;
-
-    virtual void clearTmpCollections(OperationContext* opCtx) const = 0;
+    virtual const DatabaseName& name() const = 0;
 
     /**
      * Sets the 'drop-pending' state of this Database.
@@ -98,7 +102,7 @@ public:
     virtual bool isDropPending(OperationContext* opCtx) const = 0;
 
     virtual void getStats(OperationContext* opCtx,
-                          BSONObjBuilder* output,
+                          DBStats* output,
                           bool includeFreeStorage,
                           double scale = 1) const = 0;
 
@@ -109,13 +113,18 @@ public:
      * If we are applying a 'drop' oplog entry on a secondary, 'dropOpTime' will contain the optime
      * of the oplog entry.
      *
+     * When fromMigrate is set, the related oplog entry will be marked with a 'fromMigrate' field to
+     * reduce its visibility (e.g. in change streams).
+     *
      * The caller should hold a DB X lock and ensure there are no index builds in progress on the
      * collection.
      * N.B. Namespace argument is passed by value as it may otherwise disappear or change.
      */
     virtual Status dropCollection(OperationContext* opCtx,
                                   NamespaceString nss,
-                                  repl::OpTime dropOpTime = {}) const = 0;
+                                  repl::OpTime dropOpTime = {},
+                                  bool markFromMigrate = false) const = 0;
+
     virtual Status dropCollectionEvenIfSystem(OperationContext* opCtx,
                                               NamespaceString nss,
                                               repl::OpTime dropOpTime = {},
@@ -135,7 +144,21 @@ public:
                                          const NamespaceString& nss,
                                          const CollectionOptions& options = CollectionOptions(),
                                          bool createDefaultIndexes = true,
-                                         const BSONObj& idIndex = BSONObj()) const = 0;
+                                         const BSONObj& idIndex = BSONObj(),
+                                         bool fromMigrate = false) const = 0;
+
+    /**
+     * A MODE_IX collection lock must be held for this call. Throws a WriteConflictException error
+     * if the collection already exists (say if another thread raced to create it).
+     *
+     * Surrounding writeConflictRetry loops must encompass checking that the collection exists as
+     * well as creating it. Otherwise the loop will endlessly throw WCEs: the caller must check that
+     * the collection exists to break free.
+     */
+    virtual Collection* createVirtualCollection(OperationContext* opCtx,
+                                                const NamespaceString& nss,
+                                                const CollectionOptions& opts,
+                                                const VirtualCollectionOptions& vopts) const = 0;
 
     virtual Status createView(OperationContext* opCtx,
                               const NamespaceString& viewName,
@@ -150,26 +173,6 @@ public:
                                     bool stayTemp) const = 0;
 
     virtual const NamespaceString& getSystemViewsName() const = 0;
-
-    /**
-     * Generates a collection namespace suitable for creating a temporary collection.
-     * The namespace is based on a model that replaces each percent sign in 'collectionNameModel' by
-     * a random character in the range [0-9A-Za-z].
-     * Returns FailedToParse if 'collectionNameModel' does not contain any percent signs.
-     * Returns NamespaceExists if we are unable to generate a collection name that does not conflict
-     * with an existing collection in this database.
-     *
-     * The database must be locked in MODE_IX when calling this function.
-     */
-    virtual StatusWith<NamespaceString> makeUniqueCollectionNamespace(
-        OperationContext* opCtx, StringData collectionNameModel) const = 0;
-
-    /**
-     * If we are in a replset, every replicated collection must have an _id index.  As we scan each
-     * database, we also gather a list of drop-pending collection namespaces for the
-     * DropPendingCollectionReaper to clean up eventually.
-     */
-    virtual void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx) const = 0;
 };
 
 }  // namespace mongo

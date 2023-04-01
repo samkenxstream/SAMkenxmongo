@@ -27,16 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/exec/geo_near.h"
 
-#include "mongo/logv2/log.h"
+#include <algorithm>
 #include <memory>
+#include <s2regionintersection.h>  // For s2 search
 #include <vector>
-
-// For s2 search
-#include "third_party/s2/s2regionintersection.h"
 
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/exec/document_value/value.h"
@@ -48,8 +45,11 @@
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/query/expression_index.h"
 #include "mongo/db/query/expression_index_knobs_gen.h"
+#include "mongo/logv2/log.h"
 
-#include <algorithm>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -585,7 +585,7 @@ std::unique_ptr<NearStage::CoveredInterval> GeoNear2DStage::nextInterval(
     // FLAT searches need to add an additional annulus $within matcher, see above
     // TODO: Find out if this matcher is actually needed
     if (FLAT == queryCRS) {
-        docMatcher = new TwoDPtInAnnulusExpression(_fullBounds, twoDFieldName);
+        docMatcher = new TwoDPtInAnnulusExpression(_fullBounds, StringData(twoDFieldName));
     }
 
     // FetchStage owns index scan
@@ -916,7 +916,7 @@ std::unique_ptr<NearStage::CoveredInterval> GeoNear2DSphereStage::nextInterval(
     invariant(cover.empty());
     S2CellUnion diffUnion;
     diffUnion.GetDifference(&coverUnion, &_scannedCells);
-    for (auto cellId : diffUnion.cell_ids()) {
+    for (const auto& cellId : diffUnion.cell_ids()) {
         if (region->MayIntersect(S2Cell(cellId))) {
             cover.push_back(cellId);
         }

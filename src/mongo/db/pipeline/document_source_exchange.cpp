@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -40,6 +39,9 @@
 #include "mongo/db/pipeline/document_source_exchange.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -91,7 +93,10 @@ const char* DocumentSourceExchange::getSourceName() const {
     return kStageName.rawData();
 }
 
-Value DocumentSourceExchange::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceExchange::serialize(SerializationOptions opts) const {
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484348);
+    }
     return Value(DOC(getSourceName() << _exchange->getSpec().toBSON()));
 }
 
@@ -404,7 +409,7 @@ size_t Exchange::getTargetConsumer(const Document& input) {
     // Build the key.
     BSONObjBuilder kb;
     size_t counter = 0;
-    for (auto elem : _keyPattern) {
+    for (const auto& elem : _keyPattern) {
         auto value = input.getNestedField(_keyPaths[counter]);
 
         // By definition we send documents with missing fields to the consumer 0.

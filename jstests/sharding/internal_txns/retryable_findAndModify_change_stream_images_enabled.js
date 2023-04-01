@@ -3,9 +3,9 @@
  * changeStreamPreAndPostImages enabled are retryable.
  *
  * @tags: [
- * requires_fcv_53,
- * featureFlagInternalTransactions,
- * featureFlagChangeStreamPreAndPostImages
+ * requires_fcv_60,
+ * uses_transactions,
+ * exclude_from_large_txns,
  * ]
  */
 (function() {
@@ -17,7 +17,5 @@ const transactionTest =
     new RetryableInternalTransactionTest({changeStreamPreAndPostImages: {enabled: true}});
 transactionTest.runTestsForAllRetryableInternalTransactionTypes(
     transactionTest.runFindAndModifyTestsEnableImageCollection);
-transactionTest.runTestsForAllRetryableInternalTransactionTypes(
-    transactionTest.runFindAndModifyTestsDisableImageCollection);
 transactionTest.stop();
 })();

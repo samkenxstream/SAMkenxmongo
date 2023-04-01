@@ -1,17 +1,21 @@
 /**
  * Tests passing a hint to the update command on a time-series collection.
  * @tags: [
- *   assumes_unsharded_collection, # TODO SERVER-60233: Remove this tag.
- *   does_not_support_stepdowns,
- *   does_not_support_transactions,
- *   requires_fcv_51,
- *   requires_getmore,
+ *   # Fail points in this test do not exist on mongos.
+ *   assumes_against_mongod_not_mongos,
  *   # $currentOp can't run with a readConcern other than 'local'.
  *   assumes_read_concern_unchanged,
  *   # This test only synchronizes updates on the primary.
  *   assumes_read_preference_unchanged,
- *   # Fail points in this test do not exist on mongos.
- *   assumes_against_mongod_not_mongos,
+ *   assumes_unsharded_collection, # TODO SERVER-60233: Remove this tag.
+ *   # This test depends on certain writes ending up in the same bucket. Stepdowns may result in
+ *   # writes splitting between two primaries, and thus different buckets.
+ *   does_not_support_stepdowns,
+ *   # Specifically testing multi-updates.
+ *   requires_multi_updates,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
+ *   # Test uses parallel shell to wait on fail point.
  *   uses_parallel_shell,
  * ]
  */
@@ -21,11 +25,6 @@
 load("jstests/core/timeseries/libs/timeseries.js");
 load("jstests/libs/curop_helpers.js");
 load('jstests/libs/parallel_shell_helpers.js');
-
-if (!TimeseriesTest.timeseriesUpdatesAndDeletesEnabled(db.getMongo())) {
-    jsTestLog("Skipping test because the time-series updates and deletes feature flag is disabled");
-    return;
-}
 
 const timeFieldName = "time";
 const metaFieldName = "tag";
@@ -39,6 +38,9 @@ const dbName = jsTestName();
  */
 const testUpdateHintSucceeded =
     ({initialDocList, indexes, updateList, resultDocList, nModifiedBuckets, expectedPlan}) => {
+        const testDB = db.getSiblingDB(dbName);
+        const coll = testDB.getCollection(collName);
+
         const awaitTestUpdate = startParallelShell(funWithArgs(
             function(dbName,
                      collName,
@@ -88,20 +90,18 @@ const testUpdateHintSucceeded =
             updateList,
             resultDocList,
             nModifiedBuckets));
+        try {
+            const childCurOp =
+                waitForCurOpByFailPoint(testDB, coll.getFullName(), "hangAfterBatchUpdate")[0];
 
-        const testDB = db.getSiblingDB(dbName);
-        const coll = testDB.getCollection(collName);
+            // Verify that the query plan uses the expected index.
+            assert.eq(childCurOp.planSummary, expectedPlan);
+        } finally {
+            assert.commandWorked(
+                testDB.adminCommand({configureFailPoint: "hangAfterBatchUpdate", mode: "off"}));
 
-        const childCurOp =
-            waitForCurOpByFailPoint(testDB, coll.getFullName(), "hangAfterBatchUpdate")[0];
-
-        // Verify that the query plan uses the expected index.
-        assert.eq(childCurOp.planSummary, expectedPlan);
-
-        assert.commandWorked(
-            testDB.adminCommand({configureFailPoint: "hangAfterBatchUpdate", mode: "off"}));
-
-        awaitTestUpdate();
+            awaitTestUpdate();
+        }
     };
 
 /**
@@ -153,6 +153,44 @@ const hintDoc3 = {
 };
 
 /************* Tests passing a hint to an update on a collection with a single index. *************/
+// Query on and update the metaField using a forward collection scan: hint: {$natural 1}.
+testUpdateHintSucceeded({
+    initialDocList: [hintDoc1, hintDoc2, hintDoc3],
+    indexes: [{[metaFieldName]: 1}],
+    updateList: [{
+        q: {[metaFieldName + ".a"]: {$lte: 2}},
+        u: {$inc: {[metaFieldName + ".a"]: 10}},
+        multi: true,
+        hint: {$natural: 1}
+    }],
+    resultDocList: [
+        {_id: 1, [timeFieldName]: dateTime, [metaFieldName]: {"a": 11}},
+        {_id: 2, [timeFieldName]: dateTime, [metaFieldName]: {"a": 12}},
+        hintDoc3
+    ],
+    nModifiedBuckets: 2,
+    expectedPlan: "COLLSCAN",
+});
+
+// Query on and update the metaField using a backward collection scan: hint: {$natural -1}.
+testUpdateHintSucceeded({
+    initialDocList: [hintDoc1, hintDoc2, hintDoc3],
+    indexes: [{[metaFieldName]: 1}],
+    updateList: [{
+        q: {[metaFieldName + ".a"]: {$lte: 2}},
+        u: {$inc: {[metaFieldName + ".a"]: 10}},
+        multi: true,
+        hint: {$natural: -1}
+    }],
+    resultDocList: [
+        {_id: 1, [timeFieldName]: dateTime, [metaFieldName]: {"a": 11}},
+        {_id: 2, [timeFieldName]: dateTime, [metaFieldName]: {"a": 12}},
+        hintDoc3
+    ],
+    nModifiedBuckets: 2,
+    expectedPlan: "COLLSCAN",
+});
+
 // Query on and update the metaField using the metaField index as a hint, specifying the hint with
 // an index specification document.
 testUpdateHintSucceeded({

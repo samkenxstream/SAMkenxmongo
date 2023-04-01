@@ -1,10 +1,12 @@
 /**
  * Tests maximum number of measurements held in each bucket in a time-series buckets collection.
  * @tags: [
+ *   # This test depends on certain writes ending up in the same bucket. Stepdowns may result in
+ *   # writes splitting between two primaries, and thus different buckets.
  *   does_not_support_stepdowns,
- *   does_not_support_transactions,
- *   requires_getmore,
- *   requires_fcv_52,
+ *   requires_collstats,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 (function() {
@@ -13,9 +15,6 @@
 load("jstests/core/timeseries/libs/timeseries.js");  // For 'TimeseriesTest'.
 
 TimeseriesTest.run((insert) => {
-    const isTimeseriesBucketCompressionEnabled =
-        TimeseriesTest.timeseriesBucketCompressionEnabled(db);
-
     const collNamePrefix = 'timeseries_bucket_limit_count_';
 
     // Assumes each bucket has a limit of 1000 measurements.
@@ -71,9 +70,11 @@ TimeseriesTest.run((insert) => {
         assert.eq(bucketMaxCount - 1,
                   bucketDocs[0].control.max.x,
                   'invalid control.max for x in first bucket: ' + tojson(bucketDocs));
-        assert.eq(isTimeseriesBucketCompressionEnabled ? 2 : 1,
+        assert.eq(2,
                   bucketDocs[0].control.version,
                   'unexpected control.version in first bucket: ' + tojson(bucketDocs));
+        assert(!bucketDocs[0].control.hasOwnProperty("closed"),
+               'unexpected control.closed in first bucket: ' + tojson(bucketDocs));
 
         // Second bucket should contain the remaining documents.
         assert.eq(bucketMaxCount,
@@ -90,7 +91,9 @@ TimeseriesTest.run((insert) => {
                   'invalid control.max for x in second bucket: ' + tojson(bucketDocs));
         assert.eq(1,
                   bucketDocs[1].control.version,
-                  'unexpected control.version in first bucket: ' + tojson(bucketDocs));
+                  'unexpected control.version in second bucket: ' + tojson(bucketDocs));
+        assert(!bucketDocs[1].control.hasOwnProperty("closed"),
+               'unexpected control.closed in second bucket: ' + tojson(bucketDocs));
     };
 
     runTest(1);

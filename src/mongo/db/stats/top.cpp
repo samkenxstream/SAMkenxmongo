@@ -27,14 +27,18 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/stats/top.h"
 
+#include "mongo/db/curop.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/service_context.h"
+#include "mongo/util/namespace_string_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
@@ -106,6 +110,9 @@ void Top::_record(OperationContext* opCtx,
                   LockType lockType,
                   long long micros,
                   Command::ReadWriteType readWriteType) {
+    if (c.isStatsRecordingAllowed) {
+        c.isStatsRecordingAllowed = !CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation;
+    }
 
     _incrementHistogram(opCtx, micros, &c.opLatencyHistogram, readWriteType);
 
@@ -174,19 +181,22 @@ void Top::_appendToUsageMap(BSONObjBuilder& b, const UsageMap& map) const {
         BSONObjBuilder bb(b.subobjStart(names[i]));
 
         const CollectionData& coll = map.find(names[i])->second;
+        auto pos = names[i].find('.');
+        auto nss = NamespaceString(names[i].substr(0, pos), names[i].substr(pos + 1));
 
-        _appendStatsEntry(b, "total", coll.total);
+        if (coll.isStatsRecordingAllowed && !nss.isFLE2StateCollection()) {
+            _appendStatsEntry(b, "total", coll.total);
 
-        _appendStatsEntry(b, "readLock", coll.readLock);
-        _appendStatsEntry(b, "writeLock", coll.writeLock);
+            _appendStatsEntry(b, "readLock", coll.readLock);
+            _appendStatsEntry(b, "writeLock", coll.writeLock);
 
-        _appendStatsEntry(b, "queries", coll.queries);
-        _appendStatsEntry(b, "getmore", coll.getmore);
-        _appendStatsEntry(b, "insert", coll.insert);
-        _appendStatsEntry(b, "update", coll.update);
-        _appendStatsEntry(b, "remove", coll.remove);
-        _appendStatsEntry(b, "commands", coll.commands);
-
+            _appendStatsEntry(b, "queries", coll.queries);
+            _appendStatsEntry(b, "getmore", coll.getmore);
+            _appendStatsEntry(b, "insert", coll.insert);
+            _appendStatsEntry(b, "update", coll.update);
+            _appendStatsEntry(b, "remove", coll.remove);
+            _appendStatsEntry(b, "commands", coll.commands);
+        }
         bb.done();
     }
 }
@@ -205,7 +215,7 @@ void Top::appendLatencyStats(const NamespaceString& nss,
     stdx::lock_guard<SimpleMutex> lk(_lock);
     BSONObjBuilder latencyStatsBuilder;
     _usage[hashedNs].opLatencyHistogram.append(includeHistograms, false, &latencyStatsBuilder);
-    builder->append("ns", nss.ns());
+    builder->append("ns", NamespaceStringUtil::serialize(nss));
     builder->append("latencyStats", latencyStatsBuilder.obj());
 }
 

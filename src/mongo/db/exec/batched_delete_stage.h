@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/exec/batched_delete_stage_buffer.h"
 #include "mongo/db/exec/batched_delete_stage_gen.h"
 #include "mongo/db/exec/delete_stage.h"
 #include "mongo/db/exec/write_stage_common.h"
@@ -36,31 +37,62 @@
 
 namespace mongo {
 
-/**
- * Batch sizing parameters. A batch of documents staged for deletion is committed as soon
- * as one of the targets below is met, or upon reaching EOF.
- */
-struct BatchedDeleteStageBatchParams {
-    BatchedDeleteStageBatchParams()
-        : targetBatchBytes(gBatchedDeletesTargetBatchBytes.load()),
-          targetBatchDocs(gBatchedDeletesTargetBatchDocs.load()),
-          targetBatchTimeMS(Milliseconds(gBatchedDeletesTargetBatchTimeMS.load())) {}
+struct BatchedDeleteStageParams {
+    BatchedDeleteStageParams()
+        : targetBatchDocs(gBatchedDeletesTargetBatchDocs.load()),
+          targetBatchTimeMS(Milliseconds(gBatchedDeletesTargetBatchTimeMS.load())),
+          targetStagedDocBytes(gBatchedDeletesTargetStagedDocBytes.load()),
+          targetPassDocs(0),
+          targetPassTimeMS(Milliseconds(0)) {}
 
-    // Documents staged for deletions are processed in a batch once this batch size target is met.
-    // Accounts for documents and indexes. A value of zero means unlimited.
-    long long targetBatchBytes = 0;
+    //
+    // A 'batch' refers to the deletes executed in a single WriteUnitOfWork. A batch of staged
+    // document deletes is committed as soon as one of the batch targets is met, or upon reach EOF.
+    //
+    // 'Batch' targets have no impact on the total number of documents removed in the batched delete
+    // operation.
+    //
+
     // Documents staged for deletions are processed in a batch once this document count target is
     // met. A value of zero means unlimited.
     long long targetBatchDocs = 0;
+
     // A batch is committed as soon as this target execution time is met. Zero means unlimited.
     Milliseconds targetBatchTimeMS = Milliseconds(0);
+
+    // Documents staged for deletions are processed in a batch once this size target is met.
+    // Accounts for document size, not for indexes. A value of zero means unlimited.
+    long long targetStagedDocBytes = 0;
+
+    //
+    // A 'pass' defines a approximate target number of documents or runtime after which the
+    // deletion stops staging documents, executes any remaining deletes, and eventually returns
+    // completion. 'Pass' parameters are approximate because they are checked at a per batch commit
+    // granularity.
+    //
+    // 'Pass' targets may impact the total number of documents removed in the batched delete
+    // operation. When set, there is no guarantee all matching documents will be removed in the
+    // operation. For this reason, 'pass' targets are only exposed to internal users for specific
+    // use cases.
+    //
+
+    // Limits the amount of documents processed in a single pass. Once met, no more documents will
+    // be fetched for delete - any remaining staged deletes will be executed provided they still
+    // match the query and haven't been deleted by a concurrent operation. A value of zero means
+    // unlimited.
+    long long targetPassDocs;
+
+    // Limits the time spent staging and executing deletes in a single pass. Once met, no more
+    // documents will be fetched for delete - any remaining staged deletes will be executed provided
+    // they still match the query and haven't been deleted by a concurrent operation. A value of
+    // zero means unlimited.
+    Milliseconds targetPassTimeMS;
 };
 
 /**
- * The BATCHED_DELETE stage deletes documents in batches, using RecordId's that are returned from
- * its child. In comparison, the base class DeleteStage deletes documents one by one. The stage
- * returns NEED_TIME after deleting a document, or after staging a document to be deleted in the
- * next batch.
+ * The BATCHED_DELETE stage deletes documents in batches. In comparison, the base class DeleteStage
+ * deletes documents one by one. The stage returns NEED_TIME after executing a batch of deletes, or
+ * after staging a delete for the next batch.
  *
  * Callers of work() must be holding a write lock (and, for replicated deletes, callers must have
  * had the replication coordinator approve the write).
@@ -71,14 +103,20 @@ class BatchedDeleteStage final : public DeleteStage {
 
 public:
     static constexpr StringData kStageType = "BATCHED_DELETE"_sd;
-
     BatchedDeleteStage(ExpressionContext* expCtx,
                        std::unique_ptr<DeleteStageParams> params,
-                       std::unique_ptr<BatchedDeleteStageBatchParams> batchParams,
+                       std::unique_ptr<BatchedDeleteStageParams> batchedDeleteParams,
                        WorkingSet* ws,
                        const CollectionPtr& collection,
                        PlanStage* child);
     ~BatchedDeleteStage();
+
+    // Returns true when no more work can be done (there are no more deletes to commit).
+    bool isEOF() final;
+
+    std::unique_ptr<mongo::PlanStageStats> getStats() final;
+
+    const SpecificStats* getSpecificStats() const final;
 
     StageState doWork(WorkingSetID* out);
 
@@ -87,23 +125,73 @@ public:
     }
 
 private:
-    /**
-     * Deletes the documents staged in _ridMap in a batch.
-     * Returns NEED_TIME on success.
-     */
+    // Returns NEED_TIME when some, or all, of the documents staged in the _stagedDeletesBuffer are
+    // successfully deleted. Returns NEED_YIELD otherwise.
     PlanStage::StageState _deleteBatch(WorkingSetID* out);
 
-    // Maps records to delete to the latest snapshot their data matched the query. Records must be
-    // deleted in a single WriteUnitOrWork. Operation order has no impact on the outcome of the
-    // WriteUnitOfWork since all operations become visible at the same time.
-    stdx::unordered_map<RecordId, SnapshotId, RecordId::Hasher> _ridMap;
+    // Attempts to delete the documents staged for deletion in a WriteUnitOfWork. Updates
+    // recordsToSkip, docsDeleted, and buffferOffset to reflect which document deletes are skipped,
+    // executed, or remaining when the WriteUnitOfWork is committed.
+    //
+    // Returns the time spent (milliseconds) committing the batch.
+    long long _commitBatch(WorkingSetID* out,
+                           std::set<WorkingSetID>* recordsToSkip,
+                           unsigned int* docsDeleted,
+                           unsigned int* bytesDeleted,
+                           unsigned int* bufferOffset);
 
-    // Whether there are remaining docs in the buffer from a previous call to doWork() that should
-    // be drained before fetching more documents.
-    bool _drainRemainingBuffer = false;
+    // Attempts to stage a new delete in the _stagedDeletesBuffer. Returns the PlanStage::StageState
+    // fetched directly from the child except when there is a document to stage. Converts
+    // PlanStage::ADVANCED to PlanStage::NEED_TIME before returning when a document is staged for
+    // delete - PlanStage:ADVANCED doesn't hold meaning in a batched delete since nothing will ever
+    // be directly returned from this stage.
+    PlanStage::StageState _doStaging(WorkingSetID* out);
+
+    // Stages the document tied to workingSetMemberID into the _stagedDeletesBuffer.
+    void _stageNewDelete(WorkingSetID* workingSetMemberID);
+
+    // Tries to restore the child's state. Returns NEED_TIME if the restore succeeds, NEED_YIELD
+    // otherwise.
+    PlanStage::StageState _tryRestoreState(WorkingSetID* out);
+
+    // Prepares to retry draining the _stagedDeletesBuffer after a WriteConflictException or a
+    // TemporarilyUnavailableException. Removes 'recordsThatNoLongerMatch' then yields.
+    void _prepareToRetryDrainAfterYield(WorkingSetID* out,
+                                        const std::set<WorkingSetID>& recordsThatNoLongerMatch);
+
+    BatchedDeleteStats _specificStats;
+
+    // Returns true if one or more of the batch targets are met and it is time to delete the batch.
+    bool _batchTargetMet();
+
+    // Returns true if one or more of the pass targets are met and it is time to drain the remaining
+    // buffer and return completion. Note - this method checks a timer and repeated calls can become
+    // expensive.
+    bool _passTargetMet();
 
     // Batch targeting parameters.
-    std::unique_ptr<BatchedDeleteStageBatchParams> _batchParams;
+    std::unique_ptr<BatchedDeleteStageParams> _batchedDeleteParams;
+
+    // Holds information for each document staged for delete.
+    BatchedDeleteStageBuffer _stagedDeletesBuffer;
+
+    // Holds the maximum cumulative size of all documents staged for delete. It is a watermark in
+    // that it resets to zero once the target is met and the staged documents start being processed,
+    // regardless of whether all staged deletes have been committed yet.
+    size_t _stagedDeletesWatermarkBytes;
+
+    // Tracks the cumulative number of documents staged for deletes over the operation.
+    long long _passTotalDocsStaged;
+
+    // Tracks the cumulative elapsed time since the operation began.
+    Timer _passTimer;
+
+    // True when the deletes in the buffer must be committed before more documents can be staged.
+    bool _commitStagedDeletes;
+
+    // True when the operation is done staging new documents. The only work left is to drain the
+    // remaining buffer.
+    bool _passStagingComplete;
 };
 
 }  // namespace mongo

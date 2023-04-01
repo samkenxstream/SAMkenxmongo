@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
@@ -36,10 +35,14 @@
 #include "mongo/logv2/log.h"
 #include "mongo/s/request_types/auto_split_vector_gen.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
+
 namespace mongo {
 namespace {
 
-static constexpr int64_t kSmallestChunkSizeSupported = 1024 * 1024;
+static constexpr int64_t kSmallestChunkSizeBytesSupported = 1024 * 1024;
+static constexpr int64_t kBiggestChunkSizeBytesSupported = 1024 * 1024 * 1024;
 
 class AutoSplitVectorCommand final : public TypedCommand<AutoSplitVectorCommand> {
 public:
@@ -67,27 +70,28 @@ public:
         Response typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     "The autoSplitVector command can only be invoked on shards (no CSRS).",
-                    serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
 
             uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
-            opCtx->setAlwaysInterruptAtStepDownOrUp();
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             const auto& req = request();
 
             uassert(ErrorCodes::ErrorCodes::InvalidOptions,
-                    str::stream() << "maxChunksSizeBytes cannot be smaller than "
-                                  << kSmallestChunkSizeSupported,
-                    req.getMaxChunkSizeBytes() >= kSmallestChunkSizeSupported);
+                    str::stream() << "maxChunksSizeBytes must lie within the range ["
+                                  << kSmallestChunkSizeBytesSupported / (1024 * 1024) << "MB, "
+                                  << kBiggestChunkSizeBytesSupported / (1024 * 1024) << "MB]",
+                    req.getMaxChunkSizeBytes() >= kSmallestChunkSizeBytesSupported &&
+                        req.getMaxChunkSizeBytes() <= kBiggestChunkSizeBytesSupported);
 
             auto [splitPoints, continuation] = autoSplitVector(opCtx,
                                                                ns(),
                                                                req.getKeyPattern(),
                                                                req.getMin(),
                                                                req.getMax(),
-                                                               req.getMaxChunkSizeBytes());
-            Response autoSplitVectorResponse(std::move(splitPoints));
-            autoSplitVectorResponse.setContinuation(continuation);
-            return autoSplitVectorResponse;
+                                                               req.getMaxChunkSizeBytes(),
+                                                               req.getLimit());
+            return Response(std::move(splitPoints), continuation);
         }
 
     private:

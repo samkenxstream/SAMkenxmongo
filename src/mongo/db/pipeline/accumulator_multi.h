@@ -46,6 +46,8 @@ namespace mongo {
  */
 class AccumulatorN : public AccumulatorState {
 public:
+    enum AccumulatorType { kMinN, kMaxN, kFirstN, kLastN, kTopN, kTop, kBottomN, kBottom };
+
     static constexpr auto kFieldNameN = "n"_sd;
     static constexpr auto kFieldNameInput = "input"_sd;
 
@@ -64,6 +66,8 @@ public:
 
     AccumulatorN(ExpressionContext* expCtx);
 
+    virtual AccumulatorType getAccumulatorType() const = 0;
+
     /**
      * Verifies that 'input' is a positive integer.
      */
@@ -81,7 +85,7 @@ public:
      */
     static void serializeHelper(const boost::intrusive_ptr<Expression>& initializer,
                                 const boost::intrusive_ptr<Expression>& argument,
-                                bool explain,
+                                SerializationOptions options,
                                 MutableDocument& md);
 
 protected:
@@ -132,12 +136,12 @@ public:
 
     Document serialize(boost::intrusive_ptr<Expression> initializer,
                        boost::intrusive_ptr<Expression> argument,
-                       bool explain) const final;
+                       SerializationOptions options = {}) const final;
 
     void reset() final;
 
-    bool isAssociative() const final {
-        return true;
+    ExpressionNary::Associativity getAssociativity() const final {
+        return ExpressionNary::Associativity::kFull;
     }
 
     bool isCommutative() const final {
@@ -159,6 +163,10 @@ public:
 
     static const char* getName();
 
+    AccumulatorType getAccumulatorType() const {
+        return AccumulatorType::kMinN;
+    }
+
     static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* expCtx);
 };
 
@@ -169,6 +177,10 @@ public:
         : AccumulatorMinMaxN(expCtx, MinMaxSense::kMax) {}
 
     static const char* getName();
+
+    AccumulatorType getAccumulatorType() const override {
+        return AccumulatorType::kMaxN;
+    }
 
     static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* expCtx);
 };
@@ -195,12 +207,12 @@ public:
 
     Document serialize(boost::intrusive_ptr<Expression> initializer,
                        boost::intrusive_ptr<Expression> argument,
-                       bool explain) const final;
+                       SerializationOptions options = {}) const final;
 
     void reset() final;
 
-    bool isAssociative() const final {
-        return true;
+    ExpressionNary::Associativity getAssociativity() const final {
+        return ExpressionNary::Associativity::kFull;
     }
 
     bool isCommutative() const final {
@@ -233,6 +245,10 @@ public:
 
     static const char* getName();
 
+    AccumulatorType getAccumulatorType() const override {
+        return AccumulatorType::kFirstN;
+    }
+
     static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* expCtx);
 };
 
@@ -243,6 +259,10 @@ public:
         : AccumulatorFirstLastN(expCtx, Sense::kLast) {}
 
     static const char* getName();
+
+    AccumulatorType getAccumulatorType() const override {
+        return AccumulatorType::kLastN;
+    }
 
     static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* expCtx);
 };
@@ -302,18 +322,38 @@ public:
 
     Document serialize(boost::intrusive_ptr<Expression> initializer,
                        boost::intrusive_ptr<Expression> argument,
-                       bool explain) const final;
+                       SerializationOptions options = {}) const final;
 
     void reset() final;
 
-    bool isAssociative() const final {
-        return true;
+    ExpressionNary::Associativity getAssociativity() const final {
+        return ExpressionNary::Associativity::kFull;
     }
 
     /**
      * Used for removable version of this operator as a window function.
      */
     void remove(const Value& val);
+
+    SortPattern getSortPattern() const {
+        return _sortPattern;
+    }
+
+    AccumulatorType getAccumulatorType() const override {
+        if constexpr (single) {
+            if constexpr (sense == TopBottomSense::kTop) {
+                return AccumulatorType::kTop;
+            } else {
+                return AccumulatorType::kBottom;
+            }
+        } else {
+            if constexpr (sense == TopBottomSense::kTop) {
+                return AccumulatorType::kTopN;
+            } else {
+                return AccumulatorType::kBottomN;
+            }
+        }
+    }
 
 private:
     // top/bottom/topN/bottomN do NOT ignore null values, but MISSING values will be promoted to

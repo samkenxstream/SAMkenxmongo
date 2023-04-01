@@ -31,6 +31,8 @@
 
 #include <memory>
 
+#include "mongo/db/index/column_key_generator.h"
+#include "mongo/db/index/columns_access_method.h"
 #include "mongo/db/index/duplicate_key_tracker.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/multikey_paths.h"
@@ -48,12 +50,14 @@ class OperationContext;
 
 class IndexBuildInterceptor {
 public:
+    using RetrySkippedRecordMode = SkippedRecordTracker::RetrySkippedRecordMode;
+
     /**
      * Determines if we will yield locks while draining the side tables.
      */
     enum class DrainYieldPolicy { kNoYield, kYield };
 
-    enum class Op { kInsert, kDelete };
+    enum class Op { kInsert, kDelete, kUpdate };
 
     /**
      * Indicates whether to record duplicate keys that have been inserted into the index. When set
@@ -67,7 +71,7 @@ public:
      * table to store any duplicate key constraint violations found during the build, if the index
      * being built has uniqueness constraints.
      */
-    IndexBuildInterceptor(OperationContext* opCtx, IndexCatalogEntry* entry);
+    IndexBuildInterceptor(OperationContext* opCtx, const IndexCatalogEntry* entry);
 
     /**
      * Finds the temporary table associated with storing writes during this index build. Only used
@@ -76,7 +80,7 @@ public:
      * violations found during the build, if the index being built has uniqueness constraints.
      */
     IndexBuildInterceptor(OperationContext* opCtx,
-                          IndexCatalogEntry* entry,
+                          const IndexCatalogEntry* entry,
                           StringData sideWritesIdent,
                           boost::optional<StringData> duplicateKeyTrackerIdent,
                           boost::optional<StringData> skippedRecordTrackerIdent);
@@ -99,6 +103,20 @@ public:
                      const MultikeyPaths& multikeyPaths,
                      Op op,
                      int64_t* numKeysOut);
+
+    /**
+     * Client writes that are concurrent with a column store index build will have their index
+     * updates written to a temporary table. After the index table scan is complete, these updates
+     * will be applied to the underlying index table.
+     *
+     * On success, 'numKeysWrittenOut' will contain the number of keys that will be inserted or
+     * updated by applying the side write and 'numKeysDeletedOut' will contain the number of keys
+     * that will be removed.
+     */
+    Status sideWrite(OperationContext* opCtx,
+                     const std::vector<column_keygen::CellPatch>& keys,
+                     int64_t* numKeysWrittenOut,
+                     int64_t* numKeysDeletedOut);
 
     /**
      * Given a duplicate key, record the key for later verification by a call to
@@ -137,11 +155,16 @@ public:
     }
 
     /**
-     * Tries to index previously skipped records. For each record, if the new indexing attempt is
-     * successful, keys are written directly to the index. Unsuccessful key generation or writes
-     * will return errors.
+     * By default, tries to generate keys and insert previously skipped records in the index. For
+     * each record, if the new indexing attempt is successful, keys are written directly to the
+     * index. Unsuccessful key generation or writes will return errors.
+     *
+     * The behaviour can be modified by specifying a RetrySkippedRecordMode.
      */
-    Status retrySkippedRecords(OperationContext* opCtx, const CollectionPtr& collection);
+    Status retrySkippedRecords(
+        OperationContext* opCtx,
+        const CollectionPtr& collection,
+        RetrySkippedRecordMode mode = RetrySkippedRecordMode::kKeyGenerationAndInsertion);
 
     /**
      * Returns whether there are no visible records remaining to be applied from the side writes
@@ -173,7 +196,6 @@ public:
 private:
     using SideWriteRecord = std::pair<RecordId, BSONObj>;
 
-
     Status _applyWrite(OperationContext* opCtx,
                        const CollectionPtr& coll,
                        const BSONObj& doc,
@@ -193,8 +215,10 @@ private:
                                    FailPoint* fp,
                                    long long iteration) const;
 
+    Status _finishSideWrite(OperationContext* opCtx, const std::vector<BSONObj>& toInsert);
+
     // The entry for the index that is being built.
-    IndexCatalogEntry* _indexCatalogEntry;
+    const IndexCatalogEntry* _indexCatalogEntry;
 
     // This temporary record store records intercepted keys that will be written into the index by
     // calling drainWritesIntoIndex(). It is owned by the interceptor and dropped along with it.
@@ -224,5 +248,4 @@ private:
         MONGO_MAKE_LATCH("IndexBuildInterceptor::_multikeyPathMutex");
     boost::optional<MultikeyPaths> _multikeyPaths;
 };
-
 }  // namespace mongo

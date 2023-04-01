@@ -10,13 +10,14 @@
 
 /*
  * usage --
- *     TODO: Add a comment describing this function.
+ *     Display a usage message for the downgrade command.
  */
 static int
 usage(void)
 {
-    static const char *options[] = {
-      "-V", "a required option, the version to which the database is downgraded", NULL, NULL};
+    static const char *options[] = {"-V",
+      "a required option, the version to which the database is downgraded", "-?",
+      "show this message", NULL, NULL};
 
     util_usage("downgrade -V release", "options:", options);
     return (1);
@@ -24,7 +25,7 @@ usage(void)
 
 /*
  * util_downgrade --
- *     TODO: Add a comment describing this function.
+ *     The downgrade command.
  */
 int
 util_downgrade(WT_SESSION *session, int argc, char *argv[])
@@ -35,12 +36,14 @@ util_downgrade(WT_SESSION *session, int argc, char *argv[])
     char config_str[128], *release;
 
     release = NULL;
-    while ((ch = __wt_getopt(progname, argc, argv, "V:")) != EOF)
+    while ((ch = __wt_getopt(progname, argc, argv, "V:?")) != EOF)
         switch (ch) {
         case 'V':
             release = __wt_optarg;
             break;
         case '?':
+            usage();
+            return (0);
         default:
             return (usage());
         }

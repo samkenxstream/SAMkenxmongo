@@ -2,7 +2,6 @@
  * Tests the donorAbortMigration command during a tenant migration.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
@@ -11,22 +10,26 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    isShardMergeEnabled,
+    makeX509OptionsForTest,
+    runMigrationAsync,
+    tryAbortMigrationAsync
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
 load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+load("jstests/replsets/rslib.js");  // 'createRstArgs'
 
-const kTenantId = "testTenantId";
+const kTenantId = ObjectId().str;
 const kDelayMS =
     500000;  // Using some arbitrarily large delay time in to make sure that the donor is not
              // waiting this long when it receives a donorAbortMigration command.
 
-const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
+const migrationX509Options = makeX509OptionsForTest();
 
 (() => {
     jsTestLog("Test sending donorAbortMigration before an instance's future chain begins.");
@@ -44,16 +47,14 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
         recipientConnString: tmt.getRecipientConnString(),
     };
 
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(tmt.getDonorRst());
+    const donorRstArgs = createRstArgs(tmt.getDonorRst());
 
-    const startMigrationThread =
-        new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
+    const startMigrationThread = new Thread(runMigrationAsync, migrationOpts, donorRstArgs);
     startMigrationThread.start();
 
     fp.wait();
 
-    const tryAbortThread =
-        new Thread(TenantMigrationUtil.tryAbortMigrationAsync, migrationOpts, donorRstArgs);
+    const tryAbortThread = new Thread(tryAbortMigrationAsync, migrationOpts, donorRstArgs);
     tryAbortThread.start();
 
     // Wait for donorAbortMigration command to start.
@@ -82,8 +83,7 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
         "command repeatedly fails with retryable errors.");
     const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
-    if (TenantMigrationUtil.isShardMergeEnabled(
-            tenantMigrationTest.getDonorPrimary().getDB("admin"))) {
+    if (isShardMergeEnabled(tenantMigrationTest.getDonorPrimary().getDB("admin"))) {
         tenantMigrationTest.stop();
         jsTestLog("Skipping test, Shard Merge does not support retry");
         return;
@@ -123,8 +123,7 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
               "against admin.system.keys repeatedly fails with retryable errors.");
     const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
-    if (TenantMigrationUtil.isShardMergeEnabled(
-            tenantMigrationTest.getDonorPrimary().getDB("admin"))) {
+    if (isShardMergeEnabled(tenantMigrationTest.getDonorPrimary().getDB("admin"))) {
         tenantMigrationTest.stop();
         jsTestLog("Skipping test, Shard Merge does not support retry");
         return;
@@ -277,9 +276,8 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
 
     barrierBeforeFetchingKeys.wait();
 
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(tmt.getDonorRst());
-    const tryAbortThread =
-        new Thread(TenantMigrationUtil.tryAbortMigrationAsync, migrationOpts, donorRstArgs);
+    const donorRstArgs = createRstArgs(tmt.getDonorRst());
+    const tryAbortThread = new Thread(tryAbortMigrationAsync, migrationOpts, donorRstArgs);
     tryAbortThread.start();
 
     // Wait for donorAbortMigration command to start.
@@ -306,6 +304,7 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
     const donorRst = new ReplSetTest({
         nodes: 3,
         name: "donorRst",
+        serverless: true,
         settings: {chainingAllowed: false},
         nodeOptions: migrationX509Options.donor
     });
@@ -375,9 +374,8 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
 
     fp.wait();
 
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst());
-    const tryAbortThread =
-        new Thread(TenantMigrationUtil.tryAbortMigrationAsync, migrationOpts, donorRstArgs);
+    const donorRstArgs = createRstArgs(tenantMigrationTest.getDonorRst());
+    const tryAbortThread = new Thread(tryAbortMigrationAsync, migrationOpts, donorRstArgs);
     tryAbortThread.start();
 
     // Wait for donorAbortMigration command to start.
@@ -419,9 +417,8 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
 
     fp.wait();
 
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst());
-    const tryAbortThread =
-        new Thread(TenantMigrationUtil.tryAbortMigrationAsync, migrationOpts, donorRstArgs);
+    const donorRstArgs = createRstArgs(tenantMigrationTest.getDonorRst());
+    const tryAbortThread = new Thread(tryAbortMigrationAsync, migrationOpts, donorRstArgs);
     tryAbortThread.start();
 
     // Wait for donorAbortMigration command to start.
@@ -495,8 +492,8 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
 (() => {
     jsTestLog("Test sending donorAbortMigration for a non-existent tenant migration.");
 
-    const donorRst =
-        new ReplSetTest({nodes: 2, name: "donorRst", nodeOptions: migrationX509Options.donor});
+    const donorRst = new ReplSetTest(
+        {nodes: 2, name: "donorRst", serverless: true, nodeOptions: migrationX509Options.donor});
 
     donorRst.startSet();
     donorRst.initiate();
@@ -537,5 +534,4 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
 
     tenantMigrationTest.stop();
     donorRst.stopSet();
-})();
 })();

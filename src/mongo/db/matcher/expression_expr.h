@@ -68,14 +68,17 @@ public:
      */
     Value evaluateExpression(const MatchableDocument* doc) const;
 
-    std::unique_ptr<MatchExpression> shallowClone() const final;
+    std::unique_ptr<MatchExpression> clone() const final;
 
     void debugString(StringBuilder& debug, int indentationLevel = 0) const final {
         _debugAddSpace(debug, indentationLevel);
         debug << "$expr " << _expression->serialize(false).toString();
+        _debugStringAttachTagInfo(&debug);
     }
 
-    void serialize(BSONObjBuilder* out, bool includePath) const final;
+    void serialize(BSONObjBuilder* out, SerializationOptions opts) const final;
+
+    bool isTriviallyTrue() const final;
 
     bool equivalent(const MatchExpression* other) const final;
 
@@ -88,7 +91,7 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const final {
-        MONGO_UNREACHABLE;
+        MONGO_UNREACHABLE_TASSERT(6400207);
     }
 
     void resetChild(size_t, MatchExpression*) {
@@ -104,6 +107,13 @@ public:
     }
 
     boost::intrusive_ptr<Expression> getExpression() const {
+        return _expression;
+    }
+
+    /**
+     * Use if the caller needs to modify the expression held by this $expr.
+     */
+    boost::intrusive_ptr<Expression>& getExpressionRef() {
         return _expression;
     }
 
@@ -130,12 +140,6 @@ private:
     ExpressionOptimizerFunc getOptimizer() const final;
 
     void _doSetCollator(const CollatorInterface* collator) final;
-
-    void _doAddDependencies(DepsTracker* deps) const final {
-        if (_expression) {
-            _expression->addDependencies(deps);
-        }
-    }
 
     boost::intrusive_ptr<ExpressionContext> _expCtx;
 

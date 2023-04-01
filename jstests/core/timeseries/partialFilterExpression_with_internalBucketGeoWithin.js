@@ -2,20 +2,22 @@
  * This tests that partialFilterExpressions can include the $internalBucketGeoWithin operator when
  * indexing buckets of timeseries operators.
  * @tags: [
- * requires_non_retryable_writes,
- * requires_fcv_51,
- * assumes_no_implicit_collection_creation_after_drop,
- *  does_not_support_transactions
+ *   # Refusing to run a test that issues an aggregation command with explain because it may
+ *   # return incomplete results if interrupted by a stepdown.
+ *   does_not_support_stepdowns,
+ *   requires_non_retryable_writes,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 
 load("jstests/libs/analyze_plan.js");
+load("jstests/libs/feature_flag_util.js");
+load("jstests/libs/fixture_helpers.js");  // For isSharded.
 load('jstests/noPassthrough/libs/index_build.js');
-(function() {
-const isFeatureEnabled = db.adminCommand({getParameter: 1, featureFlagTimeseriesMetricIndexes: 1})
-                             .featureFlagTimeseriesMetricIndexes.value;
 
-if (isFeatureEnabled) {
+(function() {
+if (FeatureFlagUtil.isEnabled(db, "TimeseriesMetricIndexes")) {
     const timeFieldName = "timestamp";
 
     const coll = db.partialFilterExpression_with_internalBucketGeoWithin;
@@ -25,6 +27,8 @@ if (isFeatureEnabled) {
     assert.commandWorked(
         db.createCollection(coll.getName(), {timeseries: {timeField: timeFieldName}}));
     assert.contains(bucketsColl.getName(), db.getCollectionNames());
+
+    const shardKeyIndexCount = FixtureHelpers.isSharded(bucketsColl) ? 1 : 0;
 
     assert.commandWorked(coll.insert({
         timestamp: ISODate(),
@@ -115,7 +119,7 @@ if (isFeatureEnabled) {
         }
     }));
 
-    IndexBuildTest.assertIndexes(bucketsColl, 1, ["a_1"]);
+    IndexBuildTest.assertIndexes(bucketsColl, 1 + shardKeyIndexCount, ["a_1"]);
 
     var findAndExplain = assert.commandWorked(bucketsColl
                                                   .find({
@@ -163,7 +167,7 @@ if (isFeatureEnabled) {
             }
         }
     }));
-    IndexBuildTest.assertIndexes(bucketsColl, 1, ["a_1"]);
+    IndexBuildTest.assertIndexes(bucketsColl, 1 + shardKeyIndexCount, ["a_1"]);
 
     findAndExplain = assert.commandWorked(bucketsColl
                                               .find({

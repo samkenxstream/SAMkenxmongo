@@ -35,7 +35,7 @@
 
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/namespace_string.h"
@@ -55,33 +55,57 @@ namespace {
 
 using namespace mongo::repl;
 
-NamespaceString kMinValidNss("local", "replset.minvalid");
-NamespaceString kOplogTruncateAfterPointNss("local", "replset.oplogTruncateAfterPoint");
-NamespaceString kInitialSyncIdNss("local", "replset.initialSyncId");
+NamespaceString kMinValidNss =
+    NamespaceString::createNamespaceString_forTest("local", "replset.minvalid");
+NamespaceString kOplogTruncateAfterPointNss =
+    NamespaceString::createNamespaceString_forTest("local", "replset.oplogTruncateAfterPoint");
+NamespaceString kInitialSyncIdNss =
+    NamespaceString::createNamespaceString_forTest("local", "replset.initialSyncId");
 
 /**
  * Returns min valid document.
  */
 BSONObj getMinValidDocument(OperationContext* opCtx, const NamespaceString& minValidNss) {
     return writeConflictRetry(opCtx, "getMinValidDocument", minValidNss.ns(), [opCtx, minValidNss] {
-        Lock::DBLock dblk(opCtx, minValidNss.db(), MODE_IS);
+        Lock::DBLock dblk(opCtx, minValidNss.dbName(), MODE_IS);
         Lock::CollectionLock lk(opCtx, minValidNss, MODE_IS);
         BSONObj mv;
-        if (Helpers::getSingleton(opCtx, minValidNss.ns().c_str(), mv)) {
+        if (Helpers::getSingleton(opCtx, minValidNss, mv)) {
             return mv;
         }
         return mv;
     });
 }
 
+class JournalListenerWithDurabilityTracking : public JournalListener {
+public:
+    Token getToken(OperationContext* opCtx) {
+        return {};
+    }
+
+    void onDurable(const Token& token) {
+        onDurableCalled = true;
+    }
+
+    bool onDurableCalled = false;
+};
+
 class ReplicationConsistencyMarkersTest : public ServiceContextMongoDTest {
 protected:
+    ReplicationConsistencyMarkersTest()
+        : ServiceContextMongoDTest(Options{}.useJournalListener(
+              std::make_unique<JournalListenerWithDurabilityTracking>())) {}
+
     OperationContext* getOperationContext() {
         return _opCtx.get();
     }
 
     StorageInterface* getStorageInterface() {
         return _storageInterface.get();
+    }
+
+    JournalListenerWithDurabilityTracking* getJournalListener() {
+        return static_cast<JournalListenerWithDurabilityTracking*>(_journalListener.get());
     }
 
 private:
@@ -106,20 +130,6 @@ private:
     ServiceContext::UniqueOperationContext _opCtx;
     std::unique_ptr<StorageInterfaceImpl> _storageInterface;
 };
-
-/**
- * Recovery unit that tracks if waitUntilDurable() is called.
- */
-class RecoveryUnitWithDurabilityTracking : public RecoveryUnitNoop {
-public:
-    bool waitUntilDurable(OperationContext* opCtx) override;
-    bool waitUntilDurableCalled = false;
-};
-
-bool RecoveryUnitWithDurabilityTracking::waitUntilDurable(OperationContext* opCtx) {
-    waitUntilDurableCalled = true;
-    return RecoveryUnitNoop::waitUntilDurable(opCtx);
-}
 
 TEST_F(ReplicationConsistencyMarkersTest, InitialSyncFlag) {
     ReplicationConsistencyMarkersImpl consistencyMarkers(
@@ -222,19 +232,13 @@ TEST_F(ReplicationConsistencyMarkersTest, ReplicationConsistencyMarkers) {
     // Check oplog truncate after point document.
     ASSERT_EQUALS(endOpTime.getTimestamp(), consistencyMarkers.getOplogTruncateAfterPoint(opCtx));
 
-    // SERVER-49685: We can't use a RecoveryUnitNoop with ephemeralForTest
-    //// Recovery unit will be owned by "opCtx".
-    // RecoveryUnitWithDurabilityTracking* recoveryUnit = new RecoveryUnitWithDurabilityTracking();
-    // opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(recoveryUnit),
-    //                       WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
-
-    //// Set min valid without waiting for the changes to be durable.
-    // OpTime endOpTime2({Seconds(789), 0}, 1LL);
-    // consistencyMarkers.setMinValid(opCtx, endOpTime2);
-    // consistencyMarkers.clearAppliedThrough(opCtx, {});
-    // ASSERT_EQUALS(consistencyMarkers.getAppliedThrough(opCtx), OpTime());
-    // ASSERT_EQUALS(consistencyMarkers.getMinValid(opCtx), endOpTime2);
-    // ASSERT_FALSE(recoveryUnit->waitUntilDurableCalled);
+    // Set min valid without waiting for the changes to be durable.
+    OpTime endOpTime2({Seconds(789), 0}, 1LL);
+    consistencyMarkers.setMinValid(opCtx, endOpTime2);
+    consistencyMarkers.clearAppliedThrough(opCtx);
+    ASSERT_EQUALS(consistencyMarkers.getAppliedThrough(opCtx), OpTime());
+    ASSERT_EQUALS(consistencyMarkers.getMinValid(opCtx), endOpTime2);
+    ASSERT_FALSE(getJournalListener()->onDurableCalled);
 }
 
 TEST_F(ReplicationConsistencyMarkersTest, InitialSyncId) {
@@ -254,8 +258,8 @@ TEST_F(ReplicationConsistencyMarkersTest, InitialSyncId) {
     consistencyMarkers.setInitialSyncIdIfNotSet(opCtx);
     auto firstInitialSyncIdBson = consistencyMarkers.getInitialSyncId(opCtx);
     ASSERT_FALSE(firstInitialSyncIdBson.isEmpty());
-    InitialSyncIdDocument firstInitialSyncIdDoc = InitialSyncIdDocument::parse(
-        IDLParserErrorContext("initialSyncId"), firstInitialSyncIdBson);
+    InitialSyncIdDocument firstInitialSyncIdDoc =
+        InitialSyncIdDocument::parse(IDLParserContext("initialSyncId"), firstInitialSyncIdBson);
 
     // Setting it twice should change nothing.
     consistencyMarkers.setInitialSyncIdIfNotSet(opCtx);
@@ -270,8 +274,8 @@ TEST_F(ReplicationConsistencyMarkersTest, InitialSyncId) {
     consistencyMarkers.setInitialSyncIdIfNotSet(opCtx);
     auto secondInitialSyncIdBson = consistencyMarkers.getInitialSyncId(opCtx);
     ASSERT_FALSE(secondInitialSyncIdBson.isEmpty());
-    InitialSyncIdDocument secondInitialSyncIdDoc = InitialSyncIdDocument::parse(
-        IDLParserErrorContext("initialSyncId"), secondInitialSyncIdBson);
+    InitialSyncIdDocument secondInitialSyncIdDoc =
+        InitialSyncIdDocument::parse(IDLParserContext("initialSyncId"), secondInitialSyncIdBson);
     ASSERT_NE(firstInitialSyncIdDoc.get_id(), secondInitialSyncIdDoc.get_id());
 }
 

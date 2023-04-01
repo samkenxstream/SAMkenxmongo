@@ -366,11 +366,11 @@ public:
                                  BSONObjBuilder* response,
                                  Status* result);
 
-    // produce a reply to a V1 heartbeat
-    Status prepareHeartbeatResponseV1(Date_t now,
-                                      const ReplSetHeartbeatArgsV1& args,
-                                      StringData ourSetName,
-                                      ReplSetHeartbeatResponse* response);
+    // produce a reply to a V1 heartbeat, and return whether the remote node's config has changed.
+    StatusWith<bool> prepareHeartbeatResponseV1(Date_t now,
+                                                const ReplSetHeartbeatArgsV1& args,
+                                                StringData ourSetName,
+                                                ReplSetHeartbeatResponse* response);
 
     struct ReplSetStatusArgs {
         const Date_t now;
@@ -585,7 +585,7 @@ public:
      * Returns a Status if the position could not be set, false if the last optimes for the node
      * did not change, or true if either the last applied or last durable optime did change.
      */
-    StatusWith<bool> setLastOptime(const UpdatePositionArgs::UpdateInfo& args, Date_t now);
+    StatusWith<bool> setLastOptimeForMember(const UpdatePositionArgs::UpdateInfo& args, Date_t now);
 
     /**
      * Sets the latest optime committed in the previous config to the current lastCommitted optime.
@@ -986,7 +986,7 @@ private:
 
     // Returns the oldest acceptable OpTime that a node must have for us to choose it as our sync
     // source.
-    const OpTime _getOldestSyncOpTime() const;
+    OpTime _getOldestSyncOpTime() const;
 
     // Returns true if the candidate node is viable as our sync source.
     bool _isEligibleSyncSource(int candidateIndex,
@@ -1038,7 +1038,7 @@ private:
     MemberData& _selfMemberData();
 
     // Index of self member in member data.
-    const int _selfMemberDataIndex() const;
+    int _selfMemberDataIndex() const;
 
     /*
      * Returns information we have on the state of the node identified by memberId.  Returns

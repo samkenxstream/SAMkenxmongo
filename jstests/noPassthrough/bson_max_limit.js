@@ -69,11 +69,11 @@ function executeTest(db) {
 
     // Reset. Test retryable findAndModify's.
     let sessionDb = db.getMongo().startSession({}).getDatabase("test");
-    retryableFindAndModify(db, "coll", {_id: 1}, false, false, false, /*remove=*/true);
-    retryableFindAndModify(db, "coll", {_id: 1}, doc, false, /*upsert=*/true, false);
+    retryableFindAndModify(db, "coll", {_id: 1}, false, false, false, /*remove=*/ true);
+    retryableFindAndModify(db, "coll", {_id: 1}, doc, false, /*upsert=*/ true, false);
     retryableFindAndModify(db, "coll", {_id: 1}, {$unset: {a: 1}}, false, false, false);
     retryableFindAndModify(
-        db, "coll", {_id: 1}, {$set: {a: bigStr}}, /*new(Image)=*/true, false, false);
+        db, "coll", {_id: 1}, {$set: {a: bigStr}}, /*new(Image)=*/ true, false, false);
 }
 
 {
@@ -102,11 +102,6 @@ function executeTest(db) {
     // Test the modern default behavior where storeFindAndModifyImagesInSideCollection is true.
     rst.getPrimary().adminCommand(
         {setParameter: 1, storeFindAndModifyImagesInSideCollection: true});
-    executeTest(rst.getPrimary().getDB("test"));
-
-    // Test the legacy behavior where storeFindAndModifyImagesInSideCollection is false.
-    rst.getPrimary().adminCommand(
-        {setParameter: 1, storeFindAndModifyImagesInSideCollection: false});
     executeTest(rst.getPrimary().getDB("test"));
     rst.stopSet();
 }

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -37,6 +36,9 @@
 #include "mongo/unittest/log_test.h"
 #include "mongo/util/log_with_sampling.h"
 #include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace {
@@ -63,9 +65,10 @@ auto scenario(bool debugLogEnabled, bool slowOp, bool forceSample) {
     auto loggedSeverityGuard = unittest::MinimumLoggedSeverityGuard(
         component, debugLogEnabled ? logv2::LogSeverity::Debug(1) : logv2::LogSeverity::Info());
 
-    ScopeGuard sampleRateGuard(
-        [savedRate = serverGlobalParams.sampleRate] { serverGlobalParams.sampleRate = savedRate; });
-    serverGlobalParams.sampleRate = forceSample ? 1.0 : 0.0;
+    ScopeGuard sampleRateGuard([savedRate = serverGlobalParams.sampleRate.load()] {
+        serverGlobalParams.sampleRate.store(savedRate);
+    });
+    serverGlobalParams.sampleRate.store(forceSample ? 1.0 : 0.0);
 
     return shouldLogSlowOpWithSampling(
         opCtx.get(), component, Milliseconds{slowOp ? 11 : 9}, Milliseconds{10});

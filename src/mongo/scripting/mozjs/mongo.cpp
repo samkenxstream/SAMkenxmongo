@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/scripting/mozjs/mongo.h"
 
 #include <js/Object.h>
@@ -41,11 +39,13 @@
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/replica_set_monitor.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/logical_session_id_helpers.h"
+#include "mongo/client/sasl_oidc_client_conversation.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
+#include "mongo/scripting/engine.h"
 #include "mongo/scripting/mozjs/cursor.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
@@ -54,6 +54,7 @@
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/quick_exit.h"
 
 namespace mongo {
@@ -61,6 +62,7 @@ namespace mozjs {
 
 const JSFunctionSpec MongoBase::methods[] = {
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(auth, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(cleanup, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(close, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(compact, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(cursorHandleFromId, MongoExternalInfo),
@@ -80,12 +82,15 @@ const JSFunctionSpec MongoBase::methods[] = {
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(getApiParameters, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(_runCommandImpl, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(_startSession, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(_setOIDCIdPAuthCallback, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(_refreshAccessToken, MongoExternalInfo),
     JS_FS_END,
 };
 
 const char* const MongoBase::className = "Mongo";
 
 EncryptedDBClientCallback* encryptedDBClientCallback = nullptr;
+GetNestedConnectionCallback* getNestedConnectionCallback = nullptr;
 
 const JSFunctionSpec MongoExternalInfo::freeFunctions[4] = {
     MONGO_ATTACH_JS_FUNCTION(_forgetReplSet),
@@ -259,13 +264,16 @@ void doRunCommand(JSContext* cx, JS::CallArgs args, MakeRequest makeRequest) {
     auto arg = ValueWriter(cx, args.get(1)).toBSON();
 
     auto request = makeRequest(database, arg);
-    if (auto token = args.get(3); token.isObject()) {
-        request.securityToken = ValueWriter(cx, token).toBSON();
+    if (auto tokenArg = args.get(3); tokenArg.isObject()) {
+        using VTS = auth::ValidatedTenancyScope;
+        if (auto token = ValueWriter(cx, tokenArg).toBSON(); token.nFields() > 0) {
+            request.validatedTenancyScope = VTS(token, VTS::InitTag::kInitForShell);
+        }
     } else {
         uassert(ErrorCodes::BadValue,
                 str::stream() << "The token parameter to " << Params::kCommandName
                               << " must be an object",
-                token.isUndefined());
+                tokenArg.isUndefined());
     }
 
     const auto& conn = getConnectionRef(args);
@@ -312,57 +320,35 @@ void MongoBase::Functions::_runCommandImpl::call(JSContext* cx, JS::CallArgs arg
                 str::stream() << "The options parameter to runCommand must be a number",
                 args.get(2).isNumber());
         auto options = ValueWriter(cx, args.get(2)).toInt32();
-        return rpc::upconvertRequest(database, cmd, options);
+        return rpc::upconvertRequest({boost::none, database}, cmd, options);
     });
 }
 
 void MongoBase::Functions::find::call(JSContext* cx, JS::CallArgs args) {
     auto scope = getScope(cx);
 
-    if (args.length() != 7)
-        uasserted(ErrorCodes::BadValue, "find needs 7 args");
-
-    if (!args.get(1).isObject())
-        uasserted(ErrorCodes::BadValue, "needs to be an object");
+    tassert(6887100, "wrong number of args for find operation", args.length() == 3);
+    tassert(6887101, "first arg must be an object", args.get(0).isObject());
+    tassert(6887102, "second arg must be an object", args.get(1).isObject());
+    tassert(6887103, "third arg must be a boolean", args.get(2).isBoolean());
 
     auto conn = getConnection(args);
 
-    std::string ns = ValueWriter(cx, args.get(0)).toString();
+    const BSONObj cmdObj = ValueWriter(cx, args.get(0)).toBSON();
+    const BSONObj readPreference = ValueWriter(cx, args.get(1)).toBSON();
+    const bool isExhaust = ValueWriter(cx, args.get(2)).toBoolean();
 
-    BSONObj fields;
-    BSONObj q = ValueWriter(cx, args.get(1)).toBSON();
-
-    bool haveFields = false;
-
-    if (args.get(2).isObject()) {
-        JS::RootedObject obj(cx, args.get(2).toObjectOrNull());
-
-        ObjectWrapper(cx, obj).enumerate([&](jsid) {
-            haveFields = true;
-            return false;
-        });
+    FindCommandRequest findCmdRequest =
+        FindCommandRequest::parse(IDLParserContext("FindCommandRequest"), cmdObj);
+    ReadPreferenceSetting readPref;
+    if (!readPreference.isEmpty()) {
+        readPref = uassertStatusOK(ReadPreferenceSetting::fromInnerBSON(readPreference));
     }
+    ExhaustMode exhaustMode = isExhaust ? ExhaustMode::kOn : ExhaustMode::kOff;
 
-    if (haveFields)
-        fields = ValueWriter(cx, args.get(2)).toBSON();
-
-    int limit = ValueWriter(cx, args.get(3)).toInt32();
-    int nToSkip = ValueWriter(cx, args.get(4)).toInt32();
-    int batchSize = ValueWriter(cx, args.get(5)).toInt32();
-    int options = ValueWriter(cx, args.get(6)).toInt32();
-
-    const Query query = Query::fromBSONDeprecated(q);
-    std::unique_ptr<DBClientCursor> cursor(conn->query_DEPRECATED(NamespaceString(ns),
-                                                                  query.getFilter(),
-                                                                  query,
-                                                                  limit,
-                                                                  nToSkip,
-                                                                  haveFields ? &fields : nullptr,
-                                                                  options,
-                                                                  batchSize));
-    if (!cursor.get()) {
-        uasserted(ErrorCodes::InternalError, "error doing query: failed");
-    }
+    std::unique_ptr<DBClientCursor> cursor =
+        conn->find(std::move(findCmdRequest), readPref, exhaustMode);
+    uassert(ErrorCodes::InternalError, "error doing query: failed", cursor);
 
     JS::RootedObject c(cx);
     scope->getProto<CursorInfo>().newObject(&c);
@@ -406,6 +392,12 @@ void MongoBase::Functions::decrypt::call(JSContext* cx, JS::CallArgs args) {
     auto conn = getConnection(args);
     auto ptr = getEncryptionCallbacks(conn);
     ptr->decrypt(scope, cx, args);
+}
+
+void MongoBase::Functions::cleanup::call(JSContext* cx, JS::CallArgs args) {
+    auto conn = getConnection(args);
+    auto ptr = getEncryptionCallbacks(conn);
+    ptr->cleanup(cx, args);
 }
 
 void MongoBase::Functions::compact::call(JSContext* cx, JS::CallArgs args) {
@@ -487,9 +479,16 @@ void MongoBase::Functions::_markNodeAsFailed::call(JSContext* cx, JS::CallArgs a
                   "third argument to _markNodeAsFailed must be a stringified reason");
     }
 
-    auto* rsConn = dynamic_cast<DBClientReplicaSet*>(getConnection(args));
+    DBClientReplicaSet* rsConn = dynamic_cast<DBClientReplicaSet*>(getConnection(args));
+    if (!rsConn && getNestedConnectionCallback) {
+        DBClientBase* base = getNestedConnectionCallback(getConnection(args));
+        if (base) {
+            rsConn = dynamic_cast<DBClientReplicaSet*>(base);
+        }
+    }
+
     if (!rsConn) {
-        uasserted(ErrorCodes::BadValue, "connection object isn't a replica set connection");
+        uasserted(ErrorCodes::BadValue, "connection object is not a replica set object");
     }
 
     auto hostAndPort = ValueWriter(cx, args.get(0)).toString();
@@ -514,8 +513,10 @@ std::unique_ptr<DBClientBase> runEncryptedDBClientCallback(std::unique_ptr<DBCli
     return conn;
 }
 
-void setEncryptedDBClientCallback(EncryptedDBClientCallback* callback) {
-    encryptedDBClientCallback = callback;
+void setEncryptedDBClientCallbacks(EncryptedDBClientCallback* encCallback,
+                                   GetNestedConnectionCallback* getCallback) {
+    encryptedDBClientCallback = encCallback;
+    getNestedConnectionCallback = getCallback;
 }
 
 // "new Mongo(uri, encryptedDBClientCallback, {options...})"
@@ -540,8 +541,8 @@ void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {
             uassert(4938001,
                     "the 'api' option for Mongo() must be an object",
                     options["api"].isABSONObj());
-            apiParameters = ClientAPIVersionParameters::parse(IDLParserErrorContext("api"_sd),
-                                                              options["api"].Obj());
+            apiParameters =
+                ClientAPIVersionParameters::parse(IDLParserContext("api"_sd), options["api"].Obj());
             if (apiParameters.getDeprecationErrors().value_or(false) ||
                 apiParameters.getStrict().value_or(false)) {
                 uassert(4938002,
@@ -583,7 +584,7 @@ void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {
     // the global retryWrites value. This is checked in sessions.js by using the injected
     // _shouldRetryWrites() function, which returns true if the --retryWrites flag was passed.
     if (retryWrites) {
-        o.setBoolean(InternedString::_retryWrites, retryWrites.get());
+        o.setBoolean(InternedString::_retryWrites, retryWrites.value());
     }
 
     args.rval().setObjectOrNull(thisv);
@@ -637,6 +638,40 @@ void MongoBase::Functions::_startSession::call(JSContext* cx, JS::CallArgs args)
     args.rval().setObjectOrNull(obj.get());
 }
 
+void MongoBase::Functions::_setOIDCIdPAuthCallback::call(JSContext* cx, JS::CallArgs args) {
+    if (args.length() != 1) {
+        uasserted(ErrorCodes::BadValue, "_setOIDCIdPAuthCallBack takes exactly 1 arg");
+    }
+
+    if (!args.get(0).isString()) {
+        uasserted(ErrorCodes::BadValue,
+                  "first argument to _setOIDCIdPAuthCallback must be a stringified function");
+    }
+
+    // ValueWriter currently does not have a native way to retrieve a std::function from a JS
+    // function. Existing places that require executing JS functions ($where, db.eval) parse the JS
+    // function as a raw string and then stash that into a wrapper type such as JsFunction.
+    // ScriptingFunction is loaded with the stringified function and then gets invoked by the parent
+    // scope. A potential alternative here would be to use JS_ValueToFunction, but that returns a
+    // pointer to a JSFunction that is still locally scoped to this function. Hence, we represent
+    // the function as a string, stash it into a lambda, and execute it directly when needed.
+    std::string stringifiedFn = ValueWriter(cx, args.get(0)).toString();
+    SaslOIDCClientConversation::setOIDCIdPAuthCallback(
+        [=](StringData userName, StringData idpEndpoint) {
+            auto* jsScope = getGlobalScriptEngine()->newScope();
+            BSONObj authInfo = BSON("userName" << userName << "activationEndpoint" << idpEndpoint);
+            ScriptingFunction function = jsScope->createFunction(stringifiedFn.c_str());
+            jsScope->invoke(function, nullptr, &authInfo);
+        });
+
+    args.rval().setUndefined();
+}
+
+void MongoBase::Functions::_refreshAccessToken::call(JSContext* cx, JS::CallArgs args) {
+    auto accessToken = uassertStatusOK(SaslOIDCClientConversation::doRefreshFlow());
+    ValueReader(cx, args.rval()).fromStringData(accessToken);
+}
+
 void MongoExternalInfo::Functions::load::call(JSContext* cx, JS::CallArgs args) {
     auto scope = getScope(cx);
 
@@ -652,7 +687,10 @@ void MongoExternalInfo::Functions::load::call(JSContext* cx, JS::CallArgs args) 
 }
 
 void MongoExternalInfo::Functions::quit::call(JSContext* cx, JS::CallArgs args) {
-    quickExit(args.get(0).isNumber() ? args.get(0).toNumber() : 0);
+    auto arg = args.get(0);
+    quickExit(((arg.isNumber()) && (arg.toNumber() >= 0) && (arg.toNumber() <= 255))
+                  ? static_cast<ExitCode>(arg.toNumber())
+                  : ExitCode::clean);
 }
 
 void MongoExternalInfo::Functions::_forgetReplSet::call(JSContext* cx, JS::CallArgs args) {

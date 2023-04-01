@@ -3,33 +3,24 @@
  * entries with timestamp less than the 'startFetchingDonorTimestamp'.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
+ *   incompatible_with_shard_merge,
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
  * ]
  */
-(function() {
-"use strict";
 
-load("jstests/libs/retryable_writes_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/libs/uuid_util.js");        // For extractUUIDFromObject().
 load("jstests/libs/fail_point_util.js");  // For configureFailPoint().
 load("jstests/libs/parallelTester.js");   // For Thread.
 
-if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
-    jsTestLog("Retryable writes are not supported, skipping test");
-    return;
-}
-
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
-const kTenantId = "testTenantId";
-const kDbName = kTenantId + "_" +
-    "testDb";
+const kTenantId = ObjectId().str;
+const kDbName = `${kTenantId}_testDb`;
 const kCollName = "testColl";
 
 const donorPrimary = tenantMigrationTest.getDonorPrimary();
@@ -75,7 +66,7 @@ const fpAfterPreFetchingRetryableWrites = configureFailPoint(
 fpBeforeRetrievingStartOpTime.off();
 fpAfterPreFetchingRetryableWrites.wait();
 
-const kOplogBufferNS = "repl.migration.oplog_" + migrationOpts.migrationIdString;
+const kOplogBufferNS = `repl.migration.oplog_${migrationOpts.migrationIdString}`;
 const recipientOplogBuffer = recipientPrimary.getDB("config")[kOplogBufferNS];
 jsTestLog({"oplog buffer ns": kOplogBufferNS});
 let res = recipientOplogBuffer.find({"entry.o._id": "retryableWrite"}).toArray();
@@ -113,4 +104,3 @@ assert.eq(0, bsonWoCompare(cmdResponse, retryResponse), retryResponse);
 
 assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 tenantMigrationTest.stop();
-})();

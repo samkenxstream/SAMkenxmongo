@@ -28,7 +28,9 @@
  */
 
 #include "mongo/db/query/optimizer/syntax/expr.h"
+#include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/query/optimizer/node.h"
+#include "mongo/platform/decimal128.h"
 
 namespace mongo::optimizer {
 
@@ -50,7 +52,12 @@ Constant::Constant(Constant&& other) noexcept {
     other._val = 0;
 }
 
-ABT Constant::str(std::string str) {
+ABT Constant::createFromCopy(const sbe::value::TypeTags tag, const sbe::value::Value val) {
+    auto copy = sbe::value::copyValue(tag, val);
+    return make<Constant>(copy.first, copy.second);
+}
+
+ABT Constant::str(StringData str) {
     // Views are non-owning so we have to make a copy.
     auto [tag, val] = makeNewString(str);
     return make<Constant>(tag, val);
@@ -66,6 +73,19 @@ ABT Constant::int64(int64_t valueInt64) {
 
 ABT Constant::fromDouble(double value) {
     return make<Constant>(TypeTags::NumberDouble, bitcastFrom<double>(value));
+}
+
+ABT Constant::fromDecimal(const Decimal128& value) {
+    auto [tag, val] = makeCopyDecimal(value);
+    return make<Constant>(tag, val);
+}
+
+ABT Constant::timestamp(const Timestamp& t) {
+    return make<Constant>(TypeTags::Timestamp, bitcastFrom<uint64_t>(t.asULL()));
+}
+
+ABT Constant::date(const Date_t& d) {
+    return make<Constant>(TypeTags::Date, bitcastFrom<int64_t>(d.toMillisSinceEpoch()));
 }
 
 ABT Constant::emptyObject() {
@@ -103,7 +123,13 @@ Constant::~Constant() {
 }
 
 bool Constant::operator==(const Constant& other) const {
+    // Handle the cases when only one of the compared values is Nothing; in this scenario,
+    // compareValue returns Nothing instead of the answer we want.
+    if (_tag == sbe::value::TypeTags::Nothing || other._tag == sbe::value::TypeTags::Nothing) {
+        return _tag == other._tag;
+    }
     const auto [compareTag, compareVal] = compareValue(_tag, _val, other._tag, other._val);
+    uassert(7086702, "Invalid comparison result", compareTag == sbe::value::TypeTags::NumberInt32);
     return sbe::value::bitcastTo<int32_t>(compareVal) == 0;
 }
 
@@ -131,6 +157,33 @@ bool Constant::isValueInt32() const {
 int32_t Constant::getValueInt32() const {
     uassert(6624354, "Constant value type is not int32_t", isValueInt32());
     return bitcastTo<int32_t>(_val);
+}
+
+bool Constant::isValueDouble() const {
+    return _tag == TypeTags::NumberDouble;
+}
+
+double Constant::getValueDouble() const {
+    uassert(673180, "Constant value type is not double", isValueDouble());
+    return bitcastTo<double>(_val);
+}
+
+bool Constant::isValueDecimal() const {
+    return _tag == TypeTags::NumberDecimal;
+}
+
+Decimal128 Constant::getValueDecimal() const {
+    uassert(673181, "Constant value type is not Decimal128", isValueDecimal());
+    return bitcastTo<Decimal128>(_val);
+}
+
+bool Constant::isValueBool() const {
+    return _tag == TypeTags::Boolean;
+}
+
+bool Constant::getValueBool() const {
+    uassert(6624356, "Constant value type is not bool", isValueBool());
+    return bitcastTo<bool>(_val);
 }
 
 }  // namespace mongo::optimizer

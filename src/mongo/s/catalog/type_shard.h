@@ -35,7 +35,7 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/db/shard_id.h"
 
 namespace mongo {
 
@@ -56,9 +56,6 @@ public:
         kNotShardAware = 0,
         kShardAware,
     };
-
-    // Name of the shards collection in the config server.
-    static const NamespaceString ConfigNS;
 
     // Field names and types in the shards collection type.
     static const BSONField<std::string> name;
@@ -138,6 +135,8 @@ private:
     boost::optional<std::string> _host;
     // (O) is it draining chunks?
     boost::optional<bool> _draining;
+
+    // TODO SERVER-68430 remove maxSizeMB field after 7.0 branches out
     // (O) maximum allowed disk space in MB
     boost::optional<long long> _maxSizeMB;
     // (O) shard tags

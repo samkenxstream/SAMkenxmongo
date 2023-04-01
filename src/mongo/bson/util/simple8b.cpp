@@ -257,7 +257,12 @@ uint8_t _countTrailingZerosWithZero(uint128_t value) {
 uint8_t _countBitsWithoutLeadingZeros(uint128_t value) {
     uint64_t high = absl::Uint128High64(value);
     if (high == 0) {
-        return _countBitsWithoutLeadingZeros(static_cast<uint64_t>(value));
+        uint64_t low = absl::Uint128Low64(value);
+        // We can't call _countBitsWithoutLeadingZeros() with numeric_limits<uint64_t>::max as it
+        // would overflow and yield the wrong result. Just return the correct value instead.
+        if (low == std::numeric_limits<uint64_t>::max())
+            return 65;
+        return _countBitsWithoutLeadingZeros(low);
     } else {
         return 128 - countLeadingZerosNonZero64(high);
     }
@@ -352,7 +357,7 @@ Simple8bBuilder<T>::PendingIterator::PendingIterator(
     : _begin(beginning), _it(it), _rleValue(rleValue), _rleCount(rleCount) {}
 
 template <typename T>
-auto Simple8bBuilder<T>::PendingIterator::operator-> () const -> pointer {
+auto Simple8bBuilder<T>::PendingIterator::operator->() const -> pointer {
     return &operator*();
 }
 
@@ -700,7 +705,7 @@ int64_t Simple8bBuilder<T>::_encodeLargestPossibleWord(uint8_t extensionType) {
 
     _pendingValues.erase(_pendingValues.begin(), _pendingValues.begin() + integersCoded);
     _currMaxBitLen = kMinDataBits;
-    for (auto val : _pendingValues) {
+    for (const auto& val : _pendingValues) {
         _updateSimple8bCurrentState(val);
     }
     // Reset which selectors are possible to use for next word

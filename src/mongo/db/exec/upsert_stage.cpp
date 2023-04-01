@@ -29,14 +29,17 @@
 
 #include "mongo/db/exec/upsert_stage.h"
 
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/local_oplog_info.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/internal_transactions_feature_flag_gen.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/update/storage_validation.h"
+#include "mongo/db/update/update_util.h"
 #include "mongo/s/would_change_owning_shard_exception.h"
 
 namespace mongo {
@@ -128,9 +131,13 @@ void UpsertStage::_performInsert(BSONObj newDocument) {
     // 'q' field belong to this shard, but those in the 'u' field do not. In this case we need to
     // throw so that MongoS can target the insert to the correct shard.
     if (_isUserInitiatedWrite) {
-        auto* const css = CollectionShardingState::get(opCtx(), collection()->ns());
-        if (css->getCollectionDescription(opCtx()).isSharded()) {
-            const auto collFilter = css->getOwnershipFilter(
+        const auto& collDesc =
+            _cachedShardingCollectionDescription.getCollectionDescription(opCtx());
+
+        if (collDesc.isSharded()) {
+            auto scopedCss = CollectionShardingState::assertCollectionLockedAndAcquire(
+                opCtx(), collection()->ns());
+            auto collFilter = scopedCss->getOwnershipFilter(
                 opCtx(), CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup);
             const ShardKeyPattern& shardKeyPattern = collFilter.getShardKeyPattern();
             auto newShardKey = shardKeyPattern.extractShardKeyFromDoc(newDocument);
@@ -138,12 +145,20 @@ void UpsertStage::_performInsert(BSONObj newDocument) {
             if (!collFilter.keyBelongsToMe(newShardKey)) {
                 // An attempt to upsert a document with a shard key value that belongs on another
                 // shard must either be a retryable write or inside a transaction.
-                uassert(ErrorCodes::IllegalOperation,
+                // An upsert without a transaction number is legal if
+                // gFeatureFlagUpdateDocumentShardKeyUsingTransactionApi is enabled because mongos
+                // will be able to start an internal transaction to handle the
+                // wouldChangeOwningShard error thrown below.
+                if (!feature_flags::gFeatureFlagUpdateDocumentShardKeyUsingTransactionApi.isEnabled(
+                        serverGlobalParams.featureCompatibility)) {
+                    uassert(
+                        ErrorCodes::IllegalOperation,
                         "The upsert document could not be inserted onto the shard targeted by the "
                         "query, since its shard key belongs on a different shard. Cross-shard "
                         "upserts are only allowed when running in a transaction or with "
                         "retryWrites: true.",
                         opCtx()->getTxnNumber());
+                }
                 uasserted(WouldChangeOwningShardInfo(_params.request->getQuery(),
                                                      newDocument,
                                                      true /* upsert */,
@@ -171,11 +186,12 @@ void UpsertStage::_performInsert(BSONObj newDocument) {
             insertStmt.oplogSlot = oplogSlots.front();
         }
 
-        uassertStatusOK(collection()->insertDocument(opCtx(),
-                                                     insertStmt,
-                                                     _params.opDebug,
-                                                     _params.request->source() ==
-                                                         OperationSource::kFromMigrate));
+        uassertStatusOK(collection_internal::insertDocument(opCtx(),
+                                                            collection(),
+                                                            insertStmt,
+                                                            _params.opDebug,
+                                                            _params.request->source() ==
+                                                                OperationSource::kFromMigrate));
 
         // Technically, we should save/restore state here, but since we are going to return
         // immediately after, it would just be wasted work.
@@ -184,59 +200,36 @@ void UpsertStage::_performInsert(BSONObj newDocument) {
 }
 
 BSONObj UpsertStage::_produceNewDocumentForInsert() {
-    // Obtain the collection description. This will be needed to compute the shardKey paths.
-    // The collection description must remain in scope since it owns the pointers used by
-    // 'shardKeyPaths' and 'immutablePaths'.
-    boost::optional<ScopedCollectionDescription> optCollDesc;
     FieldRefSet shardKeyPaths, immutablePaths;
-
     if (_isUserInitiatedWrite) {
-        optCollDesc.emplace(
-            CollectionShardingState::get(opCtx(), _params.request->getNamespaceString())
-                ->getCollectionDescription(opCtx()));
+        // Obtain the collection description. This will be needed to compute the shardKey paths.
+        const auto& collDesc =
+            _cachedShardingCollectionDescription.getCollectionDescription(opCtx());
 
         // If the collection is sharded, add all fields from the shard key to the 'shardKeyPaths'
         // set.
-        if (optCollDesc->isSharded()) {
-            shardKeyPaths.fillFrom(optCollDesc->getKeyPatternFields());
+        if (collDesc.isSharded()) {
+            shardKeyPaths.fillFrom(collDesc.getKeyPatternFields());
         }
+
         // An unversioned request cannot update the shard key, so all shardKey paths are immutable.
-        if (!OperationShardingState::isOperationVersioned(opCtx())) {
+        if (!OperationShardingState::isComingFromRouter(opCtx())) {
             for (auto&& shardKeyPath : shardKeyPaths) {
                 immutablePaths.insert(shardKeyPath);
             }
         }
+
         // The _id field is always immutable to user requests, even if the shard key is mutable.
         immutablePaths.keepShortest(&idFieldRef);
     }
 
-    // Reset the document into which we will be writing.
-    _doc.reset();
+    // Generate the new document to be inserted.
+    update::produceDocumentForUpsert(
+        opCtx(), _params.request, _params.driver, _params.canonicalQuery, immutablePaths, _doc);
 
-    // First: populate the document's immutable paths with equality predicate values from the query,
-    // if available. This generates the pre-image document that we will run the update against.
-    if (auto* cq = _params.canonicalQuery) {
-        uassertStatusOK(_params.driver->populateDocumentWithQueryFields(*cq, immutablePaths, _doc));
-    } else {
-        fassert(17354, CanonicalQuery::isSimpleIdQuery(_params.request->getQuery()));
-        fassert(17352, _doc.root().appendElement(_params.request->getQuery()[idFieldName]));
-    }
-
-    // Second: run the appropriate document generation strategy over the document to generate the
-    // post-image. If the update operation modifies any of the immutable paths, this will throw.
-    if (_params.request->shouldUpsertSuppliedDocument()) {
-        _generateNewDocumentFromSuppliedDoc(immutablePaths);
-    } else {
-        _generateNewDocumentFromUpdateOp(immutablePaths);
-    }
-
-    // Third: ensure _id is first if it exists, and generate a new OID otherwise.
-    _ensureIdFieldIsFirst(&_doc, true);
-
-    // Fourth: assert that the finished document has all required fields and is valid for storage.
+    // Assert that the finished document has all required fields and is valid for storage.
     _assertDocumentToBeInsertedIsValid(_doc, shardKeyPaths);
 
-    // Fifth: validate that the newly-produced document does not exceed the maximum BSON user size.
     auto newDocument = _doc.getObject();
     if (!DocumentValidationSettings::get(opCtx()).isInternalValidationDisabled()) {
         uassert(17420,
@@ -247,42 +240,7 @@ BSONObj UpsertStage::_produceNewDocumentForInsert() {
     return newDocument;
 }
 
-void UpsertStage::_generateNewDocumentFromUpdateOp(const FieldRefSet& immutablePaths) {
-    // Use the UpdateModification from the original request to generate a new document by running
-    // the update over the empty (except for fields extracted from the query) document. We do not
-    // validate for storage until later, but we do ensure that no immutable fields are modified.
-    const bool validateForStorage = false;
-    const bool isInsert = true;
-    uassertStatusOK(
-        _params.driver->update(opCtx(), {}, &_doc, validateForStorage, immutablePaths, isInsert));
-};
-
-void UpsertStage::_generateNewDocumentFromSuppliedDoc(const FieldRefSet& immutablePaths) {
-    // We should never call this method unless the request has a set of update constants.
-    invariant(_params.request->shouldUpsertSuppliedDocument());
-    invariant(_params.request->getUpdateConstants());
-
-    // Extract the supplied document from the constants and validate that it is an object.
-    auto suppliedDocElt = _params.request->getUpdateConstants()->getField("new"_sd);
-    invariant(suppliedDocElt.type() == BSONType::Object);
-    auto suppliedDoc = suppliedDocElt.embeddedObject();
-
-    // The supplied doc is functionally a replacement update. We need a new driver to apply it.
-    UpdateDriver replacementDriver(nullptr);
-
-    // Create a new replacement-style update from the supplied document.
-    replacementDriver.parse(write_ops::UpdateModification::parseFromClassicUpdate(suppliedDoc), {});
-    replacementDriver.setLogOp(false);
-
-    // We do not validate for storage, as we will validate the full document before inserting.
-    // However, we ensure that no immutable fields are modified.
-    const bool validateForStorage = false;
-    const bool isInsert = true;
-    uassertStatusOK(
-        replacementDriver.update(opCtx(), {}, &_doc, validateForStorage, immutablePaths, isInsert));
-}
-
-void UpsertStage::_assertDocumentToBeInsertedIsValid(const mb::Document& document,
+void UpsertStage::_assertDocumentToBeInsertedIsValid(const mutablebson::Document& document,
                                                      const FieldRefSet& shardKeyPaths) {
     // For a non-internal operation, we assert that the document contains all required paths, that
     // no shard key fields have arrays at any point along their paths, and that the document is
@@ -292,20 +250,17 @@ void UpsertStage::_assertDocumentToBeInsertedIsValid(const mb::Document& documen
         // should always have an _id here, since we generated one earlier if not already present.
         invariant(document.root().ok() && document.root()[idFieldName].ok());
         bool containsDotsAndDollarsField = false;
-        bool allowTopLevelDollarPrefixes =
-            serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-            serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
-                multiversion::FeatureCompatibilityVersion::kFullyDowngradedTo_5_0);
+
         storage_validation::scanDocument(document,
-                                         allowTopLevelDollarPrefixes,
+                                         true, /* allowTopLevelDollarPrefixes */
                                          true, /* Should validate for storage */
                                          &containsDotsAndDollarsField);
         if (containsDotsAndDollarsField)
             _params.driver->setContainsDotsAndDollarsField(true);
 
         //  Neither _id nor the shard key fields may have arrays at any point along their paths.
-        _assertPathsNotArray(document, {{&idFieldRef}});
-        _assertPathsNotArray(document, shardKeyPaths);
+        update::assertPathsNotArray(document, {{&idFieldRef}});
+        update::assertPathsNotArray(document, shardKeyPaths);
     }
 }
 

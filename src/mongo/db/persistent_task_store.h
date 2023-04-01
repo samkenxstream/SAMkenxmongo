@@ -54,6 +54,8 @@ const WriteConcernOptions kMajorityWriteConcernNoTimeout{WriteConcernOptions::kM
                                                          WriteConcernOptions::SyncMode::UNSET,
                                                          WriteConcernOptions::kNoTimeout};
 
+const WriteConcernOptions kLocalWriteConcern;
+
 }  // namespace WriteConcerns
 
 template <typename T>
@@ -156,8 +158,8 @@ public:
 
         while (cursor->more()) {
             auto bson = cursor->next();
-            auto t = T::parse(
-                IDLParserErrorContext("PersistentTaskStore:" + _storageNss.toString()), bson);
+            auto t =
+                T::parse(IDLParserContext("PersistentTaskStore:" + _storageNss.toString()), bson);
 
             if (bool shouldContinue = handler(t); !shouldContinue)
                 return;

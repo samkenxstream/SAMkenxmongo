@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -40,36 +39,41 @@
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
 namespace mongo {
 
-Status ProfileCmdBase::checkAuthForCommand(Client* client,
-                                           const std::string& dbName,
-                                           const BSONObj& cmdObj) const {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
+Status ProfileCmdBase::checkAuthForOperation(OperationContext* opCtx,
+                                             const DatabaseName& dbName,
+                                             const BSONObj& cmdObj) const {
+    AuthorizationSession* authzSession = AuthorizationSession::get(opCtx->getClient());
 
-    auto request = ProfileCmdRequest::parse(IDLParserErrorContext("profile"), cmdObj);
+    auto request = ProfileCmdRequest::parse(IDLParserContext("profile"), cmdObj);
     const auto profilingLevel = request.getCommandParameter();
 
     if (profilingLevel < 0 && !request.getSlowms() && !request.getSampleRate()) {
         // If the user just wants to view the current values of 'slowms' and 'sampleRate', they
         // only need read rights on system.profile, even if they can't change the profiling level.
         if (authzSession->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace({dbName, "system.profile"}), ActionType::find)) {
+                ResourcePattern::forExactNamespace(
+                    NamespaceStringUtil::parseNamespaceFromRequest(dbName, "system.profile")),
+                ActionType::find)) {
             return Status::OK();
         }
     }
 
-    return authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(dbName),
-                                                          ActionType::enableProfiler)
+    return authzSession->isAuthorizedForActionsOnResource(
+               ResourcePattern::forDatabaseName(dbName.db()), ActionType::enableProfiler)
         ? Status::OK()
         : Status(ErrorCodes::Unauthorized, "unauthorized");
 }
 
 bool ProfileCmdBase::run(OperationContext* opCtx,
-                         const std::string& dbName,
+                         const DatabaseName& dbName,
                          const BSONObj& cmdObj,
                          BSONObjBuilder& result) {
-    auto request = ProfileCmdRequest::parse(IDLParserErrorContext("profile"), cmdObj);
+    auto request = ProfileCmdRequest::parse(IDLParserContext("profile"), cmdObj);
     const auto profilingLevel = request.getCommandParameter();
 
     // Validate arguments before making changes.
@@ -79,11 +83,11 @@ bool ProfileCmdBase::run(OperationContext* opCtx,
                 *sampleRate >= 0.0 && *sampleRate <= 1.0);
     }
 
-    // Delegate to _applyProfilingLevel to set the profiling level appropriately whether we are on
-    // mongoD or mongoS.
+    // Delegate to _applyProfilingLevel to set the profiling level appropriately whether
+    // we are on mongoD or mongoS.
     auto oldSettings = _applyProfilingLevel(opCtx, dbName, request);
-    auto oldSlowMS = serverGlobalParams.slowMS;
-    auto oldSampleRate = serverGlobalParams.sampleRate;
+    auto oldSlowMS = serverGlobalParams.slowMS.load();
+    auto oldSampleRate = serverGlobalParams.sampleRate.load();
 
     result.append("was", oldSettings.level);
     result.append("slowms", oldSlowMS);
@@ -98,10 +102,10 @@ bool ProfileCmdBase::run(OperationContext* opCtx,
     }
 
     if (auto slowms = request.getSlowms()) {
-        serverGlobalParams.slowMS = *slowms;
+        serverGlobalParams.slowMS.store(*slowms);
     }
     if (auto sampleRate = request.getSampleRate()) {
-        serverGlobalParams.sampleRate = *sampleRate;
+        serverGlobalParams.sampleRate.store(*sampleRate);
     }
 
     // Log the change made to server's profiling settings, if the request asks to change anything.
@@ -125,12 +129,13 @@ bool ProfileCmdBase::run(OperationContext* opCtx,
         // (0, 1, or 2).
         auto newSettings = CollectionCatalog::get(opCtx)->getDatabaseProfileSettings(dbName);
         newState.append("level"_sd, newSettings.level);
-        newState.append("slowms"_sd, serverGlobalParams.slowMS);
-        newState.append("sampleRate"_sd, serverGlobalParams.sampleRate);
+        newState.append("slowms"_sd, serverGlobalParams.slowMS.load());
+        newState.append("sampleRate"_sd, serverGlobalParams.sampleRate.load());
         if (newSettings.filter) {
             newState.append("filter"_sd, newSettings.filter->serialize());
         }
         attrs.add("to", newState.obj());
+        attrs.add("db", dbName);
 
         LOGV2(48742, "Profiler settings changed", attrs);
     }

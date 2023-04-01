@@ -1,3 +1,5 @@
+load("jstests/libs/ttl_util.js");
+
 var ClusteredCappedUtils = class {
     // Validate TTL-based deletion on a clustered, capped collection.
     static testClusteredCappedCollectionWithTTL(db, collName, clusterKeyField) {
@@ -39,7 +41,8 @@ var ClusteredCappedUtils = class {
         }
         assert.commandWorked(coll.insertMany(docs, {ordered: true}));
 
-        ClusteredCollectionUtil.waitForTTL(db);
+        // This test runs with default read concern 'local'.
+        TTLUtil.waitForPass(db, /*waitForMajorityCommit=*/ false);
 
         // Only the recent documents survived.
         assert.eq(coll.find().itcount(), batchSize);
@@ -140,7 +143,7 @@ var ClusteredCappedUtils = class {
         // TTL delete the two old documents.
 
         assert.commandWorked(db.adminCommand({setParameter: 1, ttlMonitorEnabled: true}));
-        ClusteredCollectionUtil.waitForTTL(db);
+        TTLUtil.waitForPass(db, /*waitForMajorityCommit=*/ isReplicated);
         assert.eq(2, db.getCollection(collName).find().itcount());
 
         // Confirm that the tailable getMore can resume from where it was, since the document the
@@ -209,7 +212,7 @@ var ClusteredCappedUtils = class {
         // TTL delete the two old documents, while the tailable cursor is still on the first one.
 
         assert.commandWorked(db.adminCommand({setParameter: 1, ttlMonitorEnabled: true}));
-        ClusteredCollectionUtil.waitForTTL(db);
+        TTLUtil.waitForPass(db, /*waitForMajorityCommit=*/ isReplicated);
         assert.eq(1, db.getCollection(collName).find().itcount());
 
         // Confirm that the tailable cursor returns CappedPositionLost, as the document it was
@@ -280,27 +283,71 @@ var ClusteredCappedUtils = class {
         const oneDayInSeconds = 60 * 60 * 24;
         const tenDaysInMilliseconds = 10 * oneDayInSeconds * 1000;
         const tenDaysAgo = new Date(new Date() - tenDaysInMilliseconds);
+        const earlierTenDaysAgo = new Date(tenDaysAgo.getTime() - 1);
 
-        // Create clustered capped collection and insert a soon-to-be-expired document.
+        // Create clustered capped collection and insert soon-to-be-expired documents.
         assert.commandWorked(db.createCollection(collName, {
             clusteredIndex: {key: {_id: 1}, unique: true},
             capped: true,
             expireAfterSeconds: oneDayInSeconds
         }));
-        assert.commandWorked(
-            db.getCollection(collName).insertOne({_id: tenDaysAgo, info: "10 days ago"}));
+        assert.commandWorked(db.getCollection(collName).insertMany([
+            {_id: tenDaysAgo, info: "10 days ago"},
+            {_id: earlierTenDaysAgo, info: "10 days ago"}
+        ]));
+        assert.eq(2, db.getCollection(collName).find().itcount());
 
-        // Expire the document.
+        // Expire the documents.
         assert.commandWorked(db.adminCommand({setParameter: 1, ttlMonitorEnabled: true}));
-        ClusteredCollectionUtil.waitForTTL(db);
+        // No need to wait for majority commit, as default 'local' read concern is used.
+        TTLUtil.waitForPass(db, /*waitForMajorityCommit=*/ false);
         assert.eq(0, db.getCollection(collName).find().itcount());
 
         // The TTL deletion has been replicated to the oplog.
+        const isBatched = assert.commandWorked(db.adminCommand(
+            {getParameter: 1, "ttlMonitorBatchDeletes": 1}))["ttlMonitorBatchDeletes"];
         const ns = db.getName() + "." + collName;
-        assert.eq(1,
-                  db.getSiblingDB("local")
-                      .oplog.rs.find({op: "d", ns: ns, "o._id": tenDaysAgo})
-                      .itcount());
+
+        const featureFlagBatchMultiDeletes = assert.commandWorked(db.adminCommand({
+            getParameter: 1,
+            "featureFlagBatchMultiDeletes": 1
+        }))["featureFlagBatchMultiDeletes"]["value"];
+
+        if (featureFlagBatchMultiDeletes && isBatched) {
+            const ops =
+                db.getSiblingDB("local")
+                    .oplog.rs
+                    .find({
+                        op: "c",
+                        ns: "admin.$cmd",
+                        "o.applyOps": {
+                            $elemMatch:
+                                {op: "d", ns: ns, "o._id": {$in: [tenDaysAgo, earlierTenDaysAgo]}}
+                        }
+                    })
+                    .sort({$natural: -1})
+                    .limit(1)
+                    .toArray();
+            assert.lte(ops[0].o.applyOps.length, 2);
+            if (ops[0].o.applyOps.length === 1) {
+                // The batch got split in two separate executions.
+                const pendingId =
+                    ops[0].o.applyOps[0].o._id === tenDaysAgo ? earlierTenDaysAgo : tenDaysAgo;
+                assert.eq(1,
+                          db.getSiblingDB("local")
+                              .oplog.rs.find({op: "d", ns: ns, "o._id": pendingId})
+                              .itcount());
+            }
+        } else {
+            assert.eq(1,
+                      db.getSiblingDB("local")
+                          .oplog.rs.find({op: "d", ns: ns, "o._id": tenDaysAgo})
+                          .itcount());
+            assert.eq(1,
+                      db.getSiblingDB("local")
+                          .oplog.rs.find({op: "d", ns: ns, "o._id": earlierTenDaysAgo})
+                          .itcount());
+        }
 
         db.getCollection(collName).drop();
     }

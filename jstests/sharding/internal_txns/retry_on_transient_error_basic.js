@@ -3,7 +3,7 @@
  * can be retried on a replica set and that its txnRetryCounter is persisted correctly
  * on all nodes.
  *
- * @tags: [requires_fcv_51, featureFlagInternalTransactions]
+ * @tags: [requires_fcv_60, uses_transactions, requires_persistence]
  */
 (function() {
 'use strict';
@@ -144,6 +144,10 @@ function testPersistence(shardRst, lsid, txnNumber, txnDocFilter, oplogEntryFilt
     const txnRetryCounter0 = NumberInt(0);
     const txnRetryCounter1 = NumberInt(1);
     let db = shardRst.getPrimary().getDB(kDbName);
+
+    // Preload the collection metadata to avoid repeating the insert command if it fails due to
+    // StaleConfig error.
+    assert.commandWorked(db.adminCommand({_flushRoutingTableCacheUpdates: kNs}));
 
     const insertCmdObj = {
         insert: kCollName,

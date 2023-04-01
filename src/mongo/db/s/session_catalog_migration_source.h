@@ -30,13 +30,13 @@
 #pragma once
 
 #include <boost/optional.hpp>
-#include <memory>
 
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/db/session_txn_record_gen.h"
-#include "mongo/db/transaction_history_iterator.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/shard_key_pattern.h"
@@ -93,6 +93,13 @@ public:
                                   NamespaceString ns,
                                   ChunkRange chunk,
                                   KeyPattern shardKey);
+
+    /**
+     * Gets the session oplog entries to be sent to the destination. The initialization is separated
+     * from the constructor to allow the member functions of the SessionCatalogMigrationSource to be
+     * called before the initialization step is finished.
+     */
+    void init(OperationContext* opCtx);
 
     /**
      * Returns true if there are more oplog entries to fetch at this moment. Note that new writes
@@ -170,6 +177,30 @@ public:
     static bool shouldSkipOplogEntry(const mongo::repl::OplogEntry& oplogEntry,
                                      const ShardKeyPattern& shardKeyPattern,
                                      const ChunkRange& chunkRange);
+
+    long long getSessionOplogEntriesToBeMigratedSoFar();
+    long long getSessionOplogEntriesSkippedSoFarLowerBound();
+
+    /**
+     * Given an Oplog entry, extracts the shard key corresponding to the key pattern for insert,
+     * update, and delete op types. If the op type is not a CRUD operation, an empty BSONObj()
+     * will be returned.
+     *
+     * For update and delete operations, the Oplog entry will contain an object with the document
+     * key.
+     *
+     * For insert operations, the Oplog entry will contain the original document from which the
+     * document key must be extracted
+     *
+     * Examples:
+     *  For KeyPattern {'a.b': 1}
+     *   If the oplog entries contains field op='i'
+     *     oplog contains: { a : { b : "1" } }
+     *   If the oplog entries contains field op='u' or op='d'
+     *     oplog contains: { 'a.b': "1" }
+     */
+    static BSONObj extractShardKeyFromOplogEntry(const ShardKeyPattern& shardKeyPattern,
+                                                 const repl::OplogEntry& entry);
 
 private:
     /**
@@ -301,7 +332,7 @@ private:
     Mutex _newOplogMutex = MONGO_MAKE_LATCH("SessionCatalogMigrationSource::_newOplogMutex");
 
     // The average size of documents in config.transactions.
-    uint64_t _averageSessionDocSize;
+    uint64_t _averageSessionDocSize{0};
 
     // Stores oplog opTime of new writes that are coming in.
     std::list<std::pair<repl::OpTime, EntryAtOpTimeType>> _newWriteOpTimeList;
@@ -324,6 +355,16 @@ private:
     // Sets to true if there is no need to fetch an oplog anymore (for example, because migration
     // aborted).
     std::shared_ptr<Notification<bool>> _newOplogNotification;
+
+    // The number of session oplog entries that need to be migrated
+    // from the source to the destination
+    AtomicWord<long long> _sessionOplogEntriesToBeMigratedSoFar{0};
+
+    // There are optimizations so that we do not send all of the oplog
+    // entries to the destination. This stat provides a lower bound on the number of session oplog
+    // entries that we did not send to the destination. It is a lower bound because some of the
+    // optimizations do not allow us to know the exact number of oplog entries we skipped.
+    AtomicWord<long long> _sessionOplogEntriesSkippedSoFarLowerBound{0};
 };
 
 }  // namespace mongo

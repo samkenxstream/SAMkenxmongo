@@ -2,17 +2,19 @@
  * Tests index creation, index drops, list indexes, hide/unhide index on a time-series collection.
  *
  * @tags: [
+ *   # This test depends on certain writes ending up in the same bucket. Stepdowns may result in
+ *   # writes splitting between two primaries, and thus different buckets.
  *   does_not_support_stepdowns,
- *   does_not_support_transactions,
- *   requires_fcv_52,
- *   requires_getmore,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 (function() {
 "use strict";
 
-load("jstests/libs/fixture_helpers.js");
 load("jstests/core/timeseries/libs/timeseries.js");
+load("jstests/libs/feature_flag_util.js");
+load("jstests/libs/fixture_helpers.js");
 
 TimeseriesTest.run((insert) => {
     const collNamePrefix = 'timeseries_index_';
@@ -64,7 +66,9 @@ TimeseriesTest.run((insert) => {
         assert.contains(bucketsColl.getName(), db.getCollectionNames());
 
         // When the collection is sharded, there is 1 extra index for the shard key.
-        const numExtraIndexes = FixtureHelpers.isSharded(bucketsColl) ? 1 : 0;
+        // TODO SERVER-66438: Remove feature flag check.
+        const numExtraIndexes = (FixtureHelpers.isSharded(bucketsColl) ? 1 : 0) +
+            (FeatureFlagUtil.isPresentAndEnabled(db, "TimeseriesScalabilityImprovements") ? 1 : 0);
         {
             const indexes = bucketsColl.getIndexes();
             assert.eq(numExtraIndexes,
@@ -225,7 +229,7 @@ TimeseriesTest.run((insert) => {
     runTest({[metaFieldName + '.location']: "2d", [metaFieldName + '.tag1']: -1},
             {'meta.location': "2d", 'meta.tag1': -1});
 
-    if (TimeseriesTest.timeseriesMetricIndexesEnabled(db.getMongo())) {
+    if (FeatureFlagUtil.isEnabled(db, "TimeseriesMetricIndexes")) {
         // Measurement 2dsphere index
         runTest({'loc': '2dsphere'}, {'data.loc': '2dsphere_bucket'});
     }
@@ -242,7 +246,7 @@ TimeseriesTest.run((insert) => {
         coll.getName(), {timeseries: {timeField: timeFieldName, metaField: metaFieldName}}));
     assert.commandWorked(insert(coll, doc), 'failed to insert doc: ' + tojson(doc));
 
-    if (!TimeseriesTest.timeseriesMetricIndexesEnabled(db.getMongo())) {
+    if (!FeatureFlagUtil.isEnabled(db, "TimeseriesMetricIndexes")) {
         // Reject index keys that do not include the metadata field.
         assert.commandFailedWithCode(coll.createIndex({not_metadata: 1}),
                                      ErrorCodes.CannotCreateIndex);
@@ -265,7 +269,7 @@ TimeseriesTest.run((insert) => {
                                      [ErrorCodes.CannotCreateIndex, ErrorCodes.InvalidOptions]);
     };
 
-    if (!TimeseriesTest.timeseriesMetricIndexesEnabled(db.getMongo())) {
+    if (!FeatureFlagUtil.isEnabled(db, "TimeseriesMetricIndexes")) {
         // Partial indexes are not supported on time-series collections if the time-series metric
         // feature flag is disabled.
         testCreateIndexFailed({[metaFieldName]: 1}, {partialFilterExpression: {meta: {$gt: 5}}});
@@ -287,12 +291,22 @@ TimeseriesTest.run((insert) => {
     const bucketsColl = db.getCollection('system.buckets.' + coll.getName());
     assert.commandWorked(bucketsColl.createIndex({not_metadata: 1}),
                          'failed to create index: ' + tojson({not_metadata: 1}));
-    const numExtraIndexes = FixtureHelpers.isSharded(bucketsColl) ? 1 : 0;
+    // TODO SERVER-66438: Remove feature flag check.
+    const numExtraIndexes = (FixtureHelpers.isSharded(bucketsColl) ? 1 : 0) +
+        (FeatureFlagUtil.isPresentAndEnabled(db, "TimeseriesScalabilityImprovements") ? 1 : 0);
     assert.eq(
         1 + numExtraIndexes, bucketsColl.getIndexes().length, tojson(bucketsColl.getIndexes()));
     assert.eq(0 + numExtraIndexes, coll.getIndexes().length, tojson(coll.getIndexes()));
 
     // Cannot directly create a "2dsphere_bucket" index.
     testCreateIndexFailed({"loc": "2dsphere_bucket"});
+
+    // {} is not a valid index spec.
+    testCreateIndexFailed({});
+
+    // Hints are not valid index specs.
+    testCreateIndexFailed({$natural: 1});
+    testCreateIndexFailed({$natural: -1});
+    testCreateIndexFailed({$hint: 'my_index_name'});
 });
 })();

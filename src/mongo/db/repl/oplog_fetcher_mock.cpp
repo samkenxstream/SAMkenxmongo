@@ -27,11 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/db/repl/oplog_fetcher_mock.h"
 
 #include <utility>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 
 namespace mongo {
@@ -43,15 +44,16 @@ OplogFetcherMock::OplogFetcherMock(
     EnqueueDocumentsFn enqueueDocumentsFn,
     OnShutdownCallbackFn onShutdownCallbackFn,
     Config config)
-    : OplogFetcher(executor,
-                   // Pass a dummy OplogFetcherRestartDecision to the base OplogFetcher.
-                   std::make_unique<OplogFetcherRestartDecisionDefault>(0),
-                   dataReplicatorExternalState,
-                   // Pass a dummy EnqueueDocumentsFn to the base OplogFetcher.
-                   [](const auto& a1, const auto& a2, const auto& a3) { return Status::OK(); },
-                   // Pass a dummy OnShutdownCallbackFn to the base OplogFetcher.
-                   [](const auto& a, const int b) {},
-                   config),
+    : OplogFetcher(
+          executor,
+          // Pass a dummy OplogFetcherRestartDecision to the base OplogFetcher.
+          std::make_unique<OplogFetcherRestartDecisionDefault>(0),
+          dataReplicatorExternalState,
+          // Pass a dummy EnqueueDocumentsFn to the base OplogFetcher.
+          [](const auto& a1, const auto& a2, const auto& a3) { return Status::OK(); },
+          // Pass a dummy OnShutdownCallbackFn to the base OplogFetcher.
+          [](const auto& a, const int b) {},
+          config),
       _oplogFetcherRestartDecision(std::move(oplogFetcherRestartDecision)),
       _onShutdownCallbackFn(std::move(onShutdownCallbackFn)),
       _enqueueDocumentsFn(std::move(enqueueDocumentsFn)),
@@ -170,7 +172,7 @@ void OplogFetcherMock::waitForshutdown() {
     }
 }
 
-Status OplogFetcherMock::_doStartup_inlock() noexcept {
+void OplogFetcherMock::_doStartup_inlock() {
     // Create a thread that waits on the _finishPromise and call _finishCallback once with the
     // finish status. This is to synchronize the OplogFetcher shutdown between the test thread and
     // the OplogFetcher's owner. For example, the OplogFetcher could be shut down by the test thread
@@ -188,7 +190,6 @@ Status OplogFetcherMock::_doStartup_inlock() noexcept {
         auto status = future.getNoThrow();
         _finishCallback(status);
     });
-    return Status::OK();
 }
 
 void OplogFetcherMock::_doShutdown_inlock() noexcept {

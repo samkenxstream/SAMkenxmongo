@@ -27,17 +27,17 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/query/plan_executor_impl.h"
 
+#include "mongo/util/duration.h"
 #include <memory>
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/exec/cached_plan.h"
 #include "mongo/db/exec/collection_scan.h"
@@ -61,11 +61,16 @@
 #include "mongo/db/query/plan_yield_policy_impl.h"
 #include "mongo/db/query/yield_policy_callbacks_impl.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/stacktrace.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -86,9 +91,10 @@ namespace {
 /**
  * Constructs a PlanYieldPolicy based on 'policy'.
  */
-std::unique_ptr<PlanYieldPolicy> makeYieldPolicy(PlanExecutorImpl* exec,
-                                                 PlanYieldPolicy::YieldPolicy policy,
-                                                 const Yieldable* yieldable) {
+std::unique_ptr<PlanYieldPolicy> makeYieldPolicy(
+    PlanExecutorImpl* exec,
+    PlanYieldPolicy::YieldPolicy policy,
+    stdx::variant<const Yieldable*, PlanYieldPolicy::YieldThroughAcquisitions> yieldable) {
     switch (policy) {
         case PlanYieldPolicy::YieldPolicy::YIELD_AUTO:
         case PlanYieldPolicy::YieldPolicy::YIELD_MANUAL:
@@ -112,16 +118,17 @@ std::unique_ptr<PlanYieldPolicy> makeYieldPolicy(PlanExecutorImpl* exec,
 }
 }  // namespace
 
-PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
-                                   unique_ptr<WorkingSet> ws,
-                                   unique_ptr<PlanStage> rt,
-                                   unique_ptr<QuerySolution> qs,
-                                   unique_ptr<CanonicalQuery> cq,
-                                   const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                   const CollectionPtr& collection,
-                                   bool returnOwnedBson,
-                                   NamespaceString nss,
-                                   PlanYieldPolicy::YieldPolicy yieldPolicy)
+PlanExecutorImpl::PlanExecutorImpl(
+    OperationContext* opCtx,
+    unique_ptr<WorkingSet> ws,
+    unique_ptr<PlanStage> rt,
+    unique_ptr<QuerySolution> qs,
+    unique_ptr<CanonicalQuery> cq,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    stdx::variant<const CollectionPtr*, const ScopedCollectionAcquisition*> collection,
+    bool returnOwnedBson,
+    NamespaceString nss,
+    PlanYieldPolicy::YieldPolicy yieldPolicy)
     : _opCtx(opCtx),
       _cq(std::move(cq)),
       _expCtx(_cq ? _cq->getExpCtx() : expCtx),
@@ -134,18 +141,20 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
     invariant(!_expCtx || _expCtx->opCtx == _opCtx);
     invariant(!_cq || !_expCtx || _cq->getExpCtx() == _expCtx);
 
-    // If this PlanExecutor is executing a COLLSCAN, keep a pointer directly to the COLLSCAN
-    // stage. This is used for change streams in order to keep the the latest oplog timestamp
-    // and post batch resume token up to date as the oplog scan progresses.
-    if (auto collectionScan = getStageByType(_root.get(), STAGE_COLLSCAN)) {
-        _collScanStage = static_cast<CollectionScan*>(collectionScan);
-    }
+    const CollectionPtr* collectionPtr =
+        stdx::visit(OverloadedVisitor{[](const CollectionPtr* coll) { return coll; },
+                                      [](const ScopedCollectionAcquisition* coll) {
+                                          return &coll->getCollectionPtr();
+                                      }},
+                    collection);
+    invariant(collectionPtr);
+    const bool collectionExists = static_cast<bool>(*collectionPtr);
 
     // If we don't yet have a namespace string, then initialize it from either 'collection' or
     // '_cq'.
     if (_nss.isEmpty()) {
-        if (collection) {
-            _nss = collection->ns();
+        if (collectionExists) {
+            _nss = (*collectionPtr)->ns();
         } else {
             invariant(_cq);
             _nss =
@@ -154,10 +163,22 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
     }
 
     // There's no point in yielding if the collection doesn't exist.
-    _yieldPolicy =
-        makeYieldPolicy(this,
-                        collection ? yieldPolicy : PlanYieldPolicy::YieldPolicy::NO_YIELD,
-                        collection ? &collection : nullptr);
+    const stdx::variant<const Yieldable*, PlanYieldPolicy::YieldThroughAcquisitions> yieldable =
+        stdx::visit(
+            OverloadedVisitor{[](const CollectionPtr* coll) {
+                                  return stdx::variant<const Yieldable*,
+                                                       PlanYieldPolicy::YieldThroughAcquisitions>(
+                                      *coll ? coll : nullptr);
+                              },
+                              [](const ScopedCollectionAcquisition* coll) {
+                                  return stdx::variant<const Yieldable*,
+                                                       PlanYieldPolicy::YieldThroughAcquisitions>(
+                                      PlanYieldPolicy::YieldThroughAcquisitions{});
+                              }},
+            collection);
+
+    _yieldPolicy = makeYieldPolicy(
+        this, collectionExists ? yieldPolicy : PlanYieldPolicy::YieldPolicy::NO_YIELD, yieldable);
 
     uassertStatusOK(_pickBestPlan());
 
@@ -171,6 +192,13 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
         auto subplanStage = static_cast<SubplanStage*>(subplan);
         _planExplainer->updateEnumeratorExplainInfo(
             subplanStage->compositeSolution()->_enumeratorExplainInfo);
+    }
+
+    // If this PlanExecutor is executing a COLLSCAN, keep a pointer directly to the COLLSCAN
+    // stage. This is used for change streams in order to keep the the latest oplog timestamp
+    // and post batch resume token up to date as the oplog scan progresses.
+    if (auto collectionScan = getStageByType(_root.get(), STAGE_COLLSCAN)) {
+        _collScanStage = static_cast<CollectionScan*>(collectionScan);
     }
 }
 
@@ -248,7 +276,10 @@ void PlanExecutorImpl::saveState() {
     if (!isMarkedAsKilled()) {
         _root->saveState();
     }
-    _yieldPolicy->setYieldable(nullptr);
+
+    if (!_yieldPolicy->usesCollectionAcquisitions()) {
+        _yieldPolicy->setYieldable(nullptr);
+    }
     _currentState = kSaved;
 }
 
@@ -268,7 +299,9 @@ void PlanExecutorImpl::restoreStateWithoutRetrying(const RestoreContext& context
                                                    const Yieldable* yieldable) {
     invariant(_currentState == kSaved);
 
-    _yieldPolicy->setYieldable(yieldable);
+    if (!_yieldPolicy->usesCollectionAcquisitions()) {
+        _yieldPolicy->setYieldable(yieldable);
+    }
     if (!isMarkedAsKilled()) {
         _root->restoreState(context);
     }
@@ -337,12 +370,14 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
     if (!_stash.empty()) {
         invariant(objOut && !dlOut);
         *objOut = {SnapshotId(), _stash.front()};
-        _stash.pop();
+        _stash.pop_front();
         return PlanExecutor::ADVANCED;
     }
 
-    // Incremented on every writeConflict, reset to 0 on any successful call to _root->work.
+    // The below are incremented on every WriteConflict or TemporarilyUnavailable error accordingly,
+    // and reset to 0 on any successful call to _root->work.
     size_t writeConflictsInARow = 0;
+    size_t tempUnavailErrorsInARow = 0;
 
     // Capped insert data; declared outside the loop so we hold a shared pointer to the capped
     // insert notifier the entire time we are in the loop.  Holding a shared pointer to the
@@ -359,15 +394,34 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
         //   2) some stage requested a yield, or
         //   3) we need to yield and retry due to a WriteConflictException.
         // In all cases, the actual yielding happens here.
+
+        const auto whileYieldingFn = [&]() {
+            // If we yielded because we encountered a sharding critical section, wait for the
+            // critical section to end before continuing. By waiting for the critical section to be
+            // exited we avoid busy spinning immediately and encountering the same critical section
+            // again. It is important that this wait happens after having released the lock
+            // hierarchy -- otherwise deadlocks could happen, or the very least, locks would be
+            // unnecessarily held while waiting.
+            const auto& shardingCriticalSection = planExecutorShardingCriticalSectionFuture(_opCtx);
+            if (shardingCriticalSection) {
+                OperationShardingState::waitForCriticalSectionToComplete(_opCtx,
+                                                                         *shardingCriticalSection)
+                    .ignore();
+                planExecutorShardingCriticalSectionFuture(_opCtx).reset();
+            }
+        };
+
         if (_yieldPolicy->shouldYieldOrInterrupt(_opCtx)) {
-            uassertStatusOK(_yieldPolicy->yieldOrInterrupt(_opCtx));
+            uassertStatusOK(_yieldPolicy->yieldOrInterrupt(_opCtx, whileYieldingFn));
         }
 
         WorkingSetID id = WorkingSet::INVALID_ID;
         PlanStage::StageState code = _root->work(&id);
 
-        if (code != PlanStage::NEED_YIELD)
+        if (code != PlanStage::NEED_YIELD) {
             writeConflictsInARow = 0;
+            tempUnavailErrorsInARow = 0;
+        }
 
         if (PlanStage::ADVANCED == code) {
             WorkingSetMember* member = _workingSet->get(id);
@@ -393,12 +447,8 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
             }
 
             if (nullptr != dlOut) {
-                if (member->hasRecordId()) {
-                    *dlOut = member->recordId;
-                } else {
-                    _workingSet->free(id);
-                    hasRequestedData = false;
-                }
+                tassert(6297500, "Working set member has no record ID", member->hasRecordId());
+                *dlOut = std::move(member->recordId);
             }
 
             if (hasRequestedData) {
@@ -420,20 +470,40 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
             // This result didn't have the data the caller wanted, try again.
         } else if (PlanStage::NEED_YIELD == code) {
             invariant(id == WorkingSet::INVALID_ID);
-            if (!_yieldPolicy->canAutoYield() ||
-                MONGO_unlikely(skipWriteConflictRetries.shouldFail())) {
-                throw WriteConflictException();
+            invariant(_opCtx->recoveryUnit());
+
+            if (_expCtx->getTemporarilyUnavailableException()) {
+                _expCtx->setTemporarilyUnavailableException(false);
+
+                if (!_yieldPolicy->canAutoYield()) {
+                    throwTemporarilyUnavailableException(
+                        "got TemporarilyUnavailable exception on a plan that cannot auto-yield");
+                }
+
+                tempUnavailErrorsInARow++;
+                handleTemporarilyUnavailableException(
+                    _opCtx,
+                    tempUnavailErrorsInARow,
+                    "plan executor",
+                    _nss.ns(),
+                    TemporarilyUnavailableException(
+                        Status(ErrorCodes::TemporarilyUnavailable, "temporarily unavailable")));
+            } else {
+                // We're yielding because of a WriteConflictException.
+                if (!_yieldPolicy->canAutoYield() ||
+                    MONGO_unlikely(skipWriteConflictRetries.shouldFail())) {
+                    throwWriteConflictException(
+                        "Write conflict during plan execution and yielding is disabled.");
+                }
+
+                CurOp::get(_opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
+                writeConflictsInARow++;
+                logWriteConflictAndBackoff(writeConflictsInARow, "plan execution", _nss.ns());
             }
 
-            CurOp::get(_opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
-            writeConflictsInARow++;
-            WriteConflictException::logAndBackoff(
-                writeConflictsInARow, "plan execution", _nss.ns());
-
-            // If we're allowed to, we will yield next time through the loop.
-            if (_yieldPolicy->canAutoYield()) {
-                _yieldPolicy->forceYield();
-            }
+            // Yield next time through the loop.
+            invariant(_yieldPolicy->canAutoYield());
+            _yieldPolicy->forceYield();
         } else if (PlanStage::NEED_TIME == code) {
             // Fall through to yield check at end of large conditional.
         } else {
@@ -571,6 +641,11 @@ long long PlanExecutorImpl::executeDelete() {
             const SpecificStats* stats = _root->child()->getSpecificStats();
             return static_cast<const DeleteStats*>(stats)->docsDeleted;
         }
+        case StageType::STAGE_TIMESERIES_MODIFY: {
+            const auto* tsWriteStats =
+                static_cast<const TimeseriesModifyStats*>(_root->getSpecificStats());
+            return tsWriteStats->measurementsDeleted;
+        }
         default: {
             invariant(StageType::STAGE_DELETE == _root->stageType() ||
                       StageType::STAGE_BATCHED_DELETE == _root->stageType());
@@ -580,8 +655,25 @@ long long PlanExecutorImpl::executeDelete() {
     }
 }
 
-void PlanExecutorImpl::enqueue(const BSONObj& obj) {
-    _stash.push(Document{obj.getOwned()});
+BatchedDeleteStats PlanExecutorImpl::getBatchedDeleteStats() {
+    // If we're deleting on a non-existent collection, then the delete plan may have an EOF as the
+    // root stage.
+    if (_root->stageType() == STAGE_EOF) {
+        return BatchedDeleteStats();
+    }
+
+    invariant(_root->stageType() == StageType::STAGE_BATCHED_DELETE);
+
+    // If the collection exists, we expect the root of the plan tree to be a batched delete stage.
+    // Note: findAndModify is incompatible with the batched delete stage so no need to handle
+    // projection stage wrapping.
+    const auto stats = _root->getSpecificStats();
+    auto batchedStats = static_cast<const BatchedDeleteStats*>(stats);
+    return *batchedStats;
+}
+
+void PlanExecutorImpl::stashResult(const BSONObj& obj) {
+    _stash.push_front(Document{obj.getOwned()});
 }
 
 bool PlanExecutorImpl::isMarkedAsKilled() const {

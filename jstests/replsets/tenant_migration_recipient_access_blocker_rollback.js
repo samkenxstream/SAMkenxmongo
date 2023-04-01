@@ -3,28 +3,34 @@
  * migration recipient access blocker is initialized in the correct state.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
+ *   # Shard merge protocol will be tested by
+ *   # tenant_migration_shard_merge_recipient_access_blocker_rollback.js.
+ *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
  * ]
  */
-(function() {
-"use strict";
+
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    getCertificateAndPrivateKey,
+    makeX509OptionsForTest
+} from "jstests/replsets/libs/tenant_migration_util.js";
+
 load("jstests/libs/uuid_util.js");           // For extractUUIDFromObject().
 load("jstests/libs/fail_point_util.js");     // For configureFailPoint().
 load("jstests/libs/write_concern_util.js");  // for 'stopReplicationOnSecondaries'
 load("jstests/libs/parallelTester.js");      // For Thread()
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
-const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
+const migrationX509Options = makeX509OptionsForTest();
 
 const recipientRst = new ReplSetTest({
     name: "recipRst",
     nodes: 3,
+    serverless: true,
     nodeOptions: Object.assign(migrationX509Options.recipient, {}),
     settings: {catchUpTimeoutMillis: 0, chainingAllowed: false}
 });
@@ -89,14 +95,14 @@ function runRollbackAfterMigrationCommitted(tenantId) {
     // Stepping up one of the secondaries should cause the original primary to rollback.
     jsTestLog("Stepping up one of the secondaries.");
     const newRecipientPrimary = secondaries[0];
-    assert.commandWorked(newRecipientPrimary.adminCommand({replSetStepUp: 1}));
+    recipientRst.stepUp(newRecipientPrimary, {awaitReplicationBeforeStepUp: false});
 
     jsTestLog("Restarting server replication.");
     restartServerReplication(secondaries);
     recipientRst.awaitReplication();
 
     jsTestLog("Stepping up the original primary back to primary.");
-    assert.commandWorked(originalPrimary.adminCommand({replSetStepUp: 1}));
+    recipientRst.stepUp(originalPrimary, {awaitReplicationBeforeStepUp: false});
 
     jsTestLog("Perform a read against the original primary on the tenant collection.");
     assert.eq(numDocs, originalPrimary.getDB(dbName)[collName].find().itcount());
@@ -119,8 +125,8 @@ function runRollbackAfterLoneRecipientForgetMigrationCommand(tenantId) {
     const kMigrationId = UUID();
     const kTenantId = tenantId;
     const kReadPreference = {mode: "primary"};
-    const recipientCertificateForDonor = TenantMigrationUtil.getCertificateAndPrivateKey(
-        "jstests/libs/tenant_migration_recipient.pem");
+    const recipientCertificateForDonor =
+        getCertificateAndPrivateKey("jstests/libs/tenant_migration_recipient.pem");
 
     const dbName = tenantMigrationTest.tenantDB(kTenantId, "testDB");
     const collName = "testColl";
@@ -188,7 +194,7 @@ function runRollbackAfterLoneRecipientForgetMigrationCommand(tenantId) {
 
     // Stepping up one of the secondaries should cause the original primary to rollback.
     jsTestLog("Stepping up one of the secondaries.");
-    assert.commandWorked(newPrimary.adminCommand({replSetStepUp: 1}));
+    recipientRst.stepUp(newPrimary, {awaitReplicationBeforeStepUp: false});
 
     assert.commandFailedWithCode(recipientForgetMigrationThread.returnData(),
                                  ErrorCodes.InterruptedDueToReplStateChange);
@@ -203,20 +209,19 @@ function runRollbackAfterLoneRecipientForgetMigrationCommand(tenantId) {
     jsTestLog("Stepping up the original primary back to primary.");
     const fpOriginalPrimaryBeforeStarting =
         configureFailPoint(originalPrimary, "pauseBeforeRunTenantMigrationRecipientInstance");
-    assert.commandWorked(originalPrimary.adminCommand({replSetStepUp: 1}));
+    fpOriginalPrimary.off();
+    recipientRst.stepUp(originalPrimary, {awaitReplicationBeforeStepUp: false});
 
     jsTestLog("Perform another read against the original primary on the tenant collection.");
     assert.eq(1, originalPrimary.getDB(dbName)[collName].find().itcount());
 
     fpOriginalPrimaryBeforeStarting.off();
-    fpOriginalPrimary.off();
     fpNewPrimary.off();
 
     tenantMigrationTest.stop();
 }
 
-runRollbackAfterMigrationCommitted('testTenantId-1');
-runRollbackAfterLoneRecipientForgetMigrationCommand('testTenantId-2');
+runRollbackAfterMigrationCommitted(ObjectId().str);
+runRollbackAfterLoneRecipientForgetMigrationCommand(ObjectId().str);
 
 recipientRst.stopSet();
-})();

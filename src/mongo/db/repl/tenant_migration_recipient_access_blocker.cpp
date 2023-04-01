@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
 
 #include "mongo/platform/basic.h"
 
@@ -37,13 +36,15 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/tenant_migration_access_blocker_registry.h"
-#include "mongo/db/repl/tenant_migration_decoration.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/repl/tenant_migration_recipient_access_blocker.h"
-#include "mongo/db/repl/tenant_migration_util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/cancellation.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/future_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
+
 
 namespace mongo {
 
@@ -51,22 +52,12 @@ namespace {
 
 MONGO_FAIL_POINT_DEFINE(tenantMigrationRecipientNotRejectReads);
 
-}
+}  // namespace
 
 TenantMigrationRecipientAccessBlocker::TenantMigrationRecipientAccessBlocker(
-    ServiceContext* serviceContext,
-    UUID migrationId,
-    std::string tenantId,
-    MigrationProtocolEnum protocol,
-    std::string donorConnString)
-    : TenantMigrationAccessBlocker(BlockerType::kRecipient, protocol),
-      _serviceContext(serviceContext),
-      _migrationId(migrationId),
-      _tenantId(std::move(tenantId)),
-      _protocol(protocol),
-      _donorConnString(std::move(donorConnString)) {
-    invariant(tenant_migration_util::protocolTenantIdCompatibilityCheck(_protocol, _tenantId));
-}
+    ServiceContext* serviceContext, const UUID& migrationId)
+    : TenantMigrationAccessBlocker(BlockerType::kRecipient, migrationId),
+      _serviceContext(serviceContext) {}
 
 Status TenantMigrationRecipientAccessBlocker::checkIfCanWrite(Timestamp writeTs) {
     // This is guaranteed by the migration protocol. The recipient will not get any writes until the
@@ -86,22 +77,11 @@ SharedSemiFuture<void> TenantMigrationRecipientAccessBlocker::getCanReadFuture(
         return SharedSemiFuture<void>();
     }
 
-    // Exclude internal reads decorated with 'tenantMigrationRecipientInfo' from any logic.
-    if (repl::tenantMigrationRecipientInfo(opCtx).has_value()) {
-        LOGV2_DEBUG(5492000,
-                    1,
-                    "Internal tenant read got excluded from the MTAB filtering",
-                    "tenantId"_attr = _tenantId,
-                    "opId"_attr = opCtx->getOpID());
-        return SharedSemiFuture<void>();
-    }
-
-    if (opCtx->getClient()->session() &&
-        (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient)) {
+    if (tenant_migration_access_blocker::shouldExcludeRead(opCtx)) {
         LOGV2_DEBUG(5739900,
                     1,
                     "Internal tenant read got excluded from the MTAB filtering",
-                    "tenantId"_attr = _tenantId,
+                    "migrationId"_attr = getMigrationId(),
                     "opId"_attr = opCtx->getOpID());
         return SharedSemiFuture<void>();
     }
@@ -121,7 +101,7 @@ SharedSemiFuture<void> TenantMigrationRecipientAccessBlocker::getCanReadFuture(
         LOGV2_DEBUG(5749100,
                     1,
                     "Tenant read is blocked on the recipient before migration completes",
-                    "tenantId"_attr = _tenantId,
+                    "migrationId"_attr = getMigrationId(),
                     "opId"_attr = opCtx->getOpID(),
                     "command"_attr = command);
         return SharedSemiFuture<void>(Status(
@@ -133,7 +113,7 @@ SharedSemiFuture<void> TenantMigrationRecipientAccessBlocker::getCanReadFuture(
         LOGV2_DEBUG(5749101,
                     1,
                     "Tenant read is blocked on the recipient before migration completes",
-                    "tenantId"_attr = _tenantId,
+                    "migrationId"_attr = getMigrationId(),
                     "opId"_attr = opCtx->getOpID(),
                     "command"_attr = command,
                     "atClusterTime"_attr = *atClusterTime,
@@ -197,14 +177,12 @@ void TenantMigrationRecipientAccessBlocker::appendInfoForServerStatus(
     BSONObjBuilder* builder) const {
     stdx::lock_guard<Latch> lg(_mutex);
 
+    getMigrationId().appendToBuilder(builder, "migrationId");
     builder->append("state", _state.toString());
     if (_rejectBeforeTimestamp) {
-        builder->append("rejectBeforeTimestamp", _rejectBeforeTimestamp.get());
+        builder->append("rejectBeforeTimestamp", _rejectBeforeTimestamp.value());
     }
     builder->append("ttlIsBlocked", _ttlIsBlocked);
-    if (_protocol == MigrationProtocolEnum::kMultitenantMigrations) {
-        builder->append("tenantId", _tenantId);
-    }
 }
 
 std::string TenantMigrationRecipientAccessBlocker::BlockerState::toString() const {
@@ -218,21 +196,13 @@ std::string TenantMigrationRecipientAccessBlocker::BlockerState::toString() cons
     }
 }
 
-UUID TenantMigrationRecipientAccessBlocker::getMigrationId() const {
-    return _migrationId;
-}
-
-BSONObj TenantMigrationRecipientAccessBlocker::getDebugInfo() const {
-    return BSON("tenantId" << _tenantId << "donorConnectionString" << _donorConnString);
-}
-
 void TenantMigrationRecipientAccessBlocker::startRejectingReadsBefore(const Timestamp& timestamp) {
     stdx::lock_guard<Latch> lk(_mutex);
     _state.transitionToRejectBefore();
     if (!_rejectBeforeTimestamp || timestamp > *_rejectBeforeTimestamp) {
         LOGV2(5358100,
               "Tenant migration recipient starting to reject reads before timestamp",
-              "tenantId"_attr = _tenantId,
+              "migrationId"_attr = getMigrationId(),
               "timestamp"_attr = timestamp);
         _rejectBeforeTimestamp = timestamp;
     }

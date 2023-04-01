@@ -4,13 +4,19 @@
  * collection.
  *
  * @tags: [
- *   requires_fcv_51,
- *   requires_pipeline_optimization,
- *   requires_timeseries,
- *   does_not_support_stepdowns,
- *   does_not_support_transactions,
+ *   # TODO (SERVER-73321): remove
+ *   assumes_against_mongod_not_mongos,
  *   # Explain of a resolved view must be executed by mongos.
  *   directly_against_shardsvrs_incompatible,
+ *   # Time series geo functionality requires optimization.
+ *   requires_pipeline_optimization,
+ *   # Refusing to run a test that issues an aggregation command with explain because it may return
+ *   # incomplete results if interrupted by a stepdown.
+ *   does_not_support_stepdowns,
+ *   # Error-handling behavior updated in 6.2, will cause issues for multiversion testing
+ *   requires_fcv_62,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 
@@ -89,7 +95,7 @@ results = coll.aggregate([
               ])
               .toArray();
 assert.eq(results.length, 1, results);
-assert.docEq(results[0].a, {b: {type: "Point", coordinates: [0, 0]}});
+assert.docEq({b: {type: "Point", coordinates: [0, 0]}}, results[0].a);
 
 // Test a scenario where $geoWithin does implicit array traversal.
 coll.drop();
@@ -114,11 +120,13 @@ results = coll.aggregate([
               ])
               .toArray();
 assert.eq(results.length, 1, results);
-assert.docEq(results[0].a, [
-    12345,
-    {type: "Point", coordinates: [180, 0]},
-    {"1": {type: "Point", coordinates: [0, 0]}},
-]);
+assert.docEq(
+    [
+        12345,
+        {type: "Point", coordinates: [180, 0]},
+        {"1": {type: "Point", coordinates: [0, 0]}},
+    ],
+    results[0].a);
 
 pipeline = [{
     $match: {
@@ -304,6 +312,11 @@ assert.sameMembers(results, [
             }
         }
     }];
+    err = assert.throws(() => coll.explain().aggregate(pipeline));
+    assert.eq(err.code, ErrorCodes.BadValue, err);
+
+    // $geoWithin doesn't support multiple shapes.
+    pipeline = [{$match: {loc: {$geoWithin: {$centerSphere: [[0, 80], 1], $center: [[0, 0], 5]}}}}];
     err = assert.throws(() => coll.explain().aggregate(pipeline));
     assert.eq(err.code, ErrorCodes.BadValue, err);
 }

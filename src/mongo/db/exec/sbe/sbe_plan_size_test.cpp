@@ -29,7 +29,6 @@
 
 #include "mongo/db/exec/sbe/stages/branch.h"
 #include "mongo/db/exec/sbe/stages/bson_scan.h"
-#include "mongo/db/exec/sbe/stages/check_bounds.h"
 #include "mongo/db/exec/sbe/stages/co_scan.h"
 #include "mongo/db/exec/sbe/stages/exchange.h"
 #include "mongo/db/exec/sbe/stages/filter.h"
@@ -103,20 +102,11 @@ TEST_F(PlanSizeTest, Branch) {
 }
 
 TEST_F(PlanSizeTest, BsonScan) {
-    auto stage = makeS<BSONScanStage>(nullptr,
-                                      nullptr,
+    auto stage = makeS<BSONScanStage>(std::vector<BSONObj>{},
                                       generateSlotId(),
+                                      kEmptyPlanNodeId,
                                       std::vector<std::string>{2},
-                                      mockSV(),
-                                      kEmptyPlanNodeId);
-    assertPlanSize(*stage);
-}
-
-TEST_F(PlanSizeTest, CheckBounds) {
-    CheckBoundsParams params{
-        IndexBounds{}, BSONObj{}, int{}, KeyString::Version{}, Ordering::allAscending()};
-    auto stage = makeS<CheckBoundsStage>(
-        mockS(), params, generateSlotId(), generateSlotId(), generateSlotId(), kEmptyPlanNodeId);
+                                      mockSV());
     assertPlanSize(*stage);
 }
 
@@ -139,11 +129,12 @@ TEST_F(PlanSizeTest, Filter) {
 TEST_F(PlanSizeTest, HashAgg) {
     auto stage = makeS<HashAggStage>(mockS(),
                                      mockSV(),
-                                     makeEM(generateSlotId(), mockE()),
+                                     makeSlotExprPairVec(generateSlotId(), mockE()),
                                      makeSV(),
                                      true,
                                      generateSlotId(),
                                      false,
+                                     makeSlotExprPairVec(),
                                      kEmptyPlanNodeId);
     assertPlanSize(*stage);
 }
@@ -160,20 +151,37 @@ TEST_F(PlanSizeTest, HashJoin) {
     assertPlanSize(*stage);
 }
 
-TEST_F(PlanSizeTest, IndexScan) {
+TEST_F(PlanSizeTest, SimpleIndexScanStage) {
     auto collUuid = UUID::parse("00000000-0000-0000-0000-000000000000").getValue();
-    auto stage = makeS<IndexScanStage>(collUuid,
-                                       StringData(),
-                                       true,
-                                       generateSlotId(),
-                                       generateSlotId(),
-                                       generateSlotId(),
-                                       IndexKeysInclusionSet(1),
-                                       mockSV(),
-                                       generateSlotId(),
-                                       generateSlotId(),
-                                       nullptr,
-                                       kEmptyPlanNodeId);
+    auto stage = makeS<SimpleIndexScanStage>(collUuid,
+                                             StringData(),
+                                             true,
+                                             generateSlotId(),
+                                             generateSlotId(),
+                                             generateSlotId(),
+                                             IndexKeysInclusionSet(1),
+                                             mockSV(),
+                                             makeE<EVariable>(generateSlotId()),
+                                             makeE<EVariable>(generateSlotId()),
+                                             nullptr,
+                                             kEmptyPlanNodeId);
+    assertPlanSize(*stage);
+}
+
+TEST_F(PlanSizeTest, GenericIndexScanStage) {
+    auto collUuid = UUID::parse("00000000-0000-0000-0000-000000000000").getValue();
+    GenericIndexScanStageParams params{
+        makeE<EVariable>(generateSlotId()), {}, 1, KeyString::Version{0}, Ordering::allAscending()};
+    auto stage = makeS<GenericIndexScanStage>(collUuid,
+                                              StringData(),
+                                              std::move(params),
+                                              generateSlotId(),
+                                              generateSlotId(),
+                                              generateSlotId(),
+                                              IndexKeysInclusionSet(1),
+                                              mockSV(),
+                                              nullptr,
+                                              kEmptyPlanNodeId);
     assertPlanSize(*stage);
 }
 

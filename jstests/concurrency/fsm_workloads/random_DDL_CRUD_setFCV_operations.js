@@ -36,23 +36,18 @@ var $config = extendWorkload($config, function($config, $super) {
                 jsTestLog('setFCV: Invalid transition');
                 return;
             }
-            throw e;
-        }
-        jsTestLog('setFCV state finished');
-    };
-
-    // TODO SERVER-63983: remove the following state override once 6.0 becomes lastLTS
-    $config.states.create = function(db, collName, connCache) {
-        assertAlways.commandWorked(db.adminCommand({enableSharding: db.getName()}));
-        try {
-            $super.states.create.apply(this, arguments);
-        } catch (e) {
-            if (e.code === ErrorCodes.IllegalOperation) {
-                // FCV downgrade happened between enableSharding and shardCollection
+            if (e.code === 7428200) {
+                // Cannot upgrade FCV if a previous FCV downgrade stopped in the middle of cleaning
+                // up internal server metadata.
+                assertAlways.eq(latestFCV, targetFCV);
+                jsTestLog(
+                    'setFCV: Cannot upgrade FCV if a previous FCV downgrade stopped in the middle \
+                    of cleaning up internal server metadata');
                 return;
             }
             throw e;
         }
+        jsTestLog('setFCV state finished');
     };
 
     $config.transitions = {

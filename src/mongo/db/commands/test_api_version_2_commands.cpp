@@ -51,8 +51,14 @@ public:
         return false;
     }
 
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();  // No auth required
+    }
+
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         auto apiParameters = APIParameters::get(opCtx);
@@ -77,8 +83,14 @@ public:
         return false;
     }
 
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();  // No auth required
+    }
+
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         auto apiParameters = APIParameters::get(opCtx);
@@ -107,8 +119,14 @@ public:
         return false;
     }
 
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();  // No auth required
+    }
+
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         auto apiParameters = APIParameters::get(opCtx);
@@ -133,8 +151,14 @@ public:
         return false;
     }
 
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();  // No auth required
+    }
+
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         auto apiParameters = APIParameters::get(opCtx);

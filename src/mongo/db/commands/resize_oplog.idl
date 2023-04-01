@@ -30,14 +30,14 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 commands:
     replSetResizeOplog:
         description: "Parser for the 'replSetResizeOplog' command."
         command_name: replSetResizeOplog
         cpp_name: ReplSetResizeOplogRequest
-        strict: false
+        strict: true
         namespace: type
         api_version: ""
         type: safeInt64

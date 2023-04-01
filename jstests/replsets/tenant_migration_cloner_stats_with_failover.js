@@ -11,7 +11,6 @@
  * 4. Allow the tenant migration to complete and commit. Ensure that stats are sensible.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
@@ -22,19 +21,16 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/libs/uuid_util.js");        // For extractUUIDFromObject().
 load("jstests/libs/fail_point_util.js");  // For configureFailPoint().
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
 // Limit the batch size to test the stat in between batches.
 const tenantMigrationTest = new TenantMigrationTest(
     {name: jsTestName(), sharedOptions: {setParameter: {collectionClonerBatchSize: 10}}});
 
 const kMigrationId = UUID();
-const kTenantId = 'testTenantId';
+const kTenantId = ObjectId().str;
 const kReadPreference = {
     mode: "primary"
 };
@@ -124,8 +120,7 @@ jsTestLog("Bytes copied after first batch of second database: " + bytesCopiedInc
 // original primary to the new primary. Then, step up the new primary.
 const fpAfterCreatingCollectionOfSecondDB =
     configureFailPoint(newRecipientPrimary, "tenantCollectionClonerHangAfterCreateCollection");
-tenantMigrationTest.getRecipientRst().awaitReplication();
-newRecipientPrimary.adminCommand({replSetStepUp: 1});
+tenantMigrationTest.getRecipientRst().stepUp(newRecipientPrimary);
 fpAfterBatchOfSecondDB.off();
 
 jsTestLog("Wait until the new primary creates collection of second database.");
@@ -149,4 +144,3 @@ assert.eq(currOp.databases.databasesClonedBeforeFailover, 1, res);
 assert.eq(currOp.databases[dbName2].clonedCollectionsBeforeFailover, 1, res);
 
 tenantMigrationTest.stop();
-})();

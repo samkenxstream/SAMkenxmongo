@@ -27,17 +27,20 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/collection_uuid_mismatch_info.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/rename_collection_common.h"
 #include "mongo/db/commands/rename_collection_gen.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -78,7 +81,7 @@ public:
             renameCollReq.setStayTemp(request().getStayTemp());
             renameCollReq.setExpectedSourceUUID(request().getCollectionUUID());
             stdx::visit(
-                visit_helper::Overloaded{
+                OverloadedVisitor{
                     [&renameCollReq](bool dropTarget) { renameCollReq.setDropTarget(dropTarget); },
                     [&renameCollReq](const UUID& uuid) {
                         renameCollReq.setDropTarget(true);
@@ -90,10 +93,22 @@ public:
             ShardsvrRenameCollection renameCollRequest(fromNss);
             renameCollRequest.setDbName(fromNss.db());
             renameCollRequest.setRenameCollectionRequest(renameCollReq);
+            renameCollRequest.setAllowEncryptedCollectionRename(
+                AuthorizationSession::get(opCtx->getClient())
+                    ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                       ActionType::setUserWriteBlockMode));
 
             auto catalogCache = Grid::get(opCtx)->catalogCache();
-            const auto dbInfo = uassertStatusOK(catalogCache->getDatabase(opCtx, fromNss.db()));
-            auto cri = uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, fromNss));
+            auto swDbInfo = Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, fromNss.db());
+            if (swDbInfo == ErrorCodes::NamespaceNotFound) {
+                uassert(CollectionUUIDMismatchInfo(fromNss.dbName(),
+                                                   *request().getCollectionUUID(),
+                                                   fromNss.coll().toString(),
+                                                   boost::none),
+                        "Database does not exist",
+                        !request().getCollectionUUID());
+            }
+            const auto dbInfo = uassertStatusOK(swDbInfo);
 
             auto shard = uassertStatusOK(
                 Grid::get(opCtx)->shardRegistry()->getShard(opCtx, dbInfo->getPrimary()));
@@ -109,13 +124,13 @@ public:
             uassertStatusOK(cmdResponse.commandStatus);
 
             auto renameCollResp = RenameCollectionResponse::parse(
-                IDLParserErrorContext("renameCollection"), cmdResponse.response);
+                IDLParserContext("renameCollection"), cmdResponse.response);
 
-            // TODO: SERVER-53098 advance the cache by collection version.
             catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
                 toNss, renameCollResp.getCollectionVersion(), dbInfo->getPrimary());
 
             catalogCache->invalidateCollectionEntry_LINEARIZABLE(fromNss);
+            catalogCache->invalidateIndexEntry_LINEARIZABLE(fromNss);
         }
 
         NamespaceString ns() const override {

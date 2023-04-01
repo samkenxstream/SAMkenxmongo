@@ -4,9 +4,9 @@
  * @tags: [
  *   requires_replication,
  *   requires_sharding,
+ *   temporary_catalog_shard_incompatible,
  * ]
  */
-load("jstests/libs/logv2_helpers.js");
 
 (function() {
 "use strict";
@@ -20,10 +20,10 @@ TestData.disableImplicitSessions = true;
 // check would be lost.
 TestData.skipGossipingClusterTime = true;
 
-// Don't check for UUID and index consistency across the cluster at the end, since the test shuts
-// down a shard.
+// Skip the following checks across the cluster at the end, since the test shuts down a shard.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
 // Set up a 2-shard single-node replicaset cluster.
 const st = new ShardingTest({name: jsTestName(), shards: 2, rs: {nodes: 1}});
@@ -58,26 +58,17 @@ function assertMatchingLogLineExists(fields) {
         return fieldNames.every((fieldName) => {
             const fieldValue = fields[fieldName];
             let regex;
-            if (isJsonLogNoConn()) {
-                const regexDecimal = "\"" + escapeRegex(fieldName) + "\":? ?(" +
-                    escapeRegex(checkLog.formatAsJsonLogLine(fieldValue, false, true)) + "|" +
-                    escapeRegex(checkLog.formatAsJsonLogLine(fieldValue, true, true)) + ")";
+            const regexDecimal = "\"" + escapeRegex(fieldName) + "\":? ?(" +
+                escapeRegex(checkLog.formatAsJsonLogLine(fieldValue, false, true)) + "|" +
+                escapeRegex(checkLog.formatAsJsonLogLine(fieldValue, true, true)) + ")";
 
-                const regexNoDecimal = "\"" + escapeRegex(fieldName) + "\":? ?(" +
-                    escapeRegex(checkLog.formatAsJsonLogLine(fieldValue, false, false)) + "|" +
-                    escapeRegex(checkLog.formatAsJsonLogLine(fieldValue, true, false)) + ")";
+            const regexNoDecimal = "\"" + escapeRegex(fieldName) + "\":? ?(" +
+                escapeRegex(checkLog.formatAsJsonLogLine(fieldValue, false, false)) + "|" +
+                escapeRegex(checkLog.formatAsJsonLogLine(fieldValue, true, false)) + ")";
 
-                const matchDecimal = line.match(regexDecimal);
-                const matchNoDecimal = line.match(regexNoDecimal);
-                return (matchDecimal && matchDecimal[0]) || (matchNoDecimal && matchNoDecimal[0]);
-            } else {
-                const regex = escapeRegex(fieldName) + ":? ?(" +
-                    escapeRegex(checkLog.formatAsLogLine(fieldValue)) + "|" +
-                    escapeRegex(checkLog.formatAsLogLine(fieldValue, true)) + ")";
-
-                const match = line.match(regex);
-                return match && match[0];
-            }
+            const matchDecimal = line.match(regexDecimal);
+            const matchNoDecimal = line.match(regexNoDecimal);
+            return (matchDecimal && matchDecimal[0]) || (matchNoDecimal && matchNoDecimal[0]);
         });
     }
 

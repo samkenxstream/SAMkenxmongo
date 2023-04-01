@@ -37,7 +37,8 @@
 
 namespace mongo {
 
-const NamespaceString kTestNss("TestDB", "TestColl");
+const NamespaceString kTestNss =
+    NamespaceString::createNamespaceString_forTest("TestDB", "TestColl");
 
 class SbeAndHashTest : public SbeStageBuilderTestFixture {
 protected:
@@ -48,10 +49,10 @@ protected:
     std::unique_ptr<QuerySolutionNode> makeHashAndTree(
         std::vector<std::vector<BSONArray>> docsVec) {
         auto andHashNode = std::make_unique<AndHashNode>();
-        for (auto docs : docsVec) {
+        for (const auto& docs : docsVec) {
             auto virtScan =
                 std::make_unique<VirtualScanNode>(docs, VirtualScanNode::ScanType::kCollScan, true);
-            andHashNode->children.push_back(virtScan.release());
+            andHashNode->children.push_back(std::move(virtScan));
         }
         return std::move(andHashNode);
     }

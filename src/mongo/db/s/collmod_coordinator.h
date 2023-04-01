@@ -35,7 +35,9 @@
 
 namespace mongo {
 
-class CollModCoordinator final : public ShardingDDLCoordinator {
+class CollModCoordinator final
+    : public RecoverableShardingDDLCoordinator<CollModCoordinatorDocument,
+                                               CollModCoordinatorPhaseEnum> {
 public:
     using StateDoc = CollModCoordinatorDocument;
     using Phase = CollModCoordinatorPhaseEnum;
@@ -44,9 +46,7 @@ public:
 
     void checkIfOptionsConflict(const BSONObj& doc) const override;
 
-    boost::optional<BSONObj> reportForCurrentOp(
-        MongoProcessInterface::CurrentOpConnectionsMode connMode,
-        MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override;
+    void appendCommandInfo(BSONObjBuilder* cmdInfoBuilder) const override;
 
     /**
      * Waits for the termination of the parent DDLCoordinator (so all the resources are liberated)
@@ -59,38 +59,43 @@ public:
     }
 
 private:
-    ShardingDDLCoordinatorMetadata const& metadata() const override {
-        return _doc.getShardingDDLCoordinatorMetadata();
+    struct CollectionInfo {
+        bool isSharded;
+        boost::optional<TimeseriesOptions> timeSeriesOptions;
+        // The targeting namespace can be different from the original namespace in some cases, like
+        // time-series collections.
+        NamespaceString nsForTargeting;
+    };
+
+    struct ShardingInfo {
+        // The primary shard for the collection, only set if the collection is sharded.
+        ShardId primaryShard;
+        // The shards owning chunks for the collection, only set if the collection is sharded.
+        std::vector<ShardId> shardsOwningChunks;
+    };
+
+    StringData serializePhase(const Phase& phase) const override {
+        return CollModCoordinatorPhase_serializer(phase);
     }
 
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                   const CancellationToken& token) noexcept override;
 
-    template <typename Func>
-    auto _executePhase(const Phase& newPhase, Func&& func) {
-        return [=] {
-            const auto& currPhase = _doc.getPhase();
-
-            if (currPhase > newPhase) {
-                // Do not execute this phase if we already reached a subsequent one.
-                return;
-            }
-            if (currPhase < newPhase) {
-                // Persist the new phase if this is the first time we are executing it.
-                _enterPhase(newPhase);
-            }
-            return func();
-        };
-    }
-
-    void _enterPhase(Phase newPhase);
-
     void _performNoopRetryableWriteOnParticipants(
         OperationContext* opCtx, const std::shared_ptr<executor::TaskExecutor>& executor);
 
-    BSONObj _initialState;
-    CollModCoordinatorDocument _doc;
+    void _saveCollectionInfoOnCoordinatorIfNecessary(OperationContext* opCtx);
+
+    void _saveShardingInfoOnCoordinatorIfNecessary(OperationContext* opCtx);
+
+    // TODO SERVER-68008 Remove once 7.0 becomes last LTS
+    bool _isPre61Compatible() const;
+
+    const mongo::CollModRequest _request;
+
     boost::optional<BSONObj> _result;
+    boost::optional<CollectionInfo> _collInfo;
+    boost::optional<ShardingInfo> _shardingInfo;
 };
 
 }  // namespace mongo

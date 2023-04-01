@@ -29,7 +29,9 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/bson/json.h"
 #include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/inline_auto_update.h"
 
 namespace mongo {
 namespace unittest {
@@ -82,6 +84,21 @@ GENERATE_BSON_CMP_FUNC(BSONElement, LTE, SimpleBSONElementComparator::kInstance,
 GENERATE_BSON_CMP_FUNC(BSONElement, GT, SimpleBSONElementComparator::kInstance, >);
 GENERATE_BSON_CMP_FUNC(BSONElement, GTE, SimpleBSONElementComparator::kInstance, >=);
 GENERATE_BSON_CMP_FUNC(BSONElement, NE, SimpleBSONElementComparator::kInstance, !=);
+
+std::string formatJsonStr(const std::string& input) {
+    BSONObj obj = fromjson(input);
+    const static JsonStringFormat format = JsonStringFormat::ExtendedRelaxedV2_0_0;
+    std::string str = obj.jsonString(format);
+
+    // Raw JSON strings additionally have `fromjson(R())`, so subtract that from the auto-update max
+    // line length.
+    static constexpr size_t kRawJsonMaxLineLength =
+        kAutoUpdateMaxLineLength - "fromjson(R())"_sd.size();
+    if (str.size() > kRawJsonMaxLineLength) {
+        str = obj.jsonString(format, 1);
+    }
+    return str::stream() << "R\"(" << str << ")\"";
+}
 
 }  // namespace unittest
 }  // namespace mongo

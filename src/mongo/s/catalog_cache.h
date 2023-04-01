@@ -33,8 +33,11 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/s/catalog/type_database_gen.h"
+#include "mongo/s/catalog/type_index_catalog.h"
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/chunk_manager.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/s/sharding_index_catalog_cache.h"
 #include "mongo/s/type_collection_common_types_gen.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/read_through_cache.h"
@@ -48,6 +51,17 @@ class ComparableDatabaseVersion;
 using DatabaseTypeCache = ReadThroughCache<std::string, DatabaseType, ComparableDatabaseVersion>;
 using DatabaseTypeValueHandle = DatabaseTypeCache::ValueHandle;
 using CachedDatabaseInfo = DatabaseTypeValueHandle;
+
+struct CollectionRoutingInfo {
+    CollectionRoutingInfo(ChunkManager&& chunkManager,
+                          boost::optional<ShardingIndexesCatalogCache>&& shardingIndexesCatalog)
+        : cm(std::move(chunkManager)), sii(std::move(shardingIndexesCatalog)) {}
+    ChunkManager cm;
+    boost::optional<ShardingIndexesCatalogCache> sii;
+
+    ShardVersion getCollectionVersion() const;
+    ShardVersion getShardVersion(const ShardId& shardId) const;
+};
 
 /**
  * This class wrap a DatabaseVersion object augmenting it with:
@@ -149,31 +163,33 @@ public:
                                                bool allowLocks = false);
 
     /**
-     * Blocking method to get the routing information for a specific collection at a given cluster
-     * time.
+     * Blocking method to get both the placement information and the index information for a
+     * collection.
      *
-     * If the collection is sharded, returns routing info initialized with a ChunkManager. If the
-     * collection is not sharded, returns routing info initialized with the primary shard for the
-     * specified database. If an error occurs while loading the metadata, returns a failed status.
+     * If the collection is sharded, returns placement info initialized with a ChunkManager and a
+     * list of global indexes that may be empty if no global indexes exist. If the collection is not
+     * sharded, returns placement info initialized with the primary shard for the specified database
+     * and an empty list representing no global indexes. If an error occurs while loading the
+     * metadata, returns a failed status.
      *
-     * If the given atClusterTime is so far in the past that it is not possible to construct routing
-     * info, returns a StaleClusterTime error.
+     * If the given atClusterTime is so far in the past that it is not possible to construct
+     * placement info, returns a StaleClusterTime error.
      */
-    StatusWith<ChunkManager> getCollectionRoutingInfoAt(OperationContext* opCtx,
-                                                        const NamespaceString& nss,
-                                                        Timestamp atClusterTime);
+    StatusWith<CollectionRoutingInfo> getCollectionRoutingInfoAt(OperationContext* opCtx,
+                                                                 const NamespaceString& nss,
+                                                                 Timestamp atClusterTime);
 
     /**
      * Same as the getCollectionRoutingInfoAt call above, but returns the latest known routing
      * information for the specified namespace.
      *
      * While this method may fail under the same circumstances as getCollectionRoutingInfoAt, it is
-     * guaranteed to never return StaleClusterTime, because the latest routing information should
+     * guaranteed to never throw StaleClusterTime, because the latest routing information should
      * always be available.
      */
-    virtual StatusWith<ChunkManager> getCollectionRoutingInfo(OperationContext* opCtx,
-                                                              const NamespaceString& nss,
-                                                              bool allowLocks = false);
+    virtual StatusWith<CollectionRoutingInfo> getCollectionRoutingInfo(OperationContext* opCtx,
+                                                                       const NamespaceString& nss,
+                                                                       bool allowLocks = false);
 
     /**
      * Same as getDatbase above, but in addition forces the database entry to be refreshed.
@@ -184,24 +200,47 @@ public:
     /**
      * Same as getCollectionRoutingInfo above, but in addition causes the namespace to be refreshed.
      */
-    StatusWith<ChunkManager> getCollectionRoutingInfoWithRefresh(OperationContext* opCtx,
-                                                                 const NamespaceString& nss);
+    StatusWith<CollectionRoutingInfo> getCollectionRoutingInfoWithRefresh(
+        OperationContext* opCtx, const NamespaceString& nss);
 
+    /**
+     * Same as getCollectionRoutingInfo above, but in addition, causes the placement information for
+     * the namespace to be refreshed. Will only refresh the index information if the collection
+     * uuid from the placement information does not match the collection uuid from the cached index
+     * information.
+     */
+    StatusWith<CollectionRoutingInfo> getCollectionRoutingInfoWithPlacementRefresh(
+        OperationContext* opCtx, const NamespaceString& nss);
+
+    /**
+     * Same as getCollectionRoutingInfo above, but in addition, causes the index information for the
+     * namespace to be refreshed. Will only refresh the placement information if the collection uuid
+     * from the index information does not match the collection uuid from the cached placement
+     * information.
+     */
+    StatusWith<CollectionRoutingInfo> getCollectionRoutingInfoWithIndexRefresh(
+        OperationContext* opCtx, const NamespaceString& nss);
 
     /**
      * Same as getCollectionRoutingInfo above, but throws NamespaceNotSharded error if the namespace
      * is not sharded.
      */
-    ChunkManager getShardedCollectionRoutingInfo(OperationContext* opCtx,
-                                                 const NamespaceString& nss);
-
+    CollectionRoutingInfo getShardedCollectionRoutingInfo(OperationContext* opCtx,
+                                                          const NamespaceString& nss);
 
     /**
      * Same as getCollectionRoutingInfoWithRefresh above, but in addition returns a
      * NamespaceNotSharded error if the collection is not sharded.
      */
-    StatusWith<ChunkManager> getShardedCollectionRoutingInfoWithRefresh(OperationContext* opCtx,
-                                                                        const NamespaceString& nss);
+    StatusWith<CollectionRoutingInfo> getShardedCollectionRoutingInfoWithRefresh(
+        OperationContext* opCtx, const NamespaceString& nss);
+
+    /**
+     * Same as getCollectionRoutingInfoWithPlacementRefresh above, but in addition returns a
+     * NamespaceNotSharded error if the collection is not sharded.
+     */
+    StatusWith<CollectionRoutingInfo> getShardedCollectionRoutingInfoWithPlacementRefresh(
+        OperationContext* opCtx, const NamespaceString& nss);
 
     /**
      * Advances the version in the cache for the given database.
@@ -227,7 +266,7 @@ public:
      */
     void invalidateShardOrEntireCollectionEntryForShardedCollection(
         const NamespaceString& nss,
-        const boost::optional<ChunkVersion>& wantedVersion,
+        const boost::optional<ShardVersion>& wantedVersion,
         const ShardId& shardId);
 
     /**
@@ -254,13 +293,6 @@ public:
     void report(BSONObjBuilder* builder) const;
 
     /**
-     * Checks if the current operation was ever marked as needing refresh. If the curent operation
-     * was marked as needing refresh, updates the relevant counters inside the Stats struct.
-     */
-    void checkAndRecordOperationBlockedByRefresh(OperationContext* opCtx, mongo::LogicalOp opType);
-
-
-    /**
      * Non-blocking method that marks the current database entry for the dbName as needing
      * refresh. Will cause all further targetting attempts to block on a catalog cache refresh,
      * even if they do not require causal consistency.
@@ -273,6 +305,8 @@ public:
      * even if they do not require causal consistency.
      */
     void invalidateCollectionEntry_LINEARIZABLE(const NamespaceString& nss);
+
+    void invalidateIndexEntry_LINEARIZABLE(const NamespaceString& nss);
 
 private:
     class DatabaseCache : public DatabaseTypeCache {
@@ -336,20 +370,41 @@ private:
         void _updateRefreshesStats(bool isIncremental, bool add);
     };
 
-    StatusWith<ChunkManager> _getCollectionRoutingInfoAt(OperationContext* opCtx,
-                                                         const NamespaceString& nss,
-                                                         boost::optional<Timestamp> atClusterTime,
-                                                         bool allowLocks = false);
+    class IndexCache : public ShardingIndexesCatalogRTCBase {
+    public:
+        IndexCache(ServiceContext* service, ThreadPoolInterface& threadPool);
+
+    private:
+        LookupResult _lookupIndexes(OperationContext* opCtx,
+                                    const NamespaceString& nss,
+                                    const ValueHandle& indexes,
+                                    const ComparableIndexVersion& previousIndexVersion);
+        Mutex _mutex = MONGO_MAKE_LATCH("IndexCache::_mutex");
+    };
+
+    StatusWith<ChunkManager> _getCollectionPlacementInfoAt(OperationContext* opCtx,
+                                                           const NamespaceString& nss,
+                                                           boost::optional<Timestamp> atClusterTime,
+                                                           bool allowLocks = false);
+
+    boost::optional<ShardingIndexesCatalogCache> _getCollectionIndexInfoAt(
+        OperationContext* opCtx, const NamespaceString& nss, bool allowLocks = false);
+
+    void _triggerPlacementVersionRefresh(OperationContext* opCtx, const NamespaceString& nss);
+
+    void _triggerIndexVersionRefresh(OperationContext* opCtx, const NamespaceString& nss);
 
     // Interface from which chunks will be retrieved
     CatalogCacheLoader& _cacheLoader;
 
     // Executor on which the caches below will execute their blocking work
-    std::shared_ptr<ThreadPool> _executor;
+    ThreadPool _executor;
 
     DatabaseCache _databaseCache;
 
     CollectionCache _collectionCache;
+
+    IndexCache _indexCache;
 
     /**
      * Encapsulates runtime statistics across all databases and collections in this catalog cache
@@ -362,18 +417,6 @@ private:
         // Cumulative, always-increasing counter of how much time threads waiting for refresh
         // combined
         AtomicWord<long long> totalRefreshWaitTimeMicros{0};
-
-        // Cumulative, always-increasing counter of how many operations have been blocked by a
-        // catalog cache refresh. Broken down by operation type to match the operations tracked
-        // by the OpCounters class.
-        struct OperationsBlockedByRefresh {
-            AtomicWord<long long> countAllOperations{0};
-            AtomicWord<long long> countInserts{0};
-            AtomicWord<long long> countQueries{0};
-            AtomicWord<long long> countUpdates{0};
-            AtomicWord<long long> countDeletes{0};
-            AtomicWord<long long> countCommands{0};
-        } operationsBlockedByRefresh;
 
         /**
          * Reports the accumulated statistics for serverStatus.

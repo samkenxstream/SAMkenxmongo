@@ -36,6 +36,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user_name.h"
+#include "mongo/db/database_name.h"
 #include "mongo/stdx/variant.h"
 
 namespace mongo {
@@ -62,7 +63,9 @@ public:
     static_assert(std::is_same<UserName, T>::value || std::is_same<RoleName, T>::value,
                   "UMCInfoCommandArg only valid with T = UserName | RoleName");
 
-    static UMCInfoCommandArg parseFromBSON(const BSONElement& elem) {
+    static UMCInfoCommandArg parseFromBSON(const boost::optional<TenantId> tenantId,
+                                           const BSONElement& elem,
+                                           const SerializationContext&) {
         if (elem.isNumber() && (elem.safeNumberLong() == 1)) {
             return UMCInfoCommandArg(AllOnCurrentDB{});
         }
@@ -73,15 +76,17 @@ public:
         if (elem.type() == Array) {
             Multiple values;
             for (const auto& v : elem.Obj()) {
-                values.push_back(parseNamedElement(v));
+                values.push_back(parseNamedElement(v, tenantId));
             }
             return UMCInfoCommandArg(std::move(values));
         }
 
-        return UMCInfoCommandArg(parseNamedElement(elem));
+        return UMCInfoCommandArg(parseNamedElement(elem, tenantId));
     }
 
-    void serializeToBSON(StringData fieldName, BSONObjBuilder* bob) const {
+    void serializeToBSON(StringData fieldName,
+                         BSONObjBuilder* bob,
+                         const SerializationContext&) const {
         if (stdx::holds_alternative<AllOnCurrentDB>(_value)) {
             bob->append(fieldName, 1);
         } else if (stdx::holds_alternative<AllForAllDBs>(_value)) {
@@ -99,11 +104,12 @@ public:
         }
     }
 
-    void serializeToBSON(BSONArrayBuilder* bob) const {
+    void serializeToBSON(BSONArrayBuilder* bob,
+                         const SerializationContext& serializationContext) const {
         // Minimize code duplication by using object serialization path.
         // In practice, we don't use this API, it only exists for IDL completeness.
         BSONObjBuilder tmp;
-        serializeToBSON("", &tmp);
+        serializeToBSON("", &tmp, serializationContext);
         auto elem = tmp.obj();
         bob->append(elem.firstElement());
     }
@@ -132,7 +138,7 @@ public:
     /**
      * For isExact() commands, returns a set of T with unspecified DB names resolved with $dbname.
      */
-    std::vector<T> getElements(StringData dbname) const {
+    std::vector<T> getElements(const DatabaseName& dbname) const {
         if (!isExact()) {
             dassert(false);
             uasserted(ErrorCodes::InternalError, "Unable to get exact match for wildcard query");
@@ -165,11 +171,12 @@ private:
     explicit UMCInfoCommandArg(Single value) : _value(std::move(value)) {}
     explicit UMCInfoCommandArg(Multiple values) : _value(std::move(values)) {}
 
-    static Single parseNamedElement(const BSONElement& elem) {
+    static Single parseNamedElement(const BSONElement& elem,
+                                    const boost::optional<TenantId> tenantId) {
         if (elem.type() == String) {
             return elem.String();
         }
-        return T::parseFromBSON(elem);
+        return T::parseFromBSON(elem, tenantId);
     }
 
     static void serializeSingle(StringData fieldName, BSONObjBuilder* builder, Single elem) {
@@ -190,7 +197,7 @@ private:
         }
     }
 
-    static T getElement(Single elem, StringData dbname) {
+    static T getElement(Single elem, const DatabaseName& dbname) {
         if (stdx::holds_alternative<T>(elem)) {
             return stdx::get<T>(elem);
         } else {

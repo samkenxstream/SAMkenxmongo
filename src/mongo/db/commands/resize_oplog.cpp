@@ -27,23 +27,22 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
-
-#include "mongo/platform/basic.h"
-
 #include <string>
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/resize_oplog_gen.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 namespace {
@@ -68,10 +67,10 @@ public:
         return "Resize oplog using size (in MBs) and optionally, retention (in terms of hours)";
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const final {
-        AuthorizationSession* authzSession = AuthorizationSession::get(client);
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName&,
+                                 const BSONObj&) const final {
+        AuthorizationSession* authzSession = AuthorizationSession::get(opCtx->getClient());
         if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
                                                            ActionType::replSetResizeOplog)) {
             return Status::OK();
@@ -80,17 +79,15 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName&,
              const BSONObj& jsobj,
              BSONObjBuilder& result) {
         AutoGetCollection coll(opCtx, NamespaceString::kRsOplogNamespace, MODE_X);
-        Database* database = coll.getDb();
-        uassert(ErrorCodes::NamespaceNotFound, "database local does not exist", database);
         uassert(ErrorCodes::NamespaceNotFound, "oplog does not exist", coll);
         uassert(ErrorCodes::IllegalOperation, "oplog isn't capped", coll->isCapped());
 
         auto params =
-            ReplSetResizeOplogRequest::parse(IDLParserErrorContext("replSetResizeOplog"), jsobj);
+            ReplSetResizeOplogRequest::parse(IDLParserContext("replSetResizeOplog"), jsobj);
 
         return writeConflictRetry(opCtx, "replSetResizeOplog", coll->ns().ns(), [&] {
             WriteUnitOfWork wunit(opCtx);

@@ -35,8 +35,7 @@
 namespace mongo {
 namespace sbe {
 /**
- * Scans a buffer of contiguous BSON documents, with the start of the buffer indicated by
- * 'bsonBegin' and the end indicated by 'bsonEnd'. The resulting BSON documents are placed into the
+ * Scans a vector of BSON documents. The resulting BSON documents are placed into the
  * given 'recordSlot', if provided.
  *
  * The caller can also optionally provide a vector of top-level field names, 'fields', to extract
@@ -46,12 +45,12 @@ namespace sbe {
  */
 class BSONScanStage final : public PlanStage {
 public:
-    BSONScanStage(const char* bsonBegin,
-                  const char* bsonEnd,
+    BSONScanStage(std::vector<BSONObj> bsons,
                   boost::optional<value::SlotId> recordSlot,
-                  std::vector<std::string> fields,
-                  value::SlotVector vars,
-                  PlanNodeId planNodeId);
+                  PlanNodeId planNodeId,
+                  std::vector<std::string> fields = {},
+                  value::SlotVector vars = {},
+                  bool participateInTrialRunTracking = true);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -68,8 +67,7 @@ public:
     size_t estimateCompileTimeSize() const final;
 
 private:
-    const char* const _bsonBegin;
-    const char* const _bsonEnd;
+    const std::vector<BSONObj> _bsons;
 
     const boost::optional<value::SlotId> _recordSlot;
     const std::vector<std::string> _fields;
@@ -80,7 +78,7 @@ private:
     value::FieldViewAccessorMap _fieldAccessors;
     value::SlotAccessorMap _varAccessors;
 
-    const char* _bsonCurrent;
+    std::vector<BSONObj>::const_iterator _bsonCurrent;
 
     ScanStats _specificStats;
 };

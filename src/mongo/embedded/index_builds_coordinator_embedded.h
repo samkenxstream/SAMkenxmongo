@@ -58,7 +58,7 @@ public:
 
     StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> startIndexBuild(
         OperationContext* opCtx,
-        std::string dbName,
+        const DatabaseName& dbName,
         const UUID& collectionUUID,
         const std::vector<BSONObj>& specs,
         const UUID& buildUUID,
@@ -67,7 +67,7 @@ public:
 
     StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> resumeIndexBuild(
         OperationContext* opCtx,
-        std::string dbName,
+        const DatabaseName& dbName,
         const UUID& collectionUUID,
         const std::vector<BSONObj>& specs,
         const UUID& buildUUID,
@@ -76,6 +76,10 @@ public:
     /**
      * None of the following functions should ever be called on an embedded server node.
      */
+    Status voteAbortIndexBuild(OperationContext* opCtx,
+                               const UUID& buildUUID,
+                               const HostAndPort& hostAndPort,
+                               const StringData& reason) override;
     Status voteCommitIndexBuild(OperationContext* opCtx,
                                 const UUID& buildUUID,
                                 const HostAndPort& hostAndPort) override;
@@ -90,6 +94,10 @@ private:
 
     bool _signalIfCommitQuorumNotEnabled(OperationContext* opCtx,
                                          std::shared_ptr<ReplIndexBuildState> replState) override;
+
+    void _signalPrimaryForAbortAndWaitForExternalAbort(OperationContext* opCtx,
+                                                       ReplIndexBuildState* replState,
+                                                       const Status& abortStatus) override;
 
     void _signalPrimaryForCommitReadiness(OperationContext* opCtx,
                                           std::shared_ptr<ReplIndexBuildState> replState) override;

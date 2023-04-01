@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/type_shard_collection.h"
 
 namespace mongo {
@@ -40,27 +38,18 @@ ShardCollectionType::ShardCollectionType(NamespaceString nss,
                                          KeyPattern keyPattern,
                                          bool unique)
     : ShardCollectionTypeBase(std::move(nss),
-                              std::move(epoch),
-                              std::move(timestamp),
                               std::move(uuid),
                               std::move(keyPattern),
-                              unique) {}
+                              unique,
+                              std::move(epoch),
+                              std::move(timestamp)) {}
 
 ShardCollectionType::ShardCollectionType(const BSONObj& obj) {
-    ShardCollectionTypeBase::parseProtected(IDLParserErrorContext("ShardCollectionType"), obj);
+    ShardCollectionTypeBase::parseProtected(IDLParserContext("ShardCollectionType"), obj);
 
     uassert(ErrorCodes::ShardKeyNotFound,
             str::stream() << "Empty shard key. Failed to parse: " << obj.toString(),
             !getKeyPattern().toBSON().isEmpty());
-
-    // Last refreshed collection version is stored as a timestamp in the BSON representation of
-    // shard collection type for legacy reasons. We therefore explicitly convert this timestamp, if
-    // it exists, into a chunk version.
-    if (getLastRefreshedCollectionVersion()) {
-        ChunkVersion version = *getLastRefreshedCollectionVersion();
-        setLastRefreshedCollectionVersion(ChunkVersion(
-            version.majorVersion(), version.minorVersion(), getEpoch(), getTimestamp()));
-    }
 }
 
 BSONObj ShardCollectionType::toBSON() const {
@@ -81,6 +70,18 @@ void ShardCollectionType::setAllowMigrations(bool allowMigrations) {
         setPre50CompatibleAllowMigrations(boost::none);
     else
         setPre50CompatibleAllowMigrations(false);
+}
+
+boost::optional<ChunkVersion> ShardCollectionType::getLastRefreshedCollectionPlacementVersion()
+    const {
+    // Last refreshed collection placement version is stored as a timestamp in the BSON
+    // representation of shard collection type for legacy reasons. We therefore explicitly convert
+    // this timestamp, if it exists, into a chunk version.
+    if (!getLastRefreshedCollectionMajorMinorVersion())
+        return boost::none;
+
+    Timestamp majorMinor = *getLastRefreshedCollectionMajorMinorVersion();
+    return ChunkVersion({getEpoch(), getTimestamp()}, {majorMinor.getSecs(), majorMinor.getInc()});
 }
 
 }  // namespace mongo

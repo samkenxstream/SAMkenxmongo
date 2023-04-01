@@ -36,7 +36,7 @@
 #include "mongo/util/str.h"
 
 namespace mongo {
-const NamespaceString MongosType::ConfigNS("config.mongos");
+const NamespaceString MongosType::ConfigNS(NamespaceString::kConfigMongosNamespace);
 
 const BSONField<std::string> MongosType::name("_id");
 const BSONField<Date_t> MongosType::created("created");
@@ -131,19 +131,19 @@ StatusWith<MongosType> MongosType::fromBSON(const BSONObj& source) {
 }
 
 Status MongosType::validate() const {
-    if (!_name.is_initialized() || _name->empty()) {
+    if (!_name.has_value() || _name->empty()) {
         return {ErrorCodes::NoSuchKey, str::stream() << "missing " << name.name() << " field"};
     }
 
-    if (!_ping.is_initialized()) {
+    if (!_ping.has_value()) {
         return {ErrorCodes::NoSuchKey, str::stream() << "missing " << ping.name() << " field"};
     }
 
-    if (!_uptime.is_initialized()) {
+    if (!_uptime.has_value()) {
         return {ErrorCodes::NoSuchKey, str::stream() << "missing " << uptime.name() << " field"};
     }
 
-    if (!_waiting.is_initialized()) {
+    if (!_waiting.has_value()) {
         return {ErrorCodes::NoSuchKey, str::stream() << "missing " << waiting.name() << " field"};
     }
 

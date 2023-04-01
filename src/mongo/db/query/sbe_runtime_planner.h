@@ -45,13 +45,13 @@ namespace mongo::sbe {
  * index pointing to the winning plan within this vector.
  */
 struct CandidatePlans {
-    std::vector<plan_ranker::CandidatePlan> plans;
-    size_t winnerIdx;
-
     auto& winner() {
         invariant(winnerIdx < plans.size());
         return plans[winnerIdx];
     }
+
+    std::vector<plan_ranker::CandidatePlan> plans;
+    size_t winnerIdx;
 };
 
 /**
@@ -87,60 +87,48 @@ public:
           _cq(cq),
           _queryParams(queryParams),
           _yieldPolicy(yieldPolicy),
-          _indexExistenceChecker(collections.getMainCollection()) {
+          _indexExistenceChecker(collections) {
         invariant(_opCtx);
     }
 
 protected:
     /**
+     * Fetches a next document from the given plan stage tree and the loaded document is placed into
+     * the candidate's plan result queue.
+     *
+     * Returns true if a document was fetched, and false if the plan stage tree reached EOF, an
+     * exception was thrown or the plan stage tree returned maxNumResults documents.
+     *
+     * If the plan stage throws a 'QueryExceededMemoryLimitNoDiskUseAllowed', it will be caught and
+     * the 'candidate->status' will be set. This failure is considered recoverable, as another
+     * candidate plan may require less memory, or may not contain a stage requiring spilling to disk
+     * at all.
+     */
+    static bool fetchNextDocument(plan_ranker::CandidatePlan* candidate, size_t maxNumResults);
+
+    /**
      * Prepares the given plan stage tree for execution, attaches it to the operation context and
-     * returns two slot accessors for the result and recordId slots, and a boolean value indicating
-     * if the plan has exited early from the trial period. If the plan has failed in a recoverable
-     * fashion, it will return a non-OK status.
+     * returns two slot accessors for the result and recordId slots. The caller should pass true
+     * for 'preparingFromCache' if the SBE plan being prepared is being recovered from the SBE plan
+     * cache.
      */
-    StatusWith<std::tuple<sbe::value::SlotAccessor*, sbe::value::SlotAccessor*, bool>>
-    prepareExecutionPlan(PlanStage* root, stage_builder::PlanStageData* data) const;
+    std::pair<sbe::value::SlotAccessor*, sbe::value::SlotAccessor*> prepareExecutionPlan(
+        PlanStage* root, stage_builder::PlanStageData* data, bool preparingFromCache) const;
 
     /**
-     * Executes a candidate plan until it
-     *   - reaches EOF, or
-     *   - reaches the 'maxNumResults' limit, or
-     *   - early exits via the TrialRunTracker, or
-     *   - returns a failure Status.
-     *
-     * The execution process populates the 'results' array of the 'candidate' plan with any results
-     * from execution the plan. This function also sets the 'status' and 'exitedEarly' fields of the
-     * input 'candidate' object when applicable.
+     * Wraps prepareExecutionPlan(), checks index validity, and caches outputAccessors.
      */
-    void executeCandidateTrial(plan_ranker::CandidatePlan* candidate, size_t maxNumResults);
+    void prepareCandidate(plan_ranker::CandidatePlan* candidate, bool preparingFromCache);
 
-    /**
-     * Executes each plan in a round-robin fashion to collect execution stats. Stops when:
-     *    * Any plan hits EOF.
-     *    * Or returns a pre-defined number of results.
-     *    * Or all candidate plans fail or exit early by throwing a special signaling exception.
-     *
-     * All documents returned by each plan are enqueued into the 'CandidatePlan->results' queue.
-     *
-     * Upon completion returns a vector of candidate plans. Execution stats can be obtained for each
-     * of the candidate plans by calling 'CandidatePlan->root->getStats()'.
-     *
-     * After the trial period ends, all plans remain open, but 'exitedEarly' plans are in an invalid
-     * state. Any 'exitedEarly' plans must be closed and reopened before they can be executed.
-     */
-    std::vector<plan_ranker::CandidatePlan> collectExecutionStats(
-        std::vector<std::unique_ptr<QuerySolution>> solutions,
-        std::vector<std::pair<std::unique_ptr<PlanStage>, stage_builder::PlanStageData>> roots,
-        size_t maxTrialPeriodNumReads);
+    void executeCachedCandidateTrial(plan_ranker::CandidatePlan* candidate, size_t maxNumResults);
 
     OperationContext* const _opCtx;
     const MultipleCollectionAccessor& _collections;
     const CanonicalQuery& _cq;
     const QueryPlannerParams _queryParams;
     PlanYieldPolicySBE* const _yieldPolicy;
-
-    // TODO SERVER-62913: When support for indexed nested loop join is added, this member needs
-    //  to be extended to support checking for index existence on multiple collections.
     const AllIndicesRequiredChecker _indexExistenceChecker;
+
+    std::vector<plan_ranker::CandidatePlan> _candidates;
 };
 }  // namespace mongo::sbe

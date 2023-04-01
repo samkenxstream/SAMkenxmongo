@@ -32,7 +32,14 @@ global:
     - "mongo/db/catalog/collection_options_validation.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
+
+feature_flags:
+  featureFlagCappedCollectionsRelaxedSize:
+    description: Enables capped collections to have a size non multiple of 256 bytes.
+    cpp_varname: feature_flags::gfeatureFlagCappedCollectionsRelaxedSize
+    default: true
+    version: 6.2
 
 enums:
     ValidationLevel:
@@ -59,6 +66,6 @@ structs:
                 description: "The index options for the specified storage engines."
                 type: object_owned
                 optional: true
-                unstable: false
+                stability: stable
                 validator:
                     callback: collection_options_validation::validateStorageEngineOptions

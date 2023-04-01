@@ -6,27 +6,28 @@
  * TODO SERVER-61231: shard merge can't handle concurrent rollback, adapt this test.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
  *   requires_persistence,
+ *   # The currentOp output field 'dataSyncCompleted' was renamed to 'migrationCompleted'.
+ *   requires_fcv_70,
  *   serverless,
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    makeX509OptionsForTest,
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");  // for 'extractUUIDFromObject'
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 load("jstests/replsets/rslib.js");  // for 'stopServerReplication'
 
 function runTest({failPointName, failPointData = {}, batchSize = 10 * 1000}) {
-    const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
+    const migrationX509Options = makeX509OptionsForTest();
 
     const donorRst = new ReplSetTest({
         name: "recipientRst",
@@ -37,6 +38,7 @@ function runTest({failPointName, failPointData = {}, batchSize = 10 * 1000}) {
             {rsConfig: {priority: 0, hidden: true}},
             {rsConfig: {priority: 0, hidden: true}}
         ],
+        serverless: true,
         nodeOptions: Object.assign(migrationX509Options.donor, {
             setParameter: {
                 // Allow non-timestamped reads on donor after migration completes for testing.
@@ -63,7 +65,7 @@ function runTest({failPointName, failPointData = {}, batchSize = 10 * 1000}) {
         sharedOptions: {setParameter: {collectionClonerBatchSize: batchSize}}
     });
 
-    const tenantId = "testTenantId";
+    const tenantId = ObjectId().str;
     const dbName = tenantMigrationTest.tenantDB(tenantId, "testDB");
     const collName = "testColl";
 
@@ -124,7 +126,7 @@ function runTest({failPointName, failPointData = {}, batchSize = 10 * 1000}) {
     jsTestLog("Failing over to next primary");
     assert.commandWorked(
         donorA.adminCommand({replSetStepDown: ReplSetTest.kDefaultTimeoutMS, force: true}));
-    assert.commandWorked(nextPrimary.adminCommand({replSetStepUp: ReplSetTest.kDefaultTimeoutMS}));
+    donorRst.stepUp(nextPrimary, {awaitReplicationBeforeStepUp: false});
     assert.eq(nextPrimary, donorRst.getPrimary());
     restartServerReplication(nextPrimary);
     restartServerReplication(donorD);
@@ -132,8 +134,8 @@ function runTest({failPointName, failPointData = {}, batchSize = 10 * 1000}) {
 
     res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
     currOp = res.inprog[0];
+    assert.eq(currOp.garbageCollectable, false, () => tojson(currOp));
     assert.eq(currOp.migrationCompleted, false, () => tojson(currOp));
-    assert.eq(currOp.dataSyncCompleted, false, () => tojson(currOp));
 
     // The sync source has not rolled back, so the recipient has not yet perceived an interruption.
     assert.eq(NumberLong(0), currOp.numRestartsDueToDonorConnectionFailure, () => tojson(currOp));
@@ -162,8 +164,8 @@ function runTest({failPointName, failPointData = {}, batchSize = 10 * 1000}) {
     currOp = res.inprog[0];
 
     // The migration should still be considered active as it is not yet forgotten.
+    assert.eq(currOp.garbageCollectable, false, () => tojson(currOp));
     assert.eq(currOp.migrationCompleted, false, () => tojson(currOp));
-    assert.eq(currOp.dataSyncCompleted, false, () => tojson(currOp));
 
     // A restart was necessary, due to the sync source closing connections on rollback.
     assert.eq(NumberLong(1), currOp.numRestartsDueToDonorConnectionFailure, () => tojson(currOp));
@@ -284,7 +286,7 @@ switch (caseNum) {
     case 11:
         jsTestLog("[11] Testing rollback after finishing cloning.");
         runTest({
-            failPointName: "fpAfterCollectionClonerDone",
+            failPointName: "fpBeforeFetchingCommittedTransactions",
             failPointData: {
                 action: "hang",
             },
@@ -294,4 +296,3 @@ switch (caseNum) {
         // Unreachable.
         assert(false);
 }
-})();

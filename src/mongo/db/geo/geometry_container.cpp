@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/geo/geometry_container.h"
 
@@ -36,6 +35,9 @@
 #include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -230,6 +232,46 @@ Box GeometryContainer::R2BoxRegion::buildBounds(const GeometryContainer& geometr
     return bounds;
 }
 
+GeometryContainer::GeometryContainer(const GeometryContainer& other)
+    : _point{other._point},
+      _line{other._line},
+      _box{other._box},
+      _polygon{other._polygon},
+      _cap{other._cap},
+      _multiPoint{other._multiPoint},
+      _multiLine{other._multiLine},
+      _multiPolygon{other._multiPolygon},
+      _geometryCollection{other._geometryCollection} {
+    if (other._s2Region) {
+        _s2Region.reset(other._s2Region->Clone());
+    }
+    if (hasR2Region()) {
+        _r2Region.reset(new R2BoxRegion(this));
+    }
+}
+
+GeometryContainer& GeometryContainer::operator=(const GeometryContainer& other) {
+    if (&other != this) {
+        _point = other._point;
+        _line = other._line;
+        _box = other._box;
+        _polygon = other._polygon;
+        _cap = other._cap;
+        _multiPoint = other._multiPoint;
+        _multiLine = other._multiLine;
+        _multiPolygon = other._multiPolygon;
+        _geometryCollection = other._geometryCollection;
+
+        if (other._s2Region) {
+            _s2Region.reset(other._s2Region->Clone());
+        }
+        if (hasR2Region()) {
+            _r2Region.reset(new R2BoxRegion(this));
+        }
+    }
+    return *this;
+}
+
 const R2Region& GeometryContainer::getR2Region() const {
     return *_r2Region;
 }
@@ -277,7 +319,9 @@ bool GeometryContainer::contains(const GeometryContainer& otherContainer) const 
     }
 
     if (nullptr != otherContainer._polygon) {
-        invariant(nullptr != otherContainer._polygon->s2Polygon);
+        tassert(7323500,
+                "Checking if geometry contains big polygon is not supported",
+                nullptr != otherContainer._polygon->s2Polygon);
         return contains(*otherContainer._polygon->s2Polygon);
     }
 

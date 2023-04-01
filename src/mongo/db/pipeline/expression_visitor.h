@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/pipeline/expression.h"
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/expression_walker.h"
@@ -47,6 +48,7 @@ class ExpressionAnd;
 class ExpressionAnyElementTrue;
 class ExpressionArray;
 class ExpressionArrayElemAt;
+class ExpressionBitNot;
 class ExpressionFirst;
 class ExpressionLast;
 class ExpressionObjectToArray;
@@ -107,6 +109,7 @@ class ExpressionReverseArray;
 class ExpressionSortArray;
 class ExpressionSlice;
 class ExpressionIsArray;
+class ExpressionInternalFindAllValuesAtPath;
 class ExpressionRandom;
 class ExpressionRound;
 class ExpressionSecond;
@@ -152,7 +155,11 @@ class ExpressionHyperbolicSine;
 class ExpressionInternalFindSlice;
 class ExpressionInternalFindPositional;
 class ExpressionInternalFindElemMatch;
+class ExpressionInternalFLEBetween;
+class ExpressionInternalFLEEqual;
+class ExpressionInternalIndexKey;
 class ExpressionInternalJsEmit;
+class ExpressionInternalOwningShard;
 class ExpressionFunction;
 class ExpressionDegreesToRadians;
 class ExpressionRadiansToDegrees;
@@ -162,6 +169,9 @@ class ExpressionDateSubtract;
 class ExpressionDateTrunc;
 class ExpressionGetField;
 class ExpressionSetField;
+class ExpressionBitAnd;
+class ExpressionBitOr;
+class ExpressionBitXor;
 
 class AccumulatorAvg;
 class AccumulatorFirstN;
@@ -170,6 +180,8 @@ class AccumulatorMax;
 class AccumulatorMin;
 class AccumulatorMaxN;
 class AccumulatorMinN;
+class AccumulatorMedian;
+class AccumulatorPercentile;
 class AccumulatorStdDevPop;
 class AccumulatorStdDevSamp;
 class AccumulatorSum;
@@ -182,6 +194,9 @@ template <typename AccumulatorState>
 class ExpressionFromAccumulator;
 template <typename AccumulatorN>
 class ExpressionFromAccumulatorN;
+
+template <typename TAccumulator>
+class ExpressionFromAccumulatorQuantile;
 
 /**
  * This is a base class to allow for traversal of an aggregation expression tree. It implements the
@@ -212,6 +227,10 @@ public:
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionTestApiVersion>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionArray>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionArrayElemAt>) = 0;
+    virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionBitAnd>) = 0;
+    virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionBitOr>) = 0;
+    virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionBitXor>) = 0;
+    virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionBitNot>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionFirst>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionLast>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionObjectToArray>) = 0;
@@ -244,6 +263,8 @@ public:
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionLn>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionLog>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionLog10>) = 0;
+    virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionInternalFLEBetween>) = 0;
+    virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionInternalFLEEqual>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionMap>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionMeta>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionMod>) = 0;
@@ -266,6 +287,8 @@ public:
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionSortArray>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionSlice>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionIsArray>) = 0;
+    virtual void visit(
+        expression_walker::MaybeConstPtr<IsConst, ExpressionInternalFindAllValuesAtPath>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionRandom>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionRound>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionSplit>) = 0;
@@ -336,6 +359,12 @@ public:
         expression_walker::MaybeConstPtr<IsConst, ExpressionFromAccumulatorN<AccumulatorMinN>>) = 0;
     virtual void visit(
         expression_walker::MaybeConstPtr<IsConst,
+                                         ExpressionFromAccumulatorQuantile<AccumulatorMedian>>) = 0;
+    virtual void visit(expression_walker::MaybeConstPtr<
+                       IsConst,
+                       ExpressionFromAccumulatorQuantile<AccumulatorPercentile>>) = 0;
+    virtual void visit(
+        expression_walker::MaybeConstPtr<IsConst,
                                          ExpressionFromAccumulator<AccumulatorStdDevPop>>) = 0;
     virtual void visit(
         expression_walker::MaybeConstPtr<IsConst,
@@ -360,6 +389,9 @@ public:
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionSetField>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionTsSecond>) = 0;
     virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionTsIncrement>) = 0;
+    virtual void visit(
+        expression_walker::MaybeConstPtr<IsConst, ExpressionInternalOwningShard>) = 0;
+    virtual void visit(expression_walker::MaybeConstPtr<IsConst, ExpressionInternalIndexKey>) = 0;
 };
 
 using ExpressionMutableVisitor = ExpressionVisitor<false>;
@@ -373,7 +405,7 @@ using ExpressionConstVisitor = ExpressionVisitor<true>;
  *
  * struct FieldPathVisitor : public SelectiveConstExpressionVisitorBase {
  *     // To avoid overloaded-virtual warnings.
- *     using public SelectiveConstExpressionVisitorBase::visit;
+ *     using SelectiveConstExpressionVisitorBase::visit;
  *
  *     void visit(const ExpressionFieldPath* expr) final {
  *         // logic for what to do with an ExpressionFieldPath.
@@ -389,6 +421,10 @@ struct SelectiveConstExpressionVisitorBase : public ExpressionConstVisitor {
     void visit(const ExpressionAnyElementTrue*) override {}
     void visit(const ExpressionArray*) override {}
     void visit(const ExpressionArrayElemAt*) override {}
+    void visit(const ExpressionBitAnd*) override {}
+    void visit(const ExpressionBitOr*) override {}
+    void visit(const ExpressionBitXor*) override {}
+    void visit(const ExpressionBitNot*) override {}
     void visit(const ExpressionFirst*) override {}
     void visit(const ExpressionLast*) override {}
     void visit(const ExpressionObjectToArray*) override {}
@@ -421,6 +457,8 @@ struct SelectiveConstExpressionVisitorBase : public ExpressionConstVisitor {
     void visit(const ExpressionLn*) override {}
     void visit(const ExpressionLog*) override {}
     void visit(const ExpressionLog10*) override {}
+    void visit(const ExpressionInternalFLEBetween*) override {}
+    void visit(const ExpressionInternalFLEEqual*) override {}
     void visit(const ExpressionMap*) override {}
     void visit(const ExpressionMeta*) override {}
     void visit(const ExpressionMod*) override {}
@@ -443,6 +481,7 @@ struct SelectiveConstExpressionVisitorBase : public ExpressionConstVisitor {
     void visit(const ExpressionSortArray*) override {}
     void visit(const ExpressionSlice*) override {}
     void visit(const ExpressionIsArray*) override {}
+    void visit(const ExpressionInternalFindAllValuesAtPath*) override {}
     void visit(const ExpressionRound*) override {}
     void visit(const ExpressionSplit*) override {}
     void visit(const ExpressionSqrt*) override {}
@@ -500,6 +539,8 @@ struct SelectiveConstExpressionVisitorBase : public ExpressionConstVisitor {
     void visit(const ExpressionFromAccumulatorN<AccumulatorLastN>*) override {}
     void visit(const ExpressionFromAccumulatorN<AccumulatorMaxN>*) override {}
     void visit(const ExpressionFromAccumulatorN<AccumulatorMinN>*) override {}
+    void visit(const ExpressionFromAccumulatorQuantile<AccumulatorMedian>*) override {}
+    void visit(const ExpressionFromAccumulatorQuantile<AccumulatorPercentile>*) override {}
     void visit(const ExpressionFromAccumulator<AccumulatorStdDevPop>*) override {}
     void visit(const ExpressionFromAccumulator<AccumulatorStdDevSamp>*) override {}
     void visit(const ExpressionFromAccumulator<AccumulatorSum>*) override {}
@@ -518,5 +559,7 @@ struct SelectiveConstExpressionVisitorBase : public ExpressionConstVisitor {
     void visit(const ExpressionSetField*) override {}
     void visit(const ExpressionTsSecond*) override {}
     void visit(const ExpressionTsIncrement*) override {}
+    void visit(const ExpressionInternalOwningShard*) override {}
+    void visit(const ExpressionInternalIndexKey*) override {}
 };
 }  // namespace mongo

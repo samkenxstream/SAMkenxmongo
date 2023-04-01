@@ -80,7 +80,11 @@ struct StorageGlobalParams {
     // entries for collections not restored and more.
     bool restore;
 
-    bool dur;  // --dur durability (now --journal)
+    // --magicRestore
+    bool magicRestore;
+
+    // Whether the Storage Engine selected should be ephemeral in nature or not.
+    bool ephemeral = false;
 
     // --journalCommitInterval
     static constexpr int kMaxJournalCommitIntervalMs = 500;
@@ -105,10 +109,9 @@ struct StorageGlobalParams {
     AtomicDouble syncdelay;                               // seconds between fsyncs
 
     // --queryableBackupMode
-    // Puts MongoD into "read-only" mode. MongoD will not write any data to the underlying
-    // filesystem. Note that read operations may require writes. For example, a sort on a large
-    // dataset may fail if it requires spilling to disk.
-    bool readOnly;
+    // Prevents user-originating operations from performing writes to the server. Internally
+    // generated writes are still permitted.
+    bool queryableBackupMode;
 
     // --groupCollections
     // Dictate to the storage engine that it should attempt to create new MongoDB collections from
@@ -122,7 +125,7 @@ struct StorageGlobalParams {
     // outside of the retention window which is set by this option.
     AtomicWord<double> oplogMinRetentionHours;
 
-    // Controls whether we allow the OplogStones mechanism to delete oplog history on WT.
+    // Controls whether we allow the OplogTruncateMarkers mechanism to delete oplog history on WT.
     bool allowOplogTruncation;
 
     // Disables lock-free reads. Lock-free reads is incompatible with
@@ -132,6 +135,9 @@ struct StorageGlobalParams {
     // Delay in seconds between triggering the next checkpoint after the completion of the previous
     // one. A value of 0 indicates that checkpointing will be skipped.
     size_t checkpointDelaySecs;
+
+    // Test-only option. Disables table logging.
+    bool forceDisableTableLogging = false;
 };
 
 extern StorageGlobalParams storageGlobalParams;

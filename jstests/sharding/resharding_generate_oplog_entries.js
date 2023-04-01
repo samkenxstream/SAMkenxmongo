@@ -44,6 +44,7 @@ function simulateResharding() {
     let donorReshardingFields = {
         "uuid": uuid,
         "state": "preparing-to-donate",
+        "startTime": new Date(),
         "donorFields": {
             "tempNs": tempReshardingNss,
             "reshardingKey": {y: 1},
@@ -81,7 +82,7 @@ simulateResharding();
 let primary = st.shard0;
 
 (() => {
-    jsTestLog("Inserting docs in atomic applyOps");
+    jsTestLog("Inserting docs in applyOps");
 
     assert.commandWorked(primary.getDB(dbName).runCommand({
         applyOps:

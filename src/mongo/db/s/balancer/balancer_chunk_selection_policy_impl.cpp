@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -39,16 +38,22 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj_comparator_interface.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/sharding_config_server_parameters_gen.h"
+#include "mongo/db/s/sharding_util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/bits.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
-#include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/get_stats_for_balancing_gen.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 
@@ -85,17 +90,96 @@ StatusWith<DistributionStatus> createCollectionDistributionStatus(
         return true;
     });
 
-    DistributionStatus distribution(nss, std::move(shardToChunksMap));
-
     const auto& keyPattern = chunkMgr.getShardKeyPattern().getKeyPattern();
 
-    // Cache the collection tags
-    auto status = ZoneInfo::addTagsFromCatalog(opCtx, nss, keyPattern, distribution.zoneInfo());
-    if (!status.isOK()) {
-        return status;
+    // Cache the collection zones
+    auto swZoneInfo = ZoneInfo::getZonesForCollection(opCtx, nss, keyPattern);
+    if (!swZoneInfo.isOK()) {
+        return swZoneInfo.getStatus();
     }
 
+    DistributionStatus distribution(nss, std::move(shardToChunksMap), swZoneInfo.getValue());
+
     return {std::move(distribution)};
+}
+
+stdx::unordered_map<NamespaceString, CollectionDataSizeInfoForBalancing>
+getDataSizeInfoForCollections(OperationContext* opCtx,
+                              const std::vector<CollectionType>& collections) {
+    const auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
+    uassertStatusOK(balancerConfig->refreshAndCheck(opCtx));
+
+    const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+    const auto shardIds = shardRegistry->getAllShardIds(opCtx);
+
+    // Map to be returned, incrementally populated with the collected statistics
+    stdx::unordered_map<NamespaceString, CollectionDataSizeInfoForBalancing> dataSizeInfoMap;
+
+    std::vector<NamespaceWithOptionalUUID> namespacesWithUUIDsForStatsRequest;
+    for (const auto& coll : collections) {
+        const auto& nss = coll.getNss();
+        const auto maxChunkSizeBytes =
+            coll.getMaxChunkSizeBytes().value_or(balancerConfig->getMaxChunkSizeBytes());
+
+        dataSizeInfoMap.emplace(
+            nss,
+            CollectionDataSizeInfoForBalancing(std::map<ShardId, int64_t>(), maxChunkSizeBytes));
+
+        NamespaceWithOptionalUUID nssWithUUID(nss);
+        nssWithUUID.setUUID(coll.getUuid());
+        namespacesWithUUIDsForStatsRequest.push_back(nssWithUUID);
+    }
+
+    ShardsvrGetStatsForBalancing req{namespacesWithUUIDsForStatsRequest};
+    req.setScaleFactor(1);
+    const auto reqObj = req.toBSON({});
+
+    const auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+    const auto responsesFromShards =
+        sharding_util::sendCommandToShards(opCtx,
+                                           DatabaseName::kAdmin.toString(),
+                                           reqObj,
+                                           shardIds,
+                                           executor,
+                                           false /* throwOnError */);
+
+    for (auto&& response : responsesFromShards) {
+        try {
+            const auto& shardId = response.shardId;
+            const auto errorContext =
+                "Failed to get stats for balancing from shard '{}'"_format(shardId.toString());
+            const auto responseValue =
+                uassertStatusOKWithContext(std::move(response.swResponse), errorContext);
+
+            const ShardsvrGetStatsForBalancingReply reply =
+                ShardsvrGetStatsForBalancingReply::parse(
+                    IDLParserContext("ShardsvrGetStatsForBalancingReply"),
+                    std::move(responseValue.data));
+            const auto collStatsFromShard = reply.getStats();
+
+            invariant(collStatsFromShard.size() == collections.size());
+            for (const auto& stats : collStatsFromShard) {
+                invariant(dataSizeInfoMap.contains(stats.getNs()));
+                dataSizeInfoMap.at(stats.getNs()).shardToDataSizeMap[shardId] = stats.getCollSize();
+            }
+        } catch (const ExceptionFor<ErrorCodes::ShardNotFound>& ex) {
+            // Handle `removeShard`: skip shards removed during a balancing round
+            LOGV2_DEBUG(6581603,
+                        1,
+                        "Skipping shard for the current balancing round",
+                        "error"_attr = redact(ex));
+        }
+    }
+
+    return dataSizeInfoMap;
+}
+
+CollectionDataSizeInfoForBalancing getDataSizeInfoForCollection(OperationContext* opCtx,
+                                                                const NamespaceString& nss) {
+    const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
+    const auto coll = catalogClient->getCollection(opCtx, nss);
+    std::vector<CollectionType> vec{coll};
+    return std::move(getDataSizeInfoForCollections(opCtx, vec).at(nss));
 }
 
 /**
@@ -109,9 +193,9 @@ class SplitCandidatesBuffer {
     SplitCandidatesBuffer& operator=(const SplitCandidatesBuffer&) = delete;
 
 public:
-    SplitCandidatesBuffer(NamespaceString nss, ChunkVersion collectionVersion)
+    SplitCandidatesBuffer(NamespaceString nss, ChunkVersion collectionPlacementVersion)
         : _nss(std::move(nss)),
-          _collectionVersion(collectionVersion),
+          _collectionPlacementVersion(collectionPlacementVersion),
           _chunkSplitPoints(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<SplitInfo>()) {
     }
 
@@ -125,7 +209,7 @@ public:
             _chunkSplitPoints.emplace(chunk.getMin(),
                                       SplitInfo(chunk.getShardId(),
                                                 _nss,
-                                                _collectionVersion,
+                                                _collectionPlacementVersion,
                                                 chunk.getLastmod(),
                                                 chunk.getMin(),
                                                 chunk.getMax(),
@@ -152,45 +236,45 @@ public:
     }
 
 private:
-    // Namespace and expected collection version
+    // Namespace and expected collection placement version
     const NamespaceString _nss;
-    const ChunkVersion _collectionVersion;
+    const ChunkVersion _collectionPlacementVersion;
 
     // Chunk min key and split vector associated with that chunk
     BSONObjIndexedMap<SplitInfo> _chunkSplitPoints;
 };
 
 /**
- * Populates splitCandidates with chunk and splitPoint pairs for chunks that violate tag
+ * Populates splitCandidates with chunk and splitPoint pairs for chunks that violate zone
  * range boundaries.
  */
-void getSplitCandidatesToEnforceTagRanges(const ChunkManager& cm,
-                                          const DistributionStatus& distribution,
-                                          SplitCandidatesBuffer* splitCandidates) {
+void getSplitCandidatesToEnforceZoneRanges(const ChunkManager& cm,
+                                           const DistributionStatus& distribution,
+                                           SplitCandidatesBuffer* splitCandidates) {
     const auto& globalMax = cm.getShardKeyPattern().getKeyPattern().globalMax();
 
-    // For each tag range, find chunks that need to be split.
-    for (const auto& tagRangeEntry : distribution.tagRanges()) {
-        const auto& tagRange = tagRangeEntry.second;
+    // For each zone range, find chunks that need to be split.
+    for (const auto& zoneRangeEntry : distribution.zoneRanges()) {
+        const auto& zoneRange = zoneRangeEntry.second;
 
-        const auto chunkAtZoneMin = cm.findIntersectingChunkWithSimpleCollation(tagRange.min);
-        invariant(chunkAtZoneMin.getMax().woCompare(tagRange.min) > 0);
+        const auto chunkAtZoneMin = cm.findIntersectingChunkWithSimpleCollation(zoneRange.min);
+        invariant(chunkAtZoneMin.getMax().woCompare(zoneRange.min) > 0);
 
-        if (chunkAtZoneMin.getMin().woCompare(tagRange.min)) {
-            splitCandidates->addSplitPoint(chunkAtZoneMin, tagRange.min);
+        if (chunkAtZoneMin.getMin().woCompare(zoneRange.min)) {
+            splitCandidates->addSplitPoint(chunkAtZoneMin, zoneRange.min);
         }
 
         // The global max key can never fall in the middle of a chunk.
-        if (!tagRange.max.woCompare(globalMax))
+        if (!zoneRange.max.woCompare(globalMax))
             continue;
 
-        const auto chunkAtZoneMax = cm.findIntersectingChunkWithSimpleCollation(tagRange.max);
+        const auto chunkAtZoneMax = cm.findIntersectingChunkWithSimpleCollation(zoneRange.max);
 
         // We need to check that both the chunk's minKey does not match the zone's max and also that
         // the max is not equal, which would only happen in the case of the zone ending in MaxKey.
-        if (chunkAtZoneMax.getMin().woCompare(tagRange.max) &&
-            chunkAtZoneMax.getMax().woCompare(tagRange.max)) {
-            splitCandidates->addSplitPoint(chunkAtZoneMax, tagRange.max);
+        if (chunkAtZoneMax.getMin().woCompare(zoneRange.max) &&
+            chunkAtZoneMax.getMax().woCompare(zoneRange.max)) {
+            splitCandidates->addSplitPoint(chunkAtZoneMax, zoneRange.max);
         }
     }
 }
@@ -266,7 +350,8 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToSpli
 
     const auto& shardStats = shardStatsStatus.getValue();
 
-    auto collections = Grid::get(opCtx)->catalogClient()->getCollections(opCtx, {});
+    const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
+    auto collections = catalogClient->getCollections(opCtx, {});
     if (collections.empty()) {
         return SplitInfoVector{};
     }
@@ -291,9 +376,9 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToSpli
             } else {
                 LOGV2_WARNING(
                     21852,
-                    "Unable to enforce tag range policy for collection {namespace}: {error}",
-                    "Unable to enforce tag range policy for collection",
-                    "namespace"_attr = nss.ns(),
+                    "Unable to enforce zone range policy for collection {namespace}: {error}",
+                    "Unable to enforce zone range policy for collection",
+                    logAttrs(nss),
                     "error"_attr = candidatesStatus.getStatus());
             }
 
@@ -322,60 +407,150 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToSpli
 }
 
 StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToMove(
-    OperationContext* opCtx, stdx::unordered_set<ShardId>* usedShards) {
-    auto shardStatsStatus = _clusterStats->getStats(opCtx);
-    if (!shardStatsStatus.isOK()) {
-        return shardStatsStatus.getStatus();
-    }
+    OperationContext* opCtx,
+    const std::vector<ClusterStatistics::ShardStatistics>& shardStats,
+    stdx::unordered_set<ShardId>* availableShards,
+    stdx::unordered_set<NamespaceString>* imbalancedCollectionsCachePtr) {
+    invariant(availableShards);
+    invariant(imbalancedCollectionsCachePtr);
 
-    const auto& shardStats = shardStatsStatus.getValue();
-
-    if (shardStats.size() < 2) {
+    if (availableShards->size() < 2) {
         return MigrateInfoVector{};
     }
 
-    auto collections = Grid::get(opCtx)->catalogClient()->getCollections(opCtx, {});
+    const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
+    auto collections = catalogClient->getCollections(opCtx,
+                                                     {},
+                                                     repl::ReadConcernLevel::kMajorityReadConcern,
+                                                     BSON(CollectionType::kNssFieldName << 1));
     if (collections.empty()) {
         return MigrateInfoVector{};
     }
 
     MigrateInfoVector candidateChunks;
+    static constexpr auto kStatsForBalancingBatchSize = 50;
+    static constexpr auto kMaxCachedCollectionsSize = int(0.75 * kStatsForBalancingBatchSize);
 
-    std::shuffle(collections.begin(), collections.end(), _random);
+    // Lambda function used to get a CollectionType leveraging the `collections` vector
+    // The `collections` vector must be sorted by nss when it is called
+    auto getCollectionTypeByNss = [&collections](const NamespaceString& nss)
+        -> std::pair<boost::optional<CollectionType>, std::vector<CollectionType>::iterator> {
+        // Using a lower_bound to perform a binary search on the `collections` vector
+        const auto collIt =
+            std::lower_bound(collections.begin(),
+                             collections.end(),
+                             nss,
+                             [](const CollectionType& coll, const NamespaceString& ns) {
+                                 return coll.getNss() < ns;
+                             });
 
-    for (const auto& coll : collections) {
-        const NamespaceString& nss(coll.getNss());
+        if (collIt == collections.end() || collIt->getNss() != nss) {
+            return std::make_pair(boost::none, collections.end());
+        }
+        return std::make_pair(*collIt, collIt);
+    };
 
+    // Lambda function to check if a collection is explicitly disabled for balancing
+    const auto canBalanceCollection = [](const CollectionType& coll) -> bool {
         if (!coll.getAllowBalance() || !coll.getAllowMigrations() || !coll.getPermitMigrations() ||
             coll.getDefragmentCollection()) {
             LOGV2_DEBUG(5966401,
                         1,
                         "Not balancing explicitly disabled collection",
-                        "namespace"_attr = nss,
+                        logAttrs(coll.getNss()),
                         "allowBalance"_attr = coll.getAllowBalance(),
                         "allowMigrations"_attr = coll.getAllowMigrations(),
                         "permitMigrations"_attr = coll.getPermitMigrations(),
                         "defragmentCollection"_attr = coll.getDefragmentCollection());
+            return false;
+        }
+        return true;
+    };
+
+    // Lambda function to select migrate candidates from a batch of collections
+    const auto processBatch = [&](std::vector<CollectionType>& collBatch) {
+        const auto collsDataSizeInfo = getDataSizeInfoForCollections(opCtx, collBatch);
+
+        std::shuffle(collBatch.begin(), collBatch.end(), _random);
+        for (const auto& coll : collBatch) {
+
+            if (availableShards->size() < 2) {
+                break;
+            }
+
+            const auto& nss = coll.getNss();
+
+            auto swMigrateCandidates = _getMigrateCandidatesForCollection(
+                opCtx, nss, shardStats, collsDataSizeInfo.at(nss), availableShards);
+            if (swMigrateCandidates == ErrorCodes::NamespaceNotFound) {
+                // Namespace got dropped before we managed to get to it, so just skip it
+                imbalancedCollectionsCachePtr->erase(nss);
+                continue;
+            } else if (!swMigrateCandidates.isOK()) {
+                LOGV2_WARNING(21853,
+                              "Unable to balance collection",
+                              logAttrs(nss),
+                              "error"_attr = swMigrateCandidates.getStatus());
+                continue;
+            }
+
+            candidateChunks.insert(
+                candidateChunks.end(),
+                std::make_move_iterator(swMigrateCandidates.getValue().first.begin()),
+                std::make_move_iterator(swMigrateCandidates.getValue().first.end()));
+
+            const auto& migrateCandidates = swMigrateCandidates.getValue().first;
+            if (migrateCandidates.empty()) {
+                imbalancedCollectionsCachePtr->erase(nss);
+            } else if (imbalancedCollectionsCachePtr->size() < kMaxCachedCollectionsSize) {
+                imbalancedCollectionsCachePtr->insert(nss);
+            }
+        }
+    };
+
+    // To assess if a collection has chunks to migrate, we need to ask shards the size of that
+    // collection. For efficiency, we ask for a batch of collections per every shard request instead
+    // of a single request per collection
+    std::vector<CollectionType> collBatch;
+
+    // The first batch is partially filled by the imbalanced cached collections
+    for (auto imbalancedNssIt = imbalancedCollectionsCachePtr->begin();
+         imbalancedNssIt != imbalancedCollectionsCachePtr->end();) {
+
+        const auto& [imbalancedColl, collIt] = getCollectionTypeByNss(*imbalancedNssIt);
+
+        if (!imbalancedColl.has_value() || !canBalanceCollection(imbalancedColl.value())) {
+            // The collection was dropped or is no longer enabled for balancing.
+            imbalancedCollectionsCachePtr->erase(imbalancedNssIt++);
             continue;
         }
 
-        auto candidatesStatus =
-            _getMigrateCandidatesForCollection(opCtx, nss, shardStats, usedShards);
-        if (candidatesStatus == ErrorCodes::NamespaceNotFound) {
-            // Namespace got dropped before we managed to get to it, so just skip it
-            continue;
-        } else if (!candidatesStatus.isOK()) {
-            LOGV2_WARNING(21853,
-                          "Unable to balance collection {namespace}: {error}",
-                          "Unable to balance collection",
-                          "namespace"_attr = nss.ns(),
-                          "error"_attr = candidatesStatus.getStatus());
-            continue;
+        collBatch.push_back(imbalancedColl.value());
+        ++imbalancedNssIt;
+
+        // Remove the collection from the whole list of collections to avoid processing it twice
+        collections.erase(collIt);
+    }
+
+    // Iterate all the remaining collections randomly
+    std::shuffle(collections.begin(), collections.end(), _random);
+    for (const auto& coll : collections) {
+
+        if (canBalanceCollection(coll)) {
+            collBatch.push_back(coll);
         }
 
-        candidateChunks.insert(candidateChunks.end(),
-                               std::make_move_iterator(candidatesStatus.getValue().first.begin()),
-                               std::make_move_iterator(candidatesStatus.getValue().first.end()));
+        if (collBatch.size() == kStatsForBalancingBatchSize) {
+            processBatch(collBatch);
+            if (availableShards->size() < 2) {
+                return candidateChunks;
+            }
+            collBatch.clear();
+        }
+    }
+
+    if (collBatch.size() > 0) {
+        processBatch(collBatch);
     }
 
     return candidateChunks;
@@ -392,11 +567,21 @@ StatusWith<MigrateInfosWithReason> BalancerChunkSelectionPolicyImpl::selectChunk
 
     // Used to check locally if the collection exists, it should trow NamespaceNotFound if it
     // doesn't.
-    Grid::get(opCtx)->catalogClient()->getCollection(opCtx, nss);
+    ShardingCatalogManager::get(opCtx)->localCatalogClient()->getCollection(opCtx, nss);
 
-    stdx::unordered_set<ShardId> usedShards;
+    stdx::unordered_set<ShardId> availableShards;
+    std::transform(shardStats.begin(),
+                   shardStats.end(),
+                   std::inserter(availableShards, availableShards.end()),
+                   [](const ClusterStatistics::ShardStatistics& shardStatistics) -> ShardId {
+                       return shardStatistics.shardId;
+                   });
 
-    auto candidatesStatus = _getMigrateCandidatesForCollection(opCtx, nss, shardStats, &usedShards);
+
+    const auto dataSizeInfo = getDataSizeInfoForCollection(opCtx, nss);
+
+    auto candidatesStatus =
+        _getMigrateCandidatesForCollection(opCtx, nss, shardStats, dataSizeInfo, &availableShards);
     if (!candidatesStatus.isOK()) {
         return candidatesStatus.getStatus();
     }
@@ -416,12 +601,13 @@ BalancerChunkSelectionPolicyImpl::selectSpecificChunkToMove(OperationContext* op
     const auto& shardStats = shardStatsStatus.getValue();
 
     auto routingInfoStatus =
-        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx, nss);
+        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx,
+                                                                                              nss);
     if (!routingInfoStatus.isOK()) {
         return routingInfoStatus.getStatus();
     }
 
-    const auto& cm = routingInfoStatus.getValue();
+    const auto& [cm, _] = routingInfoStatus.getValue();
 
     const auto collInfoStatus = createCollectionDistributionStatus(opCtx, nss, shardStats, cm);
     if (!collInfoStatus.isOK()) {
@@ -430,7 +616,9 @@ BalancerChunkSelectionPolicyImpl::selectSpecificChunkToMove(OperationContext* op
 
     const DistributionStatus& distribution = collInfoStatus.getValue();
 
-    return BalancerPolicy::balanceSingleChunk(chunk, shardStats, distribution);
+    const auto dataSizeInfo = getDataSizeInfoForCollection(opCtx, nss);
+
+    return BalancerPolicy::balanceSingleChunk(chunk, shardStats, distribution, dataSizeInfo);
 }
 
 Status BalancerChunkSelectionPolicyImpl::checkMoveAllowed(OperationContext* opCtx,
@@ -441,7 +629,8 @@ Status BalancerChunkSelectionPolicyImpl::checkMoveAllowed(OperationContext* opCt
         return shardStatsStatus.getStatus();
     }
 
-    const CollectionType collection = Grid::get(opCtx)->catalogClient()->getCollection(
+    const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
+    const CollectionType collection = catalogClient->getCollection(
         opCtx, chunk.getCollectionUUID(), repl::ReadConcernLevel::kLocalReadConcern);
     const auto& nss = collection.getNss();
 
@@ -449,12 +638,13 @@ Status BalancerChunkSelectionPolicyImpl::checkMoveAllowed(OperationContext* opCt
     auto shardStats = std::move(shardStatsStatus.getValue());
 
     auto routingInfoStatus =
-        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx, nss);
+        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx,
+                                                                                              nss);
     if (!routingInfoStatus.isOK()) {
         return routingInfoStatus.getStatus();
     }
 
-    const auto& cm = routingInfoStatus.getValue();
+    const auto& [cm, _] = routingInfoStatus.getValue();
 
     const auto collInfoStatus = createCollectionDistributionStatus(opCtx, nss, shardStats, cm);
     if (!collInfoStatus.isOK()) {
@@ -476,18 +666,19 @@ Status BalancerChunkSelectionPolicyImpl::checkMoveAllowed(OperationContext* opCt
     }
 
     return BalancerPolicy::isShardSuitableReceiver(*newShardIterator,
-                                                   distribution.getTagForChunk(chunk));
+                                                   distribution.getZoneForChunk(chunk));
 }
 
 StatusWith<SplitInfoVector> BalancerChunkSelectionPolicyImpl::_getSplitCandidatesForCollection(
     OperationContext* opCtx, const NamespaceString& nss, const ShardStatisticsVector& shardStats) {
     auto routingInfoStatus =
-        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx, nss);
+        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx,
+                                                                                              nss);
     if (!routingInfoStatus.isOK()) {
         return routingInfoStatus.getStatus();
     }
 
-    const auto& cm = routingInfoStatus.getValue();
+    const auto& [cm, _] = routingInfoStatus.getValue();
 
     const auto collInfoStatus = createCollectionDistributionStatus(opCtx, nss, shardStats, cm);
     if (!collInfoStatus.isOK()) {
@@ -500,15 +691,15 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicyImpl::_getSplitCandidate
     SplitCandidatesBuffer splitCandidates(nss, cm.getVersion());
 
     if (nss == NamespaceString::kLogicalSessionsNamespace) {
-        if (!distribution.tags().empty()) {
+        if (!distribution.zones().empty()) {
             LOGV2_WARNING(4562401,
                           "Ignoring zones for the sessions collection",
-                          "tags"_attr = distribution.tags());
+                          "zones"_attr = distribution.zones());
         }
 
         getSplitCandidatesForSessionsCollection(opCtx, cm, &splitCandidates);
     } else {
-        getSplitCandidatesToEnforceTagRanges(cm, distribution, &splitCandidates);
+        getSplitCandidatesToEnforceZoneRanges(cm, distribution, &splitCandidates);
     }
 
     return splitCandidates.done();
@@ -519,14 +710,16 @@ BalancerChunkSelectionPolicyImpl::_getMigrateCandidatesForCollection(
     OperationContext* opCtx,
     const NamespaceString& nss,
     const ShardStatisticsVector& shardStats,
-    stdx::unordered_set<ShardId>* usedShards) {
+    const CollectionDataSizeInfoForBalancing& collDataSizeInfo,
+    stdx::unordered_set<ShardId>* availableShards) {
     auto routingInfoStatus =
-        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx, nss);
+        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx,
+                                                                                              nss);
     if (!routingInfoStatus.isOK()) {
         return routingInfoStatus.getStatus();
     }
 
-    const auto& cm = routingInfoStatus.getValue();
+    const auto& [cm, _] = routingInfoStatus.getValue();
 
     const auto& shardKeyPattern = cm.getShardKeyPattern().getKeyPattern();
 
@@ -537,15 +730,15 @@ BalancerChunkSelectionPolicyImpl::_getMigrateCandidatesForCollection(
 
     const DistributionStatus& distribution = collInfoStatus.getValue();
 
-    for (const auto& tagRangeEntry : distribution.tagRanges()) {
-        const auto& tagRange = tagRangeEntry.second;
+    for (const auto& zoneRangeEntry : distribution.zoneRanges()) {
+        const auto& zoneRange = zoneRangeEntry.second;
 
-        const auto chunkAtZoneMin = cm.findIntersectingChunkWithSimpleCollation(tagRange.min);
+        const auto chunkAtZoneMin = cm.findIntersectingChunkWithSimpleCollation(zoneRange.min);
 
-        if (chunkAtZoneMin.getMin().woCompare(tagRange.min)) {
+        if (chunkAtZoneMin.getMin().woCompare(zoneRange.min)) {
             return {ErrorCodes::IllegalOperation,
                     str::stream()
-                        << "Tag boundaries " << tagRange.toString()
+                        << "Zone boundaries " << zoneRange.toString()
                         << " fall in the middle of an existing chunk "
                         << ChunkRange(chunkAtZoneMin.getMin(), chunkAtZoneMin.getMax()).toString()
                         << ". Balancing for collection " << nss.ns()
@@ -553,18 +746,18 @@ BalancerChunkSelectionPolicyImpl::_getMigrateCandidatesForCollection(
         }
 
         // The global max key can never fall in the middle of a chunk
-        if (!tagRange.max.woCompare(shardKeyPattern.globalMax()))
+        if (!zoneRange.max.woCompare(shardKeyPattern.globalMax()))
             continue;
 
-        const auto chunkAtZoneMax = cm.findIntersectingChunkWithSimpleCollation(tagRange.max);
+        const auto chunkAtZoneMax = cm.findIntersectingChunkWithSimpleCollation(zoneRange.max);
 
         // We need to check that both the chunk's minKey does not match the zone's max and also that
         // the max is not equal, which would only happen in the case of the zone ending in MaxKey.
-        if (chunkAtZoneMax.getMin().woCompare(tagRange.max) &&
-            chunkAtZoneMax.getMax().woCompare(tagRange.max)) {
+        if (chunkAtZoneMax.getMin().woCompare(zoneRange.max) &&
+            chunkAtZoneMax.getMax().woCompare(zoneRange.max)) {
             return {ErrorCodes::IllegalOperation,
                     str::stream()
-                        << "Tag boundaries " << tagRange.toString()
+                        << "Zone boundaries " << zoneRange.toString()
                         << " fall in the middle of an existing chunk "
                         << ChunkRange(chunkAtZoneMax.getMin(), chunkAtZoneMax.getMax()).toString()
                         << ". Balancing for collection " << nss.ns()
@@ -575,7 +768,8 @@ BalancerChunkSelectionPolicyImpl::_getMigrateCandidatesForCollection(
     return BalancerPolicy::balance(
         shardStats,
         distribution,
-        usedShards,
+        collDataSizeInfo,
+        availableShards,
         Grid::get(opCtx)->getBalancerConfiguration()->attemptToBalanceJumboChunks());
 }
 

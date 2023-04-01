@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
 #include "mongo/platform/basic.h"
 
@@ -38,8 +37,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/resharding/resharding_util.h"
@@ -49,6 +47,9 @@
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/flush_resharding_state_change_gen.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
+
 
 namespace mongo {
 namespace {
@@ -108,7 +109,7 @@ public:
 
             uassert(ErrorCodes::IllegalOperation,
                     "Can't call _flushReshardingStateChange if in read-only mode",
-                    !storageGlobalParams.readOnly);
+                    !opCtx->readOnly());
 
             ExecutorFuture<void>(Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor())
                 .then([svcCtx = opCtx->getServiceContext(), nss = ns()] {
@@ -119,8 +120,8 @@ public:
                     }
 
                     auto opCtx = tc->makeOperationContext();
-                    onShardVersionMismatch(
-                        opCtx.get(), nss, boost::none /* shardVersionReceived */);
+                    onCollectionPlacementVersionMismatch(
+                        opCtx.get(), nss, boost::none /* chunkVersionReceived */);
                 })
                 .onError([](const Status& status) {
                     LOGV2_WARNING(5808100,
@@ -130,7 +131,7 @@ public:
                 .getAsync([](auto) {});
 
             // Ensure the command isn't run on a stale primary.
-            doNoopWrite(opCtx, "_flushReshardingStateChange no-op", ns());
+            resharding::doNoopWrite(opCtx, "_flushReshardingStateChange no-op", ns());
         }
     };
 } _flushReshardingStateChange;

@@ -4,7 +4,6 @@
  * Incompatible with shard merge, which can't handle rollback.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
@@ -13,17 +12,21 @@
  *   serverless,
  * ]
  */
-(function() {
-"use strict";
+
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    forgetMigrationAsync,
+    makeX509OptionsForTest,
+    runMigrationAsync,
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/replsets/libs/rollback_test.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+load("jstests/replsets/rslib.js");  // 'createRstArgs'
 
-const kTenantId = "testTenantId";
+const kTenantId = ObjectId().str;
 
 const kMaxSleepTimeMS = 250;
 
@@ -32,11 +35,12 @@ const kMaxSleepTimeMS = 250;
 // state.
 const kGarbageCollectionDelayMS = 30 * 1000;
 
-const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
+const migrationX509Options = makeX509OptionsForTest();
 
 const recipientRst = new ReplSetTest({
     name: "recipientRst",
     nodes: 1,
+    serverless: true,
     nodeOptions: Object.assign({}, migrationX509Options.recipient, {
         setParameter: {
             tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
@@ -67,6 +71,7 @@ function testRollBack(setUpFunc, rollbackOpsFunc, steadyStateFunc) {
     const donorRst = new ReplSetTest({
         name: "donorRst",
         nodes: 3,
+        serverless: true,
         nodeOptions: Object.assign({}, migrationX509Options.donor, {
             setParameter: {
                 tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
@@ -84,7 +89,7 @@ function testRollBack(setUpFunc, rollbackOpsFunc, steadyStateFunc) {
 
     const tenantMigrationTest =
         new TenantMigrationTest({name: jsTestName(), donorRst, recipientRst});
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(donorRst);
+    const donorRstArgs = createRstArgs(donorRst);
     setUpFunc(tenantMigrationTest, donorRstArgs);
 
     let originalDonorPrimary = donorRst.getPrimary();
@@ -121,7 +126,7 @@ function testRollBack(setUpFunc, rollbackOpsFunc, steadyStateFunc) {
  */
 function testRollbackInitialState() {
     const migrationId = UUID();
-    const migrationOpts = makeMigrationOpts(migrationId, kTenantId + "-initial");
+    const migrationOpts = makeMigrationOpts(migrationId, ObjectId().str);
     let migrationThread;
 
     let setUpFunc = (tenantMigrationTest, donorRstArgs) => {};
@@ -130,10 +135,8 @@ function testRollbackInitialState() {
         const donorPrimary = tenantMigrationTest.getDonorPrimary();
 
         // Start the migration asynchronously and wait for the primary to insert the state doc.
-        migrationThread = new Thread(TenantMigrationUtil.runMigrationAsync,
-                                     migrationOpts,
-                                     donorRstArgs,
-                                     {retryOnRetryableErrors: true});
+        migrationThread = new Thread(
+            runMigrationAsync, migrationOpts, donorRstArgs, {retryOnRetryableErrors: true});
         migrationThread.start();
         assert.soon(() => {
             return 1 === donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS).count({
@@ -168,7 +171,7 @@ function testRollBackStateTransition(pauseFailPoint, setUpFailPoints, nextState)
         nextState}" after reaching failpoint "${pauseFailPoint}"`);
 
     const migrationId = UUID();
-    const migrationOpts = makeMigrationOpts(migrationId, kTenantId + "-" + nextState);
+    const migrationOpts = makeMigrationOpts(migrationId, ObjectId().str);
     let migrationThread, pauseFp;
 
     let setUpFunc = (tenantMigrationTest, donorRstArgs) => {
@@ -176,10 +179,8 @@ function testRollBackStateTransition(pauseFailPoint, setUpFailPoints, nextState)
         setUpFailPoints.forEach(failPoint => configureFailPoint(donorPrimary, failPoint));
         pauseFp = configureFailPoint(donorPrimary, pauseFailPoint);
 
-        migrationThread = new Thread(TenantMigrationUtil.runMigrationAsync,
-                                     migrationOpts,
-                                     donorRstArgs,
-                                     {retryOnRetryableErrors: true});
+        migrationThread = new Thread(
+            runMigrationAsync, migrationOpts, donorRstArgs, {retryOnRetryableErrors: true});
         migrationThread.start();
         pauseFp.wait();
     };
@@ -218,7 +219,7 @@ function testRollBackStateTransition(pauseFailPoint, setUpFailPoints, nextState)
  */
 function testRollBackMarkingStateGarbageCollectable() {
     const migrationId = UUID();
-    const migrationOpts = makeMigrationOpts(migrationId, kTenantId + "-markGarbageCollectable");
+    const migrationOpts = makeMigrationOpts(migrationId, ObjectId().str);
     let forgetMigrationThread;
 
     let setUpFunc = (tenantMigrationTest, donorRstArgs) => {
@@ -231,16 +232,26 @@ function testRollBackMarkingStateGarbageCollectable() {
 
         // Run donorForgetMigration and wait for the primary to do the write to mark the state doc
         // as garbage collectable.
-        forgetMigrationThread = new Thread(TenantMigrationUtil.forgetMigrationAsync,
+        forgetMigrationThread = new Thread(forgetMigrationAsync,
                                            migrationOpts.migrationIdString,
                                            donorRstArgs,
                                            true /* retryOnRetryableErrors */);
         forgetMigrationThread.start();
         assert.soon(() => {
+            let docs =
+                donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS).find().toArray();
+            // There is a ttl index on `expireAt`. Thus we know the state doc is marked as garbage
+            // collectible either when:
+            //
+            // 1) It has an `expireAt`.
+            // 2) The document is deleted/the collection is empty.
             return 1 === donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS).count({
                 _id: migrationId,
                 expireAt: {$exists: 1}
-            });
+            }) ||
+                donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS).count({
+                    _id: migrationId
+                }) === 0;
         });
     };
 
@@ -260,15 +271,16 @@ function testRollBackMarkingStateGarbageCollectable() {
  */
 function testRollBackRandom() {
     const migrationId = UUID();
-    const migrationOpts = makeMigrationOpts(migrationId, kTenantId + "-random");
+    const migrationOpts = makeMigrationOpts(migrationId, ObjectId().str);
     let migrationThread;
 
     let setUpFunc = (tenantMigrationTest, donorRstArgs) => {
-        migrationThread = new Thread((donorRstArgs, migrationOpts) => {
-            load("jstests/replsets/libs/tenant_migration_util.js");
-            assert.commandWorked(TenantMigrationUtil.runMigrationAsync(
+        migrationThread = new Thread(async (donorRstArgs, migrationOpts) => {
+            const {runMigrationAsync, forgetMigrationAsync} =
+                await import("jstests/replsets/libs/tenant_migration_util.js");
+            assert.commandWorked(await runMigrationAsync(
                 migrationOpts, donorRstArgs, {retryOnRetryableErrors: true}));
-            assert.commandWorked(TenantMigrationUtil.forgetMigrationAsync(
+            assert.commandWorked(await forgetMigrationAsync(
                 migrationOpts.migrationIdString, donorRstArgs, true /* retryOnRetryableErrors */));
         }, donorRstArgs, migrationOpts);
 
@@ -319,4 +331,3 @@ jsTest.log("Test roll back random");
 testRollBackRandom();
 
 recipientRst.stopSet();
-}());

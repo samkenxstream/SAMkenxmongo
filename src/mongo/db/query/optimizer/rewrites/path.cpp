@@ -28,12 +28,13 @@
  */
 
 #include "mongo/db/query/optimizer/rewrites/path.h"
-#include "mongo/db/query/optimizer/utils/utils.h"
+#include "mongo/db/query/optimizer/utils/path_utils.h"
+
 
 namespace mongo::optimizer {
 ABT::reference_type PathFusion::follow(ABT::reference_type n) {
     if (auto var = n.cast<Variable>(); var) {
-        auto def = _env.getDefinition(var);
+        auto def = _env.getDefinition(*var);
         if (!def.definition.empty() && !def.definition.is<Source>()) {
             return follow(def.definition);
         }
@@ -44,13 +45,8 @@ ABT::reference_type PathFusion::follow(ABT::reference_type n) {
 
 bool PathFusion::fuse(ABT& lhs, const ABT& rhs) {
     if (auto rhsComposeM = rhs.cast<PathComposeM>(); rhsComposeM != nullptr) {
-        // Try to fuse first with right path, then left.
-        if (_info[rhsComposeM->getPath2().cast<PathSyntaxSort>()]._isConst) {
-            if (fuse(lhs, rhsComposeM->getPath2())) {
-                return true;
-            }
-            if (_info[rhsComposeM->getPath1().cast<PathSyntaxSort>()]._isConst &&
-                fuse(lhs, rhsComposeM->getPath1())) {
+        for (const auto& branch : collectComposed(rhs)) {
+            if (_info[branch.cast<PathSyntaxSort>()]._isConst && fuse(lhs, branch)) {
                 return true;
             }
         }
@@ -70,7 +66,8 @@ bool PathFusion::fuse(ABT& lhs, const ABT& rhs) {
     }
 
     if (auto lhsTraverse = lhs.cast<PathTraverse>(); lhsTraverse != nullptr) {
-        if (auto rhsTraverse = rhs.cast<PathTraverse>(); rhsTraverse != nullptr) {
+        if (auto rhsTraverse = rhs.cast<PathTraverse>();
+            rhsTraverse != nullptr && lhsTraverse->getMaxDepth() == rhsTraverse->getMaxDepth()) {
             return fuse(lhsTraverse->getPath(), rhsTraverse->getPath());
         }
 
@@ -87,8 +84,9 @@ bool PathFusion::fuse(ABT& lhs, const ABT& rhs) {
         return true;
     }
 
-    if (rhs.is<PathLambda>()) {
-        lhs = make<PathComposeM>(std::move(lhs), rhs);
+    if (rhs.is<PathLambda>() && _kindCtx.back() == Kind::project) {
+        // PathLambda should be the left child.
+        lhs = make<PathComposeM>(rhs, std::move(lhs));
         return true;
     }
 
@@ -103,8 +101,14 @@ bool PathFusion::fuse(ABT& lhs, const ABT& rhs) {
             return true;
         }
 
-        lhs = make<PathComposeM>(rhs, std::move(lhs));
-        return true;
+        switch (_kindCtx.back()) {
+            case Kind::filter:
+                break;
+
+            case Kind::project:
+                lhs = make<PathComposeM>(rhs, std::move(lhs));
+                return true;
+        }
     }
 
     return false;
@@ -115,12 +119,12 @@ bool PathFusion::optimize(ABT& root) {
         _changed = false;
         algebra::transport<true>(root, *this);
 
-        if (!_changed) {
+        // If we have nodes in _redundant then continue iterating even if _changed is not set.
+        if (!_changed && _redundant.empty()) {
             break;
         }
 
         _env.rebuild(root);
-        _redundant.clear();
         _info.clear();
     }
 
@@ -218,17 +222,15 @@ void PathFusion::transport(ABT& n, const PathComposeM& path, ABT& p1, ABT& p2) {
     if (auto p1Const = p1.cast<PathConstant>(); p1Const != nullptr) {
         switch (_kindCtx.back()) {
             case Kind::filter:
-                n = make<PathConstant>(make<EvalFilter>(p2, p1Const->getConstant()));
-                _changed = true;
-                return;
+                // PathComposeM in the EvalFilter context cannot be modeled as function composition
+                // the same way that it can in EvalPath because the output of the inner EvalFilter
+                // would be a stream of booleans rather than a stream of documents.
+                break;
 
             case Kind::project:
                 n = make<PathConstant>(make<EvalPath>(p2, p1Const->getConstant()));
                 _changed = true;
                 return;
-
-            default:
-                MONGO_UNREACHABLE;
         }
     }
 
@@ -268,15 +270,17 @@ void PathFusion::transport(ABT& n, const PathComposeM& path, ABT& p1, ABT& p2) {
 
     uassert(6624131, "info must be defined", p1InfoIt != _info.end() && p2InfoIt != _info.end());
 
-    if (p1.is<PathDefault>() && p2InfoIt->second.isNotNothing()) {
-        // Default * Const e -> e (provided we can prove e is not Nothing and we can do that only
-        // when e is Constant expression)
+    if (p1.is<PathDefault>() && p2InfoIt->second.isNotNothing() &&
+        _kindCtx.back() == Kind::project) {
+        // Default * Const e -> e (provided we can prove e is not Nothing and we can do that
+        // only when e is Constant expression)
         auto result = std::exchange(p2, make<Blackhole>());
         std::swap(n, result);
         _changed = true;
-    } else if (p2.is<PathDefault>() && p1InfoIt->second.isNotNothing()) {
-        // Const e * Default -> e (provided we can prove e is not Nothing and we can do that only
-        // when e is Constant expression)
+    } else if (p2.is<PathDefault>() && p1InfoIt->second.isNotNothing() &&
+               _kindCtx.back() == Kind::project) {
+        // Const e * Default -> e (provided we can prove e is not Nothing and we can do that
+        // only when e is Constant expression)
         auto result = std::exchange(p1, make<Blackhole>());
         std::swap(n, result);
         _changed = true;
@@ -285,7 +289,10 @@ void PathFusion::transport(ABT& n, const PathComposeM& path, ABT& p1, ABT& p2) {
         for (auto l : left) {
             if (l.is<PathObj>()) {
                 _redundant.emplace(l.cast<PathSyntaxSort>());
-                _changed = true;
+
+                // Specifically not setting _changed here. Since we are trying to erase a child we
+                // need to traverse the tree again on the next iteration of the optimize() loop (see
+                // conditions above which erase from _redundant).
             }
         }
         _info[&path] = p2InfoIt->second;
@@ -294,7 +301,7 @@ void PathFusion::transport(ABT& n, const PathComposeM& path, ABT& p1, ABT& p2) {
     }
 }
 
-void PathFusion::tryFuseComposition(ABT& n, const ABT& input) {
+void PathFusion::tryFuseComposition(ABT& n, ABT& input) {
     // Check to see if our flattened composition consists of constant branches containing only
     // Field and Keep elements. If we have duplicate Field branches then retain only the
     // latest one. For example:
@@ -303,10 +310,10 @@ void PathFusion::tryFuseComposition(ABT& n, const ABT& input) {
     // TODO: handle Drop elements.
 
     // Latest value per field.
-    opt::unordered_map<FieldNameType, ABT> fieldMap;
+    opt::unordered_map<FieldNameType, ABT, FieldNameType::Hasher> fieldMap;
     // Used to preserve the relative order in which fields are set on the result.
     FieldPathType orderedFieldNames;
-    boost::optional<opt::unordered_set<FieldNameType>> toKeep;
+    boost::optional<FieldNameOrderedSet> toKeep;
 
     Type inputType = Type::any;
     if (auto constPtr = input.cast<Constant>(); constPtr != nullptr && constPtr->isObject()) {
@@ -314,6 +321,7 @@ void PathFusion::tryFuseComposition(ABT& n, const ABT& input) {
     }
 
     bool updated = false;
+    bool hasDefault = false;
     for (const auto& branch : collectComposed(n)) {
         auto info = _info.find(branch.cast<PathSyntaxSort>());
         if (info == _info.cend()) {
@@ -356,17 +364,41 @@ void PathFusion::tryFuseComposition(ABT& n, const ABT& input) {
                 }
             }
             toKeep = std::move(newKeepSet);
-        } else if (auto defaultPtr = branch.cast<PathDefault>(); defaultPtr != nullptr &&
-                   defaultPtr->getDefault().is<Constant>() &&
-                   defaultPtr->getDefault().cast<Constant>()->isObject() &&
-                   inputType == Type::object) {
-            // Skip over PathDefault with an empty object since our input is already an object.
-            updated = true;
+        } else if (auto defaultPtr = branch.cast<PathDefault>(); defaultPtr != nullptr) {
+            if (auto constPtr = defaultPtr->getDefault().cast<Constant>();
+                constPtr != nullptr && constPtr->isObject() && inputType == Type::object) {
+                // Skip over PathDefault with an empty object since our input is already an object.
+                updated = true;
+            } else {
+                // Skip over other PathDefaults but remember we had one.
+                hasDefault = true;
+            }
         } else {
             return;
-        };
+        }
+    }
+
+    if (toKeep && input != Constant::emptyObject()) {
+        // Check if we assign to every field we keep. If so, drop dependence on input.
+        bool assignToAllKeptFields = true;
+        for (const auto& fieldName : *toKeep) {
+            if (fieldMap.count(fieldName) == 0) {
+                assignToAllKeptFields = false;
+                break;
+            }
+        }
+        if (assignToAllKeptFields) {
+            // Do not need the input, do not keep fields, and ignore defaults.
+            input = Constant::emptyObject();
+            toKeep = boost::none;
+            updated = true;
+            hasDefault = false;
+        }
     }
     if (!updated) {
+        return;
+    }
+    if (hasDefault) {
         return;
     }
 
@@ -440,13 +472,6 @@ void PathFusion::transport(ABT& n, const EvalFilter& eval, ABT& path, ABT& input
 
         // And swap it for the current node
         std::swap(n, result);
-
-        _changed = true;
-    } else if (auto evalImmediateInput = input.cast<EvalFilter>(); evalImmediateInput != nullptr) {
-        // Compose immediate EvalFilter input.
-        n = make<EvalFilter>(
-            make<PathComposeM>(std::move(evalImmediateInput->getPath()), std::move(path)),
-            std::move(evalImmediateInput->getInput()));
 
         _changed = true;
     } else if (auto evalInput = realInput.cast<EvalPath>(); evalInput) {

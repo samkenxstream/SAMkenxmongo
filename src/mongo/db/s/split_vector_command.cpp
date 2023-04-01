@@ -69,19 +69,21 @@ public:
                "NOTE: This command may take a while to run";
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
-                ActionType::splitVector)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forExactNamespace(parseNs(dbName, cmdObj)),
+                     ActionType::splitVector)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
-    std::string parseNs(const string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::CommandHelpers::parseNsFullyQualified(cmdObj);
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return NamespaceStringUtil::parseNamespaceFromRequest(
+            dbName.tenantId(), CommandHelpers::parseNsFullyQualified(cmdObj));
     }
 
     bool errmsgRun(OperationContext* opCtx,
@@ -90,7 +92,7 @@ public:
                    string& errmsg,
                    BSONObjBuilder& result) override {
 
-        const NamespaceString nss = NamespaceString(parseNs(dbname, jsobj));
+        const NamespaceString nss(parseNs({boost::none, dbname}, jsobj));
         BSONObj keyPattern = jsobj.getObjectField("keyPattern");
 
         if (keyPattern.isEmpty()) {
@@ -137,17 +139,16 @@ public:
                 // Prevent maxChunkSizeBytes overflow. Check aimed to avoid fuzzer failures
                 // since users are definitely not expected to specify maxChunkSize in exabytes.
                 uassert(ErrorCodes::InvalidOptions,
-                        str::stream()
-                            << "The specified maxChunkSize in MB is too big: " << maxChunkSizeMB,
-                        maxChunkSizeMB <= (LLONG_MAX >> 20));
+                        str::stream() << "maxChunkSize must lie within the range [1MB, 1024MB]",
+                        maxChunkSizeMB >= 1 && maxChunkSizeMB <= 1024);
                 ret = maxChunkSizeMB << 20;
             } else if (maxSizeBytesElem.isNumber()) {
                 ret = maxSizeBytesElem.safeNumberLong();
+                uassert(ErrorCodes::InvalidOptions,
+                        "The specified max chunk size must lie within the range [1MB, 1024MB]",
+                        *ret >= 1024 * 1024 && *ret <= 1024 * 1024 * 1024);
             }
 
-            uassert(ErrorCodes::InvalidOptions,
-                    "The specified max chunk size must be at least 1MB",
-                    ret == boost::none || *ret >= 1024 * 1024);
             return ret;
         }();
 

@@ -13,7 +13,7 @@ load("jstests/sharding/libs/find_chunks_util.js");
 // Replica set nodes started with --shardsvr do not enable key generation until they are added
 // to a sharded cluster and reject commands with gossiped clusterTime from users without the
 // advanceClusterTime privilege. This causes ShardingTest setup to fail because the shell
-// briefly authenticates as __system and recieves clusterTime metadata then will fail trying to
+// briefly authenticates as __system and receives clusterTime metadata then will fail trying to
 // gossip that time later in setup.
 //
 
@@ -21,6 +21,12 @@ var st = new ShardingTest({
     shards: 2,
     rs: {oplogSize: 10, useHostname: false},
     other: {keyFile: 'jstests/libs/key1', useHostname: false, chunkSize: 2},
+});
+
+// This test relies on shard1 having no chunks in config.system.sessions.
+authutil.asCluster(st.s, "jstests/libs/key1", function() {
+    assert.commandWorked(st.s.adminCommand(
+        {moveChunk: "config.system.sessions", find: {_id: 0}, to: st.shard0.shardName}));
 });
 
 var mongos = st.s;
@@ -50,8 +56,12 @@ var authenticatedConn = new Mongo(mongos.host);
 authenticatedConn.getDB('admin').auth(rwUser, password);
 
 // Add user to shards to prevent localhost connections from having automatic full access
-st.rs0.getPrimary().getDB('admin').createUser(
-    {user: 'user', pwd: 'password', roles: jsTest.basicUserRoles}, {w: 3, wtimeout: 30000});
+if (!TestData.catalogShard) {
+    // In catalog shard mode, the first shard is the config server, so the user we made via mongos
+    // already used up this shard's localhost bypass.
+    st.rs0.getPrimary().getDB('admin').createUser(
+        {user: 'user', pwd: 'password', roles: jsTest.basicUserRoles}, {w: 3, wtimeout: 30000});
+}
 st.rs1.getPrimary().getDB('admin').createUser(
     {user: 'user', pwd: 'password', roles: jsTest.basicUserRoles}, {w: 3, wtimeout: 30000});
 
@@ -88,12 +98,8 @@ st.startBalancer();
 // Make sure we've done at least some splitting, so the balancer will work
 assert.gt(findChunksUtil.findChunksByNs(configDB, 'test.foo').count(), 2);
 
-// Make sure we eventually balance all the chunks we've created
-assert.soon(function() {
-    var x = st.chunkDiff("foo", "test");
-    print("chunk diff: " + x);
-    return x < 2 && configDB.locks.findOne({_id: 'test.foo'}).state == 0;
-}, "no balance happened", 15 * 60 * 1000);
+// Make sure we eventually balance the 'test.foo' collection
+st.awaitBalance('foo', 'test', 60 * 5 * 1000);
 
 var map = function() {
     emit(this.i, this.j);
@@ -217,7 +223,8 @@ var checkAdminOps = function(hasAuth) {
         checkCommandSucceeded(adminDB, {ismaster: 1});
         checkCommandSucceeded(adminDB, {hello: 1});
         checkCommandSucceeded(adminDB, {split: 'test.foo', find: {i: 1, j: 1}});
-        var chunk = findChunksUtil.findOneChunkByNs(configDB, 'test.foo', {shard: st.rs0.name});
+        var chunk =
+            findChunksUtil.findOneChunkByNs(configDB, 'test.foo', {shard: st.shard0.shardName});
         checkCommandSucceeded(
             adminDB,
             {moveChunk: 'test.foo', find: chunk.min, to: st.rs1.name, _waitForDelete: true});

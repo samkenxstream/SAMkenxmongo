@@ -85,11 +85,9 @@ var $config = (function() {
                 ChunkHelper.moveChunk(db, targetThreadColl, bounds, toShard, waitForDelete);
             } catch (e) {
                 // Ignore Interrupted errors, which come when a moveChunk is interrupted by a
-                // concurrent index operation, and DuplicateKey errors, which come when multiple
-                // moveChunks attempt to write to the config.migrations collection at once.
+                // concurrent index operation.
                 const acceptableCodes = [
                     ErrorCodes.Interrupted,
-                    ErrorCodes.DuplicateKey,
                     ErrorCodes.BackgroundOperationInProgressForNamespace,
                     ErrorCodes.LockBusy,
                 ];
@@ -214,7 +212,7 @@ var $config = (function() {
                 for (const shard in inconsistentIndexes) {
                     const shardInconsistentIndexes = inconsistentIndexes[shard];
                     if (shardInconsistentIndexes.length !== 0) {
-                        print(`found inconsistent indexes for ${thread.collName}: ${
+                        print(`found inconsistent indexes for ${collName}: ${
                             tojson(inconsistentIndexes)}`);
                         return false;
                     }

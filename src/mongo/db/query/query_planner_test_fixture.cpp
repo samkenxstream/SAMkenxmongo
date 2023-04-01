@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -44,6 +43,9 @@
 #include "mongo/db/query/query_planner_test_lib.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -271,10 +273,12 @@ void QueryPlannerTest::runQuery(BSONObj query) {
 }
 
 void QueryPlannerTest::runQueryWithPipeline(
-    BSONObj query, std::vector<std::unique_ptr<InnerPipelineStageInterface>> queryLayerPipeline) {
+    BSONObj query,
+    BSONObj proj,
+    std::vector<std::unique_ptr<InnerPipelineStageInterface>> queryLayerPipeline) {
     runQueryFull(query,
                  BSONObj(),
-                 BSONObj(),
+                 proj,
                  0,
                  0,
                  BSONObj(),
@@ -360,10 +364,12 @@ void QueryPlannerTest::runQueryFull(
                                      ExtensionsCallbackNoop(),
                                      MatchExpressionParser::kAllowAllSpecialFeatures,
                                      ProjectionPolicies::findProjectionPolicies(),
-                                     std::move(pipeline));
+                                     std::move(pipeline),
+                                     isCountLike);
     ASSERT_OK(statusWithCQ.getStatus());
     cq = std::move(statusWithCQ.getValue());
     cq->setSbeCompatible(markQueriesSbeCompatible);
+    cq->setForceGenerateRecordId(forceRecordId);
 
     auto statusWithMultiPlanSolns = QueryPlanner::plan(*cq, params);
     ASSERT_OK(statusWithMultiPlanSolns.getStatus());
@@ -437,10 +443,14 @@ void QueryPlannerTest::runInvalidQueryFull(const BSONObj& query,
                                      false,
                                      expCtx,
                                      ExtensionsCallbackNoop(),
-                                     MatchExpressionParser::kAllowAllSpecialFeatures);
+                                     MatchExpressionParser::kAllowAllSpecialFeatures,
+                                     ProjectionPolicies::findProjectionPolicies(),
+                                     {},
+                                     isCountLike);
     ASSERT_OK(statusWithCQ.getStatus());
     cq = std::move(statusWithCQ.getValue());
     cq->setSbeCompatible(markQueriesSbeCompatible);
+    cq->setForceGenerateRecordId(forceRecordId);
 
     auto statusWithMultiPlanSolns = QueryPlanner::plan(*cq, params);
     plannerStatus = statusWithMultiPlanSolns.getStatus();
@@ -466,10 +476,14 @@ void QueryPlannerTest::runQueryAsCommand(const BSONObj& cmdObj) {
                                      isExplain,
                                      expCtx,
                                      ExtensionsCallbackNoop(),
-                                     MatchExpressionParser::kAllowAllSpecialFeatures);
+                                     MatchExpressionParser::kAllowAllSpecialFeatures,
+                                     ProjectionPolicies::findProjectionPolicies(),
+                                     {},
+                                     isCountLike);
     ASSERT_OK(statusWithCQ.getStatus());
     cq = std::move(statusWithCQ.getValue());
     cq->setSbeCompatible(markQueriesSbeCompatible);
+    cq->setForceGenerateRecordId(forceRecordId);
 
     auto statusWithMultiPlanSolns = QueryPlanner::plan(*cq, params);
     ASSERT_OK(statusWithMultiPlanSolns.getStatus());
@@ -494,10 +508,14 @@ void QueryPlannerTest::runInvalidQueryAsCommand(const BSONObj& cmdObj) {
                                      isExplain,
                                      expCtx,
                                      ExtensionsCallbackNoop(),
-                                     MatchExpressionParser::kAllowAllSpecialFeatures);
+                                     MatchExpressionParser::kAllowAllSpecialFeatures,
+                                     ProjectionPolicies::findProjectionPolicies(),
+                                     {},
+                                     isCountLike);
     ASSERT_OK(statusWithCQ.getStatus());
     cq = std::move(statusWithCQ.getValue());
     cq->setSbeCompatible(markQueriesSbeCompatible);
+    cq->setForceGenerateRecordId(forceRecordId);
 
     auto statusWithMultiPlanSolns = QueryPlanner::plan(*cq, params);
     plannerStatus = statusWithMultiPlanSolns.getStatus();

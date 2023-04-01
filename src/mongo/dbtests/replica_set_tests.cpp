@@ -72,7 +72,7 @@ protected:
     void tearDown() {
         auto opCtx = makeOpCtx();
         DBDirectClient client(opCtx.get());
-        client.dropCollection(NamespaceString::kLastVoteNamespace.toString());
+        client.dropCollection(NamespaceString::kLastVoteNamespace);
 
         _replCoordExternalState.reset();
         _dropPendingCollectionReaper.reset();
@@ -97,8 +97,9 @@ private:
 
 TEST_F(ReplicaSetTest, ReplCoordExternalStateStoresLastVoteWithNewTerm) {
     auto opCtx = makeOpCtx();
-    // Methods that do writes as part of elections expect Flow Control to be disabled.
-    opCtx->setShouldParticipateInFlowControl(false);
+    // Methods that do writes as part of elections expect the admission priority to be Immediate.
+    ScopedAdmissionPriorityForLock priority(opCtx->lockState(),
+                                            AdmissionContext::Priority::kImmediate);
     auto replCoordExternalState = getReplCoordExternalState();
 
     replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 1})
@@ -120,8 +121,9 @@ TEST_F(ReplicaSetTest, ReplCoordExternalStateStoresLastVoteWithNewTerm) {
 
 TEST_F(ReplicaSetTest, ReplCoordExternalStateDoesNotStoreLastVoteWithOldTerm) {
     auto opCtx = makeOpCtx();
-    // Methods that do writes as part of elections expect Flow Control to be disabled.
-    opCtx->setShouldParticipateInFlowControl(false);
+    // Methods that do writes as part of elections expect the admission priority to be Immediate.
+    ScopedAdmissionPriorityForLock priority(opCtx->lockState(),
+                                            AdmissionContext::Priority::kImmediate);
     auto replCoordExternalState = getReplCoordExternalState();
 
     replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 1})
@@ -143,8 +145,9 @@ TEST_F(ReplicaSetTest, ReplCoordExternalStateDoesNotStoreLastVoteWithOldTerm) {
 
 TEST_F(ReplicaSetTest, ReplCoordExternalStateDoesNotStoreLastVoteWithEqualTerm) {
     auto opCtx = makeOpCtx();
-    // Methods that do writes as part of elections expect Flow Control to be disabled.
-    opCtx->setShouldParticipateInFlowControl(false);
+    // Methods that do writes as part of elections expect the admission priority to be Immediate.
+    ScopedAdmissionPriorityForLock priority(opCtx->lockState(),
+                                            AdmissionContext::Priority::kImmediate);
     auto replCoordExternalState = getReplCoordExternalState();
 
     replCoordExternalState->storeLocalLastVoteDocument(opCtx.get(), repl::LastVote{2, 1})

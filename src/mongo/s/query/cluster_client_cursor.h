@@ -35,7 +35,7 @@
 #include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_id.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/s/query/cluster_client_cursor_params.h"
 #include "mongo/s/query/cluster_query_result.h"
 #include "mongo/s/query/router_exec_stage.h"
@@ -214,12 +214,20 @@ public:
     /**
      * Returns the number of batches returned by this cursor.
      */
-    virtual std::uint64_t getNBatches() const = 0;
+    std::uint64_t getNBatches() const {
+        return _metrics.nBatches.value_or(0);
+    }
 
     /**
      * Increment the number of batches returned so far by one.
      */
-    virtual void incNBatches() = 0;
+    void incNBatches() {
+        _metrics.incrementNBatches();
+    }
+
+    void incrementCursorMetrics(OpDebug::AdditiveMetrics newMetrics) {
+        _metrics.add(newMetrics);
+    }
 
     //
     // maxTimeMS support.
@@ -244,6 +252,11 @@ public:
     void setLeftoverMaxTimeMicros(Microseconds leftoverMaxTimeMicros) {
         _leftoverMaxTimeMicros = leftoverMaxTimeMicros;
     }
+
+protected:
+    // Metrics that are accumulated over the lifetime of the cursor, incremented with each getMore.
+    // Useful for diagnostics like telemetry.
+    OpDebug::AdditiveMetrics _metrics;
 
 private:
     // Unused maxTime budget for this cursor.

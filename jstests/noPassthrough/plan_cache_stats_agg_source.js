@@ -1,5 +1,9 @@
 /**
  * Tests for the $planCacheStats aggregation metadata source.
+ * @tags: [
+ *   # TODO SERVER-67607: Test plan cache with CQF enabled.
+ *   cqf_incompatible,
+ * ]
  */
 (function() {
 "use strict";
@@ -12,10 +16,6 @@ assert.neq(null, conn, "mongod failed to start up");
 
 const testDb = conn.getDB("test");
 const coll = testDb.plan_cache_stats_agg_source;
-
-// Note that the "getParameter" command is expected to fail in versions of mongod that do not yet
-// include the slot-based execution engine. When that happens, however, 'isSBEEnabled' still
-// correctly evaluates to false.
 const isSBEEnabled = checkSBEEnabled(testDb);
 
 function makeMatchForFilteringByShape(query) {
@@ -113,7 +113,31 @@ assert(entryStats.hasOwnProperty("timeOfCreation"));
 assert.gt(entryStats.timeOfCreation, yesterday);
 assert.lt(entryStats.timeOfCreation, tomorrow);
 
-if (!checkSBEEnabled(testDb, ["featureFlagSbePlanCache"])) {
+assert(entryStats.hasOwnProperty("version"));
+
+assert.eq(false, entryStats.indexFilterSet);
+
+// After creating an index filter on a different query shape, $planCacheStats should still
+// report that no index filter is set. Setting a filter clears the cache, so we rerun the query
+// associated with the cache entry.
+assert.commandWorked(testDb.runCommand(
+    {planCacheSetFilter: coll.getName(), query: {a: 1, b: 1, c: 1}, indexes: [{a: 1}, {b: 1}]}));
+assert.eq(2, coll.aggregate([{$planCacheStats: {}}]).itcount());
+assert.eq(2, coll.find({a: 1, b: 1, c: 1}).itcount());
+assert.eq(3, coll.aggregate([{$planCacheStats: {}}]).itcount());
+entryStats = getSingleEntryStats();
+assert.eq(false, entryStats.indexFilterSet);
+
+// Create an index filter on shape {a: 1, b: 1}, and verify that indexFilterSet is now true.
+assert.commandWorked(testDb.runCommand(
+    {planCacheSetFilter: coll.getName(), query: {a: 1, b: 1}, indexes: [{a: 1}, {b: 1}]}));
+assert.eq(2, coll.aggregate([{$planCacheStats: {}}]).itcount());
+assert.eq(3, coll.find({a: 1, b: 1}).itcount());
+assert.eq(3, coll.aggregate([{$planCacheStats: {}}]).itcount());
+entryStats = getSingleEntryStats();
+assert.eq(true, entryStats.indexFilterSet);
+
+if (entryStats["version"] === "1") {
     // Verify that the entry has the expected 'createdFromQuery' field.
     assert(entryStats.hasOwnProperty("createdFromQuery"));
     assert.eq(entryStats.createdFromQuery.query, {a: 1, b: 1});
@@ -146,33 +170,6 @@ if (!checkSBEEnabled(testDb, ["featureFlagSbePlanCache"])) {
     for (let score of entryStats.candidatePlanScores) {
         assert.gt(score, 1);
     }
-
-    // TODO SERVER-59695: Enable test cases below after index filters can work with SBE plan cache.
-    // Should report that no index filter is set.
-    assert.eq(false, entryStats.indexFilterSet);
-
-    // After creating an index filter on a different query shape, $planCacheStats should still
-    // report that no index filter is set. Setting a filter clears the cache, so we rerun the query
-    // associated with the cache entry.
-    assert.commandWorked(testDb.runCommand({
-        planCacheSetFilter: coll.getName(),
-        query: {a: 1, b: 1, c: 1},
-        indexes: [{a: 1}, {b: 1}]
-    }));
-    assert.eq(2, coll.aggregate([{$planCacheStats: {}}]).itcount());
-    assert.eq(2, coll.find({a: 1, b: 1, c: 1}).itcount());
-    assert.eq(3, coll.aggregate([{$planCacheStats: {}}]).itcount());
-    entryStats = getSingleEntryStats();
-    assert.eq(false, entryStats.indexFilterSet);
-
-    // Create an index filter on shape {a: 1, b: 1}, and verify that indexFilterSet is now true.
-    assert.commandWorked(testDb.runCommand(
-        {planCacheSetFilter: coll.getName(), query: {a: 1, b: 1}, indexes: [{a: 1}, {b: 1}]}));
-    assert.eq(2, coll.aggregate([{$planCacheStats: {}}]).itcount());
-    assert.eq(3, coll.find({a: 1, b: 1}).itcount());
-    assert.eq(3, coll.aggregate([{$planCacheStats: {}}]).itcount());
-    entryStats = getSingleEntryStats();
-    assert.eq(true, entryStats.indexFilterSet);
 }
 
 // Should throw an error if $planCacheStats is not first.

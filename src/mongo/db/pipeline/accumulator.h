@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/base/string_data.h"
 #include "mongo/platform/basic.h"
 
 #include <boost/intrusive_ptr.hpp>
@@ -42,6 +43,8 @@
 #include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/stats/stats_gen.h"
+#include "mongo/db/query/stats/value_utils.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/summation.h"
 
@@ -110,8 +113,8 @@ public:
         return _needsInput;
     }
 
-    virtual bool isAssociative() const {
-        return false;
+    virtual ExpressionNary::Associativity getAssociativity() const {
+        return ExpressionNary::Associativity::kNone;
     }
 
     virtual bool isCommutative() const {
@@ -134,12 +137,12 @@ public:
      */
     virtual Document serialize(boost::intrusive_ptr<Expression> initializer,
                                boost::intrusive_ptr<Expression> argument,
-                               bool explain) const {
+                               SerializationOptions options = {}) const {
         ExpressionConstant const* ec = dynamic_cast<ExpressionConstant const*>(initializer.get());
         invariant(ec);
         invariant(ec->getValue().nullish());
 
-        return DOC(getOpName() << argument->serialize(explain));
+        return DOC(getOpName() << argument->serialize(options));
     }
 
     virtual AccumulatorDocumentsNeeded documentsNeeded() const {
@@ -188,8 +191,8 @@ public:
 
     static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* expCtx);
 
-    bool isAssociative() const final {
-        return true;
+    ExpressionNary::Associativity getAssociativity() const final {
+        return ExpressionNary::Associativity::kFull;
     }
 
     bool isCommutative() const final {
@@ -224,6 +227,34 @@ public:
 private:
     bool _haveFirst;
     Value _first;
+};
+
+class AccumulatorInternalConstructStats final : public AccumulatorState {
+public:
+    static constexpr auto kName = "$_internalConstructStats"_sd;
+
+    const char* getOpName() const final {
+        return kName.rawData();
+    }
+
+    explicit AccumulatorInternalConstructStats(ExpressionContext* expCtx,
+                                               InternalConstructStatsAccumulatorParams);
+
+    void processInternal(const Value& input, bool merging) final;
+    Value getValue(bool toBeMerged) final;
+    void reset() final;
+
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* expCtx,
+                                                         InternalConstructStatsAccumulatorParams);
+
+    bool isCommutative() const final {
+        return true;
+    }
+
+private:
+    double _count;  // Can't this be an int?
+    InternalConstructStatsAccumulatorParams _params;
+    std::vector<stats::SBEValue> _values;
 };
 
 class AccumulatorLast final : public AccumulatorState {
@@ -266,8 +297,8 @@ public:
 
     static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* expCtx);
 
-    bool isAssociative() const final {
-        return true;
+    ExpressionNary::Associativity getAssociativity() const final {
+        return ExpressionNary::Associativity::kFull;
     }
 
     bool isCommutative() const final {
@@ -294,8 +325,8 @@ public:
     Value getValue(bool toBeMerged) final;
     void reset() final;
 
-    bool isAssociative() const final {
-        return true;
+    ExpressionNary::Associativity getAssociativity() const final {
+        return ExpressionNary::Associativity::kFull;
     }
 
     bool isCommutative() const final {

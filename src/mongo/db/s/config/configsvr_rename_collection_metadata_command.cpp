@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -37,9 +36,11 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/sharding_ddl_util.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 
 namespace mongo {
@@ -67,6 +68,10 @@ public:
         return AllowedOnSecondary::kNever;
     }
 
+    bool supportsRetryableWrite() const final {
+        return true;
+    }
+
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
@@ -74,11 +79,11 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrRenameCollectionMetadata can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
-            opCtx->setAlwaysInterruptAtStepDownOrUp();
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             const auto& req = request();
 
@@ -88,19 +93,15 @@ public:
                 repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
             auto txnParticipant = TransactionParticipant::get(opCtx);
-            if (!txnParticipant) {
-                // old binaries will not send the txnNumber
-                ShardingCatalogManager::get(opCtx)->renameShardedMetadata(
-                    opCtx,
-                    ns(),
-                    req.getTo(),
-                    ShardingCatalogClient::kMajorityWriteConcern,
-                    req.getOptFromCollection());
-                return;
-            }
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << Request::kCommandName
+                                  << " expected to be called within a transaction",
+                    txnParticipant);
 
             {
                 auto newClient = opCtx->getServiceContext()->makeClient("RenameCollectionMetadata");
+                AuthorizationSession::get(newClient.get())
+                    ->grantInternalAuthorization(newClient.get());
                 {
                     stdx::lock_guard<Client> lk(*newClient.get());
                     newClient->setSystemOperationKillableByStepdown(lk);
@@ -122,8 +123,10 @@ public:
 
             // Since we no write happened on this txnNumber, we need to make a dummy write so that
             // secondaries can be aware of this txn.
+            // Such write will also guarantee that the lastOpTime of opCtx will be inclusive of any
+            // write executed under the AlternativeClientRegion.
             DBDirectClient client(opCtx);
-            client.update(NamespaceString::kServerConfigurationNamespace.ns(),
+            client.update(NamespaceString::kServerConfigurationNamespace,
                           BSON("_id"
                                << "RenameCollectionMetadataStats"),
                           BSON("$inc" << BSON("count" << 1)),

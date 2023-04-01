@@ -36,6 +36,4 @@
 namespace mongo::collection_options_validation {
 Status validateStorageEngineOptions(const BSONObj& storageEngine);
 
-EncryptedFieldConfig processAndValidateEncryptedFields(EncryptedFieldConfig config);
-
 }  // namespace mongo::collection_options_validation

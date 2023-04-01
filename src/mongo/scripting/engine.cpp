@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -47,6 +46,9 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/file.h"
 #include "mongo/util/text.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
@@ -219,7 +221,7 @@ bool Scope::execFile(const string& filename, bool printResult, bool reportError,
 
 void Scope::storedFuncMod(OperationContext* opCtx) {
     opCtx->recoveryUnit()->onCommit(
-        [](boost::optional<Timestamp>) { _lastVersion.fetchAndAdd(1); });
+        [](OperationContext*, boost::optional<Timestamp>) { _lastVersion.fetchAndAdd(1); });
 }
 
 void Scope::validateObjectIdString(const string& str) {

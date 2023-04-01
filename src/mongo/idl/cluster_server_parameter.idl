@@ -30,7 +30,7 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 structs:
     ClusterServerParameter:
@@ -51,9 +51,79 @@ structs:
                     In normal operation, the clusterParameterTime will increase as the CSP is updated via 
                     setClusterParameter, but may decrease to a previously-seen value on rollback. 
                 type: logicalTime
+                default: LogicalTime::kUninitialized
+
+    TestIntClusterParameterStorage:
+        description: "Storage used for testIntClusterParameter"
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: ClusterServerParameter
+        fields:
+            intData:
+                description: "Some int parameter"
+                type: safeInt64
+                default: 16
+
+    TestStrClusterParameterStorage:
+        description: "Storage used for testStrClusterParameter"
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: ClusterServerParameter
+        fields:
+            strData:
+                description: "Some string parameter"
+                type: string
+                default: "\"off\""
+
+    TestBoolClusterParameterStorage:
+        description: "Storage used for testBoolClusterParameter"
+        inline_chained_structs: true
+        chained_structs:
+            ClusterServerParameter: ClusterServerParameter
+        fields:
+            boolData:
+                description: "Some bool parameter"
+                type: bool
+                default: 0
 
 feature_flags:
-    featureFlagClusterWideConfig:
-        description: Mechanism for cluster-wide configuration options
-        cpp_varname: gFeatureFlagClusterWideConfig
+    featureFlagClusterWideConfigM2:
+        description: Mechanism for cluster-wide configuration options, milestone 2
+        cpp_varname: gFeatureFlagClusterWideConfigM2
+        default: true
+        version: 6.1
+    featureFlagClusterWideToaster:
+        description: Feature flag for testing use of feature flags with CW server params
+        cpp_varname: gFeatureFlagClusterWideToaster
         default: false
+
+server_parameters:
+    testIntClusterParameter:
+        set_at: cluster
+        description: "Test cluster parameter that is only usable if enableTestCommands=true"
+        cpp_vartype: TestIntClusterParameterStorage
+        cpp_varname: intStorage
+        test_only: true
+
+    testStrClusterParameter:
+        set_at: cluster
+        description: "Test cluster parameter that is only usable if enableTestCommands=true"
+        cpp_vartype: TestStrClusterParameterStorage
+        cpp_varname: strStorage
+        test_only: true
+
+    testBoolClusterParameter:
+        set_at: cluster
+        description: "Test cluster parameter that is only usable if enableTestCommands=true"
+        cpp_vartype: TestBoolClusterParameterStorage
+        cpp_varname: boolStorage
+        test_only: true
+
+    cwspTestNeedsFeatureFlagClusterWideToaster:
+        description: "Server Parameter gated on featureFlagClusterWideToaster"
+        set_at: cluster
+        cpp_varname: gCWSPTestFeatureFlagClusterWideToaster
+        cpp_vartype: TestIntClusterParameterStorage
+        test_only: true
+        condition:
+            feature_flag: gFeatureFlagClusterWideToaster

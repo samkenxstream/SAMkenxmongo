@@ -27,13 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kProcessHealth
 
 #include "mongo/db/process_health/health_observer_base.h"
 
 #include "mongo/db/process_health/deadline_future.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kProcessHealth
+
 
 namespace mongo {
 namespace process_health {
@@ -54,25 +56,38 @@ SharedSemiFuture<HealthCheckStatus> HealthObserverBase::periodicCheck(
         _currentlyRunningHealthCheck = true;
     }
 
+    Future<HealthCheckStatus> healthCheckResult;
+
+    try {
+        healthCheckResult = periodicCheckImpl({token, taskExecutor});
+    } catch (const DBException& e) {
+        LOGV2_DEBUG(6728001,
+                    2,
+                    "Health observer failed due to an exception",
+                    "observerType"_attr = getType(),
+                    "errorCode"_attr = e.code(),
+                    "reason"_attr = e.reason());
+
+        healthCheckResult = makeSimpleFailedStatus(Severity::kFailure, {e.toStatus()});
+    }
+
     _deadlineFuture = DeadlineFuture<HealthCheckStatus>::create(
         taskExecutor,
-        periodicCheckImpl({token, taskExecutor})
-            .onCompletion([this](StatusWith<HealthCheckStatus> status) {
-                const auto now = _svcCtx->getPreciseClockSource()->now();
+        std::move(healthCheckResult).onCompletion([this](StatusWith<HealthCheckStatus> status) {
+            const auto now = _svcCtx->getPreciseClockSource()->now();
 
-                auto lk = stdx::lock_guard(_mutex);
-                ++_completedChecksCount;
-                invariant(_currentlyRunningHealthCheck);
-                _currentlyRunningHealthCheck = false;
-                _lastTimeCheckCompleted = now;
+            auto lk = stdx::lock_guard(_mutex);
+            ++_completedChecksCount;
+            invariant(_currentlyRunningHealthCheck);
+            _currentlyRunningHealthCheck = false;
+            _lastTimeCheckCompleted = now;
 
-                if (!status.isOK() ||
-                    !HealthCheckStatus::isResolved(status.getValue().getSeverity())) {
-                    ++_completedChecksWithFaultCount;
-                }
+            if (!status.isOK() || !HealthCheckStatus::isResolved(status.getValue().getSeverity())) {
+                ++_completedChecksWithFaultCount;
+            }
 
-                return status;
-            }),
+            return status;
+        }),
         getObserverTimeout());
 
     return _deadlineFuture->get();

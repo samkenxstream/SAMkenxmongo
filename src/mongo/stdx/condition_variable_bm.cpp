@@ -55,7 +55,7 @@ void BM_stdxNotifyOneNoNotifyables(benchmark::State& state) {
     }
 }
 
-volatile bool alwaysTrue = true;
+volatile bool alwaysTrue = true;  // NOLINT
 
 void BM_stdWaitWithTruePredicate(benchmark::State& state) {
     std::condition_variable cv;  // NOLINT

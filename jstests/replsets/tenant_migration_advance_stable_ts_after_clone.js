@@ -4,46 +4,53 @@
  *
  * @tags: [
  *   featureFlagShardMerge,
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
- *   requires_fcv_52,
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {isShardMergeEnabled} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
 load("jstests/libs/uuid_util.js");  // For extractUUIDFromObject().
 load("jstests/replsets/rslib.js");
 
-const kTenantIdPrefix = "testTenantId";
-const kUnrelatedDbNameDonor = "unrelatedDBDonor";
-const kUnrelatedDbNameRecipient = "unrelatedDBRecipient";
+const kUnrelatedDbNameRecipient = `${ObjectId().str}_unrelatedDBRecipient`;
 const collName = "foo";
-const tenantId = kTenantIdPrefix + "-0";
+const tenantId = ObjectId().str;
 const migrationId = UUID();
 const migrationOpts = {
     migrationIdString: extractUUIDFromObject(migrationId),
-    tenantId: tenantId,
+    tenantIds: [ObjectId(tenantId)]
 };
 
 const tmt = new TenantMigrationTest({name: jsTestName()});
-tmt.insertDonorDB(tenantId + "_db", collName);
+tmt.insertDonorDB(`${tenantId}_db`, collName);
 
 const donorPrimary = tmt.getDonorPrimary();
 const recipientPrimary = tmt.getRecipientPrimary();
+
+const kRelatedDbNameDonor = tmt.tenantDB(tenantId, "donorDb");
+
+// Note: including this explicit early return here due to the fact that multiversion
+// suites will execute this test without featureFlagShardMerge enabled (despite the
+// presence of the featureFlagShardMerge tag above), which means the test will attempt
+// to run a multi-tenant migration and fail.
+if (!isShardMergeEnabled(recipientPrimary.getDB("admin"))) {
+    tmt.stop();
+    jsTestLog("Skipping Shard Merge-specific test");
+    quit();
+}
 
 // Insert a doc on the recipient with {writeConcern: majority} to advance the stable timestamp. We
 // will hold the stable timestamp on the recipient at this ts. This will ensure that when we run the
 // tenant migration, the recipient's stable timestamp will be less than the the timestamp it
 // receives from the donor to use as the startApplyingDonorOpTime.
-let recipientHoldStableTs =
+const recipientHoldStableTs =
     assert
         .commandWorked(recipientPrimary.getDB(kUnrelatedDbNameRecipient).runCommand({
             insert: collName,
@@ -59,14 +66,13 @@ const recipientHoldStablefp = configureFailPoint(
 // recipient.
 let donorAdvancedStableTs;
 assert.soon(function() {
-    donorAdvancedStableTs =
-        assert
-            .commandWorked(donorPrimary.getDB(kUnrelatedDbNameDonor).runCommand({
-                insert: collName,
-                documents: [{n: 1}],
-                writeConcern: {w: "majority"}
-            }))
-            .operationTime;
+    donorAdvancedStableTs = assert
+                                .commandWorked(donorPrimary.getDB(kRelatedDbNameDonor).runCommand({
+                                    insert: collName,
+                                    documents: [{n: 1}],
+                                    writeConcern: {w: "majority"}
+                                }))
+                                .operationTime;
 
     return bsonWoCompare(donorAdvancedStableTs, recipientHoldStableTs) > 0;
 });
@@ -93,7 +99,7 @@ hangBeforeAdvanceStableTsFp.off();
 // recipient advanced its stable timestamp to the timestamp of this write.
 let stableTimestamp;
 assert.soon(function() {
-    let noopEntry = recipientPrimary.getDB("local").oplog.rs.findOne(
+    const noopEntry = recipientPrimary.getDB("local").oplog.rs.findOne(
         {"o": {"msg": "Merge recipient advancing stable timestamp"}});
     if (noopEntry)
         stableTimestamp = noopEntry.ts;
@@ -101,7 +107,7 @@ assert.soon(function() {
     return noopEntry;
 });
 
-let majorityWriteTs =
+const majorityWriteTs =
     assert
         .commandWorked(recipientPrimary.getDB(kUnrelatedDbNameRecipient).runCommand({
             insert: collName,
@@ -114,4 +120,3 @@ assert(bsonWoCompare(majorityWriteTs, donorAdvancedStableTs) >= 0);
 
 TenantMigrationTest.assertCommitted(tmt.waitForMigrationToComplete(migrationOpts));
 tmt.stop();
-})();

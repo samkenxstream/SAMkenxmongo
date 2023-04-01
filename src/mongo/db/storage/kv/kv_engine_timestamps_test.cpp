@@ -57,7 +57,6 @@ public:
         Operation() = default;
         Operation(ServiceContext::UniqueClient client, RecoveryUnit* ru)
             : _client(std::move(client)), _opCtx(_client->makeOperationContext()) {
-            _opCtx->releaseRecoveryUnit();
             _opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(ru),
                                     WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
         }
@@ -204,8 +203,10 @@ public:
         auto op = makeOperation();
         WriteUnitOfWork wuow(op);
         std::string ns = "a.b";
-        ASSERT_OK(engine->createRecordStore(op, ns, ns, CollectionOptions()));
-        rs = engine->getRecordStore(op, ns, ns, CollectionOptions());
+        ASSERT_OK(engine->createRecordStore(
+            op, NamespaceString::createNamespaceString_forTest(ns), ns, CollectionOptions()));
+        rs = engine->getRecordStore(
+            op, NamespaceString::createNamespaceString_forTest(ns), ns, CollectionOptions());
         ASSERT(rs);
     }
 

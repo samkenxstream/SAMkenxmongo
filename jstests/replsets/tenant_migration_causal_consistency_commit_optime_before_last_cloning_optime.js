@@ -2,9 +2,13 @@
  * Verify that causal consistency is respected if a tenant migration commits with an earlier optime
  * timestamp than the latest optime associated with cloning on the recipient.
  *
+ * TODO (SERVER-61231): This test currently relies on a TenantCollectionCloner failpoint, which is
+ * not used by shard merge, but the behavior we are testing here is likely still relevant. Adapt
+ * for shard merge.
+ *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
+ *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
  *   requires_persistence,
@@ -12,12 +16,11 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {makeX509OptionsForTest} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
 load("jstests/replsets/rslib.js");
 
 function assertCanFindWithReadConcern(conn, dbName, collName, expectedDoc, readConcern) {
@@ -27,19 +30,18 @@ function assertCanFindWithReadConcern(conn, dbName, collName, expectedDoc, readC
     assert.eq(expectedDoc, res.cursor.firstBatch[0], tojson(res));
 }
 
-let counter = 0;
-let makeTenantId = function() {
-    return "tenant-" + counter++;
-};
-
 // Local read concern case.
 (() => {
-    const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
+    const migrationX509Options = makeX509OptionsForTest();
 
     // Simulate a lagged node by setting secondaryDelaySecs on one recipient secondary. Verify this
     // does not prevent reading all the tenant's data after the migration commits.
-    const recipientRst = new ReplSetTest(
-        {name: "recipient_local_case", nodes: 3, nodeOptions: migrationX509Options.recipient});
+    const recipientRst = new ReplSetTest({
+        name: "recipient_local_case",
+        nodes: 3,
+        serverless: true,
+        nodeOptions: migrationX509Options.recipient
+    });
     recipientRst.startSet();
 
     let config = recipientRst.getReplSetConfig();
@@ -52,13 +54,13 @@ let makeTenantId = function() {
 
     const tmt = new TenantMigrationTest({name: jsTestName(), recipientRst});
 
-    const tenantId = makeTenantId();
+    const tenantId = ObjectId().str;
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(UUID()),
-        tenantId: tenantId,
+        tenantId,
     };
 
-    const dbName = tenantId + "_test";
+    const dbName = `${tenantId}_test`;
     const collName = "foo";
 
     // Insert tenant data to be copied. Save the operationTime to use for afterClusterTime reads
@@ -110,13 +112,13 @@ let makeTenantId = function() {
 (() => {
     const tmt = new TenantMigrationTest({name: jsTestName(), sharedOptions: {nodes: 3}});
 
-    const tenantId = makeTenantId();
+    const tenantId = ObjectId().str;
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(UUID()),
-        tenantId: tenantId,
+        tenantId,
     };
 
-    const dbName = tenantId + "_test";
+    const dbName = `${tenantId}_test`;
     const collName = "foo";
 
     // Insert tenant data to be copied.
@@ -200,4 +202,3 @@ let makeTenantId = function() {
 })();
 
 // Snapshot read concern is tested in replsets/tenant_migration_concurrent_reads_on_recipient.js
-})();

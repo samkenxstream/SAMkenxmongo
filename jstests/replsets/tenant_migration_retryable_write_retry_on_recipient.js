@@ -3,7 +3,6 @@
  * on the recipient.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
@@ -12,18 +11,20 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    isShardMergeEnabled,
+    runMigrationAsync
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");  // for 'Thread'
 load("jstests/libs/uuid_util.js");
+load("jstests/replsets/rslib.js");  // 'createRstArgs'
 
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
-const kTenantId = "testTenantId";
+const kTenantId = ObjectId().str;
 const kDbName = tenantMigrationTest.tenantDB(kTenantId, "testDb");
 const kCollNameBefore = "testCollBefore";
 const kCollNameDuring = "testCollDuring";
@@ -37,15 +38,15 @@ const recipientDb = recipientPrimary.getDB(kDbName);
 // wrongly restarts the Shard Merge protocol. It copies and imports donor files again, and
 // eventually hits an invariant in TenantFileImporterService, which doesn't support restart.
 // Once we fix Shard Merge to not resume on stepup, this test will work as-is.
-if (TenantMigrationUtil.isShardMergeEnabled(donorPrimary.getDB("adminDB"))) {
+if (isShardMergeEnabled(donorPrimary.getDB("adminDB"))) {
     jsTestLog("Skip: featureFlagShardMerge enabled, but shard merge does not survive stepup");
     tenantMigrationTest.stop();
-    return;
+    quit();
 }
 
 jsTestLog("Run a migration to the end of cloning");
-const waitAfterCloning =
-    configureFailPoint(recipientPrimary, "fpAfterCollectionClonerDone", {action: "hang"});
+const waitBeforeFetchingTransactions =
+    configureFailPoint(recipientPrimary, "fpBeforeFetchingCommittedTransactions", {action: "hang"});
 
 const migrationId = UUID();
 const migrationOpts = {
@@ -165,11 +166,10 @@ assert.commandWorked(
 assert.commandWorked(
     donorDb.runCommand(beforeWrites.retryableFindAndModifyUpdateWithPreImageCommand));
 
-const donorRstArgs = TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst());
-const migrationThread =
-    new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
+const donorRstArgs = createRstArgs(tenantMigrationTest.getDonorRst());
+const migrationThread = new Thread(runMigrationAsync, migrationOpts, donorRstArgs);
 migrationThread.start();
-waitAfterCloning.wait();
+waitBeforeFetchingTransactions.wait();
 
 jsTestLog("Run retryable writes during the migration");
 
@@ -184,7 +184,7 @@ assert.commandWorked(
 
 // Wait for the migration to complete.
 jsTest.log("Waiting for migration to complete");
-waitAfterCloning.off();
+waitBeforeFetchingTransactions.off();
 TenantMigrationTest.assertCommitted(migrationThread.returnData());
 
 // Print the no-op oplog entries for debugging purposes.
@@ -264,8 +264,7 @@ testRecipientRetryableWrites(recipientDb, beforeWrites);
 testRecipientRetryableWrites(recipientDb, duringWrites);
 jsTestLog("Step up secondary");
 const recipientRst = tenantMigrationTest.getRecipientRst();
-recipientRst.awaitReplication();
-assert.commandWorked(recipientRst.getSecondary().adminCommand({replSetStepUp: 1}));
+recipientRst.stepUp(recipientRst.getSecondary());
 jsTestLog("Run retryable write on secondary after the migration");
 testRecipientRetryableWrites(recipientRst.getPrimary().getDB(kDbName), beforeWrites);
 testRecipientRetryableWrites(recipientRst.getPrimary().getDB(kDbName), duringWrites);
@@ -297,4 +296,3 @@ testRecipientRetryableWrites(recipient2Db, duringWrites);
 
 tenantMigrationTest2.stop();
 tenantMigrationTest.stop();
-})();

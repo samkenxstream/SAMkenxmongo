@@ -1,13 +1,19 @@
-// @tags: [does_not_support_stepdowns, requires_profiling, assumes_read_preference_unchanged]
-//
-//  Confirms that profiled find queries and corresponding logs have matching queryHashes.
+/**
+ * Confirms that profiled find queries and corresponding logs have matching queryHashes.
+ * @tags: [
+ *  does_not_support_stepdowns,
+ *  requires_profiling,
+ *  assumes_read_preference_unchanged,
+ *  # TODO SERVER-67607: support query hash in slow query log lines.
+ *  cqf_incompatible,
+ * ]
+ */
 (function() {
 "use strict";
 
 // For getLatestProfilerEntry().
 load("jstests/libs/profiler.js");
-load("jstests/libs/logv2_helpers.js");
-load("jstests/libs/sbe_util.js");  // For checkSBEEnabled.
+load("jstests/libs/sbe_util.js");
 
 // Prevent the mongo shell from gossiping its cluster time, since this will increase the amount
 // of data logged for each op. For some of the testcases below, including the cluster time would
@@ -31,12 +37,8 @@ assert.commandWorked(testDB.setLogLevel(0, "query"));
 // Returns true if the logLine command components correspond to the profile entry. This is
 // sufficient for the purpose of testing query hashes.
 function logMatchesEntry(logLine, profileEntry) {
-    if ((!isJsonLogNoConn() ? logLine.indexOf("command: find { find: \"test\"") >= 0
-                            : logLine.indexOf('command":{"find":"test"') >= 0) &&
-        logLine.indexOf(profileEntry["command"]["comment"]) >= 0) {
-        return true;
-    }
-    return false;
+    return logLine.indexOf('command":{"find":"test"') >= 0 &&
+        logLine.indexOf(profileEntry["command"]["comment"]) >= 0;
 }
 
 // Fetch the log line that corresponds to the profile entry. If there is no such line, return
@@ -108,7 +110,7 @@ const testList = [
         test: function(db, comment) {
             assert.eq(200, db.test.find().comment(comment).itcount());
         },
-        hasPlanCacheKey: false
+        hasPlanCacheKey: checkSBEEnabled(testDB)
     },
     {
         comment: "Test1 find query",
@@ -134,13 +136,7 @@ const hashValues = testList.map((testCase) => runTestsAndGetHashes(testDB, testC
 
 // Confirm that the same shape of query has the same hashes.
 assert.neq(hashValues[0], hashValues[1]);
-
-// TODO SERVER-61314: Remove this check when "featureFlagSbePlanCache" is removed. This part of the
-// test cannot work when the SBE plan cache is enabled until the SBE plan cache supports
-// auto-parameterization.
-if (!checkSBEEnabled(testDB, ["featureFlagSbePlanCache"])) {
-    assert.eq(hashValues[1], hashValues[2]);
-}
+assert.eq(hashValues[1], hashValues[2]);
 
 // Test that the expected 'planCacheKey' and 'queryHash' are included in the transitional
 // log lines when an inactive cache entry is created.

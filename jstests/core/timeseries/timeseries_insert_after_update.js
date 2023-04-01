@@ -3,10 +3,15 @@
  * were updated.
  *
  * @tags: [
+ *   # This test depends on certain writes ending up in the same bucket. Stepdowns may result in
+ *   # writes splitting between two primaries, and thus different buckets.
  *   does_not_support_stepdowns,
- *   does_not_support_transactions,
- *   requires_getmore,
- *   requires_fcv_51,
+ *   # Test explicitly relies on multi-updates.
+ *   requires_multi_updates,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
+ *   # This test depends on stats read from the primary node in replica sets.
+ *   assumes_read_preference_unchanged,
  * ]
  */
 (function() {
@@ -14,11 +19,6 @@
 
 load("jstests/core/timeseries/libs/timeseries.js");
 load("jstests/libs/fixture_helpers.js");
-
-if (!TimeseriesTest.timeseriesUpdatesAndDeletesEnabled(db.getMongo())) {
-    jsTestLog("Skipping test because the time-series updates and deletes feature flag is disabled");
-    return;
-}
 
 if (FixtureHelpers.isMongos(db) &&
     !TimeseriesTest.shardedtimeseriesCollectionsEnabled(db.getMongo())) {
@@ -58,10 +58,22 @@ TimeseriesTest.run((insert) => {
     }));
     docs[0][metaFieldName] = "b";
 
-    assert.commandWorked(insert(coll, docs.slice(1)));
-    assert.docEq(coll.find({}, {_id: 0}).sort({[timeFieldName]: 1}).toArray(), docs);
+    let stats = assert.commandWorked(coll.stats());
+    assert(stats.timeseries);
+    const expectedNumBucketsReopened = stats.timeseries['numBucketsReopened'] + 1;
 
-    // All three documents should be in their own buckets.
-    assert.eq(bucketsColl.find().itcount(), 3, bucketsColl.find().toArray());
+    assert.commandWorked(insert(coll, docs.slice(1)));
+    assert.docEq(docs, coll.find({}, {_id: 0}).sort({[timeFieldName]: 1}).toArray());
+
+    if (TimeseriesTest.timeseriesScalabilityImprovementsEnabled(testDB)) {
+        assert.eq(bucketsColl.find().itcount(), 2, bucketsColl.find().toArray());
+        stats = assert.commandWorked(coll.stats());
+        assert(stats.timeseries);
+        assert.eq(stats.timeseries['bucketCount'], 2);
+        assert.eq(stats.timeseries['numBucketsReopened'], expectedNumBucketsReopened);
+    } else {
+        // All three documents should be in their own buckets.
+        assert.eq(bucketsColl.find().itcount(), 3, bucketsColl.find().toArray());
+    }
 });
 })();

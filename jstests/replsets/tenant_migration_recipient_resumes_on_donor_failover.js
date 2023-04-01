@@ -9,7 +9,6 @@
  * Incompatible with shard merge, which can't handle restart.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
@@ -19,21 +18,20 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {makeX509OptionsForTest} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
 load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 load('jstests/replsets/rslib.js');
 
 function runTest(failPoint) {
     const recipientRst = new ReplSetTest({
         nodes: 2,
         name: jsTestName() + "_recipient",
-        nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().recipient, {
+        serverless: true,
+        nodeOptions: Object.assign(makeX509OptionsForTest().recipient, {
             setParameter: {
                 // Use a batch size of 2 so that collection cloner requires more than a single batch
                 // to complete.
@@ -50,7 +48,7 @@ function runTest(failPoint) {
         new TenantMigrationTest({name: jsTestName(), recipientRst, sharedOptions: {nodes: 3}});
 
     jsTestLog("Running test with failpoint: " + failPoint);
-    const tenantId = "testTenantId";
+    const tenantId = ObjectId().str;
     const tenantDB = tenantMigrationTest.tenantDB(tenantId, "DB");
     const collName = "testColl";
 
@@ -112,7 +110,9 @@ function runTest(failPoint) {
                                          'fpAfterStartingOplogFetcherMigrationRecipientInstance',
                                          {action: "hang"});
     // Step up a new donor primary.
-    assert.commandWorked(donorSecondary.adminCommand({replSetStepUp: 1}));
+    assert.soonNoExcept(() => {
+        return assert.commandWorked(donorSecondary.adminCommand({replSetStepUp: 1}));
+    });
     hangOnRetry.wait();
     res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
     currOp = res.inprog[0];
@@ -142,4 +142,3 @@ if (testEnabled) {
     // 'RecipientSyncData' cmd, indicating that the data is consistent.
     runTest('fpAfterDataConsistentMigrationRecipientInstance');
 }
-})();

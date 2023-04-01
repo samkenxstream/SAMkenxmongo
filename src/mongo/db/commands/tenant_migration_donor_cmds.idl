@@ -36,7 +36,7 @@ imports:
   - "mongo/client/read_preference_setting.idl"
   - "mongo/db/repl/tenant_migration_state_machine.idl"
   - "mongo/db/serverless/serverless_types.idl"
-  - "mongo/idl/basic_types.idl"
+  - "mongo/db/basic_types.idl"
   - "mongo/s/sharding_types.idl"
 
 structs:
@@ -69,9 +69,9 @@ commands:
         validator:
           callback: "tenant_migration_util::validateConnectionString"
       tenantId:
-        description: "The prefix from which the migrating database will be matched. The prefixes 'admin', 'local', 'config', the empty string, are not allowed."
+        description: "The prefix from which the migrating database will be matched. The prefixes 'admin', 'local', 'config', and the empty string ('') are not allowed. Required for multitenant migration, must be empty for shard merge."
         type: string
-        default: '""'
+        optional: true
         validator:
           callback: "tenant_migration_util::validateDatabasePrefix"
       readPreference:
@@ -97,6 +97,12 @@ commands:
         optional: true
         validator:
           callback: "tenant_migration_util::validateProtocolFCVCompatibility"
+      tenantIds:
+        description: "The tenants to migrate. Required for shard merge, must be empty for multitenant migration."
+        optional: true
+        type: array<tenant_id>
+        validator:
+          callback: "tenant_migration_util::validateDatabasePrefix"
 
   donorForgetMigration:
     description: "Parser for the 'donorForgetMigration' command."

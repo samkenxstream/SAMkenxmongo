@@ -34,11 +34,9 @@
 
 #include "mongo/db/s/balancer/balancer_policy.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/chunk_version.h"
 
 namespace mongo {
 
-class ChunkType;
 class NamespaceString;
 class OperationContext;
 template <typename T>
@@ -59,7 +57,7 @@ public:
     /**
      * Potentially blocking method, which gives out a set of chunks, which need to be split because
      * they violate the policy for some reason. The reason is decided by the policy and may include
-     * chunk is too big or chunk straddles a tag range.
+     * chunk is too big or chunk straddles a zone range.
      */
     virtual StatusWith<SplitInfoVector> selectChunksToSplit(OperationContext* opCtx) = 0;
 
@@ -74,7 +72,11 @@ public:
      * Potentially blocking method, which gives out a set of chunks to be moved.
      */
     virtual StatusWith<MigrateInfoVector> selectChunksToMove(
-        OperationContext* opCtx, stdx::unordered_set<ShardId>* unavailableShards) = 0;
+        OperationContext* opCtx,
+        const std::vector<ClusterStatistics::ShardStatistics>& shardStats,
+        stdx::unordered_set<ShardId>* availableShards,
+        stdx::unordered_set<NamespaceString>* imbalancedCollectionsCachePtr) = 0;
+
 
     /**
      * Given a valid namespace returns all the Migrations the balancer would need to perform

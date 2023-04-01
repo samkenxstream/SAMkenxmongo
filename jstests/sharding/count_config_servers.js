@@ -8,11 +8,13 @@
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
 (function() {
 "use strict";
 
-var st = new ShardingTest({name: 'sync_conn_cmd', shards: 0});
+var st =
+    new ShardingTest({name: 'sync_conn_cmd', shards: TestData.catalogShard ? 1 : 0, config: 3});
 st.s.setSecondaryOk();
 
 var configDB = st.config;

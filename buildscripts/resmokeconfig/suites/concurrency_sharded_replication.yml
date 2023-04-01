@@ -3,15 +3,12 @@ test_kind: fsm_workload_test
 selector:
   roots:
   - jstests/concurrency/fsm_workloads/**/*.js
+  - src/mongo/db/modules/*/jstests/concurrency/fsm_workloads/*.js
   exclude_files:
   # SERVER-13116 distinct isn't sharding aware
   - jstests/concurrency/fsm_workloads/distinct.js
   - jstests/concurrency/fsm_workloads/distinct_noindex.js
   - jstests/concurrency/fsm_workloads/distinct_projection.js
-
-  # SERVER-17397 Drops of sharded namespaces may not fully succeed
-  - jstests/concurrency/fsm_workloads/create_database.js
-  - jstests/concurrency/fsm_workloads/map_reduce_drop.js
 
   # Disabled due to SERVER-33753, '.count() without a predicate can be wrong on sharded
   # collections'. This bug is problematic for these workloads because they assert on count()
@@ -85,9 +82,6 @@ selector:
   # router tries to commit, it may not know the full participant list.
   - jstests/concurrency/fsm_workloads/multi_statement_transaction_all_commands_same_session.js
 
-  # SERVER-44160 Modify cleanupOrphaned to wait for overlapping ranges to finish
-  - jstests/concurrency/fsm_workloads/cleanupOrphanedWhileMigrating.js
-
   # Inserts directly into system.views using applyOps, which is not available on mongos.
   - jstests/concurrency/fsm_workloads/view_catalog_direct_system_writes.js
 
@@ -113,29 +107,34 @@ executor:
       # - RunDBCheckInBackground
       - CheckReplDBHashInBackground
       - CheckReplDBHash
+      - CheckMetadataConsistencyInBackground
       - ValidateCollections
     tests: true
   config:
     shell_options:
       global_vars:
         TestData:
-          runningWithAutoSplit: false
           runningWithBalancer: false
   hooks:
   # TODO (SERVER-63855): remove 'RunDBCheckInBackground' or put it back.
   # - class: RunDBCheckInBackground
   - class: CheckReplDBHashInBackground
   - class: CheckReplDBHash
+  - class: CheckMetadataConsistencyInBackground
   - class: CheckOrphansDeleted
+  - class: CheckRoutingTableConsistency
+  - class: CheckShardFilteringMetadata
   - class: ValidateCollections # Validation can interfere with other operations, so this goes last.
   - class: CleanupConcurrencyWorkloads
   fixture:
     class: ShardedClusterFixture
     enable_balancer: false
-    enable_autosplit: false
     mongos_options:
       set_parameters:
         enableTestCommands: 1
+        # TODO (SERVER-75503): Avoid setting query sampling server parameters in multiversion
+        # concurrency suites.
+        # queryAnalysisSamplerConfigurationRefreshSecs: 1
     shard_options:
       mongod_options:
         oplogSize: 1024
@@ -144,6 +143,9 @@ executor:
         enableTestCommands: 1
         roleGraphInvalidationIsFatal: 1
         receiveChunkWaitForRangeDeleterTimeoutMS: 90000
+        # TODO (SERVER-75503): Avoid setting query sampling server parameters in multiversion
+        # concurrency suites.
+        # queryAnalysisWriterIntervalSecs: 1
     num_rs_nodes_per_shard: 3
     num_shards: 2
     num_mongos: 2

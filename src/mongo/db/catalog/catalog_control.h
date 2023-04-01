@@ -36,6 +36,12 @@ namespace catalog {
 
 using MinVisibleTimestamp = Timestamp;
 using MinVisibleTimestampMap = std::map<UUID, MinVisibleTimestamp>;
+using RequiresTimestampExtendedRangeSupportMap = std::map<UUID, bool>;
+struct PreviousCatalogState {
+    MinVisibleTimestampMap minVisibleTimestampMap;
+    MinVisibleTimestampMap minValidTimestampMap;
+    RequiresTimestampExtendedRangeSupportMap requiresTimestampExtendedRangeSupportMap;
+};
 
 /**
  * Closes the catalog, destroying all associated in-memory data structures for all databases. After
@@ -43,7 +49,7 @@ using MinVisibleTimestampMap = std::map<UUID, MinVisibleTimestamp>;
  *
  * Must be called with the global lock acquired in exclusive mode.
  */
-MinVisibleTimestampMap closeCatalog(OperationContext* opCtx);
+PreviousCatalogState closeCatalog(OperationContext* opCtx);
 
 /**
  * Restores the catalog and all in-memory state after a call to closeCatalog().
@@ -51,7 +57,7 @@ MinVisibleTimestampMap closeCatalog(OperationContext* opCtx);
  * Must be called with the global lock acquired in exclusive mode.
  */
 void openCatalog(OperationContext* opCtx,
-                 const MinVisibleTimestampMap& catalogState,
+                 const PreviousCatalogState& catalogState,
                  Timestamp stableTimestamp);
 
 /**

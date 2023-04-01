@@ -27,12 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/global_user_write_block_state.h"
 #include "mongo/db/write_block_bypass.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 
@@ -49,29 +51,29 @@ GlobalUserWriteBlockState* GlobalUserWriteBlockState::get(OperationContext* opCt
 }
 
 void GlobalUserWriteBlockState::enableUserWriteBlocking(OperationContext* opCtx) {
-    _globalUserWritesBlocked = true;
+    _globalUserWritesBlocked.store(true);
 }
 
 void GlobalUserWriteBlockState::disableUserWriteBlocking(OperationContext* opCtx) {
-    _globalUserWritesBlocked = false;
+    _globalUserWritesBlocked.store(false);
 }
 
 void GlobalUserWriteBlockState::checkUserWritesAllowed(OperationContext* opCtx,
                                                        const NamespaceString& nss) const {
     invariant(opCtx->lockState()->isLocked());
-    uassert(ErrorCodes::OperationFailed,
+    uassert(ErrorCodes::UserWritesBlocked,
             "User writes blocked",
-            !_globalUserWritesBlocked || WriteBlockBypass::get(opCtx).isWriteBlockBypassEnabled() ||
-                nss.isOnInternalDb());
+            !_globalUserWritesBlocked.load() ||
+                WriteBlockBypass::get(opCtx).isWriteBlockBypassEnabled() || nss.isOnInternalDb() ||
+                nss.isTemporaryReshardingCollection() || nss.isSystemDotProfile());
 }
 
 bool GlobalUserWriteBlockState::isUserWriteBlockingEnabled(OperationContext* opCtx) const {
     invariant(opCtx->lockState()->isLocked());
-    return _globalUserWritesBlocked;
+    return _globalUserWritesBlocked.load();
 }
 
 void GlobalUserWriteBlockState::enableUserShardedDDLBlocking(OperationContext* opCtx) {
-    invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
     _userShardedDDLBlocked.store(true);
 }
 
@@ -81,11 +83,28 @@ void GlobalUserWriteBlockState::disableUserShardedDDLBlocking(OperationContext* 
 
 void GlobalUserWriteBlockState::checkShardedDDLAllowedToStart(OperationContext* opCtx,
                                                               const NamespaceString& nss) const {
-    invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
-    uassert(ErrorCodes::OperationFailed,
+    invariant(serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
+    uassert(ErrorCodes::UserWritesBlocked,
             "User writes blocked",
             !_userShardedDDLBlocked.load() ||
                 WriteBlockBypass::get(opCtx).isWriteBlockBypassEnabled() || nss.isOnInternalDb());
+}
+
+void GlobalUserWriteBlockState::enableUserIndexBuildBlocking(OperationContext* opCtx) {
+    _userIndexBuildsBlocked.store(true);
+}
+
+void GlobalUserWriteBlockState::disableUserIndexBuildBlocking(OperationContext* opCtx) {
+    _userIndexBuildsBlocked.store(false);
+}
+
+Status GlobalUserWriteBlockState::checkIfIndexBuildAllowedToStart(
+    OperationContext* opCtx, const NamespaceString& nss) const {
+    if (_userIndexBuildsBlocked.load() &&
+        !WriteBlockBypass::get(opCtx).isWriteBlockBypassEnabled() && !nss.isOnInternalDb()) {
+        return Status(ErrorCodes::UserWritesBlocked, "User writes blocked");
+    }
+    return Status::OK();
 }
 
 }  // namespace mongo

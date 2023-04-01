@@ -33,6 +33,7 @@
 
 #pragma once
 
+#include "mongo/db/catalog/catalog_test_fixture.h"
 #include "mongo/db/exec/sbe/stages/co_scan.h"
 #include "mongo/db/exec/sbe/stages/limit_skip.h"
 #include "mongo/db/exec/sbe/stages/project.h"
@@ -80,28 +81,34 @@ using MakeStageFn = std::function<std::pair<T, std::unique_ptr<PlanStage>>(
  * observe 1 output slot, use runTest(). For unittests where the PlanStage has multiple input slots
  * and/or where the test needs to observe multiple output slots, use runTestMulti().
  */
-class PlanStageTestFixture : public ServiceContextMongoDTest {
+class PlanStageTestFixture : public CatalogTestFixture {
 public:
-    PlanStageTestFixture() = default;
+    PlanStageTestFixture(bool enableYield = true) : _enableYield(enableYield){};
 
     void setUp() override {
-        ServiceContextMongoDTest::setUp();
-        _opCtx = cc().makeOperationContext();
+        CatalogTestFixture::setUp();
+        _yieldPolicy = _enableYield ? makeYieldPolicy() : nullptr;
         _slotIdGenerator.reset(new value::SlotIdGenerator());
+        _spoolIdGenerator.reset(new value::SpoolIdGenerator());
     }
 
     void tearDown() override {
-        _slotIdGenerator.reset();
-        _opCtx.reset();
-        ServiceContextMongoDTest::tearDown();
-    }
-
-    OperationContext* opCtx() {
-        return _opCtx.get();
+        _spoolIdGenerator.reset(nullptr);
+        _slotIdGenerator.reset(nullptr);
+        _yieldPolicy.reset(nullptr);
+        CatalogTestFixture::tearDown();
     }
 
     value::SlotId generateSlotId() {
         return _slotIdGenerator->generate();
+    }
+
+    SpoolId generateSpoolId() {
+        return _spoolIdGenerator->generate();
+    }
+
+    PlanYieldPolicySBE* getYieldPolicy() const {
+        return _yieldPolicy.get();
     }
 
     /**
@@ -114,10 +121,10 @@ public:
     /**
      * Compare two SBE values for equality.
      */
-    bool valueEquals(value::TypeTags lhsTag,
-                     value::Value lhsVal,
-                     value::TypeTags rhsTag,
-                     value::Value rhsVal) {
+    static bool valueEquals(value::TypeTags lhsTag,
+                            value::Value lhsVal,
+                            value::TypeTags rhsTag,
+                            value::Value rhsVal) {
         auto [cmpTag, cmpVal] = value::compareValue(lhsTag, lhsVal, rhsTag, rhsVal);
         return (cmpTag == value::TypeTags::NumberInt32 && value::bitcastTo<int32_t>(cmpVal) == 0);
     }
@@ -125,10 +132,10 @@ public:
     /**
      * Asserts the two values are equal. Will write a log message and abort() if they are not.
      */
-    void assertValuesEqual(value::TypeTags lhsTag,
-                           value::Value lhsVal,
-                           value::TypeTags rhsTag,
-                           value::Value rhsVal);
+    static void assertValuesEqual(value::TypeTags lhsTag,
+                                  value::Value lhsVal,
+                                  value::TypeTags rhsTag,
+                                  value::Value rhsVal);
 
     /**
      * This method takes an SBE array and returns an output slot and a unwind/project/limit/coscan
@@ -139,7 +146,8 @@ public:
      */
     std::pair<value::SlotId, std::unique_ptr<PlanStage>> generateVirtualScan(value::TypeTags arrTag,
                                                                              value::Value arrVal) {
-        return stage_builder::generateVirtualScan(_slotIdGenerator.get(), arrTag, arrVal);
+        return stage_builder::generateVirtualScan(
+            _slotIdGenerator.get(), arrTag, arrVal, _yieldPolicy.get());
     };
 
     /**
@@ -156,7 +164,7 @@ public:
     std::pair<value::SlotVector, std::unique_ptr<PlanStage>> generateVirtualScanMulti(
         int32_t numSlots, value::TypeTags arrTag, value::Value arrVal) {
         return stage_builder::generateVirtualScanMulti(
-            _slotIdGenerator.get(), numSlots, arrTag, arrVal);
+            _slotIdGenerator.get(), numSlots, arrTag, arrVal, _yieldPolicy.get());
     };
 
     /**
@@ -247,9 +255,31 @@ public:
                       value::Value expectedVal,
                       const MakeStageFn<value::SlotVector>& makeStageMulti);
 
+protected:
+    std::unique_ptr<PlanYieldPolicySBE> makeYieldPolicy() {
+        return std::make_unique<PlanYieldPolicySBE>(
+            PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
+            operationContext()->getServiceContext()->getFastClockSource(),
+            0,
+            Milliseconds::zero(),
+            &_yieldable,
+            nullptr);
+    }
+
 private:
-    ServiceContext::UniqueOperationContext _opCtx;
+    class MockYieldable : public Yieldable {
+        bool yieldable() const override {
+            return true;
+        }
+        void yield() const override {}
+        void restore() const override {}
+    };
+
+    MockYieldable _yieldable;
+    bool _enableYield;
+    std::unique_ptr<PlanYieldPolicySBE> _yieldPolicy;
     std::unique_ptr<value::SlotIdGenerator> _slotIdGenerator;
+    std::unique_ptr<value::SpoolIdGenerator> _spoolIdGenerator;
 };
 
 }  // namespace mongo::sbe

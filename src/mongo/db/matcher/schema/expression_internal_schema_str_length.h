@@ -41,7 +41,7 @@ public:
     using Validator = std::function<bool(int)>;
 
     InternalSchemaStrLengthMatchExpression(MatchType type,
-                                           StringData path,
+                                           boost::optional<StringData> path,
                                            long long strLen,
                                            StringData name,
                                            clonable_ptr<ErrorAnnotation> annotation = nullptr);
@@ -62,7 +62,7 @@ public:
 
     void debugString(StringBuilder& debug, int indentationLevel) const final;
 
-    BSONObj getSerializedRightHandSide() const final;
+    BSONObj getSerializedRightHandSide(SerializationOptions opts) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 
@@ -73,7 +73,9 @@ protected:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     StringData _name;

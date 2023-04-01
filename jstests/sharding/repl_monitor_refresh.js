@@ -3,15 +3,15 @@ load("jstests/replsets/rslib.js");
 /**
  * Test for making sure that the replica seed list in the config server does not
  * become invalid when a replica set reconfig happens.
- * @tags: [multiversion_incompatible]
+ * @tags: [multiversion_incompatible, temporary_catalog_shard_incompatible]
  */
 (function() {
 "use strict";
 
-// Skip db hash check and shard replication since the removed node has wrong config and is still
-// alive.
+// Skip the following checks since the removed node has wrong config and is still alive.
 TestData.skipCheckDBHashes = true;
 TestData.skipAwaitingReplicationOnShardsBeforeCheckingUUIDs = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
 var NODE_COUNT = 3;
 var st = new ShardingTest({shards: {rs0: {nodes: NODE_COUNT, oplogSize: 10}}});
@@ -86,5 +86,5 @@ assert.soon(
                 shardDoc.host.split(',').length + " in " + shardDoc.host);
     });
 
-st.stop();
+st.stop({parallelSupported: false});
 }());

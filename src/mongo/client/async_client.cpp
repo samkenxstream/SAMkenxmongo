@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -40,8 +39,11 @@
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/sasl_command_constants.h"
+#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
 #include "mongo/db/dbmessage.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/egress_tag_closer_manager.h"
@@ -56,8 +58,20 @@
 #include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/version.h"
 
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 namespace mongo {
 MONGO_FAIL_POINT_DEFINE(pauseBeforeMarkKeepOpen);
+MONGO_FAIL_POINT_DEFINE(alwaysLogConnAcquisitionToWireTime)
+
+namespace {
+bool connHealthMetricsEnabled() {
+    return gFeatureFlagConnHealthMetrics.isEnabledAndIgnoreFCV();
+}
+CounterMetric totalTimeForEgressConnectionAcquiredToWireMicros(
+    "network.totalTimeForEgressConnectionAcquiredToWireMicros", connHealthMetricsEnabled);
+}  // namespace
 
 Future<AsyncDBClient::Handle> AsyncDBClient::connect(
     const HostAndPort& peer,
@@ -65,10 +79,13 @@ Future<AsyncDBClient::Handle> AsyncDBClient::connect(
     ServiceContext* const context,
     transport::ReactorHandle reactor,
     Milliseconds timeout,
+    std::shared_ptr<ConnectionMetrics> connectionMetrics,
     std::shared_ptr<const transport::SSLConnectionContext> transientSSLContext) {
     auto tl = context->getTransportLayer();
-    return tl->asyncConnect(peer, sslMode, std::move(reactor), timeout, transientSSLContext)
-        .then([peer, context](transport::SessionHandle session) {
+    return tl
+        ->asyncConnect(
+            peer, sslMode, std::move(reactor), timeout, connectionMetrics, transientSSLContext)
+        .then([peer, context](std::shared_ptr<transport::Session> session) {
             return std::make_shared<AsyncDBClient>(peer, std::move(session), context);
         });
 }
@@ -161,9 +178,9 @@ Future<void> AsyncDBClient::authenticate(const BSONObj& params) {
     // We will only have a valid clientName if SSL is enabled.
     std::string clientName;
 #ifdef MONGO_CONFIG_SSL
-    auto sslConfiguration = _session->getSSLConfiguration();
-    if (sslConfiguration) {
-        clientName = sslConfiguration->clientSubjectName.toString();
+    auto& sslManager = _session->getSSLManager();
+    if (sslManager) {
+        clientName = sslManager->getSSLConfiguration().clientSubjectName.toString();
     }
 #endif
 
@@ -180,9 +197,9 @@ Future<void> AsyncDBClient::authenticateInternal(
     // We will only have a valid clientName if SSL is enabled.
     std::string clientName;
 #ifdef MONGO_CONFIG_SSL
-    auto sslConfiguration = _session->getSSLConfiguration();
-    if (sslConfiguration) {
-        clientName = sslConfiguration->clientSubjectName.toString();
+    auto& sslManager = _session->getSSLManager();
+    if (sslManager) {
+        clientName = sslManager->getSSLConfiguration().clientSubjectName.toString();
     }
 #endif
 
@@ -258,7 +275,7 @@ Future<void> AsyncDBClient::_call(Message request, int32_t msgId, const BatonHan
     request.header().setId(msgId);
     request.header().setResponseToMsgId(0);
 #ifdef MONGO_CONFIG_SSL
-    if (!SSLPeerInfo::forSession(_session).isTLS) {
+    if (!SSLPeerInfo::forSession(_session).isTLS()) {
         OpMsg::appendChecksum(&request);
     }
 #else
@@ -283,18 +300,42 @@ Future<Message> AsyncDBClient::_waitForResponse(boost::optional<int32_t> msgId,
         });
 }
 
-Future<rpc::UniqueReply> AsyncDBClient::runCommand(OpMsgRequest request,
-                                                   const BatonHandle& baton,
-                                                   bool fireAndForget) {
+Future<rpc::UniqueReply> AsyncDBClient::runCommand(
+    OpMsgRequest request,
+    const BatonHandle& baton,
+    bool fireAndForget,
+    boost::optional<std::shared_ptr<Timer>> fromConnAcquiredTimer) {
     auto requestMsg = request.serialize();
     if (fireAndForget) {
         OpMsg::setFlag(&requestMsg, OpMsg::kMoreToCome);
     }
     auto msgId = nextMessageId();
     auto future = _call(std::move(requestMsg), msgId, baton);
+    auto logMetrics = [this, fromConnAcquiredTimer] {
+        if (fromConnAcquiredTimer) {
+            const auto timeElapsedMicros =
+                durationCount<Microseconds>(fromConnAcquiredTimer.get()->elapsed());
+            totalTimeForEgressConnectionAcquiredToWireMicros.increment(timeElapsedMicros);
+
+            if ((!gEnableDetailedConnectionHealthMetricLogLines || timeElapsedMicros < 1000) &&
+                !MONGO_unlikely(alwaysLogConnAcquisitionToWireTime.shouldFail())) {
+                return;
+            }
+
+            // Log slow acquisition times at info level but rate limit it to prevent spamming
+            // users.
+            static auto& logSeverity = *new logv2::SeveritySuppressor{
+                Seconds{1}, logv2::LogSeverity::Info(), logv2::LogSeverity::Debug(2)};
+            LOGV2_DEBUG(6496702,
+                        logSeverity().toInt(),
+                        "Acquired connection for remote operation and completed writing to wire",
+                        "durationMicros"_attr = timeElapsedMicros);
+        }
+    };
 
     if (fireAndForget) {
-        return std::move(future).then([msgId, this]() -> Future<rpc::UniqueReply> {
+        return std::move(future).then([msgId, logMetrics, this]() -> Future<rpc::UniqueReply> {
+            logMetrics();
             // Return a mock status OK response since we do not expect a real response.
             OpMsgBuilder builder;
             builder.setBody(BSON("ok" << 1));
@@ -306,21 +347,25 @@ Future<rpc::UniqueReply> AsyncDBClient::runCommand(OpMsgRequest request,
     }
 
     return std::move(future)
-        .then([msgId, baton, this]() { return _waitForResponse(msgId, baton); })
+        .then([msgId, logMetrics, baton, this]() {
+            logMetrics();
+            return _waitForResponse(msgId, baton);
+        })
         .then([this](Message response) -> Future<rpc::UniqueReply> {
             return rpc::UniqueReply(response, rpc::makeReply(&response));
         });
 }
 
 Future<executor::RemoteCommandResponse> AsyncDBClient::runCommandRequest(
-    executor::RemoteCommandRequest request, const BatonHandle& baton) {
+    executor::RemoteCommandRequest request,
+    const BatonHandle& baton,
+    boost::optional<std::shared_ptr<Timer>> fromConnAcquiredTimer) {
     auto startTimer = Timer();
     auto opMsgRequest = OpMsgRequest::fromDBAndBody(
         std::move(request.dbname), std::move(request.cmdObj), std::move(request.metadata));
-    opMsgRequest.securityToken = request.securityToken;
-    auto fireAndForget =
-        request.fireAndForgetMode == executor::RemoteCommandRequest::FireAndForgetMode::kOn;
-    return runCommand(std::move(opMsgRequest), baton, fireAndForget)
+    opMsgRequest.validatedTenancyScope = request.validatedTenancyScope;
+    return runCommand(
+               std::move(opMsgRequest), baton, request.options.fireAndForget, fromConnAcquiredTimer)
         .then([this, startTimer = std::move(startTimer)](rpc::UniqueReply response) {
             return executor::RemoteCommandResponse(*response, startTimer.elapsed());
         });
@@ -358,7 +403,7 @@ Future<executor::RemoteCommandResponse> AsyncDBClient::beginExhaustCommandReques
     executor::RemoteCommandRequest request, const BatonHandle& baton) {
     auto opMsgRequest = OpMsgRequest::fromDBAndBody(
         std::move(request.dbname), std::move(request.cmdObj), std::move(request.metadata));
-    opMsgRequest.securityToken = request.securityToken;
+    opMsgRequest.validatedTenancyScope = request.validatedTenancyScope;
 
     return runExhaustCommand(std::move(opMsgRequest), baton);
 }

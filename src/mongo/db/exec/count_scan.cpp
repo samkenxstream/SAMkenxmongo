@@ -32,9 +32,10 @@
 #include <memory>
 
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -62,6 +63,11 @@ BSONObj replaceBSONFieldNames(const BSONObj& replace, const BSONObj& fieldNames)
 
     return bob.obj();
 }
+
+bool isCompoundWildcardIndex(const IndexDescriptor* indexDescriptor) {
+    return indexDescriptor->getIndexType() == IndexType::INDEX_WILDCARD &&
+        indexDescriptor->keyPattern().nFields() > 1;
+}
 }  // namespace
 
 using std::unique_ptr;
@@ -80,7 +86,7 @@ CountScan::CountScan(ExpressionContext* expCtx,
     : RequiresIndexStage(kStageType, expCtx, collection, params.indexDescriptor, workingSet),
       _workingSet(workingSet),
       _keyPattern(std::move(params.keyPattern)),
-      _shouldDedup(params.isMultiKey),
+      _shouldDedup(params.isMultiKey || isCompoundWildcardIndex(params.indexDescriptor)),
       _startKey(std::move(params.startKey)),
       _startKeyInclusive(params.startKeyInclusive),
       _endKey(std::move(params.endKey)),
@@ -109,32 +115,43 @@ PlanStage::StageState CountScan::doWork(WorkingSetID* out) {
 
     boost::optional<IndexKeyEntry> entry;
     const bool needInit = !_cursor;
-    try {
-        // We don't care about the keys.
-        const auto kWantLoc = SortedDataInterface::Cursor::kWantLoc;
 
-        if (needInit) {
-            // First call to work().  Perform cursor init.
-            _cursor = indexAccessMethod()->newCursor(opCtx());
-            _cursor->setEndPosition(_endKey, _endKeyInclusive);
+    const auto ret = handlePlanStageYield(
+        expCtx(),
+        "CountScan",
+        collection()->ns().ns(),
+        [&] {
+            // We don't care about the keys.
+            const auto kWantLoc = SortedDataInterface::Cursor::kWantLoc;
 
-            auto keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
-                _startKey,
-                indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
-                indexAccessMethod()->getSortedDataInterface()->getOrdering(),
-                true, /* forward */
-                _startKeyInclusive);
-            entry = _cursor->seek(keyStringForSeek);
-        } else {
-            entry = _cursor->next(kWantLoc);
-        }
-    } catch (const WriteConflictException&) {
-        if (needInit) {
-            // Release our cursor and try again next time.
-            _cursor.reset();
-        }
-        *out = WorkingSet::INVALID_ID;
-        return PlanStage::NEED_YIELD;
+            if (needInit) {
+                // First call to work().  Perform cursor init.
+                _cursor = indexAccessMethod()->newCursor(opCtx());
+                _cursor->setEndPosition(_endKey, _endKeyInclusive);
+
+                auto keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+                    _startKey,
+                    indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
+                    indexAccessMethod()->getSortedDataInterface()->getOrdering(),
+                    true, /* forward */
+                    _startKeyInclusive);
+                entry = _cursor->seek(keyStringForSeek);
+            } else {
+                entry = _cursor->next(kWantLoc);
+            }
+            return PlanStage::ADVANCED;
+        },
+        [&] {
+            // yieldHandler
+            if (needInit) {
+                // Release our cursor and try again next time.
+                _cursor.reset();
+            }
+            *out = WorkingSet::INVALID_ID;
+        });
+
+    if (ret != PlanStage::ADVANCED) {
+        return ret;
     }
 
     ++_specificStats.keysExamined;

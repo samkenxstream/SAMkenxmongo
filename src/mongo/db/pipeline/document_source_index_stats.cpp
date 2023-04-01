@@ -51,7 +51,10 @@ const char* DocumentSourceIndexStats::getSourceName() const {
 DocumentSource::GetNextResult DocumentSourceIndexStats::doGetNext() {
     if (_indexStats.empty()) {
         _indexStats = pExpCtx->mongoProcessInterface->getIndexStats(
-            pExpCtx->opCtx, pExpCtx->ns, _processName, pExpCtx->fromMongos);
+            pExpCtx->opCtx,
+            pExpCtx->ns,
+            _processName,
+            !serverGlobalParams.clusterRole.has(ClusterRole::None));
         _indexStatsIter = _indexStats.cbegin();
     }
 
@@ -75,8 +78,10 @@ intrusive_ptr<DocumentSource> DocumentSourceIndexStats::createFromBson(
     return new DocumentSourceIndexStats(pExpCtx);
 }
 
-Value DocumentSourceIndexStats::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceIndexStats::serialize(SerializationOptions opts) const {
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484342);
+    }
     return Value(DOC(getSourceName() << Document()));
 }
 }  // namespace mongo

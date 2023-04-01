@@ -31,16 +31,36 @@
 
 #include <map>
 
-#include "mongo/db/query/optimizer/index_bounds.h"
+#include "mongo/db/query/optimizer/partial_schema_requirements.h"
 
 
 namespace mongo::optimizer {
 
+/**
+ * Describes how documents are distributed among separate threads or machines.
+ */
 struct DistributionAndPaths {
     DistributionAndPaths(DistributionType type);
     DistributionAndPaths(DistributionType type, ABTVector paths);
 
+    /**
+     * Each distribution type assigns documents to partitions in a particular pattern.
+     *
+     * For example, RangePartitioning tries to keep similar values together,
+     * while HashPartitioning tries to separate similar values.
+     */
     DistributionType _type;
+
+    /**
+     * The paths identify the parts of a document that determine its partition.
+     *
+     * For example, in RangePartitioning or HashPartitioning, if two documents agree on
+     * these paths, then they always end up in the same partition.
+     *
+     * Some distribution types, such as Centralized or Replicated, don't need to
+     * look at any part of a document to decide its partition, so they don't
+     * need any paths.
+     */
     ABTVector _paths;
 };
 
@@ -55,6 +75,44 @@ struct IndexCollationEntry {
 };
 
 using IndexCollationSpec = std::vector<IndexCollationEntry>;
+
+/**
+ * Represents a set of paths that are known to be 'non-multikey'--which in this context
+ * is defined as 'do not apply their child path to an array'.
+ *
+ * For example, in this document: {a: [ {b: 3}, {b: 4} ]}
+ * - 'a' is multikey
+ * - 'a.b' is non-multikey
+ *
+ * We say 'a.b' is non-multikey, because even though 'Get [a] Traverse [1] Get [b] p'
+ * applies 'p' to two different values (3 and 4), neither one is an array.
+ * Therefore if 'p' starts with Traverse (of any maxDepth), we can remove it.
+ * If 'p' starts with more than one Traverse, we can apply the rule repeatedly.
+ *
+ * This also implies that 'Get [a] Get [b] p' is non-multikey.
+ * (Because: if Get [a] produces an array, then Get [b] applies 'p' to Nothing.
+ *  In other words: replacing Traverse Get with Get can only make a path be Nothing
+ *  in more cases.)
+ *
+ * However, this doesn't tell us anything about 'Get [a] Traverse [inf] Get [b] p',
+ * where the intermediate Traverse has maxDepth > 1. For example, consider this document:
+ *     {a: [ {b: 5}, [ {b: [6, 7]} ] ]}
+ * We'd still say 'a.b' is non-multikey, because 'Get [a] Traverse [1] Get [b] p' doesn't
+ * reach into the nested array, and doesn't find [6, 7].
+ * But 'Get [a] Traverse [inf] Get [b] p' does reach into the nested array, so it does
+ * apply 'p' to [6, 7], so we can't remove Traverse nodes from 'p'.
+ */
+struct MultikeynessTrie {
+    static MultikeynessTrie fromIndexPath(const ABT& path);
+
+    void merge(const MultikeynessTrie& other);
+    void add(const ABT& path);
+
+    opt::unordered_map<FieldNameType, MultikeynessTrie, FieldNameType::Hasher> children;
+    // An empty trie doesn't know whether anything is multikey.
+    // 'true' means "not sure" while 'false' means "definitely no arrays".
+    bool isMultiKey = true;
+};
 
 /**
  * Defines an available system index.
@@ -85,6 +143,7 @@ public:
     const DistributionAndPaths& getDistributionAndPaths() const;
 
     const PartialSchemaRequirements& getPartialReqMap() const;
+    PartialSchemaRequirements& getPartialReqMap();
 
 private:
     const IndexCollationSpec _collationSpec;
@@ -95,44 +154,48 @@ private:
 
     const DistributionAndPaths _distributionAndPaths;
 
-    // Requirements map for partial filter expression.
-    const PartialSchemaRequirements _partialReqMap;
+    // Requirements map for partial filter expression. May be trivially true.
+    PartialSchemaRequirements _partialReqMap;
 };
+
+using ScanDefOptions = opt::unordered_map<std::string, std::string>;
 
 // Used to specify parameters to scan node, such as collection name, or file where collection is
 // read from.
 class ScanDefinition {
 public:
-    using OptionsMapType = opt::unordered_map<std::string, std::string>;
-
     ScanDefinition();
-    ScanDefinition(OptionsMapType options,
-                   opt::unordered_map<std::string, IndexDefinition> indexDefs);
-    ScanDefinition(OptionsMapType options,
-                   opt::unordered_map<std::string, IndexDefinition> indexDefs,
-                   DistributionAndPaths distributionAndPaths,
-                   bool exists = true,
-                   CEType ce = -1.0);
 
-    const OptionsMapType& getOptionsMap() const;
+    ScanDefinition(ScanDefOptions options,
+                   opt::unordered_map<std::string, IndexDefinition> indexDefs,
+                   MultikeynessTrie multikeynessTrie,
+                   DistributionAndPaths distributionAndPaths,
+                   bool exists,
+                   CEType ce);
+
+    const ScanDefOptions& getOptionsMap() const;
 
     const DistributionAndPaths& getDistributionAndPaths() const;
 
     const opt::unordered_map<std::string, IndexDefinition>& getIndexDefs() const;
     opt::unordered_map<std::string, IndexDefinition>& getIndexDefs();
 
+    const MultikeynessTrie& getMultikeynessTrie() const;
+
     bool exists() const;
 
     CEType getCE() const;
 
 private:
-    OptionsMapType _options;
+    ScanDefOptions _options;
     DistributionAndPaths _distributionAndPaths;
 
     /**
      * Indexes associated with this collection.
      */
     opt::unordered_map<std::string, IndexDefinition> _indexDefs;
+
+    MultikeynessTrie _multikeynessTrie;
 
     /**
      * True if the collection exists.

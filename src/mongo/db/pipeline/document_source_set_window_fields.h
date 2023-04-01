@@ -33,6 +33,7 @@
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_set_window_fields_gen.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/memory_usage_tracker.h"
 #include "mongo/db/pipeline/window_function/partition_iterator.h"
@@ -70,8 +71,13 @@ struct WindowFunctionStatement {
         }
     }
 
-    void serialize(MutableDocument& outputFields,
-                   boost::optional<ExplainOptions::Verbosity> explain) const;
+    void addVariableRefs(std::set<Variables::Id>* refs) const {
+        if (expr) {
+            expr->addVariableRefs(refs);
+        }
+    }
+
+    void serialize(MutableDocument& outputFields, SerializationOptions opts) const;
 };
 
 /**
@@ -117,7 +123,7 @@ public:
           _iterator(expCtx.get(), pSource, &_memoryTracker, std::move(partitionBy), _sortBy){};
 
     GetModPathsReturn getModifiedPaths() const final {
-        std::set<std::string> outputPaths;
+        OrderedPathSet outputPaths;
         for (auto&& outputField : _outputFields) {
             outputPaths.insert(outputField.fieldName);
         }
@@ -147,7 +153,7 @@ public:
         }
 
         if (_partitionBy && (*_partitionBy)) {
-            (*_partitionBy)->addDependencies(deps);
+            expression::addDependencies((*_partitionBy).get(), deps);
         }
 
         for (auto&& outputField : _outputFields) {
@@ -155,6 +161,16 @@ public:
         }
 
         return DepsTracker::State::SEE_NEXT;
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {
+        if (_partitionBy && (*_partitionBy)) {
+            expression::addVariableRefs((*_partitionBy).get(), refs);
+        }
+
+        for (auto&& outputField : _outputFields) {
+            outputField.addVariableRefs(refs);
+        }
     }
 
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
@@ -167,7 +183,7 @@ public:
 
     boost::intrusive_ptr<DocumentSource> optimize() final;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     DocumentSource::GetNextResult doGetNext();
 

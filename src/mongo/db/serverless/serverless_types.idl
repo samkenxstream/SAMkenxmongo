@@ -29,7 +29,7 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 enums:
     MigrationProtocol:
@@ -38,3 +38,10 @@ enums:
         values:
             kMultitenantMigrations: "multitenant migrations"
             kShardMerge: "shard merge"
+
+    MigrationDecision:
+        description: "Whether the migration committed or aborted."
+        type: string
+        values:
+            kCommitted: "committed"
+            kAborted: "aborted"

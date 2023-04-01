@@ -112,21 +112,9 @@ class CppTypeBase(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def is_const_type(self):
-        # type: () -> bool
-        """Return True if the type should be returned by const."""
-        pass
-
-    @abstractmethod
     def return_by_reference(self):
         # type: () -> bool
         """Return True if the type should be returned by reference."""
-        pass
-
-    @abstractmethod
-    def disable_xvalue(self):
-        # type: () -> bool
-        """Return True if the type should have the xvalue getter disabled."""
         pass
 
     @abstractmethod
@@ -175,31 +163,9 @@ class _CppTypeBasic(CppTypeBase):
         # type: () -> str
         return self.get_type_name()
 
-    def is_const_type(self):
-        # type: () -> bool
-        # Enum types are never const since they are mapped to primitive types, and coverity warns.
-        if self._field.type.is_enum:
-            return False
-
-        type_name = self.get_type_name().replace(' ', '')
-
-        # If it is not a primitive type, then it is const.
-        if not is_primitive_type(type_name):
-            return True
-
-        # Arrays of bytes should also be const though.
-        if type_name == _STD_ARRAY_UINT8_16:
-            return True
-
-        return False
-
     def return_by_reference(self):
         # type: () -> bool
         return not is_primitive_type(self.get_type_name()) and not self._field.type.is_enum
-
-    def disable_xvalue(self):
-        # type: () -> bool
-        return False
 
     def is_view_type(self):
         # type: () -> bool
@@ -246,17 +212,9 @@ class _CppTypeView(CppTypeBase):
         # type: () -> str
         return self._view_type
 
-    def is_const_type(self):
-        # type: () -> bool
-        return True
-
     def return_by_reference(self):
         # type: () -> bool
         return False
-
-    def disable_xvalue(self):
-        # type: () -> bool
-        return True
 
     def is_view_type(self):
         # type: () -> bool
@@ -305,17 +263,9 @@ class _CppTypeVector(CppTypeBase):
         # type: () -> str
         return 'ConstDataRange'
 
-    def is_const_type(self):
-        # type: () -> bool
-        return True
-
     def return_by_reference(self):
         # type: () -> bool
         return False
-
-    def disable_xvalue(self):
-        # type: () -> bool
-        return True
 
     def is_view_type(self):
         # type: () -> bool
@@ -366,17 +316,9 @@ class _CppTypeDelegating(CppTypeBase):
         # type: () -> str
         return self._base.get_getter_setter_type()
 
-    def is_const_type(self):
-        # type: () -> bool
-        return True
-
     def return_by_reference(self):
         # type: () -> bool
         return self._base.return_by_reference()
-
-    def disable_xvalue(self):
-        # type: () -> bool
-        return self._base.disable_xvalue()
 
     def is_view_type(self):
         # type: () -> bool
@@ -414,10 +356,6 @@ class _CppTypeArray(_CppTypeDelegating):
         # type: () -> bool
         if self._base.is_view_type():
             return False
-        return True
-
-    def disable_xvalue(self):
-        # type: () -> bool
         return True
 
     def get_getter_body(self, member_name):
@@ -466,10 +404,6 @@ class _CppTypeOptional(_CppTypeDelegating):
     def get_getter_setter_type(self):
         # type: () -> str
         return _qualify_optional_type(self._base.get_getter_setter_type())
-
-    def disable_xvalue(self):
-        # type: () -> bool
-        return True
 
     def return_by_reference(self):
         # type: () -> bool
@@ -583,8 +517,8 @@ class BsonCppTypeBase(object, metaclass=ABCMeta):
         pass
 
 
-def _call_method_or_global_function(expression, method_name):
-    # type: (str, str) -> str
+def _call_method_or_global_function(expression, ast_type):
+    # type: (str, ast.Type) -> str
     """
     Given a fully-qualified method name, call it correctly.
 
@@ -592,13 +526,20 @@ def _call_method_or_global_function(expression, method_name):
     not treated as a global C++ function though. This notion of functions is designed to support
     enum deserializers/serializers which are not methods.
     """
+    method_name = ast_type.serializer
+    serialization_context = 'getSerializationContext()' if ast_type.deserialize_with_tenant else ''
+
     short_method_name = writer.get_method_name(method_name)
     if writer.is_function(method_name):
-        return common.template_args('${method_name}(${expression})', expression=expression,
-                                    method_name=method_name)
+        if ast_type.deserialize_with_tenant:
+            serialization_context = ', ' + serialization_context
+        return common.template_args('${method_name}(${expression}${serialization_context})',
+                                    expression=expression, method_name=method_name,
+                                    serialization_context=serialization_context)
 
-    return common.template_args('${expression}.${method_name}()', expression=expression,
-                                method_name=short_method_name)
+    return common.template_args('${expression}.${method_name}(${serialization_context})',
+                                expression=expression, method_name=short_method_name,
+                                serialization_context=serialization_context)
 
 
 class _CommonBsonCppTypeBase(BsonCppTypeBase):
@@ -621,7 +562,7 @@ class _CommonBsonCppTypeBase(BsonCppTypeBase):
 
     def gen_serializer_expression(self, indented_writer, expression):
         # type: (writer.IndentedTextWriter, str) -> str
-        return _call_method_or_global_function(expression, self._ast_type.serializer)
+        return _call_method_or_global_function(expression, self._ast_type)
 
 
 class _ObjectBsonCppTypeBase(BsonCppTypeBase):
@@ -646,9 +587,15 @@ class _ObjectBsonCppTypeBase(BsonCppTypeBase):
     def gen_serializer_expression(self, indented_writer, expression):
         # type: (writer.IndentedTextWriter, str) -> str
         method_name = writer.get_method_name(self._ast_type.serializer)
-        indented_writer.write_line(
-            common.template_args('const BSONObj localObject = ${expression}.${method_name}();',
-                                 expression=expression, method_name=method_name))
+        if self._ast_type.deserialize_with_tenant:  # SerializationContext is tied to tenant deserialization
+            indented_writer.write_line(
+                common.template_args(
+                    'const BSONObj localObject = ${expression}.${method_name}(getSerializationContext());',
+                    expression=expression, method_name=method_name))
+        else:
+            indented_writer.write_line(
+                common.template_args('const BSONObj localObject = ${expression}.${method_name}();',
+                                     expression=expression, method_name=method_name))
         return "localObject"
 
 
@@ -718,7 +665,6 @@ class _BinDataBsonCppTypeBase(BsonCppTypeBase):
 def get_bson_cpp_type(ast_type):
     # type: (ast.Type) -> Optional[BsonCppTypeBase]
     """Get a class that provides custom serialization for the given BSON type."""
-    # pylint: disable=too-many-return-statements
 
     # Does not support list of types
     if len(ast_type.bson_serialization_type) > 1:

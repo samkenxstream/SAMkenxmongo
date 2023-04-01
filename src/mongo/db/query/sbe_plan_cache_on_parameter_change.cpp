@@ -56,7 +56,7 @@ Status clearSbeCacheOnParameterChangeHelper() {
 }
 
 Status onPlanCacheSizeUpdate(const std::string& str) {
-    auto newSize = PlanCacheSizeParameter::parse(str);
+    auto newSize = memory_util::MemorySize::parse(str);
     if (!newSize.isOK()) {
         return newSize.getStatus();
     }
@@ -72,8 +72,8 @@ Status onPlanCacheSizeUpdate(const std::string& str) {
     return Status::OK();
 }
 
-Status validatePlanCacheSize(const std::string& str) {
-    return PlanCacheSizeParameter::parse(str).getStatus();
+Status validatePlanCacheSize(const std::string& str, const boost::optional<TenantId>&) {
+    return memory_util::MemorySize::parse(str).getStatus();
 }
 
 const Decorable<ServiceContext>::Decoration<std::unique_ptr<OnParamChangeUpdater>>

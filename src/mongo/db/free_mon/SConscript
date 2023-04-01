@@ -20,11 +20,10 @@ fmEnv.Library(
         'free_mon_storage.idl',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/dbhelpers',
         '$BUILD_DIR/mongo/db/ftdc/ftdc',
-        '$BUILD_DIR/mongo/idl/idl_parser',
+        '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/third_party/shim_snappy',
     ],
 )
@@ -41,15 +40,15 @@ if free_monitoring == "on":
             'free_mon_status.cpp',
         ],
         LIBDEPS=[
-            '$BUILD_DIR/mongo/db/commands/server_status',
-            '$BUILD_DIR/mongo/db/ftdc/ftdc_server',
-            '$BUILD_DIR/mongo/util/options_parser/options_parser',
             'free_mon',
         ],
         LIBDEPS_PRIVATE=[
             '$BUILD_DIR/mongo/client/clientdriver_network',
+            '$BUILD_DIR/mongo/db/commands/server_status_core',
+            '$BUILD_DIR/mongo/db/ftdc/ftdc_server',
             '$BUILD_DIR/mongo/util/concurrency/thread_pool',
             '$BUILD_DIR/mongo/util/net/http_client',
+            '$BUILD_DIR/mongo/util/options_parser/options_parser',
         ],
     )
 else:
@@ -67,7 +66,6 @@ else:
             'free_mon',
         ],
     )
-
 
 fmEnv.CppUnitTest(
     target='db_free_mon_test',

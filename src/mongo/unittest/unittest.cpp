@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -40,7 +39,6 @@
 #include <iostream>
 #include <map>
 #include <memory>
-#include <pcrecpp.h>
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/init.h"
@@ -56,10 +54,15 @@
 #include "mongo/logv2/plain_formatter.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/exit_code.h"
+#include "mongo/util/pcre.h"
 #include "mongo/util/signal_handlers_synchronous.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/timer.h"
 #include "mongo/util/version/releases.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo::unittest {
 namespace {
@@ -77,7 +80,7 @@ auto& suitesMap() {
 }  // namespace
 
 bool searchRegex(const std::string& pattern, const std::string& string) {
-    return pcrecpp::RE(pattern).PartialMatch(string);
+    return !!pcre::Regex(pattern).matchView(string);
 }
 
 class Result {
@@ -263,14 +266,19 @@ void CaptureLogs::startCapturingLogMessages() {
             logv2::AllLogsFilter(logv2::LogManager::global().getGlobalDomain()));
         _captureBSONSink->set_formatter(logv2::BSONFormatter());
     }
+    _captureSink->locked_backend()->setEnabled(true);
+    _captureBSONSink->locked_backend()->setEnabled(true);
     boost::log::core::get()->add_sink(_captureSink);
     boost::log::core::get()->add_sink(_captureBSONSink);
-
     _isCapturingLogMessages = true;
 }
 
 void CaptureLogs::stopCapturingLogMessages() {
     invariant(_isCapturingLogMessages);
+    // These sinks can still emit messages after they are detached
+    // from the log core. Disable them first to prevent that race.
+    _captureSink->locked_backend()->setEnabled(false);
+    _captureBSONSink->locked_backend()->setEnabled(false);
     boost::log::core::get()->remove_sink(_captureSink);
     boost::log::core::get()->remove_sink(_captureBSONSink);
 
@@ -336,6 +344,12 @@ bool isSubset(BSONObj haystack, BSONObj needle) {
             case Array:
                 // not supported
                 invariant(false);
+                // This annotation shouldn't really be needed because
+                // `invariantFailed` is annotated to be `noreturn`,
+                // but clang 12 doesn't seem to be able to capitalize
+                // on that fact to see that we are not actually
+                // falling through.
+                [[fallthrough]];
             default:
                 if (SimpleBSONElementComparator::kInstance.compare(foundElement, element) != 0) {
                     return false;
@@ -388,21 +402,21 @@ std::unique_ptr<Result> Suite::run(const std::string& filter,
     Timer timer;
     auto r = std::make_unique<Result>(_name);
 
-    boost::optional<pcrecpp::RE> filterRe;
-    boost::optional<pcrecpp::RE> fileNameFilterRe;
+    boost::optional<pcre::Regex> filterRe;
+    boost::optional<pcre::Regex> fileNameFilterRe;
     if (!filter.empty())
         filterRe.emplace(filter);
     if (!fileNameFilter.empty())
         fileNameFilterRe.emplace(fileNameFilter);
 
     for (const auto& tc : _tests) {
-        if (filterRe && !filterRe->PartialMatch(tc.name)) {
-            LOGV2_DEBUG(23057, 1, "skipped due to filter", "test"_attr = tc.name);
+        if (filterRe && !filterRe->matchView(tc.name)) {
+            LOGV2_DEBUG(23057, 3, "skipped due to filter", "test"_attr = tc.name);
             continue;
         }
 
-        if (fileNameFilterRe && !fileNameFilterRe->PartialMatch(tc.fileName)) {
-            LOGV2_DEBUG(23058, 1, "skipped due to fileNameFilter", "testFile"_attr = tc.fileName);
+        if (fileNameFilterRe && !fileNameFilterRe->matchView(tc.fileName)) {
+            LOGV2_DEBUG(23058, 3, "skipped due to fileNameFilter", "testFile"_attr = tc.fileName);
             continue;
         }
 
@@ -470,7 +484,7 @@ int Suite::run(const std::vector<std::string>& suites,
                int runsPerTest) {
     if (suitesMap().empty()) {
         LOGV2_ERROR(23061, "no suites registered.");
-        return EXIT_FAILURE;
+        return static_cast<int>(ExitCode::fail);
     }
 
     for (unsigned int i = 0; i < suites.size(); i++) {
@@ -478,7 +492,7 @@ int Suite::run(const std::vector<std::string>& suites,
             LOGV2_ERROR(23062,
                         "invalid test suite, use --list to see valid names",
                         "suite"_attr = suites[i]);
-            return EXIT_FAILURE;
+            return static_cast<int>(ExitCode::fail);
         }
     }
 
@@ -492,7 +506,7 @@ int Suite::run(const std::vector<std::string>& suites,
 
     std::vector<std::unique_ptr<Result>> results;
 
-    for (std::string name : torun) {
+    for (const std::string& name : torun) {
         std::shared_ptr<Suite>& s = suitesMap()[name];
         fassert(16145, s != nullptr);
 
@@ -516,8 +530,9 @@ int Suite::run(const std::vector<std::string>& suites,
         tests += r->_tests;
         if (!r->_fails.empty()) {
             failedSuites.push_back(r->toBSON());
-            for (const std::string& failedTest : r->_fails) {
-                totals._fails.push_back(r->_name + "/" + failedTest);
+            for (size_t i = 0; i < r->_fails.size(); i++) {
+                totals._fails.push_back(r->_name + "/" + r->_fails[i]);
+                totals._messages.push_back(r->_messages[i]);
             }
         }
         asserts += r->_asserts;
@@ -535,6 +550,15 @@ int Suite::run(const std::vector<std::string>& suites,
         }
     }
     LOGV2(23065, "Totals", "totals"_attr = totals.toBSON());
+
+    std::size_t failCount = totals._fails.size();
+    for (std::size_t i = 0; i < failCount; i++) {
+        LOGV2(8423378,
+              "Test Failed",
+              "testName"_attr = totals._fails[i],
+              "exception"_attr = totals._messages[i].type,
+              "error"_attr = totals._messages[i].error);
+    }
 
     // summary
     if (!totals._fails.empty()) {
@@ -662,6 +686,10 @@ SpawnInfo& getSpawnInfo() {
     return *v;
 }
 
+AutoUpdateConfig& getAutoUpdateConfig() {
+    static AutoUpdateConfig config{};
+    return config;
+}
 namespace {
 // At startup, teach the terminate handler how to print TestAssertionFailureException.
 [[maybe_unused]] const auto earlyCall = [] {

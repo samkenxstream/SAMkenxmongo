@@ -27,12 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/operation_context.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
@@ -50,11 +52,18 @@ ReplicationStateTransitionLockGuard::ReplicationStateTransitionLockGuard(Operati
     _enqueueLock();
 }
 
+ReplicationStateTransitionLockGuard::ReplicationStateTransitionLockGuard(
+    ReplicationStateTransitionLockGuard&& other)
+    : _opCtx(other._opCtx), _mode(other._mode), _result(other._result) {
+    other._result = LockResult::LOCK_INVALID;
+}
+
 ReplicationStateTransitionLockGuard::~ReplicationStateTransitionLockGuard() {
     _unlock();
 }
 
-void ReplicationStateTransitionLockGuard::waitForLockUntil(mongo::Date_t deadline) {
+void ReplicationStateTransitionLockGuard::waitForLockUntil(
+    mongo::Date_t deadline, const Locker::LockTimeoutCallback& onTimeout) {
     // We can return early if the lock request was already satisfied.
     if (_result == LOCK_OK) {
         return;
@@ -62,7 +71,7 @@ void ReplicationStateTransitionLockGuard::waitForLockUntil(mongo::Date_t deadlin
 
     _result = LOCK_INVALID;
     // Wait for the completion of the lock request for the RSTL.
-    _opCtx->lockState()->lockRSTLComplete(_opCtx, _mode, deadline);
+    _opCtx->lockState()->lockRSTLComplete(_opCtx, _mode, deadline, onTimeout);
     _result = LOCK_OK;
 }
 
@@ -81,6 +90,10 @@ void ReplicationStateTransitionLockGuard::_enqueueLock() {
 }
 
 void ReplicationStateTransitionLockGuard::_unlock() {
+    if (_result == LockResult::LOCK_INVALID) {
+        return;
+    }
+
     // If ReplicationStateTransitionLockGuard is called in a WriteUnitOfWork, we won't accept
     // any exceptions to be thrown between _enqueueLock and waitForLockUntil because that would
     // delay cleaning up any failed RSTL lock attempt state from lock manager.

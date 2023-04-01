@@ -65,7 +65,7 @@ const assertCommandsFailDuringReshardingOp = (database) => {
         jsTest.log(`Testing that ${tojson(command)} fails during resharding operation`);
         // The collMod is serialized with the resharding command, so we explicitly add an timeout to
         // the command so that it doesn't get blocked and timeout the test.
-        if (command.hasOwnProperty('collMod')) {
+        if (command.hasOwnProperty('collMod') || command.hasOwnProperty('dropIndexes')) {
             command = Object.assign({}, command);
             command.maxTimeMS = 5000;
         }
@@ -118,6 +118,7 @@ const waitUntilReshardingInitializedOnDonor = () => {
  * @param {Function} config.setup
  * @param {AfterReshardingCallback} afterReshardingFn
  */
+
 const withReshardingInBackground =
     (duringReshardingFn,
      {setup = () => {}, expectedErrorCode, afterReshardingFn = () => {}} = {}) => {
@@ -132,32 +133,49 @@ const withReshardingInBackground =
             },
             duringReshardingFn,
             {expectedErrorCode: expectedErrorCode, afterReshardingFn: afterReshardingFn});
-
         assertCommandsSucceedAfterReshardingOpFinishes(mongos.getDB(databaseName));
         assert.commandWorked(sourceCollection.dropIndex(indexCreatedByTest));
     };
 
 // Tests that the prohibited commands work if the resharding operation is aborted.
+let awaitAbort;
 withReshardingInBackground(() => {
     waitUntilReshardingInitializedOnDonor();
+    assert.neq(null,
+               mongos.getCollection("config.reshardingOperations").findOne({ns: sourceNamespace}));
+    awaitAbort = startParallelShell(funWithArgs(function(sourceNamespace) {
+                                        db.adminCommand({abortReshardCollection: sourceNamespace});
+                                    }, sourceNamespace), mongos.port);
+    // Wait for the coordinator to remove coordinator document from config.reshardingOperations
+    // as a result of the recipients and donors transitioning to done due to abort.
+    assert.soon(() => {
+        const coordinatorDoc =
+            mongos.getCollection("config.reshardingOperations").findOne({ns: sourceNamespace});
 
-    assert.commandWorked(mongos.adminCommand({abortReshardCollection: sourceNamespace}));
+        return coordinatorDoc === null || coordinatorDoc.state === "aborting";
+    });
 }, {
     expectedErrorCode: ErrorCodes.ReshardCollectionAborted,
 });
+awaitAbort();
 
 // Tests that the prohibited commands succeed if the resharding operation succeeds. During the
-// operation it makes sures that the prohibited commands are rejected during the resharding
+// operation it makes sure that the prohibited commands are rejected during the resharding
 // operation.
 withReshardingInBackground(() => {
     waitUntilReshardingInitializedOnDonor();
 
     jsTest.log(
         "About to test that the admin commands do not work while the resharding operation is in progress.");
+
     assert.commandFailedWithCode(
         mongos.adminCommand(
             {moveChunk: sourceNamespace, find: {oldKey: -10}, to: donorShardNames[1]}),
-        ErrorCodes.LockBusy);
+
+        [
+            ErrorCodes.LockBusy,  // TODO SERVER-68551: remove LockBusy from expected error set
+            ErrorCodes.ConflictingOperationInProgress
+        ]);
     assert.commandFailedWithCode(
         mongos.adminCommand({reshardCollection: otherNamespace, key: {newKey: 1}}),
         ErrorCodes.ReshardCollectionInProgress);

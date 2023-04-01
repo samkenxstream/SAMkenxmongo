@@ -23,12 +23,9 @@ except ImportError:
     print("*** Run 'pip3 install --user regex' to speed up error code checking")
     import re  # type: ignore
 
-ASSERT_NAMES = ["uassert", "massert", "fassert", "fassertFailed"]
 MAXIMUM_CODE = 9999999  # JIRA Ticket + XX
 
-# pylint: disable=invalid-name
 codes = []  # type: ignore
-# pylint: enable=invalid-name
 
 # Each AssertLocation identifies the C++ source location of an assertion
 AssertLocation = namedtuple("AssertLocation", ['sourceFile', 'byteOffset', 'lines', 'code'])
@@ -46,6 +43,7 @@ _CODE_PATTERNS = [
         r"(?:StatusOK)?"
         r"(?:WithContext)?"
         r"\s*\(",
+        r"MONGO_UNREACHABLE_TASSERT\(",
         # DBException and AssertionException constructors
         r"(?:DB|Assertion)Exception\s*[({]",
         # Calls to all LOGV2* variants
@@ -59,7 +57,7 @@ _CODE_PATTERNS = [
 ]
 
 _DIR_EXCLUDE_RE = re.compile(r'(\..*'
-                             r'|pcre-.*'
+                             r'|pcre2.*'
                              r'|32bit.*'
                              r'|mongodb-.*'
                              r'|debian.*'
@@ -238,15 +236,16 @@ def read_error_codes(src_root='src/mongo'):
     return (codes, errors, seen)
 
 
-def replace_bad_codes(errors, next_code_generator):  # pylint: disable=too-many-locals
-    """Modify C++ source files to replace invalid assertion codes.
+def replace_bad_codes(errors, next_code_generator):
+    """
+    Modify C++ source files to replace invalid assertion codes.
 
     For now, we only modify zero codes.
 
-    Args:
-        errors: list of AssertLocation
-        next_code_generator: generator -> int, next non-conflicting assertion code
+    :param errors: list of AssertLocation
+    :param next_code_generator: generator -> int, next non-conflicting assertion code
     """
+
     zero_errors = [e for e in errors if int(e.code) == 0]
     skip_errors = [e for e in errors if int(e.code) != 0]
 
@@ -296,7 +295,7 @@ def coerce_to_number(ticket_value):
 
 
 def main():
-    """Main."""
+    """Validate error codes."""
     parser = OptionParser(description=__doc__.strip())
     parser.add_option("--fix", dest="replace", action="store_true", default=False,
                       help="Fix zero codes in source files [default: %default]")
@@ -305,7 +304,7 @@ def main():
     parser.add_option("--list-files", dest="list_files", action="store_true", default=False,
                       help="Print the name of each file as it is scanned [default: %default]")
     parser.add_option(
-        "--ticket", dest="ticket", type="str", action="store", default=0,
+        "--ticket", dest="ticket", type="str", action="store", default=None,
         help="Generate error codes for a given SERVER ticket number. Inputs can be of"
         " the form: `--ticket=12345` or `--ticket=SERVER-12345`.")
     options, extra = parser.parse_args()
@@ -321,11 +320,13 @@ def main():
     if ok and options.quiet:
         return
 
-    next_code_gen = get_next_code(seen, coerce_to_number(options.ticket))
-
     print("ok: %s" % ok)
-    if not options.replace:
+
+    if options.ticket:
+        next_code_gen = get_next_code(seen, coerce_to_number(options.ticket))
         print("next: %s" % next(next_code_gen))
+    else:
+        next_code_gen = get_next_code(seen, 0)
 
     if ok:
         sys.exit(0)

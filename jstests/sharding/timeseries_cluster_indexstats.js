@@ -2,7 +2,7 @@
  * Tests that the $indexstats aggregation pipeline returns timeseries index statistics.
  *
  * @tags: [
- *   requires_fcv_51
+ *   requires_fcv_51,
  * ]
  */
 
@@ -59,21 +59,26 @@ function checkIndexStats(coll, keys, sharded) {
               keys.length,
               `There should be ${keys.length} indices on the collection.\n${tojson(indices)}`);
     indices.forEach((index, i) => {
-        assert.eq(index.hasOwnProperty('shard'),
-                  sharded,
-                  sharded
-                      ? `Index stats 'shard' field should exist on a sharded collection.\n${
-                            tojson(index)}`
-                      : `Index stats 'shard' field should not exist on a non-sharded collection.\n${
-                            tojson(index)}`);
+        assert(index.hasOwnProperty('shard'), tojson(index));
         assert.docEq(
-            index.key, keys[i], `Index should have key spec ${tojson(keys[i])}.\n${tojson(index)}`);
+            keys[i], index.key, `Index should have key spec ${tojson(keys[i])}.\n${tojson(index)}`);
     });
 }
 
 // Check indexStats before sharding.
-checkIndexStats(mongosColl, [{[metaField]: 1}], false);
-checkIndexStats(mongosBucketColl, [{"meta": 1}, {"control.time.min": 1}], false);
+if (TimeseriesTest.timeseriesScalabilityImprovementsEnabled(st.shard0)) {
+    checkIndexStats(mongosColl, [{[metaField]: 1, [timeField]: 1}, {[metaField]: 1}], false);
+    checkIndexStats(mongosBucketColl,
+                    [
+                        {"meta": 1, "control.min.tm": 1, "control.max.tm": 1},
+                        {"meta": 1},
+                        {"control.time.min": 1}
+                    ],
+                    false);
+} else {
+    checkIndexStats(mongosColl, [{[metaField]: 1}], false);
+    checkIndexStats(mongosBucketColl, [{"meta": 1}, {"control.time.min": 1}], false);
+}
 
 // Shard the timeseries collection.
 assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
@@ -103,9 +108,21 @@ assert.eq(1, counts[otherShard.shardName], counts);
 assert.commandWorked(mongosBucketColl.createIndex({'control.time.max': 1}));
 
 // Check indexStats after sharding.
-checkIndexStats(mongosColl, [{[metaField]: 1}], true);
-checkIndexStats(
-    mongosBucketColl, [{"meta": 1}, {"control.time.min": 1}, {"control.time.max": 1}], true);
+if (TimeseriesTest.timeseriesScalabilityImprovementsEnabled(st.shard0)) {
+    checkIndexStats(mongosColl, [{[metaField]: 1, [timeField]: 1}, {[metaField]: 1}], true);
+    checkIndexStats(mongosBucketColl,
+                    [
+                        {"meta": 1, "control.min.tm": 1, "control.max.tm": 1},
+                        {"meta": 1},
+                        {"control.time.min": 1},
+                        {"control.time.max": 1}
+                    ],
+                    true);
+} else {
+    checkIndexStats(mongosColl, [{[metaField]: 1}], true);
+    checkIndexStats(
+        mongosBucketColl, [{"meta": 1}, {"control.time.min": 1}, {"control.time.max": 1}], true);
+}
 
 st.stop();
 })();

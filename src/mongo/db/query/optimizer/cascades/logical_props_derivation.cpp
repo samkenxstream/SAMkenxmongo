@@ -62,6 +62,13 @@ static void populateInitialDistributions(const DistributionAndPaths& distributio
     }
 }
 
+/**
+ * If the projections in 'req' cover every path of 'distributionAndPaths',
+ * then add a new 'DistributionAndProjections' entry to 'distributions'.
+ *
+ * This is used to populate metadata in a SargableNode, so we know what distributions
+ * it can provide, and what projection names matter for each one.
+ */
 static void populateDistributionPaths(const PartialSchemaRequirements& req,
                                       const ProjectionName& scanProjectionName,
                                       const DistributionAndPaths& distributionAndPaths,
@@ -72,12 +79,10 @@ static void populateDistributionPaths(const PartialSchemaRequirements& req,
             ProjectionNameVector distributionProjections;
 
             for (const ABT& path : distributionAndPaths._paths) {
-                auto it = req.find(PartialSchemaKey{scanProjectionName, path});
-                if (it == req.cend()) {
+                if (auto binding = req.findProjection({scanProjectionName, path})) {
+                    distributionProjections.push_back(*binding);
+                } else {
                     break;
-                }
-                if (it->second.hasBoundProjectionName()) {
-                    distributionProjections.push_back(it->second.getBoundProjectionName());
                 }
             }
 
@@ -85,6 +90,7 @@ static void populateDistributionPaths(const PartialSchemaRequirements& req,
                 distributions.emplace(distributionAndPaths._type,
                                       std::move(distributionProjections));
             }
+            break;
         }
 
         default:
@@ -92,39 +98,48 @@ static void populateDistributionPaths(const PartialSchemaRequirements& req,
     }
 }
 
-static bool computePossiblyEqPredsOnly(const PartialSchemaRequirements& reqMap) {
-    PartialSchemaRequirements equalitiesReqMap;
-    PartialSchemaRequirements fullyOpenReqMap;
+/**
+ * Check that every predicate in 'reqMap' is either an equality predicate, or fully open.
+ */
+static bool computeEqPredsOnly(const PartialSchemaRequirements& reqMap) {
+    bool eqPredsOnly = true;
+    PSRExpr::visitDisjuncts(reqMap.getRoot(), [&](const PSRExpr::Node& child, const size_t) {
+        PartialSchemaKeySet equalityKeys;
+        PartialSchemaKeySet fullyOpenKeys;
 
-    for (const auto& [key, req] : reqMap) {
-        const auto& intervals = req.getIntervals();
-        if (auto singularInterval = IntervalReqExpr::getSingularDNF(intervals)) {
-            if (singularInterval->isFullyOpen()) {
-                fullyOpenReqMap.emplace(key, req);
-            } else if (singularInterval->isEquality()) {
-                equalitiesReqMap.emplace(key, req);
-            } else {
-                // Encountered a non-equality and not-fully-open interval.
-                return false;
+        PSRExpr::visitConjuncts(child, [&](const PSRExpr::Node& atom, const size_t) {
+            PSRExpr::visitAtom(atom, [&](const PartialSchemaEntry& e) {
+                if (!eqPredsOnly) {
+                    return;
+                }
+
+                const auto& [key, req] = e;
+                const auto& intervals = req.getIntervals();
+                if (auto singularInterval = IntervalReqExpr::getSingularDNF(intervals)) {
+                    if (singularInterval->isFullyOpen()) {
+                        fullyOpenKeys.insert(key);
+                    } else if (singularInterval->isEquality()) {
+                        equalityKeys.insert(key);
+                    } else {
+                        // Encountered a non-equality and not-fully-open interval.
+                        eqPredsOnly = false;
+                    }
+                } else {
+                    // Encountered a non-trivial interval.
+                    eqPredsOnly = false;
+                }
+            });
+        });
+
+        for (const auto& key : fullyOpenKeys) {
+            if (equalityKeys.count(key) == 0) {
+                // No possible match for fully open requirement.
+                eqPredsOnly = false;
             }
-        } else {
-            // Encountered a non-trivial interval.
-            return false;
         }
-    }
+    });
 
-    PartialSchemaKeySet resultKeySet;
-    PartialSchemaRequirement req_unused;
-    for (const auto& [key, req] : fullyOpenReqMap) {
-        findMatchingSchemaRequirement(
-            key, equalitiesReqMap, resultKeySet, req_unused, false /*setIntervalsAndBoundProj*/);
-        if (resultKeySet.empty()) {
-            // No possible match for fully open requirement.
-            return false;
-        }
-    }
-
-    return true;
+    return eqPredsOnly;
 }
 
 class DeriveLogicalProperties {
@@ -141,30 +156,35 @@ public:
                                          distributions);
         }
 
-        return maybeUpdateNodePropsMap(
-            node,
-            makeLogicalProps(IndexingAvailability(_groupId,
-                                                  node.getProjectionName(),
-                                                  node.getScanDefName(),
-                                                  true /*possiblyEqPredsOnly*/,
-                                                  {} /*satisfiedPartialIndexes*/),
-                             CollectionAvailability({node.getScanDefName()}),
-                             DistributionAvailability(std::move(distributions))));
+        return maybeUpdateNodePropsMap(node,
+                                       createInitialScanProps(node.getProjectionName(),
+                                                              node.getScanDefName(),
+                                                              _groupId,
+                                                              std::move(distributions)));
     }
 
     LogicalProps transport(const ValueScanNode& node, LogicalProps /*bindResult*/) {
-        // We do not originate indexing availability, and have empty collection availability with
-        // Centralized + Replicated distribution availability. During physical optimization we
-        // accept optimization under any distribution.
-        LogicalProps result =
-            makeLogicalProps(CollectionAvailability{{}}, DistributionAvailability{{}});
+        LogicalProps result;
+        if (const auto& props = node.getProps(); props) {
+            result = *props;
+            if (hasProperty<IndexingAvailability>(result)) {
+                // Update the group to our current one.
+                getProperty<IndexingAvailability>(result).setScanGroupId(_groupId);
+            }
+        } else {
+            // We do not originate indexing availability, and have empty collection availability
+            // with Centralized + Replicated distribution availability. During physical optimization
+            // we accept optimization under any distribution.
+            result = makeLogicalProps(CollectionAvailability{{}}, DistributionAvailability{{}});
+        }
+
         addCentralizedAndRoundRobinDistributions(result);
         return maybeUpdateNodePropsMap(node, std::move(result));
     }
 
     LogicalProps transport(const MemoLogicalDelegatorNode& node) {
         uassert(6624109, "Uninitialized memo", _memo != nullptr);
-        return maybeUpdateNodePropsMap(node, _memo->getGroup(node.getGroupId())._logicalProperties);
+        return maybeUpdateNodePropsMap(node, _memo->getLogicalProps(node.getGroupId()));
     }
 
     LogicalProps transport(const FilterNode& node,
@@ -173,7 +193,7 @@ public:
         // Propagate indexing, collection, and distribution availabilities.
         LogicalProps result = std::move(childResult);
         if (hasProperty<IndexingAvailability>(result)) {
-            getProperty<IndexingAvailability>(result).setPossiblyEqPredsOnly(false);
+            getProperty<IndexingAvailability>(result).setEqPredsOnly(false);
         }
         addCentralizedAndRoundRobinDistributions(result);
         return maybeUpdateNodePropsMap(node, std::move(result));
@@ -187,7 +207,7 @@ public:
         // when the memo group is created.
         LogicalProps result = std::move(childResult);
         if (hasProperty<IndexingAvailability>(result)) {
-            getProperty<IndexingAvailability>(result).setPossiblyEqPredsOnly(false);
+            getProperty<IndexingAvailability>(result).setEqPredsOnly(false);
         }
         addCentralizedAndRoundRobinDistributions(result);
         return maybeUpdateNodePropsMap(node, std::move(result));
@@ -216,25 +236,20 @@ public:
                                       distributions);
         }
 
-        if (indexingAvailability.getPossiblyEqPredsOnly()) {
-            indexingAvailability.setPossiblyEqPredsOnly(
-                computePossiblyEqPredsOnly(node.getReqMap()));
+        if (indexingAvailability.getEqPredsOnly()) {
+            indexingAvailability.setEqPredsOnly(computeEqPredsOnly(node.getReqMap()));
         }
 
-        auto& satisfiedPartialIndexes =
-            getProperty<IndexingAvailability>(result).getSatisfiedPartialIndexes();
+        auto& satisfiedPartialIndexes = indexingAvailability.getSatisfiedPartialIndexes();
         for (const auto& [indexDefName, indexDef] : scanDef.getIndexDefs()) {
-            if (!indexDef.getPartialReqMap().empty()) {
-                auto intersection = node.getReqMap();
-                // We specifically ignore projectionRenames here.
-                ProjectionRenames projectionRenames_unused;
-                if (intersectPartialSchemaReq(
-                        intersection, indexDef.getPartialReqMap(), projectionRenames_unused) &&
-                    intersection == node.getReqMap()) {
+            if (!indexDef.getPartialReqMap().isNoop()) {
+                if (isSubsetOfPartialSchemaReq(node.getReqMap(), indexDef.getPartialReqMap())) {
                     satisfiedPartialIndexes.insert(indexDefName);
                 }
             }
         }
+
+        indexingAvailability.setHasProperInterval(hasProperIntervals(node.getReqMap()));
 
         return maybeUpdateNodePropsMap(node, std::move(result));
     }
@@ -247,13 +262,37 @@ public:
         uasserted(6624042, "Should not be necessary to derive properties for RIDIntersectNode");
     }
 
-    LogicalProps transport(const BinaryJoinNode& node,
+    LogicalProps transport(const RIDUnionNode& node,
                            LogicalProps /*leftChildResult*/,
-                           LogicalProps /*rightChildResult*/,
+                           LogicalProps /*rightChildResult*/) {
+        // Properties for the group should already be derived via the underlying Filter or
+        // Evaluation logical nodes.
+        uasserted(7016302, "Should not be necessary to derive properties for RIDUnionNode");
+    }
+
+    LogicalProps transport(const BinaryJoinNode& node,
+                           LogicalProps leftChildResult,
+                           LogicalProps rightChildResult,
                            LogicalProps /*exprResult*/) {
-        // TODO: remove indexing availability property when implemented.
-        // TODO: combine scan defs from all children for CollectionAvailability.
-        uasserted(6624043, "Logical property derivation not implemented.");
+        // We are specifically not adding the node's projection to ProjectionAvailability here.
+        // The logical properties already contains projection availability which is derived first
+        // when the memo group is created.
+
+        LogicalProps result = std::move(leftChildResult);
+        auto& mergedScanDefs = getProperty<CollectionAvailability>(result).getScanDefSet();
+        auto& mergedDistributionSet =
+            getProperty<DistributionAvailability>(result).getDistributionSet();
+
+        auto rightChildScanDefs =
+            getProperty<CollectionAvailability>(rightChildResult).getScanDefSet();
+        mergedScanDefs.merge(std::move(rightChildScanDefs));
+
+        auto rightChildDistributionSet =
+            getProperty<DistributionAvailability>(rightChildResult).getDistributionSet();
+        mergedDistributionSet.merge(std::move(rightChildDistributionSet));
+
+        removeProperty<IndexingAvailability>(result);
+        return maybeUpdateNodePropsMap(node, std::move(result));
     }
 
     LogicalProps transport(const UnionNode& node,

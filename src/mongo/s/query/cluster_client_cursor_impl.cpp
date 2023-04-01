@@ -27,26 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/s/query/cluster_client_cursor_impl.h"
 
 #include <memory>
 
 #include "mongo/db/curop.h"
+#include "mongo/db/query/telemetry.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/query/router_stage_limit.h"
 #include "mongo/s/query/router_stage_merge.h"
 #include "mongo/s/query/router_stage_remove_metadata_fields.h"
 #include "mongo/s/query/router_stage_skip.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 namespace mongo {
 
-static Counter64 mongosCursorStatsTotalOpened;
-static Counter64 mongosCursorStatsMoreThanOneBatch;
-static ServerStatusMetricField<Counter64> displayMongosCursorStatsTotalOpened(
-    "mongos.cursor.totalOpened", &mongosCursorStatsTotalOpened);
-static ServerStatusMetricField<Counter64> displayMongosCursorStatsMoreThanOneBatch(
-    "mongos.cursor.moreThanOneBatch", &mongosCursorStatsMoreThanOneBatch);
+static CounterMetric mongosCursorStatsTotalOpened("mongos.cursor.totalOpened");
+static CounterMetric mongosCursorStatsMoreThanOneBatch("mongos.cursor.moreThanOneBatch");
 
 ClusterClientCursorGuard ClusterClientCursorImpl::make(
     OperationContext* opCtx,
@@ -75,7 +73,8 @@ ClusterClientCursorImpl::ClusterClientCursorImpl(OperationContext* opCtx,
       _opCtx(opCtx),
       _createdDate(opCtx->getServiceContext()->getPreciseClockSource()->now()),
       _lastUseDate(_createdDate),
-      _queryHash(CurOp::get(opCtx)->debug().queryHash) {
+      _queryHash(CurOp::get(opCtx)->debug().queryHash),
+      _telemetryStoreKey(CurOp::get(opCtx)->debug().telemetryStoreKey) {
     dassert(!_params.compareWholeSortKeyOnRouter ||
             SimpleBSONObjComparator::kInstance.evaluate(
                 _params.sortToApplyOnRouter == AsyncResultsMerger::kWholeSortKeySortPattern));
@@ -100,15 +99,15 @@ ClusterClientCursorImpl::ClusterClientCursorImpl(OperationContext* opCtx,
 }
 
 ClusterClientCursorImpl::~ClusterClientCursorImpl() {
-    if (_nBatchesReturned > 1)
+    if (_metrics.nBatches && *_metrics.nBatches > 1)
         mongosCursorStatsMoreThanOneBatch.increment();
 }
 
 StatusWith<ClusterQueryResult> ClusterClientCursorImpl::next() {
-
     invariant(_opCtx);
     const auto interruptStatus = _opCtx->checkForInterruptNoAssert();
     if (!interruptStatus.isOK()) {
+        _maxTimeMSExpired |= (interruptStatus.code() == ErrorCodes::MaxTimeMSExpired);
         return interruptStatus;
     }
 
@@ -124,11 +123,30 @@ StatusWith<ClusterQueryResult> ClusterClientCursorImpl::next() {
     if (next.isOK() && !next.getValue().isEOF()) {
         ++_numReturnedSoFar;
     }
+    // Record if we just got a MaxTimeMSExpired error.
+    _maxTimeMSExpired |= (next.getStatus().code() == ErrorCodes::MaxTimeMSExpired);
     return next;
 }
 
 void ClusterClientCursorImpl::kill(OperationContext* opCtx) {
+    if (_hasBeenKilled) {
+        LOGV2_DEBUG(7372700,
+                    3,
+                    "Kill called on cluster client cursor after cursor has already been killed, so "
+                    "ignoring");
+        return;
+    }
+
+    if (_telemetryStoreKey && opCtx) {
+        telemetry::writeTelemetry(opCtx,
+                                  _telemetryStoreKey,
+                                  getOriginatingCommand(),
+                                  _metrics.executionTime.value_or(Microseconds{0}).count(),
+                                  _metrics.nreturned.value_or(0));
+    }
+
     _root->kill(opCtx);
+    _hasBeenKilled = true;
 }
 
 void ClusterClientCursorImpl::reattachToOperationContext(OperationContext* opCtx) {
@@ -162,7 +180,8 @@ const PrivilegeVector& ClusterClientCursorImpl::getOriginatingPrivileges() const
 }
 
 bool ClusterClientCursorImpl::partialResultsReturned() const {
-    return _root->partialResultsReturned();
+    // We may have timed out in this layer, or within the plan tree waiting for results from shards.
+    return (_maxTimeMSExpired && _params.isAllowPartialResults) || _root->partialResultsReturned();
 }
 
 std::size_t ClusterClientCursorImpl::getNumRemotes() const {
@@ -215,14 +234,6 @@ void ClusterClientCursorImpl::setLastUseDate(Date_t now) {
 
 boost::optional<uint32_t> ClusterClientCursorImpl::getQueryHash() const {
     return _queryHash;
-}
-
-std::uint64_t ClusterClientCursorImpl::getNBatches() const {
-    return _nBatchesReturned;
-}
-
-void ClusterClientCursorImpl::incNBatches() {
-    ++_nBatchesReturned;
 }
 
 APIParameters ClusterClientCursorImpl::getAPIParameters() const {

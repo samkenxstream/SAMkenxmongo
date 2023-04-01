@@ -27,27 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/resharding/resharding_data_copy_util.h"
 
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/resharding/resharding_oplog_applier_progress_gen.h"
 #include "mongo/db/s/resharding/resharding_txn_cloner_progress_gen.h"
 #include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/db/s/session_catalog_migration.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/session_txn_record_gen.h"
+#include "mongo/db/s/sharding_index_catalog_ddl_util.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/session/session_txn_record_gen.h"
 #include "mongo/db/storage/write_unit_of_work.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/logv2/redaction.h"
 #include "mongo/util/scopeguard.h"
 
@@ -119,11 +120,11 @@ void ensureOplogCollectionsDropped(OperationContext* opCtx,
 
         // Drop the conflict stash collection for this donor.
         auto stashNss = getLocalConflictStashNamespace(sourceUUID, donor.getShardId());
-        ensureCollectionDropped(opCtx, stashNss);
+        resharding::data_copy::ensureCollectionDropped(opCtx, stashNss);
 
         // Drop the oplog buffer collection for this donor.
         auto oplogBufferNss = getLocalOplogBufferNamespace(sourceUUID, donor.getShardId());
-        ensureCollectionDropped(opCtx, oplogBufferNss);
+        resharding::data_copy::ensureCollectionDropped(opCtx, oplogBufferNss);
     }
 }
 
@@ -135,12 +136,20 @@ void ensureTemporaryReshardingCollectionRenamed(OperationContext* opCtx,
     // It is safe for resharding to drop and reacquire locks when checking for collection existence
     // because the coordinator will prevent two resharding operations from running for the same
     // namespace at the same time.
+
+    boost::optional<Timestamp> indexVersion;
     auto tempReshardingNssExists = [&] {
         AutoGetCollection tempReshardingColl(opCtx, metadata.getTempReshardingNss(), MODE_IS);
         uassert(ErrorCodes::InvalidUUID,
                 "Temporary resharding collection exists but doesn't have a UUID matching the"
                 " resharding operation",
                 !tempReshardingColl || tempReshardingColl->uuid() == metadata.getReshardingUUID());
+        auto sii = CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(
+                       opCtx, metadata.getTempReshardingNss())
+                       ->getIndexesInCritSec(opCtx);
+        indexVersion = sii
+            ? boost::make_optional<Timestamp>(sii->getCollectionIndexes().indexVersion())
+            : boost::none;
         return bool(tempReshardingColl);
     }();
 
@@ -152,6 +161,11 @@ void ensureTemporaryReshardingCollectionRenamed(OperationContext* opCtx,
         uassert(
             ErrorCodes::InvalidUUID, errmsg, sourceColl->uuid() == metadata.getReshardingUUID());
         return;
+    }
+
+    if (indexVersion) {
+        renameCollectionShardingIndexCatalog(
+            opCtx, metadata.getTempReshardingNss(), metadata.getSourceNss(), *indexVersion);
     }
 
     RenameCollectionOptions options;
@@ -177,8 +191,6 @@ Value findHighestInsertedId(OperationContext* opCtx, const CollectionPtr& collec
 
 boost::optional<Document> findDocWithHighestInsertedId(OperationContext* opCtx,
                                                        const CollectionPtr& collection) {
-    // TODO SERVER-60824: Remove special handling for empty collections once non-blocking sort is
-    // enabled on clustered collections.
     if (collection && collection->isEmpty(opCtx)) {
         return boost::none;
     }
@@ -187,8 +199,7 @@ boost::optional<Document> findDocWithHighestInsertedId(OperationContext* opCtx,
     findCommand->setLimit(1);
     findCommand->setSort(BSON("_id" << -1));
 
-    auto recordId =
-        Helpers::findOne(opCtx, collection, std::move(findCommand), true /* requireIndex */);
+    auto recordId = Helpers::findOne(opCtx, collection, std::move(findCommand));
     if (recordId.isNull()) {
         return boost::none;
     }
@@ -201,7 +212,8 @@ std::vector<InsertStatement> fillBatchForInsert(Pipeline& pipeline, int batchSiz
     // The BlockingResultsMerger underlying by the $mergeCursors stage records how long the
     // recipient spent waiting for documents from the donor shards. It doing so requires the CurOp
     // to be marked as having started.
-    auto* curOp = CurOp::get(pipeline.getContext()->opCtx);
+    auto opCtx = pipeline.getContext()->opCtx;
+    auto* curOp = CurOp::get(opCtx);
     curOp->ensureStarted();
     ON_BLOCK_EXIT([curOp] { curOp->done(); });
 
@@ -245,7 +257,8 @@ int insertBatch(OperationContext* opCtx,
             numBytes += insert->doc.objsize();
         }
 
-        uassertStatusOK(outputColl->insertDocuments(opCtx, batch.begin(), batch.end(), nullptr));
+        uassertStatusOK(collection_internal::insertDocuments(
+            opCtx, *outputColl, batch.begin(), batch.end(), nullptr));
         wuow.commit();
 
         return numBytes;
@@ -257,11 +270,15 @@ boost::optional<SharedSemiFuture<void>> withSessionCheckedOut(OperationContext* 
                                                               TxnNumber txnNumber,
                                                               boost::optional<StmtId> stmtId,
                                                               unique_function<void()> callable) {
+    {
+        auto lk = stdx::lock_guard(*opCtx->getClient());
+        opCtx->setLogicalSessionId(std::move(lsid));
+        opCtx->setTxnNumber(txnNumber);
+    }
 
-    opCtx->setLogicalSessionId(std::move(lsid));
-    opCtx->setTxnNumber(txnNumber);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
 
-    MongoDOperationContextSession ocs(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
     try {
@@ -290,6 +307,10 @@ boost::optional<SharedSemiFuture<void>> withSessionCheckedOut(OperationContext* 
     } catch (const ExceptionFor<ErrorCodes::PreparedTransactionInProgress>&) {
         // txnParticipant.transactionIsPrepared()
         return txnParticipant.onExitPrepare();
+    } catch (const ExceptionFor<ErrorCodes::RetryableTransactionInProgress>&) {
+        // This is a retryable write that was executed using an internal transaction and there is
+        // a retry in progress.
+        return txnParticipant.onConflictingInternalTransactionCompletion(opCtx);
     }
 
     callable();

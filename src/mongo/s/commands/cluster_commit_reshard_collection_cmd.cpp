@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -42,6 +41,9 @@
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 #include "mongo/s/resharding/resharding_feature_flag_gen.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
 namespace mongo {
 namespace {
 
@@ -54,7 +56,7 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            LOGV2(5391600, "Beginning commitReshardCollection", "namespace"_attr = ns());
+            LOGV2(5391600, "Beginning commitReshardCollection", logAttrs(ns()));
             ConfigsvrCommitReshardCollection cmd(ns());
             cmd.setDbName(request().getDbName());
 

@@ -8,9 +8,9 @@ doassert = function(msg, obj) {
 
     if (jsTest.options().traceExceptions) {
         if (typeof (msg) == "string" && msg.indexOf("assert") == 0)
-            print(msg);
+            print(new Date().toISOString() + " " + msg);
         else
-            print("assert: " + msg);
+            print(new Date().toISOString() + " assert: " + msg);
     }
 
     var ex;
@@ -110,7 +110,8 @@ assert = (function() {
                     doassert("msg function cannot expect any parameters.");
                 }
             } else if (typeof msg !== "string" && typeof msg !== "object") {
-                doassert("msg parameter must be a string, function or object.");
+                doassert("msg parameter must be a string, function or object. Found type: " +
+                         typeof (msg));
             }
 
             if (msg && assert._debug) {
@@ -181,40 +182,45 @@ assert = (function() {
     };
 
     function _isDocEq(a, b) {
-        if (a == b) {
-            return true;
-        }
-
-        var aSorted = sortDoc(a);
-        var bSorted = sortDoc(b);
-
-        if ((aSorted != null && bSorted != null) && friendlyEqual(aSorted, bSorted)) {
-            return true;
-        }
-
-        return false;
+        return a === b || bsonUnorderedFieldsCompare(a, b) === 0;
     }
 
-    assert.docEq = function(a, b, msg) {
+    /**
+     * Throws if 'actualDoc' object is not equal to 'expectedDoc' object. The order of fields
+     * (properties) within objects is disregarded.
+     * Throws if object representation in BSON exceeds 16793600 bytes.
+     */
+    assert.docEq = function(expectedDoc, actualDoc, msg) {
         _validateAssertionMessage(msg);
 
-        if (_isDocEq(a, b)) {
+        if (_isDocEq(expectedDoc, actualDoc)) {
             return;
         }
 
-        doassert(_buildAssertionMessage(
-            msg, "[" + tojson(a) + "] != [" + tojson(b) + "] are not equal"));
+        doassert(_buildAssertionMessage(msg,
+                                        "expected document " + tojson(expectedDoc) +
+                                            " and actual document " + tojson(actualDoc) +
+                                            " are not equal"));
     };
 
-    assert.setEq = function(aSet, bSet, msg) {
+    /**
+     * Throws if the elements of the two given sets are not the same. Use only for primitive
+     * (non-object) set element types.
+     */
+    assert.setEq = function(expectedSet, actualSet, msg) {
+        _validateAssertionMessage(msg);
+
         const failAssertion = function() {
-            doassert(_buildAssertionMessage(msg, tojson(aSet) + " != " + tojson(bSet)));
+            doassert(_buildAssertionMessage(msg,
+                                            "expected set " + tojson(expectedSet) +
+                                                " and actual set " + tojson(actualSet) +
+                                                " are not equal"));
         };
-        if (aSet.size !== bSet.size) {
+        if (expectedSet.size !== actualSet.size) {
             failAssertion();
         }
-        for (let a of aSet) {
-            if (!bSet.has(a)) {
+        for (let a of expectedSet) {
+            if (!actualSet.has(a)) {
                 failAssertion();
             }
         }
@@ -340,14 +346,6 @@ assert = (function() {
     assert.soon = function(func, msg, timeout, interval, {runHangAnalyzer = true} = {}) {
         _validateAssertionMessage(msg);
 
-        var msgPrefix = "assert.soon failed: " + func;
-
-        if (msg) {
-            if (typeof (msg) != "function") {
-                msgPrefix = "assert.soon failed, msg";
-            }
-        }
-
         var start = new Date();
 
         if (TestData && TestData.inEvergreen) {
@@ -357,6 +355,14 @@ assert = (function() {
         }
 
         interval = interval || 200;
+
+        var msgPrefix = "assert.soon failed (timeout " + timeout + "ms): " + func;
+
+        if (msg) {
+            if (typeof (msg) != "function") {
+                msgPrefix = "assert.soon failed (timeout " + timeout + "ms), msg";
+            }
+        }
 
         while (1) {
             if (typeof (func) == "string") {
@@ -596,6 +602,7 @@ assert = (function() {
                 msg,
                 "[" + tojson(error.code) + "] != [" + tojson(expectedCode) + "] are not equal"));
         }
+        return error;
     };
 
     assert.doesNotThrow = function(func, params, msg) {
@@ -840,10 +847,12 @@ assert = (function() {
 
     assert.commandWorkedOrFailedWithCode = function commandWorkedOrFailedWithCode(
         res, errorCodeSet, msg) {
-        if (!res.ok) {
-            return assert.commandFailedWithCode(res, errorCodeSet, msg);
-        } else {
+        try {
+            // First check if the command worked.
             return assert.commandWorked(res, msg);
+        } catch (e) {
+            // If the command did not work, assert it failed with one of the specified codes.
+            return assert.commandFailedWithCode(res, errorCodeSet, msg);
         }
     };
 

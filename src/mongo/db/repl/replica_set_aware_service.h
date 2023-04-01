@@ -75,6 +75,9 @@ namespace mongo {
  *     void onStartup(OperationContext* opCtx) final {
  *         // ...
  *     }
+ *     void onSetCurrentConfig(OperationContext* opCtx) final {
+ *         // ...
+ *     }
  *     void onShutdown() final {
  *         // ...
  *     }
@@ -118,14 +121,24 @@ public:
     virtual void onStartup(OperationContext* opCtx) = 0;
 
     /**
-     * Called after startup recovery has completed.
+     * Called when the ReplicationCoordinator sets its replica set config, e.g. after processing
+     * replSetInitiate, reconfiguring via heartbeat, or processing replSetReconfig. May be called
+     * multiple times and not necessarily in the order the configs were processed.
      */
-    virtual void onStartupRecoveryComplete(OperationContext* opCtx) = 0;
+    virtual void onSetCurrentConfig(OperationContext* opCtx) = 0;
 
     /**
-     * Called after initial sync has completed.
+     * Called when either initial sync or startup recovery have completed.
+     * Local reads are always available at this point, with no special restrictions on resource
+     * locks. If the "isMajorityDataAvailable" flag is set, the data read locally is also committed
+     * to a majority of replica set members. In the opposite case, the local data may be subject to
+     * rollback attempts, which will also crash the server.
+     * This is one of the first hooks that a node will run after starting up and this is expected to
+     * be evoked strictly before any calls to onRollback, although it may be preceded by OpObserver
+     * calls. In-memory state may be reconstructed here, pending the difference in data availability
+     * described above.
      */
-    virtual void onInitialSyncComplete(OperationContext* opCtx) = 0;
+    virtual void onInitialDataAvailable(OperationContext* opCtx, bool isMajorityDataAvailable) = 0;
 
     /**
      * Called as part of ReplicationCoordinator shutdown.
@@ -133,18 +146,28 @@ public:
     virtual void onShutdown() = 0;
 
     /**
-     * Called prior to stepping up as PRIMARY, i.e. after drain mode has completed.
+     * Called prior to stepping up as PRIMARY, i.e. after drain mode has completed but before
+     * the RSTL is acquired.
+     * Implementations of this method should be short-running in order to prevent blocking
+     * the stepUp from completing.
      */
     virtual void onStepUpBegin(OperationContext* opCtx, long long term) = 0;
 
     /**
-     * Called after the node has transitioned to PRIMARY.
+     * Called after the node has transitioned to PRIMARY, i.e. after stepUp reconfig and after
+     * writing the first oplog entry with the new term, but before the node starts accepting
+     * writes.
+     * Implementations of this method should be short-running in order to prevent blocking
+     * the stepUp from completing.
      */
     virtual void onStepUpComplete(OperationContext* opCtx, long long term) = 0;
 
     /**
      * Called after the node has transitioned out of PRIMARY. Usually this is into SECONDARY, but it
      * could also be into ROLLBACK or REMOVED.
+     *
+     * NB: also called when SECONDARY nodes transition to ROLLBACK, hence it should never be assumed
+     * that `onStepUp` hooks have been invoked at least once before this method is invoked.
      */
     virtual void onStepDown() = 0;
 
@@ -152,6 +175,11 @@ public:
      * Called when the node commences being an arbiter.
      */
     virtual void onBecomeArbiter() = 0;
+
+    /**
+     * Returns the name of the service. Used for logging purposes.
+     */
+    virtual std::string getServiceName() const = 0;
 };
 
 
@@ -170,24 +198,24 @@ public:
 
     public:
         explicit Registerer(std::string name, std::vector<std::string> prereqs = {})
-            : _registerer(std::move(name),
-                          std::move(prereqs),
-                          [&](ServiceContext* serviceContext) {
-                              if (!_registered) {
-                                  _registered =
-                                      ActualService::get(serviceContext)->_shouldRegister();
-                              }
-                              if (*_registered) {
-                                  ReplicaSetAwareServiceRegistry::get(serviceContext)
-                                      ._registerService(ActualService::get(serviceContext));
-                              }
-                          },
-                          [&](ServiceContext* serviceContext) {
-                              if (_registered && *_registered) {
-                                  ReplicaSetAwareServiceRegistry::get(serviceContext)
-                                      ._unregisterService(ActualService::get(serviceContext));
-                              }
-                          }) {}
+            : _registerer(
+                  std::move(name),
+                  std::move(prereqs),
+                  [&](ServiceContext* serviceContext) {
+                      if (!_registered) {
+                          _registered = ActualService::get(serviceContext)->_shouldRegister();
+                      }
+                      if (*_registered) {
+                          ReplicaSetAwareServiceRegistry::get(serviceContext)
+                              ._registerService(ActualService::get(serviceContext));
+                      }
+                  },
+                  [&](ServiceContext* serviceContext) {
+                      if (_registered && *_registered) {
+                          ReplicaSetAwareServiceRegistry::get(serviceContext)
+                              ._unregisterService(ActualService::get(serviceContext));
+                      }
+                  }) {}
 
     private:
         boost::optional<bool> _registered;
@@ -200,13 +228,16 @@ public:
     static ReplicaSetAwareServiceRegistry& get(ServiceContext* serviceContext);
 
     void onStartup(OperationContext* opCtx) final;
-    void onStartupRecoveryComplete(OperationContext* opCtx) final;
-    void onInitialSyncComplete(OperationContext* opCtx) final;
+    void onSetCurrentConfig(OperationContext* opCtx) final;
+    void onInitialDataAvailable(OperationContext* opCtx, bool isMajorityDataAvailable) final;
     void onShutdown() final;
     void onStepUpBegin(OperationContext* opCtx, long long term) final;
     void onStepUpComplete(OperationContext* opCtx, long long term) final;
     void onStepDown() final;
     void onBecomeArbiter() final;
+    inline std::string getServiceName() const override final {
+        return "ReplicaSetAwareServiceRegistry";
+    }
 
 private:
     void _registerService(ReplicaSetAwareInterface* service);
@@ -260,7 +291,7 @@ template <class ActualService>
 class ReplicaSetAwareServiceConfigSvr : public ReplicaSetAwareService<ActualService> {
 private:
     virtual bool shouldRegisterReplicaSetAwareService() const final {
-        return serverGlobalParams.clusterRole == ClusterRole::ConfigServer;
+        return serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer);
     }
 };
 
@@ -272,7 +303,7 @@ template <class ActualService>
 class ReplicaSetAwareServiceShardSvr : public ReplicaSetAwareService<ActualService> {
 private:
     virtual bool shouldRegisterReplicaSetAwareService() const final {
-        return serverGlobalParams.clusterRole == ClusterRole::ShardServer;
+        return serverGlobalParams.clusterRole.has(ClusterRole::ShardServer);
     }
 };
 

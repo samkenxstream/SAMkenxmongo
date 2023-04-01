@@ -32,7 +32,7 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 structs:
     BalancerCollectionStatusResponse:
@@ -40,7 +40,7 @@ structs:
         strict: false
         fields:
             chunkSize:
-                type: safeInt64
+                type: safeDouble
                 description: "Configured chunk size in MiB for this collection"
             balancerCompliant:
                 type: bool

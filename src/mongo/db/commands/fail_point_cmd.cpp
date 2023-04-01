@@ -87,16 +87,22 @@ public:
     }
 
     // No auth needed because it only works when enabled via command line.
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {}
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        return Status::OK();
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
 
     std::string help() const override {
         return "modifies the settings of a fail point";
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         const std::string failPointName(cmdObj.firstElement().str());
@@ -138,7 +144,7 @@ public:
         // The command parameter happens to be string so it's historically been interpreted
         // by parseNs as a collection. Continuing to do so here for unexamined compatibility.
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
 
         // No auth needed because it only works when enabled via command line.

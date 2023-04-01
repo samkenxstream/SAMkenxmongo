@@ -51,6 +51,7 @@
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/plan_executor_pipeline.h"
+#include "mongo/db/query/multiple_collection_accessor.h"
 #include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_solution.h"
@@ -70,7 +71,7 @@ public:
     PlanExecutorTest() : _client(&_opCtx) {}
 
     virtual ~PlanExecutorTest() {
-        _client.dropCollection(nss.ns());
+        _client.dropCollection(nss);
     }
 
     void addIndex(const BSONObj& obj) {
@@ -78,19 +79,19 @@ public:
     }
 
     void insert(const BSONObj& obj) {
-        _client.insert(nss.ns(), obj);
+        _client.insert(nss, obj);
     }
 
     void remove(const BSONObj& obj) {
-        _client.remove(nss.ns(), obj);
+        _client.remove(nss, obj);
     }
 
     void dropCollection() {
-        _client.dropCollection(nss.ns());
+        _client.dropCollection(nss);
     }
 
     void update(BSONObj& query, BSONObj& updateSpec) {
-        _client.update(nss.ns(), query, updateSpec);
+        _client.update(nss, query, updateSpec);
     }
 
     /**
@@ -98,9 +99,9 @@ public:
      * capable of executing a simple collection scan.
      */
     unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeCollScanExec(
-        const CollectionPtr& coll,
+        const CollectionPtr* coll,
         BSONObj& filterObj,
-        PlanYieldPolicy::YieldPolicy yieldPolicy = PlanYieldPolicy::YieldPolicy::YIELD_MANUAL,
+        PlanYieldPolicy::YieldPolicy yieldPolicy = PlanYieldPolicy::YieldPolicy::NO_YIELD,
         TailableModeEnum tailableMode = TailableModeEnum::kNormal) {
         CollectionScanParams csparams;
         csparams.direction = CollectionScanParams::FORWARD;
@@ -117,13 +118,13 @@ public:
 
         // Make the stage.
         unique_ptr<PlanStage> root(
-            new CollectionScan(cq->getExpCtxRaw(), coll, csparams, ws.get(), cq.get()->root()));
+            new CollectionScan(cq->getExpCtxRaw(), *coll, csparams, ws.get(), cq.get()->root()));
 
         // Hand the plan off to the executor.
         auto statusWithPlanExecutor = plan_executor_factory::make(std::move(cq),
                                                                   std::move(ws),
                                                                   std::move(root),
-                                                                  &coll,
+                                                                  coll,
                                                                   yieldPolicy,
                                                                   QueryPlannerParams::DEFAULT);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
@@ -142,19 +143,20 @@ public:
      * over the specified index with the specified bounds.
      */
     unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeIndexScanExec(
-        Database* db, const CollectionPtr& coll, BSONObj& indexSpec, int start, int end) {
+        Database* db, const CollectionPtr* coll, BSONObj& indexSpec, int start, int end) {
         // Build the index scan stage.
         auto descriptor = getIndex(db, indexSpec);
-        IndexScanParams ixparams(&_opCtx, coll, descriptor);
+        IndexScanParams ixparams(&_opCtx, *coll, descriptor);
         ixparams.bounds.isSimpleRange = true;
         ixparams.bounds.startKey = BSON("" << start);
         ixparams.bounds.endKey = BSON("" << end);
         ixparams.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
 
         unique_ptr<WorkingSet> ws(new WorkingSet());
-        auto ixscan = std::make_unique<IndexScan>(_expCtx.get(), coll, ixparams, ws.get(), nullptr);
-        unique_ptr<PlanStage> root =
-            std::make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ixscan), nullptr, coll);
+        auto ixscan =
+            std::make_unique<IndexScan>(_expCtx.get(), *coll, ixparams, ws.get(), nullptr);
+        unique_ptr<PlanStage> root = std::make_unique<FetchStage>(
+            _expCtx.get(), ws.get(), std::move(ixscan), nullptr, *coll);
 
         auto findCommand = std::make_unique<FindCommandRequest>(nss);
         auto statusWithCQ = CanonicalQuery::canonicalize(&_opCtx, std::move(findCommand));
@@ -167,8 +169,8 @@ public:
             plan_executor_factory::make(std::move(cq),
                                         std::move(ws),
                                         std::move(root),
-                                        &coll,
-                                        PlanYieldPolicy::YieldPolicy::YIELD_MANUAL,
+                                        coll,
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
                                         QueryPlannerParams::DEFAULT);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         return std::move(statusWithPlanExecutor.getValue());
@@ -183,10 +185,11 @@ protected:
 
 private:
     const IndexDescriptor* getIndex(Database* db, const BSONObj& obj) {
-        CollectionPtr collection =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss);
+        CollectionPtr collection(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss));
         std::vector<const IndexDescriptor*> indexes;
-        collection->getIndexCatalog()->findIndexesByKeyPattern(&_opCtx, obj, false, &indexes);
+        collection->getIndexCatalog()->findIndexesByKeyPattern(
+            &_opCtx, obj, IndexCatalog::InclusionPolicy::kReady, &indexes);
         ASSERT_LTE(indexes.size(), 1U);
         return indexes.size() == 0 ? nullptr : indexes[0];
     }
@@ -214,13 +217,14 @@ TEST_F(PlanExecutorTest, DropIndexScanAgg) {
     // Create an "inner" plan executor and register it with the cursor manager so that it can
     // get notified when the collection is dropped.
     unique_ptr<PlanExecutor, PlanExecutor::Deleter> innerExec(
-        makeIndexScanExec(ctx.db(), collection, indexSpec, 7, 10));
+        makeIndexScanExec(ctx.db(), &collection, indexSpec, 7, 10));
 
     // Wrap the "inner" plan executor in a DocumentSourceCursor and add it as the first source
     // in the pipeline.
     innerExec->saveState();
+    MultipleCollectionAccessor collections(collection);
     auto cursorSource = DocumentSourceCursor::create(
-        collection, std::move(innerExec), _expCtx, DocumentSourceCursor::CursorType::kRegular);
+        collections, std::move(innerExec), _expCtx, DocumentSourceCursor::CursorType::kRegular);
     auto pipeline = Pipeline::create({cursorSource}, _expCtx);
 
     auto outerExec = plan_executor_factory::make(_expCtx, std::move(pipeline));
@@ -241,8 +245,8 @@ TEST_F(PlanExecutorTest, ShouldReportErrorIfExceedsTimeLimitDuringYield) {
 
     BSONObj filterObj = fromjson("{_id: {$gt: 0}}");
 
-    const CollectionPtr& coll = ctx.getCollection();
-    auto exec = makeCollScanExec(coll, filterObj, PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT);
+    CollectionPtr coll = ctx.getCollection();
+    auto exec = makeCollScanExec(&coll, filterObj, PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT);
 
     BSONObj resultObj;
     ASSERT_THROWS_CODE_AND_WHAT(exec->getNext(&resultObj, nullptr),
@@ -258,8 +262,8 @@ TEST_F(PlanExecutorTest, ShouldReportErrorIfKilledDuringYieldButIsTailableAndAwa
 
     BSONObj filterObj = fromjson("{_id: {$gt: 0}}");
 
-    const CollectionPtr& coll = ctx.getCollection();
-    auto exec = makeCollScanExec(coll,
+    CollectionPtr coll = ctx.getCollection();
+    auto exec = makeCollScanExec(&coll,
                                  filterObj,
                                  PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT,
                                  TailableModeEnum::kTailableAndAwaitData);
@@ -278,8 +282,8 @@ TEST_F(PlanExecutorTest, ShouldNotSwallowExceedsTimeLimitDuringYieldButIsTailabl
 
     BSONObj filterObj = fromjson("{_id: {$gt: 0}}");
 
-    const CollectionPtr& coll = ctx.getCollection();
-    auto exec = makeCollScanExec(coll,
+    CollectionPtr coll = ctx.getCollection();
+    auto exec = makeCollScanExec(&coll,
                                  filterObj,
                                  PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT,
                                  TailableModeEnum::kTailable);
@@ -298,8 +302,9 @@ TEST_F(PlanExecutorTest, ShouldReportErrorIfKilledDuringYield) {
 
     BSONObj filterObj = fromjson("{_id: {$gt: 0}}");
 
-    const CollectionPtr& coll = ctx.getCollection();
-    auto exec = makeCollScanExec(coll, filterObj, PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED);
+    CollectionPtr coll = ctx.getCollection();
+    auto exec =
+        makeCollScanExec(&coll, filterObj, PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED);
 
     BSONObj resultObj;
     ASSERT_THROWS_CODE_AND_WHAT(exec->getNext(&resultObj, nullptr),
@@ -310,14 +315,12 @@ TEST_F(PlanExecutorTest, ShouldReportErrorIfKilledDuringYield) {
 
 class PlanExecutorSnapshotTest : public PlanExecutorTest {
 protected:
-    CollectionPtr setupCollection() {
+    void setupCollection() {
         insert(BSON("_id" << 1 << "a" << 1));
         insert(BSON("_id" << 2 << "a" << 2 << "payload"
                           << "x"));
         insert(BSON("_id" << 3 << "a" << 3));
         insert(BSON("_id" << 4 << "a" << 4));
-
-        return CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss);
     }
 
     /**
@@ -365,8 +368,8 @@ TEST_F(PlanExecutorSnapshotTest, SnapshotControl) {
 
     BSONObj filterObj = fromjson("{a: {$gte: 2}}");
 
-    const CollectionPtr& coll = ctx.getCollection();
-    auto exec = makeCollScanExec(coll, filterObj);
+    CollectionPtr coll = ctx.getCollection();
+    auto exec = makeCollScanExec(&coll, filterObj);
 
     BSONObj objOut;
     ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&objOut, nullptr));
@@ -385,12 +388,13 @@ TEST_F(PlanExecutorSnapshotTest, SnapshotControl) {
  */
 TEST_F(PlanExecutorSnapshotTest, SnapshotTest) {
     dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
-    auto coll = setupCollection();
+    setupCollection();
     BSONObj indexSpec = BSON("_id" << 1);
     addIndex(indexSpec);
 
     BSONObj filterObj = fromjson("{a: {$gte: 2}}");
-    auto exec = makeIndexScanExec(ctx.db(), coll, indexSpec, 2, 5);
+    CollectionPtr coll = ctx.getCollection();
+    auto exec = makeIndexScanExec(ctx.db(), &coll, indexSpec, 2, 5);
 
     BSONObj objOut;
     ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&objOut, nullptr));

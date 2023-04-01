@@ -26,8 +26,6 @@
 # it in the license file.
 #
 
-# _configsvrCommitChunksMerge IDL File
-
 global:
     cpp_namespace: "mongo"
     cpp_includes:
@@ -35,7 +33,7 @@ global:
         - "mongo/util/uuid.h"
     
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/s/chunk_range.idl"
     - "mongo/s/chunk_version.idl"
     - "mongo/s/sharding_types.idl"
@@ -51,12 +49,26 @@ types:
 
 structs:
     ConfigSvrMergeResponse:
-        description: "Response of the _configsvrCommitChunksMerge command."
+        description: "Response of the _configsvrCommitChunksMerge command"
         strict: false
+        is_command_reply: true
         fields:
             shardVersion:
                 type: ChunkVersion
-                description: "Latest version of the shard."
+                description: "Latest data placement of the shard."
+
+    MergeAllChunksOnShardResponse:
+        description: "Response of the _configsvrCommitMergeAllChunksOnShard and _shardsvrMergeAllChunksOnShard commands"
+        strict: false
+        is_command_reply: true
+        fields:
+            shardVersion:
+                type: ChunkVersion
+                description: "Latest data placement of the shard."
+            numMergedChunks:
+                type: int
+                description: "Number of chunks that were merged"
+                default: 0 # TODO SERVER-74573 remove default once 7.0 branches out
 
 commands:
     _configsvrCommitChunksMerge:
@@ -80,11 +92,69 @@ commands:
                 type: chunk_range
                 cpp_name: "chunkRange"
                 description: "Chunk bounds to merge."
-            validAfter:
+            epoch:
+                description: "The expected epoch of the collection that is being committed"
+                type: objectid
+                optional: true
+            timestamp:
+                description: "The expected timestamp of the collection that is being committed"
                 type: timestamp
-                description: "The time after which this chunk is at this shard."
                 optional: true
-            writeConcern:
-                description: "The level of write concern for the creation operation."
-                type: object
-                optional: true
+    
+    clusterMergeAllChunksOnShard:
+        command_name: mergeAllChunksOnShard
+        cpp_name: ClusterMergeAllChunksOnShard
+        description: "Definition of the mergeAllChunksOnShard command called on routers."
+        namespace: type
+        type: namespacestring
+        api_version: ""
+        strict: false
+        fields:
+            shard:
+                description: "The id of the shard."
+                type: shard_id
+                validator:
+                    callback: "ShardId::validate"
+            maxNumberOfChunksToMerge:
+                description: "The maximum number of chunks to merge"
+                type: int
+                default: 2147483647  # INT_MAX
+
+    _shardsvrMergeAllChunksOnShard:
+        command_name: _shardsvrMergeAllChunksOnShard
+        cpp_name: ShardSvrMergeAllChunksOnShard
+        description: "Definition of the mergeAllChunksOnShard command called on the shards."
+        namespace: type
+        type: namespacestring
+        api_version: ""
+        strict: false
+        fields:
+            shard:
+                description: "The id of the shard."
+                type: shard_id
+                validator:
+                    callback: "ShardId::validate"
+            maxNumberOfChunksToMerge:
+                description: "The maximum number of chunks to merge"
+                type: int
+                default: 2147483647  # INT_MAX
+
+    _configsvrCommitMergeAllChunksOnShard:
+        command_name: _configsvrCommitMergeAllChunksOnShard
+        cpp_name: ConfigSvrCommitMergeAllChunksOnShard
+        description: "Definition of the mergeAllChunksOnShard command called on the config server."
+        namespace: type
+        type: namespacestring
+        api_version: ""
+        strict: false
+        reply_type: ConfigSvrMergeResponse
+        fields:
+            shard:
+                description: "The id of the shard."
+                type: shard_id
+                validator:
+                    callback: "ShardId::validate"
+            maxNumberOfChunksToMerge:
+                description: "The maximum number of chunks to merge"
+                type: int
+                default: 2147483647  # INT_MAX

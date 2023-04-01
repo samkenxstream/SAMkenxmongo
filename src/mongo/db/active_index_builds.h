@@ -75,7 +75,7 @@ public:
     void awaitNoIndexBuildInProgressForCollection(OperationContext* opCtx,
                                                   const UUID& collectionUUID);
 
-    void awaitNoBgOpInProgForDb(OperationContext* opCtx, StringData db);
+    void awaitNoBgOpInProgForDb(OperationContext* opCtx, const DatabaseName& dbName);
 
     /**
      * Unregisters the index build.
@@ -99,6 +99,12 @@ public:
      * Get the number of in-progress index builds.
      */
     size_t getActiveIndexBuilds() const;
+
+    /**
+     * Provides passthrough access to ReplIndexBuildState for index build info.
+     * Does nothing if build UUID does not refer to an active index build.
+     */
+    void appendBuildInfo(const UUID& buildUUID, BSONObjBuilder* builder) const;
 
     /**
      * When _sleepForTest is true, this function will sleep for 100ms and then check the value

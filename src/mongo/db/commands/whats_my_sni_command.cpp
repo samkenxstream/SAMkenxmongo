@@ -42,7 +42,7 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& ns,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         auto sniName = opCtx->getClient()->getSniNameForSession();
@@ -70,9 +70,11 @@ public:
         return AllowedOnSecondary::kAlways;
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {}
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();
+    }
 };
 
 MONGO_REGISTER_TEST_COMMAND(CmdWhatsMySNI)

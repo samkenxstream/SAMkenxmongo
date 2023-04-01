@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -48,8 +47,6 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/error_labels.h"
 #include "mongo/db/initialize_api_parameters.h"
-#include "mongo/db/initialize_operation_session_info.h"
-#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/namespace_string.h"
@@ -61,6 +58,8 @@
 #include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/session/initialize_operation_session_info.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
 #include "mongo/db/stats/api_version_metrics.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/transaction_validation.h"
@@ -68,6 +67,7 @@
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/logv2/log.h"
+#include "mongo/rpc/check_allowed_op_query_cmd.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/client_metadata.h"
@@ -75,16 +75,17 @@
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
 #include "mongo/rpc/rewrite_state_change_errors.h"
-#include "mongo/rpc/warn_deprecated_wire_ops.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/is_mongos.h"
 #include "mongo/s/load_balancer_support.h"
 #include "mongo/s/mongos_topology_coordinator.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/query/cluster_find.h"
+#include "mongo/s/query_analysis_sampler.h"
 #include "mongo/s/session_catalog_router.h"
 #include "mongo/s/shard_invalidated_for_targeting_exception.h"
 #include "mongo/s/stale_exception.h"
@@ -98,9 +99,11 @@
 #include "mongo/util/str.h"
 #include "mongo/util/timer.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 namespace mongo {
 namespace {
-
+MONGO_FAIL_POINT_DEFINE(hangBeforeCheckingMongosShutdownInterrupt);
 const auto kOperationTime = "operationTime"_sd;
 
 /**
@@ -115,17 +118,18 @@ MONGO_FAIL_POINT_DEFINE(allowSkippingAppendRequiredFieldsToResponse);
 
 Future<void> runCommandInvocation(std::shared_ptr<RequestExecutionContext> rec,
                                   std::shared_ptr<CommandInvocation> invocation) {
-    auto threadingModel = [client = rec->getOpCtx()->getClient()] {
+    bool useDedicatedThread = [&] {
+        auto client = rec->getOpCtx()->getClient();
         if (auto context = transport::ServiceExecutorContext::get(client); context) {
-            return context->getThreadingModel();
+            return context->useDedicatedThread();
         }
         tassert(5453902,
                 "Threading model may only be absent for internal and direct clients",
                 !client->hasRemote() || client->isInDirectClient());
-        return transport::ServiceExecutor::ThreadingModel::kDedicated;
+        return true;
     }();
     return CommandHelpers::runCommandInvocation(
-        std::move(rec), std::move(invocation), threadingModel);
+        std::move(rec), std::move(invocation), useDedicatedThread);
 }
 
 /**
@@ -199,13 +203,10 @@ Future<void> invokeInTransactionRouter(std::shared_ptr<RequestExecutionContext> 
 
             auto opCtx = rec->getOpCtx();
 
-            auto txnRouter = TransactionRouter::get(opCtx);
-            if (!txnRouter) {
-                // The command had yielded its session while the error was thrown.
-                return;
+            // Abort if the router wasn't yielded, which may happen at global shutdown.
+            if (auto txnRouter = TransactionRouter::get(opCtx)) {
+                txnRouter.implicitlyAbortTransaction(opCtx, status);
             }
-
-            TransactionRouter::get(opCtx).implicitlyAbortTransaction(opCtx, status);
         });
 }
 
@@ -259,7 +260,7 @@ void ExecCommandClient::_prologue() {
     const auto dbname = request.getDatabase();
     uassert(ErrorCodes::IllegalOperation,
             "Can't use 'local' database through mongos",
-            dbname != NamespaceString::kLocalDb);
+            dbname != DatabaseName::kLocal.db());
     uassert(ErrorCodes::InvalidNamespace,
             "Invalid database name: '{}'"_format(dbname),
             NamespaceString::validDBName(dbname, NamespaceString::DollarInDbNameBehavior::Allow));
@@ -357,7 +358,7 @@ void ExecCommandClient::_onCompletion() {
     if (!_invocation->isSafeForBorrowedThreads()) {
         // If the last command wasn't safe for a borrowed thread, then let's move
         // off of it.
-        seCtx->setThreadingModel(transport::ServiceExecutor::ThreadingModel::kDedicated);
+        seCtx->setUseDedicatedThread(true);
     }
 }
 
@@ -405,6 +406,9 @@ private:
     // invocation and extracting read/write concerns).
     void _parseCommand();
 
+    // updates statistics and applies labels if an error occurs.
+    void _updateStatsAndApplyErrorLabels(const Status& status);
+
     const std::shared_ptr<RequestExecutionContext> _rec;
     const std::shared_ptr<BSONObjBuilder> _errorBuilder;
     const NetworkOp _opType;
@@ -427,28 +431,14 @@ public:
 
     explicit RunInvocation(ParseAndRunCommand* parc) : _parc(parc) {}
 
-    ~RunInvocation() {
-        if (!_shouldAffectCommandCounter)
-            return;
-        auto opCtx = _parc->_rec->getOpCtx();
-        Grid::get(opCtx)->catalogCache()->checkAndRecordOperationBlockedByRefresh(
-            opCtx, mongo::LogicalOp::opCommand);
-    }
-
     Future<void> run();
 
 private:
     Status _setup();
 
-    // Logs and updates statistics if an error occurs.
-    void _tapOnError(const Status& status);
-
-    void _tapOnSuccess();
-
     ParseAndRunCommand* const _parc;
 
     boost::optional<RouterOperationContextSession> _routerSession;
-    bool _shouldAffectCommandCounter = false;
 };
 
 /*
@@ -487,7 +477,35 @@ private:
 
     int _tries = 0;
 };
+void ParseAndRunCommand::_updateStatsAndApplyErrorLabels(const Status& status) {
+    auto opCtx = _rec->getOpCtx();
+    const auto command = _rec->getCommand();
 
+    if (command)
+        command->incrementCommandsFailed();
+    NotPrimaryErrorTracker::get(opCtx->getClient()).recordError(status.code());
+    // WriteConcern error (wcCode) is set to boost::none because:
+    // 1. TransientTransaction error label handling for commitTransaction command in mongos is
+    //    delegated to the shards. Mongos simply propagates the shard's response up to the client.
+    // 2. For other commands in a transaction, they shouldn't get a writeConcern error so this
+    //    setting doesn't apply.
+
+    if (_osi.has_value()) {
+
+        auto errorLabels = getErrorLabels(opCtx,
+                                          *_osi,
+                                          command->getName(),
+                                          status.code(),
+                                          boost::none,
+                                          false /* isInternalClient */,
+                                          true /* isMongos */,
+                                          repl::OpTime{},
+                                          repl::OpTime{});
+
+
+        _errorBuilder->appendElements(errorLabels);
+    }
+}
 void ParseAndRunCommand::_parseCommand() {
     auto opCtx = _rec->getOpCtx();
     const auto& m = _rec->getMessage();
@@ -513,7 +531,7 @@ void ParseAndRunCommand::_parseCommand() {
     Client* client = opCtx->getClient();
     const auto session = client->session();
     if (session) {
-        if (!opCtx->isExhaust() || !_isHello.get()) {
+        if (!opCtx->isExhaust() || !_isHello.value()) {
             InExhaustHello::get(session.get())->setInExhaust(false, _commandName);
         }
     }
@@ -531,12 +549,6 @@ void ParseAndRunCommand::_parseCommand() {
     uassert(ErrorCodes::InvalidOptions,
             "no such command option $maxTimeMs; use maxTimeMS instead",
             request.body[query_request_helper::queryOptionMaxTimeMS].eoo());
-    const int maxTimeMS =
-        uassertStatusOK(parseMaxTimeMS(request.body[query_request_helper::cmdOptionMaxTimeMS]));
-    if (maxTimeMS > 0 && command->getLogicalOp() != LogicalOp::opGetMore) {
-        opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS}, ErrorCodes::MaxTimeMSExpired);
-    }
-    opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
     // If the command includes a 'comment' field, set it on the current OpCtx.
     if (auto commentField = request.body["comment"]) {
@@ -553,6 +565,8 @@ void ParseAndRunCommand::_parseCommand() {
         APIParameters::get(opCtx) = APIParameters::fromClient(apiParamsFromClient);
     }
 
+    rpc::readRequestMetadata(opCtx, request, command->requiresAuth());
+
     _invocation = command->parse(opCtx, request);
     CommandInvocation::set(opCtx, _invocation);
 
@@ -564,7 +578,7 @@ void ParseAndRunCommand::_parseCommand() {
         (request.getDatabase() == *_ns ? NamespaceString(*_ns, "$cmd") : NamespaceString(*_ns));
 
     // Fill out all currentOp details.
-    CurOp::get(opCtx)->setGenericOpRequestDetails(opCtx, nss, command, request.body, _opType);
+    CurOp::get(opCtx)->setGenericOpRequestDetails(nss, command, request.body, _opType);
 
     _osi.emplace(initializeOperationSessionInfo(opCtx,
                                                 request.body,
@@ -572,9 +586,7 @@ void ParseAndRunCommand::_parseCommand() {
                                                 command->attachLogicalSessionsToOpCtx(),
                                                 true));
 
-    // TODO SERVER-28756: Change allowTransactionsOnConfigDatabase to true once we fix the bug
-    // where the mongos custom write path incorrectly drops the client's txnNumber.
-    auto allowTransactionsOnConfigDatabase = false;
+    auto allowTransactionsOnConfigDatabase = !isMongos();
     validateSessionOptions(*_osi, command->getName(), nss, allowTransactionsOnConfigDatabase);
 
     _wc.emplace(uassertStatusOK(WriteConcernOptions::extractWCFromCommand(request.body)));
@@ -595,6 +607,11 @@ void ParseAndRunCommand::_parseCommand() {
     }
 }
 
+bool isInternalClient(OperationContext* opCtx) {
+    return (opCtx->getClient()->session() &&
+            (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient));
+}
+
 Status ParseAndRunCommand::RunInvocation::_setup() {
     auto invocation = _parc->_invocation;
     auto opCtx = _parc->_rec->getOpCtx();
@@ -602,13 +619,34 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
     const auto& request = _parc->_rec->getRequest();
     auto replyBuilder = _parc->_rec->getReplyBuilder();
 
+    const int maxTimeMS =
+        uassertStatusOK(parseMaxTimeMS(request.body[query_request_helper::cmdOptionMaxTimeMS]));
+    if (maxTimeMS > 0 && command->getLogicalOp() != LogicalOp::opGetMore) {
+        opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS}, ErrorCodes::MaxTimeMSExpired);
+    }
+
+    if (MONGO_unlikely(
+            hangBeforeCheckingMongosShutdownInterrupt.shouldFail([&](const BSONObj& data) {
+                if (data.hasField("cmdName") && data.hasField("ns")) {
+                    std::string cmdNS = _parc->_ns.value();
+                    return ((data.getStringField("cmdName") == _parc->_commandName) &&
+                            (data.getStringField("ns") == cmdNS));
+                }
+                return false;
+            }))) {
+
+        LOGV2(6217501, "Hanging before hangBeforeCheckingMongosShutdownInterrupt is cancelled");
+        hangBeforeCheckingMongosShutdownInterrupt.pauseWhileSet();
+    }
+    opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
+
     auto appendStatusToReplyAndSkipCommandExecution = [replyBuilder](Status status) -> Status {
         auto responseBuilder = replyBuilder->getBodyBuilder();
         CommandHelpers::appendCommandStatusNoThrow(responseBuilder, status);
         return Status(ErrorCodes::SkipCommandExecution, status.reason());
     };
 
-    if (_parc->_isHello.get()) {
+    if (_parc->_isHello.value()) {
         // Preload generic ClientMetadata ahead of our first hello request. After the first
         // request, metaElement should always be empty.
         auto metaElem = request.body[kMetadataDocumentName];
@@ -623,8 +661,6 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
         auto appName = clientMetadata->getApplicationName().toString();
         apiVersionMetrics.update(appName, apiParams);
     }
-
-    rpc::readRequestMetadata(opCtx, request, command->requiresAuth());
 
     CommandHelpers::evaluateFailCommandFailPoint(opCtx, invocation.get());
     bool startTransaction = false;
@@ -668,14 +704,12 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
     // the client supplied a WC or not.
     bool clientSuppliedWriteConcern = !_parc->_wc->usedDefaultConstructedWC;
     bool customDefaultWriteConcernWasApplied = false;
-    bool isInternalClient =
-        (opCtx->getClient()->session() &&
-         (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient));
+    bool isInternalClientValue = isInternalClient(opCtx);
 
     if (supportsWriteConcern && !clientSuppliedWriteConcern &&
-        (!TransactionRouter::get(opCtx) || isTransactionCommand(_parc->_commandName)) &&
+        (!TransactionRouter::get(opCtx) || command->isTransactionCommand()) &&
         !opCtx->getClient()->isInDirectClient()) {
-        if (isInternalClient) {
+        if (isInternalClientValue) {
             uassert(
                 5569900,
                 "received command without explicit writeConcern on an internalClient connection {}"_format(
@@ -723,7 +757,7 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
                 provenance.setSource(ReadWriteConcernProvenance::Source::clientSupplied);
             } else if (customDefaultWriteConcernWasApplied) {
                 provenance.setSource(ReadWriteConcernProvenance::Source::customDefault);
-            } else if (opCtx->getClient()->isInDirectClient() || isInternalClient) {
+            } else if (opCtx->getClient()->isInDirectClient() || isInternalClientValue) {
                 provenance.setSource(ReadWriteConcernProvenance::Source::internalWriteDefault);
             } else {
                 provenance.setSource(ReadWriteConcernProvenance::Source::implicitDefault);
@@ -772,7 +806,7 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
                 const auto readConcernSource = rwcDefaults.getDefaultReadConcernSource();
                 customDefaultReadConcernWasApplied =
                     (readConcernSource &&
-                     readConcernSource.get() == DefaultReadConcernSourceEnum::kGlobal);
+                     readConcernSource.value() == DefaultReadConcernSourceEnum::kGlobal);
 
                 applyDefaultReadConcern(*rcDefault);
             }
@@ -863,7 +897,9 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
 
     if (command->shouldAffectCommandCounter()) {
         globalOpCounters.gotCommand();
-        _shouldAffectCommandCounter = true;
+        if (analyze_shard_key::supportsSamplingQueries(opCtx)) {
+            analyze_shard_key::QueryAnalysisSampler::get(opCtx).gotCommand(command->getName());
+        }
     }
 
     return Status::OK();
@@ -876,8 +912,8 @@ void ParseAndRunCommand::RunAndRetry::_setup() {
     auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
 
     if (_tries > 1) {
-        // Re-parse before retrying in case the process of run()-ning the invocation could affect
-        // the parsed result.
+        // Re-parse before retrying in case the process of run()-ning the invocation could
+        // affect the parsed result.
         _parc->_invocation = command->parse(opCtx, request);
         invariant(_parc->_invocation->ns().toString() == _parc->_ns,
                   "unexpected change of namespace when retrying");
@@ -916,15 +952,15 @@ Future<void> ParseAndRunCommand::RunAndRetry::_run() {
 }
 
 void ParseAndRunCommand::RunAndRetry::_checkRetryForTransaction(Status& status) {
-    // Retry logic specific to transactions. Throws and aborts the transaction if the error cannot
-    // be retried on.
+    // Retry logic specific to transactions. Throws and aborts the transaction if the error
+    // cannot be retried on.
     auto opCtx = _parc->_rec->getOpCtx();
     auto txnRouter = TransactionRouter::get(opCtx);
     if (!txnRouter) {
         if (opCtx->inMultiDocumentTransaction()) {
-            // This command must have failed while its session was yielded. We cannot retry in this
-            // case, whatever the session was yielded to is responsible for that, so rethrow the
-            // error.
+            // This command must have failed while its session was yielded. We cannot retry in
+            // this case, whatever the session was yielded to is responsible for that, so
+            // rethrow the error.
             iassert(status);
         }
 
@@ -961,7 +997,7 @@ void ParseAndRunCommand::RunAndRetry::_checkRetryForTransaction(Status& status) 
         if (!txnRouter.canContinueOnStaleShardOrDbError(_parc->_commandName, status)) {
             if (status.code() == ErrorCodes::ShardInvalidatedForTargeting) {
                 auto catalogCache = Grid::get(opCtx)->catalogCache();
-                (void)catalogCache->getCollectionRoutingInfoWithRefresh(
+                (void)catalogCache->getCollectionRoutingInfoWithPlacementRefresh(
                     opCtx, status.extraInfo<ShardInvalidatedForTargetingInfo>()->getNss());
             }
 
@@ -1064,39 +1100,10 @@ void ParseAndRunCommand::RunAndRetry::_onTenantMigrationAborted(Status& status) 
         iassert(status);
 }
 
-void ParseAndRunCommand::RunInvocation::_tapOnError(const Status& status) {
-    auto opCtx = _parc->_rec->getOpCtx();
-    const auto command = _parc->_rec->getCommand();
-
-    command->incrementCommandsFailed();
-    NotPrimaryErrorTracker::get(opCtx->getClient()).recordError(status.code());
-    // WriteConcern error (wcCode) is set to boost::none because:
-    // 1. TransientTransaction error label handling for commitTransaction command in mongos is
-    //    delegated to the shards. Mongos simply propagates the shard's response up to the client.
-    // 2. For other commands in a transaction, they shouldn't get a writeConcern error so this
-    //    setting doesn't apply.
-    auto errorLabels = getErrorLabels(opCtx,
-                                      *_parc->_osi,
-                                      command->getName(),
-                                      status.code(),
-                                      boost::none,
-                                      false /* isInternalClient */,
-                                      true /* isMongos */);
-    _parc->_errorBuilder->appendElements(errorLabels);
-}
-
-void ParseAndRunCommand::RunInvocation::_tapOnSuccess() {
-    auto opCtx = _parc->_rec->getOpCtx();
-    if (_parc->_osi && _parc->_osi->getAutocommit() == boost::optional<bool>(false)) {
-        tassert(5918604,
-                "A successful transaction command must always check out its session after yielding",
-                TransactionRouter::get(opCtx));
-    }
-}
-
 Future<void> ParseAndRunCommand::RunAndRetry::run() {
     return makeReadyFutureWith([&] {
-               // Try kMaxNumStaleVersionRetries times. On the last try, exceptions are rethrown.
+               // Try kMaxNumStaleVersionRetries times. On the last try, exceptions are
+               // rethrown.
                _tries++;
 
                _setup();
@@ -1130,12 +1137,10 @@ Future<void> ParseAndRunCommand::RunAndRetry::run() {
 
 Future<void> ParseAndRunCommand::RunInvocation::run() {
     return makeReadyFutureWith([&] {
-               iassert(_setup());
-               return future_util::makeState<RunAndRetry>(_parc).thenWithState(
-                   [](auto* runner) { return runner->run(); });
-           })
-        .tap([this]() { _tapOnSuccess(); })
-        .tapError([this](Status status) { _tapOnError(status); });
+        iassert(_setup());
+        return future_util::makeState<RunAndRetry>(_parc).thenWithState(
+            [](auto* runner) { return runner->run(); });
+    });
 }
 
 Future<void> ParseAndRunCommand::run() {
@@ -1144,6 +1149,7 @@ Future<void> ParseAndRunCommand::run() {
                return future_util::makeState<RunInvocation>(this).thenWithState(
                    [](auto* runner) { return runner->run(); });
            })
+        .tapError([this](Status status) { _updateStatsAndApplyErrorLabels(status); })
         .onError<ErrorCodes::SkipCommandExecution>([this](Status status) {
             // We've already skipped execution, so no other action is required.
             return Status::OK();
@@ -1184,7 +1190,8 @@ private:
 void ClientCommand::_parseMessage() try {
     const auto& msg = _rec->getMessage();
     _rec->setReplyBuilder(rpc::makeReplyBuilder(rpc::protocolForMessage(msg)));
-    auto opMsgReq = rpc::opMsgRequestFromAnyProtocol(msg);
+    auto opMsgReq = rpc::opMsgRequestFromAnyProtocol(msg, _rec->getOpCtx()->getClient());
+
     if (msg.operation() == dbQuery) {
         checkAllowedOpQueryCommand(*(_rec->getOpCtx()->getClient()), opMsgReq.getCommandName());
     }
@@ -1236,7 +1243,7 @@ Future<void> ClientCommand::_execute() {
 }
 
 Future<void> ClientCommand::_handleException(Status status) {
-    if (_propagateException) {
+    if (status == ErrorCodes::CloseConnectionForShutdownCommand || _propagateException) {
         return status;
     }
 
@@ -1271,6 +1278,8 @@ DbResponse ClientCommand::_produceResponse() {
     if (OpMsg::isFlagSet(m, OpMsg::kMoreToCome)) {
         return {};  // Don't reply.
     }
+
+    CommandHelpers::checkForInternalError(reply, isInternalClient(_rec->getOpCtx()));
 
     DbResponse dbResponse;
     if (OpMsg::isFlagSet(m, OpMsg::kExhaustSupported)) {

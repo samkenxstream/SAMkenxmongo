@@ -59,7 +59,7 @@ public:
     QueryStageFetchBase() : _client(&_opCtx) {}
 
     virtual ~QueryStageFetchBase() {
-        _client.dropCollection(ns());
+        _client.dropCollection(nss());
     }
 
     void getRecordIds(set<RecordId>* out, const CollectionPtr& coll) {
@@ -70,11 +70,11 @@ public:
     }
 
     void insert(const BSONObj& obj) {
-        _client.insert(ns(), obj);
+        _client.insert(nss(), obj);
     }
 
     void remove(const BSONObj& obj) {
-        _client.remove(ns(), obj);
+        _client.remove(nss(), obj);
     }
 
     static const char* ns() {
@@ -102,11 +102,11 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
 
@@ -166,14 +166,14 @@ public:
 class FetchStageFilter : public QueryStageFetchBase {
 public:
     void run() {
-        Lock::DBLock lk(&_opCtx, nss().db(), MODE_X);
-        OldClientContext ctx(&_opCtx, ns());
+        Lock::DBLock lk(&_opCtx, nss().dbName(), MODE_X);
+        OldClientContext ctx(&_opCtx, nss());
         Database* db = ctx.db();
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
 

@@ -26,29 +26,26 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+
 #pragma once
 
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/timestamp.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/pipeline.h"
-#include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/resharding/coordinator_document_gen.h"
 #include "mongo/db/s/resharding/donor_oplog_id_gen.h"
-#include "mongo/db/s/sharding_state_lock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/resharding/common_types_gen.h"
-#include "mongo/s/shard_id.h"
-#include "mongo/util/str.h"
 
 namespace mongo {
+namespace resharding {
 
 constexpr auto kReshardFinalOpLogType = "reshardFinalOp"_sd;
 constexpr auto kReshardProgressMark = "reshardProgressMark"_sd;
@@ -293,4 +290,36 @@ NamespaceString getLocalConflictStashNamespace(UUID existingUUID, ShardId donorS
 
 void doNoopWrite(OperationContext* opCtx, StringData opStr, const NamespaceString& nss);
 
+boost::optional<Milliseconds> estimateRemainingRecipientTime(bool applyingBegan,
+                                                             int64_t bytesCopied,
+                                                             int64_t bytesToCopy,
+                                                             Milliseconds timeSpentCopying,
+                                                             int64_t oplogEntriesApplied,
+                                                             int64_t oplogEntriesFetched,
+                                                             Milliseconds timeSpentApplying);
+
+/**
+ * Looks up the StateMachine by namespace of the collection being resharded. If it does not exist,
+ * returns boost::none.
+ */
+template <class Service, class Instance>
+std::vector<std::shared_ptr<Instance>> getReshardingStateMachines(OperationContext* opCtx,
+                                                                  const NamespaceString& sourceNs) {
+    auto service =
+        checked_cast<Service*>(repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext())
+                                   ->lookupServiceByName(Service::kServiceName));
+    auto instances = service->getAllReshardingInstances(opCtx);
+    std::vector<std::shared_ptr<Instance>> result;
+    for (const auto& genericInstace : instances) {
+        auto instance = checked_pointer_cast<Instance>(genericInstace);
+        auto metadata = instance->getMetadata();
+        if (metadata.getSourceNss() != sourceNs) {
+            continue;
+        }
+        result.emplace_back(std::move(instance));
+    }
+    return result;
+}
+
+}  // namespace resharding
 }  // namespace mongo

@@ -1,9 +1,13 @@
 /**
  * Tests that in a tenant migration, the recipient primary will use majority read concern when
  * cloning documents from the donor.
+ *
+ * TODO (SERVER-63517): Remove this test, it requires failover, and the ability to write to the
+ * donor during migration, and it tests a cloning method superseded by Shard Merge.
+ *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
+ *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
  *   requires_persistence,
@@ -11,19 +15,18 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {runMigrationAsync} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");           // for 'extractUUIDFromObject'
 load("jstests/libs/parallelTester.js");      // for 'Thread'
 load("jstests/libs/write_concern_util.js");  // for 'stopReplicationOnSecondaries'
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+load("jstests/replsets/rslib.js");           // 'createRstArgs'
 
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
-const tenantId = "testTenantId";
+const tenantId = ObjectId().str;
 const dbName = tenantMigrationTest.tenantDB(tenantId, "testDB");
 const collName = "testColl";
 
@@ -31,14 +34,6 @@ const donorPrimary = tenantMigrationTest.getDonorPrimary();
 const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 const donorRst = tenantMigrationTest.getDonorRst();
 const donorTestColl = donorPrimary.getDB(dbName).getCollection(collName);
-
-// TODO (SERVER-63517): Remove this test, it requires failover, and the ability to write to the
-// donor during migration, and it tests a cloning method superseded by Shard Merge.
-if (TenantMigrationUtil.isShardMergeEnabled(donorRst.getPrimary().getDB("adminDB"))) {
-    jsTestLog("Skip: featureFlagShardMerge enabled, but shard merge does not survive failover");
-    tenantMigrationTest.stop();
-    return;
-}
 
 // The default WC is majority and stopReplicationOnSecondaries will prevent satisfying any majority
 assert.commandWorked(recipientPrimary.adminCommand(
@@ -54,7 +49,7 @@ const migrationId = UUID();
 const migrationOpts = {
     migrationIdString: extractUUIDFromObject(migrationId),
     recipientConnString: tenantMigrationTest.getRecipientConnString(),
-    tenantId: tenantId,
+    tenantId,
 };
 
 // Configure fail point to have the recipient primary hang before the query stage.
@@ -69,9 +64,8 @@ const waitBeforeCloning = configureFailPoint(recipientDb, "hangBeforeClonerStage
 // Start a migration and wait for recipient to hang before querying the donor in the cloning phase.
 // At this point, we have waited for the listIndex results to be majority committed on the donor,
 // so we can stop server replication.
-const donorRstArgs = TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst());
-const migrationThread =
-    new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
+const donorRstArgs = createRstArgs(tenantMigrationTest.getDonorRst());
+const migrationThread = new Thread(runMigrationAsync, migrationOpts, donorRstArgs);
 migrationThread.start();
 waitBeforeCloning.wait();
 stopReplicationOnSecondaries(donorRst);
@@ -84,13 +78,13 @@ assert.eq(4, donorTestColl.find().itcount());
 assert.eq(2, donorTestColl.find().readConcern("majority").itcount());
 
 // Let the cloner finish.
-const waitAfterCloning =
-    configureFailPoint(recipientDb, "fpAfterCollectionClonerDone", {action: "hang"});
+const waitBeforeFetchingTransactions =
+    configureFailPoint(recipientDb, "fpBeforeFetchingCommittedTransactions", {action: "hang"});
 waitBeforeCloning.off();
 
 // Wait for the cloning phase to finish. Check that the recipient has only cloned documents that are
 // majority committed on the donor replica set.
-waitAfterCloning.wait();
+waitBeforeFetchingTransactions.wait();
 // Tenant migration recipient rejects all reads until it has applied data past the blockTimestamp
 // (returnAfterReachingTimestamp). Use this failpoint to allow the find command below to succeed.
 const notRejectReadsFp =
@@ -101,7 +95,6 @@ notRejectReadsFp.off();
 
 // Restart secondary replication in the donor replica set and complete the migration.
 restartReplicationOnSecondaries(donorRst);
-waitAfterCloning.off();
+waitBeforeFetchingTransactions.off();
 TenantMigrationTest.assertCommitted(migrationThread.returnData());
 tenantMigrationTest.stop();
-})();

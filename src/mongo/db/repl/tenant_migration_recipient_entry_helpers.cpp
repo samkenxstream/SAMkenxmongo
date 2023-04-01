@@ -27,13 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/namespace_string.h"
@@ -45,6 +44,8 @@
 #include "mongo/db/repl/tenant_migration_state_machine_gen.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
 
 
 namespace mongo {
@@ -74,7 +75,7 @@ Status insertStateDoc(OperationContext* opCtx, const TenantMigrationRecipientDoc
                                      << BSON("$exists" << false));
             const auto updateMod = BSON("$setOnInsert" << stateDoc.toBSON());
             auto updateResult =
-                Helpers::upsert(opCtx, nss.ns(), filter, updateMod, /*fromMigrate=*/false);
+                Helpers::upsert(opCtx, nss, filter, updateMod, /*fromMigrate=*/false);
 
             // '$setOnInsert' update operator can no way modify the existing on-disk state doc.
             invariant(!updateResult.numDocsModified);
@@ -101,7 +102,7 @@ Status updateStateDoc(OperationContext* opCtx, const TenantMigrationRecipientDoc
     return writeConflictRetry(
         opCtx, "updateTenantMigrationRecipientStateDoc", nss.ns(), [&]() -> Status {
             auto updateResult =
-                Helpers::upsert(opCtx, nss.ns(), stateDoc.toBSON(), /*fromMigrate=*/false);
+                Helpers::upsert(opCtx, nss, stateDoc.toBSON(), /*fromMigrate=*/false);
             if (updateResult.numMatched == 0) {
                 return {ErrorCodes::NoSuchKey,
                         str::stream()
@@ -147,11 +148,8 @@ StatusWith<TenantMigrationRecipientDocument> getStateDoc(OperationContext* opCtx
     }
 
     BSONObj result;
-    auto foundDoc = Helpers::findOne(opCtx,
-                                     collection.getCollection(),
-                                     BSON("_id" << migrationUUID),
-                                     result,
-                                     /*requireIndex=*/true);
+    auto foundDoc =
+        Helpers::findOne(opCtx, collection.getCollection(), BSON("_id" << migrationUUID), result);
     if (!foundDoc) {
         return Status(ErrorCodes::NoMatchingDocument,
                       str::stream() << "No matching state doc found with tenant migration UUID: "
@@ -159,7 +157,7 @@ StatusWith<TenantMigrationRecipientDocument> getStateDoc(OperationContext* opCtx
     }
 
     try {
-        return TenantMigrationRecipientDocument::parse(IDLParserErrorContext("recipientStateDoc"),
+        return TenantMigrationRecipientDocument::parse(IDLParserContext("recipientStateDoc"),
                                                        result);
     } catch (DBException& ex) {
         return ex.toStatus(

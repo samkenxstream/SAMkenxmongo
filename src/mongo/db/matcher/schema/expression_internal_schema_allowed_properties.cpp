@@ -30,6 +30,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/matcher/schema/expression_internal_schema_allowed_properties.h"
+#include "mongo/util/errno_util.h"
 
 namespace mongo {
 constexpr StringData InternalSchemaAllowedPropertiesMatchExpression::kName;
@@ -47,10 +48,10 @@ InternalSchemaAllowedPropertiesMatchExpression::InternalSchemaAllowedPropertiesM
       _otherwise(std::move(otherwise)) {
 
     for (auto&& constraint : _patternProperties) {
-        const auto& errorStr = constraint.first.regex->error();
+        const auto& re = constraint.first.regex;
         uassert(ErrorCodes::BadValue,
-                str::stream() << "Invalid regular expression: " << errorStr,
-                errorStr.empty());
+                str::stream() << "Invalid regular expression: " << errorMessage(re->error()),
+                *re);
     }
 }
 
@@ -59,16 +60,9 @@ void InternalSchemaAllowedPropertiesMatchExpression::debugString(StringBuilder& 
     _debugAddSpace(debug, indentationLevel);
 
     BSONObjBuilder builder;
-    serialize(&builder, true);
-    debug << builder.obj().toString() << "\n";
-
-    const auto* tag = getTag();
-    if (tag) {
-        debug << " ";
-        tag->debugString(&debug);
-    }
-
-    debug << "\n";
+    serialize(&builder, {});
+    debug << builder.obj().toString();
+    _debugStringAttachTagInfo(&debug);
 }
 
 bool InternalSchemaAllowedPropertiesMatchExpression::equivalent(const MatchExpression* expr) const {
@@ -107,7 +101,7 @@ bool InternalSchemaAllowedPropertiesMatchExpression::_matchesBSONObj(const BSONO
     for (auto&& property : obj) {
         bool checkOtherwise = true;
         for (auto&& constraint : _patternProperties) {
-            if (constraint.first.regex->PartialMatch(property.fieldName())) {
+            if (constraint.first.regex->matchView(property.fieldName())) {
                 checkOtherwise = false;
                 if (!constraint.second->matchesBSONElement(property)) {
                     return false;
@@ -128,47 +122,54 @@ bool InternalSchemaAllowedPropertiesMatchExpression::_matchesBSONObj(const BSONO
 }
 
 void InternalSchemaAllowedPropertiesMatchExpression::serialize(BSONObjBuilder* builder,
-                                                               bool includePath) const {
+                                                               SerializationOptions opts) const {
     BSONObjBuilder expressionBuilder(
         builder->subobjStart(InternalSchemaAllowedPropertiesMatchExpression::kName));
 
     std::vector<StringData> sortedProperties(_properties.begin(), _properties.end());
     std::sort(sortedProperties.begin(), sortedProperties.end());
-    expressionBuilder.append("properties", sortedProperties);
-
-    expressionBuilder.append("namePlaceholder", _namePlaceholder);
+    if (opts.replacementForLiteralArgs) {
+        expressionBuilder.append("properties", opts.replacementForLiteralArgs.get());
+        expressionBuilder.append("namePlaceholder", opts.replacementForLiteralArgs.get());
+    } else {
+        expressionBuilder.append("properties", sortedProperties);
+        expressionBuilder.append("namePlaceholder", _namePlaceholder);
+    }
 
     BSONArrayBuilder patternPropertiesBuilder(expressionBuilder.subarrayStart("patternProperties"));
     for (auto&& item : _patternProperties) {
         BSONObjBuilder itemBuilder(patternPropertiesBuilder.subobjStart());
-        itemBuilder.appendRegex("regex", item.first.rawRegex);
+        if (opts.replacementForLiteralArgs) {
+            itemBuilder.appendRegex("regex", opts.replacementForLiteralArgs.get());
+        } else {
+            itemBuilder.appendRegex("regex", item.first.rawRegex);
+        }
 
         BSONObjBuilder subexpressionBuilder(itemBuilder.subobjStart("expression"));
-        item.second->getFilter()->serialize(&subexpressionBuilder, includePath);
+        item.second->getFilter()->serialize(&subexpressionBuilder, opts);
         subexpressionBuilder.doneFast();
     }
     patternPropertiesBuilder.doneFast();
 
     BSONObjBuilder otherwiseBuilder(expressionBuilder.subobjStart("otherwise"));
-    _otherwise->getFilter()->serialize(&otherwiseBuilder, includePath);
+    _otherwise->getFilter()->serialize(&otherwiseBuilder, opts);
     otherwiseBuilder.doneFast();
     expressionBuilder.doneFast();
 }
 
-std::unique_ptr<MatchExpression> InternalSchemaAllowedPropertiesMatchExpression::shallowClone()
-    const {
+std::unique_ptr<MatchExpression> InternalSchemaAllowedPropertiesMatchExpression::clone() const {
     std::vector<PatternSchema> clonedPatternProperties;
     clonedPatternProperties.reserve(_patternProperties.size());
     for (auto&& constraint : _patternProperties) {
         clonedPatternProperties.emplace_back(Pattern(constraint.first.rawRegex),
-                                             constraint.second->shallowClone());
+                                             constraint.second->clone());
     }
 
     auto clone = std::make_unique<InternalSchemaAllowedPropertiesMatchExpression>(
         _properties,
         _namePlaceholder,
         std::move(clonedPatternProperties),
-        _otherwise->shallowClone(),
+        _otherwise->clone(),
         _errorAnnotation);
     return {std::move(clone)};
 }

@@ -43,7 +43,7 @@ UUID OplogApplicationChecks::getUUIDFromOplogEntry(const BSONObj& oplogEntry) {
 };
 
 Status OplogApplicationChecks::checkOperationAuthorization(OperationContext* opCtx,
-                                                           const std::string& dbname,
+                                                           const DatabaseName&,
                                                            const BSONObj& oplogEntry,
                                                            AuthorizationSession* authSession,
                                                            bool alwaysUpsert) {
@@ -62,15 +62,19 @@ Status OplogApplicationChecks::checkOperationAuthorization(OperationContext* opC
 
     BSONElement nsElem = oplogEntry["ns"];
     checkBSONType(BSONType::String, nsElem);
-    NamespaceString ns(oplogEntry["ns"].checkAndGetStringData());
+    boost::optional<TenantId> tid = oplogEntry.hasElement("tid")
+        ? boost::make_optional<TenantId>(TenantId::parseFromBSON(oplogEntry["tid"]))
+        : boost::none;
+    NamespaceString nss =
+        NamespaceStringUtil::deserialize(tid, oplogEntry["ns"].checkAndGetStringData());
 
     if (oplogEntry.hasField("ui"_sd)) {
         // ns by UUID overrides the ns specified if they are different.
         auto catalog = CollectionCatalog::get(opCtx);
         boost::optional<NamespaceString> uuidCollNS =
             catalog->lookupNSSByUUID(opCtx, getUUIDFromOplogEntry(oplogEntry));
-        if (uuidCollNS && *uuidCollNS != ns)
-            ns = *uuidCollNS;
+        if (uuidCollNS && *uuidCollNS != nss)
+            nss = *uuidCollNS;
     }
 
     BSONElement oElem = oplogEntry["o"];
@@ -84,19 +88,26 @@ Status OplogApplicationChecks::checkOperationAuthorization(OperationContext* opC
             return Status(ErrorCodes::FailedToParse, "Unrecognized command in op");
         }
 
-        std::string dbNameForAuthCheck = ns.db().toString();
+        auto dbNameForAuthCheck = nss.dbName();
         if (commandName == "renameCollection") {
             // renameCollection commands must be run on the 'admin' database. Its arguments are
             // fully qualified namespaces. Catalog internals don't know the op produced by running
             // renameCollection was originally run on 'admin', so we must restore this.
-            dbNameForAuthCheck = "admin";
+            dbNameForAuthCheck = DatabaseName(nss.tenantId(), "admin");
         }
 
         // TODO reuse the parse result for when we run() later. Note that when running,
         // we must use a potentially different dbname.
         return [&] {
             try {
-                auto request = OpMsgRequest::fromDBAndBody(dbNameForAuthCheck, o);
+                using VTS = auth::ValidatedTenancyScope;
+                boost::optional<VTS> vts = dbNameForAuthCheck.tenantId()
+                    ? boost::optional<VTS>(VTS(dbNameForAuthCheck.tenantId().value(),
+                                               VTS::TrustedForInnerOpMsgRequestTag{}))
+                    : boost::none;
+
+                auto request = OpMsgRequestBuilder::createWithValidatedTenancyScope(
+                    dbNameForAuthCheck, vts, o);
                 commandInOplogEntry->parse(opCtx, request)->checkAuthorization(opCtx, request);
                 return Status::OK();
             } catch (const DBException& e) {
@@ -106,7 +117,7 @@ Status OplogApplicationChecks::checkOperationAuthorization(OperationContext* opC
     }
 
     if (opType == "i"_sd) {
-        return auth::checkAuthForInsert(authSession, opCtx, ns);
+        return auth::checkAuthForInsert(authSession, opCtx, nss);
     } else if (opType == "u"_sd) {
         BSONElement o2Elem = oplogEntry["o2"];
         checkBSONType(BSONType::Object, o2Elem);
@@ -122,14 +133,14 @@ Status OplogApplicationChecks::checkOperationAuthorization(OperationContext* opC
 
         return auth::checkAuthForUpdate(authSession,
                                         opCtx,
-                                        ns,
+                                        nss,
                                         o2,
                                         write_ops::UpdateModification::parseFromOplogEntry(
                                             o, write_ops::UpdateModification::DiffOptions{}),
                                         upsert);
     } else if (opType == "d"_sd) {
 
-        return auth::checkAuthForDelete(authSession, opCtx, ns, o);
+        return auth::checkAuthForDelete(authSession, opCtx, nss, o);
     } else if (opType == "db"_sd) {
         // It seems that 'db' isn't used anymore. Require all actions to prevent casual use.
         ActionSet allActions;
@@ -206,10 +217,10 @@ Status OplogApplicationChecks::checkOperation(const BSONElement& e) {
     return Status::OK();
 }
 
-Status OplogApplicationChecks::checkAuthForCommand(OperationContext* opCtx,
-                                                   const std::string& dbname,
-                                                   const BSONObj& cmdObj,
-                                                   OplogApplicationValidity validity) {
+Status OplogApplicationChecks::checkAuthForOperation(OperationContext* opCtx,
+                                                     const DatabaseName& dbName,
+                                                     const BSONObj& cmdObj,
+                                                     OplogApplicationValidity validity) {
     AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
     if (!authSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
                                                        ActionType::applyOps)) {
@@ -252,24 +263,9 @@ Status OplogApplicationChecks::checkAuthForCommand(OperationContext* opCtx,
     for (const BSONElement& e : cmdObj.firstElement().Array()) {
         checkBSONType(BSONType::Object, e);
         Status status = OplogApplicationChecks::checkOperationAuthorization(
-            opCtx, dbname, e.Obj(), authSession, alwaysUpsert);
+            opCtx, dbName, e.Obj(), authSession, alwaysUpsert);
         if (!status.isOK()) {
             return status;
-        }
-    }
-
-    BSONElement preconditions = cmdObj["preCondition"];
-    if (!preconditions.eoo()) {
-        for (const BSONElement& precondition : preconditions.Array()) {
-            checkBSONType(BSONType::Object, precondition);
-            BSONElement nsElem = precondition.Obj()["ns"];
-            checkBSONType(BSONType::String, nsElem);
-            NamespaceString nss(nsElem.checkAndGetStringData());
-
-            if (!authSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forExactNamespace(nss), ActionType::find)) {
-                return Status(ErrorCodes::Unauthorized, "Unauthorized to check precondition");
-            }
         }
     }
 

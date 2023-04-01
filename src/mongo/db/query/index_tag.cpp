@@ -46,13 +46,13 @@ namespace {
 // Compares 'lhs' for 'rhs', using the tag-based ordering expected by the access planner. Returns a
 // negative number if 'lhs' is smaller than 'rhs', 0 if they are equal, and 1 if 'lhs' is larger.
 int tagComparison(const MatchExpression* lhs, const MatchExpression* rhs) {
-    IndexTag* lhsTag = static_cast<IndexTag*>(lhs->getTag());
-    size_t lhsValue = (nullptr == lhsTag) ? IndexTag::kNoIndex : lhsTag->index;
-    size_t lhsPos = (nullptr == lhsTag) ? IndexTag::kNoIndex : lhsTag->pos;
+    IndexTag* lhsTag = dynamic_cast<IndexTag*>(lhs->getTag());
+    size_t lhsValue = lhsTag ? lhsTag->index : IndexTag::kNoIndex;
+    size_t lhsPos = lhsTag ? lhsTag->pos : IndexTag::kNoIndex;
 
-    IndexTag* rhsTag = static_cast<IndexTag*>(rhs->getTag());
-    size_t rhsValue = (nullptr == rhsTag) ? IndexTag::kNoIndex : rhsTag->index;
-    size_t rhsPos = (nullptr == rhsTag) ? IndexTag::kNoIndex : rhsTag->pos;
+    IndexTag* rhsTag = dynamic_cast<IndexTag*>(rhs->getTag());
+    size_t rhsValue = rhsTag ? rhsTag->index : IndexTag::kNoIndex;
+    size_t rhsPos = rhsTag ? rhsTag->pos : IndexTag::kNoIndex;
 
     // First, order on indices.
     if (lhsValue != rhsValue) {
@@ -60,18 +60,23 @@ int tagComparison(const MatchExpression* lhs, const MatchExpression* rhs) {
         return lhsValue < rhsValue ? -1 : 1;
     }
 
-    // Next, order so that if there's a GEO_NEAR it's first.
-    if (MatchExpression::GEO_NEAR == lhs->matchType()) {
-        return -1;
-    } else if (MatchExpression::GEO_NEAR == rhs->matchType()) {
-        return 1;
-    }
+    // Next, order geo and text predicates which MUST use an index before all others. We're not sure
+    // if this is strictly necessary for correctness, but putting these all together and first may
+    // help determine earlier if there is an index that must be used.
+    if (lhs->matchType() != rhs->matchType()) {
+        // Next, order so that if there's a GEO_NEAR it's first.
+        if (MatchExpression::GEO_NEAR == lhs->matchType()) {
+            return -1;
+        } else if (MatchExpression::GEO_NEAR == rhs->matchType()) {
+            return 1;
+        }
 
-    // Ditto text.
-    if (MatchExpression::TEXT == lhs->matchType()) {
-        return -1;
-    } else if (MatchExpression::TEXT == rhs->matchType()) {
-        return 1;
+        // Ditto text.
+        if (MatchExpression::TEXT == lhs->matchType()) {
+            return -1;
+        } else if (MatchExpression::TEXT == rhs->matchType()) {
+            return 1;
+        }
     }
 
     // Next, order so that the first field of a compound index appears first.
@@ -128,9 +133,9 @@ void attachNode(MatchExpression* node,
                 OrMatchExpression* targetParent,
                 size_t targetPosition,
                 std::unique_ptr<MatchExpression::TagData> tagData) {
-    auto clone = node->shallowClone();
+    auto clone = node->clone();
     if (clone->matchType() == MatchExpression::NOT) {
-        IndexTag* indexTag = static_cast<IndexTag*>(tagData.get());
+        IndexTag* indexTag = checked_cast<IndexTag*>(tagData.get());
         clone->setTag(new IndexTag(indexTag->index));
         clone->getChild(0)->setTag(tagData.release());
     } else {
@@ -142,7 +147,7 @@ void attachNode(MatchExpression* node,
         andNode->add(std::move(clone));
     } else {
         auto andNode = std::make_unique<AndMatchExpression>();
-        auto indexTag = static_cast<IndexTag*>(clone->getTag());
+        auto indexTag = checked_cast<IndexTag*>(clone->getTag());
         andNode->setTag(new IndexTag(indexTag->index));
         andNode->add(std::move((*targetParent->getChildVector())[targetPosition]));
         andNode->add(std::move(clone));
@@ -286,21 +291,24 @@ void resolveOrPushdowns(MatchExpression* tree) {
         AndMatchExpression* andNode = static_cast<AndMatchExpression*>(tree);
         MatchExpression* indexedOr = getIndexedOr(andNode);
 
-        for (size_t i = 0; i < andNode->numChildren(); ++i) {
-            auto child = andNode->getChild(i);
+        if (indexedOr) {
+            for (size_t i = 0; i < andNode->numChildren(); ++i) {
+                auto child = andNode->getChild(i);
 
-            // For ELEM_MATCH_OBJECT, we push down all tagged descendants. However, we cannot trim
-            // any of these predicates, since the $elemMatch filter must be applied in its entirety.
-            if (child->matchType() == MatchExpression::ELEM_MATCH_OBJECT) {
-                std::vector<MatchExpression*> orPushdownDescendants;
-                getElemMatchOrPushdownDescendants(child, &orPushdownDescendants);
-                for (auto descendant : orPushdownDescendants) {
-                    static_cast<void>(processOrPushdownNode(descendant, indexedOr));
+                // For ELEM_MATCH_OBJECT, we push down all tagged descendants. However, we cannot
+                // trim any of these predicates, since the $elemMatch filter must be applied in its
+                // entirety.
+                if (child->matchType() == MatchExpression::ELEM_MATCH_OBJECT) {
+                    std::vector<MatchExpression*> orPushdownDescendants;
+                    getElemMatchOrPushdownDescendants(child, &orPushdownDescendants);
+                    for (auto descendant : orPushdownDescendants) {
+                        static_cast<void>(processOrPushdownNode(descendant, indexedOr));
+                    }
+                } else if (processOrPushdownNode(child, indexedOr)) {
+                    // The indexed $or can completely satisfy the child predicate, so we trim it.
+                    auto ownedChild = andNode->removeChild(i);
+                    --i;
                 }
-            } else if (processOrPushdownNode(child, indexedOr)) {
-                // The indexed $or can completely satisfy the child predicate, so we trim it.
-                auto ownedChild = andNode->removeChild(i);
-                --i;
             }
         }
     }

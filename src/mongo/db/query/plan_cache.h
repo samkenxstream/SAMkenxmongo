@@ -30,7 +30,9 @@
 #pragma once
 
 #include "mongo/db/catalog/util/partitioned.h"
+#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/query/lru_key_value.h"
+#include "mongo/db/query/partitioned_cache.h"
 #include "mongo/db/query/plan_cache_callbacks.h"
 #include "mongo/db/query/plan_cache_debug_info.h"
 #include "mongo/platform/mutex.h"
@@ -46,7 +48,22 @@ class PlanCacheEntryBase;
 /**
  * Tracks the approximate cumulative size of the plan cache entries across all the collections.
  */
-extern Counter64 planCacheTotalSizeEstimateBytes;
+extern CounterMetric planCacheTotalSizeEstimateBytes;
+
+/**
+ * Tracks the number of query shapes in the plan cache entries across all the collections. Each
+ * entry in the plan cache is a unique query shape.
+ */
+extern CounterMetric planCacheEntries;
+
+/**
+ * Represents the security level of a plan to help us dictate if we whould filter it out during
+ * planCacheStats.
+ */
+enum class PlanSecurityLevel {
+    kNotSensitive,
+    kSensitive,
+};
 
 /**
  * Information returned from a get(...) query.
@@ -61,8 +78,7 @@ public:
     CachedPlanHolder(const PlanCacheEntryBase<CachedPlanType, DebugInfoType>& entry)
         : cachedPlan(entry.cachedPlan->clone()),
           decisionWorks(entry.works),
-          debugInfo(entry.debugInfo ? std::make_unique<DebugInfoType>(*entry.debugInfo) : nullptr) {
-    }
+          debugInfo(entry.debugInfo) {}
 
     /**
      * Indicates whether or not the cached plan is pinned to cache.
@@ -79,8 +95,9 @@ public:
     // is not subject to replanning.
     const boost::optional<size_t> decisionWorks;
 
-    // Per-plan cache entry information that is used for debugging purpose.
-    std::unique_ptr<DebugInfoType> debugInfo;
+    // Per-plan cache entry information that is used for debugging purpose. Shared across all plans
+    // recovered from the same cached entry.
+    const std::shared_ptr<const DebugInfoType> debugInfo;
 };
 
 /**
@@ -95,12 +112,14 @@ public:
     static std::unique_ptr<Entry> create(std::unique_ptr<CachedPlanType> cachedPlan,
                                          uint32_t queryHash,
                                          uint32_t planCacheKey,
+                                         uint32_t planCacheCommandKey,
                                          Date_t timeOfCreation,
                                          bool isActive,
+                                         PlanSecurityLevel securityLevel,
                                          size_t works,
                                          DebugInfoType debugInfo) {
         // If the cumulative size of the plan caches is estimated to remain within a predefined
-        // threshold, then then include additional debug info which is not strictly necessary for
+        // threshold, then include additional debug info which is not strictly necessary for
         // the plan cache to be functional. Once the cumulative plan cache size exceeds this
         // threshold, omit this debug info as a heuristic to prevent plan cache memory consumption
         // from growing too large.
@@ -113,16 +132,18 @@ public:
             includeDebugInfo = true;
         }
 
-        boost::optional<DebugInfoType> debugInfoOpt;
+        std::shared_ptr<const DebugInfoType> debugInfoOpt;
         if (includeDebugInfo) {
-            debugInfoOpt.emplace(std::move(debugInfo));
+            debugInfoOpt = std::make_shared<const DebugInfoType>(std::move(debugInfo));
         }
 
         return std::unique_ptr<Entry>(new Entry(std::move(cachedPlan),
                                                 timeOfCreation,
                                                 queryHash,
                                                 planCacheKey,
+                                                planCacheCommandKey,
                                                 isActive,
+                                                securityLevel,
                                                 works,
                                                 std::move(debugInfoOpt)));
     }
@@ -135,19 +156,25 @@ public:
     static std::unique_ptr<Entry> createPinned(std::unique_ptr<CachedPlanType> cachedPlan,
                                                uint32_t queryHash,
                                                uint32_t planCacheKey,
+                                               uint32_t planCacheCommandKey,
                                                Date_t timeOfCreation,
+                                               PlanSecurityLevel securityLevel,
                                                DebugInfoType debugInfo) {
-        return std::unique_ptr<Entry>(new Entry(std::move(cachedPlan),
-                                                timeOfCreation,
-                                                queryHash,
-                                                planCacheKey,
-                                                true,         // isActive
-                                                boost::none,  // decisionWorks
-                                                std::move(debugInfo)));
+        return std::unique_ptr<Entry>(
+            new Entry(std::move(cachedPlan),
+                      timeOfCreation,
+                      queryHash,
+                      planCacheKey,
+                      planCacheCommandKey,
+                      true,  // isActive
+                      securityLevel,
+                      boost::none,  // decisionWorks
+                      std::make_shared<const DebugInfoType>(std::move(debugInfo))));
     }
 
     ~PlanCacheEntryBase() {
         planCacheTotalSizeEstimateBytes.decrement(estimatedEntrySizeBytes);
+        planCacheEntries.decrement(1);
     }
 
     /**
@@ -159,21 +186,19 @@ public:
     }
 
     /**
-     * Make a deep copy.
+     * Make a copy of this plan cache entry. For all members a deep copy will be made, apart from
+     * 'debugInfo' which is shared among all clone entries.
      */
     std::unique_ptr<Entry> clone() const {
-        boost::optional<DebugInfoType> debugInfoCopy;
-        if (debugInfo) {
-            debugInfoCopy.emplace(*debugInfo);
-        }
-
         return std::unique_ptr<Entry>(new Entry(cachedPlan->clone(),
                                                 timeOfCreation,
                                                 queryHash,
                                                 planCacheKey,
+                                                planCacheCommandKey,
                                                 isActive,
+                                                securityLevel,
                                                 works,
-                                                std::move(debugInfoCopy)));
+                                                debugInfo));
     }
 
     std::string debugString() const {
@@ -189,7 +214,7 @@ public:
     }
 
     // A cached plan that can be used to reconstitute the complete execution plan from cache.
-    const std::unique_ptr<CachedPlanType> cachedPlan;
+    const std::unique_ptr<const CachedPlanType> cachedPlan;
 
     const Date_t timeOfCreation;
 
@@ -200,9 +225,19 @@ public:
     // Hash of the "stable" cache key, which is the same regardless of what indexes are around.
     const uint32_t planCacheKey;
 
+    // Hash of the plan cache command key. This key is a representation of the query shape used
+    // specifically by the plan cache commands (planCacheClear, planCacheClearFilter,
+    // planCacheListFilters, and planCacheSetFilter). Its encoding incorporates the filter, sort,
+    // projection, and user-defined collation.
+    const uint32_t planCacheCommandKey;
+
     // Whether or not the cache entry is active. Inactive cache entries should not be used for
     // planning.
     bool isActive = false;
+
+    // Security level of the plan entry, dictates whether a plan should be omitted during
+    // planCacheStats.
+    PlanSecurityLevel securityLevel;
 
     // The number of "works" required for a plan to run on this shape before it becomes
     // active. This value is also used to determine the number of works necessary in order to
@@ -211,11 +246,11 @@ public:
     //
     // If boost::none the cached entry is pinned to cached. Pinned entries are always active
     // and are not subject to replanning.
-    boost::optional<size_t> works;
+    const boost::optional<size_t> works;
 
     // Optional debug info containing plan cache entry information that is used strictly as
-    // debug information.
-    const boost::optional<DebugInfoType> debugInfo;
+    // debug information. Read-only and shared between all plans recovered from this entry.
+    const std::shared_ptr<const DebugInfoType> debugInfo;
 
     // An estimate of the size in bytes of this plan cache entry. This is the "deep size",
     // calculated by recursively incorporating the size of owned objects, the objects that they in
@@ -230,14 +265,18 @@ private:
                        Date_t timeOfCreation,
                        uint32_t queryHash,
                        uint32_t planCacheKey,
+                       uint32_t planCacheCommandKey,
                        bool isActive,
+                       PlanSecurityLevel securityLevel,
                        boost::optional<size_t> works,
-                       boost::optional<DebugInfoType> debugInfo)
+                       std::shared_ptr<const DebugInfoType> debugInfo)
         : cachedPlan(std::move(cachedPlan)),
           timeOfCreation(timeOfCreation),
           queryHash(queryHash),
           planCacheKey(planCacheKey),
+          planCacheCommandKey(planCacheCommandKey),
           isActive(isActive),
+          securityLevel(securityLevel),
           works(works),
           debugInfo(std::move(debugInfo)),
           estimatedEntrySizeBytes(_estimateObjectSizeInBytes()) {
@@ -246,6 +285,8 @@ private:
         // Account for the object in the global metric for estimating the server's total plan cache
         // memory consumption.
         planCacheTotalSizeEstimateBytes.increment(estimatedEntrySizeBytes);
+        // Account for new entry in the plan cache.
+        planCacheEntries.increment(1);
     }
 
     // Ensure that PlanCacheEntryBase is non-copyable.
@@ -273,18 +314,32 @@ private:
  */
 template <class KeyType,
           class CachedPlanType,
-          class BudgetEstimator,
+          class KeyBudgetEstimator,
           class DebugInfoType,
           class Partitioner,
           class KeyHasher = std::hash<KeyType>>
-class PlanCacheBase {
+class PlanCacheBase
+    : public PartitionedCache<
+          KeyType,
+          // The 'Value' being "std::shared_ptr<const Entry>" is because we allow readers to clone
+          // cache entries out of the lock, therefore it is illegal to mutate the pieces of a cache
+          // entry that can be cloned whether you are holding a lock or not.
+          std::shared_ptr<const PlanCacheEntryBase<CachedPlanType, DebugInfoType>>,
+          KeyBudgetEstimator,
+          Partitioner,
+          KeyHasher> {
 private:
     PlanCacheBase(const PlanCacheBase&) = delete;
     PlanCacheBase& operator=(const PlanCacheBase&) = delete;
 
 public:
+    using Base =
+        PartitionedCache<KeyType,
+                         std::shared_ptr<const PlanCacheEntryBase<CachedPlanType, DebugInfoType>>,
+                         KeyBudgetEstimator,
+                         Partitioner,
+                         KeyHasher>;
     using Entry = PlanCacheEntryBase<CachedPlanType, DebugInfoType>;
-    using Lru = LRUKeyValue<KeyType, Entry, BudgetEstimator, KeyHasher>;
 
     // We have three states for a cache entry to be in. Rather than just 'present' or 'not
     // present', we use a notion of 'inactive entries' as a way of remembering how performant our
@@ -317,11 +372,7 @@ public:
      * Initialize plan cache with the total cache size in bytes and number of partitions.
      */
     explicit PlanCacheBase(size_t cacheSize, size_t numPartitions = 1)
-        : _numPartitions(numPartitions) {
-        invariant(numPartitions > 0);
-        Lru lru{cacheSize / numPartitions};
-        _partitionedCache = std::make_unique<Partitioned<Lru, Partitioner>>(numPartitions, lru);
-    }
+        : Base(cacheSize, numPartitions) {}
 
     ~PlanCacheBase() = default;
 
@@ -346,6 +397,7 @@ public:
                const plan_ranker::PlanRankingDecision& why,
                Date_t now,
                const PlanCacheCallbacks<KeyType, CachedPlanType, DebugInfoType>* callbacks,
+               PlanSecurityLevel securityLevel,
                boost::optional<double> worksGrowthCoefficient = boost::none) {
         invariant(cachedPlan);
 
@@ -354,49 +406,58 @@ public:
                           "number of scores in decision must match viable candidates");
         }
 
-        auto newWorks = stdx::visit(
-            visit_helper::Overloaded{[](const plan_ranker::StatsDetails& details) {
-                                         return details.candidatePlanStats[0]->common.works;
-                                     },
-                                     [](const plan_ranker::SBEStatsDetails& details) {
-                                         return calculateNumberOfReads(
-                                             details.candidatePlanStats[0].get());
-                                     }},
-            why.stats);
+        auto newWorks =
+            stdx::visit(OverloadedVisitor{[](const plan_ranker::StatsDetails& details) {
+                                              return details.candidatePlanStats[0]->common.works;
+                                          },
+                                          [](const plan_ranker::SBEStatsDetails& details) {
+                                              return calculateNumberOfReads(
+                                                  details.candidatePlanStats[0].get());
+                                          }},
+                        why.stats);
 
-        auto partition = _partitionedCache->lockOnePartition(key);
-        auto [queryHash, planCacheKey, isNewEntryActive, shouldBeCreated] = [&]() {
+        auto oldEntryWithPartitionLock = this->getWithPartitionLock(key);
+        // Can't use reference to structured bindings in a lambda until C++20 so manually
+        // destructure it here.
+        auto partitionLock = std::move(oldEntryWithPartitionLock.second);
+        auto oldEntryWithStatus = std::move(oldEntryWithPartitionLock.first);
+        auto [queryHash, planCacheKey, isNewEntryActive, shouldBeCreated, increasedWorks] = [&]() {
             if (internalQueryCacheDisableInactiveEntries.load()) {
                 // All entries are always active.
                 return std::make_tuple(key.queryHash(),
                                        key.planCacheKeyHash(),
                                        true /* isNewEntryActive  */,
-                                       true /* shouldBeCreated  */);
+                                       true /* shouldBeCreated  */,
+                                       boost::optional<size_t>(boost::none));
             } else {
-                auto oldEntryWithStatus = partition->get(key);
                 tassert(6007020,
                         "LRU store must get value or NoSuchKey error code",
                         oldEntryWithStatus.isOK() ||
                             oldEntryWithStatus.getStatus() == ErrorCodes::NoSuchKey);
-                Entry* oldEntry =
-                    oldEntryWithStatus.isOK() ? oldEntryWithStatus.getValue() : nullptr;
+                bool hasOldEntry = oldEntryWithStatus.isOK();
 
                 const auto newState = getNewEntryState(
                     key,
-                    oldEntry,
+                    // Deference the pointer, then the shared_ptr, and then back to a raw pointer.
+                    hasOldEntry ? &**oldEntryWithStatus.getValue() : nullptr,
                     newWorks,
                     worksGrowthCoefficient.get_value_or(internalQueryCacheWorksGrowthCoefficient),
                     callbacks);
 
                 // Avoid recomputing the hashes if we've got an old entry to grab them from.
-                return oldEntry ? std::make_tuple(oldEntry->queryHash,
-                                                  oldEntry->planCacheKey,
-                                                  newState.shouldBeActive,
-                                                  newState.shouldBeCreated)
-                                : std::make_tuple(key.queryHash(),
-                                                  key.planCacheKeyHash(),
-                                                  newState.shouldBeActive,
-                                                  newState.shouldBeCreated);
+                auto [queryHash, planCacheKey] = [&]() {
+                    if (hasOldEntry) {
+                        auto&& oldEntry = &**oldEntryWithStatus.getValue();
+                        return std::make_pair(oldEntry->queryHash, oldEntry->planCacheKey);
+                    } else {
+                        return std::make_pair(key.queryHash(), key.planCacheKeyHash());
+                    }
+                }();
+                return std::make_tuple(queryHash,
+                                       planCacheKey,
+                                       newState.shouldBeActive,
+                                       newState.shouldBeCreated,
+                                       newState.increasedWorks);
             }
         }();
 
@@ -406,15 +467,22 @@ public:
 
         // We use callback function here to build the 'DebugInfo' rather than pass in a constructed
         // DebugInfo for performance.
-        auto newEntry(Entry::create(std::move(cachedPlan),
-                                    queryHash,
-                                    planCacheKey,
-                                    now,
-                                    isNewEntryActive,
-                                    newWorks,
-                                    callbacks->buildDebugInfo()));
+        //
+        // Most of the time when either creating a new cache entry or replacing an old cache entry,
+        // the 'works' value is based on the latest trial run. However, if the cache entry was
+        // inactive and the latest trial required a higher works value, then we follow a special
+        // formula for computing an 'increasedWorks' value.
+        std::shared_ptr<Entry> newEntry = Entry::create(std::move(cachedPlan),
+                                                        queryHash,
+                                                        planCacheKey,
+                                                        callbacks->getPlanCacheCommandKeyHash(),
+                                                        now,
+                                                        isNewEntryActive,
+                                                        securityLevel,
+                                                        increasedWorks ? *increasedWorks : newWorks,
+                                                        callbacks->buildDebugInfo());
 
-        partition->add(key, newEntry.release());
+        this->put(key, std::move(newEntry), partitionLock);
         return Status::OK();
     }
 
@@ -423,16 +491,22 @@ public:
      * is always created and always active in this scenario.
      */
     void setPinned(const KeyType& key,
+                   const uint32_t planCacheCommandKey,
                    std::unique_ptr<CachedPlanType> plan,
                    Date_t now,
-                   DebugInfoType debugInfo) {
+                   DebugInfoType debugInfo,
+                   bool shouldOmitDiagnosticInformation) {
         invariant(plan);
-        auto entry = Entry::createPinned(
-            std::move(plan), key.queryHash(), key.planCacheKeyHash(), now, std::move(debugInfo));
-        auto partition = _partitionedCache->lockOnePartition(key);
-        // We're not interested in the number of evicted entries if the cache store exceeds the
-        // budget after add(), so we just ignore the return value.
-        partition->add(key, entry.release());
+        std::shared_ptr<Entry> entry =
+            Entry::createPinned(std::move(plan),
+                                key.queryHash(),
+                                key.planCacheKeyHash(),
+                                planCacheCommandKey,
+                                now,
+                                shouldOmitDiagnosticInformation ? PlanSecurityLevel::kSensitive
+                                                                : PlanSecurityLevel::kNotSensitive,
+                                std::move(debugInfo));
+        this->put(key, std::move(entry));
     }
 
     /**
@@ -446,16 +520,21 @@ public:
             return;
         }
 
-        auto partition = _partitionedCache->lockOnePartition(key);
-        auto entry = partition->get(key);
+        auto [entry, partitionLock] = this->getWithPartitionLock(key);
+
         if (!entry.isOK()) {
             tassert(6007021,
                     "Unexpected error code from LRU store",
                     entry.getStatus() == ErrorCodes::NoSuchKey);
             return;
         }
-        tassert(6007022, "LRU store must get a value or an error code", entry.getValue());
-        entry.getValue()->isActive = false;
+
+        auto entryPtr = *entry.getValue();
+        if (entryPtr->isActive == true) {
+            std::shared_ptr<Entry> newEntry = entryPtr->clone();
+            newEntry->isActive = false;
+            this->put(key, std::move(newEntry), partitionLock);
+        }
     }
 
     /**
@@ -466,21 +545,26 @@ public:
      * for the query (if there is one).
      */
     GetResult get(const KeyType& key) const {
-        auto partition = _partitionedCache->lockOnePartition(key);
-        auto entry = partition->get(key);
-        if (!entry.isOK()) {
-            tassert(6007023,
-                    "Unexpected error code from LRU store",
-                    entry.getStatus() == ErrorCodes::NoSuchKey);
-            return {CacheEntryState::kNotPresent, nullptr};
+        std::shared_ptr<const Entry> entrySharedPtr;
+        CacheEntryState state;
+        {
+            auto [entry, partitionLock] = this->getWithPartitionLock(key);
+            if (!entry.isOK()) {
+                tassert(6007023,
+                        "Unexpected error code from LRU store",
+                        entry.getStatus() == ErrorCodes::NoSuchKey);
+                return {CacheEntryState::kNotPresent, nullptr};
+            }
+            entrySharedPtr = *entry.getValue();
+            state = entrySharedPtr->isActive ? CacheEntryState::kPresentActive
+                                             : CacheEntryState::kPresentInactive;
         }
-        tassert(6007024, "LRU store must get a value or an error code", entry.getValue());
-
-        auto state = entry.getValue()->isActive ? CacheEntryState::kPresentActive
-                                                : CacheEntryState::kPresentInactive;
-        return {
-            state,
-            std::make_unique<CachedPlanHolder<CachedPlanType, DebugInfoType>>(*entry.getValue())};
+        // The purpose of cloning 'entry' (in CachedPlanHolder ctor) after we release the lock
+        // is to allow multiple threads to clone the same plan cache entry at once. 'entry'
+        // cannot be deleted by another thread even if the plan cache is being concurrently
+        // modified by other threads because we are holding a std::shared_ptr to this entry.
+        return {state,
+                std::make_unique<CachedPlanHolder<CachedPlanType, DebugInfoType>>(*entrySharedPtr)};
     }
 
     /**
@@ -499,59 +583,16 @@ public:
     }
 
     /**
-     * Remove the entry with the 'key' from the cache. If there is no entry for the given key in
-     * the cache, this call is a no-op.
-     */
-    void remove(const KeyType& key) {
-        _partitionedCache->erase(key);
-    }
-
-    /**
-     * Remove all the entries for keys for which the predicate returns true. Return the number of
-     * removed entries.
-     */
-    template <typename UnaryPredicate>
-    size_t removeIf(UnaryPredicate predicate) {
-        size_t nRemoved = 0;
-        for (size_t partitionId = 0; partitionId < _numPartitions; ++partitionId) {
-            auto lockedPartition = _partitionedCache->lockOnePartitionById(partitionId);
-            nRemoved += lockedPartition->removeIf(predicate);
-        }
-        return nRemoved;
-    }
-
-    /**
-     * Remove *all* cached plans.  Does not clear index information.
-     */
-    void clear() {
-        _partitionedCache->clear();
-    }
-
-    /**
-     * Reset total cache size. If the size is set to a smaller value than before, enough entries are
-     * evicted in order to ensure that the cache fits within the new budget.
-     */
-    void reset(size_t cacheSize) {
-        for (size_t partitionId = 0; partitionId < _numPartitions; ++partitionId) {
-            auto lockedPartition = _partitionedCache->lockOnePartitionById(partitionId);
-            lockedPartition->reset(cacheSize / _numPartitions);
-        }
-    }
-
-    /**
      * Returns a copy of a cache entry, looked up by the plan cache key.
      *
      * If there is no entry in the cache for the 'query', returns an error Status.
      */
     StatusWith<std::unique_ptr<Entry>> getEntry(const KeyType& key) const {
-        auto partition = _partitionedCache->lockOnePartition(key);
-        auto entry = partition->get(key);
-        if (!entry.isOK()) {
-            return entry.getStatus();
+        auto result = this->lookup(key);
+        if (!result.isOK()) {
+            return {result.getStatus()};
         }
-        invariant(entry.getValue());
-
-        return std::unique_ptr<Entry>(entry.getValue()->clone());
+        return {result.getValue()->get()->clone()};
     }
 
     /**
@@ -560,23 +601,11 @@ public:
     std::vector<std::unique_ptr<Entry>> getAllEntries() const {
         std::vector<std::unique_ptr<Entry>> entries;
 
-        for (size_t partitionId = 0; partitionId < _numPartitions; ++partitionId) {
-            auto lockedPartition = _partitionedCache->lockOnePartitionById(partitionId);
-
-            for (auto&& [key, entry] : *lockedPartition) {
-                entries.emplace_back(entry->clone());
-            }
-        }
+        this->forEach([&](const KeyType& key, const std::shared_ptr<Entry>& entry) {
+            entries.emplace_back(entry);
+        });
 
         return entries;
-    }
-
-    /**
-     * Returns the size of the cache.
-     * Used for testing.
-     */
-    size_t size() const {
-        return _partitionedCache->size();
     }
 
     /**
@@ -596,20 +625,15 @@ public:
 
         std::vector<BSONObj> results;
 
-        for (size_t partitionId = 0; partitionId < _numPartitions; ++partitionId) {
-            auto lockedPartition = _partitionedCache->lockOnePartitionById(partitionId);
-
-            for (auto&& cacheEntry : *lockedPartition) {
-                if (cacheKeyFilterFunc && !cacheKeyFilterFunc(cacheEntry.first)) {
-                    continue;
-                }
-                const auto& entry = cacheEntry.second;
-                auto serializedEntry = serializationFunc(*entry);
-                if (filterFunc(serializedEntry)) {
-                    results.push_back(serializedEntry);
-                }
+        this->forEach([&](const KeyType& key, const std::shared_ptr<const Entry>& entry) {
+            if (cacheKeyFilterFunc && !cacheKeyFilterFunc(key)) {
+                return;
             }
-        }
+            auto serializedEntry = serializationFunc(*entry);
+            if (filterFunc(serializedEntry)) {
+                results.push_back(serializedEntry);
+            }
+        });
 
         return results;
     }
@@ -618,6 +642,7 @@ private:
     struct NewEntryState {
         bool shouldBeCreated = false;
         bool shouldBeActive = false;
+        boost::optional<size_t> increasedWorks = boost::none;
     };
 
     /**
@@ -625,10 +650,11 @@ private:
      * whether:
      * - We should create a new entry
      * - The new entry should be marked 'active'
+     * - The new entry should update 'works' to the new value returned as 'increasedWorks'.
      */
     NewEntryState getNewEntryState(
         const KeyType& key,
-        Entry* oldEntry,
+        const Entry* oldEntry,
         size_t newWorks,
         double growthCoefficient,
         const PlanCacheCallbacks<KeyType, CachedPlanType, DebugInfoType>* callbacks) {
@@ -663,8 +689,8 @@ private:
             // We do nothing.
             res.shouldBeCreated = false;
         } else if (newWorks > oldWorks) {
-            // This plan performed worse than expected. Rather than immediately overwriting the
-            // cache, lower the bar to what is considered good performance and keep the entry
+            // The cached plan performed worse than expected. Rather than immediately overwriting
+            // the cache, lower the bar to what is considered good performance and keep the entry
             // inactive.
 
             // Be sure that 'works' always grows by at least 1, in case its current
@@ -677,12 +703,12 @@ private:
             if (callbacks) {
                 callbacks->onIncreasingWorkValue(key, oldEntry, increasedWorks);
             }
-            oldEntry->works = increasedWorks;
 
-            // Don't create a new entry.
-            res.shouldBeCreated = false;
+            // Create a new inactive cache entry with 'increasedWorks'.
+            res.shouldBeCreated = true;
+            res.increasedWorks.emplace(increasedWorks);
         } else {
-            // This plan performed just as well or better than we expected, based on the
+            // This cached plan performed just as well or better than we expected, based on the
             // inactive entry's works. We use this as an indicator that it's safe to
             // cache (as an active entry) the plan this query used for the future.
             if (callbacks) {
@@ -695,9 +721,6 @@ private:
 
         return res;
     }
-
-    std::size_t _numPartitions;
-    std::unique_ptr<Partitioned<Lru, Partitioner>> _partitionedCache;
 };
 
 }  // namespace mongo

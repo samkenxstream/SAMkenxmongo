@@ -27,18 +27,29 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/set_cluster_parameter_gen.h"
+#include "mongo/db/commands/cluster_server_parameter_cmds_gen.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/commands/set_cluster_parameter_invocation.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/idl/cluster_server_parameter_gen.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
 namespace {
+
+const WriteConcernOptions kMajorityWriteConcern{WriteConcernOptions::kMajority,
+                                                WriteConcernOptions::SyncMode::UNSET,
+                                                WriteConcernOptions::kNoTimeout};
 
 class SetClusterParameterCommand final : public TypedCommand<SetClusterParameterCommand> {
 public:
@@ -56,21 +67,47 @@ public:
         return "Set cluster parameter on replica set or node";
     }
 
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
 
-        void typedRun(OperationContext*) {
-            LOGV2(6226501, "Received setClusterParameter on node");
+        void typedRun(OperationContext* opCtx) {
+            uassert(ErrorCodes::ErrorCodes::NotImplemented,
+                    "setClusterParameter can only run on mongos in sharded clusters",
+                    (serverGlobalParams.clusterRole.has(ClusterRole::None)));
+
+            if (!feature_flags::gFeatureFlagAuditConfigClusterParameter.isEnabled(
+                    serverGlobalParams.featureCompatibility)) {
+                uassert(ErrorCodes::IllegalOperation,
+                        str::stream() << Request::kCommandName << " cannot be run on standalones",
+                        repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
+                            repl::ReplicationCoordinator::modeNone);
+            }
+
+            std::unique_ptr<ServerParameterService> parameterService =
+                std::make_unique<ClusterParameterService>();
+
+            DBDirectClient dbClient(opCtx);
+            ClusterParameterDBClientService dbService(dbClient);
+
+            SetClusterParameterInvocation invocation{std::move(parameterService), dbService};
+
+            invocation.invoke(opCtx, request(), boost::none, kMajorityWriteConcern);
         }
 
     private:
         bool supportsWriteConcern() const override {
             return false;
         }
+
         NamespaceString ns() const override {
             return NamespaceString();
         }
+
         void doCheckAuthorization(OperationContext* opCtx) const override {
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
@@ -80,5 +117,6 @@ public:
         }
     };
 } setClusterParameterCommand;
+
 }  // namespace
 }  // namespace mongo

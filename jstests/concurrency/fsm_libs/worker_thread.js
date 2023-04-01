@@ -36,6 +36,17 @@ var workerThread = (function() {
         TestData = (TestData !== undefined) ? TestData : {};
 
         try {
+            // Running a callback passed through testData before running fsm worker theads.
+            // Can be added to yml files as the following example:
+            // fsmPreOverridesLoadedCallback: '
+            //     testingReplication = true;
+            //     load('jstests/libs/override_methods/network_error_and_txn_override.js');
+            //     ...
+            // '
+            if (typeof TestData.fsmPreOverridesLoadedCallback !== 'undefined') {
+                new Function(`${TestData.fsmPreOverridesLoadedCallback}`)();
+            }
+
             if (typeof db !== 'undefined') {
                 // The implicit database connection created within the thread's scope
                 // is unneeded, so forcibly clean it up.
@@ -227,6 +238,19 @@ var workerThread = (function() {
                 };
             }
         } finally {
+            // Kill this worker thread's session to ensure any possible idle cursors left open by
+            // the workload are closed.
+            // TODO SERVER-74993: Remove this.
+            try {
+                var session = myDB.getSession();
+                if (session) {
+                    myDB.runCommand({killSessions: [session.getSessionId()]});
+                }
+            } catch (e) {
+                // Ignore errors from killSessions.
+                jsTest.log('Error running killSessions: ' + e);
+            }
+
             // Avoid retention of connection object
             configs = null;
             myDB = null;

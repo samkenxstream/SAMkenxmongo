@@ -68,7 +68,7 @@ Status AuthzManagerExternalStateMongod::query(
         FindCommandRequest findRequest{collectionName};
         findRequest.setFilter(filter);
         findRequest.setProjection(projection);
-        client.find(std::move(findRequest), ReadPreferenceSetting{}, resultProcessor);
+        client.find(std::move(findRequest), resultProcessor);
         return Status::OK();
     } catch (const DBException& e) {
         return e.toStatus();
@@ -76,26 +76,25 @@ Status AuthzManagerExternalStateMongod::query(
 }
 
 Status AuthzManagerExternalStateMongod::findOne(OperationContext* opCtx,
-                                                const NamespaceString& collectionName,
+                                                const NamespaceString& nss,
                                                 const BSONObj& query,
                                                 BSONObj* result) {
-    AutoGetCollectionForReadCommandMaybeLockFree ctx(opCtx, collectionName);
+    AutoGetCollectionForReadCommandMaybeLockFree ctx(opCtx, nss);
 
     BSONObj found;
     if (Helpers::findOne(opCtx, ctx.getCollection(), query, found)) {
         *result = found.getOwned();
         return Status::OK();
     }
-    return Status(ErrorCodes::NoMatchingDocument,
-                  str::stream() << "No document in " << collectionName.ns() << " matches "
-                                << query);
+    return {ErrorCodes::NoMatchingDocument,
+            str::stream() << "No document in " << nss.ns() << " matches " << query};
 }
 
 bool AuthzManagerExternalStateMongod::hasOne(OperationContext* opCtx,
-                                             const NamespaceString& collectionName,
+                                             const NamespaceString& nss,
                                              const BSONObj& query) {
-    AutoGetCollectionForReadCommandMaybeLockFree ctx(opCtx, collectionName);
-    return !Helpers::findOne(opCtx, ctx.getCollection(), query, false).isNull();
+    AutoGetCollectionForReadCommandMaybeLockFree ctx(opCtx, nss);
+    return !Helpers::findOne(opCtx, ctx.getCollection(), query).isNull();
 }
 
 namespace {

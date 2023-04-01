@@ -88,13 +88,16 @@ public:
      * that is being cloned. It is expected that only one of the DocumentSourceSequentialCache
      * copies will be used, and therefore only one will actively be using the cache.
      */
-    boost::intrusive_ptr<DocumentSource> clone() const final {
-        auto newStage = create(pExpCtx, _cache);
+    boost::intrusive_ptr<DocumentSource> clone(
+        const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const final {
+        auto newStage = create(newExpCtx ? newExpCtx : pExpCtx, _cache);
         // Keep the position flag so in case the containing pipeline is cloned post-optimization.
         newStage->_hasOptimizedPos = _hasOptimizedPos;
         newStage->_cacheIsEOF = _cacheIsEOF;
         return newStage;
     }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
 protected:
     GetNextResult doGetNext() final;
@@ -105,7 +108,7 @@ private:
     DocumentSourceSequentialDocumentCache(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                           SequentialDocumentCache* cache);
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     SequentialDocumentCache* _cache;
 

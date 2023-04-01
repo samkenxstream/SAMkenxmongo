@@ -35,7 +35,6 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/counter.h"
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
@@ -46,6 +45,7 @@
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/multitenancy_gen.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/read_concern_support_result.h"
 #include "mongo/db/repl/read_concern_args.h"
@@ -107,18 +107,21 @@ public:
     }
 
     /**
-     * A behavior to perform after CommandInvocation::run()
+     * A behavior to perform after CommandInvocation::run(). Note that the response argument is not
+     * const, because the ReplyBuilderInterface does not expose any const methods to inspect the
+     * response body. However, onAfterRun must not mutate the response body.
      */
     virtual void onAfterRun(OperationContext* opCtx,
                             const OpMsgRequest& request,
-                            CommandInvocation* invocation) = 0;
+                            CommandInvocation* invocation,
+                            rpc::ReplyBuilderInterface* response) = 0;
 
     /**
      * A behavior to perform after CommandInvocation::asyncRun(). Defaults to `onAfterRun(...)`.
      */
     virtual void onAfterAsyncRun(std::shared_ptr<RequestExecutionContext> rec,
                                  CommandInvocation* invocation) {
-        onAfterRun(rec->getOpCtx(), rec->getRequest(), invocation);
+        onAfterRun(rec->getOpCtx(), rec->getRequest(), invocation, rec->getReplyBuilder());
     }
 };
 
@@ -126,15 +129,18 @@ public:
 // Would be a namespace, but want to keep it closed rather than open.
 // Some of these may move to the BasicCommand shim if they are only for legacy implementations.
 struct CommandHelpers {
+    static const WriteConcernOptions kMajorityWriteConcern;
+
     // The type of the first field in 'cmdObj' must be mongo::String. The first field is
     // interpreted as a collection name.
     static std::string parseNsFullyQualified(const BSONObj& cmdObj);
 
     // The type of the first field in 'cmdObj' must be mongo::String or Symbol.
     // The first field is interpreted as a collection name.
-    static NamespaceString parseNsCollectionRequired(StringData dbname, const BSONObj& cmdObj);
+    static NamespaceString parseNsCollectionRequired(const DatabaseName& dbName,
+                                                     const BSONObj& cmdObj);
 
-    static NamespaceStringOrUUID parseNsOrUUID(StringData dbname, const BSONObj& cmdObj);
+    static NamespaceStringOrUUID parseNsOrUUID(const DatabaseName& dbName, const BSONObj& cmdObj);
 
     /**
      * Return the namespace for the command. If the first field in 'cmdObj' is of type
@@ -142,7 +148,16 @@ struct CommandHelpers {
      * appended to 'dbname' after a '.' character. If the first field is not of type
      * mongo::String, then 'dbname' is returned unmodified.
      */
+    // TODO SERVER-68423: Remove this method once all call sites have been updated to pass
+    // DatabaseName.
     static std::string parseNsFromCommand(StringData dbname, const BSONObj& cmdObj);
+
+    /**
+     * Return the namespace for the command. If the first field in 'cmdObj' is of type
+     * mongo::String, then that field is interpreted as the collection name.
+     * If the first field is not of type mongo::String, then the namespace only has database name.
+     */
+    static NamespaceString parseNsFromCommand(const DatabaseName& dbName, const BSONObj& cmdObj);
 
     /**
      * Utility that returns a ResourcePattern for the namespace returned from
@@ -258,13 +273,12 @@ struct CommandHelpers {
     static BSONObj runCommandDirectly(OperationContext* opCtx, const OpMsgRequest& request);
 
     /**
-     * Decides the command execution model (i.e., synchronous or asynchronous) based on the provided
-     * threading model.
+     * Runs the command synchronously in presence of a dedicated thread.
+     * Otherwise, runs the command asynchronously.
      */
-    static Future<void> runCommandInvocation(
-        std::shared_ptr<RequestExecutionContext> rec,
-        std::shared_ptr<CommandInvocation> invocation,
-        transport::ServiceExecutor::ThreadingModel threadingModel);
+    static Future<void> runCommandInvocation(std::shared_ptr<RequestExecutionContext> rec,
+                                             std::shared_ptr<CommandInvocation> invocation,
+                                             bool useDedicatedThread);
 
     /**
      * Runs a previously parsed CommandInvocation and propagates the result to the
@@ -348,6 +362,13 @@ struct CommandHelpers {
      */
     static void handleMarkKillOnClientDisconnect(OperationContext* opCtx,
                                                  bool shouldMarkKill = true);
+
+    /**
+     * Provides diagnostics if the reply builder contains an internal-only error, and will cause
+     * deferred-fatality when testing diagnostics is enabled.
+     */
+    static void checkForInternalError(rpc::ReplyBuilderInterface* replyBuilder,
+                                      bool isInternalClient);
 };
 
 /**
@@ -357,6 +378,7 @@ class Command {
 public:
     using CommandMap = StringMap<Command*>;
     enum class AllowedOnSecondary { kAlways, kNever, kOptIn };
+    enum class HandshakeRole { kNone, kHello, kAuth };
 
     /**
      * Constructs a new command and causes it to be registered with the global commands list. It is
@@ -409,6 +431,13 @@ public:
      */
     virtual bool adminOnly() const {
         return false;
+    }
+
+    /**
+     * Returns the role this command has in the connection handshake.
+     */
+    virtual HandshakeRole handshakeRole() const {
+        return HandshakeRole::kNone;
     }
 
     /*
@@ -601,6 +630,35 @@ public:
         return nullptr;
     }
 
+    /**
+     * Returns true if this command supports apply once semantic when retried.
+     */
+    virtual bool supportsRetryableWrite() const {
+        return false;
+    }
+
+    /**
+     * Returns true if sessions should be checked out when lsid and txnNumber is present in the
+     * request.
+     */
+    virtual bool shouldCheckoutSession() const {
+        return true;
+    }
+
+    /**
+     * Returns true if this is a command related to managing the lifecycle of a transaction.
+     */
+    virtual bool isTransactionCommand() const {
+        return false;
+    }
+
+    /**
+     * Returns true if this command can be run in a transaction.
+     */
+    virtual bool allowedInTransactions() const {
+        return false;
+    }
+
 private:
     // The full name of the command
     const std::string _name;
@@ -609,11 +667,8 @@ private:
     const std::vector<StringData> _aliases;
 
     // Counters for how many times this command has been executed and failed
-    mutable Counter64 _commandsExecuted;
-    mutable Counter64 _commandsFailed;
-    // Pointers to hold the metrics tree references
-    ServerStatusMetricField<Counter64> _commandsExecutedMetric;
-    ServerStatusMetricField<Counter64> _commandsFailedMetric;
+    CounterMetric _commandsExecuted;
+    CounterMetric _commandsFailed;
 };
 
 /**
@@ -726,6 +781,20 @@ public:
     }
 
     /**
+     * Returns if this invocation is a mirrored read.
+     */
+    bool isMirrored() const {
+        return _mirrored;
+    }
+
+    /**
+     * Sets that this operation is a mirrored read.
+     */
+    void markMirrored() {
+        _mirrored = true;
+    }
+
+    /**
      * Returns true if command allows afterClusterTime in its readConcern. The command may not allow
      * it if it is specifically intended not to take any LockManager locks. Waiting for
      * afterClusterTime takes the MODE_IS lock.
@@ -783,6 +852,8 @@ private:
     virtual void doCheckAuthorization(OperationContext* opCtx) const = 0;
 
     const Command* const _definition;
+
+    bool _mirrored = false;
 };
 
 /**
@@ -797,12 +868,12 @@ private:
 public:
     using Command::Command;
 
-    virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
-        return CommandHelpers::parseNsFromCommand(dbname, cmdObj);
+    virtual NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const {
+        return CommandHelpers::parseNsFromCommand(dbName, cmdObj);
     }
 
-    ResourcePattern parseResourcePattern(const std::string& dbname, const BSONObj& cmdObj) const {
-        return CommandHelpers::resourcePatternForNamespace(parseNs(dbname, cmdObj));
+    ResourcePattern parseResourcePattern(const DatabaseName& dbName, const BSONObj& cmdObj) const {
+        return CommandHelpers::resourcePatternForNamespace(parseNs(dbName, cmdObj).ns());
     }
 
     //
@@ -813,7 +884,7 @@ public:
      * Runs the given command. Returns true upon success.
      */
     virtual bool runWithReplyBuilder(OperationContext* opCtx,
-                                     const std::string& db,
+                                     const DatabaseName& dbName,
                                      const BSONObj& cmdObj,
                                      rpc::ReplyBuilderInterface* replyBuilder) = 0;
 
@@ -821,9 +892,10 @@ public:
      * Provides a future that may run the command asynchronously. By default, it falls back to
      * runWithReplyBuilder.
      */
-    virtual Future<void> runAsync(std::shared_ptr<RequestExecutionContext> rec, std::string db) {
+    virtual Future<void> runAsync(std::shared_ptr<RequestExecutionContext> rec,
+                                  const DatabaseName& dbName) {
         if (!runWithReplyBuilder(
-                rec->getOpCtx(), db, rec->getRequest().body, rec->getReplyBuilder()))
+                rec->getOpCtx(), dbName, rec->getRequest().body, rec->getReplyBuilder()))
             return Status(ErrorCodes::FailedToRunWithReplyBuilder,
                           fmt::format("Failed to run command: {}", rec->getCommand()->getName()));
         return Status::OK();
@@ -848,11 +920,13 @@ public:
 
     /**
      * Checks if the client associated with the given OperationContext is authorized to run this
-     * command. Default implementation defers to checkAuthForCommand.
+     * command.
+     * Command imlpementations MUST provide a method here, even if no authz checks are required.
+     * Such commands should return Status::OK(), with a comment stating "No auth required".
      */
     virtual Status checkAuthForOperation(OperationContext* opCtx,
-                                         const std::string& dbname,
-                                         const BSONObj& cmdObj) const;
+                                         const DatabaseName& dbName,
+                                         const BSONObj& cmdObj) const = 0;
 
     /**
      * supportsWriteConcern returns true if this command should be parsed for a writeConcern
@@ -915,32 +989,6 @@ public:
 private:
     std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
                                              const OpMsgRequest& request) final;
-
-    //
-    // Deprecated virtual methods.
-    //
-
-    /**
-     * Checks if the given client is authorized to run this command on database "dbname"
-     * with the invocation described by "cmdObj".
-     *
-     * NOTE: Implement checkAuthForOperation that takes an OperationContext* instead.
-     */
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const;
-
-    /**
-     * Appends to "*out" the privileges required to run this command on database "dbname" with
-     * the invocation described by "cmdObj".  New commands shouldn't implement this, they should
-     * implement checkAuthForOperation (which takes an OperationContext*), instead.
-     */
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        // The default implementation of addRequiredPrivileges should never be hit.
-        fassertFailed(16940);
-    }
 };
 
 /**
@@ -954,16 +1002,16 @@ public:
      * Runs the given command. Returns true upon success.
      */
     virtual bool run(OperationContext* opCtx,
-                     const std::string& db,
+                     const DatabaseName& dbName,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) = 0;
 
     bool runWithReplyBuilder(OperationContext* opCtx,
-                             const std::string& db,
+                             const DatabaseName& dbName,
                              const BSONObj& cmdObj,
                              rpc::ReplyBuilderInterface* replyBuilder) override {
         auto result = replyBuilder->getBodyBuilder();
-        return run(opCtx, db, cmdObj, result);
+        return run(opCtx, dbName, cmdObj, result);
     }
 };
 
@@ -1000,7 +1048,7 @@ constexpr StringData command_alias_v = CommandAlias<T>::kAlias;
  *
  *      - a static member factory function 'parse', callable as:
  *
- *         const IDLParserErrorContext& idlCtx = ...;
+ *         const IDLParserContext& idlCtx = ...;
  *         const OpMsgRequest& opMsgRequest = ...;
  *         Request r = Request::parse(idlCtx, opMsgRequest);
  *
@@ -1023,15 +1071,15 @@ protected:
     BasicCommandWithRequestParser(StringData name) : BasicCommandWithReplyBuilderInterface(name) {}
 
     bool runWithReplyBuilder(OperationContext* opCtx,
-                             const std::string& db,
+                             const DatabaseName& dbName,
                              const BSONObj& cmdObj,
                              rpc::ReplyBuilderInterface* replyBuilder) final {
         auto result = replyBuilder->getBodyBuilder();
 
         // To enforce API versioning
-        auto requestParser = RequestParser(opCtx, cmdObj);
+        auto requestParser = RequestParser(opCtx, dbName, cmdObj);
 
-        auto cmdDone = runWithRequestParser(opCtx, db, cmdObj, requestParser, result);
+        auto cmdDone = runWithRequestParser(opCtx, dbName, cmdObj, requestParser, result);
 
         // Only validate results in test mode so that we don't expose users to errors if we
         // construct an invalid reply.
@@ -1048,7 +1096,7 @@ protected:
      * Runs the given command. Returns true upon success.
      */
     virtual bool runWithRequestParser(OperationContext* opCtx,
-                                      const std::string& db,
+                                      const DatabaseName& dbName,
                                       const BSONObj& cmdObj,
                                       const RequestParser& requestParser,
                                       BSONObjBuilder& result) = 0;
@@ -1062,7 +1110,7 @@ protected:
      * Calls to this function should be done only in test mode so that we don't expose users to
      * errors if we construct an invalid error reply.
      */
-    static bool checkIsErrorStatus(const BSONObj& resultObj, const IDLParserErrorContext& ctx) {
+    static bool checkIsErrorStatus(const BSONObj& resultObj, const IDLParserContext& ctx) {
         auto wcStatus = getWriteConcernStatusFromCommandResult(resultObj);
         if (!wcStatus.isOK()) {
             if (wcStatus.code() == ErrorCodes::TypeMismatch) {
@@ -1075,7 +1123,7 @@ protected:
             auto status = getStatusFromCommandResult(resultObj);
             if (!status.isOK()) {
                 // Will throw if the result doesn't match the ErrorReply.
-                ErrorReply::parse(IDLParserErrorContext("ErrorType", &ctx), resultObj);
+                ErrorReply::parse(IDLParserContext("ErrorType", &ctx), resultObj);
                 return true;
             }
         }
@@ -1089,18 +1137,21 @@ class BasicCommandWithRequestParser<Derived>::RequestParser {
 public:
     using RequestType = typename Derived::Request;
 
-    RequestParser(OperationContext* opCtx, const BSONObj& cmdObj)
-        : _request{_parseRequest(opCtx, cmdObj)} {}
+    RequestParser(OperationContext* opCtx, const DatabaseName& dbName, const BSONObj& cmdObj)
+        : _request{_parseRequest(opCtx, dbName, cmdObj)} {}
 
     const RequestType& request() const {
         return _request;
     }
 
 private:
-    static RequestType _parseRequest(OperationContext* opCtx, const BSONObj& cmdObj) {
+    static RequestType _parseRequest(OperationContext* opCtx,
+                                     const DatabaseName& dbName,
+                                     const BSONObj& cmdObj) {
         return RequestType::parse(
-            IDLParserErrorContext(RequestType::kCommandName,
-                                  APIParameters::get(opCtx).getAPIStrict().value_or(false)),
+            IDLParserContext(RequestType::kCommandName,
+                             APIParameters::get(opCtx).getAPIStrict().value_or(false),
+                             dbName.tenantId()),
             cmdObj);
     }
 
@@ -1113,7 +1164,7 @@ private:
 class ErrmsgCommandDeprecated : public BasicCommand {
     using BasicCommand::BasicCommand;
     bool run(OperationContext* opCtx,
-             const std::string& db,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) final;
 
@@ -1137,7 +1188,7 @@ class ErrmsgCommandDeprecated : public BasicCommand {
  *
  *      - a static member factory function 'parse', callable as:
  *
- *         const IDLParserErrorContext& idlCtx = ...;
+ *         const IDLParserContext& idlCtx = ...;
  *         const OpMsgRequest& opMsgRequest = ...;
  *         Request r = Request::parse(idlCtx, opMsgRequest);
  *
@@ -1210,8 +1261,7 @@ private:
                                     << command->getName() << "' instead");
         }
 
-        return RequestType::parse(IDLParserErrorContext(command->getName(), apiStrict),
-                                  opMsgRequest);
+        return RequestType::parse(IDLParserContext(command->getName(), apiStrict), opMsgRequest);
     }
 
     RequestType _request;
@@ -1292,8 +1342,7 @@ class CommandRegistry {
 public:
     using CommandMap = Command::CommandMap;
 
-    CommandRegistry() : _unknownsMetricField("commands.<UNKNOWN>", &_unknowns) {}
-
+    CommandRegistry() = default;
     CommandRegistry(const CommandRegistry&) = delete;
     CommandRegistry& operator=(const CommandRegistry&) = delete;
 
@@ -1310,9 +1359,7 @@ public:
     }
 
 private:
-    Counter64 _unknowns;
-    ServerStatusMetricField<Counter64> _unknownsMetricField;
-
+    CounterMetric _unknowns{"commands.<UNKNOWN>"};
     CommandMap _commands;
 };
 

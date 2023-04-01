@@ -33,8 +33,8 @@
 
 namespace mongo {
 void MatchExpressionParameterizationVisitor::visitBitTestExpression(BitTestMatchExpression* expr) {
-    expr->setBitPositionsParamId(_context->nextInputParamId());
-    expr->setBitMaskParamId(_context->nextInputParamId());
+    expr->setBitPositionsParamId(_context->nextInputParamId(expr));
+    expr->setBitMaskParamId(_context->nextInputParamId(expr));
 }
 
 void MatchExpressionParameterizationVisitor::visit(BitsAllClearMatchExpression* expr) {
@@ -74,21 +74,21 @@ void MatchExpressionParameterizationVisitor::visit(LTMatchExpression* expr) {
 }
 
 void MatchExpressionParameterizationVisitor::visit(ModMatchExpression* expr) {
-    expr->setDivisorInputParamId(_context->nextInputParamId());
-    expr->setRemainderInputParamId(_context->nextInputParamId());
+    expr->setDivisorInputParamId(_context->nextInputParamId(expr));
+    expr->setRemainderInputParamId(_context->nextInputParamId(expr));
 }
 
 void MatchExpressionParameterizationVisitor::visit(RegexMatchExpression* expr) {
-    expr->setSourceRegexInputParamId(_context->nextInputParamId());
-    expr->setCompiledRegexInputParamId(_context->nextInputParamId());
+    expr->setSourceRegexInputParamId(_context->nextInputParamId(expr));
+    expr->setCompiledRegexInputParamId(_context->nextInputParamId(expr));
 }
 
 void MatchExpressionParameterizationVisitor::visit(SizeMatchExpression* expr) {
-    expr->setInputParamId(_context->nextInputParamId());
+    expr->setInputParamId(_context->nextInputParamId(expr));
 }
 
 void MatchExpressionParameterizationVisitor::visit(WhereMatchExpression* expr) {
-    expr->setInputParamId(_context->nextInputParamId());
+    expr->setInputParamId(_context->nextInputParamId(expr));
 }
 
 void MatchExpressionParameterizationVisitor::visitComparisonMatchExpression(
@@ -102,11 +102,10 @@ void MatchExpressionParameterizationVisitor::visitComparisonMatchExpression(
         case BSONType::DBRef:
         case BSONType::MaxKey:
         case BSONType::Undefined:
-            // ignore such values
+        case BSONType::Object:
             break;
 
         case BSONType::String:
-        case BSONType::Object:
         case BSONType::BinData:
         case BSONType::jstOID:
         case BSONType::Bool:
@@ -118,16 +117,16 @@ void MatchExpressionParameterizationVisitor::visitComparisonMatchExpression(
         case BSONType::NumberInt:
         case BSONType::bsonTimestamp:
         case BSONType::NumberLong:
-            expr->setInputParamId(_context->nextInputParamId());
+            expr->setInputParamId(_context->nextInputParamId(expr));
             break;
         case BSONType::NumberDouble:
             if (!std::isnan(expr->getData().numberDouble())) {
-                expr->setInputParamId(_context->nextInputParamId());
+                expr->setInputParamId(_context->nextInputParamId(expr));
             }
             break;
         case BSONType::NumberDecimal:
             if (!expr->getData().numberDecimal().isNaN()) {
-                expr->setInputParamId(_context->nextInputParamId());
+                expr->setInputParamId(_context->nextInputParamId(expr));
             }
             break;
     }
@@ -143,6 +142,7 @@ void MatchExpressionParameterizationVisitor::visit(InMatchExpression* expr) {
         switch (equality.type()) {
             case BSONType::jstNULL:
             case BSONType::Array:
+            case BSONType::Object:
                 // We don't set inputParamId if a InMatchExpression contains one of the values
                 // above.
                 return;
@@ -153,7 +153,7 @@ void MatchExpressionParameterizationVisitor::visit(InMatchExpression* expr) {
         };
     }
 
-    expr->setInputParamId(_context->nextInputParamId());
+    expr->setInputParamId(_context->nextInputParamId(expr));
 }
 
 void MatchExpressionParameterizationVisitor::visit(TypeMatchExpression* expr) {

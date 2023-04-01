@@ -27,12 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/commands/kill_operations_gen.h"
-
 #include <fmt/format.h>
 
 #include "mongo/base/init.h"
@@ -41,11 +35,14 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/kill_operations_gen.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/operation_killer.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
 
@@ -64,7 +61,8 @@ public:
             auto opKeys = Base::request().getOperationKeys();
 
             for (auto& opKey : opKeys) {
-                LOGV2(4615602, "Attempting to kill operation", "operationKey"_attr = opKey);
+                LOGV2_DEBUG(
+                    4615602, 2, "Attempting to kill operation", "operationKey"_attr = opKey);
                 opKiller.killOperation(OperationKey(opKey));
             }
             Derived::killCursors(opCtx, opKeys);
@@ -72,7 +70,7 @@ public:
 
     private:
         NamespaceString ns() const override {
-            return NamespaceString(Base::request().getDbName(), "");
+            return NamespaceString(Base::request().getDbName());
         }
 
         bool supportsWriteConcern() const override {
@@ -119,3 +117,5 @@ private:
 };
 
 }  // namespace mongo
+
+#undef MONGO_LOGV2_DEFAULT_COMPONENT

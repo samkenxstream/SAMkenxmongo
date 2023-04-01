@@ -27,13 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/geo/geoparser.h"
 #include "mongo/db/pipeline/document_source_internal_compute_geo_near_distance.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -139,15 +141,17 @@ DocumentSource::GetNextResult DocumentSourceInternalGeoNearDistance::doGetNext()
     return next;
 }
 
-Value DocumentSourceInternalGeoNearDistance::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceInternalGeoNearDistance::serialize(SerializationOptions opts) const {
+
     MutableDocument out;
-    out.setField(DocumentSourceInternalGeoNearDistance::kNearFieldName, Value(_coords));
-    out.setField(DocumentSourceInternalGeoNearDistance::kKeyFieldName, Value(_key));
+    out.setField(DocumentSourceInternalGeoNearDistance::kNearFieldName,
+                 opts.serializeLiteralValue(_coords));
+    out.setField(DocumentSourceInternalGeoNearDistance::kKeyFieldName,
+                 Value(opts.serializeFieldName(_key)));
     out.setField(DocumentSourceInternalGeoNearDistance::kDistanceFieldFieldName,
-                 Value(_distanceField.fullPath()));
+                 Value(opts.serializeFieldName(_distanceField.fullPath())));
     out.setField(DocumentSourceInternalGeoNearDistance::kDistanceMultiplierFieldName,
-                 Value(_distanceMultiplier));
+                 opts.serializeLiteralValue(_distanceMultiplier));
 
     return Value(DOC(getSourceName() << out.freeze()));
 }

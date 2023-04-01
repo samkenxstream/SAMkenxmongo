@@ -10,18 +10,20 @@
 
 /*
  * usage --
- *     TODO: Add a comment describing this function.
+ *     Display a usage message for the upgrade command.
  */
 static int
 usage(void)
 {
-    util_usage("upgrade uri", NULL, NULL);
+    static const char *options[] = {"-?", "show this message", NULL, NULL};
+
+    util_usage("upgrade uri", "options:", options);
     return (1);
 }
 
 /*
  * util_upgrade --
- *     TODO: Add a comment describing this function.
+ *     The upgrade command.
  */
 int
 util_upgrade(WT_SESSION *session, int argc, char *argv[])
@@ -31,9 +33,11 @@ util_upgrade(WT_SESSION *session, int argc, char *argv[])
     char *uri;
 
     uri = NULL;
-    while ((ch = __wt_getopt(progname, argc, argv, "")) != EOF)
+    while ((ch = __wt_getopt(progname, argc, argv, "?")) != EOF)
         switch (ch) {
         case '?':
+            usage();
+            return (0);
         default:
             return (usage());
         }

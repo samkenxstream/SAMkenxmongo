@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -41,6 +40,9 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/concurrency/thread_pool.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace repl {
@@ -361,7 +363,8 @@ TEST_F(TenantAllDatabaseClonerTest, ListDatabasesRecordsCorrectOperationTime) {
 TEST_F(TenantAllDatabaseClonerTest, TenantDatabasesAlreadyExist) {
     // Test that cloner should fail if tenant databases already exist on the recipient prior to
     // starting cloning phase of the migration.
-    ASSERT_OK(createCollection(NamespaceString(_tenantDbA, "coll"), CollectionOptions()));
+    ASSERT_OK(createCollection(NamespaceString::createNamespaceString_forTest(_tenantDbA, "coll"),
+                               CollectionOptions()));
 
     auto listDatabasesReply =
         "{ok:1, databases:[{name:'" + _tenantDbA + "'}, {name:'" + _tenantDbAAB + "'}]}";
@@ -375,8 +378,8 @@ TEST_F(TenantAllDatabaseClonerTest, TenantDatabasesAlreadyExist) {
 
 TEST_F(TenantAllDatabaseClonerTest, ResumingFromLastClonedDb) {
     // Test that all databases cloner correctly resumes from the last cloned database.
-    auto nssDbA = NamespaceString(_tenantDbA, "coll");
-    auto nssDbAAb = NamespaceString(_tenantDbAAB, "coll");
+    auto nssDbA = NamespaceString::createNamespaceString_forTest(_tenantDbA, "coll");
+    auto nssDbAAb = NamespaceString::createNamespaceString_forTest(_tenantDbAAB, "coll");
     ASSERT_OK(createCollection(nssDbA, CollectionOptions()));
     ASSERT_OK(createCollection(nssDbAAb, CollectionOptions()));
 
@@ -402,7 +405,7 @@ TEST_F(TenantAllDatabaseClonerTest, ResumingFromLastClonedDb) {
     _mockServer->setCommandReply("find", createFindResponse());
     _mockServer->setCommandReply("dbStats", fromjson("{ok:1, dataSize: 30}"));
 
-    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, ResumePhase::kDataSync);
     auto cloner = makeAllDatabaseCloner(&resumingSharedData);
     cloner->setStopAfterStage_forTest("initializeStatsStage");
 
@@ -423,7 +426,7 @@ TEST_F(TenantAllDatabaseClonerTest, LastClonedDbDeleted_AllGreater) {
     // Test that we correctly resume from next database compared greater than the last cloned
     // database if the last cloned database is dropped. This tests the case when all databases in
     // the latest listDatabases result are compared greater than the last cloned database.
-    auto nssDbA = NamespaceString(_tenantDbA, "coll");
+    auto nssDbA = NamespaceString::createNamespaceString_forTest(_tenantDbA, "coll");
     ASSERT_OK(createCollection(nssDbA, CollectionOptions()));
 
     long long size = 0;
@@ -445,7 +448,7 @@ TEST_F(TenantAllDatabaseClonerTest, LastClonedDbDeleted_AllGreater) {
     _mockServer->setCommandReply("find", createFindResponse());
     _mockServer->setCommandReply("dbStats", fromjson("{ok:1, dataSize: 30}"));
 
-    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, ResumePhase::kDataSync);
     auto cloner = makeAllDatabaseCloner(&resumingSharedData);
     cloner->setStopAfterStage_forTest("initializeStatsStage");
 
@@ -467,8 +470,8 @@ TEST_F(TenantAllDatabaseClonerTest, LastClonedDbDeleted_SomeGreater) {
     // database if the last cloned database is dropped. This tests the case when some but not all
     // databases in the latest listDatabases result are compared greater than the last cloned
     // database.
-    auto nssDbA = NamespaceString(_tenantDbA, "coll");
-    auto nssDbAAb = NamespaceString(_tenantDbAAB, "coll");
+    auto nssDbA = NamespaceString::createNamespaceString_forTest(_tenantDbA, "coll");
+    auto nssDbAAb = NamespaceString::createNamespaceString_forTest(_tenantDbAAB, "coll");
     ASSERT_OK(createCollection(nssDbA, CollectionOptions()));
     ASSERT_OK(createCollection(nssDbAAb, CollectionOptions()));
 
@@ -502,7 +505,7 @@ TEST_F(TenantAllDatabaseClonerTest, LastClonedDbDeleted_SomeGreater) {
     _mockServer->setCommandReply("find", createFindResponse());
     _mockServer->setCommandReply("dbStats", fromjson("{ok:1, dataSize: 30}"));
 
-    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, ResumePhase::kDataSync);
     auto cloner = makeAllDatabaseCloner(&resumingSharedData);
     cloner->setStopAfterStage_forTest("initializeStatsStage");
 
@@ -522,9 +525,9 @@ TEST_F(TenantAllDatabaseClonerTest, LastClonedDbDeleted_AllLess) {
     // Test that we correctly resume from next database compared greater than the last cloned
     // database if the last cloned database is dropped. This tests the case when all databases in
     // the latest listDatabases result are compared less than the last cloned database.
-    auto nssDbA = NamespaceString(_tenantDbA, "coll");
-    auto nssDbAAb = NamespaceString(_tenantDbAAB, "coll");
-    auto nssDbABC = NamespaceString(_tenantDbABC, "coll");
+    auto nssDbA = NamespaceString::createNamespaceString_forTest(_tenantDbA, "coll");
+    auto nssDbAAb = NamespaceString::createNamespaceString_forTest(_tenantDbAAB, "coll");
+    auto nssDbABC = NamespaceString::createNamespaceString_forTest(_tenantDbABC, "coll");
 
     ASSERT_OK(createCollection(nssDbA, CollectionOptions()));
     ASSERT_OK(createCollection(nssDbAAb, CollectionOptions()));
@@ -570,7 +573,7 @@ TEST_F(TenantAllDatabaseClonerTest, LastClonedDbDeleted_AllLess) {
     _mockServer->setCommandReply("find", createFindResponse());
     _mockServer->setCommandReply("dbStats", fromjson("{ok:1, dataSize: 30}"));
 
-    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, ResumePhase::kDataSync);
     auto cloner = makeAllDatabaseCloner(&resumingSharedData);
     cloner->setStopAfterStage_forTest("initializeStatsStage");
 

@@ -31,6 +31,7 @@
 
 #include "mongo/db/exec/sbe/stages/hash_join.h"
 
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/size_estimator.h"
 #include "mongo/util/str.h"
@@ -44,8 +45,9 @@ HashJoinStage::HashJoinStage(std::unique_ptr<PlanStage> outer,
                              value::SlotVector innerCond,
                              value::SlotVector innerProjects,
                              boost::optional<value::SlotId> collatorSlot,
-                             PlanNodeId planNodeId)
-    : PlanStage("hj"_sd, planNodeId),
+                             PlanNodeId planNodeId,
+                             bool participateInTrialRunTracking)
+    : PlanStage("hj"_sd, planNodeId, participateInTrialRunTracking),
       _outerCond(std::move(outerCond)),
       _outerProjects(std::move(outerProjects)),
       _innerCond(std::move(innerCond)),
@@ -68,7 +70,8 @@ std::unique_ptr<PlanStage> HashJoinStage::clone() const {
                                            _innerCond,
                                            _innerProjects,
                                            _collatorSlot,
-                                           _commonStats.nodeId);
+                                           _commonStats.nodeId,
+                                           _participateInTrialRunTracking);
 }
 
 void HashJoinStage::prepare(CompileCtx& ctx) {

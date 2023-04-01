@@ -10,31 +10,18 @@
 // example, $group is pushed down to SBE at the shard-side and some accumulators may return the
 // partial aggregation results in a special format to the mongos.
 //
-// Needs the following tag to be excluded from linux-64-duroff build variant because running
-// wiredTiger without journaling in a replica set is not supported.
 // @tags: [requires_sharding]
 (function() {
 'use strict';
 
 load("jstests/libs/analyze_plan.js");
 
-// As of now, $group pushdown to SBE feature is not enabled by default. So, enables it with a
-// minimal configuration of a sharded cluster.
-//
-// TODO Remove {setParameter: "featureFlagSBEGroupPushdown=true"} when the feature is enabled by
-// default.
-const st = new ShardingTest(
-    {config: 1, shards: 1, shardOptions: {setParameter: "featureFlagSBEGroupPushdown=true"}});
+const st = new ShardingTest({config: 1, shards: 1});
 
 // This database name can provide multiple similar test cases with a good separate namespace and
 // each test case may create a separate collection for its own dataset.
 const db = st.getDB(jsTestName());
 const dbAtShard = st.shard0.getDB(jsTestName());
-
-// Makes sure that $group pushdown to SBE feature is enabled.
-assert(
-    assert.commandWorked(dbAtShard.adminCommand({getParameter: 1, featureFlagSBEGroupPushdown: 1}))
-        .featureFlagSBEGroupPushdown.value);
 
 // Makes sure that the test db is sharded and the data is stored into the only shard.
 assert.commandWorked(st.s0.adminCommand({enableSharding: db.getName()}));
@@ -42,8 +29,8 @@ st.ensurePrimaryShard(db.getName(), st.shard0.shardName);
 
 let assertShardedGroupResultsMatch = (coll, pipeline) => {
     // Turns to the classic engine at the shard before figuring out its result.
-    assert.commandWorked(
-        dbAtShard.adminCommand({setParameter: 1, internalQueryForceClassicEngine: true}));
+    assert.commandWorked(dbAtShard.adminCommand(
+        {setParameter: 1, internalQueryFrameworkControl: "forceClassicEngine"}));
 
     // Collects the classic engine's result as the expected result, executing the pipeline at the
     // mongos.
@@ -53,7 +40,7 @@ let assertShardedGroupResultsMatch = (coll, pipeline) => {
 
     // Turns to the SBE engine at the shard.
     assert.commandWorked(
-        dbAtShard.adminCommand({setParameter: 1, internalQueryForceClassicEngine: false}));
+        dbAtShard.adminCommand({setParameter: 1, internalQueryFrameworkControl: "tryBonsai"}));
 
     // Verifies that the SBE engine's results are same as the expected results, executing the
     // pipeline at the mongos.

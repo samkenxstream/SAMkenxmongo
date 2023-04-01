@@ -27,21 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/ops/update.h"
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_yield_restore.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/exec/update_stage.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
@@ -50,6 +50,9 @@
 #include "mongo/db/update/update_driver.h"
 #include "mongo/db/update_index_data.h"
 #include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
+
 
 namespace mongo {
 
@@ -67,7 +70,8 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
     // The update stage does not create its own collection.  As such, if the update is
     // an upsert, create the collection that the update stage inserts into beforehand.
     writeConflictRetry(opCtx, "createCollection", nsString.ns(), [&] {
-        collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nsString);
+        collection = CollectionPtr(
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nsString));
         if (collection || !request.isUpsert()) {
             return;
         }
@@ -81,10 +85,12 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
                                                  << nsString << " during upsert"));
         }
         WriteUnitOfWork wuow(opCtx);
-        collection = db->createCollection(opCtx, nsString, CollectionOptions());
+        collection = CollectionPtr(db->createCollection(opCtx, nsString, CollectionOptions()));
         invariant(collection);
         wuow.commit();
     });
+
+    collection.makeYieldable(opCtx, LockedCollectionYieldRestore(opCtx, collection));
 
     // Parse the update, get an executor for it, run the executor, get stats out.
     const ExtensionsCallbackReal extensionsCallback(opCtx, &request.getNamespaceString());

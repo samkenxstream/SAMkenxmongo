@@ -35,7 +35,7 @@ namespace mongo {
 
 InternalSchemaNumArrayItemsMatchExpression::InternalSchemaNumArrayItemsMatchExpression(
     MatchType type,
-    StringData path,
+    boost::optional<StringData> path,
     long long numItems,
     StringData name,
     clonable_ptr<ErrorAnnotation> annotation)
@@ -46,19 +46,18 @@ InternalSchemaNumArrayItemsMatchExpression::InternalSchemaNumArrayItemsMatchExpr
 void InternalSchemaNumArrayItemsMatchExpression::debugString(StringBuilder& debug,
                                                              int indentationLevel) const {
     _debugAddSpace(debug, indentationLevel);
-    debug << path() << " " << _name << " " << _numItems << "\n";
-
-    MatchExpression::TagData* td = getTag();
-    if (nullptr != td) {
-        debug << " ";
-        td->debugString(&debug);
-    }
-    debug << "\n";
+    debug << path() << " " << _name << " " << _numItems;
+    _debugStringAttachTagInfo(&debug);
 }
 
-BSONObj InternalSchemaNumArrayItemsMatchExpression::getSerializedRightHandSide() const {
+BSONObj InternalSchemaNumArrayItemsMatchExpression::getSerializedRightHandSide(
+    SerializationOptions opts) const {
     BSONObjBuilder objBuilder;
-    objBuilder.append(_name, _numItems);
+    if (opts.replacementForLiteralArgs) {
+        objBuilder.append(_name, opts.replacementForLiteralArgs.get());
+    } else {
+        objBuilder.append(_name, _numItems);
+    }
     return objBuilder.obj();
 }
 

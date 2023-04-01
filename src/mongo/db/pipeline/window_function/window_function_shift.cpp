@@ -32,7 +32,7 @@
 #include "window_function_exec_first_last.h"
 
 namespace mongo::window_function {
-REGISTER_WINDOW_FUNCTION(shift, ExpressionShift::parse);
+REGISTER_STABLE_WINDOW_FUNCTION(shift, ExpressionShift::parse);
 
 boost::intrusive_ptr<Expression> ExpressionShift::parseShiftArgs(BSONObj obj,
                                                                  const mongo::StringData& accName,
@@ -119,12 +119,12 @@ boost::intrusive_ptr<Expression> ExpressionShift::parse(BSONObj obj,
     return shiftExpr;
 }
 
-Value ExpressionShift::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+Value ExpressionShift::serialize(SerializationOptions opts) const {
     MutableDocument args;
-    args.addField(kByArg, Value(_offset));
-    args.addField(kOutputArg, _input->serialize(static_cast<bool>(explain)));
-    args.addField(kDefaultArg, _defaultVal.get_value_or(mongo::Value(BSONNULL)));
-
+    args.addField(kByArg, opts.serializeLiteralValue(_offset));
+    args.addField(kOutputArg, _input->serialize(opts));
+    args.addField(kDefaultArg,
+                  opts.serializeLiteralValue(_defaultVal.get_value_or(mongo::Value(BSONNULL))));
     MutableDocument windowFun;
     windowFun.addField(_accumulatorName, args.freezeToValue());
     return windowFun.freezeToValue();

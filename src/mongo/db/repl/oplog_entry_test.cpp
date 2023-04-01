@@ -27,10 +27,9 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/repl/idempotency_test_fixture.h"
 #include "mongo/db/repl/oplog_entry_test_helpers.h"
+#include "mongo/unittest/matcher.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -38,7 +37,7 @@ namespace repl {
 namespace {
 
 const OpTime entryOpTime{Timestamp(3, 4), 5};
-const NamespaceString nss{"foo", "bar"};
+const NamespaceString nss = NamespaceString::createNamespaceString_forTest("foo", "bar");
 const int docId = 17;
 
 TEST(OplogEntryTest, Update) {
@@ -55,6 +54,7 @@ TEST(OplogEntryTest, Update) {
     ASSERT_BSONOBJ_EQ(entry.getObjectContainingDocumentKey(), doc);
     ASSERT(entry.getCommandType() == OplogEntry::CommandType::kNotCommand);
     ASSERT_EQ(entry.getOpTime(), entryOpTime);
+    ASSERT(!entry.getTid());
 }
 
 TEST(OplogEntryTest, Insert) {
@@ -70,6 +70,7 @@ TEST(OplogEntryTest, Insert) {
     ASSERT_BSONOBJ_EQ(entry.getObjectContainingDocumentKey(), doc);
     ASSERT(entry.getCommandType() == OplogEntry::CommandType::kNotCommand);
     ASSERT_EQ(entry.getOpTime(), entryOpTime);
+    ASSERT(!entry.getTid());
 }
 
 TEST(OplogEntryTest, Delete) {
@@ -85,6 +86,7 @@ TEST(OplogEntryTest, Delete) {
     ASSERT_BSONOBJ_EQ(entry.getObjectContainingDocumentKey(), doc);
     ASSERT(entry.getCommandType() == OplogEntry::CommandType::kNotCommand);
     ASSERT_EQ(entry.getOpTime(), entryOpTime);
+    ASSERT(!entry.getTid());
 }
 
 TEST(OplogEntryTest, Create) {
@@ -102,6 +104,7 @@ TEST(OplogEntryTest, Create) {
                       BSON("create" << nss.coll() << "capped" << true << "size" << 15));
     ASSERT(entry.getCommandType() == OplogEntry::CommandType::kCreate);
     ASSERT_EQ(entry.getOpTime(), entryOpTime);
+    ASSERT(!entry.getTid());
 }
 
 TEST(OplogEntryTest, OpTimeBaseNonStrictParsing) {
@@ -113,12 +116,12 @@ TEST(OplogEntryTest, OpTimeBaseNonStrictParsing) {
     // OpTimeBase should be successfully created from an OplogEntry, even though it has
     // extraneous fields.
     UNIT_TEST_INTERNALS_IGNORE_UNUSED_RESULT_WARNINGS(
-        OpTimeBase::parse(IDLParserErrorContext("OpTimeBase"), oplogEntryExtraField));
+        OpTimeBase::parse(IDLParserContext("OpTimeBase"), oplogEntryExtraField));
 
     // OplogEntryBase should still use strict parsing and throw an error when it has extraneous
     // fields.
     ASSERT_THROWS_CODE(
-        OplogEntryBase::parse(IDLParserErrorContext("OplogEntryBase"), oplogEntryExtraField),
+        OplogEntryBase::parse(IDLParserContext("OplogEntryBase"), oplogEntryExtraField),
         AssertionException,
         40415);
 
@@ -130,11 +133,149 @@ TEST(OplogEntryTest, OpTimeBaseNonStrictParsing) {
     // When an OplogEntryBase is created with a missing required field in a chained struct, it
     // should throw an exception.
     ASSERT_THROWS_CODE(
-        OplogEntryBase::parse(IDLParserErrorContext("OplogEntryBase"), oplogEntryMissingTimestamp),
+        OplogEntryBase::parse(IDLParserContext("OplogEntryBase"), oplogEntryMissingTimestamp),
         AssertionException,
         40414);
 }
 
+TEST(OplogEntryTest, InsertIncludesTidField) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", true);
+    const BSONObj doc = BSON("_id" << docId << "a" << 5);
+    TenantId tid(OID::gen());
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(tid, "foo", "bar");
+    const auto entry =
+        makeOplogEntry(entryOpTime, OpTypeEnum::kInsert, nss, doc, boost::none, {}, Date_t::now());
+
+    ASSERT(entry.getTid());
+    ASSERT_EQ(*entry.getTid(), tid);
+    ASSERT_EQ(entry.getNss(), nss);
+    ASSERT_BSONOBJ_EQ(entry.getIdElement().wrap("_id"), BSON("_id" << docId));
+    ASSERT_BSONOBJ_EQ(entry.getOperationToApply(), doc);
+}
+
+TEST(OplogEntryTest, ParseMutableOplogEntryIncludesTidField) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", true);
+
+    const TenantId tid(OID::gen());
+
+    const NamespaceString nssWithTid =
+        NamespaceString::createNamespaceString_forTest(tid, nss.ns());
+
+    const BSONObj oplogBson = [&] {
+        BSONObjBuilder bob;
+        bob.append("ts", Timestamp(0, 0));
+        bob.append("t", 0LL);
+        bob.append("op", "c");
+        tid.serializeToBSON("tid", &bob);
+        bob.append("ns", nssWithTid.ns());
+        bob.append("wall", Date_t());
+        BSONObjBuilder{bob.subobjStart("o")}.append("_id", 1);
+        return bob.obj();
+    }();
+
+    auto oplogEntry = unittest::assertGet(MutableOplogEntry::parse(oplogBson));
+    ASSERT(oplogEntry.getTid());
+    ASSERT_EQ(oplogEntry.getTid(), tid);
+    ASSERT_EQ(oplogEntry.getNss(), nssWithTid);
+}
+
+TEST(OplogEntryTest, ParseDurableOplogEntryIncludesTidField) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", true);
+
+    const TenantId tid(OID::gen());
+    const NamespaceString nssWithTid =
+        NamespaceString::createNamespaceString_forTest(tid, nss.ns());
+
+    const BSONObj oplogBson = [&] {
+        BSONObjBuilder bob;
+        bob.append("ts", Timestamp(0, 0));
+        bob.append("t", 0LL);
+        bob.append("op", "i");
+        tid.serializeToBSON("tid", &bob);
+        bob.append("ns", nssWithTid.ns());
+        bob.append("wall", Date_t());
+        BSONObjBuilder{bob.subobjStart("o")}.append("_id", 1).append("data", "x");
+        BSONObjBuilder{bob.subobjStart("o2")}.append("_id", 1);
+        return bob.obj();
+    }();
+
+    auto oplogEntry = unittest::assertGet(DurableOplogEntry::parse(oplogBson));
+    ASSERT(oplogEntry.getTid());
+    ASSERT_EQ(oplogEntry.getTid(), tid);
+    ASSERT_EQ(oplogEntry.getNss(), nssWithTid);
+}
+
+TEST(OplogEntryTest, ParseReplOperationIncludesTidField) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", true);
+
+    UUID uuid(UUID::gen());
+    TenantId tid(OID::gen());
+    NamespaceString nssWithTid = NamespaceString::createNamespaceString_forTest(tid, nss.ns());
+
+    auto op = repl::DurableOplogEntry::makeInsertOperation(
+        nssWithTid,
+        uuid,
+        BSONObjBuilder{}.append("_id", 1).append("data", "x").obj(),
+        BSONObjBuilder{}.append("_id", 1).obj());
+    BSONObj oplogBson = op.toBSON();
+
+    auto replOp = ReplOperation::parse(IDLParserContext("ReplOperation", false, tid), oplogBson);
+    ASSERT(replOp.getTid());
+    ASSERT_EQ(replOp.getTid(), tid);
+    ASSERT_EQ(replOp.getNss(), nssWithTid);
+}
+
+TEST(OplogEntryTest, ConvertMutableOplogEntryToReplOperation) {
+    // Required by setTid to take effect
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", true);
+    RAIIServerParameterControllerForTest multitenancySupportController("multitenancySupport", true);
+    auto tid = TenantId(OID::gen());
+    auto nssWithTid = NamespaceString::createNamespaceString_forTest(tid, nss.ns());
+    auto opType = repl::OpTypeEnum::kCommand;
+    auto uuid = UUID::gen();
+    std::vector<StmtId> stmtIds{StmtId(0), StmtId(1), StmtId(2)};
+    const auto doc = BSON("x" << 1);
+
+    MutableOplogEntry entry;
+    entry.setTid(tid);
+    entry.setNss(nssWithTid);
+    entry.setTimestamp(Timestamp(1, 1));    // only exists in OplogEntryBase
+    entry.setWallClockTime(Date_t::now());  // only exists in OplogEntryBase
+    entry.setTerm(1);                       // only exists in OplogEntryBase
+    entry.setUuid(uuid);
+    entry.setOpType(opType);
+    entry.setObject(doc);
+    entry.setStatementIds(stmtIds);
+
+    auto replOp = entry.toReplOperation();
+
+    ASSERT_EQ(replOp.getTid(), tid);
+    ASSERT_EQ(replOp.getTid(), entry.getTid());
+    ASSERT_EQ(replOp.getUuid(), uuid);
+    ASSERT_EQ(replOp.getUuid(), entry.getUuid());
+    ASSERT_EQ(replOp.getOpType(), opType);
+    ASSERT_EQ(replOp.getOpType(), entry.getOpType());
+    ASSERT_EQ(replOp.getNss(), nssWithTid);
+    ASSERT_EQ(replOp.getNss(), entry.getNss());
+    ASSERT_FALSE(replOp.getFromMigrate());
+    ASSERT_EQ(replOp.getFromMigrate(), entry.getFromMigrate());
+    ASSERT_BSONOBJ_EQ(replOp.getObject(), doc);
+    ASSERT_BSONOBJ_EQ(replOp.getObject(), entry.getObject());
+    ASSERT_EQ(replOp.getStatementIds().size(), stmtIds.size());
+    ASSERT_EQ(replOp.getStatementIds().size(), entry.getStatementIds().size());
+    ASSERT_THAT(replOp.getStatementIds(), unittest::match::Eq(stmtIds));
+    ASSERT_THAT(replOp.getStatementIds(), unittest::match::Eq(entry.getStatementIds()));
+
+    // While overwhelmingly set to false, a few sharding scenarios
+    // set 'fromMigrate' to true. Therefore, testing it.
+    entry.setFromMigrateIfTrue(true);
+    auto replOp2 = entry.toReplOperation();
+    ASSERT_EQ(replOp2.getFromMigrate(), entry.getFromMigrate());
+}
 
 }  // namespace
 }  // namespace repl

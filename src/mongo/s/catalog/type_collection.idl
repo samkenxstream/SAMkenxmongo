@@ -30,7 +30,7 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/db/keypattern.idl"
     - "mongo/s/chunk_version.idl"
     - "mongo/s/resharding/type_collection_fields.idl"
@@ -44,7 +44,7 @@ enums:
             kMergeAndMeasureChunks : "mergeAndMeasureChunks"
             kMoveAndMergeChunks: "moveAndMergeChunks"
             kMergeChunks : "mergeChunks"
-            kSplitChunks: "splitChunks"
+            kSplitChunks: "splitChunks" # Never used but kept for parsing backwards compatibility
             kFinished: "finished"
 
 structs:
@@ -105,13 +105,17 @@ structs:
                 type: safeInt64
                 description: "Max chunk size in bytes."
                 optional: true
-            defragmentCollection: 
+            defragmentCollection:
                 type: bool
                 description: "Balancer will merge chunks up to the configured maxChunkSizeBytes."
                 optional: true
-            noAutoSplit: 
+            noAutoSplit:
                 type: bool
                 description: "Specifies whether the auto-splitter should be running or not for this collection."
+                optional: true
+            enableAutoMerge:
+                type: bool
+                description: "Specifies whether the auto-merger should be running or not for this collection."
                 optional: true
             defragmentationPhase:
                 type: DefragmentationPhase
@@ -148,4 +152,9 @@ structs:
                 description: "DEPRECATED flag that determines wether this collection allows chunks to
                                move. This will only prevent migration from committing and new balancer
                                rounds, this flag will not be loaded by shards."
+                optional: true
+            indexVersion:
+                type: timestamp
+                description: "Current collection index version. It will tick everytime a global index 
+                                is created or dropped."
                 optional: true

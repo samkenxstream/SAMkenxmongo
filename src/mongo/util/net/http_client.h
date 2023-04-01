@@ -73,6 +73,11 @@ public:
     virtual void allowInsecureHTTP(bool allow) = 0;
 
     /**
+     * Returns Status::OK iff the provided URL endpoint uses HTTPS.
+     */
+    static Status endpointIsHTTPS(StringData url);
+
+    /**
      * Assign a set of headers for this request.
      */
     virtual void setHeaders(const std::vector<std::string>& headers) = 0;
@@ -81,13 +86,17 @@ public:
      * Sets the maximum time to wait during the connection phase.
      * `0` indicates no timeout.
      */
-    virtual void setConnectTimeout(Seconds timeout) = 0;
+    void setConnectTimeout(Seconds timeout) {
+        _connectTimeout = timeout;
+    }
 
     /**
      * Sets the maximum time to wait for the total request.
      * `0` indicates no timeout.
      */
-    virtual void setTimeout(Seconds timeout) = 0;
+    void setTimeout(Seconds timeout) {
+        _timeout = timeout;
+    }
 
     /**
      * Perform a request to specified URL.
@@ -136,6 +145,10 @@ public:
      * Content for ServerStatus http_client section.
      */
     static BSONObj getServerStatus();
+
+protected:
+    Seconds _timeout = kTotalRequestTimeout;
+    Seconds _connectTimeout = kConnectionTimeout;
 
 private:
     DataBuilder requestSuccess(HttpMethod method, StringData url, ConstDataRange data) const {

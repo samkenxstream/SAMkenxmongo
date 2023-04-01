@@ -3,15 +3,12 @@ test_kind: fsm_workload_test
 selector:
   roots:
   - jstests/concurrency/fsm_workloads/**/*.js
+  - src/mongo/db/modules/*/jstests/concurrency/fsm_workloads/*.js
   exclude_files:
   # SERVER-13116 distinct isn't sharding aware
   - jstests/concurrency/fsm_workloads/distinct.js
   - jstests/concurrency/fsm_workloads/distinct_noindex.js
   - jstests/concurrency/fsm_workloads/distinct_projection.js
-
-  # SERVER-17397 Drops of sharded namespaces may not fully succeed
-  - jstests/concurrency/fsm_workloads/create_database.js
-  - jstests/concurrency/fsm_workloads/map_reduce_drop.js
 
   # Disabled due to SERVER-33753, '.count() without a predicate can be wrong on sharded
   # collections'. This bug is problematic for these workloads because they assert on count()
@@ -172,36 +169,36 @@ executor:
   archive:
     hooks:
       - CheckReplDBHash
+      - CheckMetadataConsistencyInBackground
       - ValidateCollections
     tests: true
   config:
     shell_options:
-      eval: >-
-        load("jstests/libs/override_methods/mongos_manual_intervention_actions.js");
       global_vars:
         TestData:
           runningWithConfigStepdowns: true
           runningWithShardStepdowns: true
-          runningWithAutoSplit: false
           runningWithBalancer: false
-          useStepdownPermittedFile: true
+          useActionPermittedFile: true
   hooks:
   - class: ContinuousStepdown
     config_stepdown: true
     shard_stepdown: true
-    use_stepdown_permitted_file: true
-    wait_for_mongos_retarget: true
+    use_action_permitted_file: true
   - class: CheckReplDBHash
+  - class: CheckMetadataConsistencyInBackground
   - class: CheckOrphansDeleted
+  - class: CheckRoutingTableConsistency
+  - class: CheckShardFilteringMetadata
   - class: ValidateCollections # Validation can interfere with other operations, so this goes last.
   - class: CleanupConcurrencyWorkloads
   fixture:
     class: ShardedClusterFixture
     enable_balancer: false
-    enable_autosplit: false
     mongos_options:
       set_parameters:
         enableTestCommands: 1
+        queryAnalysisSamplerConfigurationRefreshSecs: 1
     configsvr_options:
       num_nodes: 3
       all_nodes_electable: true
@@ -224,6 +221,7 @@ executor:
         enableElectionHandoff: 0
         roleGraphInvalidationIsFatal: 1
         receiveChunkWaitForRangeDeleterTimeoutMS: 90000
+        queryAnalysisWriterIntervalSecs: 1
     num_rs_nodes_per_shard: 3
     num_shards: 2
     num_mongos: 2

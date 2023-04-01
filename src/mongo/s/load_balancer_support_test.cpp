@@ -26,19 +26,19 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/s/load_balancer_support.h"
 
 #include "mongo/bson/json.h"
 #include "mongo/db/service_context_test_fixture.h"
-#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/concurrency/locker_mongos_client_observer.h"
-#include "mongo/s/load_balancer_feature_flag_gen.h"
 #include "mongo/unittest/assert_that.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/fail_point.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace {

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/util/testing_proctor.h"
 
@@ -35,6 +34,9 @@
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/static_immortal.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
@@ -47,7 +49,7 @@ bool TestingProctor::isEnabled() const {
     uassert(ErrorCodes::NotYetInitialized,
             "Cannot check whether testing diagnostics is enabled before it is initialized",
             isInitialized());
-    return _diagnosticsEnabled.get();
+    return _diagnosticsEnabled.value();
 }
 
 void TestingProctor::setEnabled(bool enable) {
@@ -58,7 +60,7 @@ void TestingProctor::setEnabled(bool enable) {
 
     uassert(ErrorCodes::AlreadyInitialized,
             "Cannot alter testing diagnostics once initialized",
-            _diagnosticsEnabled.get() == enable);
+            _diagnosticsEnabled.value() == enable);
 
     LOGV2(4672601, "Overriding testing diagnostics", "enabled"_attr = enable);
 }

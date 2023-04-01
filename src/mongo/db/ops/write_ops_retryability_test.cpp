@@ -42,9 +42,10 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -54,7 +55,14 @@ using unittest::assertGet;
 
 const BSONObj kNestedOplog(BSON("$sessionMigrateInfo" << 1));
 
-using WriteOpsRetryability = ServiceContextMongoDTest;
+class WriteOpsRetryability : public ServiceContextMongoDTest {
+public:
+    void setUp() override {
+        auto serviceContext = getServiceContext();
+        auto storageImpl = std::make_unique<repl::StorageInterfaceImpl>();
+        repl::StorageInterface::set(serviceContext, std::move(storageImpl));
+    }
+};
 
 /**
  * Creates OplogEntry with given field values.
@@ -68,9 +76,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 boost::optional<repl::OpTime> postImageOpTime = boost::none) {
     return {
         repl::DurableOplogEntry(opTime,                           // optime
-                                boost::none,                      // hash
                                 opType,                           // opType
-                                boost::none,                      // tenant id
                                 nss,                              // namespace
                                 boost::none,                      // uuid
                                 boost::none,                      // fromMigrate
@@ -131,16 +137,18 @@ TEST_F(WriteOpsRetryability, ParseOplogEntryForUpdate) {
 }
 
 TEST_F(WriteOpsRetryability, ParseOplogEntryForNestedUpdate) {
-    auto innerOplog = makeOplogEntry(repl::OpTime(Timestamp(50, 10), 1),   // optime
-                                     repl::OpTypeEnum::kUpdate,            // op type
-                                     NamespaceString("a.b"),               // namespace
-                                     BSON("_id" << 1 << "x" << 5),         // o
-                                     BSON("_id" << 1));                    // o2
-    auto updateOplog = makeOplogEntry(repl::OpTime(Timestamp(60, 10), 1),  // optime
-                                      repl::OpTypeEnum::kNoop,             // op type
-                                      NamespaceString("a.b"),              // namespace
-                                      kNestedOplog,                        // o
-                                      innerOplog.getEntry().toBSON());     // o2
+    auto innerOplog =
+        makeOplogEntry(repl::OpTime(Timestamp(50, 10), 1),                     // optime
+                       repl::OpTypeEnum::kUpdate,                              // op type
+                       NamespaceString::createNamespaceString_forTest("a.b"),  // namespace
+                       BSON("_id" << 1 << "x" << 5),                           // o
+                       BSON("_id" << 1));                                      // o2
+    auto updateOplog =
+        makeOplogEntry(repl::OpTime(Timestamp(60, 10), 1),                     // optime
+                       repl::OpTypeEnum::kNoop,                                // op type
+                       NamespaceString::createNamespaceString_forTest("a.b"),  // namespace
+                       kNestedOplog,                                           // o
+                       innerOplog.getEntry().toBSON());                        // o2
 
     auto res = parseOplogEntryForUpdate(updateOplog);
 
@@ -165,15 +173,17 @@ TEST_F(WriteOpsRetryability, ParseOplogEntryForUpsert) {
 }
 
 TEST_F(WriteOpsRetryability, ParseOplogEntryForNestedUpsert) {
-    auto innerOplog = makeOplogEntry(repl::OpTime(Timestamp(50, 10), 1),   // optime
-                                     repl::OpTypeEnum::kInsert,            // op type
-                                     NamespaceString("a.b"),               // namespace
-                                     BSON("_id" << 2));                    // o
-    auto insertOplog = makeOplogEntry(repl::OpTime(Timestamp(60, 10), 1),  /// optime
-                                      repl::OpTypeEnum::kNoop,             // op type
-                                      NamespaceString("a.b"),              // namespace
-                                      kNestedOplog,                        // o
-                                      innerOplog.getEntry().toBSON());     // o2
+    auto innerOplog =
+        makeOplogEntry(repl::OpTime(Timestamp(50, 10), 1),                     // optime
+                       repl::OpTypeEnum::kInsert,                              // op type
+                       NamespaceString::createNamespaceString_forTest("a.b"),  // namespace
+                       BSON("_id" << 2));                                      // o
+    auto insertOplog =
+        makeOplogEntry(repl::OpTime(Timestamp(60, 10), 1),                     /// optime
+                       repl::OpTypeEnum::kNoop,                                // op type
+                       NamespaceString::createNamespaceString_forTest("a.b"),  // namespace
+                       kNestedOplog,                                           // o
+                       innerOplog.getEntry().toBSON());                        // o2
 
     auto res = parseOplogEntryForUpdate(insertOplog);
 
@@ -183,10 +193,11 @@ TEST_F(WriteOpsRetryability, ParseOplogEntryForNestedUpsert) {
 }
 
 TEST_F(WriteOpsRetryability, ShouldFailIfParsingDeleteOplogForUpdate) {
-    auto deleteOplog = makeOplogEntry(repl::OpTime(Timestamp(50, 10), 1),  // optime
-                                      repl::OpTypeEnum::kDelete,           // op type
-                                      NamespaceString("a.b"),              // namespace
-                                      BSON("_id" << 2));                   // o
+    auto deleteOplog =
+        makeOplogEntry(repl::OpTime(Timestamp(50, 10), 1),                     // optime
+                       repl::OpTypeEnum::kDelete,                              // op type
+                       NamespaceString::createNamespaceString_forTest("a.b"),  // namespace
+                       BSON("_id" << 2));                                      // o
 
     ASSERT_THROWS(parseOplogEntryForUpdate(deleteOplog), AssertionException);
 }
@@ -197,7 +208,8 @@ TEST_F(WriteOpsRetryability, PerformInsertsSuccess) {
     repl::UnreplicatedWritesBlock unreplicated(opCtxRaii.get());
     setUpReplication(getServiceContext());
 
-    write_ops::InsertCommandRequest insertOp(NamespaceString("foo.bar"));
+    write_ops::InsertCommandRequest insertOp(
+        NamespaceString::createNamespaceString_forTest("foo.bar"));
     insertOp.getWriteCommandRequestBase().setOrdered(true);
     insertOp.setDocuments({BSON("_id" << 0), BSON("_id" << 1)});
     write_ops_exec::WriteResult result = write_ops_exec::performInserts(opCtxRaii.get(), insertOp);
@@ -218,7 +230,8 @@ TEST_F(WriteOpsRetryability, PerformRetryableInsertsSuccess) {
     // Set up a retryable write where statements 1 and 2 have already executed.
     setUpTxnParticipant(opCtxRaii.get(), {1, 2});
 
-    write_ops::InsertCommandRequest insertOp(NamespaceString("foo.bar"));
+    write_ops::InsertCommandRequest insertOp(
+        NamespaceString::createNamespaceString_forTest("foo.bar"));
     insertOp.getWriteCommandRequestBase().setOrdered(true);
     // Setup documents that cannot be successfully inserted to show that the retryable logic was
     // exercised.
@@ -245,7 +258,8 @@ TEST_F(WriteOpsRetryability, PerformRetryableInsertsWithBatchedFailure) {
     // Set up a retryable write where statement 3 has already executed.
     setUpTxnParticipant(opCtxRaii.get(), {3});
 
-    write_ops::InsertCommandRequest insertOp(NamespaceString("foo.bar"));
+    write_ops::InsertCommandRequest insertOp(
+        NamespaceString::createNamespaceString_forTest("foo.bar"));
     insertOp.getWriteCommandRequestBase().setOrdered(false);
     // Setup documents such that the second will fail insertion.
     insertOp.setDocuments({BSON("_id" << 0), BSON("_id" << 0), BSON("_id" << 1)});
@@ -269,7 +283,8 @@ TEST_F(WriteOpsRetryability, PerformOrderedInsertsStopsAtError) {
     repl::UnreplicatedWritesBlock unreplicated(opCtxRaii.get());
     setUpReplication(getServiceContext());
 
-    write_ops::InsertCommandRequest insertOp(NamespaceString("foo.bar"));
+    write_ops::InsertCommandRequest insertOp(
+        NamespaceString::createNamespaceString_forTest("foo.bar"));
     insertOp.getWriteCommandRequestBase().setOrdered(true);
     // Setup documents such that the second cannot be successfully inserted.
     insertOp.setDocuments({BSON("_id" << 0), BSON("_id" << 0), BSON("_id" << 1)});
@@ -290,7 +305,8 @@ TEST_F(WriteOpsRetryability, PerformOrderedInsertsStopsAtBadDoc) {
     repl::UnreplicatedWritesBlock unreplicated(opCtxRaii.get());
     setUpReplication(getServiceContext());
 
-    write_ops::InsertCommandRequest insertOp(NamespaceString("foo.bar"));
+    write_ops::InsertCommandRequest insertOp(
+        NamespaceString::createNamespaceString_forTest("foo.bar"));
     insertOp.getWriteCommandRequestBase().setOrdered(true);
 
     // Setup documents such that the second cannot be successfully inserted.
@@ -322,7 +338,8 @@ TEST_F(WriteOpsRetryability, PerformUnorderedInsertsContinuesAtBadDoc) {
     repl::UnreplicatedWritesBlock unreplicated(opCtxRaii.get());
     setUpReplication(getServiceContext());
 
-    write_ops::InsertCommandRequest insertOp(NamespaceString("foo.bar"));
+    write_ops::InsertCommandRequest insertOp(
+        NamespaceString::createNamespaceString_forTest("foo.bar"));
     insertOp.getWriteCommandRequestBase().setOrdered(false);
 
     // Setup documents such that the second cannot be successfully inserted.
@@ -349,7 +366,7 @@ TEST_F(WriteOpsRetryability, PerformUnorderedInsertsContinuesAtBadDoc) {
 
 using FindAndModifyRetryability = MockReplCoordServerFixture;
 
-const NamespaceString kNs("test.user");
+const NamespaceString kNs = NamespaceString::createNamespaceString_forTest("test.user");
 
 TEST_F(FindAndModifyRetryability, BasicUpsertReturnNew) {
     auto request = makeFindAndModifyRequest(

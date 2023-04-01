@@ -1,10 +1,7 @@
 /**
  * Tests that large write error results from bulk write operations are within the BSON size limit.
  *
- * Tenant migrations are not expected to be run on servers with ephemeralForTest.
- *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
@@ -12,14 +9,11 @@
  *   serverless,
  * ]
  */
-(function() {
-'use strict';
 
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
 const kCollName = "testColl";
 const kTenantDefinedDbName = "0";
@@ -44,7 +38,7 @@ jsTestLog("Testing that large write errors fit within the BSON size limit.");
 
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
-const tenantId = "bulkUnorderedInserts-committed";
+const tenantId = ObjectId().str;
 const migrationOpts = {
     migrationIdString: extractUUIDFromObject(UUID()),
     tenantId,
@@ -93,4 +87,3 @@ assert.lte(Object.bsonsize(bulkWriteRes),
            assert.commandWorked(primaryDB.hello()).maxBsonObjectSize);
 
 tenantMigrationTest.stop();
-})();

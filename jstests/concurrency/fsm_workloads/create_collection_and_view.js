@@ -4,7 +4,7 @@
  * Repeatedly creates a collection and a view with the same namespace. Validates that we never
  * manage to have both a Collection and View created on the same namespace at the same time.
  *
- * @tags: [catches_command_failures]
+ * @tags: [catches_command_failures, antithesis_incompatible]
  */
 
 var $config = (function() {
@@ -34,15 +34,14 @@ var $config = (function() {
     const states = {
         init: (db, collName) => {},
         createView: (db, collName) => {
-            // The view creation code may uassert with code 17399 if Collection already exist. In a
-            // sharded collection, we may sometimes get a NamespaceNotFound error, as we attempt to
-            // to do some additional validation on the creation options after we get back the
-            // NamespaceExists error, and the namespace may have been dropped in the meantime.
+            // In a sharded collection, we may sometimes get a NamespaceNotFound error, as we
+            // attempt to to do some additional validation on the creation options after we get back
+            // the NamespaceExists error, and the namespace may have been dropped in the meantime.
             assertAlways.commandWorkedOrFailedWithCode(
                 db.createCollection(
                     getCollectionName(collName),
                     {viewOn: getBaseCollectionName(collName), pipeline: [{$match: {}}]}),
-                [ErrorCodes.NamespaceExists, 17399, ErrorCodes.NamespaceNotFound]);
+                [ErrorCodes.NamespaceExists, ErrorCodes.NamespaceNotFound]);
         },
         createCollection: (db, collName) => {
             // In a sharded collection, we may sometimes get a NamespaceNotFound error. See above.

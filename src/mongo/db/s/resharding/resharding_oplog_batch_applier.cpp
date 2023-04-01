@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
 #include "mongo/platform/basic.h"
 
@@ -41,6 +40,11 @@
 #include "mongo/db/s/resharding/resharding_oplog_application.h"
 #include "mongo/db/s/resharding/resharding_oplog_session_application.h"
 #include "mongo/logv2/log.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/shard_version_factory.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
+
 
 namespace mongo {
 
@@ -72,28 +76,35 @@ SemiFuture<void> ReshardingOplogBatchApplier::applyBatch(
                        auto opCtx = factory.makeOperationContext(&cc());
 
                        if constexpr (IsForSessionApplication) {
-                           auto hitPreparedTxn =
+                           auto conflictingTxnCompletionFuture =
                                _sessionApplication.tryApplyOperation(opCtx.get(), oplogEntry);
 
-                           if (hitPreparedTxn) {
-                               return future_util::withCancellation(std::move(*hitPreparedTxn),
-                                                                    cancelToken);
+                           if (conflictingTxnCompletionFuture) {
+                               return future_util::withCancellation(
+                                   std::move(*conflictingTxnCompletionFuture), cancelToken);
                            }
                        } else {
-                           // ReshardingOpObserver depends on the collection metadata being known
-                           // when processing writes to the temporary resharding collection. We
-                           // attach shard version IGNORED to the write operations and retry once
-                           // on a StaleConfig exception to allow the collection metadata
-                           // information to be recovered.
-                           ScopedSetShardRole scopedSetShardRole(
-                               opCtx.get(),
-                               _crudApplication.getOutputNss(),
-                               ChunkVersion::IGNORED() /* shardVersion */,
-                               boost::none /* databaseVersion */);
-
                            resharding::data_copy::withOneStaleConfigRetry(opCtx.get(), [&] {
+                               // ReshardingOpObserver depends on the collection metadata being
+                               // known when processing writes to the temporary resharding
+                               // collection. We attach placement version IGNORED to the write
+                               // operations and retry once on a StaleConfig exception to allow the
+                               // collection metadata information to be recovered.
+                               auto [_, sii] = uassertStatusOK(
+                                   Grid::get(opCtx.get())
+                                       ->catalogCache()
+                                       ->getCollectionRoutingInfo(opCtx.get(),
+                                                                  _crudApplication.getOutputNss()));
+                               ScopedSetShardRole scopedSetShardRole(
+                                   opCtx.get(),
+                                   _crudApplication.getOutputNss(),
+                                   ShardVersionFactory::make(
+                                       ChunkVersion::IGNORED(),
+                                       sii ? boost::make_optional(sii->getCollectionIndexes())
+                                           : boost::none) /* shardVersion */,
+                                   boost::none /* databaseVersion */);
                                uassertStatusOK(
-                                   _crudApplication.applyOperation(opCtx.get(), oplogEntry));
+                                   _crudApplication.applyOperation(opCtx.get(), sii, oplogEntry));
                            });
                        }
                    }

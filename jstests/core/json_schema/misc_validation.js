@@ -17,6 +17,8 @@
  *   requires_non_retryable_commands,
  *   requires_non_retryable_writes,
  *   requires_replication,
+ *   # This test depends on hardcoded database name equality.
+ *   tenant_migration_incompatible,
  * ]
  */
 (function() {
@@ -298,28 +300,4 @@ assert.eq(1, coll.find({$jsonSchema: {required: ["a"]}, $text: {$search: "test"}
 assert.eq(
     3, coll.find({$or: [{$jsonSchema: {required: ["a"]}}, {$text: {$search: "TEST"}}]}).itcount());
 assert.eq(1, coll.find({$and: [{$jsonSchema: {}}, {$text: {$search: "TEST"}}]}).itcount());
-
-if (!isMongos) {
-    coll.drop();
-    assert.commandWorked(coll.insert({_id: 0, a: true}));
-
-    // Test $jsonSchema in the precondition checking for applyOps.
-    res = testDB.adminCommand({
-        applyOps: [
-            {op: "u", ns: coll.getFullName(), o2: {_id: 0}, o: {$set: {a: false}}},
-        ],
-        preCondition: [{
-            ns: coll.getFullName(),
-            q: {$jsonSchema: {properties: {a: {type: "boolean"}}}},
-            res: {a: true}
-        }]
-    });
-    assert.commandWorked(res);
-    assert.eq(1, res.applied);
-
-    // Use majority write concern to clear the drop-pending that can cause lock conflicts with
-    // transactions.
-    coll.drop({writeConcern: {w: "majority"}});
-    assert.commandWorked(coll.insert({_id: 1, a: true}));
-}
 }());

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/db/pipeline/change_stream_helpers_legacy.h"
 
@@ -44,112 +43,52 @@
 #include "mongo/db/pipeline/document_source_change_stream_unwind_transaction.h"
 #include "mongo/db/pipeline/expression.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
 namespace mongo {
 namespace change_stream_legacy {
 
-std::list<boost::intrusive_ptr<DocumentSource>> buildPipeline(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, DocumentSourceChangeStreamSpec spec) {
-    // The only case where we expect to build a legacy pipeline is if we are a shard which has
-    // received a $changeStream request from an older mongoS.
-    tassert(5565900,
-            "Unexpected {needsMerge:false} request for a legacy change stream pipeline",
-            expCtx->needsMerge);
+// TODO SERVER-66138: This function can be removed after we branch for 7.0.
+void populateInternalOperationFilter(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                     BSONArrayBuilder* orBuilder) {
+    std::vector<StringData> opTypes = {"reshardBegin"_sd, "reshardDoneCatchUp"_sd};
 
-    std::list<boost::intrusive_ptr<DocumentSource>> stages;
-
-    const auto userRequestedResumePoint =
-        spec.getResumeAfter() || spec.getStartAfter() || spec.getStartAtOperationTime();
-
-    if (!userRequestedResumePoint) {
-        // Make sure we update the 'resumeAfter' in the 'spec' so that we serialize the
-        // correct resume token when sending it to the shards.
-        spec.setResumeAfter(ResumeToken::makeHighWaterMarkToken(
-            DocumentSourceChangeStream::getStartTimeForNewStream(expCtx)));
+    // Noop change events that are only applicable when merging results on mongoS:
+    //   - migrateChunkToNewShard: A chunk migrated to a shard that didn't have any chunks.
+    if (expCtx->inMongos || expCtx->needsMerge) {
+        opTypes.push_back("migrateChunkToNewShard"_sd);
     }
 
-    // Unfold the $changeStream into its constituent stages and add them to the pipeline.
-    stages.push_back(DocumentSourceChangeStreamOplogMatch::create(expCtx, spec));
-    stages.push_back(DocumentSourceChangeStreamUnwindTransaction::create(expCtx));
-    stages.push_back(DocumentSourceChangeStreamTransform::create(expCtx, spec));
-
-    tassert(5467606,
-            "'DocumentSourceChangeStreamTransform' stage should populate "
-            "'initialPostBatchResumeToken' field",
-            !expCtx->initialPostBatchResumeToken.isEmpty());
-
-    // The resume stage must come after the check invalidate stage so that the former can determine
-    // whether the event that matches the resume token should be followed by an "invalidate" event.
-    stages.push_back(DocumentSourceChangeStreamCheckInvalidate::create(expCtx, spec));
-
-    // We must always check that the shard is capable of resuming from the specified point.
-    stages.push_back(DocumentSourceChangeStreamCheckResumability::create(expCtx, spec));
-
-    // If 'showExpandedEvents' is NOT set, add a filter that returns only classic change events.
-    if (!spec.getShowExpandedEvents()) {
-        stages.push_back(DocumentSourceMatch::create(
-            change_stream_filter::getMatchFilterForClassicOperationTypes(), expCtx));
+    for (const auto& eventName : opTypes) {
+        // Legacy oplog messages used the "o2.type" field to indicate the message type.
+        orBuilder->append(BSON("o2.type" << eventName));
     }
-
-    return stages;
 }
 
-boost::optional<Document> legacyLookupPreImage(boost::intrusive_ptr<ExpressionContext> pExpCtx,
-                                               const Document& preImageId) {
-    // We need the oplog's UUID for lookup, so obtain the collection info via MongoProcessInterface.
-    auto localOplogInfo = pExpCtx->mongoProcessInterface->getCollectionOptions(
-        pExpCtx->opCtx, NamespaceString::kRsOplogNamespace);
-
-    // Extract the UUID from the collection information. We should always have a valid uuid here.
-    auto oplogUUID = invariantStatusOK(UUID::parse(localOplogInfo["uuid"]));
-
-    // Look up the pre-image oplog entry using the opTime as the query filter.
-    const auto opTime = repl::OpTime::parse(preImageId.toBson());
-    auto lookedUpDoc =
-        pExpCtx->mongoProcessInterface->lookupSingleDocument(pExpCtx,
-                                                             NamespaceString::kRsOplogNamespace,
-                                                             oplogUUID,
-                                                             Document{opTime.asQuery()},
-                                                             boost::none);
-
-    // Return boost::none to signify that we failed to find the pre-image.
-    if (!lookedUpDoc) {
-        return boost::none;
+// TODO SERVER-66138: This function can be removed after we branch for 7.0.
+Document convertFromLegacyOplogFormat(const Document& o2Entry, const NamespaceString& nss) {
+    auto type = o2Entry["type"];
+    if (type.missing()) {
+        return o2Entry;
     }
 
-    // If we had an optime to look up, and we found an oplog entry with that timestamp, then we
-    // should always have a valid no-op entry containing a valid, non-empty pre-image document.
-    auto opLogEntry = uassertStatusOK(repl::OplogEntry::parse(lookedUpDoc->toBson()));
-    tassert(5868901,
-            "Oplog entry type must be a no-op",
-            opLogEntry.getOpType() == repl::OpTypeEnum::kNoop);
-    tassert(5868902,
-            "Oplog entry must contait a non-empty pre-image document",
-            !opLogEntry.getObject().isEmpty());
+    MutableDocument doc(o2Entry);
+    doc.remove("type");
 
-    return Document{opLogEntry.getObject().getOwned()};
+    // This field would be the first field in the new format, but the current change stream code
+    // does not depend on the field order.
+    doc.addField(type.getString(), Value(nss.toString()));
+    return doc.freeze();
 }
 
-boost::optional<std::pair<UUID, std::vector<FieldPath>>> buildDocumentKeyCache(
-    const ResumeTokenData& tokenData) {
-    if (!tokenData.eventIdentifier.missing() && tokenData.uuid) {
-        auto docKey = tokenData.eventIdentifier.getDocument();
-
-        // Newly added events store their operationType and operationDescription as the
-        // eventIdentifier, not a documentKey.
-        if (docKey["_id"].missing()) {
-            return {};
-        }
-
-        std::vector<FieldPath> docKeyFields;
-        auto iter = docKey.fieldIterator();
-        while (iter.more()) {
-            auto fieldPair = iter.next();
-            docKeyFields.push_back(fieldPair.first);
-        }
-
-        return std::make_pair(tokenData.uuid.get(), docKeyFields);
-    }
-    return {};
+// TODO SERVER-66138: This function can be removed after we branch for 7.0.
+StringData getNewShardDetectedOpName(const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    // The op name on 6.0 and older versions.
+    const StringData kNewShardDetectedOpTypeLegacyName = "kNewShardDetected"_sd;
+    return (expCtx->changeStreamTokenVersion == ResumeTokenData::kDefaultTokenVersion)
+        ? DocumentSourceChangeStream::kNewShardDetectedOpType
+        : kNewShardDetectedOpTypeLegacyName;
 }
 
 }  // namespace change_stream_legacy

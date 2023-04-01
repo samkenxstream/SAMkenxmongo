@@ -29,24 +29,8 @@ from pkg_resources import parse_version
 
 import SCons
 
-_icecream_version_min = parse_version("1.1rc2")
+_icecream_version_min = parse_version("1.3")
 _icecream_version_gcc_remote_cpp = parse_version("1.2")
-
-
-# I'd prefer to use value here, but amazingly, its __str__ returns the
-# *initial* value of the Value and not the built value, if
-# available. That seems like a bug. In the meantime, make our own very
-# sinmple Substition thing.
-class _BoundSubstitution:
-    def __init__(self, env, expression):
-        self.env = env
-        self.expression = expression
-        self.result = None
-
-    def __str__(self):
-        if self.result is None:
-            self.result = self.env.subst(self.expression)
-        return self.result
 
 
 def icecc_create_env(env, target, source, for_signature):
@@ -100,14 +84,6 @@ def icecc_create_env(env, target, source, for_signature):
 
 
 def generate(env):
-    # icecc lower then 1.1 supports addfile remapping accidentally
-    # and above it adds an empty cpuinfo so handle cpuinfo issues for icecream
-    # below version 1.1
-    if (env['ICECREAM_VERSION'] <= parse_version('1.1')
-        and env.ToolchainIs("clang")
-        and os.path.exists('/proc/cpuinfo')):
-        env.AppendUnique(ICECC_CREATE_ENV_ADDFILES=[('/proc/cpuinfo', '/dev/null')])
-
     # Absoluteify, so we can derive ICERUN
     env["ICECC"] = env.WhereIs("$ICECC")
 
@@ -131,9 +107,10 @@ def generate(env):
     env["CXX"] = env.WhereIs("$CXX")
 
     # Set up defaults for configuration options
-    env['ICECREAM_TARGET_DIR'] = env.Dir(
-        env.get('ICECREAM_TARGET_DIR', '#./.icecream')
-    )
+    env['ICECREAM_TARGET_DIR'] = env.Dir(env.get(
+        'ICECREAM_TARGET_DIR',
+        '#./.icecream',
+    ), )
     verbose = env.get('ICECREAM_VERBOSE', False)
     env['ICECC_DEBUG'] = env.get('ICECC_DEBUG', False)
 
@@ -141,9 +118,7 @@ def generate(env):
     # environment doesn't need to see or know about. Make a custom env
     # that we use consistently from here to where we end up setting
     # ICECREAM_RUN_ICECC in the user env.
-    setupEnv = env.Clone(
-        NINJA_SKIP=True
-    )
+    setupEnv = env.Clone(NINJA_SKIP=True)
 
     if 'ICECC_VERSION' in setupEnv and bool(setupEnv['ICECC_VERSION']):
 
@@ -177,7 +152,8 @@ def generate(env):
                 source=[setupEnv.Value(quoted)],
                 action=SCons.Action.Action(
                     f"{cmdstr} -o $TARGET $ICECC_VERSION_URL",
-                    "Downloading compiler package from $ICECC_VERSION_URL" if not verbose else str(),
+                    "Downloading compiler package from $ICECC_VERSION_URL"
+                    if not verbose else str(),
                 ),
             )[0]
 
@@ -187,8 +163,8 @@ def generate(env):
 
             if not icecc_version_file.exists():
                 raise Exception(
-                    'The ICECC_VERSION variable set set to {}, but this file does not exist'.format(icecc_version_file)
-                )
+                    'The ICECC_VERSION variable set set to {}, but this file does not exist'.format(
+                        icecc_version_file, ))
 
         # This is what we are going to call the file names as known to SCons on disk
         setupEnv["ICECC_VERSION_ID"] = "user_provided." + icecc_version_file.name
@@ -196,27 +172,27 @@ def generate(env):
     else:
 
         setupEnv["ICECC_COMPILER_TYPE"] = setupEnv.get(
-            "ICECC_COMPILER_TYPE", os.path.basename(setupEnv.WhereIs("${CC}"))
+            "ICECC_COMPILER_TYPE",
+            os.path.basename(setupEnv.WhereIs("${CC}")),
         )
 
         # This is what we are going to call the file names as known to SCons on disk. We do the
         # subst early so that we can call `replace` on the result.
         setupEnv["ICECC_VERSION_ID"] = setupEnv.subst(
-            "icecc-create-env.${CC}${CXX}.tar.gz").replace("/", "_"
-        )
+            "icecc-create-env.${CC}${CXX}.tar.gz").replace("/", "_")
 
         setupEnv["ICECC_VERSION"] = icecc_version_file = setupEnv.Command(
             target="$ICECREAM_TARGET_DIR/$ICECC_VERSION_ID",
             source=[
                 "$ICECC_CREATE_ENV",
                 "$CC",
-                "$CXX"
+                "$CXX",
             ],
             action=SCons.Action.Action(
                 icecc_create_env,
                 "Generating icecream compiler package: $TARGET" if not verbose else str(),
                 generator=True,
-            )
+            ),
         )[0]
 
     # At this point, all paths above have produced a file of some sort. We now move on
@@ -250,38 +226,37 @@ def generate(env):
     # file as found on the users filesystem or from
     # icecc-create-env. We put the absolute path to that filename into
     # a file that we can read from.
-    icecc_version_info = setupEnv.File(setupEnv.Command(
-        target=[
-            '${ICECREAM_TARGET_BASE}.sha256',
-            '${ICECREAM_TARGET_BASE}.sha256.path',
-        ],
-        source=icecc_version_file,
-        action=SCons.Action.ListAction(
-            [
-
-                # icecc-create-env run twice with the same input will
-                # create files with identical contents, and identical
-                # filenames, but with different hashes because it
-                # includes timestamps. So we compute a new hash based
-                # on the actual stream contents of the file by
-                # untarring it into shasum.
-                SCons.Action.Action(
-                    "tar xfO ${SOURCES[0]} | shasum -b -a 256 - | awk '{ print $1 }' > ${TARGETS[0]}",
-                    "Calculating sha256 sum of ${SOURCES[0]}" if not verbose else str(),
-                ),
-
-                SCons.Action.Action(
-                    "ln -f ${SOURCES[0]} ${TARGETS[0].dir}/icecream_py_sha256_$$(cat ${TARGETS[0]}).tar.gz",
-                    "Linking ${SOURCES[0]} to its sha256 sum name" if not verbose else str(),
-                ),
-
-                SCons.Action.Action(
-                    "echo ${TARGETS[0].dir.abspath}/icecream_py_sha256_$$(cat ${TARGETS[0]}).tar.gz > ${TARGETS[1]}",
-                    "Storing sha256 sum name for ${SOURCES[0]} to ${TARGETS[1]}" if not verbose else str(),
-                )
+    icecc_version_info = setupEnv.File(
+        setupEnv.Command(
+            target=[
+                '${ICECREAM_TARGET_BASE}.sha256',
+                '${ICECREAM_TARGET_BASE}.sha256.path',
             ],
-        )
-    ))
+            source=icecc_version_file,
+            action=SCons.Action.ListAction(
+                [
+
+                    # icecc-create-env run twice with the same input will
+                    # create files with identical contents, and identical
+                    # filenames, but with different hashes because it
+                    # includes timestamps. So we compute a new hash based
+                    # on the actual stream contents of the file by
+                    # untarring it into shasum.
+                    SCons.Action.Action(
+                        "tar xfO ${SOURCES[0]} | shasum -b -a 256 - | awk '{ print $1 }' > ${TARGETS[0]}",
+                        "Calculating sha256 sum of ${SOURCES[0]}" if not verbose else str(),
+                    ),
+                    SCons.Action.Action(
+                        "ln -f ${SOURCES[0]} ${TARGETS[0].dir}/icecream_py_sha256_$$(cat ${TARGETS[0]}).tar.gz",
+                        "Linking ${SOURCES[0]} to its sha256 sum name" if not verbose else str(),
+                    ),
+                    SCons.Action.Action(
+                        "echo ${TARGETS[0].dir.abspath}/icecream_py_sha256_$$(cat ${TARGETS[0]}).tar.gz > ${TARGETS[1]}",
+                        "Storing sha256 sum name for ${SOURCES[0]} to ${TARGETS[1]}"
+                        if not verbose else str(),
+                    ),
+                ], ),
+        ), )
 
     # We can't allow these to interact with the cache because the
     # second action produces a file unknown to SCons. If caching were
@@ -296,13 +271,11 @@ def generate(env):
     # wrapper script.
     icecc_version_string_value = setupEnv.Command(
         target=setupEnv.Value(None),
-        source=[
-            icecc_version_info[1]
-        ],
+        source=[icecc_version_info[1]],
         action=SCons.Action.Action(
             lambda env, target, source: target[0].write(source[0].get_text_contents()),
             "Reading compiler package sha256 sum path from $SOURCE" if not verbose else str(),
-        )
+        ),
     )[0]
 
     def icecc_version_string_generator(source, target, env, for_signature):
@@ -335,9 +308,9 @@ def generate(env):
             '',
         ],
         SUBST_DICT={
-            '@icecc@' : '$ICECC',
-            '@icecc_version@' : '$ICECC_VERSION',
-            '@icecc_version_arch@' : icecc_version_arch_string,
+            '@icecc@': '$ICECC',
+            '@icecc_version@': '$ICECC_VERSION',
+            '@icecc_version_arch@': icecc_version_arch_string,
         },
 
         # Don't change around the suffixes
@@ -349,7 +322,7 @@ def generate(env):
         # so that it knows to invoke SCons to produce it as part of
         # TEMPLATE expansion. Since we have set NINJA_SKIP=True for
         # setupEnv, we need to reverse that here.
-        NINJA_SKIP=False
+        NINJA_SKIP=False,
     )
 
     setupEnv.AddPostAction(
@@ -421,8 +394,7 @@ def generate(env):
                 continue
             base = emitterdict[suffix]
             emitterdict[suffix] = SCons.Builder.ListEmitter(
-                [base, icecc_toolchain_dependency_emitter]
-            )
+                [base, icecc_toolchain_dependency_emitter], )
 
     # Check whether ccache is requested and is a valid tool.
     if "CCACHE" in env:
@@ -450,35 +422,65 @@ def generate(env):
     if "ICECC_SCHEDULER" in env:
         env["ENV"]["USE_SCHEDULER"] = env["ICECC_SCHEDULER"]
 
-    # If ccache is in play we actually want the icecc binary in the
-    # CCACHE_PREFIX environment variable, not on the command line, per
-    # the ccache documentation on compiler wrappers. Otherwise, just
-    # put $ICECC on the command line. We wrap it in the magic "don't
-    # consider this part of the build signature" sigils in the hope
-    # that enabling and disabling icecream won't cause rebuilds. This
-    # is unlikely to really work, since above we have maybe changed
-    # compiler flags (things like -fdirectives-only), but we still try
-    # to do the right thing.
+    # Make a generator to expand to what icecream binary to use in
+    # the case where we are not a conftest or a deny list source file.
+    def icecc_generator(target, source, env, for_signature):
+        # TODO: SERVER-60915 use new conftest API
+        if "conftest" in str(target[0]):
+            return ''
+
+        if env.subst('$ICECC_LOCAL_COMPILATION_FILTER', target=target, source=source) == 'True':
+            return '$ICERUN'
+
+        return '$ICECREAM_RUN_ICECC'
+
+    env['ICECC_GENERATOR'] = icecc_generator
+
     if ccache_enabled:
+
+        # Don't want to overwrite some existing generator
+        # if there is an existing one, we will need to chain them
+        if env.get('SHELL_ENV_GENERATOR') is not None:
+            existing_gen = env.get('SHELL_ENV_GENERATOR')
+        else:
+            existing_gen = None
+
+        # If ccache is in play we actually want the icecc binary in the
+        # CCACHE_PREFIX environment variable, not on the command line, per
+        # the ccache documentation on compiler wrappers. Otherwise, just
+        # put $ICECC on the command line. We wrap it in the magic "don't
+        # consider this part of the build signature" sigils in the hope
+        # that enabling and disabling icecream won't cause rebuilds. This
+        # is unlikely to really work, since above we have maybe changed
+        # compiler flags (things like -fdirectives-only), but we still try
+        # to do the right thing.
+        #
         # If the path to CCACHE_PREFIX isn't absolute, then it will
         # look it up in PATH. That isn't what we want here, we make
         # the path absolute.
-        env['ENV']['CCACHE_PREFIX'] = _BoundSubstitution(env, "${ICECREAM_RUN_ICECC.abspath}")
-    else:
-        # Make a generator to expand to ICECC in the case where we are
-        # not a conftest. We never want to run conftests remotely.
-        # Ideally, we would do this for the CCACHE_PREFIX case above,
-        # but unfortunately if we did we would never actually see the
-        # conftests, because the BoundSubst means that we will never
-        # have a meaningful `target` variable when we are in ENV.
-        # Instead, rely on the ccache.py tool to do it's own filtering
-        # out of conftests.
-        def icecc_generator(target, source, env, for_signature):
-            if "conftest" not in str(target[0]):
-                return '$ICECREAM_RUN_ICECC'
-            return ''
-        env['ICECC_GENERATOR'] = icecc_generator
+        def icecc_ccache_prefix_gen(env, target, source):
+            # TODO: SERVER-60915 use new conftest API
+            if "conftest" in str(target[0]):
+                return env['ENV']
 
+            if existing_gen:
+                shell_env = existing_gen(env, target, source)
+            else:
+                shell_env = env['ENV'].copy()
+            shell_env['CCACHE_PREFIX'] = env.File(
+                env.subst("$ICECC_GENERATOR", target=target, source=source)).abspath
+            return shell_env
+
+        env['SHELL_ENV_GENERATOR'] = icecc_ccache_prefix_gen
+
+    else:
+
+        # We wrap it in the magic "don't
+        # consider this part of the build signature" sigils in the hope
+        # that enabling and disabling icecream won't cause rebuilds. This
+        # is unlikely to really work, since above we have maybe changed
+        # compiler flags (things like -fdirectives-only), but we still try
+        # to do the right thing.
         icecc_string = "$( $ICECC_GENERATOR $)"
         env["CCCOM"] = " ".join([icecc_string, env["CCCOM"]])
         env["CXXCOM"] = " ".join([icecc_string, env["CXXCOM"]])
@@ -494,9 +496,10 @@ def generate(env):
     # jobs, figure out what sort they are and extend this part of the
     # setup.
     def icerun_generator(target, source, env, for_signature):
-            if "conftest" not in str(target[0]):
-                return '$ICERUN'
-            return ''
+        if "conftest" not in str(target[0]):
+            return '$ICERUN'
+        return ''
+
     env['ICERUN_GENERATOR'] = icerun_generator
 
     icerun_commands = [
@@ -554,14 +557,16 @@ def exists(env):
     else:
         icerun = env.File("$ICECC").File("icerun")
     if not icerun:
-        print(f"Error: the icerun wrapper does not exist at {icerun} as expected")
+        print(f"Error: the icerun wrapper does not exist which is needed for icecream")
+        return False
 
     if "ICECC_CREATE_ENV" in env:
         icecc_create_env_bin = env.WhereIs("$ICECC_CREATE_ENV")
     else:
         icecc_create_env_bin = env.File("ICECC").File("icecc-create-env")
     if not icecc_create_env_bin:
-        print(f"Error: the icecc-create-env utility does not exist at {icecc_create_env_bin} as expected")
+        print(f"Error: the icecc-create-env utility does not exist which is needed for icecream")
+        return False
 
     for line in pipe.stdout:
         line = line.decode("utf-8")
@@ -573,13 +578,14 @@ def exists(env):
         icecc_version = re.split("ICECC (.+)", line)
         if len(icecc_version) < 2:
             continue
-        icecc_version = parse_version(icecc_version[1])
-        if icecc_version >= _icecream_version_min:
+        icecc_current_version = parse_version(icecc_version[1])
+        if icecc_current_version >= _icecream_version_min:
             validated = True
-
-    if validated:
-        env['ICECREAM_VERSION'] = icecc_version
-    else:
-        print(f"Error: failed to verify icecream version >= {_icecream_version_min}, found {icecc_version}")
+    if icecc_current_version:
+        env['ICECREAM_VERSION'] = icecc_current_version
+    if not validated:
+        print(
+            f"Error: failed to verify icecream version >= {_icecream_version_min}, found {icecc_current_version}"
+        )
 
     return validated

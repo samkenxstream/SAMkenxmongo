@@ -1,6 +1,9 @@
 /**
+ * The test runs commands that are not allowed with security token: benchRun.
  * @tags: [
+ *   not_allowed_with_security_token,
  *   uses_multiple_connections,
+ *   uses_parallel_shell,
  * ]
  */
 (function() {

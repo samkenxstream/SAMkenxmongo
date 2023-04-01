@@ -28,13 +28,14 @@
  */
 
 #include "mongo/db/query/optimizer/cascades/rewrite_queues.h"
-#include "mongo/db/query/optimizer/utils/memo_utils.h"
-#include <mongo/db/query/optimizer/defs.h>
+#include "mongo/db/query/optimizer/cascades/rewriter_rules.h"
+#include "mongo/db/query/optimizer/defs.h"
+
 
 namespace mongo::optimizer::cascades {
 
 LogicalRewriteEntry::LogicalRewriteEntry(const double priority,
-                                         LogicalRewriteType type,
+                                         const LogicalRewriteType type,
                                          MemoLogicalNodeId nodeId)
     : _priority(priority), _type(type), _nodeId(nodeId) {}
 
@@ -57,20 +58,45 @@ bool LogicalRewriteEntryComparator::operator()(
     return x->_nodeId._index < y->_nodeId._index;
 }
 
+PhysRewriteEntry::PhysRewriteEntry(const double priority,
+                                   PhysicalRewriteType rule,
+                                   std::unique_ptr<ABT> node,
+                                   std::vector<std::pair<ABT*, properties::PhysProps>> childProps,
+                                   NodeCEMap nodeCEMap)
+    : _priority(priority),
+      _rule(rule),
+      _node(std::move(node)),
+      _childProps(std::move(childProps)),
+      _nodeCEMap(std::move(nodeCEMap)) {}
+
+bool PhysRewriteEntryComparator::operator()(const std::unique_ptr<PhysRewriteEntry>& x,
+                                            const std::unique_ptr<PhysRewriteEntry>& y) const {
+    // Lower numerical priority is considered last (and thus de-queued first).
+    return x->_priority > y->_priority;
+}
+
 void optimizeChildrenNoAssert(PhysRewriteQueue& queue,
                               const double priority,
-                              ABT node,
+                              const PhysicalRewriteType rule,
+                              std::unique_ptr<ABT> node,
                               ChildPropsType childProps,
                               NodeCEMap nodeCEMap) {
     queue.emplace(std::make_unique<PhysRewriteEntry>(
-        priority, std::move(node), std::move(childProps), std::move(nodeCEMap)));
+        priority, rule, std::move(node), std::move(childProps), std::move(nodeCEMap)));
 }
 
-void optimizeUnderNewProperties(cascades::PhysRewriteQueue& queue,
-                                const double priority,
-                                ABT child,
-                                properties::PhysProps props) {
-    optimizeChild<FilterNode>(queue, priority, wrapConstFilter(std::move(child)), std::move(props));
+void optimizeChildrenNoAssert(PhysRewriteQueue& queue,
+                              double priority,
+                              PhysicalRewriteType rule,
+                              ABT node,
+                              ChildPropsType childProps,
+                              NodeCEMap nodeCEMap) {
+    optimizeChildrenNoAssert(queue,
+                             priority,
+                             rule,
+                             std::make_unique<ABT>(std::move(node)),
+                             std::move(childProps),
+                             std::move(nodeCEMap));
 }
 
 }  // namespace mongo::optimizer::cascades

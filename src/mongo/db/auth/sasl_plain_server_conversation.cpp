@@ -39,9 +39,13 @@
 #include "mongo/crypto/mechanism_scram.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/auth/user.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/password_digest.h"
 #include "mongo/util/text.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 namespace mongo {
 namespace {
@@ -125,8 +129,18 @@ StatusWith<std::tuple<bool, std::string>> SASLPlainServerMechanism::stepImpl(
     }
 
     // The authentication database is also the source database for the user.
-    auto swUser = authManager->acquireUser(
-        opCtx, UserName(ServerMechanismBase::_principalName, _authenticationDatabase));
+    auto swUser = [&]() {
+        if (gEnableDetailedConnectionHealthMetricLogLines) {
+            ScopedCallbackTimer timer([&](Microseconds elapsed) {
+                LOGV2(6788606,
+                      "Auth metrics report",
+                      "metric"_attr = "plain_acquireUser",
+                      "micros"_attr = elapsed.count());
+            });
+        }
+
+        return authManager->acquireUser(opCtx, getUserRequest());
+    }();
 
     if (!swUser.isOK()) {
         return swUser.getStatus();

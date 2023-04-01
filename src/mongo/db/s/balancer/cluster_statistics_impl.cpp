@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -38,12 +37,16 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_util.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -113,8 +116,9 @@ StatusWith<std::vector<ShardStatistics>> ClusterStatisticsImpl::_getStats(
     // db.serverStatus() (mem.mapped) to all shards.
     //
     // TODO: skip unresponsive shards and mark information as stale.
-    auto shardsStatus = Grid::get(opCtx)->catalogClient()->getAllShards(
-        opCtx, repl::ReadConcernLevel::kMajorityReadConcern);
+    const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
+    auto shardsStatus =
+        catalogClient->getAllShards(opCtx, repl::ReadConcernLevel::kMajorityReadConcern);
     if (!shardsStatus.isOK()) {
         return shardsStatus.getStatus();
     }
@@ -130,10 +134,7 @@ StatusWith<std::vector<ShardStatistics>> ClusterStatisticsImpl::_getStats(
             if (ns) {
                 return shardutil::retrieveCollectionShardSize(opCtx, shard.getName(), *ns);
             }
-            // optimization for the case where the balancer does not care about the dataSize
-            if (!shard.getMaxSizeMB()) {
-                return 0;
-            }
+
             return shardutil::retrieveTotalShardSize(opCtx, shard.getName());
         }();
 
@@ -160,17 +161,16 @@ StatusWith<std::vector<ShardStatistics>> ClusterStatisticsImpl::_getStats(
                   "error"_attr = mongoDVersionStatus.getStatus());
         }
 
-        std::set<std::string> shardTags;
+        std::set<std::string> shardZones;
 
-        for (const auto& shardTag : shard.getTags()) {
-            shardTags.insert(shardTag);
+        for (const auto& shardZone : shard.getTags()) {
+            shardZones.insert(shardZone);
         }
 
         stats.emplace_back(shard.getName(),
-                           shard.getMaxSizeMB() * 1024 * 1024,
                            shardSizeStatus.getValue(),
                            shard.getDraining(),
-                           std::move(shardTags),
+                           std::move(shardZones),
                            std::move(mongoDVersion),
                            ShardStatistics::use_bytes_t{});
     }

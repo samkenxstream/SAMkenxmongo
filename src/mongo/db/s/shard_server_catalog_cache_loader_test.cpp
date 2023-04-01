@@ -27,16 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <boost/optional/optional_io.hpp>
-
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/s/shard_server_catalog_cache_loader.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/catalog/type_database_gen.h"
 #include "mongo/s/catalog_cache_loader_mock.h"
 #include "mongo/s/type_collection_common_types_gen.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 namespace {
@@ -47,21 +49,22 @@ using std::vector;
 using unittest::assertGet;
 using CollectionAndChangedChunks = CatalogCacheLoader::CollectionAndChangedChunks;
 
-const NamespaceString kNss = NamespaceString("foo.bar");
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("foo.bar");
 const std::string kPattern = "_id";
 const ShardId kShardId = ShardId("shard0");
 
 class ShardServerCatalogCacheLoaderTest : public ShardServerTestFixture {
 public:
     /**
-     * Returns five chunks using collVersion as a starting version.
+     * Returns five chunks using collectionPlacementVersion as a starting version.
      */
-    vector<ChunkType> makeFiveChunks(const ChunkVersion& collectionVersion);
+    vector<ChunkType> makeFiveChunks(const ChunkVersion& collectionPlacementVersion);
 
     /**
-     * Returns a chunk update diff GTE 'collVersion' for the chunks created by makeFiveChunks above.
+     * Returns a chunk update diff GTE 'collectionPlacementVersion' for the chunks created by
+     * makeFiveChunks above.
      */
-    vector<ChunkType> makeThreeUpdatedChunksDiff(const ChunkVersion& collectionVersion);
+    vector<ChunkType> makeThreeUpdatedChunksDiff(const ChunkVersion& collectionPlacementVersion);
 
     /**
      * Returns a routing table applying 'threeUpdatedChunks' (the result of
@@ -71,9 +74,9 @@ public:
         const vector<ChunkType>& originalFiveChunks, const vector<ChunkType>& threeUpdatedChunks);
 
     /**
-     * This helper makes a CollectionType with the current _maxCollVersion.
+     * This helper makes a CollectionType with the current _maxCollPlacementVersion.
      */
-    CollectionType makeCollectionType(const ChunkVersion& collVersion);
+    CollectionType makeCollectionType(const ChunkVersion& collPlacementVersion);
 
     /**
      * Sets up the _shardLoader with the results of makeFiveChunks().
@@ -81,6 +84,7 @@ public:
     std::pair<CollectionType, vector<ChunkType>> setUpChunkLoaderWithFiveChunks();
 
     void refreshCollectionEpochOnRemoteLoader();
+    void refreshDatabaseOnRemoteLoader();
 
     const KeyPattern kKeyPattern = KeyPattern(BSON(kPattern << 1));
 
@@ -112,8 +116,8 @@ void ShardServerCatalogCacheLoaderTest::tearDown() {
 }
 
 vector<ChunkType> ShardServerCatalogCacheLoaderTest::makeFiveChunks(
-    const ChunkVersion& collectionVersion) {
-    ChunkVersion collVersion(collectionVersion);
+    const ChunkVersion& collectionPlacementVersion) {
+    ChunkVersion collPlacementVersion(collectionPlacementVersion);
     vector<ChunkType> chunks;
     const UUID uuid = UUID::gen();
 
@@ -123,14 +127,14 @@ vector<ChunkType> ShardServerCatalogCacheLoaderTest::makeFiveChunks(
         BSON("a" << 10), BSON("a" << 50), BSON("a" << 100), BSON("a" << 200), BSON("a" << MAXKEY)};
 
     for (int i = 0; i < 5; ++i) {
-        collVersion.incMajor();
+        collPlacementVersion.incMajor();
 
         ChunkType chunk;
         chunk.setCollectionUUID(uuid);
         chunk.setMin(mins[i]);
         chunk.setMax(maxs[i]);
         chunk.setShard(kShardId);
-        chunk.setVersion(collVersion);
+        chunk.setVersion(collPlacementVersion);
 
         chunks.push_back(chunk);
     }
@@ -139,8 +143,8 @@ vector<ChunkType> ShardServerCatalogCacheLoaderTest::makeFiveChunks(
 }
 
 vector<ChunkType> ShardServerCatalogCacheLoaderTest::makeThreeUpdatedChunksDiff(
-    const ChunkVersion& collectionVersion) {
-    ChunkVersion collVersion(collectionVersion);
+    const ChunkVersion& collectionPlacementVersion) {
+    ChunkVersion collPlacementVersion(collectionPlacementVersion);
     vector<ChunkType> chunks;
     const UUID uuid = UUID::gen();
 
@@ -154,7 +158,7 @@ vector<ChunkType> ShardServerCatalogCacheLoaderTest::makeThreeUpdatedChunksDiff(
     oldChunk.setMin(BSON("a" << 200));
     oldChunk.setMax(BSON("a" << MAXKEY));
     oldChunk.setShard(kShardId);
-    oldChunk.setVersion(collVersion);
+    oldChunk.setVersion(collPlacementVersion);
     chunks.push_back(oldChunk);
 
 
@@ -163,14 +167,14 @@ vector<ChunkType> ShardServerCatalogCacheLoaderTest::makeThreeUpdatedChunksDiff(
     BSONObj maxs[] = {BSON("a" << 5), BSON("a" << 10), BSON("a" << 100)};
 
     for (int i = 0; i < 3; ++i) {
-        collVersion.incMinor();
+        collPlacementVersion.incMinor();
 
         ChunkType chunk;
         chunk.setCollectionUUID(uuid);
         chunk.setMin(mins[i]);
         chunk.setMax(maxs[i]);
         chunk.setShard(kShardId);
-        chunk.setVersion(collVersion);
+        chunk.setVersion(collPlacementVersion);
 
         chunks.push_back(chunk);
     }
@@ -192,10 +196,10 @@ ShardServerCatalogCacheLoaderTest::makeCombinedOriginalFiveChunksAndThreeNewChun
 }
 
 CollectionType ShardServerCatalogCacheLoaderTest::makeCollectionType(
-    const ChunkVersion& collVersion) {
+    const ChunkVersion& collPlacementVersion) {
     return {kNss,
-            collVersion.epoch(),
-            collVersion.getTimestamp(),
+            collPlacementVersion.epoch(),
+            collPlacementVersion.getTimestamp(),
             Date_t::now(),
             UUID::gen(),
             kKeyPattern};
@@ -203,10 +207,10 @@ CollectionType ShardServerCatalogCacheLoaderTest::makeCollectionType(
 
 std::pair<CollectionType, vector<ChunkType>>
 ShardServerCatalogCacheLoaderTest::setUpChunkLoaderWithFiveChunks() {
-    ChunkVersion collectionVersion(1, 0, OID::gen(), Timestamp(1, 1));
+    ChunkVersion collectionPlacementVersion({OID::gen(), Timestamp(1, 1)}, {1, 0});
 
-    CollectionType collectionType = makeCollectionType(collectionVersion);
-    vector<ChunkType> chunks = makeFiveChunks(collectionVersion);
+    CollectionType collectionType = makeCollectionType(collectionPlacementVersion);
+    vector<ChunkType> chunks = makeFiveChunks(collectionPlacementVersion);
     _remoteLoaderMock->setCollectionRefreshReturnValue(collectionType);
     _remoteLoaderMock->setChunkRefreshReturnValue(chunks);
 
@@ -214,12 +218,18 @@ ShardServerCatalogCacheLoaderTest::setUpChunkLoaderWithFiveChunks() {
 
     ASSERT_EQUALS(collAndChunksRes.epoch, collectionType.getEpoch());
     ASSERT_EQUALS(collAndChunksRes.changedChunks.size(), 5UL);
-    ASSERT(!collAndChunksRes.timeseriesFields.is_initialized());
+    ASSERT(!collAndChunksRes.timeseriesFields.has_value());
     for (unsigned int i = 0; i < collAndChunksRes.changedChunks.size(); ++i) {
         ASSERT_BSONOBJ_EQ(collAndChunksRes.changedChunks[i].toShardBSON(), chunks[i].toShardBSON());
     }
 
     return std::pair{collectionType, std::move(chunks)};
+}
+
+void ShardServerCatalogCacheLoaderTest::refreshDatabaseOnRemoteLoader() {
+    DatabaseType databaseType(
+        kNss.db().toString(), kShardId, DatabaseVersion{UUID::gen(), Timestamp{1, 1}});
+    _remoteLoaderMock->setDatabaseRefreshReturnValue(std::move(databaseType));
 }
 
 TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromUnshardedToUnsharded) {
@@ -305,8 +315,8 @@ TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedAndFindDiff) {
 
     // Then refresh again and find updated chunks.
 
-    ChunkVersion collVersion = chunks.back().getVersion();
-    vector<ChunkType> updatedChunksDiff = makeThreeUpdatedChunksDiff(collVersion);
+    ChunkVersion collPlacementVersion = chunks.back().getVersion();
+    vector<ChunkType> updatedChunksDiff = makeThreeUpdatedChunksDiff(collPlacementVersion);
     _remoteLoaderMock->setChunkRefreshReturnValue(updatedChunksDiff);
 
     auto collAndChunksRes = _shardLoader->getChunksSince(kNss, chunks.back().getVersion()).get();
@@ -371,9 +381,10 @@ TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedAndFindNewEpoch)
 
     // Then refresh again and find that the collection has been dropped and recreated.
 
-    ChunkVersion collVersionWithNewEpoch(1, 0, OID::gen(), Timestamp(2, 0));
-    CollectionType collectionTypeWithNewEpoch = makeCollectionType(collVersionWithNewEpoch);
-    vector<ChunkType> chunksWithNewEpoch = makeFiveChunks(collVersionWithNewEpoch);
+    ChunkVersion collPlacementVersionWithNewEpoch({OID::gen(), Timestamp(2, 0)}, {1, 0});
+    CollectionType collectionTypeWithNewEpoch =
+        makeCollectionType(collPlacementVersionWithNewEpoch);
+    vector<ChunkType> chunksWithNewEpoch = makeFiveChunks(collPlacementVersionWithNewEpoch);
     _remoteLoaderMock->setCollectionRefreshReturnValue(collectionTypeWithNewEpoch);
     _remoteLoaderMock->setChunkRefreshReturnValue(chunksWithNewEpoch);
 
@@ -398,9 +409,10 @@ TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedAndFindMixedChun
     // Then refresh again and retrieve chunks from the config server that have mixed epoches, like
     // as if the chunks read yielded around a drop and recreate of the collection.
 
-    ChunkVersion collVersionWithNewEpoch(1, 0, OID::gen(), Timestamp(2, 0));
-    CollectionType collectionTypeWithNewEpoch = makeCollectionType(collVersionWithNewEpoch);
-    vector<ChunkType> chunksWithNewEpoch = makeFiveChunks(collVersionWithNewEpoch);
+    ChunkVersion collPlacementVersionWithNewEpoch({OID::gen(), Timestamp(2, 0)}, {1, 0});
+    CollectionType collectionTypeWithNewEpoch =
+        makeCollectionType(collPlacementVersionWithNewEpoch);
+    vector<ChunkType> chunksWithNewEpoch = makeFiveChunks(collPlacementVersionWithNewEpoch);
     vector<ChunkType> mixedChunks;
     mixedChunks.push_back(chunks.back());
     mixedChunks.insert(mixedChunks.end(), chunksWithNewEpoch.begin(), chunksWithNewEpoch.end());
@@ -441,14 +453,15 @@ TEST_F(ShardServerCatalogCacheLoaderTest, PrimaryLoadFromShardedAndFindMixedChun
 }
 
 TEST_F(ShardServerCatalogCacheLoaderTest, TimeseriesFieldsAreProperlyPropagatedOnSSCCL) {
-    ChunkVersion collectionVersion(1, 0, OID::gen(), Timestamp(1, 1));
+    ChunkVersion collectionPlacementVersion({OID::gen(), Timestamp(1, 1)}, {1, 0});
 
-    CollectionType collectionType = makeCollectionType(collectionVersion);
-    vector<ChunkType> chunks = makeFiveChunks(collectionVersion);
+    CollectionType collectionType = makeCollectionType(collectionPlacementVersion);
+    vector<ChunkType> chunks = makeFiveChunks(collectionPlacementVersion);
     auto timeseriesOptions = TimeseriesOptions("fieldName");
 
     {
         TypeCollectionTimeseriesFields tsFields;
+        timeseriesOptions.setGranularity(BucketGranularityEnum::Seconds);
         tsFields.setTimeseriesOptions(timeseriesOptions);
         collectionType.setTimeseriesFields(tsFields);
 
@@ -456,7 +469,7 @@ TEST_F(ShardServerCatalogCacheLoaderTest, TimeseriesFieldsAreProperlyPropagatedO
         _remoteLoaderMock->setChunkRefreshReturnValue(chunks);
 
         auto collAndChunksRes = _shardLoader->getChunksSince(kNss, ChunkVersion::UNSHARDED()).get();
-        ASSERT(collAndChunksRes.timeseriesFields.is_initialized());
+        ASSERT(collAndChunksRes.timeseriesFields.has_value());
         ASSERT(collAndChunksRes.timeseriesFields->getGranularity() ==
                BucketGranularityEnum::Seconds);
     }
@@ -464,9 +477,9 @@ TEST_F(ShardServerCatalogCacheLoaderTest, TimeseriesFieldsAreProperlyPropagatedO
     {
         auto& lastChunk = chunks.back();
         const auto maxLoaderVersion = lastChunk.getVersion();
-        ChunkVersion newCollectionVersion = maxLoaderVersion;
-        newCollectionVersion.incMinor();
-        lastChunk.setVersion(newCollectionVersion);
+        ChunkVersion newCollectionPlacementVersion = maxLoaderVersion;
+        newCollectionPlacementVersion.incMinor();
+        lastChunk.setVersion(newCollectionPlacementVersion);
 
         TypeCollectionTimeseriesFields tsFields;
         timeseriesOptions.setGranularity(BucketGranularityEnum::Hours);
@@ -477,15 +490,15 @@ TEST_F(ShardServerCatalogCacheLoaderTest, TimeseriesFieldsAreProperlyPropagatedO
         _remoteLoaderMock->setChunkRefreshReturnValue(std::vector{lastChunk});
 
         auto collAndChunksRes = _shardLoader->getChunksSince(kNss, maxLoaderVersion).get();
-        ASSERT(collAndChunksRes.timeseriesFields.is_initialized());
+        ASSERT(collAndChunksRes.timeseriesFields.has_value());
         ASSERT(collAndChunksRes.timeseriesFields->getGranularity() == BucketGranularityEnum::Hours);
     }
 }
 
 void ShardServerCatalogCacheLoaderTest::refreshCollectionEpochOnRemoteLoader() {
-    ChunkVersion collectionVersion(1, 2, OID::gen(), Timestamp(1, 1));
-    CollectionType collectionType = makeCollectionType(collectionVersion);
-    vector<ChunkType> chunks = makeFiveChunks(collectionVersion);
+    ChunkVersion collectionPlacementVersion({OID::gen(), Timestamp(1, 1)}, {1, 2});
+    CollectionType collectionType = makeCollectionType(collectionPlacementVersion);
+    vector<ChunkType> chunks = makeFiveChunks(collectionPlacementVersion);
     _remoteLoaderMock->setCollectionRefreshReturnValue(collectionType);
     _remoteLoaderMock->setChunkRefreshReturnValue(chunks);
 }
@@ -510,6 +523,126 @@ TEST_F(ShardServerCatalogCacheLoaderTest, CollAndChunkTasksConsistency) {
     // updates on metadata
     refreshCollectionEpochOnRemoteLoader();
     _shardLoader->getChunksSince(kNss, ChunkVersion::UNSHARDED()).get();
+}
+
+TEST_F(ShardServerCatalogCacheLoaderTest, setFCVForGetChunks) {
+    const auto kOriginalRole = serverGlobalParams.clusterRole;
+    const auto kOriginalFCV = serverGlobalParams.featureCompatibility.getVersion();
+
+    ON_BLOCK_EXIT([&] {
+        serverGlobalParams.clusterRole = kOriginalRole;
+        serverGlobalParams.mutableFeatureCompatibility.setVersion(kOriginalFCV);
+    });
+
+    serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
+    // (Generic FCV reference): for testing only. This comment is required by linter.
+    serverGlobalParams.mutableFeatureCompatibility.setVersion(multiversion::GenericFCV::kLastLTS);
+
+    const ChunkVersion collectionPlacementVersion({OID::gen(), Timestamp(1, 1)}, {1, 2});
+    const auto collectionType = makeCollectionType(collectionPlacementVersion);
+    auto setRemoteLoaderMockResponse = [&]() {
+        vector<ChunkType> chunks = makeFiveChunks(collectionPlacementVersion);
+        _remoteLoaderMock->setCollectionRefreshReturnValue(collectionType);
+        _remoteLoaderMock->setChunkRefreshReturnValue(chunks);
+    };
+
+    FindCommandRequest persistedCacheQuery(NamespaceString::kShardConfigCollectionsNamespace);
+    DBDirectClient client(operationContext());
+
+    {
+        // Pause the thread processing the pending updates on metadata
+        FailPointEnableBlock failPoint("hangCollectionFlush");
+
+        setRemoteLoaderMockResponse();
+        auto getChunksFuture = _shardLoader->getChunksSince(kNss, ChunkVersion::UNSHARDED());
+
+        _shardLoader->onFCVChanged();
+
+        // Should be able to join since downgrade should interrupt ongoing refreshes.
+        (void)getChunksFuture.waitNoThrow();
+    }
+
+    ASSERT_THROWS_CODE(_shardLoader->waitForCollectionFlush(operationContext(), kNss),
+                       DBException,
+                       ErrorCodes::StaleConfig);
+
+    auto cachedDoc = client.findOne(persistedCacheQuery);
+    ASSERT_TRUE(cachedDoc.isEmpty()) << cachedDoc;
+
+    setRemoteLoaderMockResponse();
+    auto getChunksFuture = _shardLoader->getChunksSince(kNss, ChunkVersion::UNSHARDED());
+    auto newChunks = getChunksFuture.get().changedChunks;
+    ASSERT_EQ(5, newChunks.size());
+
+    cachedDoc = client.findOne(persistedCacheQuery);
+    ASSERT_TRUE(cachedDoc.isEmpty()) << cachedDoc;
+
+    serverGlobalParams.mutableFeatureCompatibility.setVersion(kOriginalFCV);
+
+    setRemoteLoaderMockResponse();
+    auto chunkVersionFrom = newChunks[2].getVersion();
+    getChunksFuture = _shardLoader->getChunksSince(kNss, chunkVersionFrom);
+    newChunks = getChunksFuture.get().changedChunks;
+    ASSERT_EQ(3, newChunks.size());
+    ASSERT_EQ(chunkVersionFrom, newChunks.front().getVersion());
+
+    _shardLoader->waitForCollectionFlush(operationContext(), kNss);
+    cachedDoc = client.findOne(persistedCacheQuery);
+    ASSERT_FALSE(cachedDoc.isEmpty());
+}
+
+TEST_F(ShardServerCatalogCacheLoaderTest, setFCVForGetDatabase) {
+    const auto kOriginalRole = serverGlobalParams.clusterRole;
+    const auto kOriginalFCV = serverGlobalParams.featureCompatibility.getVersion();
+
+    ON_BLOCK_EXIT([&] {
+        serverGlobalParams.clusterRole = kOriginalRole;
+        serverGlobalParams.mutableFeatureCompatibility.setVersion(kOriginalFCV);
+    });
+
+    serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
+    // (Generic FCV reference): for testing only. This comment is required by linter.
+    serverGlobalParams.mutableFeatureCompatibility.setVersion(multiversion::GenericFCV::kLastLTS);
+
+    refreshDatabaseOnRemoteLoader();
+
+    FindCommandRequest persistedCacheQuery(NamespaceString::kShardConfigDatabasesNamespace);
+    DBDirectClient client(operationContext());
+    const auto kDb = kNss.db();
+
+    {
+        // Pause the thread processing the pending updates on metadata
+        FailPointEnableBlock failPoint("hangDatabaseFlush");
+
+        // Put a first task in the list of pending updates on metadata (in-memory)
+        auto getDbFuture = _shardLoader->getDatabase(kDb);
+
+        _shardLoader->onFCVChanged();
+
+        // Should be able to join since downgrade should interrupt ongoing refreshes.
+        (void)getDbFuture.waitNoThrow();
+    }
+
+    ASSERT_THROWS_CODE(_shardLoader->waitForDatabaseFlush(operationContext(), kDb),
+                       DBException,
+                       ErrorCodes::StaleDbVersion);
+
+    auto cachedDoc = client.findOne(persistedCacheQuery);
+    ASSERT_TRUE(cachedDoc.isEmpty()) << cachedDoc;
+
+    auto getDbFuture = _shardLoader->getDatabase(kDb);
+    getDbFuture.wait();
+
+    cachedDoc = client.findOne(persistedCacheQuery);
+    ASSERT_TRUE(cachedDoc.isEmpty()) << cachedDoc;
+
+    serverGlobalParams.mutableFeatureCompatibility.setVersion(kOriginalFCV);
+
+    getDbFuture = _shardLoader->getDatabase(kDb);
+    getDbFuture.wait();
+    _shardLoader->waitForDatabaseFlush(operationContext(), kDb);
+    cachedDoc = client.findOne(persistedCacheQuery);
+    ASSERT_FALSE(cachedDoc.isEmpty());
 }
 
 }  // namespace

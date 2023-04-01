@@ -35,9 +35,11 @@
 #include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/exec/scoped_timer.h"
+#include "mongo/db/exec/scoped_timer_factory.h"
 #include "mongo/db/exec/trial_run_tracker.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -119,6 +121,42 @@ public:
     CanChangeState() = default;
 
     /**
+     * Ensures that accessor owns the underlying BSON value, which can be potentially owned by
+     * storage.
+     */
+    void prepareForYielding(value::OwnedValueAccessor& accessor, bool isAccessible) {
+        if (isAccessible) {
+            auto [tag, value] = accessor.getViewOfValue();
+            if (shouldCopyValue(tag)) {
+                accessor.makeOwned();
+            }
+        } else {
+#if defined(MONGO_CONFIG_DEBUG_BUILD)
+            auto [tag, val] = value::getPoisonValue();
+            accessor.reset(false, tag, val);
+#endif
+        }
+    }
+
+    void prepareForYielding(value::MaterializedRow& row, bool isAccessible) {
+        if (isAccessible) {
+            for (size_t idx = 0; idx < row.size(); idx++) {
+                auto [tag, value] = row.getViewOfValue(idx);
+                if (shouldCopyValue(tag)) {
+                    row.makeOwned(idx);
+                }
+            }
+        } else {
+#if defined(MONGO_CONFIG_DEBUG_BUILD)
+            auto [tag, val] = value::getPoisonValue();
+            for (size_t idx = 0; idx < row.size(); idx++) {
+                row.reset(idx, false, tag, val);
+            }
+#endif
+        }
+    }
+
+    /**
      * Notifies the stage that the underlying data source may change.
      *
      * It is illegal to call work() or isEOF() when a stage is in the "saved" state. May be called
@@ -129,17 +167,23 @@ public:
      * The 'relinquishCursor' parameter indicates whether cursors should be reset and all data
      * should be copied.
      *
+     * When 'relinquishCursor' is true, the 'disableSlotAccess' parameter indicates whether this
+     * stage is allowed to discard slot state before saving. When 'relinquishCursor' is false, the
+     * 'disableSlotAccess' parameter has no effect.
+     *
      * TODO SERVER-59620: Remove the 'relinquishCursor' parameter once all callers pass 'false'.
      */
-    void saveState(bool relinquishCursor) {
+    void saveState(bool relinquishCursor, bool disableSlotAccess = false) {
         auto stage = static_cast<T*>(this);
         stage->_commonStats.yields++;
+
+        if (relinquishCursor && disableSlotAccess) {
+            stage->disableSlotAccess();
+        }
+
         stage->doSaveState(relinquishCursor);
-        // Save the children in a right to left order so dependent stages (i.e. one using correlated
-        // slots) are saved first.
-        auto& children = stage->_children;
-        for (auto it = children.rbegin(); it != children.rend(); it++) {
-            (*it)->saveState(relinquishCursor);
+        if (!stage->_children.empty()) {
+            saveChildrenState(relinquishCursor, disableSlotAccess);
         }
 
 #if defined(MONGO_CONFIG_DEBUG_BUILD)
@@ -192,6 +236,56 @@ protected:
     enum class SaveState { kNotSaved, kSavedFull, kSavedNotFull };
     SaveState _saveState{SaveState::kNotSaved};
 #endif
+
+    virtual void saveChildrenState(bool relinquishCursor, bool disableSlotAccess) {
+        // clang-format off
+        static const StringDataSet propagateSet = {
+            "branch", "cfilter", "efilter", "exchangep", "filter",   "limit", "limitskip",
+            "lspool", "mkbson",  "mkobj",   "project",   "traverse", "union", "unique"};
+        // clang-format on
+
+        auto stage = static_cast<T*>(this);
+        if (!propagateSet.count(stage->getCommonStats()->stageType)) {
+            disableSlotAccess = false;
+        }
+
+        // Save the children in a right to left order so dependent stages (i.e. one using correlated
+        // slots) are saved first.
+        for (auto it = stage->_children.rbegin(); it != stage->_children.rend(); ++it) {
+            (*it)->saveState(relinquishCursor, disableSlotAccess);
+        }
+    }
+
+    static bool shouldCopyValue(value::TypeTags tag) {
+        switch (tag) {
+            case value::TypeTags::Array:
+            case value::TypeTags::ArraySet:
+            case value::TypeTags::Object:
+                return false;
+
+            default:
+                return true;
+        }
+    }
+};
+
+template <typename T>
+class CanTrackStats;
+
+/**
+ * An abstract class to be used for traversing a plan-stage tree.
+ */
+class PlanStageVisitor {
+public:
+    virtual ~PlanStageVisitor() = default;
+
+    friend class CanTrackStats<PlanStage>;
+
+protected:
+    /**
+     * Visits one plan-stage during a traversal over the plan-stage tree.
+     */
+    virtual void visit(const PlanStage* stage) = 0;
 };
 
 /**
@@ -203,7 +297,9 @@ protected:
 template <typename T>
 class CanTrackStats {
 public:
-    CanTrackStats(StringData stageType, PlanNodeId nodeId) : _commonStats(stageType, nodeId) {}
+    CanTrackStats(StringData stageType, PlanNodeId nodeId, bool participateInTrialRunTracking)
+        : _commonStats(stageType, nodeId),
+          _participateInTrialRunTracking(participateInTrialRunTracking) {}
 
     /**
      * Returns a tree of stats. If the stage has any children it must propagate the request for
@@ -253,6 +349,18 @@ public:
         }
     }
 
+    /**
+     * Implements a pre-order traversal over the plan-stage tree starting from this node. The
+     * visitor parameter plays the role of an accumulator during this traversal.
+     */
+    void accumulate(PlanStageVisitor& visitor) const {
+        auto stage = static_cast<const T*>(this);
+        visitor.visit(stage);
+        for (auto&& child : stage->_children) {
+            child->accumulate(visitor);
+        }
+    }
+
     void detachFromTrialRunTracker() {
         auto stage = static_cast<T*>(this);
         for (auto&& child : stage->_children) {
@@ -274,6 +382,9 @@ public:
 
     TrialRunTrackerAttachResultMask attachToTrialRunTracker(TrialRunTracker* tracker) {
         TrialRunTrackerAttachResultMask result = TrialRunTrackerAttachResultFlags::NoAttachment;
+        if (!_participateInTrialRunTracking) {
+            return result;
+        }
 
         auto stage = static_cast<T*>(this);
         for (auto&& child : stage->_children) {
@@ -288,8 +399,14 @@ public:
      * execution has started.
      */
     void markShouldCollectTimingInfo() {
-        invariant(!_commonStats.executionTimeMillis || *_commonStats.executionTimeMillis == 0);
-        _commonStats.executionTimeMillis.emplace(0);
+        invariant(durationCount<Microseconds>(_commonStats.executionTime.executionTimeEstimate) ==
+                  0);
+
+        if (internalMeasureQueryExecutionTimeInNanoseconds.load()) {
+            _commonStats.executionTime.precision = QueryExecTimerPrecision::kNanos;
+        } else {
+            _commonStats.executionTime.precision = QueryExecTimerPrecision::kMillis;
+        }
 
         auto stage = static_cast<T*>(this);
         for (auto&& child : stage->_children) {
@@ -307,27 +424,29 @@ public:
         }
     }
 
+    void disableTrialRunTracking() {
+        _participateInTrialRunTracking = false;
+    }
+
+    bool slotsAccessible() const {
+        return _slotsAccessible;
+    }
+
 protected:
     PlanState trackPlanState(PlanState state) {
         if (state == PlanState::IS_EOF) {
             _commonStats.isEOF = true;
             _slotsAccessible = false;
         } else {
-            invariant(state == PlanState::ADVANCED);
             _commonStats.advances++;
             _slotsAccessible = true;
         }
         return state;
     }
 
-
     void trackClose() {
         _commonStats.closes++;
         _slotsAccessible = false;
-    }
-
-    bool slotsAccessible() const {
-        return _slotsAccessible;
     }
 
     /**
@@ -335,9 +454,10 @@ protected:
      * May return boost::none if it is not necessary to collect timing info.
      */
     boost::optional<ScopedTimer> getOptTimer(OperationContext* opCtx) {
-        if (_commonStats.executionTimeMillis && opCtx) {
-            return {{opCtx->getServiceContext()->getFastClockSource(),
-                     _commonStats.executionTimeMillis.get_ptr()}};
+        if (opCtx && _commonStats.executionTime.precision != QueryExecTimerPrecision::kNoTiming) {
+            return scoped_timer_factory::make(opCtx->getServiceContext(),
+                                              _commonStats.executionTime.precision,
+                                              &_commonStats.executionTime.executionTimeEstimate);
         }
 
         return boost::none;
@@ -345,9 +465,15 @@ protected:
 
     CommonStats _commonStats;
 
+    // Flag which determines whether this node and its children can participate in trial run
+    // tracking. A stage and its children are not eligible for trial run tracking when they are
+    // planned deterministically (that is, the amount of work they perform is independent of
+    // other parts of the tree which are multiplanned).
+    bool _participateInTrialRunTracking{true};
+
 private:
     /**
-     * In general, accessors can be accesed only after getNext returns a row. It is most definitely
+     * In general, accessors can be accessed only after getNext returns a row. It is most definitely
      * not OK to access accessors in ANY other state; e.g. closed, not yet opened, after EOF. We
      * need this tracker to support unfortunate consequences of the internal yielding feature. Once
      * that feature is retired we can then simply revisit all stages and simplify them.
@@ -419,10 +545,15 @@ class PlanStage : public CanSwitchOperationContext<PlanStage>,
 public:
     using Vector = absl::InlinedVector<std::unique_ptr<PlanStage>, 2>;
 
-    PlanStage(StringData stageType, PlanYieldPolicy* yieldPolicy, PlanNodeId nodeId)
-        : CanTrackStats{stageType, nodeId}, CanInterrupt{yieldPolicy} {}
+    PlanStage(StringData stageType,
+              PlanYieldPolicy* yieldPolicy,
+              PlanNodeId nodeId,
+              bool participateInTrialRunTracking)
+        : CanTrackStats{stageType, nodeId, participateInTrialRunTracking},
+          CanInterrupt{yieldPolicy} {}
 
-    PlanStage(StringData stageType, PlanNodeId nodeId) : PlanStage(stageType, nullptr, nodeId) {}
+    PlanStage(StringData stageType, PlanNodeId nodeId, bool participateInTrialRunTracking)
+        : PlanStage(stageType, nullptr, nodeId, participateInTrialRunTracking) {}
 
     virtual ~PlanStage() = default;
 

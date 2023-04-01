@@ -2,38 +2,38 @@
  * Tests that tenant migration recipient's in memory state is initialized correctly on initial sync.
  * This test randomly selects a point during the migration to add a node to the recipient.
  *
- * Tenant migrations are not expected to be run on servers with ephemeralForTest.
- *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
+ *   requires_fcv_62,
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    getServerlessOperationLock,
+    ServerlessLockType
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
 load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
 
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
 const kMaxSleepTimeMS = 7500;
-const kTenantId = 'testTenantId';
+const kTenantId = ObjectId().str;
 
 let recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 
 // Force the migration to pause after entering a randomly selected state.
 Random.setRandomSeed();
 const kMigrationFpNames = [
-    "fpAfterCollectionClonerDone",
+    "fpBeforeFetchingCommittedTransactions",
     "fpAfterWaitForRejectReadsBeforeTimestamp",
 ];
 const index = Random.randInt(kMigrationFpNames.length + 1);
@@ -62,7 +62,8 @@ recipientRst.awaitReplication();
 stopServerReplication(initialSyncNode);
 
 const configRecipientsColl = initialSyncNode.getCollection(TenantMigrationTest.kConfigRecipientsNS);
-const recipientDoc = configRecipientsColl.findOne({tenantId: kTenantId});
+assert.lte(configRecipientsColl.count(), 1);
+const recipientDoc = configRecipientsColl.findOne();
 if (recipientDoc) {
     switch (recipientDoc.state) {
         case TenantMigrationTest.RecipientState.kStarted:
@@ -100,7 +101,13 @@ if (recipientDoc) {
     }
 }
 
+const activeServerlessLock = getServerlessOperationLock(initialSyncNode);
+if (recipientDoc && !recipientDoc.expireAt) {
+    assert.eq(activeServerlessLock, ServerlessLockType.TenantMigrationRecipient);
+} else {
+    assert.eq(activeServerlessLock, ServerlessLockType.None);
+}
+
 restartServerReplication(initialSyncNode);
 
 tenantMigrationTest.stop();
-})();

@@ -77,7 +77,7 @@ public:
         ConfigSvrMergeResponse typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrCommitChunksMerge can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
             uassert(ErrorCodes::InvalidNamespace,
                     "invalid namespace specified for request",
                     ns().isValid());
@@ -87,15 +87,15 @@ public:
             repl::ReadConcernArgs::get(opCtx) =
                 repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
-            const BSONObj shardAndCollVers = uassertStatusOK(
+            const auto shardAndCollVers = uassertStatusOK(
                 ShardingCatalogManager::get(opCtx)->commitChunksMerge(opCtx,
                                                                       ns(),
+                                                                      request().getEpoch(),
+                                                                      request().getTimestamp(),
                                                                       request().getCollectionUUID(),
                                                                       request().getChunkRange(),
-                                                                      request().getShard(),
-                                                                      request().getValidAfter()));
-            return ConfigSvrMergeResponse{ChunkVersion::fromBSONPositionalOrNewerFormat(
-                shardAndCollVers[ChunkVersion::kShardVersionField])};
+                                                                      request().getShard()));
+            return ConfigSvrMergeResponse{shardAndCollVers.shardPlacementVersion};
         }
 
     private:

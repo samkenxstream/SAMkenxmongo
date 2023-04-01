@@ -41,7 +41,7 @@
 #include "mongo/db/s/resharding/resharding_donor_oplog_iterator.h"
 #include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/db/transaction_history_iterator.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/str.h"
 
@@ -50,9 +50,8 @@ namespace {
 
 using namespace fmt::literals;
 
-const NamespaceString kRemoteOplogNss{"local.oplog.rs"};
-const NamespaceString kLocalOplogBufferNss{"{}.{}xxx.yyy"_format(
-    NamespaceString::kConfigDb, NamespaceString::kReshardingLocalOplogBufferPrefix)};
+const NamespaceString kLocalOplogBufferNss = NamespaceString::createNamespaceString_forTest(
+    "config", "{}xxx.yyy"_format(NamespaceString::kReshardingLocalOplogBufferPrefix));
 
 // A mock TransactionHistoryIterator to support DSReshardingIterateTransaction.
 class MockTransactionHistoryIterator : public TransactionHistoryIteratorBase {
@@ -133,6 +132,16 @@ public:
         pipeline->addInitialSource(
             DocumentSourceMock::createForTest(_mockResults, pipeline->getContext()));
         return pipeline;
+    }
+
+    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+        const AggregateCommandRequest& aggRequest,
+        Pipeline* pipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        boost::optional<BSONObj> shardCursorsSortSpec = boost::none,
+        ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
+        boost::optional<BSONObj> readConcern = boost::none) final {
+        return attachCursorSourceToPipeline(pipeline, shardTargetingPolicy, std::move(readConcern));
     }
 
     std::unique_ptr<TransactionHistoryIteratorBase> createTransactionHistoryIterator(
@@ -233,9 +242,7 @@ repl::DurableOplogEntry makeApplyOpsOplog(std::vector<BSONObj> operations,
     }
 
     return {opTime,
-            boost::none /* hash */,
             repl::OpTypeEnum::kCommand,
-            boost::none /* tenant id */,
             {},
             UUID::gen(),
             false /* fromMigrate */,
@@ -258,7 +265,7 @@ bool validateOplogId(const Timestamp& clusterTime,
                      const mongo::Document& sourceDoc,
                      const repl::OplogEntry& oplogEntry) {
     auto oplogIdExpected = ReshardingDonorOplogId{clusterTime, sourceDoc["ts"].getTimestamp()};
-    auto oplogId = ReshardingDonorOplogId::parse(IDLParserErrorContext("ReshardingAggTest"),
+    auto oplogId = ReshardingDonorOplogId::parse(IDLParserContext("ReshardingAggTest"),
                                                  oplogEntry.get_id()->getDocument().toBson());
     return oplogIdExpected == oplogId;
 }
@@ -267,7 +274,8 @@ boost::intrusive_ptr<ExpressionContextForTest> createExpressionContext(Operation
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(
         new ExpressionContextForTest(opCtx, kLocalOplogBufferNss));
     expCtx->setResolvedNamespace(kLocalOplogBufferNss, {kLocalOplogBufferNss, {}});
-    expCtx->setResolvedNamespace(kRemoteOplogNss, {kRemoteOplogNss, {}});
+    expCtx->setResolvedNamespace(NamespaceString::kRsOplogNamespace,
+                                 {NamespaceString::kRsOplogNamespace, {}});
     return expCtx;
 }
 
@@ -352,7 +360,7 @@ protected:
 
 
     ReshardingDonorOplogId getOplogId(const repl::MutableOplogEntry& oplog) {
-        return ReshardingDonorOplogId::parse(IDLParserErrorContext("ReshardingAggTest::getOplogId"),
+        return ReshardingDonorOplogId::parse(IDLParserContext("ReshardingAggTest::getOplogId"),
                                              oplog.get_id()->getDocument().toBson());
     }
 
@@ -360,10 +368,10 @@ protected:
         std::deque<DocumentSource::GetNextResult> pipelineSource) {
         // Set up the oplog collection state for $lookup and $graphLookup calls.
         auto expCtx = createExpressionContext();
-        expCtx->ns = kRemoteOplogNss;
+        expCtx->ns = NamespaceString::kRsOplogNamespace;
         expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(pipelineSource);
 
-        auto pipeline = createOplogFetchingPipelineForResharding(
+        auto pipeline = resharding::createOplogFetchingPipelineForResharding(
             expCtx,
             ReshardingDonorOplogId(Timestamp::min(), Timestamp::min()),
             _reshardingCollUUID,
@@ -522,16 +530,17 @@ TEST_F(ReshardingAggTest, VerifyPipelineOutputHasOplogSchema) {
                                                                 Document(deleteOplog.toBSON())};
 
     boost::intrusive_ptr<ExpressionContext> expCtx = createExpressionContext();
-    expCtx->ns = kRemoteOplogNss;
+    expCtx->ns = NamespaceString::kRsOplogNamespace;
     expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(pipelineSource);
 
-    std::unique_ptr<Pipeline, PipelineDeleter> pipeline = createOplogFetchingPipelineForResharding(
-        expCtx,
-        // Use the test to also exercise the stages for resuming. The timestamp passed in is
-        // excluded from the results.
-        ReshardingDonorOplogId(insertOplog.getTimestamp(), insertOplog.getTimestamp()),
-        _reshardingCollUUID,
-        {_destinedRecipient});
+    std::unique_ptr<Pipeline, PipelineDeleter> pipeline =
+        resharding::createOplogFetchingPipelineForResharding(
+            expCtx,
+            // Use the test to also exercise the stages for resuming. The timestamp passed in is
+            // excluded from the results.
+            ReshardingDonorOplogId(insertOplog.getTimestamp(), insertOplog.getTimestamp()),
+            _reshardingCollUUID,
+            {_destinedRecipient});
     auto bsonPipeline = pipeline->serializeToBson();
     if (debug) {
         std::cout << "Pipeline stages:" << std::endl;
@@ -622,14 +631,15 @@ TEST_F(ReshardingAggTest, VerifyPipelinePreparedTxn) {
 
     boost::intrusive_ptr<ExpressionContext> expCtx = createExpressionContext();
     // Set up the oplog collection state for $lookup and $graphLookup calls.
-    expCtx->ns = kRemoteOplogNss;
+    expCtx->ns = NamespaceString::kRsOplogNamespace;
     expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(pipelineSource);
 
-    std::unique_ptr<Pipeline, PipelineDeleter> pipeline = createOplogFetchingPipelineForResharding(
-        expCtx,
-        ReshardingDonorOplogId(Timestamp::min(), Timestamp::min()),
-        _reshardingCollUUID,
-        {_destinedRecipient});
+    std::unique_ptr<Pipeline, PipelineDeleter> pipeline =
+        resharding::createOplogFetchingPipelineForResharding(
+            expCtx,
+            ReshardingDonorOplogId(Timestamp::min(), Timestamp::min()),
+            _reshardingCollUUID,
+            {_destinedRecipient});
     if (debug) {
         std::cout << "Pipeline stages:" << std::endl;
         // This is can be changed to process a prefix of the pipeline for debugging.
@@ -666,7 +676,7 @@ TEST_F(ReshardingAggTest, VerifyPipelinePreparedTxn) {
     ASSERT(!pipeline->getNext());
 }
 
-TEST_F(ReshardingAggTest, VerifyPipelineAtomicApplyOps) {
+TEST_F(ReshardingAggTest, VerifyPipelineApplyOps) {
     const auto oplogBSON = fromjson(R"({
         "op": "c",
         "ns": "test.$cmd",
@@ -704,7 +714,6 @@ TEST_F(ReshardingAggTest, VerifyPipelineAtomicApplyOps) {
 
     auto pipeline = createPipeline({Document(oplogBSON)});
 
-    // We don't need to support atomic applyOps in the resharding pipeline; we filter them out.
     ASSERT(!pipeline->getNext());
 }
 
@@ -1442,12 +1451,10 @@ TEST_F(ReshardingAggWithStorageTest, RetryableFindAndModifyWithImageLookup) {
     imageEntry.setImage(preImage);
 
     DBDirectClient client(opCtx());
-    client.insert(NamespaceString::kConfigImagesNamespace.ns(), imageEntry.toBSON());
+    client.insert(NamespaceString::kConfigImagesNamespace, imageEntry.toBSON());
 
     repl::DurableOplogEntry oplog(opTime,
-                                  boost::none /* hash */,
                                   repl::OpTypeEnum::kUpdate,
-                                  boost::none /* tenant id */,
                                   kCrudNs,
                                   kCrudUUID,
                                   false /* fromMigrate */,
@@ -1478,7 +1485,7 @@ TEST_F(ReshardingAggWithStorageTest, RetryableFindAndModifyWithImageLookup) {
         expCtx->mongoProcessInterface = std::move(mockMongoInterface);
     }
 
-    auto pipeline = createOplogFetchingPipelineForResharding(
+    auto pipeline = resharding::createOplogFetchingPipelineForResharding(
         expCtx, ReshardingDonorOplogId(Timestamp::min(), Timestamp::min()), kCrudUUID, kMyShardId);
 
     pipeline->addInitialSource(DocumentSourceMock::createForTest(pipelineSource, expCtx));
@@ -1560,7 +1567,7 @@ TEST_F(ReshardingAggWithStorageTest,
     imageEntry.setImage(preImage);
 
     DBDirectClient client(opCtx());
-    client.insert(NamespaceString::kConfigImagesNamespace.ns(), imageEntry.toBSON());
+    client.insert(NamespaceString::kConfigImagesNamespace, imageEntry.toBSON());
 
     auto createPipeline = [&](ReshardingDonorOplogId startAt) {
         std::deque<DocumentSource::GetNextResult> pipelineSource{
@@ -1580,8 +1587,8 @@ TEST_F(ReshardingAggWithStorageTest,
             expCtx->mongoProcessInterface = std::move(mockMongoInterface);
         }
 
-        auto pipeline =
-            createOplogFetchingPipelineForResharding(expCtx, startAt, kCrudUUID, kMyShardId);
+        auto pipeline = resharding::createOplogFetchingPipelineForResharding(
+            expCtx, startAt, kCrudUUID, kMyShardId);
         pipeline->addInitialSource(DocumentSourceMock::createForTest(pipelineSource, expCtx));
         return pipeline;
     };
@@ -1621,7 +1628,8 @@ TEST_F(ReshardingAggWithStorageTest,
     auto operationDocs = applyOpsInfo.getOperations();
     ASSERT_EQ(operationDocs.size(), 1U);
     auto outputInnerOp2 = repl::DurableReplOperation::parse(
-        {"RetryableFindAndModifyInsideInternalTransactionWithImageLookup"}, operationDocs[0]);
+        IDLParserContext{"RetryableFindAndModifyInsideInternalTransactionWithImageLookup"},
+        operationDocs[0]);
     ASSERT_TRUE(outputInnerOp2.getPreImageOpTime());
     ASSERT_FALSE(outputInnerOp2.getNeedsRetryImage());
     ASSERT_EQ(preImageOplog.getOpTime(), *outputInnerOp2.getPreImageOpTime());
@@ -1645,7 +1653,7 @@ TEST_F(ReshardingAggWithStorageTest,
     // Create another pipeline and start fetching from after the doc for the pre-image, and verify
     // that the pipeline does not re-output the applyOps doc that comes before the pre-image doc.
     const auto startAt = ReshardingDonorOplogId::parse(
-        {"RetryableFindAndModifyInsideInternalTransactionWithImageLookup"},
+        IDLParserContext{"RetryableFindAndModifyInsideInternalTransactionWithImageLookup"},
         preImageOplog.get_id()->getDocument().toBson());
     auto newPipeline = createPipeline(startAt);
 

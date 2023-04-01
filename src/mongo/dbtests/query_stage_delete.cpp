@@ -32,7 +32,6 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
@@ -60,17 +59,17 @@ public:
             BSONObjBuilder bob;
             bob.append("_id", static_cast<long long int>(i));
             bob.append("foo", static_cast<long long int>(i));
-            _client.insert(nss.ns(), bob.obj());
+            _client.insert(nss, bob.obj());
         }
     }
 
     virtual ~QueryStageDeleteBase() {
         dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
-        _client.dropCollection(nss.ns());
+        _client.dropCollection(nss);
     }
 
     void remove(const BSONObj& obj) {
-        _client.remove(nss.ns(), obj);
+        _client.remove(nss, obj);
     }
 
     void getRecordIds(const CollectionPtr& collection,

@@ -63,22 +63,23 @@ public:
         return "Indicates free monitoring status";
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const final {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::checkFreeMonitoringStatus)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName&,
+                                 const BSONObj&) const final {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                    ActionType::checkFreeMonitoringStatus)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) final {
         // Command has no members, invoke the parser to confirm that.
-        IDLParserErrorContext ctx("getFreeMonitoringStatus");
+        IDLParserContext ctx("getFreeMonitoringStatus");
         GetFreeMonitoringStatus::parse(ctx, cmdObj);
 
         result.append("state", "disabled");

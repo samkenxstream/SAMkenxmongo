@@ -3,7 +3,6 @@
  * command followed by multiple inserts onto that collection.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
@@ -12,17 +11,14 @@
  * ]
  */
 
-(function() {
-"use strict";
-
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/aggregation/extras/utils.js");
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
 
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
-const tenantId = "testTenantId";
+const tenantId = ObjectId().str;
 const tenantDB = tenantMigrationTest.tenantDB(tenantId, "testDB");
 const collName = "testColl";
 const tenantNS = `${tenantDB}.${collName}`;
@@ -31,8 +27,8 @@ const transactionsNS = "config.transactions";
 const donorPrimary = tenantMigrationTest.getDonorPrimary();
 const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 
-const hangAfterStartingOplogApplier = configureFailPoint(
-    recipientPrimary, "fpAfterStartingOplogApplierMigrationRecipientInstance", {action: "hang"});
+const pauseTenantMigrationBeforeLeavingDataSyncState =
+    configureFailPoint(donorPrimary, "pauseTenantMigrationBeforeLeavingDataSyncState");
 
 jsTestLog("Starting a migration");
 const migrationId = UUID();
@@ -42,7 +38,7 @@ const migrationOpts = {
 };
 assert.commandWorked(tenantMigrationTest.startMigration(migrationOpts));
 
-hangAfterStartingOplogApplier.wait();
+pauseTenantMigrationBeforeLeavingDataSyncState.wait();
 
 jsTestLog("Running transaction while the migration is running");
 const session = donorPrimary.startSession();
@@ -60,7 +56,7 @@ assert.commandWorked(sessionColl.insert(doc3));
 assert.commandWorked(session.commitTransaction_forTesting());
 session.endSession();
 
-hangAfterStartingOplogApplier.off();
+pauseTenantMigrationBeforeLeavingDataSyncState.off();
 
 jsTestLog("Waiting for migration to complete");
 TenantMigrationTest.assertCommitted(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
@@ -74,4 +70,3 @@ assertArrayEq({
 });
 
 tenantMigrationTest.stop();
-})();

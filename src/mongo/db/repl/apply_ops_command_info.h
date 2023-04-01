@@ -43,12 +43,10 @@ class OperationContext;
 namespace repl {
 class ApplyOps {
 public:
-    static constexpr StringData kPreconditionFieldName = "preCondition"_sd;
     static constexpr StringData kOplogApplicationModeFieldName = "oplogApplicationMode"_sd;
 
     /**
-     * Extracts CRUD operations from an atomic applyOps oplog entry.
-     * Throws UserException on error.
+     * Extracts CRUD operations from an applyOps oplog entry. Throws UserException on error.
      */
     static std::vector<OplogEntry> extractOperations(const OplogEntry& applyOpsOplogEntry);
 
@@ -78,12 +76,6 @@ public:
      * Returns true if all operations described by this applyOps command are CRUD only.
      */
     bool areOpsCrudOnly() const;
-
-    /**
-     * Returns true if applyOps will try to process all operations in a single batch atomically.
-     * Derived from getAllowAtomic() and areOpsCrudOnly().
-     */
-    bool isAtomic() const;
 
 private:
     explicit ApplyOpsCommandInfo(const BSONObj& applyOpCmd);

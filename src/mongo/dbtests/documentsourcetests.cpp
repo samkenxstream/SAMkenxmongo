@@ -49,6 +49,7 @@
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/mock_yield_policies.h"
+#include "mongo/db/query/multiple_collection_accessor.h"
 #include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/stage_builder.h"
@@ -77,12 +78,13 @@ class DocumentSourceCursorTest : public unittest::Test {
 public:
     DocumentSourceCursorTest()
         : client(_opCtx.get()),
-          _ctx(new ExpressionContextForTest(_opCtx.get(), AggregateCommandRequest(nss, {}))) {
+          _ctx(new ExpressionContextForTest(
+              _opCtx.get(), AggregateCommandRequest(nss, std::vector<mongo::BSONObj>()))) {
         _ctx->tempDir = storageGlobalParams.dbpath + "/_tmp";
     }
 
     virtual ~DocumentSourceCursorTest() {
-        client.dropCollection(nss.ns());
+        client.dropCollection(nss);
     }
 
 protected:
@@ -106,8 +108,10 @@ protected:
                                                 PlanYieldPolicy::YieldPolicy::NO_YIELD,
                                                 QueryPlannerParams::RETURN_OWNED_DATA));
 
-        _source = DocumentSourceCursor::create(
-            _coll, std::move(exec), _ctx, DocumentSourceCursor::CursorType::kRegular);
+        _source = DocumentSourceCursor::create(MultipleCollectionAccessor(_coll),
+                                               std::move(exec),
+                                               _ctx,
+                                               DocumentSourceCursor::CursorType::kRegular);
     }
 
     intrusive_ptr<ExpressionContextForTest> ctx() {
@@ -152,7 +156,7 @@ TEST_F(DocumentSourceCursorTest, Empty) {
 
 /** Iterate a DocumentSourceCursor. */
 TEST_F(DocumentSourceCursorTest, Iterate) {
-    client.insert(nss.ns(), BSON("a" << 1));
+    client.insert(nss, BSON("a" << 1));
     createSource();
     // The DocumentSourceCursor doesn't hold a read lock.
     ASSERT(!opCtx()->lockState()->isReadLocked());
@@ -180,9 +184,9 @@ TEST_F(DocumentSourceCursorTest, Dispose) {
 
 /** Iterate a DocumentSourceCursor and then dispose of it. */
 TEST_F(DocumentSourceCursorTest, IterateDispose) {
-    client.insert(nss.ns(), BSON("a" << 1));
-    client.insert(nss.ns(), BSON("a" << 2));
-    client.insert(nss.ns(), BSON("a" << 3));
+    client.insert(nss, BSON("a" << 1));
+    client.insert(nss, BSON("a" << 2));
+    client.insert(nss, BSON("a" << 3));
     createSource();
     // The result is as expected.
     auto next = source()->getNext();
@@ -297,8 +301,8 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterTimeout)
     // Make sure the collection exists, otherwise we'll default to a NO_YIELD yield policy.
     const bool capped = true;
     const long long cappedSize = 1024;
-    ASSERT_TRUE(client.createCollection(nss.ns(), cappedSize, capped));
-    client.insert(nss.ns(), BSON("a" << 1));
+    ASSERT_TRUE(client.createCollection(nss, cappedSize, capped));
+    client.insert(nss, BSON("a" << 1));
 
     // Make a tailable collection scan wrapped up in a PlanExecutor.
     AutoGetCollectionForRead readLock(opCtx(), nss);
@@ -330,7 +334,7 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterTimeout)
     ctx()->tailableMode = TailableModeEnum::kTailableAndAwaitData;
     // DocumentSourceCursor expects a PlanExecutor that has had its state saved.
     planExecutor->saveState();
-    auto cursor = DocumentSourceCursor::create(readLock.getCollection(),
+    auto cursor = DocumentSourceCursor::create(MultipleCollectionAccessor(readLock.getCollection()),
                                                std::move(planExecutor),
                                                ctx(),
                                                DocumentSourceCursor::CursorType::kRegular);
@@ -342,8 +346,8 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterTimeout)
 
 TEST_F(DocumentSourceCursorTest, NonAwaitDataCursorShouldErrorAfterTimeout) {
     // Make sure the collection exists, otherwise we'll default to a NO_YIELD yield policy.
-    ASSERT_TRUE(client.createCollection(nss.ns()));
-    client.insert(nss.ns(), BSON("a" << 1));
+    ASSERT_TRUE(client.createCollection(nss));
+    client.insert(nss, BSON("a" << 1));
 
     // Make a tailable collection scan wrapped up in a PlanExecutor.
     AutoGetCollectionForRead readLock(opCtx(), nss);
@@ -374,7 +378,7 @@ TEST_F(DocumentSourceCursorTest, NonAwaitDataCursorShouldErrorAfterTimeout) {
     ctx()->tailableMode = TailableModeEnum::kNormal;
     // DocumentSourceCursor expects a PlanExecutor that has had its state saved.
     planExecutor->saveState();
-    auto cursor = DocumentSourceCursor::create(readLock.getCollection(),
+    auto cursor = DocumentSourceCursor::create(MultipleCollectionAccessor(readLock.getCollection()),
                                                std::move(planExecutor),
                                                ctx(),
                                                DocumentSourceCursor::CursorType::kRegular);
@@ -393,8 +397,8 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterBeingKil
     // Make sure the collection exists, otherwise we'll default to a NO_YIELD yield policy.
     const bool capped = true;
     const long long cappedSize = 1024;
-    ASSERT_TRUE(client.createCollection(nss.ns(), cappedSize, capped));
-    client.insert(nss.ns(), BSON("a" << 1));
+    ASSERT_TRUE(client.createCollection(nss, cappedSize, capped));
+    client.insert(nss, BSON("a" << 1));
 
     // Make a tailable collection scan wrapped up in a PlanExecutor.
     AutoGetCollectionForRead readLock(opCtx(), nss);
@@ -426,7 +430,7 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterBeingKil
     ctx()->tailableMode = TailableModeEnum::kTailableAndAwaitData;
     // DocumentSourceCursor expects a PlanExecutor that has had its state saved.
     planExecutor->saveState();
-    auto cursor = DocumentSourceCursor::create(readLock.getCollection(),
+    auto cursor = DocumentSourceCursor::create(MultipleCollectionAccessor(readLock.getCollection()),
                                                std::move(planExecutor),
                                                ctx(),
                                                DocumentSourceCursor::CursorType::kRegular);
@@ -437,8 +441,8 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterBeingKil
 
 TEST_F(DocumentSourceCursorTest, NormalCursorShouldErrorAfterBeingKilled) {
     // Make sure the collection exists, otherwise we'll default to a NO_YIELD yield policy.
-    ASSERT_TRUE(client.createCollection(nss.ns()));
-    client.insert(nss.ns(), BSON("a" << 1));
+    ASSERT_TRUE(client.createCollection(nss));
+    client.insert(nss, BSON("a" << 1));
 
     // Make a tailable collection scan wrapped up in a PlanExecutor.
     AutoGetCollectionForRead readLock(opCtx(), nss);
@@ -467,7 +471,7 @@ TEST_F(DocumentSourceCursorTest, NormalCursorShouldErrorAfterBeingKilled) {
     ctx()->tailableMode = TailableModeEnum::kNormal;
     // DocumentSourceCursor expects a PlanExecutor that has had its state saved.
     planExecutor->saveState();
-    auto cursor = DocumentSourceCursor::create(readLock.getCollection(),
+    auto cursor = DocumentSourceCursor::create(MultipleCollectionAccessor(readLock.getCollection()),
                                                std::move(planExecutor),
                                                ctx(),
                                                DocumentSourceCursor::CursorType::kRegular);

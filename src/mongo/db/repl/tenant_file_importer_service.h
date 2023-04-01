@@ -29,128 +29,179 @@
 
 #pragma once
 
-#include "boost/optional/optional.hpp"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/client/dbclient_connection.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replica_set_aware_service.h"
-#include "mongo/executor/scoped_task_executor.h"
-#include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/db/repl/tenant_migration_shared_data.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/producer_consumer_queue.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo::repl {
-// Runs on tenant migration recipient primary and secondaries. Copies and imports donor files.
+// Runs on tenant migration recipient primary and secondaries. Copies and imports donor files and
+// then informs the primary that it has finished by running recipientVoteImportedFiles.
 class TenantFileImporterService : public ReplicaSetAwareService<TenantFileImporterService> {
 public:
     static constexpr StringData kTenantFileImporterServiceName = "TenantFileImporterService"_sd;
     static TenantFileImporterService* get(ServiceContext* serviceContext);
+    static TenantFileImporterService* get(OperationContext* opCtx);
     TenantFileImporterService() = default;
-    void startMigration(const UUID& migrationId, const StringData& donorConnectionString);
+
+    /**
+     * Begins the process of copying and importing files for a given migration.
+     */
+    void startMigration(const UUID& migrationId);
+
+    /**
+     * Called for each file to be copied for a given migration.
+     */
     void learnedFilename(const UUID& migrationId, const BSONObj& metadataDoc);
+
+    /**
+     * Called after all files have been copied for a given migration.
+     */
     void learnedAllFilenames(const UUID& migrationId);
-    void reset(const UUID& migrationId);
+
+    /**
+     * Interrupts an in-progress migration with the provided migration id.
+     */
+    void interrupt(const UUID& migrationId);
+
+    /**
+     * Causes any in-progress migration be interrupted.
+     */
+    void interruptAll();
 
 private:
-    void onStartup(OperationContext* opCtx) final;
-
-    void onStartupRecoveryComplete(OperationContext* opCtx) final {}
-    void onInitialSyncComplete(OperationContext* opCtx) final {}
+    void onInitialDataAvailable(OperationContext*, bool) final {}
 
     void onShutdown() final {
-        stdx::lock_guard lk(_mutex);
-        _reset(lk);
+        {
+            stdx::lock_guard lk(_mutex);
+            // Prevents a new migration from starting up during or after shutdown.
+            _isShuttingDown = true;
+        }
+        interruptAll();
+        _reset();
     }
 
-    void onStepUpBegin(OperationContext* opCtx, long long term) final {
-        stdx::lock_guard lk(_mutex);
-        _reset(lk);
+    void onStartup(OperationContext*) final {}
+
+    void onSetCurrentConfig(OperationContext* opCtx) final {}
+
+    void onStepUpBegin(OperationContext*, long long) final {}
+
+    void onStepUpComplete(OperationContext*, long long) final {}
+
+    void onStepDown() final {}
+
+    void onBecomeArbiter() final {}
+
+    inline std::string getServiceName() const override final {
+        return "TenantFileImporterService";
     }
 
-    void onStepUpComplete(OperationContext* opCtx, long long term) final {
-        stdx::lock_guard lk(_mutex);
-        _reset(lk);
-    }
+    /**
+     * A worker function that waits for ImporterEvents and handles cloning and importing files.
+     */
+    void _handleEvents(const UUID& migrationId);
 
-    void onStepDown() final {
-        stdx::lock_guard lk(_mutex);
-        _reset(lk);
-    }
+    /**
+     * Called to inform the primary that we have finished copying and importing all files.
+     */
+    void _voteImportedFiles(OperationContext* opCtx, const UUID& migrationId);
 
-    void onBecomeArbiter() final {
-        stdx::lock_guard lk(_mutex);
-        _reset(lk);
-    }
+    /**
+     * Called internally by interrupt and interruptAll to interrupt a running file import operation.
+     */
+    void _interrupt(WithLock);
 
-    void _voteImportedFiles(const UUID& migrationId, WithLock);
+    /**
+     * Waits for all async work to be finished and then resets internal state.
+     */
+    void _reset();
 
-    void _reset(WithLock);
-
-    // Lasts for the lifetime of the process.
-    std::shared_ptr<executor::ThreadPoolTaskExecutor> _executor;
-    // Wraps _executor. Created by learnedFilename and destroyed by _reset.
-    std::shared_ptr<executor::ScopedTaskExecutor> _scopedExecutor;
-    boost::optional<UUID> _migrationId;
-    std::string _donorConnectionString;
-    Mutex _mutex = MONGO_MAKE_LATCH("TenantFileImporterService::_mutex");
-
-    class ImporterState {
-    public:
-        enum class State { kUninitialized, kCopyingFiles, kCopiedFiles, kImportedFiles };
-
-        void setState(State nextState) {
-            tassert(6114403,
-                    str::stream() << "current state: " << toString(_state)
-                                  << ", new state: " << toString(nextState),
-                    isValidTransition(nextState));
-            _state = nextState;
-        }
-
-        bool is(State state) const {
-            return _state == state;
-        }
-
-        StringData toString() const {
-            return toString(_state);
-        }
-
-    private:
-        static StringData toString(State value) {
-            switch (value) {
-                case State::kUninitialized:
-                    return "uninitialized";
-                case State::kCopyingFiles:
-                    return "copying files";
-                case State::kCopiedFiles:
-                    return "copied files";
-                case State::kImportedFiles:
-                    return "imported files";
-            }
-            MONGO_UNREACHABLE;
-            return StringData();
-        }
-
-        bool isValidTransition(State newState) {
-            if (_state == newState) {
-                return true;
-            }
-
-            switch (_state) {
-                case State::kUninitialized:
-                    return newState == State::kCopyingFiles;
-                case State::kCopyingFiles:
-                    return newState == State::kCopiedFiles || newState == State::kUninitialized;
-                case State::kCopiedFiles:
-                    return newState == State::kImportedFiles || newState == State::kUninitialized;
-                case State::kImportedFiles:
-                    return newState == State::kUninitialized;
-            }
-            MONGO_UNREACHABLE;
-        }
-
-        State _state = State::kUninitialized;
+    // Explicit State enum ordering defined here because we rely on comparison
+    // operators for state checking in various TenantFileImporterService methods.
+    enum class State {
+        kUninitialized = 0,
+        kStarted = 1,
+        kLearnedFilename = 2,
+        kLearnedAllFilenames = 3,
+        kInterrupted = 4
     };
 
-    ImporterState _state;
+    static StringData stateToString(State state) {
+        switch (state) {
+            case State::kUninitialized:
+                return "uninitialized";
+            case State::kStarted:
+                return "started";
+            case State::kLearnedFilename:
+                return "learned filename";
+            case State::kLearnedAllFilenames:
+                return "learned all filenames";
+            case State::kInterrupted:
+                return "interrupted";
+        }
+        MONGO_UNREACHABLE;
+        return StringData();
+    }
+
+    struct ImporterEvent {
+        enum class Type { kNone, kLearnedFileName, kLearnedAllFilenames };
+        Type type;
+        UUID migrationId;
+        BSONObj metadataDoc;
+
+        ImporterEvent(Type _type, const UUID& _migrationId)
+            : type(_type), migrationId(_migrationId) {}
+    };
+
+    using Queue =
+        MultiProducerSingleConsumerQueue<ImporterEvent,
+                                         producer_consumer_queue_detail::DefaultCostFunction>;
+    Mutex _mutex = MONGO_MAKE_LATCH("TenantFileImporterService::_mutex");
+
+    // All member variables are labeled with one of the following codes indicating the
+    // synchronization rules for accessing them.
+    //
+    // (R)  Read-only in concurrent operation; no synchronization required.
+    // (S)  Self-synchronizing; access according to class's own rules.
+    // (M)  Reads and writes guarded by _mutex.
+    // (W)  Synchronization required only for writes.
+    // (I)  Independently synchronized, see member variable comment.
+
+    // Set to true when the shutdown procedure is initiated.
+    bool _isShuttingDown = false;  // (M)
+
+    OperationContext* _opCtx;  // (M)
+
+    // The worker thread that processes ImporterEvents.
+    std::unique_ptr<stdx::thread> _workerThread;  // (M)
+
+    // The UUID of the current running migration.
+    boost::optional<UUID> _migrationId;  // (M)
+
+    // The state of the current running migration.
+    State _state;  // (M)
+
+    // The DBClientConnection to the donor used for cloning files.
+    std::shared_ptr<DBClientConnection>
+        _donorConnection;  // (I) pointer set under mutex, copied by callers.
+
+    // The ThreadPool used for cloning files.
+    std::shared_ptr<ThreadPool> _writerPool;  // (I) pointer set under mutex, copied by callers.
+
+    // The TenantMigrationSharedData used for cloning files.
+    std::shared_ptr<TenantMigrationSharedData>
+        _sharedData;  // (I) pointer set under mutex, copied by callers.
+
+    // The Queue used for processing ImporterEvents.
+    std::shared_ptr<Queue> _eventQueue;  // (I) pointer set under mutex, copied by callers.
 };
 }  // namespace mongo::repl

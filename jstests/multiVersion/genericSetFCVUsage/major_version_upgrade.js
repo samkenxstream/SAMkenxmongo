@@ -7,12 +7,14 @@
  * - Create a new collection.
  * - Insert a document into the new collection.
  * - Create an index on the new collection.
+ *
+ * @tags: [requires_v4_0]
  */
 
 (function() {
 'use strict';
 
-load('jstests/libs/get_index_helpers.js');
+load('jstests/libs/index_catalog_helpers.js');
 load('jstests/multiVersion/libs/multi_rs.js');
 load('jstests/multiVersion/libs/verify_versions.js');
 
@@ -29,10 +31,10 @@ const defaultOptions = {
 // This lists all supported releases and needs to be kept up to date as versions are added and
 // dropped.
 const versions = [
-    {binVersion: '4.0', featureCompatibilityVersion: '4.0', testCollection: 'four_zero'},
     {binVersion: '4.2', featureCompatibilityVersion: '4.2', testCollection: 'four_two'},
     {binVersion: '4.4', featureCompatibilityVersion: '4.4', testCollection: 'four_four'},
     {binVersion: '5.0', featureCompatibilityVersion: '5.0', testCollection: 'five_zero'},
+    {binVersion: '6.0', featureCompatibilityVersion: '6.0', testCollection: 'six_zero'},
     {binVersion: 'last-lts', testCollection: 'last_lts'},
     {binVersion: 'last-continuous', testCollection: 'last_continuous'},
     {binVersion: 'latest', featureCompatibilityVersion: latestFCV, testCollection: 'latest'},
@@ -68,7 +70,7 @@ for (let i = 0; i < versions.length; i++) {
                       tojson(mongodOptions));
         assert.neq(
             null,
-            GetIndexHelpers.findByKeyPattern(testDB[oldVersionCollection].getIndexes(), {a: 1}),
+            IndexCatalogHelpers.findByKeyPattern(testDB[oldVersionCollection].getIndexes(), {a: 1}),
             `index from ${oldVersionCollection} should be available; options: ` +
                 tojson(mongodOptions));
     }
@@ -164,11 +166,11 @@ for (let i = 0; i < versions.length; i++) {
                   `data from ${oldVersionCollection} should be available; nodes: ${tojson(nodes)}`);
         assert.neq(
             null,
-            GetIndexHelpers.findByKeyPattern(testDB[oldVersionCollection].getIndexes(), {a: 1}),
+            IndexCatalogHelpers.findByKeyPattern(testDB[oldVersionCollection].getIndexes(), {a: 1}),
             `index from ${oldVersionCollection} should be available; nodes: ${tojson(nodes)}`);
         assert.neq(
             null,
-            GetIndexHelpers.findByKeyPattern(testDB[oldVersionCollection].getIndexes(), {b: 1}),
+            IndexCatalogHelpers.findByKeyPattern(testDB[oldVersionCollection].getIndexes(), {b: 1}),
             `index from ${oldVersionCollection} should be available; nodes: ${tojson(nodes)}`);
     }
 

@@ -3,7 +3,6 @@
  * an abort decision.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
@@ -13,39 +12,40 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    makeX509OptionsForTest,
+    runMigrationAsync
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
-
-const kGarbageCollectionDelayMS = 5 * 1000;
-const kTenantIdPrefix = "testTenantId";
-let testNum = 0;
-
-const garbageCollectionOpts = {
-    // Set the delay before a donor state doc is garbage collected to be short to speed
-    // up the test.
-    tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
-    ttlMonitorSleepSecs: 1
-};
+load("jstests/replsets/rslib.js");  // 'createRstArgs'
 
 function setup() {
     const donorRst = new ReplSetTest({
         name: "donorRst",
         nodes: 1,
-        nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor,
-                                   {setParameter: garbageCollectionOpts})
+        serverless: true,
+        nodeOptions: Object.assign(makeX509OptionsForTest().donor, {
+            setParameter: {
+                // Set the delay before a donor state doc is garbage collected to be short to speed
+                // up the test.
+                tenantMigrationGarbageCollectionDelayMS: 0,
+                ttlMonitorSleepSecs: 1
+            }
+        })
     });
 
     donorRst.startSet();
     donorRst.initiate();
 
-    const tenantMigrationTest = new TenantMigrationTest(
-        {name: jsTestName(), donorRst: donorRst, quickGarbageCollection: true});
+    const tenantMigrationTest = new TenantMigrationTest({
+        name: jsTestName(),
+        donorRst: donorRst,
+        quickGarbageCollection: true,
+    });
     return {
         tenantMigrationTest,
         teardown: function() {
@@ -56,7 +56,7 @@ function setup() {
 }
 
 function makeTenantId() {
-    return kTenantIdPrefix + testNum++;
+    return ObjectId().str;
 }
 
 /**
@@ -94,7 +94,6 @@ function testDonorRetryRecipientSyncDataCmdOnError(tenantMigrationTest, errorCod
 
     TenantMigrationTest.assertCommitted(
         tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
-    assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 
     return migrationId;
 }
@@ -122,7 +121,8 @@ function testDonorRetryRecipientForgetMigrationCmdOnError(tenantMigrationTest, e
                                 },
                                 {times: 1});
 
-    TenantMigrationTest.assertCommitted(tenantMigrationTest.runMigration(migrationOpts));
+    TenantMigrationTest.assertCommitted(
+        tenantMigrationTest.runMigration(migrationOpts, {automaticForgetMigration: false}));
 
     // Verify that the initial recipientForgetMigration command failed.
     assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
@@ -145,6 +145,7 @@ function testDonorRetryRecipientForgetMigrationCmdOnError(tenantMigrationTest, e
         tenantMigrationTest.getDonorPrimary().getCollection(TenantMigrationTest.kConfigDonorsNS);
     assert.eq(TenantMigrationTest.DonorState.kCommitted,
               configDonorsColl.findOne({_id: migrationId}).state);
+    assert.commandWorked(tenantMigrationTest.forgetMigration(extractUUIDFromObject(migrationId)));
     teardown();
 })();
 
@@ -160,6 +161,7 @@ function testDonorRetryRecipientForgetMigrationCmdOnError(tenantMigrationTest, e
         tenantMigrationTest.getDonorPrimary().getCollection(TenantMigrationTest.kConfigDonorsNS);
     assert.eq(TenantMigrationTest.DonorState.kCommitted,
               configDonorsColl.findOne({_id: migrationId}).state);
+    assert.commandWorked(tenantMigrationTest.forgetMigration(extractUUIDFromObject(migrationId)));
     teardown();
 })();
 
@@ -190,6 +192,7 @@ function testDonorRetryRecipientForgetMigrationCmdOnError(tenantMigrationTest, e
         tenantMigrationTest.getDonorPrimary().getCollection(TenantMigrationTest.kConfigDonorsNS);
     assert.eq(TenantMigrationTest.DonorState.kCommitted,
               configDonorsColl.findOne({_id: migrationId}).state);
+    assert.commandWorked(tenantMigrationTest.forgetMigration(extractUUIDFromObject(migrationId)));
     teardown();
 })();
 
@@ -244,12 +247,11 @@ const kWriteErrorTimeMS = 50;
         collectionNS: TenantMigrationTest.kConfigDonorsNS,
     });
 
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst());
+    const donorRstArgs = createRstArgs(tenantMigrationTest.getDonorRst());
 
     // Start up a new thread to run this migration, since the 'failCollectionInserts' failpoint will
     // cause the initial 'donorStartMigration' command to loop forever without returning.
-    const migrationThread =
-        new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
+    const migrationThread = new Thread(runMigrationAsync, migrationOpts, donorRstArgs);
     migrationThread.start();
 
     // Make the insert keep failing for some time.
@@ -272,7 +274,8 @@ const kWriteErrorTimeMS = 50;
     jsTest.log("Test that the donor retries state doc update on retriable errors");
 
     const {tenantMigrationTest, teardown} = setup();
-    const tenantId = kTenantIdPrefix + "RetryOnStateDocUpdateError";
+    // const tenantId = `${kTenantIdPrefix}RetryOnStateDocUpdateError`;
+    const tenantId = ObjectId().str;
 
     const migrationId = UUID();
     const migrationOpts = {
@@ -281,7 +284,7 @@ const kWriteErrorTimeMS = 50;
         recipientConnString: tenantMigrationTest.getRecipientConnString(),
     };
 
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst());
+    const donorRstArgs = createRstArgs(tenantMigrationTest.getDonorRst());
 
     // Use a random number of skips to fail a random update to config.tenantMigrationDonors.
     const fp = configureFailPoint(tenantMigrationTest.getDonorPrimary(),
@@ -293,11 +296,12 @@ const kWriteErrorTimeMS = 50;
 
     // Start up a new thread to run this migration, since we want to continuously send
     // 'donorStartMigration' commands while the 'failCollectionUpdates' failpoint is on.
-    const migrationThread = new Thread((migrationOpts, donorRstArgs) => {
-        load("jstests/replsets/libs/tenant_migration_util.js");
-        assert.commandWorked(TenantMigrationUtil.runMigrationAsync(migrationOpts, donorRstArgs));
-        assert.commandWorked(TenantMigrationUtil.forgetMigrationAsync(
-            migrationOpts.migrationIdString, donorRstArgs));
+    const migrationThread = new Thread(async (migrationOpts, donorRstArgs) => {
+        const {runMigrationAsync, forgetMigrationAsync} =
+            await import("jstests/replsets/libs/tenant_migration_util.js");
+        assert.commandWorked(await runMigrationAsync(migrationOpts, donorRstArgs));
+        assert.commandWorked(
+            await forgetMigrationAsync(migrationOpts.migrationIdString, donorRstArgs));
     }, migrationOpts, donorRstArgs);
     migrationThread.start();
 
@@ -307,17 +311,9 @@ const kWriteErrorTimeMS = 50;
     fp.off();
     migrationThread.join();
 
-    const donorStateDoc = tenantMigrationTest.getDonorPrimary()
-                              .getCollection(TenantMigrationTest.kConfigDonorsNS)
-                              .findOne({_id: migrationId});
-    assert.eq(donorStateDoc.state, TenantMigrationTest.DonorState.kCommitted);
-    assert(donorStateDoc.expireAt);
+    // The state docs will only be completed and marked as garbage collectable if the
+    // update succeeds.
+    tenantMigrationTest.waitForMigrationGarbageCollection(migrationId, tenantId);
 
-    // Check that the recipient state doc is also correctly marked as garbage collectable.
-    const recipientStateDoc = tenantMigrationTest.getRecipientPrimary()
-                                  .getCollection(TenantMigrationTest.kConfigRecipientsNS)
-                                  .findOne({_id: migrationId});
-    assert(recipientStateDoc.expireAt);
     teardown();
-})();
 })();

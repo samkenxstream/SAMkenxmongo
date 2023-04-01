@@ -1,6 +1,6 @@
+// The test runs commands that are not allowed with security token: hostInfo.
 // @tags: [
-//     # `hostInfo` command is not available on embedded
-//     incompatible_with_embedded,
+//   not_allowed_with_security_token,
 // ]
 // SERVER-4615:  Ensure hostInfo() command returns expected results on each platform
 
@@ -35,8 +35,12 @@ if (hostinfo.os.type != "") {
     assert.neq(hostinfo.system.cpuAddrSize, "" || null || 0, "Missing CPU Address Size");
     assert.neq(hostinfo.system.memSizeMB, "" || null, "Missing Memory Size");
     assert.neq(hostinfo.system.numCores, "" || null || 0, "Missing Number of Cores");
+    assert.neq(
+        hostinfo.system.numPhysicalCores, "" || null || 0, "Missing Number of Physical Cores");
+    assert.neq(hostinfo.system.numCpuSockets, "" || null || 0, "Missing Number of CPU Sockets");
     assert.neq(hostinfo.system.cpuArch, "" || null, "Missing CPU Architecture");
     assert.neq(hostinfo.system.numaEnabled, "" || null, "Missing NUMA flag");
+    assert.neq(hostinfo.system.numNumaNodes, "" || null || 0, "Missing Number of NUMA Nodes");
 }
 
 var buildInfo = assert.commandWorked(db.runCommand({buildInfo: 1}));

@@ -29,8 +29,9 @@
 
 #pragma once
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/auth/cluster_auth_mode.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/logv2/log_format.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/process_id.h"
@@ -42,8 +43,6 @@ namespace mongo {
 
 const int DEFAULT_UNIX_PERMS = 0700;
 constexpr size_t DEFAULT_MAX_CONN = 1000000;
-
-enum class ClusterRole { None, ShardServer, ConfigServer };
 
 struct ServerGlobalParams {
     std::string binaryName;  // mongod or mongos
@@ -77,8 +76,8 @@ struct ServerGlobalParams {
 
     int defaultProfile = 0;  // --profile
     boost::optional<BSONObj> defaultProfileFilter;
-    int slowMS = 100;                      // --time in ms that is "slow"
-    double sampleRate = 1.0;               // --samplerate rate at which to sample slow queries
+    AtomicWord<int> slowMS{100};           // --time in ms that is "slow"
+    AtomicWord<double> sampleRate{1.0};    // --samplerate rate at which to sample slow queries
     int defaultLocalThresholdMillis = 15;  // --localThreshold in ms to consider a node local
     bool moveParanoia = false;             // for move chunk paranoia
 
@@ -201,26 +200,6 @@ struct ServerGlobalParams {
                 version != multiversion::GenericFCV::kLastLTS;
         }
 
-        bool isFCVUpgradingToOrAlreadyLatest() const {
-            auto currentVersion = getVersion();
-
-            // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
-            return currentVersion == multiversion::GenericFCV::kUpgradingFromLastLTSToLatest ||
-                isGreaterThanOrEqualTo(
-                       multiversion::GenericFCV::kUpgradingFromLastContinuousToLatest);
-        }
-
-        bool isFCVDowngradingOrAlreadyDowngradedFromLatest() const {
-            auto currentVersion = getVersion();
-
-            // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
-            return currentVersion == multiversion::GenericFCV::kDowngradingFromLatestToLastLTS ||
-                currentVersion == multiversion::GenericFCV::kLastLTS ||
-                currentVersion ==
-                multiversion::GenericFCV::kDowngradingFromLatestToLastContinuous ||
-                currentVersion == multiversion::GenericFCV::kLastContinuous;
-        }
-
         void reset() {
             _version.store(FCV::kUnsetDefaultLastLTSBehavior);
         }
@@ -268,4 +247,5 @@ struct TraitNamedDomain {
         return ret;
     }
 };
+
 }  // namespace mongo

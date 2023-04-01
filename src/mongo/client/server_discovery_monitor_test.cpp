@@ -27,13 +27,10 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include <memory>
-
-#include <boost/optional/optional_io.hpp>
 
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/client/replica_set_monitor_protocol_test_util.h"
@@ -50,6 +47,9 @@
 #include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/duration.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 namespace {
@@ -236,7 +236,7 @@ protected:
         while (elapsed() < deadline) {
             ASSERT_FALSE(hasReadyRequests());
             if (hostAndPort) {
-                ASSERT_FALSE(_topologyListener->hasIsMasterResponse(hostAndPort.get()));
+                ASSERT_FALSE(_topologyListener->hasIsMasterResponse(hostAndPort.value()));
             }
             advanceTime(Milliseconds(1));
         }
@@ -492,7 +492,7 @@ TEST_F(ServerDiscoveryMonitorTestFixture,
 
     // It's been less than SdamConfiguration::kMinHeartbeatFrequency since the last isMaster was
     // received. The next isMaster should be sent SdamConfiguration::kMinHeartbeatFrequency since
-    // the last isMaster was recieved rather than immediately.
+    // the last isMaster was received rather than immediately.
     auto timeRequestImmediateSent = elapsed();
     isMasterMonitor->requestImmediateCheck();
     waitForNextIsMaster(minHeartbeatFrequency);

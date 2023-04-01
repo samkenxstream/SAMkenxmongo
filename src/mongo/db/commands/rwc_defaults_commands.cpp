@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -42,9 +41,16 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/util/fail_point.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
+
+// Hang during the execution of SetDefaultRWConcernCommand.
+MONGO_FAIL_POINT_DEFINE(hangWhileSettingDefaultRWC);
 
 /**
  * Replaces the persisted default read/write concern document with a new one representing the given
@@ -77,7 +83,8 @@ void assertNotStandaloneOrShardServer(OperationContext* opCtx, StringData cmdNam
 
     uassert(51301,
             str::stream() << "'" << cmdName << "' is not supported on shard nodes.",
-            serverGlobalParams.clusterRole != ClusterRole::ShardServer);
+            serverGlobalParams.clusterRole.has(ClusterRole::None) ||
+                serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 }
 
 auto makeResponse(const ReadWriteConcernDefaults::RWConcernDefaultAndTime& rwcDefault,
@@ -113,15 +120,25 @@ public:
         auto typedRun(OperationContext* opCtx) {
             assertNotStandaloneOrShardServer(opCtx, SetDefaultRWConcern::kCommandName);
 
+            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+            auto wcChanges = replCoord->getWriteConcernTagChanges();
+
+            // Synchronize this change with potential changes to the write concern tags.
+            uassert(ErrorCodes::ConfigurationInProgress,
+                    "Replica set reconfig in progress. Please retry the command later.",
+                    wcChanges->reserveDefaultWriteConcernChange());
+            ON_BLOCK_EXIT([&]() { wcChanges->releaseDefaultWriteConcernChange(); });
+
+            hangWhileSettingDefaultRWC.pauseWhileSet();
+
             auto& rwcDefaults = ReadWriteConcernDefaults::get(opCtx->getServiceContext());
             auto newDefaults = rwcDefaults.generateNewCWRWCToBeSavedOnDisk(
                 opCtx, request().getDefaultReadConcern(), request().getDefaultWriteConcern());
             // We don't want to check if the custom write concern exists on the config servers
             // because it only has to exist on the actual shards in order to be valid.
-            if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
+            if (!serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
                 if (auto optWC = newDefaults.getDefaultWriteConcern()) {
-                    uassertStatusOK(
-                        repl::ReplicationCoordinator::get(opCtx)->validateWriteConcern(*optWC));
+                    uassertStatusOK(replCoord->validateWriteConcern(*optWC));
                 }
             }
 
@@ -150,7 +167,7 @@ public:
         }
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 } setDefaultRWConcernCommand;
@@ -202,7 +219,7 @@ public:
         }
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 } getDefaultRWConcernCommand;

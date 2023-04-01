@@ -45,12 +45,13 @@ public:
     Future<DbResponse> handleRequest(OperationContext* opCtx,
                                      const Message& request) noexcept override;
 
-    void startSession(transport::SessionHandle session) override;
+    void startSession(std::shared_ptr<transport::Session> session) override;
     void endAllSessions(transport::Session::TagMask tags) override;
     Status start() override;
     bool shutdown(Milliseconds timeout) override;
     void appendStats(BSONObjBuilder* bob) const override;
     size_t numOpenSessions() const override;
+    logv2::LogSeverity slowSessionWorkflowLogSeverity() override;
 
 private:
     class Hooks;

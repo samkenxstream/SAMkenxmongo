@@ -51,13 +51,24 @@ public:
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         return {StreamType::kStreaming,
-                PositionRequirement::kFirstAfterOptimization,
+                PositionRequirement::kCustom,
                 HostTypeRequirement::kAnyShard,
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kNotAllowed,
                 TransactionRequirement::kAllowed,
                 LookupRequirement::kAllowed,
                 UnionRequirement::kAllowed};
+    }
+
+    void validatePipelinePosition(bool alreadyOptimized,
+                                  Pipeline::SourceContainer::const_iterator pos,
+                                  const Pipeline::SourceContainer& container) const final {
+        // This stage must be in the first position in the pipeline after optimization.
+        uassert(40603,
+                str::stream() << getSourceName()
+                              << " was not the first stage in the pipeline after optimization. Is "
+                                 "optimization disabled or inhibited?",
+                !alreadyOptimized || pos == container.cbegin());
     }
 
     /**
@@ -68,7 +79,7 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     boost::intrusive_ptr<DocumentSource> optimize() final;
 
@@ -128,6 +139,8 @@ public:
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
 
     /**
      * Returns true if the $geoNear specification requires the geoNear point metadata.

@@ -27,28 +27,30 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/db/index/skipped_record_tracker.h"
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/storage/execution_context.h"
 #include "mongo/logv2/log.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
+
+
 namespace mongo {
 namespace {
 static constexpr StringData kRecordIdField = "recordId"_sd;
 }
 
-SkippedRecordTracker::SkippedRecordTracker(IndexCatalogEntry* indexCatalogEntry)
+SkippedRecordTracker::SkippedRecordTracker(const IndexCatalogEntry* indexCatalogEntry)
     : SkippedRecordTracker(nullptr, indexCatalogEntry, boost::none) {}
 
 SkippedRecordTracker::SkippedRecordTracker(OperationContext* opCtx,
-                                           IndexCatalogEntry* indexCatalogEntry,
+                                           const IndexCatalogEntry* indexCatalogEntry,
                                            boost::optional<StringData> ident)
     : _indexCatalogEntry(indexCatalogEntry) {
     if (!ident) {
@@ -59,7 +61,7 @@ SkippedRecordTracker::SkippedRecordTracker(OperationContext* opCtx,
     // lazily initialize table when we record the first document.
     _skippedRecordsTable =
         opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStoreFromExistingIdent(
-            opCtx, ident.get());
+            opCtx, ident.value());
 }
 
 void SkippedRecordTracker::keepTemporaryTable() {
@@ -109,8 +111,13 @@ bool SkippedRecordTracker::areAllRecordsApplied(OperationContext* opCtx) const {
 }
 
 Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
-                                                 const CollectionPtr& collection) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X));
+                                                 const CollectionPtr& collection,
+                                                 RetrySkippedRecordMode mode) {
+
+    const bool keyGenerationOnly = mode == RetrySkippedRecordMode::kKeyGeneration;
+
+    dassert(opCtx->lockState()->isCollectionLockedForMode(collection->ns(),
+                                                          keyGenerationOnly ? MODE_IX : MODE_X));
     if (!_skippedRecordsTable) {
         return Status::OK();
     }
@@ -121,7 +128,6 @@ Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
         _indexCatalogEntry->getNSSFromCatalog(opCtx),
         _indexCatalogEntry->descriptor(),
         &options);
-    options.fromIndexBuilder = true;
 
     // This should only be called when constraints are being enforced, on a primary. It does not
     // make sense, nor is it necessary for this to be called on a secondary.
@@ -133,21 +139,33 @@ Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
     {
         stdx::unique_lock<Client> lk(*opCtx->getClient());
         progress.set(
-            CurOp::get(opCtx)->setProgress_inlock(curopMessage, _skippedRecordCounter.load(), 1));
+            lk,
+            CurOp::get(opCtx)->setProgress_inlock(curopMessage, _skippedRecordCounter.load(), 1),
+            opCtx);
     }
+
+    int resolved = 0;
+    const auto onResolved = [&]() {
+        resolved++;
+
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        progress.get(lk)->hit();
+    };
 
     SharedBufferFragmentBuilder pooledBuilder(KeyString::HeapBuilder::kHeapAllocatorDefaultBytes);
     auto& executionCtx = StorageExecutionContext::get(opCtx);
 
     auto recordStore = _skippedRecordsTable->rs();
     auto cursor = recordStore->getCursor(opCtx);
-    int resolved = 0;
     while (auto record = cursor->next()) {
         const BSONObj doc = record->data.toBson();
 
         // This is the RecordId of the skipped record from the collection.
         RecordId skippedRecordId = RecordId::deserializeToken(doc[kRecordIdField]);
-        WriteUnitOfWork wuow(opCtx);
+        boost::optional<WriteUnitOfWork> wuow;
+        if (!keyGenerationOnly) {
+            wuow.emplace(opCtx);
+        }
 
         // If the record still exists, get a potentially new version of the document to index.
         auto collCursor = collection->getCursor(opCtx);
@@ -180,6 +198,11 @@ Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
                              multikeyPaths.get(),
                              skippedRecordId);
 
+                if (keyGenerationOnly) {
+                    // On dry runs we can skip everything else that comes after key generation.
+                    onResolved();
+                    continue;
+                }
                 auto status = iam->insertKeys(opCtx, collection, *keys, options, nullptr, nullptr);
                 if (!status.isOK()) {
                     return status;
@@ -200,7 +223,7 @@ Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
                     _multikeyPaths = *multikeyPaths;
                 }
 
-                MultikeyPathTracker::mergeMultikeyPaths(&_multikeyPaths.get(), *multikeyPaths);
+                MultikeyPathTracker::mergeMultikeyPaths(&_multikeyPaths.value(), *multikeyPaths);
             }
         }
 
@@ -208,20 +231,31 @@ Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
         recordStore->deleteRecord(opCtx, record->id);
 
         cursor->save();
-        wuow.commit();
+        wuow->commit();
         cursor->restore();
 
-        progress->hit();
-        resolved++;
+        onResolved();
     }
-    progress->finished();
+
+    {
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        progress.get(lk)->finished();
+    }
 
     int logLevel = (resolved > 0) ? 0 : 1;
-    LOGV2_DEBUG(23883,
-                logLevel,
-                "Index build: reapplied skipped records",
-                "index"_attr = _indexCatalogEntry->descriptor()->indexName(),
-                "numResolved"_attr = resolved);
+    if (keyGenerationOnly) {
+        LOGV2_DEBUG(7333101,
+                    logLevel,
+                    "Index build: verified key generation for skipped records",
+                    "index"_attr = _indexCatalogEntry->descriptor()->indexName(),
+                    "numResolved"_attr = resolved);
+    } else {
+        LOGV2_DEBUG(23883,
+                    logLevel,
+                    "Index build: reapplied skipped records",
+                    "index"_attr = _indexCatalogEntry->descriptor()->indexName(),
+                    "numResolved"_attr = resolved);
+    }
     return Status::OK();
 }
 

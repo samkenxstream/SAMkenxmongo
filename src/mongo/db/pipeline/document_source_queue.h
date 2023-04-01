@@ -55,18 +55,17 @@ public:
 
     const char* getSourceName() const override;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const override;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const override;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const override {
-        StageConstraints constraints(StreamType::kStreaming,
+        StageConstraints constraints{StreamType::kStreaming,
                                      PositionRequirement::kFirst,
                                      HostTypeRequirement::kLocalOnly,
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
                                      TransactionRequirement::kAllowed,
                                      LookupRequirement::kAllowed,
-                                     UnionRequirement::kAllowed);
-
+                                     UnionRequirement::kAllowed};
         constraints.requiresInputDocSource = false;
         constraints.isIndependentOfAnyCollection = true;
         return constraints;
@@ -76,7 +75,14 @@ public:
      * This stage does not modify anything.
      */
     GetModPathsReturn getModifiedPaths() const override {
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {}};
+    }
+
+    /**
+     * This stage does not depend on anything.
+     */
+    DepsTracker::State getDependencies(DepsTracker* deps) const override {
+        return DepsTracker::SEE_NEXT;
     }
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() override {
@@ -95,6 +101,8 @@ public:
     void push_back(const GetNextResult& result) {
         _queue.push_back(result);
     }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);

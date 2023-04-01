@@ -34,10 +34,11 @@
 
 #include "mongo/db/pipeline/accumulation_statement.h"
 
-#include "mongo/db/commands/feature_compatibility_version_documentation.h"
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/feature_compatibility_version_documentation.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
@@ -52,17 +53,17 @@ namespace {
 static StringMap<AccumulationStatement::ParserRegistration> parserMap;
 }  // namespace
 
-void AccumulationStatement::registerAccumulator(
-    std::string name,
-    AccumulationStatement::Parser parser,
-    AllowedWithApiStrict allowedWithApiStrict,
-    AllowedWithClientType allowedWithClientType,
-    boost::optional<multiversion::FeatureCompatibilityVersion> requiredMinVersion) {
+void AccumulationStatement::registerAccumulator(std::string name,
+                                                AccumulationStatement::Parser parser,
+                                                AllowedWithApiStrict allowedWithApiStrict,
+                                                AllowedWithClientType allowedWithClientType,
+                                                boost::optional<FeatureFlag> featureFlag) {
     auto it = parserMap.find(name);
     massert(28722,
             str::stream() << "Duplicate accumulator (" << name << ") registered.",
             it == parserMap.end());
-    parserMap[name] = {parser, allowedWithApiStrict, allowedWithClientType, requiredMinVersion};
+    parserMap[name] = {parser, allowedWithApiStrict, allowedWithClientType, featureFlag};
+    operatorCountersGroupAccumulatorExpressions.addCounter(name);
 }
 
 AccumulationStatement::ParserRegistration& AccumulationStatement::getParser(StringData name) {
@@ -102,7 +103,7 @@ AccumulationStatement AccumulationStatement::parseAccumulationStatement(
             str::stream() << "The " << accName << " accumulator is a unary operator",
             specElem.type() != BSONType::Array);
 
-    auto&& [parser, allowedWithApiStrict, allowedWithClientType, requiredMinVersion] =
+    auto&& [parser, allowedWithApiStrict, allowedWithClientType, featureFlag] =
         AccumulationStatement::getParser(accName);
     auto allowedMaxVersion = expCtx->maxFeatureCompatibilityVersion;
     uassert(ErrorCodes::QueryFeatureNotAllowed,
@@ -113,11 +114,14 @@ AccumulationStatement AccumulationStatement::parseAccumulationStatement(
                           << " is not allowed in the current feature compatibility version. See "
                           << feature_compatibility_version_documentation::kCompatibilityLink
                           << " for more information.",
-            !requiredMinVersion || !allowedMaxVersion || *requiredMinVersion <= *allowedMaxVersion);
+            !featureFlag || !allowedMaxVersion ||
+                featureFlag->isEnabledOnVersion(*allowedMaxVersion));
 
     tassert(5837900, "Accumulators should only appear in a user operation", expCtx->opCtx);
     assertLanguageFeatureIsAllowed(
         expCtx->opCtx, accName.toString(), allowedWithApiStrict, allowedWithClientType);
+
+    expCtx->incrementGroupAccumulatorExprCounter(accName);
     auto accExpr = parser(expCtx, specElem, vps);
 
     return AccumulationStatement(fieldName.toString(), std::move(accExpr));

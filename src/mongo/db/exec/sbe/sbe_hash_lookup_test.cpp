@@ -34,6 +34,7 @@
 #include "mongo/bson/json.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/sbe_plan_stage_test.h"
+#include "mongo/db/exec/sbe/sbe_unittest.h"
 #include "mongo/db/exec/sbe/stages/hash_lookup.h"
 #include "mongo/db/exec/sbe/util/stage_results_printer.h"
 #include "mongo/db/exec/sbe/values/value_printer.h"
@@ -41,8 +42,6 @@
 #include "mongo/unittest/golden_test.h"
 #include "mongo/util/assert_util.h"
 namespace mongo::sbe {
-
-unittest::GoldenTestConfig goldenTestConfig{"src/mongo/db/test_output/exec/sbe"};
 
 class HashLookupStageTest : public PlanStageTestFixture {
 public:
@@ -90,7 +89,7 @@ public:
         if (collator) {
             // Setup collator and insert it into the ctx.
             collatorSlot = generateSlotId();
-            ctx->pushCorrelated(collatorSlot.get(), &collatorAccessor);
+            ctx->pushCorrelated(collatorSlot.value(), &collatorAccessor);
             collatorAccessor.reset(value::TypeTags::collator,
                                    value::bitcastFrom<CollatorInterface*>(collator));
         }
@@ -109,7 +108,6 @@ public:
                                                   collatorSlot,
                                                   kEmptyPlanNodeId);
 
-        stream << "-- OUTPUT ";
         StageResultsPrinters::SlotNames slotNames;
         if (outerKeyOnly) {
             slotNames.emplace_back(outerScanSlots[1], "outer_key");
@@ -152,6 +150,8 @@ public:
         StageResultsPrinters::make(firstStream, printOptions)
             .printStageResults(ctx, slotNames, stage);
         std::string firstStr = firstStream.str();
+        stream << "--- First Stats" << std::endl;
+        printHashLookupStats(stream, stage);
 
         // Execute the stage after reopen and verify that output is the same.
         stage->open(true);
@@ -160,6 +160,8 @@ public:
             .printStageResults(ctx, slotNames, stage);
         std::string secondStr = secondStream.str();
         ASSERT_EQ(firstStr, secondStr);
+        stream << "--- Second Stats" << std::endl;
+        printHashLookupStats(stream, stage);
 
         // Execute the stage after close and open and verify that output is the same.
         stage->close();
@@ -169,19 +171,83 @@ public:
             .printStageResults(ctx, slotNames, stage);
         std::string thirdStr = thirdStream.str();
         ASSERT_EQ(firstStr, thirdStr);
+        stream << "--- Third Stats" << std::endl;
+        printHashLookupStats(stream, stage);
 
         stage->close();
 
+        // Execute the stage with spilling to disk.
+        auto defaultInternalQuerySBELookupApproxMemoryUseInBytesBeforeSpill =
+            internalQuerySBELookupApproxMemoryUseInBytesBeforeSpill.load();
+        internalQuerySBELookupApproxMemoryUseInBytesBeforeSpill.store(10);
+        ON_BLOCK_EXIT([&] {
+            internalQuerySBELookupApproxMemoryUseInBytesBeforeSpill.store(
+                defaultInternalQuerySBELookupApproxMemoryUseInBytesBeforeSpill);
+        });
+
+        // Run the stage after the knob is set and spill to disk. We need to hold a global IS lock
+        // to read from WT.
+        Lock::GlobalLock lk(operationContext(), MODE_IS);
+        stage->open(true);
+        std::stringstream fourthStream;
+        StageResultsPrinters::make(fourthStream, printOptions)
+            .printStageResults(ctx, slotNames, stage);
+        std::string fourthStr = fourthStream.str();
+        ASSERT_EQ(firstStr, fourthStr);
+        stream << "--- Fourth Stats" << std::endl;
+        printHashLookupStats(stream, stage);
+        stream << std::endl;
+
+        // Execute the stage after close and open and verify that output is the same.
+        stage->close();
+        stage->open(false);
+        std::stringstream fifthStream;
+        StageResultsPrinters::make(fifthStream, printOptions)
+            .printStageResults(ctx, slotNames, stage);
+        std::string fifthStr = fifthStream.str();
+        ASSERT_EQ(firstStr, fifthStr);
+        stream << "--- Fifth Stats" << std::endl;
+        printHashLookupStats(stream, stage);
+        stream << std::endl;
+
+        // Execute the stage after reopen and we have spilled to disk and verify that output is the
+        // same.
+        stage->open(true);
+        std::stringstream sixthStream;
+        StageResultsPrinters::make(sixthStream, printOptions)
+            .printStageResults(ctx, slotNames, stage);
+        std::string sixthStr = sixthStream.str();
+        ASSERT_EQ(firstStr, sixthStr);
+        stream << "--- Sixth Stats" << std::endl;
+        printHashLookupStats(stream, stage);
+        stream << std::endl;
+
+        stage->close();
+
+        stream << "-- OUTPUT ";
         stream << firstStr;
     }
 
 public:
     PrintOptions printOptions =
         PrintOptions().arrayObjectOrNestingMaxDepth(SIZE_MAX).useTagForAmbiguousValues(true);
+
+private:
+    static void printHashLookupStats(std::ostream& stream, const PlanStage* stage) {
+        auto stats = static_cast<const HashLookupStats*>(stage->getSpecificStats());
+        printHashLookupStats(stream, stats);
+    }
+    static void printHashLookupStats(std::ostream& stream, const HashLookupStats* stats) {
+        stream << "dsk:" << stats->usedDisk << std::endl;
+        stream << "htRecs:" << stats->spilledHtRecords << std::endl;
+        stream << "htIndices:" << stats->spilledHtBytesOverAllRecords << std::endl;
+        stream << "buffRecs:" << stats->spilledBuffRecords << std::endl;
+        stream << "buffBytes:" << stats->spilledBuffBytesOverAllRecords << std::endl;
+    }
 };
 
 TEST_F(HashLookupStageTest, BasicTests) {
-    unittest::GoldenTestContext gctx(&goldenTestConfig);
+    unittest::GoldenTestContext gctx(&goldenTestConfigSbe);
 
     runVariation(gctx,
                  "simple scalar key",
@@ -201,142 +267,142 @@ TEST_F(HashLookupStageTest, BasicTests) {
     runVariation(gctx,
                  "no matches",
                  BSONArray(fromjson(R"""([
-                    [{_id: 1}, 1],
-                    [{_id: 2}, 4]
-                 ])""")),
+                  [{_id: 1}, 1],
+                  [{_id: 2}, 4]
+               ])""")),
                  BSONArray(fromjson(R"""([
-                    [{_id: 11}, 2],
-                    [{_id: 12}, 3]
-                 ])""")));
+                  [{_id: 11}, 2],
+                  [{_id: 12}, 3]
+               ])""")));
 
     runVariation(gctx,
                  "simple array key",
                  BSONArray(fromjson(R"""([
-                    [{_id: 1}, 1],
-                    [{_id: 2}, [2, 3]],
-                    [{_id: 3}, [2, 4]],
-                    [{_id: 4}, []]
-                 ])""")),
+                  [{_id: 1}, 1],
+                  [{_id: 2}, [2, 3]],
+                  [{_id: 3}, [2, 4]],
+                  [{_id: 4}, []]
+               ])""")),
                  BSONArray(fromjson(R"""([
-                    [{_id: 11}, 2],
-                    [{_id: 12}, 4],
-                    [{_id: 13}, [1, 2, 3]],
-                    [{_id: 14}, []]
-                 ])""")));
+                  [{_id: 11}, 2],
+                  [{_id: 12}, 4],
+                  [{_id: 13}, [1, 2, 3]],
+                  [{_id: 14}, []]
+               ])""")));
 
     runVariation(gctx,
                  "nested array key",
                  BSONArray(fromjson(R"""([
-                    [{_id: 1}, 1],
-                    [{_id: 2}, 2],
-                    [{_id: 3}, 3],
-                    [{_id: 4}, [1]],
-                    [{_id: 5}, [3]],
-                    [{_id: 6}, [[3]]],
-                    [{_id: 7}, [2, [3]]]
-                 ])""")),
+                [{_id: 1}, 1],
+                [{_id: 2}, 2],
+                [{_id: 3}, 3],
+                [{_id: 4}, [1]],
+                [{_id: 5}, [3]],
+                [{_id: 6}, [[3]]],
+                [{_id: 7}, [2, [3]]]
+             ])""")),
                  BSONArray(fromjson(R"""([
-                    [{_id: 11}, 1],
-                    [{_id: 12}, 2],
-                    [{_id: 13}, 3],
-                    [{_id: 14}, [1]],
-                    [{_id: 15}, [3]],
-                    [{_id: 16}, [[3]]],
-                    [{_id: 17}, [2, [3]]]
-                 ])""")));
+                [{_id: 11}, 1],
+                [{_id: 12}, 2],
+                [{_id: 13}, 3],
+                [{_id: 14}, [1]],
+                [{_id: 15}, [3]],
+                [{_id: 16}, [[3]]],
+                [{_id: 17}, [2, [3]]]
+             ])""")));
 
     runVariation(gctx,
                  "nested object key",
                  BSONArray(fromjson(R"""([
-                    [{_id: 1}, {a: 1}],
-                    [{_id: 2}, {b: 1}],
-                    [{_id: 3}, {a: 1, b: 1}],
-                    [{_id: 4}, {b: 1, a: 1}],
-                    [{_id: 5}, [{a: 1}]],
-                    [{_id: 6}, [{a: 1}, {b: 1}]],
-                    [{_id: 7}, [{a: 1, b: 1}]],
-                    [{_id: 8}, [{b: 1, a: 1}]]
-                 ])""")),
+                [{_id: 1}, {a: 1}],
+                [{_id: 2}, {b: 1}],
+                [{_id: 3}, {a: 1, b: 1}],
+                [{_id: 4}, {b: 1, a: 1}],
+                [{_id: 5}, [{a: 1}]],
+                [{_id: 6}, [{a: 1}, {b: 1}]],
+                [{_id: 7}, [{a: 1, b: 1}]],
+                [{_id: 8}, [{b: 1, a: 1}]]
+             ])""")),
                  BSONArray(fromjson(R"""([
-                    [{_id: 11}, {a: 1}],
-                    [{_id: 12}, {b: 1}],
-                    [{_id: 13}, {a: 1, b: 1}],
-                    [{_id: 14}, {b: 1, a: 1}],
-                    [{_id: 15}, [{a: 1}]],
-                    [{_id: 16}, [{a: 1}, {b: 1}]],
-                    [{_id: 17}, [{a: 1, b: 1}]],
-                    [{_id: 18}, [{b: 1, a: 1}]]
-                 ])""")));
+                [{_id: 11}, {a: 1}],
+                [{_id: 12}, {b: 1}],
+                [{_id: 13}, {a: 1, b: 1}],
+                [{_id: 14}, {b: 1, a: 1}],
+                [{_id: 15}, [{a: 1}]],
+                [{_id: 16}, [{a: 1}, {b: 1}]],
+                [{_id: 17}, [{a: 1, b: 1}]],
+                [{_id: 18}, [{b: 1, a: 1}]]
+             ])""")));
 
     runVariation(gctx,
                  "mixed key",
                  BSONArray(fromjson(R"""([
-                    [{_id: 1}, null],
-                    [{_id: 2}, 1],
-                    [{_id: 3}, "abc"],
-                    [{_id: 4}, NumberDecimal("1")],
-                    [{_id: 5}, [1]],
-                    [{_id: 6}, ["abc"]],
-                    [{_id: 7}, [null]],
-                    [{_id: 8}, [null, "1", "abc", NumberDecimal("1")]],
-                    [{_id: 9}, [{x:1, y: "abc"}]]
-                 ])""")),
+              [{_id: 1}, null],
+              [{_id: 2}, 1],
+              [{_id: 3}, "abc"],
+              [{_id: 4}, NumberDecimal("1")],
+              [{_id: 5}, [1]],
+              [{_id: 6}, ["abc"]],
+              [{_id: 7}, [null]],
+              [{_id: 8}, [null, "1", "abc", NumberDecimal("1")]],
+              [{_id: 9}, [{x:1, y: "abc"}]]
+           ])""")),
                  BSONArray(fromjson(R"""([
-                    [{_id: 11}, null],
-                    [{_id: 12}, 1],
-                    [{_id: 13}, "abc"],
-                    [{_id: 14}, NumberDecimal("1")],
-                    [{_id: 15}, [1]],
-                    [{_id: 16}, ["abc"]],
-                    [{_id: 17}, [null]],
-                    [{_id: 18}, [null, "1", "abc", NumberDecimal("1")]],
-                    [{_id: 19}, [{x:1, y: "abc"}]]
-                 ])""")));
+              [{_id: 11}, null],
+              [{_id: 12}, 1],
+              [{_id: 13}, "abc"],
+              [{_id: 14}, NumberDecimal("1")],
+              [{_id: 15}, [1]],
+              [{_id: 16}, ["abc"]],
+              [{_id: 17}, [null]],
+              [{_id: 18}, [null, "1", "abc", NumberDecimal("1")]],
+              [{_id: 19}, [{x:1, y: "abc"}]]
+           ])""")));
 
     auto toLowerCollator =
         std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kToLowerString);
     runVariation(gctx,
                  "with toLower collator",
                  BSONArray(fromjson(R"""([
-                    [{_id: 1}, null],
-                    [{_id: 2}, "abc"],
-                    [{_id: 3}, "ABC"],
-                    [{_id: 4}, "Abc"],
-                    [{_id: 5}, "def"]
-                 ])""")),
+              [{_id: 1}, null],
+              [{_id: 2}, "abc"],
+              [{_id: 3}, "ABC"],
+              [{_id: 4}, "Abc"],
+              [{_id: 5}, "def"]
+           ])""")),
                  BSONArray(fromjson(R"""([
-                    [{_id: 11}, null],
-                    [{_id: 12}, "abc"],
-                    [{_id: 13}, "ABC"],
-                    [{_id: 14}, "Abc"],
-                    [{_id: 15}, "def"]
-                 ])""")),
+              [{_id: 11}, null],
+              [{_id: 12}, "abc"],
+              [{_id: 13}, "ABC"],
+              [{_id: 14}, "Abc"],
+              [{_id: 15}, "def"]
+           ])""")),
                  true,
                  toLowerCollator.get());
 
     runVariation(gctx,
                  "empty",
                  BSONArray(fromjson(R"""([
-                 ])""")),
+           ])""")),
                  BSONArray(fromjson(R"""([
-                 ])""")));
+           ])""")));
 
     runVariation(gctx,
                  "empty outer",
                  BSONArray(fromjson(R"""([
-                 ])""")),
+           ])""")),
                  BSONArray(fromjson(R"""([
-                      [{_id: 11}, 2],
-                      [{_id: 12}, 3]
-                 ])""")));
+                [{_id: 11}, 2],
+                [{_id: 12}, 3]
+           ])""")));
 
     runVariation(gctx,
                  "empty inner",
                  BSONArray(fromjson(R"""([
-                      [{_id: 1}, 1],
-                      [{_id: 2}, 2]
-                 ])""")),
+              [{_id: 1}, 1],
+              [{_id: 2}, 2]
+         ])""")),
                  BSONArray(fromjson(R"""([
-                 ])""")));
+         ])""")));
 }
 }  // namespace mongo::sbe

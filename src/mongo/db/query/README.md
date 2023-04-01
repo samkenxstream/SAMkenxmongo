@@ -3,7 +3,7 @@
 *Disclaimer*: This is a work in progress. It is not complete and we will
 do our best to complete it in a timely manner.
 
-## Overview
+# Overview
 
 The query system generally is responsible for interpreting the user's
 request, finding an optimal way to satisfy it, and to actually compute
@@ -32,7 +32,7 @@ Here we will divide it into the following phases and topics:
        or projections
      * **Plan Selection:** Compete the candidate plans against each other
        and select the winner.
-     * **Plan Caching:** Attempt to skip the expensive steps above by
+     * [**Plan Caching:**](#plan-caching) Attempt to skip the expensive steps above by
        caching the previous winning solution.
  * **Query Execution:** Iterate the winning plan and return results to the
    client.
@@ -42,7 +42,7 @@ replica set where all the data is expected to be found locally. We plan
 to add documentation for the sharded case in the src/mongo/s/query/
 directory later.
 
-### Command Parsing & Validation
+## Command Parsing & Validation
 
 The following commands are generally maintained by the query team, with
 the majority of our focus given to the first two.
@@ -76,7 +76,7 @@ a BSONObj - we don't yet know that it has a `$or` inside. For this
 process, we prefer using an Interface Definition Language (IDL) tool to
 generate the parser and actually generate the C++ class itself.
 
-### The Interface Definition Language
+## The Interface Definition Language
 
 You can find some files ending with '.idl' as examples, a snippet may
 look like this:
@@ -113,7 +113,7 @@ The generated file will have methods to get and set all the members, and
 will return a boost::optional for optional fields. In the example above,
 it will generate a CountCommandRequest::getQuery() method, among others.
 
-### Other actions performed during this stage
+## Other actions performed during this stage
 
 As stated before, the MQL elements are unparsed - the query here is
 still an "object", stored in BSON without any scrutiny at this point.
@@ -122,7 +122,7 @@ This is how we begin to transition into the next phase where we piece
 apart the MQL. Before we do that, there are a number of important things
 that happen on these structures.
 
-#### Various initializations and setup
+### Various initializations and setup
 
 Pretty early on we will set up context on the "OperationContext" such as
 the request's read concern, read preference, maxTimeMs, etc. The
@@ -156,7 +156,7 @@ request. The most obvious reason this is required is that the
 ExpressionContext holds parsing state like the variable resolution
 tracking and the maximum sub-pipeline depth reached so far.
 
-#### Authorization checking
+### Authorization checking
 
 In many but not all cases, we have now parsed enough to check whether
 the user is allowed to perform this request. We usually only need the
@@ -188,7 +188,7 @@ detailed arguments to the stages. You can check out the
 `LiteParsedPipeline` API to see what kinds of questions we can answer
 with just the stage names and pipeline structure.
 
-#### Additional Validation
+### Additional Validation
 
 In most cases the IDL will take care of all the validation we need at
 this point. There are some constraints that are awkward or impossible to
@@ -196,7 +196,7 @@ express via the IDL though. For example, it is invalid to specify both
 `remove: true` and `new: true` to the findAndModify command. This would
 be requesting the post-image of a delete, which is nothing.
 
-#### Non-materialized view resolution
+### Non-materialized view resolution
 
 We have a feature called 'non-materialized read only views' which allows
 the user to store a 'view' in the database that mostly presents itself
@@ -209,12 +209,12 @@ predicate. In some cases this means a find command will switch over and
 run as an aggregate command, since views are defined in terms of
 aggregation pipelines.
 
-## Query Language Parsing & Validation
+# Query Language Parsing & Validation
 
 Once we have parsed the command and checked authorization, we move on to parsing the individual
 parts of the query. Once again, we will focus on the find and aggregate commands.
 
-### Find command parsing
+## Find command parsing
 The find command is parsed entirely by the IDL. The IDL parser first creates a FindCommandRequest.
 As mentioned above, the IDL parser does all of the required type checking and stores all options for
 the query. The FindCommandRequest is then turned into a CanonicalQuery. The CanonicalQuery
@@ -228,15 +228,15 @@ tree of MatchExpressions from the filter BSON object. The parser performs some v
 same time -- for example, type validation and checking the number of arguments for expressions are
 both done here.
 
-### Aggregate Command Parsing
+## Aggregate Command Parsing
 
-#### LiteParsedPipeline
+### LiteParsedPipeline
 In the process of parsing an aggregation we create two versions of the pipeline: a
 LiteParsedPipeline (that contains LiteParsedDocumentSource objects) and the Pipeline (that contains
 DocumentSource objects) that is eventually used for execution.  See the above section on
 authorization checking for more details.
 
-#### DocumentSource
+### DocumentSource
 Before talking about the aggregate command as a whole, we will first briefly discuss
 the concept of a DocumentSource. A DocumentSource represents one stage in the an aggregation
 pipeline. For each stage in the pipeline, we create another DocumentSource. A DocumentSource
@@ -247,14 +247,14 @@ will remain as a DocumentSourceGroup. Each DocumentSource has its own parser tha
 validation of its internal fields and arguments and then generates the DocumentSource that will be
 added to the final pipeline.
 
-#### Pipeline
+### Pipeline
 The pipeline parser uses the individual document source parsers to parse the entire pipeline
 argument of the aggregate command. The parsing process is fairly simple -- for each object in the
 user specified pipeline lookup the document source parser for the stage name, and then parse the
 object using that parser. The final pipeline is composed of the DocumentSources generated by the
 individual parsers.
 
-#### Aggregation Command
+### Aggregation Command
 When an aggregation is run, the first thing that happens is the request is parsed into a
 LiteParsedPipeline. As mentioned above, the LiteParsedPipeline is used to check options and
 permissions on namespaces. More checks are done in addition to those performed by the
@@ -263,7 +263,7 @@ BSON object is parsed again into the pipeline using the DocumentSource parsers t
 above. Note that we use the original BSON for parsing the pipeline and DocumentSources as opposed
 to continuing from the LiteParsedPipeline. This could be improved in the future.
 
-### Other command parsing
+## Other command parsing
 As mentioned above, there are several other commands maintained by the query team. We will quickly
 give a summary of how each is parsed, but not get into the same level of detail.
 
@@ -282,4 +282,274 @@ give a summary of how each is parsed, but not get into the same level of detail.
   query portion is delegated to the query parser and if this is an update (rather than a delete) it
   uses the same parser as the update command.
 
-TODO from here on.
+# Plan caching
+
+Plan caching is a technique in which the plans produced by the query optimizer are stored and
+subsequently reused when the client re-issues the same or similar queries. This is purely a
+performance optimization with the goal of avoiding potentially costly re-optimization.
+
+The query engine currently has two separate plan cache implementations: one for the classic
+execution engine and another for the slot-based execution engine (SBE). Although they share some
+code and behaviors, the two plan caches have some important differences and are described separately
+below.
+
+## Classic plan cache
+
+The classic plan cache (of type
+[`mongo::PlanCache`](https://github.com/mongodb/mongo/blob/f28a9f718268ca84644aa77e98ca7ee9651bd5b6/src/mongo/db/query/classic_plan_cache.h#L243-L248)
+in the implementation) is an in-memory data structure with a separate instance for each collection.
+The plan cache does not persist. It exists only on mongod, not on mongos.
+
+The cache is logically a map from "query shape" to cached plan. The query shape is non
+human-readable string that encodes the match, projection, sort, and collation of a find command (or
+the pushed-down pieces of an aggregate command) with the constants removed. For more details on the
+cache key encoding, see the
+[`canonical_query_encoder`](https://github.com/mongodb/mongo/blob/91cef76e80b79fe4a2867413af5910027c3b69d5/src/mongo/db/query/canonical_query_encoder.h).
+The plan cache keys map to cache entries which, loosely speaking, consist of index tags (see
+[PlanCacheIndexTree](https://github.com/mongodb/mongo/blob/bc7d24c035466c435ade89b62f958a6fa4e22333/src/mongo/db/query/classic_plan_cache.h#L113)
+for details). When the system receives a new query, before doing any query optimization, the query's
+plan cache key is calculated and used to look for a matching cache entry. If there is a cache hit,
+the index tags from the cache are applied to the query's `MatchExpression`. Based on these tags,
+the `QueryPlanner` is used to re-construct the corresponding `QuerySolution` and `PlanStage` trees,
+skipping plan enumeration and multi-planning.
+
+The primary goal of the classic plan cache is to avoid multi-planning: although the `QuerySolution`
+and `PlanStage` tree need to be reconstructed from scratch when recovering plans from the classic
+cache, there is still a major performance benefit achieved by avoiding the cost of repeated runtime
+plan selection.
+
+## SBE plan cache
+
+The SBE plan cache is also an in-memory map from key to cache entry (see
+[`sbe::PlanCache`](https://github.com/mongodb/mongo/blob/a04e1c1812a28ebfb9a2684859097ade649a1184/src/mongo/db/query/sbe_plan_cache.h#L224-L229)).
+Like the classic plan cache it is not persistent and exists only on mongod. The keys are encoded
+slightly differently for the SBE plan cache than for classic (see
+[`canonical_query_encoder::encodeSBE()`](https://github.com/mongodb/mongo/blob/91cef76e80b79fe4a2867413af5910027c3b69d5/src/mongo/db/query/canonical_query_encoder.h#L58))
+but they are conceptually similar.
+
+The first important difference between the caches is that there is a single SBE plan cache instance
+for the entire mongod process rather than a per-collection instance. The `sbe::PlanCache` decorates
+the `ServiceContext`. Since SBE is designed to execute queries that span multiple collections, this
+avoids having the cache entries be owned by any one collection. Also, the process-global design
+makes memory management easier: the SBE plan cache is given a maximum memory footprint based on the
+`planCacheSize` setParameter and will never exceed this memory budget. (This is in contrast to the
+classic cache, which attempts to limit its memory footprint but can be memory-greedy in some edge
+cases.)
+
+The second -- and possibly the most significant -- difference between the two plan cache
+implementations is that the SBE cache stores `sbe::PlanStage` execution trees directly. When a query
+recovers a plan from the cache, it first makes a clone of the cached tree. Each query needs its own
+execution tree, so the one in the cache acts as a master copy. Any expressions in the tree are
+compiled to SBE bytecode in order to prepare the tree for execution. Next, the plan goes through a
+"bind-in" phase which allows the SBE plan cache to work together with auto-parameterization. Queries
+using SBE are auto-parameterized, meaning that eligible constants in the incoming match expression
+are automatically assigned input parameter ids. Currently, only the match portion of the query is
+auto-parameterized. (MongoDB does not currently support prepared statements with explicit parameter
+markers; auto-parameterization is the only way a query can have parameter markers.) When the
+`QuerySolution` is compiled to an `sbe::PlanStage` tree, any constants are replaced with references
+to slots in the SBE `RuntimeEnvironment`. Thus, the resulting plan is parameterized -- it can be
+rebound to new constants by assigning new values to `RuntimeEnvironment` slots. To support this, a
+[map from input parameter id to runtime environment
+slot](https://github.com/mongodb/mongo/blob/a04e1c1812a28ebfb9a2684859097ade649a1184/src/mongo/db/query/sbe_stage_builder.h#L356-L368)
+is constructed and kept alongside the cached plan. During the bind-in phase, we lookup the slot
+associated with each input parameter id and then assign these slots to the corresponding values from
+the input query.
+
+While the classic plan cache was designed specifically to avoid repeated multi-planning, the SBE
+plan cache skips all phases of query optimization and compilation. The compilation of
+`QuerySolution` to `sbe::PlanStage` tree can be expensive, so there is a noticeable performance
+benefit associated with avoiding this recompilation. This underlies another important distinction
+between the classic and SBE caches. When a query using the classic engine has just one query
+solution, no entry is inserted into the classic cache. The reasoning is that the classic cache is
+focused on avoiding multi-planning, and single-solution queries don't go through the multi-planning
+process. However, for queries using SBE, it is valuable to avoid not just multi-planning but also
+compilation to `sbe::PlanStage`. For this reason, single-solution queries result in SBE plan cache
+entries.
+
+## Cache eviction and invalidation
+
+Both the classic and SBE plan caches avoid growing too large by implementing a least-recently used
+(LRU) eviction policy.
+
+DDL events such as index builds, index drops, and collection drops result in invalidating all cache
+entries associated with the collection. In the case of the classic plan cache, there is a
+per-collection plan cache instance, so the entire object can be flushed of its contents.
+Invalidation in the case of the SBE plan cache, on the other hand, requires the traversal of the
+cache to identify all cache entries associated with a particular collection.
+
+## Cached plan replanning
+
+For both the classic and SBE plan caches, each cache entry has an associated "works" value. The
+naming derives from the classic engine's `PlanStage::work()` method, but for SBE this is actually
+the number of individual reads done from storage-level cursors. The works value is derived from the
+original multi-planning trial period, e.g. it is the number of storage reads an SBE plan required
+during the multi-planning trial period to produce the initial batch of results or, correspondingly,
+the number of works required by a classic plan during the multi-planning trial period.
+
+When a plan is recovered from the cache, we run a similar trial period to gather the first batch of
+results before returning them to the client. If the number of works required exceeds the number
+recorded in the plan cache by some factor (10x by default), the plan cache entry is deactivated, the
+buffered result batch is discarded, and the query is planned from scratch. Otherwise, the initial
+batch is unspooled to the client and the cached plan is used to execute the remainder of the query.
+SBE and the classic engine have separate implementations of this "cached plan replanning" process,
+but they conceptually work identically.
+
+Plans in the SBE plan cache can be pinned, meaning that they have no associated works value and are
+not subject to replanning. Plans with just a single query solution as well as plans produced by
+subplanning rooted $or queries are pinned. Although pinned plans cannot be evicted through
+replanning, they can get invalidated by other means such as DDL events or LRU replacement.
+
+## Inactive cache entries
+
+When cache entries are first created, they are considered inactive. This means that the cache
+entries exist but are unused. Inactive cache entries can be promoted to active when a query of the
+same shape runs and exhibits similar or better trial period performance, as measured by the number of
+"works". Although the full mechanism is not described here, the goal of this behavior is to avoid
+situations where a plan cache entry is created with an unreasonably high works value. When this
+happens, the plan can get stuck in the cache since replanning will never kick in.
+
+# Column Store Indexes (CSI)
+
+Column store index (CSI) is a single WT B-tree index where the _index key_ is `Dotted.Path\0RowId`
+and the _index value_ contains the value(s) at that path in the source document with the matching
+`RowId` plus metadata that describes the arrays and nested objects pertinent to the path. This
+organization of the index colocates same-path document values from all source documents and makes it
+efficient to scan a given document path, similar to how a single column can be scanned in column
+stores for relational data. Including `RowId` into the _index key_ allows synchronizing scans across
+multiple paths and fetching the full document from the rowstore, if necessary. Note, that CSI doesn't
+support lookup by document values.
+
+From the point of view of management, maintenance and replication, CSI is treated the same as other
+types of indexes in MongoDB.
+
+## Query side
+
+CSI can be created for all collections except timeseries and clustered but it is only used with
+queries that project a known limited subset of fields, run in SBE and aren't eligible for any other
+indexes. For other heuristics limiting use of CSI see
+[`querySatisfiesCsiPlanningHeuristics()`](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/src/mongo/db/query/query_planner.cpp#L250).
+
+Scanning of CSI is implemented by the 
+[`columnscan`](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/src/mongo/db/exec/sbe/stages/column_scan.h)
+SBE stage. Unlike `ixscan` the plans that use `columnscan` don't include a separate fetch stage as
+the columnstore indexes are optimistically assumed to be covering for the scenarios when they are
+eligible, and if reading data from the rowstore is required during execution, the fetch is
+implemented inside the `columnscan` stage itself. In some situations `columnscan` can degenerate
+into scanning of the row store but it would still show as `columnscan` in the `explain` output. To
+observe how the rowstore is accessed, see `numRowStoreFetches` and `numRowStoreScans` in
+`explain("executionStats")`.
+
+Some filters might be pushed into the `columnscan` stage and evaluated against the values stored in
+the index (see `traverseCsiCellValues` and `traverseCsiCellTypes` primitives in the
+[VM](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/src/mongo/db/exec/sbe/vm/vm.h#L306)).
+The filters that cannot be pushed down would require a downstream `filter` stage. For details on
+which filters can be pushed down see
+[`splitMatchExpressionForColumns()`](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/src/mongo/db/matcher/expression_algo.cpp#L514).
+
+### Tests
+
+*JS Tests:* Most CSI related tests can be found in `jstests/core/columnstore` folder or by searching
+for tests that create an index with the "columnstore" tag. There are also
+[`core_column_store_indexes`](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/buildscripts/resmokeconfig/suites/core_column_store_indexes.yml)
+and [`aggregation_column_store_index_passthrough`](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/buildscripts/resmokeconfig/suites/aggregation_column_store_index_passthrough.yml)
+suites that run many tests with a CSI created implicitly via a failpoint
+`createColumnIndexOnAllCollections`.
+
+## Storage side
+
+There is now a `ColumnStore` interface, akin to the `RecordStore` and `SortedDataInterface` base
+classes.
+
+The `RecordStore` represents a collection keyed (and sorted) by generated `RecordId`s and otherwise
+the values (documents) are unsorted: the key-values are RecordId-Document.
+
+The `SortedDataInterface` represents sorted indexes, mapping index key value to `RecordId` where the
+sort is done on index key value.
+
+The `ColumnStore` differs from both of these, mapping document paths directly to their values, and
+does not sort by value but rather by path with `RecordId` postfix. A `ColumnStore` contains key-value
+entries per path in a collection document:
+
+Example input documents:
+```
+{
+  _id: new ObjectId("..."),
+  version: 2,
+  author: {
+   first: "Charlie",
+   last: "Swanson"
+  }
+},
+{
+  _id: new ObjectId("..."),
+  version: 3,
+  author: {
+   first: "Charlie",
+   last: "Swanson"
+  },
+  viewed: true
+}
+```
+High-level view of the column store data format:
+```
+(_id\01, {vals: [ ObjectId("...") ]})
+(_id\02, {vals: [ ObjectId("...") ]})
+(author\01, {flags: [HAS_SUBPATHS]})
+(author\02, {flags: [HAS_SUBPATHS]})
+(author.first\01, {vals: [ "Charlie" ]})
+(author.first\02, {vals: [ "Charlie" ]})
+(author.last\01, {vals: [ "Swanson" ]})
+(author.last\02, {vals: [ "Swanson" ]})
+(version\01, {vals: [ 2 ]})
+(version\02, {vals: [ 3 ]})
+(viewed\02, {vals: [ true ]})
+(\xFF1, {flags: [HAS_SUBPATHS]})
+(\xFF2, {flags: [HAS_SUBPATHS]})
+```
+
+Columnstore indexes benefit significantly from compression because of their structure. In long runs
+of entries with the same path that are within a tight range of record ids, the 'dotted.path\0rid'
+B-tree keys differ only in the last one or two bytes. All CSIs enable WiredTiger's prefix compression
+for index keys to remove the redundant bytes. By default, CSIs also use Zstandard compression for the
+B-tree, which is well suited to compressing blocks of data from the same column, because columns tend
+to contain data from a limited domain of values and to contain many duplicate values. The internal
+`columnstoreCompressor` index option is available for testing the performance and disk usage of other
+compression methods.
+
+### Code Structure
+
+The `ColumnStore` base class is the storage access point for columnar data. It supports reads and
+writes to the column store storage table. The `ColumnStore` component is not involved in generating
+the column key-values from the original collection document: that is the purview of another component,
+the `ColumnKeyGenerator`.
+
+The `ColumnKeyGenerator` represents a different subsystem, connected with the `ColumnStore` via the
+`IndexAccessMethod` interface. The `ColumnKeyGenerator` internally leverages the `ColumnShredder`
+class to disassemble documents into path-cell (key-value) pairs for storage. The `ColumnStoreAccessMethod`
+ties the `ColumnKeyGenerator` and `ColumnStore` together, encoding (via column_cell.h helper
+functions) the `UnencodedCellView`s produced by the `ColumnKeyGenerator` into final buffers / `CellView`s
+that the storage engine will receive.
+
+_Code spelunking entry points:_
+
+* The [IndexAccessMethod](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/src/mongo/db/index/index_access_method.h)
+is invoked by the [IndexCatalogImpl](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/src/mongo/db/catalog/index_catalog_impl.cpp#L1714-L1715).
+
+* The [ColumnStoreAccessMethod](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/src/mongo/db/index/columns_access_method.h#L39),
+note the [write paths](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/src/mongo/db/index/columns_access_method.cpp#L269-L286)
+that use the ColumnKeyGenerator.
+
+* The [ColumnKeyGenerator](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/src/mongo/db/index/column_key_generator.h#L146)
+produces many [UnencodedCellView](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/src/mongo/db/index/column_key_generator.h#L111)
+via the [ColumnShredder](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/src/mongo/db/index/column_key_generator.cpp#L163-L176)
+with the [ColumnProjectionTree & ColumnProjectionNode](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/src/mongo/db/index/column_key_generator.h#L46-L101)
+classes defining the desired path projections.
+
+* The [column_cell.h/cpp](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/src/mongo/db/index/column_cell.h#L44-L50)
+helpers are leveraged throughout
+[ColumnStoreAccessMethod write methods](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/src/mongo/db/index/columns_access_method.cpp#L281)
+to encode ColumnKeyGenerator UnencodedCellView cells into final buffers for storage write.
+
+* The ColumnStoreAccessMethod
+[invokes the WiredTigerColumnStore](https://github.com/mongodb/mongo/blob/r6.3.0-alpha/src/mongo/db/index/columns_access_method.cpp#L318)
+with the final encoded path-cell (key-value) entries for storage.

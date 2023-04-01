@@ -2,17 +2,13 @@
 
 /**
  * @tags: [
- *  featureFlagFLE2,
+ * assumes_unsharded_collection
  * ]
  */
 load("jstests/fle2/libs/encrypted_client_util.js");
 
 (function() {
 'use strict';
-
-if (!isFLE2Enabled()) {
-    return;
-}
 
 let dbTest = db.getSiblingDB('create_encrypted_indexes_db');
 

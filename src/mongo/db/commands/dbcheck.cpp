@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -36,21 +35,25 @@
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_catalog_helper.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/health_log.h"
+#include "mongo/db/catalog/health_log_interface.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/dbcheck.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/idl/command_generic_argument.h"
 #include "mongo/util/background.h"
 
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
@@ -63,9 +66,8 @@ repl::OpTime _logOp(OperationContext* opCtx,
     repl::MutableOplogEntry oplogEntry;
     oplogEntry.setOpType(repl::OpTypeEnum::kCommand);
     oplogEntry.setNss(nss);
-    if (uuid) {
-        oplogEntry.setUuid(*uuid);
-    }
+    oplogEntry.setTid(nss.tenantId());
+    oplogEntry.setUuid(uuid);
     oplogEntry.setObject(obj);
     AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
     return writeConflictRetry(
@@ -93,10 +95,10 @@ public:
                                                               OplogEntriesEnum::Start,
                                                               boost::none /*data*/
             );
-            HealthLog::get(_opCtx->getServiceContext()).log(*healthLogEntry);
+            HealthLogInterface::get(_opCtx->getServiceContext())->log(*healthLogEntry);
 
             DbCheckOplogStartStop oplogEntry;
-            const auto nss = NamespaceString("admin.$cmd");
+            const auto nss = NamespaceString::kAdminCommandNamespace;
             oplogEntry.setNss(nss);
             oplogEntry.setType(OplogEntriesEnum::Start);
             _logOp(_opCtx, nss, boost::none /*uuid*/, oplogEntry.toBSON());
@@ -108,7 +110,7 @@ public:
     ~DbCheckStartAndStopLogger() {
         try {
             DbCheckOplogStartStop oplogEntry;
-            const auto nss = NamespaceString("admin.$cmd");
+            const auto nss = NamespaceString::kAdminCommandNamespace;
             oplogEntry.setNss(nss);
             oplogEntry.setType(OplogEntriesEnum::Stop);
             _logOp(_opCtx, nss, boost::none /*uuid*/, oplogEntry.toBSON());
@@ -119,7 +121,7 @@ public:
                                                               OplogEntriesEnum::Stop,
                                                               boost::none /*data*/
             );
-            HealthLog::get(_opCtx->getServiceContext()).log(*healthLogEntry);
+            HealthLogInterface::get(_opCtx->getServiceContext())->log(*healthLogEntry);
         } catch (const DBException&) {
             LOGV2(6202201, "Could not log stop event");
         }
@@ -134,6 +136,7 @@ private:
  */
 struct DbCheckCollectionInfo {
     NamespaceString nss;
+    UUID uuid;
     BSONKey start;
     BSONKey end;
     int64_t maxCount;
@@ -142,7 +145,6 @@ struct DbCheckCollectionInfo {
     int64_t maxDocsPerBatch;
     int64_t maxBytesPerBatch;
     int64_t maxBatchTimeMillis;
-    bool snapshotRead;
     WriteConcernOptions writeConcern;
 };
 
@@ -152,9 +154,10 @@ struct DbCheckCollectionInfo {
 using DbCheckRun = std::vector<DbCheckCollectionInfo>;
 
 std::unique_ptr<DbCheckRun> singleCollectionRun(OperationContext* opCtx,
-                                                const std::string& dbName,
+                                                const DatabaseName& dbName,
                                                 const DbCheckSingleInvocation& invocation) {
-    NamespaceString nss(dbName, invocation.getColl());
+    NamespaceString nss(
+        NamespaceStringUtil::parseNamespaceFromRequest(dbName, invocation.getColl()));
     AutoGetCollectionForRead agc(opCtx, nss);
 
     uassert(ErrorCodes::NamespaceNotFound,
@@ -165,6 +168,8 @@ std::unique_ptr<DbCheckRun> singleCollectionRun(OperationContext* opCtx,
             "Cannot run dbCheck on " + nss.toString() + " because it is not replicated",
             nss.isReplicated());
 
+    uassert(6769500, "dbCheck no longer supports snapshotRead:false", invocation.getSnapshotRead());
+
     const auto start = invocation.getMinKey();
     const auto end = invocation.getMaxKey();
     const auto maxCount = invocation.getMaxCount();
@@ -174,6 +179,7 @@ std::unique_ptr<DbCheckRun> singleCollectionRun(OperationContext* opCtx,
     const auto maxBytesPerBatch = invocation.getMaxBytesPerBatch();
     const auto maxBatchTimeMillis = invocation.getMaxBatchTimeMillis();
     const auto info = DbCheckCollectionInfo{nss,
+                                            agc->uuid(),
                                             start,
                                             end,
                                             maxCount,
@@ -182,7 +188,6 @@ std::unique_ptr<DbCheckRun> singleCollectionRun(OperationContext* opCtx,
                                             maxDocsPerBatch,
                                             maxBytesPerBatch,
                                             maxBatchTimeMillis,
-                                            invocation.getSnapshotRead(),
                                             invocation.getBatchWriteConcern()};
     auto result = std::make_unique<DbCheckRun>();
     result->push_back(info);
@@ -190,13 +195,16 @@ std::unique_ptr<DbCheckRun> singleCollectionRun(OperationContext* opCtx,
 }
 
 std::unique_ptr<DbCheckRun> fullDatabaseRun(OperationContext* opCtx,
-                                            const std::string& dbName,
+                                            const DatabaseName& dbName,
                                             const DbCheckAllInvocation& invocation) {
-    uassert(
-        ErrorCodes::InvalidNamespace, "Cannot run dbCheck on local database", dbName != "local");
+    uassert(ErrorCodes::InvalidNamespace,
+            "Cannot run dbCheck on local database",
+            dbName.db() != "local");
 
-    AutoGetDb agd(opCtx, StringData(dbName), MODE_IS);
-    uassert(ErrorCodes::NamespaceNotFound, "Database " + dbName + " not found", agd.getDb());
+    AutoGetDb agd(opCtx, dbName, MODE_IS);
+    uassert(ErrorCodes::NamespaceNotFound, "Database " + dbName.db() + " not found", agd.getDb());
+
+    uassert(6769501, "dbCheck no longer supports snapshotRead:false", invocation.getSnapshotRead());
 
     const int64_t max = std::numeric_limits<int64_t>::max();
     const auto rate = invocation.getMaxCountPerSecond();
@@ -204,11 +212,12 @@ std::unique_ptr<DbCheckRun> fullDatabaseRun(OperationContext* opCtx,
     const auto maxBytesPerBatch = invocation.getMaxBytesPerBatch();
     const auto maxBatchTimeMillis = invocation.getMaxBatchTimeMillis();
     auto result = std::make_unique<DbCheckRun>();
-    auto perCollectionWork = [&](const CollectionPtr& coll) {
+    auto perCollectionWork = [&](const Collection* coll) {
         if (!coll->ns().isReplicated()) {
             return true;
         }
         DbCheckCollectionInfo info{coll->ns(),
+                                   coll->uuid(),
                                    BSONKey::min(),
                                    BSONKey::max(),
                                    max,
@@ -217,14 +226,11 @@ std::unique_ptr<DbCheckRun> fullDatabaseRun(OperationContext* opCtx,
                                    maxDocsPerBatch,
                                    maxBytesPerBatch,
                                    maxBatchTimeMillis,
-                                   invocation.getSnapshotRead(),
                                    invocation.getBatchWriteConcern()};
         result->push_back(info);
         return true;
     };
-    // TODO SERVER-63353: Change dbcheck command to use TenantDatabaseName
-    mongo::catalog::forEachCollectionFromDb(
-        opCtx, TenantDatabaseName(boost::none, dbName), MODE_IS, perCollectionWork);
+    mongo::catalog::forEachCollectionFromDb(opCtx, dbName, MODE_IS, perCollectionWork);
 
     return result;
 }
@@ -234,13 +240,14 @@ std::unique_ptr<DbCheckRun> fullDatabaseRun(OperationContext* opCtx,
  * Factory function for producing DbCheckRun's from command objects.
  */
 std::unique_ptr<DbCheckRun> getRun(OperationContext* opCtx,
-                                   const std::string& dbName,
+                                   const DatabaseName& dbName,
                                    const BSONObj& obj) {
     BSONObjBuilder builder;
 
     // Get rid of generic command fields.
     for (const auto& elem : obj) {
-        if (!isGenericArgument(elem.fieldNameStringData())) {
+        const auto& fieldName = elem.fieldNameStringData();
+        if (!isGenericArgument(fieldName)) {
             builder.append(elem);
         }
     }
@@ -250,21 +257,39 @@ std::unique_ptr<DbCheckRun> getRun(OperationContext* opCtx,
     // If the dbCheck argument is a string, this is the per-collection form.
     if (toParse["dbCheck"].type() == BSONType::String) {
         return singleCollectionRun(
-            opCtx, dbName, DbCheckSingleInvocation::parse(IDLParserErrorContext(""), toParse));
+            opCtx,
+            dbName,
+            DbCheckSingleInvocation::parse(
+                IDLParserContext("", false /*apiStrict*/, dbName.tenantId()), toParse));
     } else {
         // Otherwise, it's the database-wide form.
         return fullDatabaseRun(
-            opCtx, dbName, DbCheckAllInvocation::parse(IDLParserErrorContext(""), toParse));
+            opCtx,
+            dbName,
+            DbCheckAllInvocation::parse(
+                IDLParserContext("", false /*apiStrict*/, dbName.tenantId()), toParse));
     }
 }
 
+std::shared_ptr<const CollectionCatalog> getConsistentCatalogAndSnapshot(OperationContext* opCtx) {
+    // Loop until we get a consistent catalog and snapshot
+    while (true) {
+        const auto catalogBeforeSnapshot = CollectionCatalog::get(opCtx);
+        opCtx->recoveryUnit()->preallocateSnapshot();
+        const auto catalogAfterSnapshot = CollectionCatalog::get(opCtx);
+        if (catalogBeforeSnapshot == catalogAfterSnapshot) {
+            return catalogBeforeSnapshot;
+        }
+        opCtx->recoveryUnit()->abandonSnapshot();
+    }
+}
 
 /**
  * The BackgroundJob in which dbCheck actually executes on the primary.
  */
 class DbCheckJob : public BackgroundJob {
 public:
-    DbCheckJob(const StringData& dbName, std::unique_ptr<DbCheckRun> run)
+    DbCheckJob(const DatabaseName& dbName, std::unique_ptr<DbCheckRun> run)
         : BackgroundJob(true), _done(false), _dbName(dbName.toString()), _run(std::move(run)) {}
 
 protected:
@@ -292,7 +317,7 @@ protected:
             } catch (const DBException& e) {
                 auto logEntry = dbCheckErrorHealthLogEntry(
                     coll.nss, "dbCheck failed", OplogEntriesEnum::Batch, e.toStatus());
-                HealthLog::get(Client::getCurrent()->getServiceContext()).log(*logEntry);
+                HealthLogInterface::get(Client::getCurrent()->getServiceContext())->log(*logEntry);
                 return;
             }
 
@@ -315,15 +340,17 @@ private:
             AutoGetCollection coll(opCtx, info.nss, MODE_IS);
             if (coll) {
                 stdx::unique_lock<Client> lk(*opCtx->getClient());
-                progress.set(CurOp::get(opCtx)->setProgress_inlock(StringData(curOpMessage),
-                                                                   coll->numRecords(opCtx)));
+                progress.set(lk,
+                             CurOp::get(opCtx)->setProgress_inlock(StringData(curOpMessage),
+                                                                   coll->numRecords(opCtx)),
+                             opCtx);
             } else {
                 const auto entry = dbCheckWarningHealthLogEntry(
                     info.nss,
                     "abandoning dbCheck batch because collection no longer exists",
                     OplogEntriesEnum::Batch,
                     Status(ErrorCodes::NamespaceNotFound, "collection not found"));
-                HealthLog::get(Client::getCurrent()->getServiceContext()).log(*entry);
+                HealthLogInterface::get(Client::getCurrent()->getServiceContext())->log(*entry);
                 return;
             }
         }
@@ -401,7 +428,7 @@ private:
                                                        OplogEntriesEnum::Batch,
                                                        result.getStatus());
                 }
-                HealthLog::get(opCtx).log(*entry);
+                HealthLogInterface::get(opCtx)->log(*entry);
                 if (retryable) {
                     continue;
                 }
@@ -424,7 +451,7 @@ private:
                 (_batchesProcessed % gDbCheckHealthLogEveryNBatches.load() == 0)) {
                 // On debug builds, health-log every batch result; on release builds, health-log
                 // every N batches.
-                HealthLog::get(opCtx).log(*entry);
+                HealthLogInterface::get(opCtx)->log(*entry);
             }
 
             WriteConcernResult unused;
@@ -434,7 +461,7 @@ private:
                                                           "dbCheck failed waiting for writeConcern",
                                                           OplogEntriesEnum::Batch,
                                                           status);
-                HealthLog::get(opCtx).log(*entry);
+                HealthLogInterface::get(opCtx)->log(*entry);
             }
 
             start = stats.lastKey;
@@ -443,7 +470,10 @@ private:
             totalDocsSeen += stats.nDocs;
             totalBytesSeen += stats.nBytes;
             docsInCurrentInterval += stats.nDocs;
-            progress.get()->hit(stats.nDocs);
+            {
+                stdx::unique_lock<Client> lk(*opCtx->getClient());
+                progress.get(lk)->hit(stats.nDocs);
+            }
 
             // Check if we've exceeded any limits.
             bool reachedLast = stats.lastKey >= info.end;
@@ -460,7 +490,10 @@ private:
             }
         } while (!reachedEnd);
 
-        progress.finished();
+        {
+            stdx::unique_lock<Client> lk(*opCtx->getClient());
+            progress.get(lk)->finished();
+        }
     }
 
     /**
@@ -485,125 +518,98 @@ private:
                                      const BSONKey& first,
                                      int64_t batchDocs,
                                      int64_t batchBytes) {
-        auto lockMode = MODE_S;
-        if (info.snapshotRead) {
-            // Each batch will read at the latest no-overlap point, which is the all_durable
-            // timestamp on primaries. We assume that the history window on secondaries is always
-            // longer than the time it takes between starting and replicating a batch on the
-            // primary. Otherwise, the readTimestamp will not be available on a secondary by the
-            // time it processes the oplog entry.
-            lockMode = MODE_IS;
-            opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
+        // Each batch will read at the latest no-overlap point, which is the all_durable timestamp
+        // on primaries. We assume that the history window on secondaries is always longer than the
+        // time it takes between starting and replicating a batch on the primary. Otherwise, the
+        // readTimestamp will not be available on a secondary by the time it processes the oplog
+        // entry.
+        opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
+
+        // dbCheck writes to the oplog, so we need to take an IX lock. We don't need to write to the
+        // collection, however, so we only take an intent lock on it.
+        Lock::GlobalLock glob(opCtx, MODE_IX);
+
+        // The CollectionCatalog to use for lock-free reads with point-in-time catalog lookups.
+        std::shared_ptr<const CollectionCatalog> catalog;
+
+        boost::optional<AutoGetCollection> autoColl;
+        const Collection* collection = nullptr;
+        if (feature_flags::gPointInTimeCatalogLookups.isEnabledAndIgnoreFCV()) {
+            // Make sure we get a CollectionCatalog in sync with our snapshot.
+            catalog = getConsistentCatalogAndSnapshot(opCtx);
+
+            collection = catalog->establishConsistentCollection(
+                opCtx,
+                {info.nss.db(), info.uuid},
+                opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx));
+        } else {
+            autoColl.emplace(opCtx, info.nss, MODE_IS);
+            collection = autoColl->getCollection().get();
         }
 
+        if (_stepdownHasOccurred(opCtx, info.nss)) {
+            _done = true;
+            return Status(ErrorCodes::PrimarySteppedDown, "dbCheck terminated due to stepdown");
+        }
+
+        if (!collection) {
+            const auto msg = "Collection under dbCheck no longer exists";
+            return {ErrorCodes::NamespaceNotFound, msg};
+        }
+
+        auto readTimestamp = opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx);
+        uassert(ErrorCodes::SnapshotUnavailable,
+                "No snapshot available yet for dbCheck",
+                readTimestamp);
+        auto minVisible = collection->getMinimumVisibleSnapshot();
+        if (minVisible && *readTimestamp < *collection->getMinimumVisibleSnapshot()) {
+            invariant(!feature_flags::gPointInTimeCatalogLookups.isEnabledAndIgnoreFCV());
+            return {ErrorCodes::SnapshotUnavailable,
+                    str::stream() << "Unable to read from collection " << info.nss
+                                  << " due to pending catalog changes"};
+        }
+
+        // The CollectionPtr needs to outlive the DbCheckHasher as it's used internally.
+        const CollectionPtr collectionPtr(collection);
+
+        boost::optional<DbCheckHasher> hasher;
+        try {
+            hasher.emplace(opCtx,
+                           collectionPtr,
+                           first,
+                           info.end,
+                           std::min(batchDocs, info.maxCount),
+                           std::min(batchBytes, info.maxSize));
+        } catch (const DBException& e) {
+            return e.toStatus();
+        }
+
+        const auto batchDeadline = Date_t::now() + Milliseconds(info.maxBatchTimeMillis);
+        Status status = hasher->hashAll(opCtx, batchDeadline);
+
+        if (!status.isOK()) {
+            return status;
+        }
+
+        std::string md5 = hasher->total();
+
+        DbCheckOplogBatch batch;
+        batch.setType(OplogEntriesEnum::Batch);
+        batch.setNss(info.nss);
+        batch.setMd5(md5);
+        batch.setMinKey(first);
+        batch.setMaxKey(BSONKey(hasher->lastKey()));
+        batch.setReadTimestamp(readTimestamp);
+
+        // Send information on this batch over the oplog.
         BatchStats result;
-        auto timeoutMs = Milliseconds(gDbCheckCollectionTryLockTimeoutMillis.load());
-        const auto initialBackoffMs =
-            Milliseconds(gDbCheckCollectionTryLockMinBackoffMillis.load());
-        auto backoffMs = initialBackoffMs;
-        for (int attempt = 1;; attempt++) {
-            try {
-                // Try to acquire collection lock with increasing timeout and bounded exponential
-                // backoff.
-                auto const lockDeadline = Date_t::now() + timeoutMs;
-                timeoutMs *= 2;
+        result.time = _logOp(opCtx, info.nss, collection->uuid(), batch.toBSON());
+        result.readTimestamp = readTimestamp;
 
-                AutoGetCollection agc(opCtx,
-                                      info.nss,
-                                      lockMode,
-                                      AutoGetCollectionViewMode::kViewsForbidden,
-                                      lockDeadline);
-
-                if (_stepdownHasOccurred(opCtx, info.nss)) {
-                    _done = true;
-                    return Status(ErrorCodes::PrimarySteppedDown,
-                                  "dbCheck terminated due to stepdown");
-                }
-
-                const auto& collection =
-                    CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, info.nss);
-                if (!collection) {
-                    const auto msg = "Collection under dbCheck no longer exists";
-                    return {ErrorCodes::NamespaceNotFound, msg};
-                }
-
-                auto readTimestamp = opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx);
-                auto minVisible = collection->getMinimumVisibleSnapshot();
-                if (readTimestamp && minVisible &&
-                    *readTimestamp < *collection->getMinimumVisibleSnapshot()) {
-                    return {ErrorCodes::SnapshotUnavailable,
-                            str::stream() << "Unable to read from collection " << info.nss
-                                          << " due to pending catalog changes"};
-                }
-
-                boost::optional<DbCheckHasher> hasher;
-                try {
-                    hasher.emplace(opCtx,
-                                   collection,
-                                   first,
-                                   info.end,
-                                   std::min(batchDocs, info.maxCount),
-                                   std::min(batchBytes, info.maxSize));
-                } catch (const DBException& e) {
-                    return e.toStatus();
-                }
-
-                const auto batchDeadline = Date_t::now() + Milliseconds(info.maxBatchTimeMillis);
-                Status status = hasher->hashAll(opCtx, batchDeadline);
-
-                if (!status.isOK()) {
-                    return status;
-                }
-
-                std::string md5 = hasher->total();
-
-                DbCheckOplogBatch batch;
-                batch.setType(OplogEntriesEnum::Batch);
-                batch.setNss(info.nss);
-                batch.setMd5(md5);
-                batch.setMinKey(first);
-                batch.setMaxKey(BSONKey(hasher->lastKey()));
-                batch.setReadTimestamp(readTimestamp);
-
-                // Send information on this batch over the oplog.
-                result.time = _logOp(opCtx, info.nss, collection->uuid(), batch.toBSON());
-                result.readTimestamp = readTimestamp;
-
-                result.nDocs = hasher->docsSeen();
-                result.nBytes = hasher->bytesSeen();
-                result.lastKey = hasher->lastKey();
-                result.md5 = md5;
-
-                break;
-            } catch (const ExceptionFor<ErrorCodes::LockTimeout>& e) {
-                if (attempt > gDbCheckCollectionTryLockMaxAttempts.load()) {
-                    return StatusWith<BatchStats>(e.code(),
-                                                  "Unable to acquire the collection lock");
-                }
-
-                // Bounded exponential backoff between tryLocks.
-                opCtx->sleepFor(backoffMs);
-                const auto maxBackoffMillis =
-                    Milliseconds(gDbCheckCollectionTryLockMaxBackoffMillis.load());
-                if (backoffMs < maxBackoffMillis) {
-                    auto backoff = durationCount<Milliseconds>(backoffMs);
-                    auto initialBackoff = durationCount<Milliseconds>(initialBackoffMs);
-                    backoff *= initialBackoff;
-                    backoffMs = Milliseconds(backoff);
-                }
-                if (backoffMs > maxBackoffMillis) {
-                    backoffMs = maxBackoffMillis;
-                }
-                LOGV2_DEBUG(6175700,
-                            1,
-                            "Could not acquire collection lock, retrying",
-                            "ns"_attr = info.nss.ns(),
-                            "batchRangeMin"_attr = info.start.obj(),
-                            "batchRangeMax"_attr = info.end.obj(),
-                            "attempt"_attr = attempt,
-                            "backoff"_attr = backoffMs);
-            }
-        }
+        result.nDocs = hasher->docsSeen();
+        result.nBytes = hasher->bytesSeen();
+        result.lastKey = hasher->lastKey();
+        result.md5 = md5;
         return result;
     }
 
@@ -665,27 +671,26 @@ public:
                "              maxDocsPerBatch: <max number of docs/batch>\n"
                "              maxBytesPerBatch: <try to keep a batch within max bytes/batch>\n"
                "              maxBatchTimeMillis: <max time processing a batch in milliseconds>\n"
-               "              readTimestamp: <bool, read at a timestamp without strong locks> }\n"
                "to check a collection.\n"
                "Invoke with {dbCheck: 1} to check all collections in the database.";
     }
 
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        const bool isAuthorized =
-            AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forAnyResource(), ActionType::dbCheck);
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        const bool isAuthorized = AuthorizationSession::get(opCtx->getClient())
+                                      ->isAuthorizedForActionsOnResource(
+                                          ResourcePattern::forAnyResource(), ActionType::dbCheck);
         return isAuthorized ? Status::OK() : Status(ErrorCodes::Unauthorized, "Unauthorized");
     }
 
     virtual bool run(OperationContext* opCtx,
-                     const std::string& dbname,
+                     const DatabaseName& dbName,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        auto job = getRun(opCtx, dbname, cmdObj);
+        auto job = getRun(opCtx, dbName, cmdObj);
         try {
-            (new DbCheckJob(dbname, std::move(job)))->go();
+            (new DbCheckJob(dbName, std::move(job)))->go();
         } catch (const DBException& e) {
             result.append("ok", false);
             result.append("err", e.toString());

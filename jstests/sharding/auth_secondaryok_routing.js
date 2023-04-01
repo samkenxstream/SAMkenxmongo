@@ -18,7 +18,7 @@ load("jstests/replsets/rslib.js");
 // Replica set nodes started with --shardsvr do not enable key generation until they are added
 // to a sharded cluster and reject commands with gossiped clusterTime from users without the
 // advanceClusterTime privilege. This causes ShardingTest setup to fail because the shell
-// briefly authenticates as __system and recieves clusterTime metadata then will fail trying to
+// briefly authenticates as __system and receives clusterTime metadata then will fail trying to
 // gossip that time later in setup.
 //
 
@@ -55,10 +55,13 @@ var nodeCount = replTest.nodes.length;
 var adminDB = mongos.getDB('admin');
 adminDB.createUser({user: 'user', pwd: 'password', roles: jsTest.adminUserRoles});
 adminDB.auth('user', 'password');
-var priAdminDB = replTest.getPrimary().getDB('admin');
-replTest.getPrimary().waitForClusterTime(60);
-priAdminDB.createUser({user: 'user', pwd: 'password', roles: jsTest.adminUserRoles},
-                      {w: 3, wtimeout: 30000});
+if (!TestData.catalogShard) {
+    // In catalog shard mode, creating this user above also created it on the first shard.
+    var priAdminDB = replTest.getPrimary().getDB('admin');
+    replTest.getPrimary().waitForClusterTime(60);
+    priAdminDB.createUser({user: 'user', pwd: 'password', roles: jsTest.adminUserRoles},
+                          {w: 3, wtimeout: 30000});
+}
 
 coll.drop();
 coll.setSecondaryOk();

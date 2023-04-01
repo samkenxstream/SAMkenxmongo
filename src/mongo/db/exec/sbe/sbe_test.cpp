@@ -27,9 +27,12 @@
  *    it in the license file.
  */
 
+#include "mongo/db/exec/sbe/sbe_unittest.h"
 #include "mongo/db/exec/sbe/values/bson.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/exec/sbe/vm/vm.h"
+#include "mongo/db/exec/sbe/vm/vm_printer.h"
+#include "mongo/unittest/golden_test.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo::sbe {
@@ -242,7 +245,7 @@ TEST(SBEVM, Add) {
         vm::CodeFragment code;
         code.appendConstVal(tagInt32, valInt32);
         code.appendConstVal(tagInt64, valInt64);
-        code.appendAdd();
+        code.appendAdd({}, {});
 
         vm::ByteCode interpreter;
         auto [owned, tag, val] = interpreter.run(&code);
@@ -260,7 +263,7 @@ TEST(SBEVM, Add) {
         vm::CodeFragment code;
         code.appendConstVal(tagInt32, valInt32);
         code.appendConstVal(tagDouble, valDouble);
-        code.appendAdd();
+        code.appendAdd({}, {});
 
         vm::ByteCode interpreter;
         auto [owned, tag, val] = interpreter.run(&code);
@@ -277,7 +280,7 @@ TEST(SBEVM, Add) {
         vm::CodeFragment code;
         code.appendConstVal(tagDecimal, valDecimal);
         code.appendConstVal(tagDouble, valDouble);
-        code.appendAdd();
+        code.appendAdd({}, {});
 
         vm::ByteCode interpreter;
         auto [owned, tag, val] = interpreter.run(&code);
@@ -303,7 +306,7 @@ TEST(SBEVM, CompareBinData) {
                             value::bitcastFrom<const char*>(operands[0].value()));
         code.appendConstVal(value::TypeTags::bsonBinData,
                             value::bitcastFrom<const char*>(operands[1].value()));
-        code.appendCmp3w();
+        code.appendCmp3w({}, {});
 
         vm::ByteCode interpreter;
         auto [owned, tag, val] = interpreter.run(&code);
@@ -323,7 +326,7 @@ TEST(SBEVM, CompareBinData) {
                             value::bitcastFrom<const char*>(operands[0].value()));
         code.appendConstVal(value::TypeTags::bsonBinData,
                             value::bitcastFrom<const char*>(operands[1].value()));
-        code.appendCmp3w();
+        code.appendCmp3w({}, {});
 
         vm::ByteCode interpreter;
         auto [owned, tag, val] = interpreter.run(&code);
@@ -343,7 +346,7 @@ TEST(SBEVM, CompareBinData) {
                             value::bitcastFrom<const char*>(operands[0].value()));
         code.appendConstVal(value::TypeTags::bsonBinData,
                             value::bitcastFrom<const char*>(operands[1].value()));
-        code.appendCmp3w();
+        code.appendCmp3w({}, {});
 
         vm::ByteCode interpreter;
         auto [owned, tag, val] = interpreter.run(&code);
@@ -367,7 +370,7 @@ TEST(SBEVM, CompareBinData) {
                             value::bitcastFrom<const char*>(operands[0].value()));
         code.appendConstVal(value::TypeTags::bsonBinData,
                             value::bitcastFrom<const char*>(operands[1].value()));
-        code.appendCmp3w();
+        code.appendCmp3w({}, {});
 
         vm::ByteCode interpreter;
         auto [owned, tag, val] = interpreter.run(&code);
@@ -391,7 +394,7 @@ TEST(SBEVM, CompareBinData) {
                             value::bitcastFrom<const char*>(operands[0].value()));
         code.appendConstVal(value::TypeTags::bsonBinData,
                             value::bitcastFrom<const char*>(operands[1].value()));
-        code.appendCmp3w();
+        code.appendCmp3w({}, {});
 
         vm::ByteCode interpreter;
         auto [owned, tag, val] = interpreter.run(&code);
@@ -417,6 +420,45 @@ TEST(SBEVM, ConvertBinDataToBsonObj) {
     auto convertedBinData = builder.done();
 
     ASSERT_EQ(originalBinData.woCompare(convertedBinData), 0);
+}
+
+TEST(SBEVM, CodeFragmentToStringSanity) {
+    vm::CodeFragment code;
+    auto ptr2str = [](const void* ptr) {
+        std::stringstream ss;
+        ss << ptr;
+        return ss.str();
+    };
+
+    code.appendDiv({}, {});
+    std::string instrs = code.toString();
+
+    ASSERT_TRUE(instrs.find("[" + ptr2str(code.instrs().data()) + "]: div") >= 0);
+}
+
+TEST(SBEVM, CodeFragmentPrintStable) {
+    GoldenTestContext ctx(&goldenTestConfigSbe);
+    ctx.printTestHeader(GoldenTestContext::HeaderFormat::Text);
+
+    auto& os = ctx.outStream();
+
+    vm::CodeFragment code;
+    code.appendFillEmpty(vm::Instruction::Null);
+    code.appendFillEmpty(vm::Instruction::False);
+    code.appendFillEmpty(vm::Instruction::True);
+    code.appendTraverseP(0xAA, vm::Instruction::Nothing);
+    code.appendTraverseP(0xAA, vm::Instruction::Int32One);
+    code.appendTraverseF(0xBB, vm::Instruction::True);
+    code.appendGetField({}, "Hello world!"_sd);
+    code.appendAdd({}, {});
+
+    TimeZoneDatabase timezoneDB;
+    code.appendDateTrunc(
+        TimeUnit::day, 1, timezoneDB.getTimeZone("America/New_York"_sd), DayOfWeek::monday);
+
+    vm::CodeFragmentPrinter printer(vm::CodeFragmentPrinter::PrintFormat::Stable);
+    printer.print(os, code);
+    os << std::endl;
 }
 
 namespace {

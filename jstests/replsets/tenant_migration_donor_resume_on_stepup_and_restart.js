@@ -4,27 +4,34 @@
  * Incompatible with shard merge, which can't handle restart.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
+ *   # Some tenant migration statistics field names were changed in 6.1.
+ *   requires_fcv_61,
  *   requires_majority_read_concern,
  *   requires_persistence,
+ *   # Tenant migrations are only used in serverless.
  *   serverless,
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    forgetMigrationAsync,
+    isShardMergeEnabled,
+    makeX509OptionsForTest,
+    runMigrationAsync,
+    tryAbortMigrationAsync
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+load("jstests/replsets/rslib.js");  // 'createRstArgs'
 
 const kMaxSleepTimeMS = 100;
-const kTenantId = "testTenantId";
+const kTenantId = ObjectId().str;
 const kMigrationFpNames = [
     "pauseTenantMigrationBeforeLeavingDataSyncState",
     "pauseTenantMigrationBeforeLeavingBlockingState",
@@ -39,7 +46,7 @@ const kGarbageCollectionDelayMS = 30 * 1000;
 // Set the TTL monitor to run at a smaller interval to speed up the test.
 const kTTLMonitorSleepSecs = 1;
 
-const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
+const migrationX509Options = makeX509OptionsForTest();
 
 /**
  * Runs the donorStartMigration command to start a migration, and interrupts the migration on the
@@ -47,8 +54,8 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
  */
 function testDonorStartMigrationInterrupt(interruptFunc,
                                           {donorRestarted = false, disableForShardMerge = true}) {
-    const donorRst =
-        new ReplSetTest({nodes: 3, name: "donorRst", nodeOptions: migrationX509Options.donor});
+    const donorRst = new ReplSetTest(
+        {nodes: 3, name: "donorRst", serverless: true, nodeOptions: migrationX509Options.donor});
 
     donorRst.startSet();
     donorRst.initiate();
@@ -58,8 +65,7 @@ function testDonorStartMigrationInterrupt(interruptFunc,
     let donorPrimary = tenantMigrationTest.getDonorPrimary();
     const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 
-    if (disableForShardMerge &&
-        TenantMigrationUtil.isShardMergeEnabled(recipientPrimary.getDB("admin"))) {
+    if (disableForShardMerge && isShardMergeEnabled(recipientPrimary.getDB("admin"))) {
         jsTest.log("Skipping test for shard merge");
         tenantMigrationTest.stop();
         donorRst.stopSet();
@@ -72,12 +78,10 @@ function testDonorStartMigrationInterrupt(interruptFunc,
         tenantId: kTenantId,
         recipientConnString: tenantMigrationTest.getRecipientConnString(),
     };
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(donorRst);
+    const donorRstArgs = createRstArgs(donorRst);
 
-    const runMigrationThread = new Thread(TenantMigrationUtil.runMigrationAsync,
-                                          migrationOpts,
-                                          donorRstArgs,
-                                          {retryOnRetryableErrors: true});
+    const runMigrationThread =
+        new Thread(runMigrationAsync, migrationOpts, donorRstArgs, {retryOnRetryableErrors: true});
     runMigrationThread.start();
 
     // Wait for donorStartMigration command to start.
@@ -99,13 +103,13 @@ function testDonorStartMigrationInterrupt(interruptFunc,
     jsTestLog(`Stats at the donor primary: ${tojson(donorStats)}`);
     if (donorRestarted) {
         // If full restart happened the count could be lost completely.
-        assert.gte(1, donorStats.totalSuccessfulMigrationsDonated);
+        assert.gte(1, donorStats.totalMigrationDonationsCommitted);
     } else {
         // The double counting happens when the failover happens after migration completes
         // but before the state doc GC mark is persisted. While this test is targeting this
         // scenario it is low probability in production.
-        assert(1 == donorStats.totalSuccessfulMigrationsDonated ||
-               2 == donorStats.totalSuccessfulMigrationsDonated);
+        assert(1 == donorStats.totalMigrationDonationsCommitted ||
+               2 == donorStats.totalMigrationDonationsCommitted);
     }
     // Skip checking the stats on the recipient since enableRecipientTesting is false
     // so the recipient is forced to respond to recipientSyncData without starting the
@@ -124,6 +128,7 @@ function testDonorForgetMigrationInterrupt(interruptFunc) {
     const donorRst = new ReplSetTest({
         nodes: 3,
         name: "donorRst",
+        serverless: true,
         nodeOptions: Object.assign({}, migrationX509Options.donor, {
             setParameter: {
                 tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
@@ -134,6 +139,7 @@ function testDonorForgetMigrationInterrupt(interruptFunc) {
     const recipientRst = new ReplSetTest({
         nodes: 1,
         name: "recipientRst",
+        serverless: true,
         nodeOptions: Object.assign({}, migrationX509Options.recipient, {
             setParameter: {
                 tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
@@ -159,11 +165,11 @@ function testDonorForgetMigrationInterrupt(interruptFunc) {
         tenantId: kTenantId,
         recipientConnString: recipientRst.getURL(),
     };
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(donorRst);
+    const donorRstArgs = createRstArgs(donorRst);
 
     TenantMigrationTest.assertCommitted(
         tenantMigrationTest.runMigration(migrationOpts, {automaticForgetMigration: false}));
-    const forgetMigrationThread = new Thread(TenantMigrationUtil.forgetMigrationAsync,
+    const forgetMigrationThread = new Thread(forgetMigrationAsync,
                                              migrationOpts.migrationIdString,
                                              donorRstArgs,
                                              true /* retryOnRetryableErrors */);
@@ -195,10 +201,12 @@ function testDonorForgetMigrationInterrupt(interruptFunc) {
  * interrupts the donor using the 'interruptFunc', and asserts that the migration state is
  * eventually garbage collected.
  */
-function testDonorAbortMigrationInterrupt(interruptFunc, fpName, isShutdown = false) {
+function testDonorAbortMigrationInterrupt(
+    interruptFunc, fpName, {fpWaitBeforeAbort = false, isShutdown = false} = {}) {
     const donorRst = new ReplSetTest({
         nodes: 3,
         name: "donorRst",
+        serverless: true,
         nodeOptions: Object.assign({}, migrationX509Options.donor, {
             setParameter: {
                 tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
@@ -209,6 +217,7 @@ function testDonorAbortMigrationInterrupt(interruptFunc, fpName, isShutdown = fa
     const recipientRst = new ReplSetTest({
         nodes: 1,
         name: "recipientRst",
+        serverless: true,
         nodeOptions: Object.assign({}, migrationX509Options.recipient, {
             setParameter: {
                 tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
@@ -232,7 +241,7 @@ function testDonorAbortMigrationInterrupt(interruptFunc, fpName, isShutdown = fa
         tenantId: kTenantId,
         recipientConnString: recipientRst.getURL(),
     };
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(donorRst);
+    const donorRstArgs = createRstArgs(donorRst);
     let donorPrimary = tenantMigrationTest.getDonorPrimary();
 
     // If we passed in a valid failpoint we set it, otherwise we let the migration run normally.
@@ -243,7 +252,11 @@ function testDonorAbortMigrationInterrupt(interruptFunc, fpName, isShutdown = fa
 
     assert.commandWorked(tenantMigrationTest.startMigration(migrationOpts));
 
-    const tryAbortThread = new Thread(TenantMigrationUtil.tryAbortMigrationAsync,
+    if (fp && !isShutdown && fpWaitBeforeAbort) {
+        fp.wait();
+    }
+
+    const tryAbortThread = new Thread(tryAbortMigrationAsync,
                                       {migrationIdString: migrationOpts.migrationIdString},
                                       donorRstArgs,
                                       true /* retryOnRetryableErrors */);
@@ -289,8 +302,8 @@ function testDonorAbortMigrationInterrupt(interruptFunc, fpName, isShutdown = fa
  * restarting, check the to see if the donorDoc data has persisted.
  */
 function testStateDocPersistenceOnFailover(interruptFunc, fpName, isShutdown = false) {
-    const donorRst =
-        new ReplSetTest({nodes: 3, name: "donorRst", nodeOptions: migrationX509Options.donor});
+    const donorRst = new ReplSetTest(
+        {nodes: 3, name: "donorRst", serverless: true, nodeOptions: migrationX509Options.donor});
 
     donorRst.startSet();
     donorRst.initiate();
@@ -405,8 +418,17 @@ function testStateDocPersistenceOnFailover(interruptFunc, fpName, isShutdown = f
             // migration and cause it to fail.
             donorRst.stopSet(null /* signal */, true /*forRestart */, {skipValidation: true});
             donorRst.startSet({restart: true});
-        }, fpName, true);
+        }, fpName, {isShutdown: true});
     });
+})();
+
+(() => {
+    jsTest.log(
+        "Test that the donorAbortMigration command fails if issued after state == kCommitted");
+
+    testDonorAbortMigrationInterrupt((donorRst) => {},
+                                     "pauseTenantMigrationAfterUpdatingToCommittedState",
+                                     {fpWaitBeforeAbort: true});
 })();
 
 (() => {
@@ -463,5 +485,4 @@ function testStateDocPersistenceOnFailover(interruptFunc, fpName, isShutdown = f
             assert.commandWorked(donorPrimary.adminCommand({replSetFreeze: 0}));
         }, fpName);
     });
-})();
 })();

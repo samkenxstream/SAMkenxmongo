@@ -56,7 +56,7 @@ public:
         typename BasicCommandWithRequestParser<ClusterAbortTransactionCmdBase<Impl>>::RequestParser;
 
     void validateResult(const BSONObj& resultObj) final {
-        auto ctx = IDLParserErrorContext("AbortReply");
+        auto ctx = IDLParserContext("AbortReply");
         if (!BaseType::checkIsErrorStatus(resultObj, ctx)) {
             // Will throw if the result doesn't match the abortReply.
             Reply::parse(ctx, resultObj);
@@ -102,13 +102,21 @@ public:
     }
 
     Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
-                                 const BSONObj& cmdObj) const override {
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
         return Impl::checkAuthForOperation(opCtx);
     }
 
+    bool isTransactionCommand() const final {
+        return true;
+    }
+
+    bool allowedInTransactions() const final {
+        return true;
+    }
+
     bool runWithRequestParser(OperationContext* opCtx,
-                              const std::string& dbName,
+                              const DatabaseName& dbName,
                               const BSONObj& cmdObj,
                               const RequestParser& requestParser,
                               BSONObjBuilder& result) final {

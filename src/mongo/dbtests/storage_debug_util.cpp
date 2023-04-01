@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -38,6 +37,9 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
@@ -64,13 +66,13 @@ void printCollectionAndIndexTableEntries(OperationContext* opCtx, const Namespac
 
     // Iterate and print each index's table of documents.
     const auto indexCatalog = coll->getIndexCatalog();
-    const auto it = indexCatalog->getIndexIterator(opCtx, /*includeUnfinished*/ false);
+    const auto it = indexCatalog->getIndexIterator(opCtx, IndexCatalog::InclusionPolicy::kReady);
     while (it->more()) {
         const auto indexCatalogEntry = it->next();
         const auto indexDescriptor = indexCatalogEntry->descriptor();
         const auto iam = indexCatalogEntry->accessMethod()->asSortedData();
         if (!iam) {
-            LOGV2(6325100,
+            LOGV2(6325101,
                   "[Debugging] skipping index {index_name} because it isn't SortedData",
                   "index_name"_attr = indexDescriptor->indexName());
             continue;

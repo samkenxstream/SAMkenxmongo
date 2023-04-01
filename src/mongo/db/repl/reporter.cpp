@@ -27,13 +27,9 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/reporter.h"
 
-#include "mongo/base/counter.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/repl/update_position_args.h"
@@ -42,15 +38,16 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/destructor_guard.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
+
 namespace mongo {
 namespace repl {
 
 namespace {
 
 // The number of replSetUpdatePosition commands a node sent to its sync source.
-Counter64 numUpdatePosition;
-ServerStatusMetricField<Counter64> displayNumUpdatePosition(
-    "repl.network.replSetUpdatePosition.num", &numUpdatePosition);
+CounterMetric numUpdatePosition("repl.network.replSetUpdatePosition.num");
 
 }  // namespace
 

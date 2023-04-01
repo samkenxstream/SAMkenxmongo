@@ -22,6 +22,56 @@ function testExpressionWithCollation(coll, expression, result, collationSpec) {
     assert.eq(res[0].output, result, tojson(res));
 }
 
+function _getObjectSubtypeOrUndefined(o) {
+    function isNumberLong(v) {
+        return v instanceof NumberLong;
+    }
+    function isNumberInt(v) {
+        return v instanceof NumberInt;
+    }
+    function isNumberDecimal(v) {
+        return v instanceof NumberDecimal;
+    }
+    function isObjectId(v) {
+        return v instanceof ObjectId;
+    }
+    function isDate(v) {
+        return v instanceof Date;
+    }
+    function isTimestamp(v) {
+        return v instanceof Timestamp;
+    }
+    function isArray(v) {
+        return v instanceof Array;
+    }
+
+    const objectSubtypes = [
+        {typeName: "NumberLong", isSameSubtype: isNumberLong},
+        {typeName: "NumberInt", isSameSubtype: isNumberInt},
+        {typeName: "NumberDecimal", isSameSubtype: isNumberDecimal},
+        {typeName: "ObjectId", isSameSubtype: isObjectId},
+        {typeName: "Date", isSameSubtype: isDate},
+        {typeName: "Timestamp", isSameSubtype: isTimestamp},
+        {typeName: "Array", isSameSubtype: isArray},
+    ];
+
+    for (const subtype of objectSubtypes) {
+        if (subtype.isSameSubtype(o)) {
+            return subtype;
+        }
+    }
+    return undefined;
+}
+
+/**
+ * Compare using valueComparator if provided, or the default otherwise. Assumes al and ar have the
+ * same type.
+ */
+function _uncheckedCompare(al, ar, valueComparator) {
+    // bsonBinaryEqual would return false for NumberDecimal("0.1") and NumberDecimal("0.100").
+    return valueComparator ? valueComparator(al, ar) : (al === ar || bsonWoCompare(al, ar) === 0);
+}
+
 /**
  * Returns true if 'al' is the same as 'ar'. If the two are arrays, the arrays can be in any order.
  * Objects (either 'al' and 'ar' themselves, or embedded objects) must have all the same properties.
@@ -29,32 +79,46 @@ function testExpressionWithCollation(coll, expression, result, collationSpec) {
  * or == if not provided.
  */
 function anyEq(al, ar, verbose = false, valueComparator, fieldsToSkip = []) {
-    const debug = msg => verbose ? print(msg) : null;  // Helper to log 'msg' iff 'verbose' is true.
+    // Helper to log 'msg' iff 'verbose' is true.
+    const debug = msg => verbose ? print(msg) : null;
 
-    if (al instanceof Array) {
-        if (!(ar instanceof Array)) {
-            debug('anyEq: ar is not an array ' + tojson(ar));
-            return false;
-        }
+    if (al instanceof Object && ar instanceof Object) {
+        const alSubtype = _getObjectSubtypeOrUndefined(al);
+        if (alSubtype) {
+            // One of the supported subtypes, make sure ar is of the same type.
+            if (!alSubtype.isSameSubtype(ar)) {
+                debug('anyEq: ar is not instanceof ' + alSubtype.typeName + ' ' + tojson(ar));
+                return false;
+            }
 
-        if (!arrayEq(al, ar, verbose, valueComparator, fieldsToSkip)) {
-            debug(`anyEq: arrayEq(al, ar): false; al=${tojson(al)}, ar=${tojson(ar)}`);
-            return false;
-        }
-    } else if (al instanceof Object) {
-        // Be sure to explicitly check for Arrays, since Arrays are considered instances of Objects,
-        // and we do not want to consider [] to be equal to {}.
-        if (!(ar instanceof Object) || (ar instanceof Array)) {
-            debug('anyEq: ar is not an object ' + tojson(ar));
-            return false;
-        }
+            if (al instanceof Array) {
+                if (!arrayEq(al, ar, verbose, valueComparator, fieldsToSkip)) {
+                    debug(`anyEq: arrayEq(al, ar): false; al=${tojson(al)}, ar=${tojson(ar)}`);
+                    return false;
+                }
+            } else if (!_uncheckedCompare(al, ar, valueComparator)) {
+                debug(`anyEq: (al != ar): false; al=${tojson(al)}, ar=${tojson(ar)}`);
+                return false;
+            }
+        } else {
+            const arType = _getObjectSubtypeOrUndefined(ar);
+            if (arType) {
+                // If al was not of any of the subtypes, but ar is, then types are different.
+                debug('anyEq: al is ' + typeof al + ' but ar is ' + arType.typeName);
+                return false;
+            }
 
-        if (!documentEq(al, ar, verbose, valueComparator, fieldsToSkip)) {
-            debug(`anyEq: documentEq(al, ar): false; al=${tojson(al)}, ar=${tojson(ar)}`);
-            return false;
+            // Default to comparing object fields.
+            if (!documentEq(al, ar, verbose, valueComparator, fieldsToSkip)) {
+                debug(`anyEq: documentEq(al, ar): false; al=${tojson(al)}, ar=${tojson(ar)}`);
+                return false;
+            }
         }
-    } else if ((valueComparator && !valueComparator(al, ar)) || (!valueComparator && al !== ar)) {
-        // Neither an object nor an array, use the custom comparator if provided.
+    } else if (!_uncheckedCompare(al, ar, valueComparator)) {
+        // One of the operands, or both, is not an object. If one of them is not an object, but the
+        // other is, the default compare will return false. If both are not an object, default
+        // comparison should work fine. In all cases, if the value comparator is provided, it should
+        // be used, even for different types.
         debug(`anyEq: (al != ar): false; al=${tojson(al)}, ar=${tojson(ar)}`);
         return false;
     }
@@ -258,6 +322,8 @@ function resultsEq(rl, rr, verbose = false, fieldsToSkip = []) {
             if (!anyEq(rl[i], rr[j], verbose, null, fieldsToSkip))
                 continue;
 
+            debug(`resultsEq: search target found (${tojson(rl[i])}) (${tojson(rr[j])})`);
+
             // Because we made the copies above, we can edit these out of the arrays so we don't
             // check on them anymore.
             // For the inner loop, we're going to be skipping out, so we don't need to be too
@@ -335,6 +401,19 @@ function assertErrorCode(coll, pipe, code, errmsg, options = {}) {
 function assertErrCodeAndErrMsgContains(coll, pipe, code, expectedMessage) {
     const response = assert.commandFailedWithCode(
         coll.getDB().runCommand({aggregate: coll.getName(), pipeline: pipe, cursor: {}}), code);
+    assert.neq(
+        -1,
+        response.errmsg.indexOf(expectedMessage),
+        "Error message did not contain '" + expectedMessage + "', found:\n" + tojson(response));
+}
+
+/**
+ * Assert that an aggregation ran on admin DB fails with a specific code and the error message
+ * contains the given string. Note that 'code' can be an array of possible codes.
+ */
+function assertAdminDBErrCodeAndErrMsgContains(coll, pipe, code, expectedMessage) {
+    const response = assert.commandFailedWithCode(
+        coll.getDB().adminCommand({aggregate: 1, pipeline: pipe, cursor: {}}), code);
     assert.neq(
         -1,
         response.errmsg.indexOf(expectedMessage),
@@ -441,46 +520,97 @@ function desugarSingleStageAggregation(db, coll, stage) {
 /**
  * Runs and asserts an explain command for an aggregation with the given pipeline. Returns just the
  * pipeline from the explain results regardless of cluster topology.
+ * The fourth parameter `options` is for a few options for unusual scenarios.
+ * options.inhibitOptimization defaults to true. This prepends an inhibitOptimization stage to the
+ * query and removes it before returning results. This is sub ideal for views. options.hint is an
+ * optional hint that will get passed on to the aggregation stage. It defaults to undefined.
  */
-function getExplainedPipelineFromAggregation(db, coll, pipeline) {
+function getExplainedPipelineFromAggregation(
+    db, coll, pipeline, {inhibitOptimization = true, postPlanningResults = false, hint} = {}) {
     // Prevent stages from being absorbed into the .find() layer
-    pipeline.unshift({$_internalInhibitOptimization: {}});
-    const result = coll.explain().aggregate(pipeline);
+    if (inhibitOptimization) {
+        pipeline.unshift({$_internalInhibitOptimization: {}});
+    }
+
+    const aggOptions = hint ? {hint: hint} : {};
+
+    const result = coll.explain().aggregate(pipeline, aggOptions);
 
     assert.commandWorked(result);
-    return getExplainPipelineFromAggregationResult(db, result);
+    return getExplainPipelineFromAggregationResult(
+        db, result, {inhibitOptimization, postPlanningResults});
 }
 
-function getExplainPipelineFromAggregationResult(db, result) {
+function getExplainPipelineFromAggregationResult(db, result, {
+    inhibitOptimization = true,
+    postPlanningResults = false,
+} = {}) {
     // We proceed by cases based on topology.
     if (!FixtureHelpers.isMongos(db)) {
-        assert(Array.isArray(result.stages), result);
-        // The first two stages should be the .find() cursor and the inhibit-optimization stage;
-        // the rest of the stages are what the user's 'stage' expanded to.
+        assert(Array.isArray(result.stages) || result.queryPlanner, result);
+        // The first two stages should be the .find() cursor and the inhibit-optimization stage (if
+        // enabled); the rest of the stages are what the user's 'stage' expanded to.
         assert(result.stages[0].$cursor, result);
-        assert(result.stages[1].$_internalInhibitOptimization, result);
-        return result.stages.slice(2);
+        if (inhibitOptimization) {
+            assert(result.stages[1].$_internalInhibitOptimization, result);
+            return result.stages.slice(2);
+        } else {
+            return result.stages.slice(1);
+        }
     } else {
         if (result.splitPipeline) {
-            assert(result.splitPipeline.shardsPart[0].$_internalInhibitOptimization, result);
-            const shardsPart = result.splitPipeline.shardsPart.slice(1);
+            let shardsPart = null;
+            if (!postPlanningResults) {
+                shardsPart = result.splitPipeline.shardsPart;
+            } else {
+                assert.lt(0, Object.keys(result.shards).length, result);
+                // Pick an arbitrary shard to look at.
+                const shardName = Object.keys(result.shards)[0];
+                const shardResult = result.shards[shardName];
+                // The shardsPart is either a pipeline or a find-like plan. If it's a find-like
+                // plan, wrap it in a $cursor stage so we can combine it into one big pipeline with
+                // mergerPart.
+                if (Array.isArray(shardResult.stages)) {
+                    shardsPart = shardResult.stages;
+                } else {
+                    assert(shardResult.queryPlanner,
+                           `Expected result.shards[${
+                               tojson(shardName)}] to be a pipeline, or find-like plan: ` +
+                               tojson(result));
+                    shardsPart = [{$cursor: shardResult}];
+                }
+            }
+            if (inhibitOptimization) {
+                assert(result.splitPipeline.shardsPart[0].$_internalInhibitOptimization, result);
+                shardsPart = shardsPart.slice(1);
+            }
             assert(result.splitPipeline.mergerPart[0].$mergeCursors, result);
             const mergerPart = result.splitPipeline.mergerPart.slice(1);
             return [].concat(shardsPart).concat(mergerPart);
         } else if (result.stages) {
             // Required for aggregation_mongos_passthrough.
             assert(Array.isArray(result.stages), result);
-            // The first two stages should be the .find() cursor and the inhibit-optimization stage;
-            // the rest of the stages are what the user's 'stage' expanded to.
+            // The first two stages should be the .find() cursor and the inhibit-optimization stage
+            // (if enabled); the rest of the stages are what the user's 'stage' expanded to.
             assert(result.stages[0].$cursor, result);
-            assert(result.stages[1].$_internalInhibitOptimization, result);
-            return result.stages.slice(2);
+            if (inhibitOptimization) {
+                assert(result.stages[1].$_internalInhibitOptimization, result);
+                return result.stages.slice(2);
+            } else {
+                return result.stages.slice(1);
+            }
         } else {
             // Required for aggregation_one_shard_sharded_collections.
-            assert(Array.isArray(result.shards["shard-rs0"].stages), result);
-            assert(result.shards["shard-rs0"].stages[0].$cursor, result);
-            assert(result.shards["shard-rs0"].stages[1].$_internalInhibitOptimization, result);
-            return result.shards["shard-rs0"].stages.slice(2);
+            assert.lt(0, Object.keys(result.shards).length, result);
+            const shardResult = result.shards[Object.keys(result.shards)[0]];
+            assert(Array.isArray(shardResult.stages), result);
+            assert(shardResult.stages[0].$cursor, result);
+            if (inhibitOptimization) {
+                assert(shardResult.stages[1].$_internalInhibitOptimization, result);
+                return shardResult.stages.slice(2);
+            } else {
+                return shardResult.stages.slice(1);
+            }
         }
     }
 }

@@ -32,6 +32,7 @@
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/catalog_shard_feature_flag_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/remote_command_request.h"
@@ -39,7 +40,6 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/str.h"
 

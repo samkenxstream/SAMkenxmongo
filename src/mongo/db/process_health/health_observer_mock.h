@@ -32,13 +32,19 @@
 
 #include "mongo/db/process_health/fault_facet_mock.h"
 #include "mongo/db/process_health/health_observer_base.h"
+#include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
 namespace process_health {
 
 /**
- * Mocked health observer is using a test callback to fetch the next
- * fault severity value every time the periodic check is invoked.
+ * Mocked health observer has two modes of operation (depending on constructor called):
+ *   1.  Passing a callback that runs on an executor and returns a severity
+ *   2.  Passing an implementation of periodicCheckImpl
+ *
+ * See unit test HealthCheckThrowingExceptionMakesFailedStatus for an example of the second mode.
  */
 class HealthObserverMock : public HealthObserverBase {
 public:
@@ -49,6 +55,16 @@ public:
         : HealthObserverBase(svcCtx),
           _mockType(mockType),
           _getSeverityCallback(getSeverityCallback),
+          _observerTimeout(observerTimeout) {}
+
+    HealthObserverMock(
+        FaultFacetType mockType,
+        ServiceContext* svcCtx,
+        std::function<Future<HealthCheckStatus>(PeriodicHealthCheckContext&&)> periodicCheckImpl,
+        Milliseconds observerTimeout)
+        : HealthObserverBase(svcCtx),
+          _mockType(mockType),
+          _periodicCheckImpl(periodicCheckImpl),
           _observerTimeout(observerTimeout) {}
 
     virtual ~HealthObserverMock() = default;
@@ -67,7 +83,11 @@ protected:
     }
 
     Future<HealthCheckStatus> periodicCheckImpl(
-        PeriodicHealthCheckContext&& periodicCheckContext) noexcept override {
+        PeriodicHealthCheckContext&& periodicCheckContext) override {
+
+        if (_periodicCheckImpl.has_value()) {
+            return (*_periodicCheckImpl)(std::move(periodicCheckContext));
+        }
 
         auto completionPf = makePromiseFuture<HealthCheckStatus>();
 
@@ -96,8 +116,12 @@ protected:
 private:
     const FaultFacetType _mockType;
     std::function<Severity()> _getSeverityCallback;
+    boost::optional<std::function<Future<HealthCheckStatus>(PeriodicHealthCheckContext&&)>>
+        _periodicCheckImpl;
     const Milliseconds _observerTimeout;
 };
 
 }  // namespace process_health
 }  // namespace mongo
+
+#undef MONGO_LOGV2_DEFAULT_COMPONENT

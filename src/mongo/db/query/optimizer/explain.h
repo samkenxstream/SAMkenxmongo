@@ -30,33 +30,31 @@
 #pragma once
 
 #include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/optimizer/cascades/memo_explain_interface.h"
 #include "mongo/db/query/optimizer/explain_interface.h"
 #include "mongo/db/query/optimizer/metadata.h"
 #include "mongo/db/query/optimizer/node_defs.h"
 #include "mongo/db/query/optimizer/props.h"
 #include "mongo/db/query/optimizer/syntax/syntax.h"
 
+
 namespace mongo::optimizer {
 
-namespace cascades {
-class Memo;
-}
+enum class ExplainVersion { V1, V2, V2Compact, V3, Vmax };
 
 /**
- * This structure holds any data that is required by the BSON version of explain. It is
- * self-sufficient and separate because it must outlive the other optimizer state as it is used by
- * the runtime plan executor.
+ * This structure holds any data that is required by the explain. It is self-sufficient and separate
+ * because it must outlive the other optimizer state as it is used by the runtime plan executor.
  */
 class ABTPrinter : public AbstractABTPrinter {
 public:
-    ABTPrinter(ABT abtTree, NodeToGroupPropsMap nodeToPropsMap)
-        : _abtTree(std::move(abtTree)), _nodeToPropsMap(std::move(nodeToPropsMap)) {}
+    ABTPrinter(PlanAndProps planAndProps, ExplainVersion explainVersion);
 
     BSONObj explainBSON() const override final;
 
 private:
-    ABT _abtTree;
-    NodeToGroupPropsMap _nodeToPropsMap;
+    PlanAndProps _planAndProps;
+    ExplainVersion _explainVersion;
 };
 
 class ExplainGenerator {
@@ -65,49 +63,65 @@ public:
     // whenever memo delegators are printed.
     static std::string explain(const ABT& node,
                                bool displayProperties = false,
-                               const cascades::Memo* memo = nullptr,
+                               const cascades::MemoExplainInterface* memoInterface = nullptr,
                                const NodeToGroupPropsMap& nodeMap = {});
 
     // Optionally display logical and physical properties using the memo.
     // whenever memo delegators are printed.
     static std::string explainV2(const ABT& node,
                                  bool displayProperties = false,
-                                 const cascades::Memo* memo = nullptr,
+                                 const cascades::MemoExplainInterface* memoInterface = nullptr,
                                  const NodeToGroupPropsMap& nodeMap = {});
+
+    // Optionally display logical and physical properties using the memo.
+    // whenever memo delegators are printed.
+    static std::string explainV2Compact(
+        const ABT& node,
+        bool displayProperties = false,
+        const cascades::MemoExplainInterface* memoInterface = nullptr,
+        const NodeToGroupPropsMap& nodeMap = {});
+
+    static std::string explainNode(const ABT& node);
 
     static std::pair<sbe::value::TypeTags, sbe::value::Value> explainBSON(
         const ABT& node,
         bool displayProperties = false,
-        const cascades::Memo* memo = nullptr,
+        const cascades::MemoExplainInterface* memoInterface = nullptr,
         const NodeToGroupPropsMap& nodeMap = {});
 
-    static std::string printBSON(sbe::value::TypeTags tag, sbe::value::Value val);
+    static BSONObj explainBSONObj(const ABT& node,
+                                  bool displayProperties = false,
+                                  const cascades::MemoExplainInterface* memoInterface = nullptr,
+                                  const NodeToGroupPropsMap& nodeMap = {});
+
+    static std::string explainBSONStr(const ABT& node,
+                                      bool displayProperties = false,
+                                      const cascades::MemoExplainInterface* memoInterface = nullptr,
+                                      const NodeToGroupPropsMap& nodeMap = {});
 
     static std::string explainLogicalProps(const std::string& description,
                                            const properties::LogicalProps& props);
     static std::string explainPhysProps(const std::string& description,
                                         const properties::PhysProps& props);
 
-    static std::string explainMemo(const cascades::Memo& memo);
+    static std::string explainMemo(const cascades::MemoExplainInterface& memoInterface);
 
     static std::pair<sbe::value::TypeTags, sbe::value::Value> explainMemoBSON(
-        const cascades::Memo& memo);
+        const cascades::MemoExplainInterface& memoInterface);
+
+    static BSONObj explainMemoBSONObj(const cascades::MemoExplainInterface& memoInterface);
 
     static std::string explainPartialSchemaReqMap(const PartialSchemaRequirements& reqMap);
 
+    static std::string explainResidualRequirements(const ResidualRequirements::Node& resReqs);
+
     static std::string explainInterval(const IntervalRequirement& interval);
 
+    static std::string explainInterval(const CompoundIntervalRequirement& interval);
+
     static std::string explainIntervalExpr(const IntervalReqExpr::Node& intervalExpr);
+
+    static std::string explainIntervalExpr(const CompoundIntervalReqExpr::Node& intervalExpr);
 };
-
-// Functions used by GDB for pretty-printing. For whatever reason GDB cannot find the static
-// methods of ExplainGenerator, while it can find the functions below.
-
-std::string _printNode(const ABT& node);
-
-std::string _printInterval(const IntervalRequirement& interval);
-
-std::string _printLogicalProps(const properties::LogicalProps& props);
-std::string _printPhysProps(const properties::PhysProps& props);
 
 }  // namespace mongo::optimizer

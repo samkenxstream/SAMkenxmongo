@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #define LOGV2_FOR_ELECTION(ID, DLEVEL, MESSAGE, ...) \
     LOGV2_DEBUG_OPTIONS(                             \
@@ -35,8 +34,6 @@
 #define LOGV2_FOR_HEARTBEATS(ID, DLEVEL, MESSAGE, ...) \
     LOGV2_DEBUG_OPTIONS(                               \
         ID, DLEVEL, {logv2::LogComponent::kReplicationHeartbeats}, MESSAGE, ##__VA_ARGS__)
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/topology_coordinator_gen.h"
@@ -66,6 +63,9 @@
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
+
 namespace mongo {
 namespace repl {
 
@@ -82,10 +82,8 @@ constexpr Milliseconds TopologyCoordinator::PingStats::UninitializedPingTime;
 
 // Tracks the number of times we decide to change sync sources in order to sync from a significantly
 // closer node.
-Counter64 numSyncSourceChangesDueToSignificantlyCloserNode;
-ServerStatusMetricField<Counter64> displayNumSyncSourceChangesDueToSignificantlyCloserNode(
-    "repl.syncSource.numSyncSourceChangesDueToSignificantlyCloserNode",
-    &numSyncSourceChangesDueToSignificantlyCloserNode);
+CounterMetric numSyncSourceChangesDueToSignificantlyCloserNode(
+    "repl.syncSource.numSyncSourceChangesDueToSignificantlyCloserNode");
 
 using namespace fmt::literals;
 
@@ -383,7 +381,7 @@ HostAndPort TopologyCoordinator::_chooseNearbySyncSource(Date_t now,
     return syncSource;
 }
 
-const OpTime TopologyCoordinator::_getOldestSyncOpTime() const {
+OpTime TopologyCoordinator::_getOldestSyncOpTime() const {
     OpTime oldestSyncOpTime = OpTime();
 
     // Find primary's oplog time. We will reject sync candidates that are more than
@@ -784,11 +782,12 @@ void TopologyCoordinator::prepareSyncFromResponse(const HostAndPort& target,
     *result = Status::OK();
 }
 
-// produce a reply to a heartbeat
-Status TopologyCoordinator::prepareHeartbeatResponseV1(Date_t now,
-                                                       const ReplSetHeartbeatArgsV1& args,
-                                                       StringData ourSetName,
-                                                       ReplSetHeartbeatResponse* response) {
+// produce a reply to a heartbeat, and return whether the remote node's config has changed.
+StatusWith<bool> TopologyCoordinator::prepareHeartbeatResponseV1(
+    Date_t now,
+    const ReplSetHeartbeatArgsV1& args,
+    StringData ourSetName,
+    ReplSetHeartbeatResponse* response) {
     // Verify that replica set names match
     const std::string rshb = args.getSetName();
     if (ourSetName != rshb) {
@@ -851,7 +850,7 @@ Status TopologyCoordinator::prepareHeartbeatResponseV1(Date_t now,
 
     if (!_rsConfig.isInitialized()) {
         response->setConfigVersion(-2);
-        return Status::OK();
+        return false;
     }
 
     response->setElectable(
@@ -872,7 +871,7 @@ Status TopologyCoordinator::prepareHeartbeatResponseV1(Date_t now,
         from = _getMemberIndex(args.getSenderId());
     }
     if (from == -1) {
-        return Status::OK();
+        return false;
     }
     invariant(from != _selfIndex);
 
@@ -881,7 +880,7 @@ Status TopologyCoordinator::prepareHeartbeatResponseV1(Date_t now,
     fromNodeData.setLastHeartbeatRecv(now);
     // Update liveness for sending node.
     fromNodeData.updateLiveness(now);
-    return Status::OK();
+    return fromNodeData.getConfigVersionAndTerm() < args.getConfigVersionAndTerm();
 }
 
 int TopologyCoordinator::_getMemberIndex(int id) const {
@@ -936,6 +935,10 @@ std::pair<ReplSetHeartbeatArgsV1, Milliseconds> TopologyCoordinator::prepareHear
                                   : Milliseconds{ReplSetConfig::kDefaultHeartbeatTimeoutPeriod});
     const Milliseconds timeout(timeoutPeriod - alreadyElapsed);
     return std::make_pair(hbArgs, timeout);
+}
+
+bool isUnrecoverableHeartbeatFailure(Status status) {
+    return status.code() == ErrorCodes::InconsistentReplicaSetNames;
 }
 
 HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
@@ -1074,13 +1077,15 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
     const MemberConfig member = _rsConfig.getMemberAt(memberIndex);
     bool advancedOpTimeOrUpdatedConfig = false;
     bool becameElectable = false;
+    bool changedMemberState = false;
     if (!hbResponse.isOK()) {
         if (isUnauthorized) {
             hbData.setAuthIssue(now);
         }
         // If the heartbeat has failed i.e. used up all retries, then we mark the target node as
         // down.
-        else if (hbStats.failed() || (alreadyElapsed >= _rsConfig.getHeartbeatTimeoutPeriod())) {
+        else if (hbStats.failed() || (alreadyElapsed >= _rsConfig.getHeartbeatTimeoutPeriod()) ||
+                 isUnrecoverableHeartbeatFailure(hbResponse.getStatus())) {
             hbData.setDownValues(now, hbResponse.getStatus().reason());
         } else {
             LOGV2_DEBUG(21807,
@@ -1101,7 +1106,10 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
                     "memberId"_attr = member.getId());
         pingsInConfig++;
         auto wasUnelectable = hbData.isUnelectable();
-        advancedOpTimeOrUpdatedConfig = hbData.setUpValues(now, std::move(hbr));
+        auto hbChanges = hbData.setUpValues(now, std::move(hbr));
+        advancedOpTimeOrUpdatedConfig =
+            hbChanges.getOpTimeAdvanced() || hbChanges.getConfigChanged();
+        changedMemberState = hbChanges.getMemberStateChanged();
         becameElectable = wasUnelectable && !hbData.isUnelectable();
     }
 
@@ -1117,6 +1125,7 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
     nextAction.setNextHeartbeatStartDate(nextHeartbeatStartDate);
     nextAction.setAdvancedOpTimeOrUpdatedConfig(advancedOpTimeOrUpdatedConfig);
     nextAction.setBecameElectable(becameElectable);
+    nextAction.setChangedMemberState(changedMemberState);
     return nextAction;
 }
 
@@ -1356,14 +1365,14 @@ void TopologyCoordinator::setMyLastDurableOpTimeAndWallTime(OpTimeAndWallTime op
     myMemberData.setLastDurableOpTimeAndWallTime(opTimeAndWallTime, now);
 }
 
-StatusWith<bool> TopologyCoordinator::setLastOptime(const UpdatePositionArgs::UpdateInfo& args,
-                                                    Date_t now) {
+StatusWith<bool> TopologyCoordinator::setLastOptimeForMember(
+    const UpdatePositionArgs::UpdateInfo& args, Date_t now) {
     if (_selfIndex == -1) {
         // Ignore updates when we're in state REMOVED.
         return Status(ErrorCodes::NotPrimaryOrSecondary,
                       "Received replSetUpdatePosition command but we are in state REMOVED");
     }
-    invariant(_rsConfig.isInitialized());  // Can only use setLastOptime in replSet mode.
+    invariant(_rsConfig.isInitialized());  // Can only use setLastOptimeForMember in replSet mode.
 
     MemberId memberId;
     try {
@@ -1521,6 +1530,13 @@ HeartbeatResponseAction TopologyCoordinator::_shouldTakeOverPrimary(int updatedC
 
     auto primaryIndex = _currentPrimaryIndex;
     if (_memberData.at(primaryIndex).getTerm() != _term || updatedConfigIndex != primaryIndex) {
+        return HeartbeatResponseAction::makeNoAction();
+    }
+
+    // A priority 0 node cannot win an election. Even if the priority changed via reconfig to make
+    // the node eligible by the time a takeover scheduled here would happen, we would end up
+    // canceling that takeover due to the reconfig.
+    if (_selfConfig().getPriority() <= 0) {
         return HeartbeatResponseAction::makeNoAction();
     }
 
@@ -2371,7 +2387,7 @@ MemberData& TopologyCoordinator::_selfMemberData() {
     return _memberData[_selfMemberDataIndex()];
 }
 
-const int TopologyCoordinator::_selfMemberDataIndex() const {
+int TopologyCoordinator::_selfMemberDataIndex() const {
     invariant(!_memberData.empty());
     if (_selfIndex >= 0)
         return _selfIndex;
@@ -2580,7 +2596,8 @@ MemberState TopologyCoordinator::getMemberState() const {
     }
 
     if (_rsConfig.getConfigServer()) {
-        if (_options.clusterRole != ClusterRole::ConfigServer && !skipShardingConfigurationChecks) {
+        if (!_options.clusterRole.has(ClusterRole::ConfigServer) &&
+            !skipShardingConfigurationChecks) {
             return MemberState::RS_REMOVED;
         } else {
             invariant(_storageEngineSupportsReadCommitted != ReadCommittedSupport::kUnknown);
@@ -2589,7 +2606,8 @@ MemberState TopologyCoordinator::getMemberState() const {
             }
         }
     } else {
-        if (_options.clusterRole == ClusterRole::ConfigServer && !skipShardingConfigurationChecks) {
+        if (_options.clusterRole.has(ClusterRole::ConfigServer) &&
+            !skipShardingConfigurationChecks) {
             return MemberState::RS_REMOVED;
         }
     }
@@ -2939,6 +2957,14 @@ bool TopologyCoordinator::advanceLastCommittedOpTimeAndWallTime(OpTimeAndWallTim
         return false;
     }
 
+    if (committedOpTime.opTime.getTerm() != _lastCommittedOpTimeAndWallTime.opTime.getTerm()) {
+        LOGV2(6795400,
+              "Advancing committed opTime to a new term",
+              "newCommittedOpTime"_attr = committedOpTime.opTime,
+              "newCommittedWallime"_attr = committedOpTime.wallTime,
+              "oldTerm"_attr = _lastCommittedOpTimeAndWallTime.opTime.getTerm());
+    }
+
     LOGV2_DEBUG(21826,
                 2,
                 "Updating _lastCommittedOpTimeAndWallTime to {_lastCommittedOpTimeAndWallTime}",
@@ -3008,12 +3034,7 @@ TopologyCoordinator::UpdateTermResult TopologyCoordinator::updateTerm(long long 
     if (_iAmPrimary()) {
         return TopologyCoordinator::UpdateTermResult::kTriggerStepDown;
     }
-    LOGV2_DEBUG(21827,
-                1,
-                "Updating term from {oldTerm} to {newTerm}",
-                "Updating term",
-                "oldTerm"_attr = _term,
-                "newTerm"_attr = term);
+    LOGV2(21827, "Updating term", "oldTerm"_attr = _term, "newTerm"_attr = term);
     _term = term;
     return TopologyCoordinator::UpdateTermResult::kUpdatedTerm;
 }
@@ -3184,14 +3205,7 @@ bool TopologyCoordinator::_shouldChangeSyncSourceToBreakCycle(
     // Change sync source if our sync source is also syncing from us when we are in primary
     // catchup mode, forming a sync source selection cycle, and the sync source is not ahead
     // of us. This is to prevent a deadlock situation. See SERVER-58988 for details.
-    // When checking the sync source, we use syncSourceHost if it is set, otherwise fall back
-    // to use syncSourceIndex. The difference is that syncSourceIndex might not point to the
-    // node that we think of because it was inferred from the sender node, which could have
-    // a different config. This is acceptable since we are just choosing a different sync
-    // source if that happens and reconfigs are rare.
-    const bool isSyncingFromMe = !syncSourceHost.empty()
-        ? syncSourceHost == _selfMemberData().getHostAndPort().toString()
-        : syncSourceIndex == _selfIndex;
+    const bool isSyncingFromMe = syncSourceHost == _selfMemberData().getHostAndPort().toString();
 
     if (isSyncingFromMe && _currentPrimaryIndex == _selfIndex &&
         currentSourceOpTime <= lastOpTimeFetched) {
@@ -3485,7 +3499,7 @@ void TopologyCoordinator::processReplSetRequestVotes(const ReplSetRequestVotesAr
             if (!args.isADryRun()) {
                 _lastVote.setTerm(args.getTerm());
                 _lastVote.setCandidateIndex(args.getCandidateIndex());
-                LOGV2_DEBUG(5972100, 0, "Voting yes in election");
+                LOGV2_DEBUG(5972100, 1, "Voting yes in election");
             }
             response->setVoteGranted(true);
         }

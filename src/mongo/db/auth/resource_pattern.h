@@ -79,7 +79,9 @@ public:
      * "ns" for which ns.isSystem() is false and ns.db() == dbname.
      */
     static ResourcePattern forDatabaseName(StringData dbName) {
-        return ResourcePattern(MatchTypeEnum::kMatchDatabaseName, NamespaceString(dbName, ""));
+        return ResourcePattern(
+            MatchTypeEnum::kMatchDatabaseName,
+            NamespaceString::createNamespaceStringForAuth(boost::none, dbName, ""));
     }
 
     /**
@@ -87,8 +89,9 @@ public:
      * collectionName.
      */
     static ResourcePattern forCollectionName(StringData collectionName) {
-        return ResourcePattern(MatchTypeEnum::kMatchCollectionName,
-                               NamespaceString("", collectionName));
+        return ResourcePattern(
+            MatchTypeEnum::kMatchCollectionName,
+            NamespaceString::createNamespaceStringForAuth(boost::none, "", collectionName));
     }
 
     /**
@@ -111,8 +114,9 @@ public:
      * "db".
      */
     static ResourcePattern forAnySystemBucketsInDatabase(StringData dbName) {
-        return ResourcePattern(MatchTypeEnum::kMatchAnySystemBucketInDBResource,
-                               NamespaceString(dbName, ""));
+        return ResourcePattern(
+            MatchTypeEnum::kMatchAnySystemBucketInDBResource,
+            NamespaceString::createNamespaceStringForAuth(boost::none, dbName, ""));
     }
 
     /**
@@ -120,8 +124,9 @@ public:
      * in any database.
      */
     static ResourcePattern forAnySystemBucketsInAnyDatabase(StringData collectionName) {
-        return ResourcePattern(MatchTypeEnum::kMatchSystemBucketInAnyDBResource,
-                               NamespaceString("", collectionName));
+        return ResourcePattern(
+            MatchTypeEnum::kMatchSystemBucketInAnyDBResource,
+            NamespaceString::createNamespaceStringForAuth(boost::none, "", collectionName));
     }
 
     /**
@@ -131,8 +136,9 @@ public:
     static ResourcePattern forExactSystemBucketsCollection(StringData dbName,
                                                            StringData collectionName) {
         invariant(!collectionName.startsWith("system.buckets."));
-        return ResourcePattern(MatchTypeEnum::kMatchExactSystemBucketResource,
-                               NamespaceString(dbName, collectionName));
+        return ResourcePattern(
+            MatchTypeEnum::kMatchExactSystemBucketResource,
+            NamespaceString::createNamespaceStringForAuth(boost::none, dbName, collectionName));
     }
 
     /**

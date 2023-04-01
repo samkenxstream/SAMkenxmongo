@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
 #include <boost/optional.hpp>
 #include <fmt/format.h>
@@ -38,7 +37,6 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/cancelable_operation_context.h"
-#include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/async_requests_sender.h"
@@ -47,6 +45,9 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/testing_proctor.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
+
 
 using namespace fmt::literals;
 
@@ -60,7 +61,7 @@ MONGO_FAIL_POINT_DEFINE(hangBeforeQueryingRecipients);
 
 BSONObj makeCommandObj(const NamespaceString& ns) {
     auto command = _shardsvrReshardingOperationTime(ns);
-    command.setDbName("admin");
+    command.setDbName(DatabaseName(ns.tenantId(), "admin"));
     return command.toBSON({});
 }
 
@@ -87,12 +88,14 @@ boost::optional<Milliseconds> extractOperationRemainingTime(const BSONObj& obj) 
 }  // namespace
 
 CoordinatorCommitMonitor::CoordinatorCommitMonitor(
+    std::shared_ptr<ReshardingMetrics> metrics,
     NamespaceString ns,
     std::vector<ShardId> recipientShards,
     CoordinatorCommitMonitor::TaskExecutorPtr executor,
     CancellationToken cancelToken,
     Milliseconds maxDelayBetweenQueries)
-    : _ns(std::move(ns)),
+    : _metrics{std::move(metrics)},
+      _ns(std::move(ns)),
       _recipientShards(std::move(recipientShards)),
       _executor(std::move(executor)),
       _cancelToken(std::move(cancelToken)),
@@ -133,7 +136,7 @@ CoordinatorCommitMonitor::queryRemainingOperationTimeForRecipients() const {
     LOGV2_DEBUG(5392001,
                 kDiagnosticLogLevel,
                 "Querying recipient shards for the remaining operation time",
-                "namespace"_attr = _ns);
+                logAttrs(_ns));
 
     auto opCtx = CancelableOperationContext(cc().makeOperationContext(), _cancelToken, _executor);
     auto executor = _networkExecutor ? _networkExecutor : _executor;
@@ -164,13 +167,21 @@ CoordinatorCommitMonitor::queryRemainingOperationTimeForRecipients() const {
         uassertStatusOKWithContext(status, errorContext);
 
         const auto remainingTime = extractOperationRemainingTime(shardResponse.data);
-        // A recipient shard does not report the remaining operation time when there is no data
-        // to copy and no oplog entry to apply.
-        if (remainingTime && remainingTime.get() < minRemainingTime) {
-            minRemainingTime = remainingTime.get();
+
+        // If any recipient omits the "remainingMillis" field of the response then
+        // we cannot conclude that it is safe to begin the critical section.
+        // It is possible that the recipient just had a failover and
+        // was not able to restore its metrics before it replied to the
+        // _shardsvrReshardingOperationTime command.
+        if (!remainingTime) {
+            maxRemainingTime = Milliseconds::max();
+            continue;
         }
-        if (remainingTime && remainingTime.get() > maxRemainingTime) {
-            maxRemainingTime = remainingTime.get();
+        if (remainingTime.value() < minRemainingTime) {
+            minRemainingTime = remainingTime.value();
+        }
+        if (remainingTime.value() > maxRemainingTime) {
+            maxRemainingTime = remainingTime.value();
         }
     }
 
@@ -181,7 +192,7 @@ CoordinatorCommitMonitor::queryRemainingOperationTimeForRecipients() const {
     LOGV2_DEBUG(5392002,
                 kDiagnosticLogLevel,
                 "Finished querying recipient shards for the remaining operation time",
-                "namespace"_attr = _ns,
+                logAttrs(_ns),
                 "remainingTime"_attr = maxRemainingTime);
 
     return {minRemainingTime, maxRemainingTime};
@@ -203,12 +214,19 @@ ExecutorFuture<void> CoordinatorCommitMonitor::_makeFuture() const {
                           "Encountered an error while querying recipients, will retry shortly",
                           "error"_attr = status);
 
-            return RemainingOperationTimes{Milliseconds(0), Milliseconds::max()};
+            // On error we definitely cannot begin the critical section.  Therefore,
+            // return Milliseconds::max for remainingTimes.max (remainingTimes.max is used
+            // for determining whether the critical section should begin).
+            return RemainingOperationTimes{Milliseconds(-1), Milliseconds::max()};
         })
         .then([this, anchor = shared_from_this()](RemainingOperationTimes remainingTimes) {
-            auto metrics = ReshardingMetrics::get(cc().getServiceContext());
-            metrics->setMinRemainingOperationTime(remainingTimes.min);
-            metrics->setMaxRemainingOperationTime(remainingTimes.max);
+            // If remainingTimes.max (or remainingTimes.min) is Milliseconds::max, then use -1 so
+            // that the scale of the y-axis is still useful when looking at FTDC metrics.
+            auto clampIfMax = [](Milliseconds t) {
+                return t != Milliseconds::max() ? t : Milliseconds(-1);
+            };
+            _metrics->setCoordinatorHighEstimateRemainingTimeMillis(clampIfMax(remainingTimes.max));
+            _metrics->setCoordinatorLowEstimateRemainingTimeMillis(clampIfMax(remainingTimes.min));
 
             // Check if all recipient shards are within the commit threshold.
             if (remainingTimes.max <= _threshold)

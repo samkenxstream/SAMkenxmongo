@@ -33,8 +33,10 @@
 #include "mongo/db/s/resharding/recipient_document_gen.h"
 #include "mongo/db/s/resharding/resharding_data_replication.h"
 #include "mongo/db/s/resharding/resharding_future_util.h"
-#include "mongo/db/s/resharding/resharding_metrics_new.h"
+#include "mongo/db/s/resharding/resharding_metrics.h"
+#include "mongo/db/s/resharding/resharding_oplog_applier_metrics.h"
 #include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/db/service_context.h"
 #include "mongo/s/resharding/type_collection_fields_gen.h"
 #include "mongo/util/concurrency/thread_pool.h"
 
@@ -45,7 +47,7 @@ public:
     static constexpr StringData kServiceName = "ReshardingRecipientService"_sd;
 
     explicit ReshardingRecipientService(ServiceContext* serviceContext)
-        : PrimaryOnlyService(serviceContext) {}
+        : PrimaryOnlyService(serviceContext), _serviceContext(serviceContext) {}
     ~ReshardingRecipientService() = default;
 
     class RecipientStateMachine;
@@ -70,6 +72,14 @@ public:
 
     std::shared_ptr<repl::PrimaryOnlyService::Instance> constructInstance(
         BSONObj initialState) override;
+
+    inline std::vector<std::shared_ptr<PrimaryOnlyService::Instance>> getAllReshardingInstances(
+        OperationContext* opCtx) {
+        return getAllInstances(opCtx);
+    }
+
+private:
+    ServiceContext* _serviceContext;
 };
 
 /**
@@ -102,7 +112,8 @@ public:
         const ReshardingRecipientService* recipientService,
         const ReshardingRecipientDocument& recipientDoc,
         std::unique_ptr<RecipientStateMachineExternalState> externalState,
-        ReshardingDataReplicationFactory dataReplicationFactory);
+        ReshardingDataReplicationFactory dataReplicationFactory,
+        ServiceContext* serviceContext);
 
     ~RecipientStateMachine() = default;
 
@@ -153,6 +164,15 @@ public:
         return _completionPromise.getFuture();
     }
 
+    inline const CommonReshardingMetadata& getMetadata() const {
+        return _metadata;
+    }
+
+    inline const ReshardingMetrics& getMetrics() const {
+        invariant(_metrics);
+        return *_metrics;
+    }
+
     boost::optional<BSONObj> reportForCurrentOp(
         MongoProcessInterface::CurrentOpConnectionsMode,
         MongoProcessInterface::CurrentOpSessionsMode) noexcept override;
@@ -173,6 +193,8 @@ public:
      * Initiates the cancellation of the resharding operation.
      */
     void abort(bool isUserCancelled);
+
+    void checkIfOptionsConflict(const BSONObj& stateDoc) const final {}
 
 private:
     /**
@@ -256,8 +278,6 @@ private:
         const CancellationToken& abortToken,
         const CancelableOperationContextFactory& factory);
 
-    ReshardingMetrics* _metrics() const;
-
     ExecutorFuture<void> _startMetrics(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
         const CancellationToken& abortToken);
@@ -276,7 +296,10 @@ private:
     // The primary-only service instance corresponding to the recipient instance. Not owned.
     const ReshardingRecipientService* const _recipientService;
 
-    std::unique_ptr<ReshardingMetricsNew> _metricsNew;
+    ServiceContext* _serviceContext;
+
+    std::unique_ptr<ReshardingMetrics> _metrics;
+    ReshardingApplierMetricsMap _applierMetricsMap;
 
     // The in-memory representation of the immutable portion of the document in
     // config.localReshardingOperations.recipient.

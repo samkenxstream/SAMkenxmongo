@@ -34,7 +34,7 @@
 #include <algorithm>
 #include <memory>
 
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/exec/or.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -73,9 +73,15 @@ Status TrialStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     while (!_specificStats.trialCompleted) {
         WorkingSetID id = WorkingSet::INVALID_ID;
         const bool mustYield = (work(&id) == PlanStage::NEED_YIELD);
+        if (mustYield) {
+            // Run-time plan selection occurs before a WriteUnitOfWork is opened and it's not
+            // subject to TemporarilyUnavailableException's.
+            invariant(!expCtx()->getTemporarilyUnavailableException());
+        }
         if (mustYield || yieldPolicy->shouldYieldOrInterrupt(expCtx()->opCtx)) {
             if (mustYield && !yieldPolicy->canAutoYield()) {
-                throw WriteConflictException();
+                throwWriteConflictException(
+                    "Write conflict during TrialStage plan selection and yielding is disabled.");
             }
             auto yieldStatus = yieldPolicy->yieldOrInterrupt(expCtx()->opCtx);
             if (!yieldStatus.isOK()) {
@@ -119,6 +125,7 @@ PlanStage::StageState TrialStage::_workTrialPlan(WorkingSetID* out) {
             // Increment the 'advanced' count and fall through into NEED_TIME so that we check for
             // the end of the trial period and assess the results for both NEED_TIME and ADVANCED.
             ++_specificStats.trialAdvanced;
+            [[fallthrough]];
         }
         case PlanStage::NEED_TIME:
             // Check whether we have completed the evaluation phase.
@@ -130,6 +137,9 @@ PlanStage::StageState TrialStage::_workTrialPlan(WorkingSetID* out) {
             }
             return state;
         case PlanStage::NEED_YIELD:
+            // Run-time plan selection occurs before a WriteUnitOfWork is opened and it's not
+            // subject to TemporarilyUnavailableException's.
+            invariant(!expCtx()->getTemporarilyUnavailableException());
             // Nothing to update here.
             return state;
         case PlanStage::IS_EOF:

@@ -28,10 +28,11 @@
  */
 
 #include "mongo/db/repl/primary_only_service_test_fixture.h"
-#include "mongo/db/op_observer_impl.h"
-#include "mongo/db/op_observer_registry.h"
+
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/op_observer/oplog_writer_impl.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/repl/primary_only_service_op_observer.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
@@ -66,7 +67,8 @@ void PrimaryOnlyServiceMongoDTest::setUp() {
         _opObserverRegistry = dynamic_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
         invariant(_opObserverRegistry);
 
-        _opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
+        _opObserverRegistry->addObserver(
+            std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
         _opObserverRegistry->addObserver(
             std::make_unique<repl::PrimaryOnlyServiceOpObserver>(serviceContext));
         setUpOpObserverRegistry(_opObserverRegistry);
@@ -102,43 +104,37 @@ void PrimaryOnlyServiceMongoDTest::shutdown() {
 }
 
 void PrimaryOnlyServiceMongoDTest::stepUp(OperationContext* opCtx) {
-    auto replCoord = repl::ReplicationCoordinator::get(getServiceContext());
+    repl::stepUp(opCtx, getServiceContext(), _registry, _term);
+}
+
+void PrimaryOnlyServiceMongoDTest::stepDown() {
+    repl::stepDown(getServiceContext(), _registry);
+}
+
+void stepUp(OperationContext* opCtx,
+            ServiceContext* serviceCtx,
+            repl::PrimaryOnlyServiceRegistry* registry,
+            long long& term) {
+    auto replCoord = repl::ReplicationCoordinator::get(serviceCtx);
     auto currOpTime = replCoord->getMyLastAppliedOpTime();
 
     // Advance the term and last applied opTime. We retain the timestamp component of the current
     // last applied opTime to avoid log messages from ReplClientInfo::setLastOpToSystemLastOpTime()
     // about the opTime having moved backwards.
-    ++_term;
-    auto newOpTime = OpTime{currOpTime.getTimestamp(), _term};
+    ++term;
+    auto newOpTime = OpTime{currOpTime.getTimestamp(), term};
 
     ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
-    ASSERT_OK(replCoord->updateTerm(opCtx, _term));
+    ASSERT_OK(replCoord->updateTerm(opCtx, term));
     replCoord->setMyLastAppliedOpTimeAndWallTime({newOpTime, {}});
 
-    _registry->onStepUpComplete(opCtx, _term);
+    registry->onStepUpComplete(opCtx, term);
 }
 
-void PrimaryOnlyServiceMongoDTest::stepDown() {
-    ASSERT_OK(ReplicationCoordinator::get(getServiceContext())
-                  ->setFollowerMode(MemberState::RS_SECONDARY));
-    _registry->onStepDown();
-}
-
-std::shared_ptr<executor::TaskExecutor> makeTestExecutor() {
-    ThreadPool::Options threadPoolOptions;
-    threadPoolOptions.threadNamePrefix = "PrimaryOnlyServiceTest-";
-    threadPoolOptions.poolName = "PrimaryOnlyServiceTestThreadPool";
-    threadPoolOptions.onCreateThread = [](const std::string& threadName) {
-        Client::initThread(threadName.c_str());
-    };
-
-    auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
-    auto executor = std::make_shared<executor::ThreadPoolTaskExecutor>(
-        std::make_unique<ThreadPool>(threadPoolOptions),
-        executor::makeNetworkInterface(
-            "PrimaryOnlyServiceTestNetwork", nullptr, std::move(hookList)));
-    executor->startup();
-    return executor;
+void stepDown(ServiceContext* serviceCtx, repl::PrimaryOnlyServiceRegistry* registry) {
+    ASSERT_OK(repl::ReplicationCoordinator::get(serviceCtx)
+                  ->setFollowerMode(repl::MemberState::RS_SECONDARY));
+    registry->onStepDown();
 }
 
 }  // namespace repl

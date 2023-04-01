@@ -27,39 +27,35 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/catalog/database_holder_impl.h"
 
 #include "mongo/db/audit.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/database_impl.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/logv2/log.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 namespace mongo {
 
-Database* DatabaseHolderImpl::getDb(OperationContext* opCtx,
-                                    const TenantDatabaseName& tenantDbName) const {
-    uassert(13280,
-            "invalid db name: " + tenantDbName.dbName(),
-            NamespaceString::validDBName(tenantDbName.dbName(),
-                                         NamespaceString::DollarInDbNameBehavior::Allow));
+Database* DatabaseHolderImpl::getDb(OperationContext* opCtx, const DatabaseName& dbName) const {
+    uassert(
+        13280,
+        "invalid db name: " + dbName.db(),
+        NamespaceString::validDBName(dbName.db(), NamespaceString::DollarInDbNameBehavior::Allow));
 
-    invariant(opCtx->lockState()->isDbLockedForMode(tenantDbName.dbName(), MODE_IS) ||
-              (tenantDbName.dbName().compare("local") == 0 && opCtx->lockState()->isLocked()));
+    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IS) ||
+              (dbName.db().compare("local") == 0 && opCtx->lockState()->isLocked()));
 
     stdx::lock_guard<SimpleMutex> lk(_m);
-    DBs::const_iterator it = _dbs.find(tenantDbName);
+    DBs::const_iterator it = _dbs.find(dbName);
     if (it != _dbs.end()) {
         return it->second;
     }
@@ -67,53 +63,51 @@ Database* DatabaseHolderImpl::getDb(OperationContext* opCtx,
     return nullptr;
 }
 
-bool DatabaseHolderImpl::dbExists(OperationContext* opCtx,
-                                  const TenantDatabaseName& tenantDbName) const {
-    uassert(6198702,
-            "invalid db name: " + tenantDbName.dbName(),
-            NamespaceString::validDBName(tenantDbName.dbName(),
-                                         NamespaceString::DollarInDbNameBehavior::Allow));
+bool DatabaseHolderImpl::dbExists(OperationContext* opCtx, const DatabaseName& dbName) const {
+    uassert(
+        6198702,
+        "invalid db name: " + dbName.db(),
+        NamespaceString::validDBName(dbName.db(), NamespaceString::DollarInDbNameBehavior::Allow));
     stdx::lock_guard<SimpleMutex> lk(_m);
-    auto it = _dbs.find(tenantDbName);
+    auto it = _dbs.find(dbName);
     return it != _dbs.end() && it->second != nullptr;
 }
 
-std::set<TenantDatabaseName> DatabaseHolderImpl::_getNamesWithConflictingCasing_inlock(
-    const TenantDatabaseName& tenantDbName) {
-    std::set<TenantDatabaseName> duplicates;
+std::set<DatabaseName> DatabaseHolderImpl::_getNamesWithConflictingCasing_inlock(
+    const DatabaseName& dbName) {
+    std::set<DatabaseName> duplicates;
 
     for (const auto& nameAndPointer : _dbs) {
         // A name that's equal with case-insensitive match must be identical, or it's a duplicate.
-        if (tenantDbName.equalCaseInsensitive(nameAndPointer.first) &&
-            tenantDbName != nameAndPointer.first)
+        if (dbName.equalCaseInsensitive(nameAndPointer.first) && dbName != nameAndPointer.first)
             duplicates.insert(nameAndPointer.first);
     }
     return duplicates;
 }
 
-std::set<TenantDatabaseName> DatabaseHolderImpl::getNamesWithConflictingCasing(
-    const TenantDatabaseName& tenantDbName) {
+std::set<DatabaseName> DatabaseHolderImpl::getNamesWithConflictingCasing(
+    const DatabaseName& dbName) {
     stdx::lock_guard<SimpleMutex> lk(_m);
-    return _getNamesWithConflictingCasing_inlock(tenantDbName);
+    return _getNamesWithConflictingCasing_inlock(dbName);
 }
 
-std::vector<TenantDatabaseName> DatabaseHolderImpl::getNames() {
+std::vector<DatabaseName> DatabaseHolderImpl::getNames() {
     stdx::lock_guard<SimpleMutex> lk(_m);
-    std::vector<TenantDatabaseName> tenantDbNames;
+    std::vector<DatabaseName> dbNames;
     for (const auto& nameAndPointer : _dbs) {
-        tenantDbNames.push_back(nameAndPointer.first);
+        dbNames.push_back(nameAndPointer.first);
     }
-    return tenantDbNames;
+    return dbNames;
 }
 
 Database* DatabaseHolderImpl::openDb(OperationContext* opCtx,
-                                     const TenantDatabaseName& tenantDbName,
+                                     const DatabaseName& dbName,
                                      bool* justCreated) {
-    uassert(6198701,
-            "invalid db name: " + tenantDbName.dbName(),
-            NamespaceString::validDBName(tenantDbName.dbName(),
-                                         NamespaceString::DollarInDbNameBehavior::Allow));
-    invariant(opCtx->lockState()->isDbLockedForMode(tenantDbName.dbName(), MODE_IX));
+    uassert(
+        6198701,
+        "invalid db name: " + dbName.db(),
+        NamespaceString::validDBName(dbName.db(), NamespaceString::DollarInDbNameBehavior::Allow));
+    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IX));
 
     if (justCreated)
         *justCreated = false;  // Until proven otherwise.
@@ -122,102 +116,67 @@ Database* DatabaseHolderImpl::openDb(OperationContext* opCtx,
 
     // The following will insert a nullptr for dbname, which will treated the same as a non-
     // existant database by the get method, yet still counts in getNamesWithConflictingCasing.
-    if (auto db = _dbs[tenantDbName])
+    if (auto db = _dbs[dbName])
         return db;
 
     // We've inserted a nullptr entry for dbname: make sure to remove it on unsuccessful exit.
-    ScopeGuard removeDbGuard([this, &lk, opCtx, tenantDbName] {
+    ScopeGuard removeDbGuard([this, &lk, opCtx, dbName] {
         if (!lk.owns_lock())
             lk.lock();
-        auto it = _dbs.find(tenantDbName);
+        auto it = _dbs.find(dbName);
         // If someone else hasn't either already removed it or already set it successfully, remove.
         if (it != _dbs.end() && !it->second) {
             _dbs.erase(it);
         }
-
-        // In case anyone else is trying to open the same DB simultaneously and waiting on our
-        // result, we should notify them we failed and let them try in our place.
-        _c.notify_all();
     });
 
     // Check casing in lock to avoid transient duplicates.
-    auto duplicates = _getNamesWithConflictingCasing_inlock(tenantDbName);
+    auto duplicates = _getNamesWithConflictingCasing_inlock(dbName);
     uassert(ErrorCodes::DatabaseDifferCase,
             str::stream() << "db already exists with different case already have: ["
-                          << (*duplicates.cbegin()) << "] trying to create ["
-                          << tenantDbName.toString() << "]",
+                          << (*duplicates.cbegin()) << "] trying to create [" << dbName.toString()
+                          << "]",
             duplicates.empty());
 
     // Do the catalog lookup and database creation outside of the scoped lock, because these may
     // block.
     lk.unlock();
 
-    if (CollectionCatalog::get(opCtx)->getAllCollectionUUIDsFromDb(tenantDbName).empty()) {
-        audit::logCreateDatabase(opCtx->getClient(), tenantDbName.dbName());
+    if (CollectionCatalog::get(opCtx)->getAllCollectionUUIDsFromDb(dbName).empty()) {
+        audit::logCreateDatabase(opCtx->getClient(), dbName.toString());
         if (justCreated)
             *justCreated = true;
     }
 
-    std::unique_ptr<DatabaseImpl> newDb = std::make_unique<DatabaseImpl>(tenantDbName);
-    Status status = newDb->init(opCtx);
-    while (!status.isOK()) {
-        // If we get here, then initializing the database failed because another concurrent writer
-        // already registered their own Database instance with the ViewCatalog. We need to wait for
-        // them to finish.
-        lk.lock();
-
-        auto it = _dbs.find(tenantDbName);
-        if (it != _dbs.end() && it->second) {
-            // Creating databases only requires a DB lock in MODE_IX. Thus databases can be created
-            // concurrently. If this thread "lost the race", return the database object that was
-            // persisted in the `_dbs` map.
-            removeDbGuard.dismiss();
-            return it->second;
-        }
-
-        // Consider using OperationContext::waitForConditionOrInterrupt if the logic here changes
-        // in such a way that we can easily express it as a predicate for that function.
-        _c.wait_for(lk, stdx::chrono::milliseconds(1));
-
-        it = _dbs.find(tenantDbName);
-        if (it != _dbs.end() && it->second) {
-            // As above, another writer finished successfully, return the persisted object.
-            removeDbGuard.dismiss();
-            return it->second;
-        }
-
-        lk.unlock();
-
-        // Before we continue make sure we haven't been killed
-        opCtx->checkForInterrupt();
-
-        // At this point it's possible that the other writer just hasn't finished yet, or that they
-        // failed. In either case, we should check and see if we can initialize the database now.
-        status = newDb->init(opCtx);
-    }
+    std::unique_ptr<DatabaseImpl> newDb = std::make_unique<DatabaseImpl>(dbName);
+    newDb->init(opCtx);
 
     // Finally replace our nullptr entry with the new Database pointer.
     removeDbGuard.dismiss();
     lk.lock();
+    auto it = _dbs.find(dbName);
+    invariant(it != _dbs.end());
+    if (it->second) {
+        // Creating databases only requires a DB lock in MODE_IX, thus databases can be concurrently
+        // created. If this thread lost the race, return the database object that was already
+        // created.
+        return it->second;
+    }
+    it->second = newDb.release();
 
-    invariant(!_dbs[tenantDbName]);
-    auto* db = newDb.release();
-    _dbs[tenantDbName] = db;
-    invariant(_getNamesWithConflictingCasing_inlock(tenantDbName).empty());
-    _c.notify_all();
-
-    return db;
+    return it->second;
 }
 
 void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
     invariant(db);
+    invariant(opCtx->lockState()->inAWriteUnitOfWork());
 
     // Store the name so we have if for after the db object is deleted
     auto name = db->name();
 
     LOGV2_DEBUG(20310, 1, "dropDatabase {name}", "name"_attr = name);
 
-    invariant(opCtx->lockState()->isDbLockedForMode(name.dbName(), MODE_X));
+    invariant(opCtx->lockState()->isDbLockedForMode(name, MODE_X));
 
     auto catalog = CollectionCatalog::get(opCtx);
     for (auto collIt = catalog->begin(opCtx, name); collIt != catalog->end(opCtx); ++collIt) {
@@ -232,7 +191,7 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
                   str::stream() << "An index is building on collection '" << coll->ns() << "'.");
     }
 
-    audit::logDropDatabase(opCtx->getClient(), name.dbName());
+    audit::logDropDatabase(opCtx->getClient(), name.toString());
 
     auto const serviceContext = opCtx->getServiceContext();
 
@@ -260,57 +219,59 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
     }
 
     // Clean up the in-memory database state.
-    CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
-        catalog.clearDatabaseProfileSettings(name.dbName());
-    });
-    close(opCtx, name);
+    CollectionCatalog::write(
+        opCtx, [&](CollectionCatalog& catalog) { catalog.clearDatabaseProfileSettings(name); });
+
+    // close() is called as part of the onCommit handler as it frees the memory pointed to by 'db'.
+    // We need to keep this memory valid until the transaction successfully commits.
+    opCtx->recoveryUnit()->onCommit(
+        [this, name = name](OperationContext* opCtx, boost::optional<Timestamp>) {
+            close(opCtx, name);
+        });
 
     auto const storageEngine = serviceContext->getStorageEngine();
-    writeConflictRetry(opCtx, "dropDatabase", name.dbName(), [&] {
+    writeConflictRetry(opCtx, "dropDatabase", name.toString(), [&] {
         storageEngine->dropDatabase(opCtx, name).transitional_ignore();
     });
 }
 
-void DatabaseHolderImpl::close(OperationContext* opCtx, const TenantDatabaseName& tenantDbName) {
-    uassert(6198700,
-            "invalid db name: " + tenantDbName.dbName(),
-            NamespaceString::validDBName(tenantDbName.dbName(),
-                                         NamespaceString::DollarInDbNameBehavior::Allow));
-    invariant(opCtx->lockState()->isDbLockedForMode(tenantDbName.dbName(), MODE_X));
+void DatabaseHolderImpl::close(OperationContext* opCtx, const DatabaseName& dbName) {
+    uassert(
+        6198700,
+        "invalid db name: " + dbName.db(),
+        NamespaceString::validDBName(dbName.db(), NamespaceString::DollarInDbNameBehavior::Allow));
+    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
 
     stdx::lock_guard<SimpleMutex> lk(_m);
 
-    DBs::const_iterator it = _dbs.find(tenantDbName);
+    DBs::const_iterator it = _dbs.find(dbName);
     if (it == _dbs.end()) {
         return;
     }
     auto db = it->second;
 
-    LOGV2_DEBUG(20311, 2, "DatabaseHolder::close", "db"_attr = tenantDbName);
+    LOGV2_DEBUG(20311, 2, "DatabaseHolder::close", logAttrs(dbName));
 
     CollectionCatalog::write(
-        opCtx, [&](CollectionCatalog& catalog) { catalog.onCloseDatabase(opCtx, tenantDbName); });
+        opCtx, [&](CollectionCatalog& catalog) { catalog.onCloseDatabase(opCtx, dbName); });
 
     delete db;
     db = nullptr;
 
     _dbs.erase(it);
-
-    auto* const storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    storageEngine->closeDatabase(opCtx, tenantDbName).transitional_ignore();
 }
 
 void DatabaseHolderImpl::closeAll(OperationContext* opCtx) {
     invariant(opCtx->lockState()->isW());
 
     while (true) {
-        std::vector<TenantDatabaseName> dbs;
+        std::vector<DatabaseName> dbs;
         {
             stdx::lock_guard<SimpleMutex> lk(_m);
             for (DBs::const_iterator i = _dbs.begin(); i != _dbs.end(); ++i) {
                 // It is the caller's responsibility to ensure that no index builds are active in
                 // the database.
-                IndexBuildsCoordinator::get(opCtx)->assertNoBgOpInProgForDb(i->first.dbName());
+                IndexBuildsCoordinator::get(opCtx)->assertNoBgOpInProgForDb(i->first);
                 dbs.push_back(i->first);
             }
         }

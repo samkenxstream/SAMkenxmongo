@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -35,12 +34,17 @@
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/topology_time_ticker.h"
 #include "mongo/db/vector_clock_document_gen.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/executor/scoped_task_executor.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 namespace {
@@ -92,13 +96,16 @@ private:
     // ReplicaSetAwareService methods implementation
 
     void onStartup(OperationContext* opCtx) override {}
-    void onStartupRecoveryComplete(OperationContext* opCtx) override {}
-    void onInitialSyncComplete(OperationContext* opCtx) override {}
+    void onSetCurrentConfig(OperationContext* opCtx) override {}
+    void onInitialDataAvailable(OperationContext* opCtx, bool isMajorityDataAvailable) override;
     void onShutdown() override {}
     void onStepUpBegin(OperationContext* opCtx, long long term) override;
     void onStepUpComplete(OperationContext* opCtx, long long term) override {}
     void onStepDown() override;
     void onBecomeArbiter() override;
+    inline std::string getServiceName() const override final {
+        return "VectorClockMongoD";
+    }
 
     /**
      * Structure used as keys for the map of waiters for VectorClock durability.
@@ -186,13 +193,19 @@ VectorClockMongoD::~VectorClockMongoD() = default;
 void VectorClockMongoD::onStepUpBegin(OperationContext* opCtx, long long term) {
     stdx::lock_guard lg(_mutex);
     _durableTime.reset();
+}
 
-    // Initialize the config server's topology time to the maximum topology time from
-    // `config.shards` collection instead of using `Timestamp(0 ,0)`.
-    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+void VectorClockMongoD::onStepDown() {
+    stdx::lock_guard lg(_mutex);
+    _durableTime.reset();
+}
+
+void VectorClockMongoD::onInitialDataAvailable(OperationContext* opCtx,
+                                               bool isMajorityDataAvailable) {
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
         const auto maxTopologyTime{[&opCtx]() -> boost::optional<Timestamp> {
             DBDirectClient client{opCtx};
-            FindCommandRequest findRequest{ShardType::ConfigNS};
+            FindCommandRequest findRequest{NamespaceString::kConfigsvrShardsNamespace};
             findRequest.setSort(BSON(ShardType::topologyTime << -1));
             findRequest.setLimit(1);
             auto cursor{client.find(std::move(findRequest))};
@@ -207,14 +220,22 @@ void VectorClockMongoD::onStepUpBegin(OperationContext* opCtx, long long term) {
         }()};
 
         if (maxTopologyTime) {
-            _advanceComponentTimeTo(Component::TopologyTime, LogicalTime(*maxTopologyTime));
+            if (isMajorityDataAvailable) {
+                // The maxTopologyTime is majority committed. Thus, we can start gossiping it.
+                _advanceComponentTimeTo(Component::TopologyTime, LogicalTime(*maxTopologyTime));
+            } else {
+                // There is no guarantee that the maxTopologyTime is majority committed and we don't
+                // have a way to obtain the commit time associated with it (init sync scenario).
+                // The only guarantee that we have at this point is that any majority read
+                // that comes afterwards will read, at least, from the initialDataTimestamp. Thus,
+                // we introduce an artificial tick point <initialDataTimestamp, maxTopologyTime>.
+                const auto initialDataTimestamp =
+                    repl::ReplicationCoordinator::get(opCtx)->getMyLastAppliedOpTime();
+                TopologyTimeTicker::get(opCtx).onNewLocallyCommittedTopologyTimeAvailable(
+                    initialDataTimestamp.getTimestamp(), *maxTopologyTime);
+            }
         }
     }
-}
-
-void VectorClockMongoD::onStepDown() {
-    stdx::lock_guard lg(_mutex);
-    _durableTime.reset();
 }
 
 void VectorClockMongoD::onBecomeArbiter() {
@@ -388,8 +409,8 @@ Future<void> VectorClockMongoD::_doWhileQueueNotEmptyOrError(ServiceContext* ser
 
 VectorClock::ComponentSet VectorClockMongoD::_gossipOutInternal() const {
     VectorClock::ComponentSet toGossip{Component::ClusterTime};
-    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer ||
-        serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer) ||
+        serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
         toGossip.insert(Component::ConfigTime);
         toGossip.insert(Component::TopologyTime);
     }
@@ -398,7 +419,7 @@ VectorClock::ComponentSet VectorClockMongoD::_gossipOutInternal() const {
 
 VectorClock::ComponentSet VectorClockMongoD::_gossipInInternal() const {
     VectorClock::ComponentSet toGossip{Component::ClusterTime};
-    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer)) {
         toGossip.insert(Component::ConfigTime);
         toGossip.insert(Component::TopologyTime);
     }
@@ -442,7 +463,7 @@ void VectorClockMongoD::_tickTo(Component component, LogicalTime newTime) {
     }
 
     if (component == Component::TopologyTime &&
-        serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
         _advanceComponentTimeTo(component, std::move(newTime));
         return;
     }

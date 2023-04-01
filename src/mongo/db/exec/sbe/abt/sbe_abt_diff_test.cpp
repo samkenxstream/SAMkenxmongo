@@ -50,12 +50,16 @@ static bool compareResults(const std::vector<BSONObj>& expected,
     if (expected.size() != actual.size()) {
         std::cout << "Different result size: expected: " << expected.size()
                   << " vs actual: " << actual.size() << "\n";
-        if (!expected.empty()) {
-            std::cout << "First expected result: " << expected.front() << "\n";
+
+        std::cout << "Expected results:\n";
+        for (const auto& result : expected) {
+            std::cout << result << "\n";
         }
-        if (!actual.empty()) {
-            std::cout << "First actual result: " << actual.front() << "\n";
+        std::cout << "Actual results:\n";
+        for (const auto& result : actual) {
+            std::cout << result << "\n";
         }
+
         return false;
     }
 
@@ -129,7 +133,7 @@ public:
     void onDestroyClient(Client* client) final {}
 
     void onCreateOperationContext(OperationContext* opCtx) override {
-        opCtx->setLockState(std::make_unique<LockerImpl>());
+        opCtx->setLockState(std::make_unique<LockerImpl>(opCtx->getServiceContext()));
     }
 
     void onDestroyOperationContext(OperationContext* opCtx) final {}
@@ -140,10 +144,13 @@ const ServiceContext::ConstructorActionRegisterer clientObserverRegisterer{
     [](ServiceContext* service) {
         service->registerClientObserver(std::make_unique<TestObserver>());
     },
-    [](ServiceContext* serviceContext) {}};
+    [](ServiceContext* serviceContext) {
+    }};
 
 TEST_F(NodeSBE, DiffTestBasic) {
-    const auto contextFn = [this]() { return makeOperationContext(); };
+    const auto contextFn = [this]() {
+        return makeOperationContext();
+    };
     const auto compare = [&contextFn](const std::string& pipelineStr,
                                       const std::vector<std::string>& jsonVector) {
         return compareSBEABTAgainstPipeline(
@@ -169,7 +176,9 @@ TEST_F(NodeSBE, DiffTestBasic) {
 }
 
 TEST_F(NodeSBE, DiffTest) {
-    const auto contextFn = [this]() { return makeOperationContext(); };
+    const auto contextFn = [this]() {
+        return makeOperationContext();
+    };
     const auto compare = [&contextFn](const std::string& pipelineStr,
                                       const std::vector<std::string>& jsonVector) {
         return compareSBEABTAgainstPipeline(
@@ -227,6 +236,30 @@ TEST_F(NodeSBE, DiffTest) {
 
     ASSERT_TRUE(compare("[{$match: {a: {$elemMatch: {$elemMatch: {$lt: 6, $gt: 4}}}}}]",
                         {"{a: [[4, 5, 6], [5]]}", "{a: [4, 5, 6]}"}));
+
+    // "{a: [2]}" will not match on classic.
+    ASSERT_TRUE(compare("[{$match: {'a.b': {$eq: null}}}]",
+                        {"{a: 2}",
+                         "{}",
+                         "{a: []}",
+                         "{a: [{}]}",
+                         "{a: {b: null}}",
+                         "{a: {c: 1}}",
+                         "{a: {b: 2}}",
+                         "{a: [{b: null}, {b: 1}]}"}));
+
+    ASSERT_TRUE(compare("[{$match: {'a': {$eq: null}}}]", {"{a: 2}"}));
+
+    ASSERT_TRUE(compare("[{$match: {'a': {$ne: 2}}}]",
+                        {"{a: 1}", "{a: 2}", "{a: [1, 2]}", "{a: [1]}", "{a: [2]}"}));
+
+
+    ASSERT_TRUE(compare("[{$project: {concat: {$concat: ['$a', ' - ', '$b', ' - ', '$c']}}}]",
+                        {"{a: 'a1', b: 'b1', c: 'c1'}"}));
+    ASSERT_TRUE(compare(
+        "[{$project: {res1: {$divide: ['$a', '$b']}, res2: {$divide: ['$c', '$a']}, res3: {$mod: "
+        "['$d', '$b']}, res4: {$abs: '$e'}, res5: {$floor: '$f'}, res6: {$ceil: {$ln: '$d'}}}}]",
+        {"{a: 5, b: 10, c: 20, d: 25, e: -5, f: 2.4}"}));
 }
 
 }  // namespace

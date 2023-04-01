@@ -27,33 +27,27 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/client/dbclient_cursor.h"
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/global_settings.h"
-#include "mongo/db/op_observer_impl.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/op_observer/oplog_writer_impl.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/range_arithmetic.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
-
 namespace {
-
-using std::set;
-using std::unique_ptr;
 
 /**
  * Unit tests related to DBHelpers
@@ -101,13 +95,6 @@ public:
     void run() {
         auto serviceContext = getGlobalServiceContext();
 
-        // This test is designed for storage engines that detect write conflicts when they attempt
-        // to write to a record. ephemeralForTest, however, only detects write conflicts when a
-        // WriteUnitOfWork commits.
-        if (storageGlobalParams.engine == "ephemeralForTest") {
-            return;
-        }
-
         repl::ReplSettings replSettings;
         replSettings.setOplogSizeBytes(10 * 1024 * 1024);
         replSettings.setReplSetString("rs");
@@ -127,19 +114,19 @@ public:
         auto opCtx2 = client2->makeOperationContext();
 
         auto registry = std::make_unique<OpObserverRegistry>();
-        registry->addObserver(std::make_unique<OpObserverImpl>());
+        registry->addObserver(
+            std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
         opCtx1.get()->getServiceContext()->setOpObserver(std::move(registry));
         repl::createOplog(opCtx1.get());
 
-        Lock::DBLock dbLk1(opCtx1.get(), nss.db(), LockMode::MODE_IX);
+        Lock::DBLock dbLk1(opCtx1.get(), nss.dbName(), LockMode::MODE_IX);
         Lock::CollectionLock collLk1(opCtx1.get(), nss, LockMode::MODE_IX);
 
-        Lock::DBLock dbLk2(opCtx2.get(), nss.db(), LockMode::MODE_IX);
+        Lock::DBLock dbLk2(opCtx2.get(), nss.dbName(), LockMode::MODE_IX);
         Lock::CollectionLock collLk2(opCtx2.get(), nss, LockMode::MODE_IX);
 
-        const TenantDatabaseName tenantDbName(boost::none, nss.db());
         Database* db =
-            DatabaseHolder::get(opCtx1.get())->openDb(opCtx1.get(), tenantDbName, nullptr);
+            DatabaseHolder::get(opCtx1.get())->openDb(opCtx1.get(), nss.dbName(), nullptr);
 
         // Create the collection and insert one doc
         BSONObj doc = BSON("_id" << 1 << "x" << 2);
@@ -148,17 +135,18 @@ public:
         CollectionPtr collection1;
         {
             WriteUnitOfWork wuow(opCtx1.get());
-            collection1 = db->createCollection(opCtx1.get(), nss, CollectionOptions(), true);
-            ASSERT_TRUE(collection1 != nullptr);
-            ASSERT_TRUE(collection1
-                            ->insertDocument(
-                                opCtx1.get(), InsertStatement(doc), nullptr /* opDebug */, false)
-                            .isOK());
+            collection1 =
+                CollectionPtr(db->createCollection(opCtx1.get(), nss, CollectionOptions(), true));
+            ASSERT_TRUE(collection1);
+            ASSERT_TRUE(
+                collection_internal::insertDocument(
+                    opCtx1.get(), collection1, InsertStatement(doc), nullptr /* opDebug */, false)
+                    .isOK());
             wuow.commit();
         }
 
         BSONObj result;
-        Helpers::findById(opCtx1.get(), db, nss.ns(), idQuery, result, nullptr, nullptr);
+        Helpers::findById(opCtx1.get(), nss, idQuery, result, nullptr, nullptr);
         ASSERT_BSONOBJ_EQ(result, doc);
 
         // Assert that the same doc still exists after findByIdAndNoopUpdate
@@ -177,7 +165,7 @@ public:
 
         // Assert that findByIdAndNoopUpdate did not generate an oplog entry.
         BSONObj oplogEntry;
-        Helpers::getLast(opCtx1.get(), NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntry);
+        Helpers::getLast(opCtx1.get(), NamespaceString::kRsOplogNamespace, oplogEntry);
         ASSERT_BSONOBJ_NE(oplogEntry, BSONObj());
         ASSERT_TRUE(oplogEntry.getStringField("op") == "i"_sd);
 
@@ -207,13 +195,14 @@ private:
             WriteUnitOfWork wuow2(opCtx2);
             auto collection2 =
                 CollectionCatalog::get(opCtx2)->lookupCollectionByNamespace(opCtx2, nss);
-            ASSERT(collection2 != nullptr);
+            ASSERT(collection2);
             auto lastApplied = repl::ReplicationCoordinator::get(opCtx2->getServiceContext())
                                    ->getMyLastAppliedOpTime()
                                    .getTimestamp();
             ASSERT_OK(opCtx2->recoveryUnit()->setTimestamp(lastApplied + 1));
             BSONObj res;
-            ASSERT_TRUE(Helpers::findByIdAndNoopUpdate(opCtx2, collection2, idQuery, res));
+            ASSERT_TRUE(
+                Helpers::findByIdAndNoopUpdate(opCtx2, CollectionPtr(collection2), idQuery, res));
 
             ASSERT_THROWS(Helpers::emptyCollection(opCtx1, nss), WriteConflictException);
 
@@ -222,16 +211,16 @@ private:
 
         // Assert that the doc still exists in the collection.
         BSONObj res1;
-        Helpers::findById(opCtx1, db, nss.ns(), idQuery, res1, nullptr, nullptr);
+        Helpers::findById(opCtx1, nss, idQuery, res1, nullptr, nullptr);
         ASSERT_BSONOBJ_EQ(res1, doc);
 
         BSONObj res2;
-        Helpers::findById(opCtx2, db, nss.ns(), idQuery, res2, nullptr, nullptr);
+        Helpers::findById(opCtx2, nss, idQuery, res2, nullptr, nullptr);
         ASSERT_BSONOBJ_EQ(res2, doc);
 
         // Assert that findByIdAndNoopUpdate did not generate an oplog entry.
         BSONObj oplogEntry;
-        Helpers::getLast(opCtx2, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntry);
+        Helpers::getLast(opCtx2, NamespaceString::kRsOplogNamespace, oplogEntry);
         ASSERT_BSONOBJ_NE(oplogEntry, BSONObj());
         ASSERT_TRUE(oplogEntry.getStringField("op") == "i"_sd);
     }
@@ -254,10 +243,11 @@ private:
                 WriteUnitOfWork wuow2(opCtx2);
                 auto collection2 =
                     CollectionCatalog::get(opCtx2)->lookupCollectionByNamespace(opCtx2, nss);
-                ASSERT(collection2 != nullptr);
+                ASSERT(collection2);
 
                 BSONObj res;
-                ASSERT_THROWS(Helpers::findByIdAndNoopUpdate(opCtx2, collection2, idQuery, res),
+                ASSERT_THROWS(Helpers::findByIdAndNoopUpdate(
+                                  opCtx2, CollectionPtr(collection2), idQuery, res),
                               WriteConflictException);
             }
 
@@ -266,11 +256,11 @@ private:
 
         // Assert that the first storage transaction succeeded and that the doc is removed.
         BSONObj res1;
-        Helpers::findById(opCtx1, db, nss.ns(), idQuery, res1, nullptr, nullptr);
+        Helpers::findById(opCtx1, nss, idQuery, res1, nullptr, nullptr);
         ASSERT_BSONOBJ_EQ(res1, BSONObj());
 
         BSONObj res2;
-        Helpers::findById(opCtx2, db, nss.ns(), idQuery, res2, nullptr, nullptr);
+        Helpers::findById(opCtx2, nss, idQuery, res2, nullptr, nullptr);
         ASSERT_BSONOBJ_EQ(res2, BSONObj());
     }
 

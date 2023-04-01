@@ -29,11 +29,12 @@ global:
     cpp_namespace: "mongo::repl"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 structs:
     replSetTestEgressReply:
         description: "Result of attempting to connect to cluster member"
+        is_command_reply: true
         fields:
             target:
                 description: "Actual member connected to"

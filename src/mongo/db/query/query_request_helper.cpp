@@ -36,7 +36,6 @@
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/client/query.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/dbmessage.h"
 
@@ -92,11 +91,6 @@ Status validateFindCommandRequest(const FindCommandRequest& findCommand) {
             (findCommand.getMin().nFields() != findCommand.getMax().nFields())) {
             return Status(ErrorCodes::Error(51176), "min and max must have the same field names");
         }
-    }
-
-    if ((findCommand.getLimit() || findCommand.getBatchSize()) && findCommand.getNtoreturn()) {
-        return Status(ErrorCodes::BadValue,
-                      "'limit' or 'batchSize' fields can not be set with 'ntoreturn' field.");
     }
 
     if (query_request_helper::getTailableMode(findCommand) != TailableModeEnum::kNormal) {
@@ -158,9 +152,9 @@ void refreshNSS(const NamespaceString& nss, FindCommandRequest* findCommand) {
 std::unique_ptr<FindCommandRequest> makeFromFindCommand(const BSONObj& cmdObj,
                                                         boost::optional<NamespaceString> nss,
                                                         bool apiStrict) {
-
-    auto findCommand = std::make_unique<FindCommandRequest>(
-        FindCommandRequest::parse(IDLParserErrorContext("FindCommandRequest", apiStrict), cmdObj));
+    auto findCommand = std::make_unique<FindCommandRequest>(FindCommandRequest::parse(
+        IDLParserContext("FindCommandRequest", apiStrict, nss ? nss->tenantId() : boost::none),
+        cmdObj));
 
     // If there is an explicit namespace specified overwite it.
     if (nss) {
@@ -228,17 +222,15 @@ TailableModeEnum getTailableMode(const FindCommandRequest& findCommand) {
         tailableModeFromBools(findCommand.getTailable(), findCommand.getAwaitData()));
 }
 
-void validateCursorResponse(const BSONObj& outputAsBson) {
+void validateCursorResponse(const BSONObj& outputAsBson, boost::optional<TenantId> tenantId) {
     if (getTestCommandsEnabled()) {
-        CursorInitialReply::parse(IDLParserErrorContext("CursorInitialReply"), outputAsBson);
+        CursorInitialReply::parse(
+            IDLParserContext("CursorInitialReply", false /* apiStrict */, tenantId), outputAsBson);
     }
 }
 
 StatusWith<BSONObj> asAggregationCommand(const FindCommandRequest& findCommand) {
     BSONObjBuilder aggregationBuilder;
-
-    // The find command will translate away ntoreturn above this layer.
-    tassert(5746106, "ntoreturn should not be set in the findCommand", !findCommand.getNtoreturn());
 
     // First, check if this query has options that are not supported in aggregation.
     if (!findCommand.getMin().isEmpty()) {
@@ -371,7 +363,7 @@ StatusWith<BSONObj> asAggregationCommand(const FindCommandRequest& findCommand) 
         aggregationBuilder.append(FindCommandRequest::kUnwrappedReadPrefFieldName,
                                   findCommand.getUnwrappedReadPref());
     }
-    if (findCommand.getAllowDiskUse()) {
+    if (findCommand.getAllowDiskUse().has_value()) {
         aggregationBuilder.append(FindCommandRequest::kAllowDiskUseFieldName,
                                   static_cast<bool>(findCommand.getAllowDiskUse()));
     }

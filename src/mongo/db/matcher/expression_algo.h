@@ -34,6 +34,7 @@
 #include <set>
 
 #include "mongo/base/string_data.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -51,6 +52,11 @@ using NodeTraversalFunc = std::function<void(MatchExpression*, std::string)>;
  * $exists predicated on a prefix of the path.
  */
 bool hasExistencePredicateOnPath(const MatchExpression& expr, StringData path);
+
+/**
+ * Checks if 'expr' has any children which do not have renaming implemented.
+ */
+bool hasOnlyRenameableMatchExpressionChildren(const MatchExpression& expr);
 
 /**
  * Returns true if the documents matched by 'lhs' are a subset of the documents matched by
@@ -85,17 +91,45 @@ bool isSubsetOf(const MatchExpression* lhs, const MatchExpression* rhs);
  * For example, {a: "foo", b: "bar"} is splittable by "b", while
  * {$or: [{a: {$eq: "foo"}}, {b: {$eq: "bar"}}]} is not splittable by "b", due to the $or.
  */
-bool isSplittableBy(const MatchExpression& expr, const std::set<std::string>& pathSet);
+bool isSplittableBy(const MatchExpression& expr, const OrderedPathSet& pathSet);
+
+/**
+ * True if no path in either set is contained by a path in the other.  Does not check for
+ * dependencies within each of the sets, just across sets.  Runs in 0(n) time.
+ *
+ * areIndependent([a.b, b, a], [c]) --> true
+ * areIndependent([a.b, b, a], [a.b.f]) --> false
+ */
+bool areIndependent(const OrderedPathSet& pathSet1, const OrderedPathSet& pathSet2);
+
+/**
+ * Return true if any of the paths in 'prefixCandidates' are identical to or an ancestor of any
+ * of the paths in 'testSet'.  The order of the parameters matters -- it's not commutative.
+ */
+bool containsDependency(const OrderedPathSet& testSet, const OrderedPathSet& prefixCandidates);
+
+/**
+ * Returns true if any of the paths in 'testSet' are an ancestor of any of the other paths in
+ * 'testSet'. Examples:
+ * containsOverlappingPaths([a.b, a]) --> true
+ * containsOverlappingPaths([ab, a, a-b]) --> false
+ */
+bool containsOverlappingPaths(const OrderedPathSet& testSet);
+
+/**
+ * Returns true if any of the paths in 'testSet' contain empty path components.
+ */
+bool containsEmptyPaths(const OrderedPathSet& testSet);
 
 /**
  * Determine if 'expr' is reliant upon any path from 'pathSet'.
  */
-bool isIndependentOf(const MatchExpression& expr, const std::set<std::string>& pathSet);
+bool isIndependentOf(const MatchExpression& expr, const OrderedPathSet& pathSet);
 
 /**
  * Determine if 'expr' is reliant only upon paths from 'pathSet'.
  */
-bool isOnlyDependentOn(const MatchExpression& expr, const std::set<std::string>& pathSet);
+bool isOnlyDependentOn(const MatchExpression& expr, const OrderedPathSet& pathSet);
 
 /**
  * Returns whether the path represented by 'first' is an prefix of the path represented by 'second'.
@@ -122,31 +156,37 @@ bool bidirectionalPathPrefixOf(StringData first, StringData second);
  */
 void mapOver(MatchExpression* expr, NodeTraversalFunc func, std::string path = "");
 
-using ShouldSplitExprFunc =
-    std::function<bool(const MatchExpression&, const std::set<std::string>&)>;
+using ShouldSplitExprFunc = std::function<bool(const MatchExpression&, const OrderedPathSet&)>;
 
 /**
  * Attempt to split 'expr' into two MatchExpressions according to 'func'. 'func' describes the
  * conditions under which its argument can be split from 'expr'. Returns two pointers, where each
- * new MatchExpression contains a portion of 'expr'. The first contains the parts of 'expr' which
- * satisfy 'func', and the second are the remaining parts of 'expr', such that applying the matches
- * in sequence is equivalent to applying 'expr'. If 'expr' cannot be split, returns {nullptr, expr}.
- * If 'expr' can be entirely split, returns {expr, nullptr}. Takes ownership of 'expr'.
+ * new MatchExpression contains a portion of 'expr'. The first (split out expression) contains the
+ * parts of 'expr' which satisfy 'func', and the second (residual expression) are the remaining
+ * parts of 'expr', such that applying the matches in sequence is equivalent to applying 'expr'. If
+ * 'expr' cannot be split, returns {nullptr, expr}. If 'expr' can be entirely split, returns {expr,
+ * nullptr}. Takes ownership of 'expr'.
  *
- * For example, the default behavior is to split 'match' into two where the first is not reliant
- * upon any path from 'fields', and the second is the remainder.
+ * For example, the default behavior is to split 'expr' into two where the split out expression is
+ * not reliant upon any path from 'fields', and the residual expression is the remainder.
  *
- * Any paths which should be renamed are encoded in 'renames', which maps from path names in 'expr'
- * to the new values of those paths. If the return value is {exprLeft, exprRight} or {exprLeft,
- * nullptr}, exprLeft will reflect the path renames. For example, suppose the original match
- * expression is {old: {$gt: 3}} and 'renames' contains the mapping "old" => "new". The returned
- * exprLeft value will be {new: {$gt: 3}}, provided that "old" is not in 'fields'.
+ * Any paths which might be renamed are encoded in 'renames', which maps from path names in 'expr'
+ * to the new values of those paths. If the return value is {splitOutExpr, residualExpr} or
+ * {splitOutExpr, nullptr}, splitOutExpr will reflect the path renames. For example, suppose the
+ * original match expression is {old: {$gt: 3}} and 'renames' contains the mapping "old" => "new".
+ * The returned exprLeft value will be {new: {$gt: 3}}, provided that "old" is not in 'fields'.
+ *
+ * If the previous stage is a simple rename, 'fields' should be empty and 'renames' are attempted
+ * but due to the limitation of renaming algorithm, we may fail to rename, when we return the
+ * original expression as residualExpr.
+ *
+ * TODO SERVER-74298 Remove the above comment after the ticket is done.
  *
  * Never returns {nullptr, nullptr}.
  */
 std::pair<std::unique_ptr<MatchExpression>, std::unique_ptr<MatchExpression>>
 splitMatchExpressionBy(std::unique_ptr<MatchExpression> expr,
-                       const std::set<std::string>& fields,
+                       const OrderedPathSet& fields,
                        const StringMap<std::string>& renames,
                        ShouldSplitExprFunc func = isIndependentOf);
 
@@ -155,19 +195,30 @@ splitMatchExpressionBy(std::unique_ptr<MatchExpression> expr,
  * to the new values of those paths. For example, suppose the original match expression is
  * {old: {$gt: 3}} and 'renames' contains the mapping "old" => "new". At the end, 'expr' will be
  * {new: {$gt: 3}}.
+ *
+ * The caller should make sure that `expr` is renamable as a whole.
+ *
+ * Returns whether there's any attempted but failed to rename. This case can happen when path
+ * component is part of sub-fields. For example, expr = {x: {$eq: {y: 3}}} and renames = {{"x.y",
+ * "a.b"}}. We should be able to rename 'x' and 'y' to 'a' and 'b' respectively but due to the
+ * current limitation of renaming algorithm, we cannot rename such match expressions.
+ *
+ * TODO SERVER-74298 The return value might be necessary any more after the ticket is done.
  */
-void applyRenamesToExpression(MatchExpression* expr, const StringMap<std::string>& renames);
+bool applyRenamesToExpression(MatchExpression* expr, const StringMap<std::string>& renames);
 
 /**
- * Split a MatchExpression into subexpressions targeted to separate columns. A document will match
- * the query if all of the sub expressions match. Returns an empty optional if the entire match
- * cannot be handled by the column store.
- *
- * This API will need to change in order to support more complex queries, such as $or and
- * $elemMatch.
+ * Split a MatchExpression into two parts:
+ *  - Filters which can be applied to one "column" at a time in a columnstore index. This will be
+ *    returned as a map from path to MatchExpression. For this to be safe:
+ *    - any predicate which does not  match should disqualify the entire document
+ *    - any document which doesn't contain the path should not match.
+ *  - A "residual" predicate which captures any pieces of the expression which cannot be pushed down
+ *    into a column, either because it would be incorrect to do so, or we're not smart enough to do
+ *    so yet.
  */
-boost::optional<StringMap<std::unique_ptr<MatchExpression>>> splitMatchExpressionForColumns(
-    const MatchExpression* me);
+std::pair<StringMap<std::unique_ptr<MatchExpression>>, std::unique_ptr<MatchExpression>>
+splitMatchExpressionForColumns(const MatchExpression* me);
 
 /**
  * Serializes this complex data structure for debugging purposes.

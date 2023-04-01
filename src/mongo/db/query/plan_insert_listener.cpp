@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -38,6 +37,9 @@
 #include "mongo/db/query/find_common.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo::insert_listener {
 namespace {
@@ -82,10 +84,13 @@ std::shared_ptr<CappedInsertNotifier> getCappedInsertNotifier(OperationContext* 
 
     // We can only wait if we have a collection; otherwise we should retry immediately when
     // we hit EOF.
-    auto collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespaceForRead(opCtx, nss);
+    //
+    // Hold reference to the catalog for collection lookup without locks to be safe.
+    auto catalog = CollectionCatalog::get(opCtx);
+    auto collection = catalog->lookupCollectionByNamespace(opCtx, nss);
     invariant(collection);
 
-    return collection->getCappedInsertNotifier();
+    return collection->getRecordStore()->getCappedInsertNotifier();
 }
 
 void waitForInserts(OperationContext* opCtx,

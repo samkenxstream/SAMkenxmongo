@@ -4,6 +4,21 @@ Import('env')
 
 env = env.Clone()
 
+
+def shouldBuildGRPC(myEnv):
+    return myEnv.TargetOSIs('linux') and myEnv['ENABLE_GRPC_BUILD']
+
+
+if shouldBuildGRPC(env):
+    env.SConscript(
+        dirs=[
+            'grpc',
+        ],
+        exports=[
+            'env',
+        ],
+    )
+
 env.Library(
     target='transport_layer_common',
     source=[
@@ -13,9 +28,27 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/connection_health_metrics_parameter',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/wire_version',
         '$BUILD_DIR/mongo/util/net/ssl_manager',
+    ],
+)
+
+env.Library(
+    target='ingress_handshake_metrics',
+    source=[
+        'ingress_handshake_metrics.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/commands',
+        '$BUILD_DIR/mongo/util/clock_sources',
+        'transport_layer_common',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/commands/server_status_core',
+        '$BUILD_DIR/mongo/db/server_feature_flags',
     ],
 )
 
@@ -41,6 +74,7 @@ tlEnv.Library(
         'transport_layer_manager.cpp',
     ],
     LIBDEPS=[
+        'grpc/grpc_transport_layer' if shouldBuildGRPC(tlEnv) else [],
         'transport_layer',
     ],
     LIBDEPS_PRIVATE=[
@@ -52,24 +86,25 @@ tlEnv.Library(
 tlEnv.Library(
     target='transport_layer',
     source=[
-        'transport_layer_asio.cpp',
-        'asio_utils.cpp',
-        'baton_asio_linux.cpp' if env.TargetOSIs('linux') else [],
-        'session_asio.cpp',
+        'asio/asio_networking_baton.cpp' if env.TargetOSIs('linux') else [],
+        'asio/asio_session_impl.cpp',
+        'asio/asio_transport_layer.cpp',
+        'asio/asio_utils.cpp',
         'proxy_protocol_header_parser.cpp',
         'transport_options.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base/system_error',
         '$BUILD_DIR/mongo/db/auth/authentication_restriction',
-        '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/util/executor_stats',
         'transport_layer_common',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/idl/server_parameter',
+        '$BUILD_DIR/mongo/db/commands/server_status_core',
+        '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/mongo/db/server_feature_flags',
+        '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/util/net/ssl_manager',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
         '$BUILD_DIR/third_party/shim_asio',
@@ -85,7 +120,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         'transport_layer',
-    ]
+    ],
 )
 
 tlEnv.Library(
@@ -102,10 +137,9 @@ tlEnv.Library(
         '$BUILD_DIR/mongo/db/service_context',
     ],
     LIBDEPS_PRIVATE=[
-        "$BUILD_DIR/mongo/db/server_options_core",
-        "$BUILD_DIR/mongo/idl/server_parameter",
-        "$BUILD_DIR/mongo/util/concurrency/thread_pool",
-        "$BUILD_DIR/mongo/util/processinfo",
+        '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/mongo/util/concurrency/thread_pool',
+        '$BUILD_DIR/mongo/util/processinfo',
         '$BUILD_DIR/third_party/shim_asio',
         'transport_layer_common',
     ],
@@ -116,13 +150,14 @@ env.Library(
     source=[
         'service_entry_point_impl.cpp',
         'service_entry_point_impl.idl',
-        'service_state_machine.cpp',
+        'session_workflow.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/auth/authentication_restriction',
         '$BUILD_DIR/mongo/db/dbmessage',
         '$BUILD_DIR/mongo/db/query/command_request_response',
-        '$BUILD_DIR/mongo/db/server_options_core',
+        '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/mongo/db/server_feature_flags',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/rpc/message',
@@ -132,8 +167,9 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/traffic_recorder',
-        '$BUILD_DIR/mongo/transport/message_compressor',
         '$BUILD_DIR/mongo/util/net/ssl_manager',
+        'ingress_handshake_metrics',
+        'message_compressor',
     ],
 )
 
@@ -155,7 +191,7 @@ zlibEnv.Library(
         '$BUILD_DIR/third_party/shim_snappy',
         '$BUILD_DIR/third_party/shim_zlib',
         '$BUILD_DIR/third_party/shim_zstd',
-    ]
+    ],
 )
 
 env.Library(
@@ -183,18 +219,19 @@ env.Library(
 tlEnv.CppUnitTest(
     target='transport_test',
     source=[
-        'asio_utils_test.cpp',
+        'asio/asio_transport_layer_test.cpp',
+        'asio/asio_utils_test.cpp',
         'message_compressor_manager_test.cpp',
         'message_compressor_registry_test.cpp',
-        'transport_layer_asio_test.cpp',
         'service_executor_test.cpp',
         'max_conns_override_test.cpp',
-        'service_state_machine_test.cpp',
+        'session_workflow_test.cpp',
         'proxy_protocol_header_parser_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/client/clientdriver_network',
+        '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/dbmessage',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
@@ -223,13 +260,12 @@ tlEnvTest.Append(
     # upgrade per SERVER-54569.
     CCFLAGS=[] if env.TargetOSIs('windows') else [
         '-Wno-nonnull',
-    ],
-)
+    ], )
 
 tlEnvTest.CppIntegrationTest(
     target='transport_integration_test',
     source=[
-        'transport_layer_asio_integration_test.cpp',
+        'asio/asio_transport_layer_integration_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -239,5 +275,31 @@ tlEnvTest.CppIntegrationTest(
         '$BUILD_DIR/mongo/util/version_impl',
         '$BUILD_DIR/third_party/shim_asio',
         'transport_layer_egress_init',
+    ],
+)
+
+env.Benchmark(
+    target='service_executor_bm',
+    source=[
+        'service_executor_bm.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        'service_executor',
+        'transport_layer_mock',
+    ],
+)
+
+env.Benchmark(
+    target='session_workflow_bm',
+    source=[
+        'session_workflow_bm.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        'service_entry_point',
+        'service_executor',
+        'transport_layer_mock',
     ],
 )

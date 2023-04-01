@@ -45,18 +45,18 @@ namespace mongo {
 using boost::intrusive_ptr;
 
 // These don't make sense as accumulators, so only register them as window functions.
-REGISTER_WINDOW_FUNCTION(
+REGISTER_STABLE_WINDOW_FUNCTION(
     rank, mongo::window_function::ExpressionFromRankAccumulator<AccumulatorRank>::parse);
-REGISTER_WINDOW_FUNCTION(
+REGISTER_STABLE_WINDOW_FUNCTION(
     denseRank, mongo::window_function::ExpressionFromRankAccumulator<AccumulatorDenseRank>::parse);
-REGISTER_WINDOW_FUNCTION(
+REGISTER_STABLE_WINDOW_FUNCTION(
     documentNumber,
     mongo::window_function::ExpressionFromRankAccumulator<AccumulatorDocumentNumber>::parse);
 
 void AccumulatorRank::processInternal(const Value& input, bool merging) {
     tassert(5417001, "$rank can't be merged", !merging);
     if (!_lastInput ||
-        getExpressionContext()->getValueComparator().compare(_lastInput.get(), input) != 0) {
+        getExpressionContext()->getValueComparator().compare(_lastInput.value(), input) != 0) {
         _lastRank += _numSameRank;
         _numSameRank = 1;
         _lastInput = input;
@@ -75,7 +75,7 @@ void AccumulatorDocumentNumber::processInternal(const Value& input, bool merging
 void AccumulatorDenseRank::processInternal(const Value& input, bool merging) {
     tassert(5417003, "$denseRank can't be merged", !merging);
     if (!_lastInput ||
-        getExpressionContext()->getValueComparator().compare(_lastInput.get(), input) != 0) {
+        getExpressionContext()->getValueComparator().compare(_lastInput.value(), input) != 0) {
         ++_lastRank;
         _lastInput = input;
         _memUsageBytes = sizeof(*this) + _lastInput->getApproximateSize() - sizeof(Value);

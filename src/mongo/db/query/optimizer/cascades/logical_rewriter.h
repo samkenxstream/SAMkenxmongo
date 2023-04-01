@@ -31,8 +31,8 @@
 
 #include <queue>
 
-#include "mongo/db/query/optimizer/cascades/logical_rewriter_rules.h"
 #include "mongo/db/query/optimizer/cascades/memo.h"
+#include "mongo/db/query/optimizer/cascades/rewriter_rules.h"
 #include "mongo/db/query/optimizer/utils/utils.h"
 
 namespace mongo::optimizer::cascades {
@@ -41,12 +41,6 @@ class LogicalRewriter {
     friend class RewriteContext;
 
 public:
-    /**
-     * Maximum size of PartialSchemaRequirements for a SargableNode.
-     * This limits the number of splits for index intersection.
-     */
-    static constexpr size_t kMaxPartialSchemaReqCount = 10;
-
     /*
      * How many times are we allowed to split a sargable node to facilitate index intersection.
      * Results in at most 2^N index intersections.
@@ -58,15 +52,28 @@ public:
      */
     using RewriteSet = opt::unordered_map<LogicalRewriteType, double>;
 
-    LogicalRewriter(Memo& memo, PrefixId& prefixId, RewriteSet rewriteSet);
+    LogicalRewriter(const Metadata& metadata,
+                    Memo& memo,
+                    PrefixId& prefixId,
+                    RewriteSet rewriteSet,
+                    const DebugInfo& debugInfo,
+                    const QueryHints& hints,
+                    const PathToIntervalFn& pathToInterval,
+                    const ConstFoldFn& constFold,
+                    const LogicalPropsInterface& logicalPropsDerivation,
+                    const CardinalityEstimator& cardinalityEstimator);
 
+    // This is a transient structure. We do not allow copying or moving.
     LogicalRewriter() = delete;
     LogicalRewriter(const LogicalRewriter& other) = delete;
-    LogicalRewriter(LogicalRewriter&& other) = default;
+    LogicalRewriter(LogicalRewriter&& other) = delete;
+    LogicalRewriter& operator=(const LogicalRewriter& /*other*/) = delete;
+    LogicalRewriter& operator=(LogicalRewriter&& /*other*/) = delete;
 
     GroupIdType addRootNode(const ABT& node);
     std::pair<GroupIdType, NodeIdSet> addNode(const ABT& node,
                                               GroupIdType targetGroupId,
+                                              LogicalRewriteType rule,
                                               bool addExistingNodeWithNewChild);
     void clearGroup(GroupIdType groupId);
 
@@ -86,21 +93,21 @@ public:
     static const RewriteSet& getSubstitutionSet();
 
 private:
-    using RewriteFn =
-        std::function<void(LogicalRewriter* rewriter, const MemoLogicalNodeId nodeId)>;
+    using RewriteFn = std::function<void(
+        LogicalRewriter* rewriter, const MemoLogicalNodeId nodeId, const LogicalRewriteType rule)>;
     using RewriteFnMap = opt::unordered_map<LogicalRewriteType, RewriteFn>;
 
     /**
      * Attempts to perform a reordering rewrite specified by the R template argument.
      */
     template <class AboveType, class BelowType, template <class, class> class R>
-    void bindAboveBelow(MemoLogicalNodeId nodeMemoId);
+    void bindAboveBelow(MemoLogicalNodeId nodeMemoId, LogicalRewriteType rule);
 
     /**
      * Attempts to perform a simple rewrite specified by the R template argument.
      */
     template <class Type, template <class> class R>
-    void bindSingleNode(MemoLogicalNodeId nodeMemoId);
+    void bindSingleNode(MemoLogicalNodeId nodeMemoId, LogicalRewriteType rule);
 
     void registerRewrite(LogicalRewriteType rewriteType, RewriteFn fn);
     void initializeRewrites();
@@ -115,14 +122,21 @@ private:
     std::set<int> _groupsPending;
 
     // We don't own those:
+    const Metadata& _metadata;
     Memo& _memo;
     PrefixId& _prefixId;
+    const DebugInfo& _debugInfo;
+    const QueryHints& _hints;
+    const PathToIntervalFn& _pathToInterval;
+    const ConstFoldFn& _constFold;
+    const LogicalPropsInterface& _logicalPropsDerivation;
+    const CardinalityEstimator& _cardinalityEstimator;
 
     RewriteFnMap _rewriteMap;
 
     // Contains the set of top-level index fields for a given scanDef. For example "a.b" is encoded
     // as "a". This is used to constrain the possible splits of a sargable node.
-    opt::unordered_map<std::string, opt::unordered_set<FieldNameType>> _indexFieldPrefixMap;
+    opt::unordered_map<std::string, FieldNameSet> _indexFieldPrefixMap;
 
     // Track number of times a SargableNode at a given position in the memo has been split.
     opt::unordered_map<MemoLogicalNodeId, size_t, NodeIdHash> _sargableSplitCountMap;

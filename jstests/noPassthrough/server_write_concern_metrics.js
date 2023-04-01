@@ -1,6 +1,5 @@
 // Tests writeConcern metrics in the serverStatus output.
 // @tags: [
-//   requires_journaling,
 //   requires_persistence,
 //   requires_replication,
 // ]
@@ -292,11 +291,13 @@ for (const isPSASet of [true, false]) {
     // application, as testWriteConcernMetrics will run them multiple times.
     testWriteConcernMetrics(
         {applyOps: [{op: "i", ns: testColl.getFullName(), o: {_id: 0}}]}, "insert", 1, isPSASet);
-    testWriteConcernMetrics(
-        {applyOps: [{op: "u", ns: testColl.getFullName(), o2: {_id: 0}, o: {$set: {a: 1}}}]},
-        "update",
-        1,
-        isPSASet);
+    testWriteConcernMetrics({
+        applyOps:
+            [{op: "u", ns: testColl.getFullName(), o2: {_id: 0}, o: {$v: 2, diff: {u: {a: 1}}}}]
+    },
+                            "update",
+                            1,
+                            isPSASet);
     testWriteConcernMetrics({applyOps: [{op: "d", ns: testColl.getFullName(), o: {_id: 0}}]},
                             "delete",
                             1,

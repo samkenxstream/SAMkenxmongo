@@ -49,6 +49,7 @@
 #include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -72,10 +73,10 @@ public:
      *
      * If provided, session's ref count will be bumped by this Client.
      */
-    static void initThread(StringData desc, transport::SessionHandle session = nullptr);
+    static void initThread(StringData desc, std::shared_ptr<transport::Session> session = nullptr);
     static void initThread(StringData desc,
                            ServiceContext* serviceContext,
-                           transport::SessionHandle session);
+                           std::shared_ptr<transport::Session> session);
 
     /**
      * Moves client into the thread_local for this thread. After this call, Client::getCurrent
@@ -121,15 +122,15 @@ public:
     /**
      * Returns the Session to which this client is bound, if any.
      */
-    const transport::SessionHandle& session() const& {
+    const std::shared_ptr<transport::Session>& session() const& {
         return _session;
     }
 
     boost::optional<std::string> getSniNameForSession() const {
-        return _session ? _session->getSniName() : boost::none;
+        return _session ? SSLPeerInfo::forSession(_session).sniName() : boost::none;
     }
 
-    transport::SessionHandle session() && {
+    std::shared_ptr<transport::Session> session() && {
         return std::move(_session);
     }
 
@@ -265,7 +266,7 @@ private:
     friend class ThreadClient;
     explicit Client(std::string desc,
                     ServiceContext* serviceContext,
-                    transport::SessionHandle session);
+                    std::shared_ptr<transport::Session> session);
 
     /**
      * Sets the active operation context on this client to "opCtx".
@@ -275,7 +276,7 @@ private:
     }
 
     ServiceContext* const _serviceContext;
-    const transport::SessionHandle _session;
+    const std::shared_ptr<transport::Session> _session;
 
     // Description for the client (e.g. conn8)
     const std::string _desc;
@@ -322,7 +323,7 @@ public:
     explicit ThreadClient(ServiceContext* serviceContext);
     explicit ThreadClient(StringData desc,
                           ServiceContext* serviceContext,
-                          transport::SessionHandle session = nullptr);
+                          std::shared_ptr<transport::Session> session = nullptr);
     ~ThreadClient();
     ThreadClient(const ThreadClient&) = delete;
     ThreadClient(ThreadClient&&) = delete;
@@ -337,7 +338,7 @@ public:
     }
 
 private:
-    boost::intrusive_ptr<ThreadName> _originalThreadName;
+    ThreadNameRef _originalThreadName;
 };
 
 /**

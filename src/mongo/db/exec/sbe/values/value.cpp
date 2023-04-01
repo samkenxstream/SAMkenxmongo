@@ -33,14 +33,17 @@
 
 #include "mongo/base/compare_numbers.h"
 #include "mongo/db/exec/js_function.h"
+#include "mongo/db/exec/sbe/size_estimator.h"
 #include "mongo/db/exec/sbe/values/bson.h"
+#include "mongo/db/exec/sbe/values/makeobj_spec.h"
 #include "mongo/db/exec/sbe/values/sort_spec.h"
 #include "mongo/db/exec/sbe/values/value_builder.h"
 #include "mongo/db/exec/sbe/values/value_printer.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/db/storage/key_string.h"
-#include "mongo/util/regex_util.h"
+#include "mongo/util/errno_util.h"
+#include "mongo/util/pcre_util.h"
 
 namespace mongo {
 namespace sbe {
@@ -134,69 +137,76 @@ std::pair<TypeTags, Value> makeCopyKeyString(const KeyString::Value& inKey) {
 }
 
 std::pair<TypeTags, Value> makeNewPcreRegex(StringData pattern, StringData options) {
-    auto regex = std::make_unique<PcreRegex>(pattern, options);
-    return {TypeTags::pcreRegex, bitcastFrom<PcreRegex*>(regex.release())};
+    auto regex =
+        std::make_unique<pcre::Regex>(std::string{pattern}, pcre_util::flagsToOptions(options));
+    uassert(5073402, str::stream() << "Invalid Regex: " << errorMessage(regex->error()), *regex);
+    return {TypeTags::pcreRegex, bitcastFrom<pcre::Regex*>(regex.release())};
 }
 
-std::pair<TypeTags, Value> makeCopyPcreRegex(const PcreRegex& regex) {
-    auto regexCopy = std::make_unique<PcreRegex>(regex);
-    return {TypeTags::pcreRegex, bitcastFrom<PcreRegex*>(regexCopy.release())};
+std::pair<TypeTags, Value> makeCopyPcreRegex(const pcre::Regex& regex) {
+    auto regexCopy = std::make_unique<pcre::Regex>(regex);
+    return {TypeTags::pcreRegex, bitcastFrom<pcre::Regex*>(regexCopy.release())};
 }
 
-void PcreRegex::_compile() {
-    const auto pcreOptions = regex_util::flagsToPcreOptions(_options.c_str()).all_options();
-    const char* compile_error;
-    int eoffset;
-    _pcrePtr = pcre_compile(_pattern.c_str(), pcreOptions, &compile_error, &eoffset, nullptr);
-    uassert(5073402, str::stream() << "Invalid Regex: " << compile_error, _pcrePtr != nullptr);
+std::pair<TypeTags, Value> makeCopyTimeZone(const TimeZone& tz) {
+    auto tzCopy = std::make_unique<TimeZone>(tz);
+    return {TypeTags::timeZone, bitcastFrom<TimeZone*>(tzCopy.release())};
 }
 
-int PcreRegex::execute(StringData stringView, int startPos, std::vector<int>& buf) {
-    return pcre_exec(_pcrePtr,
-                     nullptr,
-                     stringView.rawData(),
-                     stringView.size(),
-                     startPos,
-                     0,
-                     &(buf.front()),
-                     buf.size());
+KeyString::Value SortSpec::generateSortKey(const BSONObj& obj, const CollatorInterface* collator) {
+    _sortKeyGen.setCollator(collator);
+    return _sortKeyGen.computeSortKeyString(obj);
 }
 
-size_t PcreRegex::getNumberCaptures() const {
-    int numCaptures;
-    pcre_fullinfo(_pcrePtr, nullptr, PCRE_INFO_CAPTURECOUNT, &numCaptures);
-    invariant(numCaptures >= 0);
-    return static_cast<size_t>(numCaptures);
-}
+value::SortKeyComponentVector* SortSpec::generateSortKeyComponentVector(
+    FastTuple<bool, value::TypeTags, value::Value> obj, const CollatorInterface* collator) {
+    auto [objOwned, objTag, objVal] = obj;
+    ValueGuard guard(objOwned, objTag, objVal);
 
-size_t PcreRegex::getApproximateSize() const {
-    size_t pcreSize;
-    pcre_fullinfo(_pcrePtr, nullptr, PCRE_INFO_SIZE, &pcreSize);
-    return sizeof(PcreRegex) + _pattern.size() + 1 + _options.size() + 1 + pcreSize;
-}
+    // While this function accepts any type of object, for now we simply convert everything
+    // to BSON. In the future, we may change this function to avoid the conversion.
+    auto bsonObj = [&, objTag = objTag, objVal = objVal, objOwned = objOwned]() {
+        if (objTag == value::TypeTags::bsonObject) {
+            if (objOwned) {
+                // Take ownership of the temporary object here.
+                _tempVal.emplace(objTag, objVal);
+                guard.reset();
+            }
+            return BSONObj{value::bitcastTo<const char*>(objVal)};
+        } else if (objTag == value::TypeTags::Object) {
+            BSONObjBuilder objBuilder;
+            bson::convertToBsonObj(objBuilder, value::getObjectView(objVal));
+            _tempObj = objBuilder.obj();
+            return _tempObj;
+        } else {
+            MONGO_UNREACHABLE_TASSERT(7103703);
+        }
+    }();
 
-KeyString::Value SortSpec::generateSortKey(const BSONObj& obj) const {
-    KeyStringSet keySet;
-    SharedBufferFragmentBuilder allocator(KeyString::HeapBuilder::kHeapAllocatorDefaultBytes);
-    const bool skipMultikey = false;
-    MultikeyPaths* multikeyPaths = nullptr;
-    _keyGen.getKeys(allocator, obj, skipMultikey, &keySet, multikeyPaths);
 
-    // When 'isSparse' is false, BtreeKeyGenerator::getKeys() is guaranteed to insert at least
-    // one key into 'keySet', so this assertion should always be true.
-    tassert(5037000, "BtreeKeyGenerator failed to generate key", !keySet.empty());
+    _sortKeyGen.setCollator(collator);
+    // Use the generic API for getting an array of bson elements representing the
+    // sort key.
+    _sortKeyGen.generateSortKeyComponentVector(bsonObj, &_localBsonEltStorage);
 
-    // Return the first KeyString in the set.
-    return std::move(*keySet.extract_sequence().begin());
+    // Convert this array of BSONElements into the SBE SortKeyComponentVector type.
+    {
+        size_t i = 0;
+        for (auto& elt : _localBsonEltStorage) {
+            _localSortKeyComponentStorage.elts[i++] = bson::convertFrom<true>(elt);
+        }
+    }
+    return &_localSortKeyComponentStorage;
 }
 
 BtreeKeyGenerator SortSpec::initKeyGen() const {
-    tassert(
-        5037003, "SortSpec should not be passed an empty sort pattern", !_sortPattern.isEmpty());
+    tassert(5037003,
+            "SortSpec should not be passed an empty sort pattern",
+            !_sortPatternBson.isEmpty());
 
     std::vector<const char*> fields;
     std::vector<BSONElement> fixed;
-    for (auto&& elem : _sortPattern) {
+    for (auto&& elem : _sortPatternBson) {
         fields.push_back(elem.fieldName());
 
         // BtreeKeyGenerator's constructor's first parameter (the 'fields' vector) and second
@@ -210,18 +220,107 @@ BtreeKeyGenerator SortSpec::initKeyGen() const {
 
     const bool isSparse = false;
     auto version = KeyString::Version::kLatestVersion;
-    auto ordering = Ordering::make(_sortPattern);
+    auto ordering = Ordering::make(_sortPatternBson);
 
-    return {std::move(fields), std::move(fixed), isSparse, _collator, version, ordering};
+    return {std::move(fields), std::move(fixed), isSparse, version, ordering};
 }
 
 size_t SortSpec::getApproximateSize() const {
-    // _collator points to a block of memory that SortSpec doesn't own, so we don't acccount
-    // for the size of this block of memory here.
     auto size = sizeof(SortSpec);
-    size += _sortPattern.isOwned() ? _sortPattern.objsize() : 0;
-    size += _keyGen.getApproximateSize() - sizeof(_keyGen);
+    size += _sortKeyGen.getApproximateSize();
+    size += _sortPatternBson.isOwned() ? _sortPatternBson.objsize() : 0;
     return size;
+}
+
+size_t MakeObjSpec::getApproximateSize() const {
+    auto size = sizeof(MakeObjSpec);
+    size += size_estimator::estimate(fields);
+    size += size_estimator::estimate(projects);
+    size += size_estimator::estimate(allFieldsMap);
+    return size;
+}
+
+StringDataMap<size_t> MakeObjSpec::buildAllFieldsMap() const {
+    StringDataMap<size_t> m;
+
+    for (auto& p : fields) {
+        // Mark the values from 'fields' with 'std::numeric_limits<size_t>::max()'.
+        auto [it, inserted] = m.emplace(StringData(p), std::numeric_limits<size_t>::max());
+        tassert(7522900, str::stream() << "duplicate field: " << p, inserted);
+    }
+
+    for (size_t idx = 0; idx < projects.size(); ++idx) {
+        auto& p = projects[idx];
+        // Mark the values from 'projects' with their corresponding arg index.
+        auto [it, inserted] = m.emplace(StringData(p), idx);
+        tassert(7522901, str::stream() << "duplicate field: " << p, inserted);
+    }
+
+    return m;
+}
+
+std::array<uint8_t, 128> MakeObjSpec::buildBloomFilter() const {
+    // Initialize 'bf' to all zeros.
+    std::array<uint8_t, 128> bf = {{0}};
+
+    // If there are more than 64 strings in 'allFieldsMap', don't bother with the bloom filter.
+    if (allFieldsMap.size() > 64) {
+        return bf;
+    }
+
+    // Update 'bf[idx]' to store 'fieldIdx', or, in the case of a collision, '1'.
+    auto updateBloomSlot = [](std::array<uint8_t, 128>& bf, size_t idx, size_t fieldIdx) {
+        if (bf[idx] != uint8_t(fieldIdx)) {
+            bf[idx] = !bf[idx] ? uint8_t(fieldIdx) : uint8_t(1);
+        }
+    };
+
+    size_t fieldIdx = 2;
+
+    for (auto& p : fields) {
+        auto bloomIdx1 = computeBloomIdx1(p.data(), p.size());
+        auto bloomIdx2 = computeBloomIdx2(p.data(), p.size(), bloomIdx1);
+        updateBloomSlot(bf, bloomIdx1, fieldIdx);
+        updateBloomSlot(bf, bloomIdx2, fieldIdx);
+
+        ++fieldIdx;
+    }
+
+    for (size_t idx = 0; idx < projects.size(); ++idx) {
+        auto& p = projects[idx];
+
+        auto bloomIdx1 = computeBloomIdx1(p.data(), p.size());
+        auto bloomIdx2 = computeBloomIdx2(p.data(), p.size(), bloomIdx1);
+        updateBloomSlot(bf, bloomIdx1, fieldIdx);
+        updateBloomSlot(bf, bloomIdx2, fieldIdx);
+
+        ++fieldIdx;
+    }
+
+    return bf;
+}
+
+std::string MakeObjSpec::toString() const {
+    StringBuilder builder;
+    builder << (fieldBehavior == MakeObjSpec::FieldBehavior::keep ? "keep" : "drop") << ", [";
+
+    for (size_t i = 0; i < fields.size(); ++i) {
+        if (i != 0) {
+            builder << ", ";
+        }
+        builder << '"' << fields[i] << '"';
+    }
+    builder << "], [";
+
+    for (size_t i = 0; i < projects.size(); ++i) {
+        if (i != 0) {
+            builder << ", ";
+        }
+        builder << '"' << projects[i] << '"';
+    }
+    builder << "]";
+
+    return builder.str();
 }
 
 std::pair<TypeTags, Value> makeCopyJsFunction(const JsFunction& jsFunction) {
@@ -244,6 +343,11 @@ std::pair<TypeTags, Value> makeCopySortSpec(const SortSpec& ss) {
     return {TypeTags::sortSpec, ssCopy};
 }
 
+std::pair<TypeTags, Value> makeCopyMakeObjSpec(const MakeObjSpec& mos) {
+    auto mosCopy = bitcastFrom<MakeObjSpec*>(new MakeObjSpec(mos));
+    return {TypeTags::makeObjSpec, mosCopy};
+}
+
 std::pair<TypeTags, Value> makeCopyCollator(const CollatorInterface& collator) {
     auto collatorCopy = bitcastFrom<CollatorInterface*>(collator.clone().release());
     return {TypeTags::collator, collatorCopy};
@@ -264,8 +368,13 @@ std::pair<TypeTags, Value> makeCopyRecordId(const RecordId& rid) {
     return {TypeTags::RecordId, copy};
 }
 
+std::pair<TypeTags, Value> makeCopyIndexBounds(const IndexBounds& bounds) {
+    auto boundsCopy = bitcastFrom<IndexBounds*>(new IndexBounds(bounds));
+    return {TypeTags::indexBounds, boundsCopy};
+}
 
-void releaseValue(TypeTags tag, Value val) noexcept {
+
+void releaseValueDeep(TypeTags tag, Value val) noexcept {
     switch (tag) {
         case TypeTags::RecordId:
             delete getRecordIdView(val);
@@ -317,8 +426,17 @@ void releaseValue(TypeTags tag, Value val) noexcept {
         case TypeTags::sortSpec:
             delete getSortSpecView(val);
             break;
+        case TypeTags::makeObjSpec:
+            delete getMakeObjSpecView(val);
+            break;
         case TypeTags::collator:
             delete getCollatorView(val);
+            break;
+        case TypeTags::indexBounds:
+            delete getIndexBoundsView(val);
+            break;
+        case TypeTags::timeZone:
+            delete getTimeZoneView(val);
             break;
         default:
             break;
@@ -408,45 +526,6 @@ BSONType tagToType(TypeTags tag) noexcept {
             return BSONType::DBRef;
         case TypeTags::bsonCodeWScope:
             return BSONType::CodeWScope;
-        default:
-            MONGO_UNREACHABLE;
-    }
-}
-
-bool isShallowType(TypeTags tag) noexcept {
-    switch (tag) {
-        case TypeTags::Nothing:
-        case TypeTags::Null:
-        case TypeTags::NumberInt32:
-        case TypeTags::NumberInt64:
-        case TypeTags::NumberDouble:
-        case TypeTags::Date:
-        case TypeTags::Timestamp:
-        case TypeTags::Boolean:
-        case TypeTags::StringSmall:
-        case TypeTags::MinKey:
-        case TypeTags::MaxKey:
-        case TypeTags::bsonUndefined:
-        case TypeTags::LocalLambda:
-            return true;
-        case TypeTags::RecordId:
-        case TypeTags::NumberDecimal:
-        case TypeTags::StringBig:
-        case TypeTags::bsonString:
-        case TypeTags::bsonSymbol:
-        case TypeTags::Array:
-        case TypeTags::ArraySet:
-        case TypeTags::Object:
-        case TypeTags::ObjectId:
-        case TypeTags::bsonObjectId:
-        case TypeTags::bsonObject:
-        case TypeTags::bsonArray:
-        case TypeTags::bsonBinData:
-        case TypeTags::ksValue:
-        case TypeTags::bsonRegex:
-        case TypeTags::bsonJavascript:
-        case TypeTags::bsonDBPointer:
-            return false;
         default:
             MONGO_UNREACHABLE;
     }
@@ -585,6 +664,11 @@ std::size_t hashValue(TypeTags tag, Value val, const CollatorInterface* collator
             return hashCombine(
                 hashCombine(hashInit(), abslHash(cws.code)),
                 hashValue(TypeTags::bsonObject, bitcastFrom<const char*>(cws.scope)));
+        }
+        case TypeTags::timeZone: {
+            auto timezone = getTimeZoneView(val);
+            return hashCombine(hashCombine(hashInit(), abslHash(timezone->getTzInfo())),
+                               abslHash(timezone->getUtcOffset().count()));
         }
         default:
             break;
@@ -828,6 +912,9 @@ std::pair<TypeTags, Value> compareValue(TypeTags lhsTag,
                             bitcastFrom<const char*>(rhsCws.scope));
     } else {
         // Different types.
+        if (lhsTag == TypeTags::Nothing || rhsTag == TypeTags::Nothing) {
+            return {TypeTags::Nothing, 0};
+        }
         auto lhsType = tagToType(lhsTag);
         auto rhsType = tagToType(rhsTag);
         tassert(5365500, "values cannot have the same type", lhsType != rhsType);
@@ -836,17 +923,17 @@ std::pair<TypeTags, Value> compareValue(TypeTags lhsTag,
     }
 }
 
-bool isNaN(TypeTags tag, Value val) {
+bool isNaN(TypeTags tag, Value val) noexcept {
     return (tag == TypeTags::NumberDouble && std::isnan(bitcastTo<double>(val))) ||
         (tag == TypeTags::NumberDecimal && bitcastTo<Decimal128>(val).isNaN());
 }
 
-bool isInfinity(TypeTags tag, Value val) {
+bool isInfinity(TypeTags tag, Value val) noexcept {
     return (tag == TypeTags::NumberDouble && std::isinf(bitcastTo<double>(val))) ||
         (tag == TypeTags::NumberDecimal && bitcastTo<Decimal128>(val).isInfinite());
 }
 
-void ArraySet::push_back(TypeTags tag, Value val) {
+bool ArraySet::push_back(TypeTags tag, Value val) {
     if (tag != TypeTags::Nothing) {
         ValueGuard guard{tag, val};
         auto [it, inserted] = _values.insert({tag, val});
@@ -854,7 +941,11 @@ void ArraySet::push_back(TypeTags tag, Value val) {
         if (inserted) {
             guard.reset();
         }
+
+        return inserted;
     }
+
+    return false;
 }
 
 std::pair<TypeTags, Value> ArrayEnumerator::getViewOfValue() const {
@@ -863,8 +954,7 @@ std::pair<TypeTags, Value> ArrayEnumerator::getViewOfValue() const {
     } else if (_arraySet) {
         return {_iter->first, _iter->second};
     } else {
-        auto sv = bson::fieldNameView(_arrayCurrent);
-        return bson::convertFrom<true>(_arrayCurrent, _arrayEnd, sv.size());
+        return bson::convertFrom<true>(_arrayCurrent, _arrayEnd, _fieldNameSize);
     }
 }
 
@@ -882,12 +972,14 @@ bool ArrayEnumerator::advance() {
 
         return _iter != _arraySet->values().end();
     } else {
-        if (*_arrayCurrent != 0) {
-            auto sv = bson::fieldNameView(_arrayCurrent);
-            _arrayCurrent = bson::advance(_arrayCurrent, sv.size());
+        if (_arrayCurrent != _arrayEnd - 1) {
+            _arrayCurrent = bson::advance(_arrayCurrent, _fieldNameSize);
+            if (_arrayCurrent != _arrayEnd - 1) {
+                _fieldNameSize = TinyStrHelpers::strlen(bson::fieldNameRaw(_arrayCurrent));
+            }
         }
 
-        return *_arrayCurrent != 0;
+        return _arrayCurrent != _arrayEnd - 1;
     }
 }
 
@@ -895,7 +987,7 @@ std::pair<TypeTags, Value> ObjectEnumerator::getViewOfValue() const {
     if (_object) {
         return _object->getAt(_index);
     } else {
-        auto sv = bson::fieldNameView(_objectCurrent);
+        auto sv = bson::fieldNameAndLength(_objectCurrent);
         return bson::convertFrom<true>(_objectCurrent, _objectEnd, sv.size());
     }
 }
@@ -909,7 +1001,7 @@ bool ObjectEnumerator::advance() {
         return _index < _object->size();
     } else {
         if (*_objectCurrent != 0) {
-            auto sv = bson::fieldNameView(_objectCurrent);
+            auto sv = bson::fieldNameAndLength(_objectCurrent);
             _objectCurrent = bson::advance(_objectCurrent, sv.size());
         }
 
@@ -927,7 +1019,7 @@ StringData ObjectEnumerator::getFieldName() const {
         }
     } else {
         if (*_objectCurrent != 0) {
-            return bson::fieldNameView(_objectCurrent);
+            return bson::fieldNameAndLength(_objectCurrent);
         } else {
             return ""_sd;
         }

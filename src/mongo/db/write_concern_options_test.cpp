@@ -150,14 +150,12 @@ TEST(WriteConcernOptionsTest, ParseWTimeoutAsNaNDouble) {
     ASSERT_EQUALS(WriteConcernOptions::kNoTimeout, options.wTimeout);
 }
 
-TEST(WriteConcernOptionsTest, ParseWTimeoutAsDoubleLargerThanInt) {
+TEST(WriteConcernOptionsTest, ParseWTimeoutAsDoubleLargerThanIntFails) {
     // Set wtimeout to a double with value larger than INT_MAX.
     auto sw = WriteConcernOptions::parse(BSON("wtimeout" << 2999999999.0));
-    ASSERT_OK(sw.getStatus());
-    WriteConcernOptions options = sw.getValue();
-    ASSERT_TRUE(WriteConcernOptions::SyncMode::UNSET == options.syncMode);
-    ASSERT_EQUALS(1, stdx::get<int64_t>(options.w));
-    ASSERT_EQUALS(options.wTimeout, Milliseconds{2999999999});
+    auto status = sw.getStatus();
+    ASSERT_NOT_OK(status);
+    ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
 }
 
 TEST(WriteConcernOptionsTest, ParseReturnsFailedToParseOnUnknownField) {
@@ -213,12 +211,12 @@ TEST(WriteConcernOptionsTest, ParseWithTags) {
     ASSERT(wc != wc5);
 }
 
-TEST(WriteConcernOptionsTest, WTagsNotPermittedFCVLessThan53) {
-    serverGlobalParams.mutableFeatureCompatibility.setVersion(
-        multiversion::FeatureCompatibilityVersion::kVersion_5_2);
-    auto status = WriteConcernOptions::parse(BSON("w" << BSON("abc" << 1))).getStatus();
-    ASSERT_EQUALS(ErrorCodes::FailedToParse, status);
-    ASSERT_STRING_CONTAINS(status.reason(), "w has to be a number or string");
+TEST(WriteConcernOptionsTest, ParseWithWNan) {
+    auto sw = WriteConcernOptions::parse(BSON("w" << std::nan("1")));
+    auto status = sw.getStatus();
+    ASSERT_NOT_OK(status);
+    ASSERT_EQUALS(ErrorCodes::FailedToParse, status.code());
+    ASSERT_STRING_CONTAINS(status.reason(), "w cannot be NaN");
 }
 
 }  // namespace

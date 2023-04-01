@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include "mongo/db/session_catalog.h"
+#include "mongo/db/session/session_catalog.h"
 
 namespace mongo {
 
@@ -68,7 +68,7 @@ public:
      * Check-in may only be called if the session has actually been checked out previously and
      * similarly check-out may only be called if the session is not checked out already.
      */
-    static void checkIn(OperationContext* opCtx);
+    static void checkIn(OperationContext* opCtx, OperationContextSession::CheckInReason reason);
     static void checkOut(OperationContext* opCtx);
 
 private:

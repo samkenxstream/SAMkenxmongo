@@ -36,10 +36,10 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/cancelable_operation_context.h"
 #include "mongo/db/s/resharding/donor_oplog_id_gen.h"
-#include "mongo/db/s/resharding/resharding_metrics_new.h"
+#include "mongo/db/s/resharding/resharding_oplog_applier_metrics.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/resharding/common_types_gen.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/util/cancellation.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/future.h"
@@ -49,7 +49,6 @@ namespace mongo {
 class OperationContext;
 class ReshardingOplogApplier;
 class ReshardingCollectionCloner;
-class ReshardingMetrics;
 class ReshardingOplogFetcher;
 class ReshardingTxnCloner;
 class ServiceContext;
@@ -60,6 +59,9 @@ namespace executor {
 class TaskExecutor;
 
 }  // namespace executor
+
+using ReshardingApplierMetricsMap =
+    std::map<ShardId, std::unique_ptr<ReshardingOplogApplierMetrics>>;
 
 /**
  * Manages the full sequence of data replication in resharding on the recipient.
@@ -139,7 +141,7 @@ public:
     static std::unique_ptr<ReshardingDataReplicationInterface> make(
         OperationContext* opCtx,
         ReshardingMetrics* metrics,
-        ReshardingMetricsNew* metricsNew,
+        ReshardingApplierMetricsMap* applierMetricsMap,
         CommonReshardingMetadata metadata,
         const std::vector<DonorShardFetchTimestamp>& donorShards,
         Timestamp cloneTimestamp,
@@ -214,8 +216,7 @@ private:
 
     static std::vector<std::unique_ptr<ReshardingOplogApplier>> _makeOplogAppliers(
         OperationContext* opCtx,
-        ReshardingMetrics* metrics,
-        ReshardingMetricsNew* metricsNew,
+        ReshardingApplierMetricsMap* applierMetricsMap,
         const CommonReshardingMetadata& metadata,
         const std::vector<DonorShardFetchTimestamp>& donorShards,
         Timestamp cloneTimestamp,

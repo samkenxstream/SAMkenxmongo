@@ -42,58 +42,62 @@ class PlanStageReqs;
 class PlanStageSlots;
 
 /**
- * This method generates an SBE plan stage tree implementing an index scan. It returns a tuple
- * containing: (1) a slot produced by the index scan that holds the record ID ('recordIdSlot');
- * (2) a slot vector produced by the index scan which hold parts of the index key ('indexKeySlots');
- * and (3) the SBE plan stage tree. 'indexKeySlots' will only contain slots for the parts of the
- * index key specified by the 'indexKeysToInclude' bitset.
- *
- * If the caller provides a slot ID for the 'returnKeySlot' parameter, this method will populate
- * the specified slot with the rehydrated index key for each record.
+ * A list of low and high key values representing ranges over a particular index.
+ */
+using IndexIntervals =
+    std::vector<std::pair<std::unique_ptr<KeyString::Value>, std::unique_ptr<KeyString::Value>>>;
+
+/**
+ * This method returns a pair containing: (1) an SBE plan stage tree implementing an index scan;
+ * and (2) a PlanStageSlots object containing a kRecordId slot, possibly some other kMeta slots,
+ * and slots produced by the index scan that correspond to parts of the index key specified by
+ * 'fieldBitset | sortKeyBitset'.
  */
 std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateIndexScan(
     StageBuilderState& state,
     const CollectionPtr& collection,
     const IndexScanNode* ixn,
-    const sbe::IndexKeysInclusionSet& indexKeyBitset,
+    const sbe::IndexKeysInclusionSet& fieldBitset,
+    const sbe::IndexKeysInclusionSet& sortKeyBitset,
     PlanYieldPolicy* yieldPolicy,
     StringMap<const IndexAccessMethod*>* iamMap,
     bool needsCorruptionCheck);
 
 /**
- * Constructs the most simple version of an index scan from the single interval index bounds. The
- * generated subtree will have the following form:
- *
- *         nlj [indexIdSlot, keyPatternSlot] [lowKeySlot, highKeySlot]
- *              left
- *                  project [indexIdSlot = <indexName>, keyPatternSlot = <index key pattern>,
- *                          lowKeySlot =  KS(...), highKeySlot = KS(...)]
- *                  limit 1
- *                  coscan
- *               right
- *                  ixseek lowKeySlot highKeySlot recordIdSlot [] @coll @index
- *
- * The inner branch of the nested loop join produces a single row with the low/high keys which is
- * fed to the ixscan.
- *
- * If 'recordSlot' is provided, than the corresponding slot will be filled out with each KeyString
- * in the index.
+ * Constructs low/high key values from the given index 'bounds' if they can be represented either as
+ * a single interval between the low and high keys, or multiple single intervals. If index bounds
+ * for some interval cannot be expressed as valid low/high keys, then an empty vector is returned.
  */
-std::pair<sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>> generateSingleIntervalIndexScan(
-    const CollectionPtr& collection,
-    const std::string& indexName,
-    const BSONObj& keyPattern,
-    bool forward,
-    std::unique_ptr<KeyString::Value> lowKey,
-    std::unique_ptr<KeyString::Value> highKey,
-    sbe::IndexKeysInclusionSet indexKeysToInclude,
-    sbe::value::SlotVector vars,
-    boost::optional<sbe::value::SlotId> snapshotIdSlot,
-    boost::optional<sbe::value::SlotId> indexIdSlot,
-    boost::optional<sbe::value::SlotId> recordSlot,
-    boost::optional<sbe::value::SlotId> keyPatternSlot,
-    sbe::value::SlotIdGenerator* slotIdGenerator,
-    PlanYieldPolicy* yieldPolicy,
-    PlanNodeId nodeId);
+IndexIntervals makeIntervalsFromIndexBounds(const IndexBounds& bounds,
+                                            bool forward,
+                                            KeyString::Version version,
+                                            Ordering ordering);
 
+/**
+ * Construct an array containing objects with the low and high keys for each interval.
+ *
+ * E.g., [ {l: KS(...), h: KS(...)},
+ *         {l: KS(...), h: KS(...)}, ... ]
+ */
+std::pair<sbe::value::TypeTags, sbe::value::Value> packIndexIntervalsInSbeArray(
+    IndexIntervals intervals);
+
+/**
+ * Constructs a generic multi-interval index scan. Depending on the intervals will either execute
+ * the optimized or the generic index scan subplan.
+ *
+ * This method returns a pair containing: (1) an SBE plan stage tree implementing a generic multi-
+ * interval index scan; and (2) a PlanStageSlots object containing a kRecordId slot, possibly some
+ * other kMeta slots, and slots produced by the index scan that correspond to parts of the index
+ * key specified by 'fieldBitset | sortKeyBitset'.
+ */
+std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateIndexScanWithDynamicBounds(
+    StageBuilderState& state,
+    const CollectionPtr& collection,
+    const IndexScanNode* ixn,
+    const sbe::IndexKeysInclusionSet& fieldBitset,
+    const sbe::IndexKeysInclusionSet& sortKeyBitset,
+    PlanYieldPolicy* yieldPolicy,
+    StringMap<const IndexAccessMethod*>* iamMap,
+    bool needsCorruptionCheck);
 }  // namespace mongo::stage_builder

@@ -2,12 +2,17 @@
  * Tests that timestamped reads, reads with snapshot and afterClusterTime, wait for the prepare
  * transaction oplog entry to be visible before choosing a read timestamp.
  *
+ * The test runs commands that are not allowed with security token: prepareTransaction.
  * @tags: [
+ *  not_allowed_with_security_token,
  *  uses_transactions,
  *  uses_prepare_transaction,
  *  uses_parallel_shell,
  *  # 'setDefaultRWConcern' is not supposed to be run on shard nodes.
  *  command_not_supported_in_serverless,
+ *   # TODO SERVER-70847: Snapshot reads do not succeed on non-conflicting documents while txn is
+ *   # in prepare.
+ *  cqf_incompatible,
  * ]
  */
 (function() {
@@ -44,7 +49,6 @@ TestData.otherDocFilter = {
  * certain reads and that prepare conflicts block other types of reads.
  */
 const readThreadFunc = function(readFunc, _collName, hangTimesEntered, logTimesEntered) {
-    load("jstests/libs/logv2_helpers.js");
     load("jstests/libs/fail_point_util.js");
 
     // Do not start reads until we are blocked in 'prepareTransaction'.

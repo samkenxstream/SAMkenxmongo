@@ -34,7 +34,8 @@ let txnWriteTs;
 
 const mongos = testColl.getMongo();
 
-const internalTransactionsEnabled = areInternalTransactionsEnabled(mongos);
+const updateDocumentShardKeyUsingTransactionApiEnabled =
+    isUpdateDocumentShardKeyUsingTransactionApiEnabled(mongos);
 
 const recipientShardNames = reshardingTest.recipientShardNames;
 reshardingTest.withReshardingInBackground(  //
@@ -51,10 +52,18 @@ reshardingTest.withReshardingInBackground(  //
         const tempColl = mongos.getCollection(tempNs);
         assert.soon(() => tempColl.findOne(docToUpdate) !== null);
 
-        assert.commandFailedWithCode(
-            testColl.update({_id: 0, x: 2, s: 2}, {$set: {y: 10}}),
-            ErrorCodes.IllegalOperation,
-            'was able to update value under new shard key as ordinary write');
+        // When the updateDocumentShardKeyUsingTransactionApi feature flag is enabled, ordinary
+        // updates that modify a document's shard key will complete.
+        assert.commandWorked(testColl.insert({_id: 1, x: 2, s: 2, y: 2}));
+        const updateRes = testColl.update({_id: 1, x: 2, s: 2}, {$set: {y: 10}});
+        if (updateDocumentShardKeyUsingTransactionApiEnabled) {
+            assert.commandWorked(updateRes);
+        } else {
+            assert.commandFailedWithCode(
+                updateRes,
+                ErrorCodes.IllegalOperation,
+                'was able to update value under new shard key as ordinary write');
+        }
 
         const session = testColl.getMongo().startSession({retryWrites: true});
         const sessionColl =
@@ -68,8 +77,8 @@ reshardingTest.withReshardingInBackground(  //
         assert.commandFailedWithCode(
             sessionColl.update({_id: 0}, {$set: {y: 10}}),
             31025,
-            'was able to update value under new shard key without specifying the full shard key ' +
-                'in the query');
+            'was able to update value under new shard key without specifying the full shard ' +
+                'key in the query');
 
         let res;
         assert.soon(
@@ -108,7 +117,7 @@ reshardingTest.withReshardingInBackground(  //
             // version to be bumped. The StaleConfig error won't be automatically retried by mongos
             // for the second statement in the transaction (the insert) and would lead to a
             // NoSuchTransaction error.
-            if (internalTransactionsEnabled) {
+            if (updateDocumentShardKeyUsingTransactionApiEnabled) {
                 // The handling of WCOS errors with internal transactions advances the router's
                 // notion of the transaction "statement" number between the initial update, the
                 // delete, and the insert, so if the shard version changes and is detected by the
@@ -133,7 +142,7 @@ const donorOplogColl0 = donor0.getCollection('local.oplog.rs');
 
 function assertOplogEntryIsDeleteInsertApplyOps(entry, isRetryableWrite) {
     assert(entry.o.hasOwnProperty('applyOps'), entry);
-    if (internalTransactionsEnabled && isRetryableWrite) {
+    if (updateDocumentShardKeyUsingTransactionApiEnabled && isRetryableWrite) {
         // With internal transactions the applyOps array for a retryable write update will have a
         // noop entry at the front.
         assert.eq(entry.o.applyOps.length, 3, entry);

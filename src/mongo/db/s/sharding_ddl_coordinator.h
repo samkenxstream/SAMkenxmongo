@@ -29,16 +29,21 @@
 
 #pragma once
 
-#include "mongo/db/internal_session_pool.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/persistent_task_store.h"
-#include "mongo/db/s/dist_lock_manager.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/wait_for_majority_service.h"
+#include "mongo/db/s/ddl_lock_manager.h"
 #include "mongo/db/s/forwardable_operation_metadata.h"
 #include "mongo/db/s/sharding_ddl_coordinator_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/db/session/internal_session_pool.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/future.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 
@@ -51,14 +56,14 @@ public:
 
     ~ShardingDDLCoordinator();
 
-    /*
-     * Check if the given coordinator document has the same options as this.
-     *
-     * This is used to decide if we can join a previously created coordinator.
-     * In the case the given coordinator document has incompatible options with this,
-     * this function must throw a ConflictingOperationInProgress exception with an adequate message.
+    /**
+     * Whether this coordinator is allowed to start when user write blocking is enabled, even if the
+     * writeBlockingBypass flag is not set. Coordinators that don't affect user data shall always be
+     * allowed to run even when user write blocking is enabled.
      */
-    virtual void checkIfOptionsConflict(const BSONObj& coorDoc) const = 0;
+    virtual bool canAlwaysStartWhenUserWritesAreDisabled() const {
+        return false;
+    }
 
     /*
      * Returns a future that will be completed when the construction of this coordinator instance
@@ -82,86 +87,37 @@ public:
         return _completionPromise.getFuture();
     }
 
-    const NamespaceString& nss() const {
-        return _coordId.getNss();
-    }
-
     DDLCoordinatorTypeEnum operationType() const {
         return _coordId.getOperationType();
     }
 
     const ForwardableOperationMetadata& getForwardableOpMetadata() const {
-        invariant(metadata().getForwardableOpMetadata());
-        return metadata().getForwardableOpMetadata().get();
+        invariant(_forwardableOpMetadata);
+        return _forwardableOpMetadata.get();
     }
 
     const boost::optional<mongo::DatabaseVersion>& getDatabaseVersion() const& {
-        return metadata().getDatabaseVersion();
+        return _databaseVersion;
     }
 
 protected:
+    const NamespaceString& originalNss() const {
+        return _coordId.getNss();
+    }
+
+    virtual const NamespaceString& nss() const {
+        if (const auto& bucketNss = metadata().getBucketNss()) {
+            return bucketNss.get();
+        }
+        return originalNss();
+    }
+
     virtual std::vector<StringData> _acquireAdditionalLocks(OperationContext* opCtx) {
         return {};
     };
 
     virtual ShardingDDLCoordinatorMetadata const& metadata() const = 0;
-
-    template <typename StateDoc>
-    StateDoc _insertStateDocument(StateDoc&& newDoc) {
-        auto copyMetadata = newDoc.getShardingDDLCoordinatorMetadata();
-        copyMetadata.setRecoveredFromDisk(true);
-        newDoc.setShardingDDLCoordinatorMetadata(copyMetadata);
-
-        auto opCtx = cc().makeOperationContext();
-        PersistentTaskStore<StateDoc> store(NamespaceString::kShardingDDLCoordinatorsNamespace);
-        store.add(opCtx.get(), newDoc, WriteConcerns::kMajorityWriteConcernShardingTimeout);
-
-        return std::move(newDoc);
-    }
-
-    template <typename StateDoc>
-    StateDoc _updateStateDocument(OperationContext* opCtx, StateDoc&& newDoc) {
-        PersistentTaskStore<StateDoc> store(NamespaceString::kShardingDDLCoordinatorsNamespace);
-        invariant(newDoc.getShardingDDLCoordinatorMetadata().getRecoveredFromDisk());
-        store.update(opCtx,
-                     BSON(StateDoc::kIdFieldName << newDoc.getId().toBSON()),
-                     newDoc.toBSON(),
-                     WriteConcerns::kMajorityWriteConcernShardingTimeout);
-        return std::move(newDoc);
-    }
-
-    // lazily acqiure Logical Session ID and a txn number
-    template <typename StateDoc>
-    StateDoc _updateSession(OperationContext* opCtx, StateDoc const& doc) {
-        auto newShardingDDLCoordinatorMetadata = doc.getShardingDDLCoordinatorMetadata();
-
-        auto optSession = newShardingDDLCoordinatorMetadata.getSession();
-        if (optSession) {
-            auto txnNumber = optSession->getTxnNumber();
-            optSession->setTxnNumber(++txnNumber);
-            newShardingDDLCoordinatorMetadata.setSession(optSession);
-        } else {
-            auto session = InternalSessionPool::get(opCtx)->acquireSystemSession();
-            newShardingDDLCoordinatorMetadata.setSession(
-                ShardingDDLSession(session.getSessionId(), session.getTxnNumber()));
-        }
-
-        StateDoc newDoc(doc);
-        newDoc.setShardingDDLCoordinatorMetadata(std::move(newShardingDDLCoordinatorMetadata));
-        return _updateStateDocument(opCtx, std::move(newDoc));
-    }
-
-    template <typename StateDoc>
-    OperationSessionInfo getCurrentSession(StateDoc const& doc) const {
-        invariant(doc.getShardingDDLCoordinatorMetadata().getSession());
-        ShardingDDLSession shardingDDLSession =
-            *doc.getShardingDDLCoordinatorMetadata().getSession();
-
-        OperationSessionInfo osi;
-        osi.setSessionId(shardingDDLSession.getLsid());
-        osi.setTxnNumber(shardingDDLSession.getTxnNumber());
-        return osi;
-    }
+    virtual void setMetadata(ShardingDDLCoordinatorMetadata&& metadata) = 0;
 
     /*
      * Performs a noop write on all shards and the configsvr using the sessionId and txnNumber
@@ -181,10 +137,18 @@ protected:
         return false;
     };
 
+    /*
+     * Specify if the given error will be retried by the ddl coordinator infrastructure.
+     */
+    bool _isRetriableErrorForDDLCoordinator(const Status& status);
+
     ShardingDDLCoordinatorService* _service;
     const ShardingDDLCoordinatorId _coordId;
 
     const bool _recoveredFromDisk;
+    const boost::optional<mongo::ForwardableOperationMetadata> _forwardableOpMetadata;
+    const boost::optional<mongo::DatabaseVersion> _databaseVersion;
+
     bool _firstExecution{
         true};  // True only when executing the coordinator for the first time (meaning it's not a
                 // retry after a retryable error nor a recovered instance from a previous primary)
@@ -197,6 +161,11 @@ private:
     virtual ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                           const CancellationToken& token) noexcept = 0;
 
+    virtual ExecutorFuture<void> _cleanupOnAbort(
+        std::shared_ptr<executor::ScopedTaskExecutor> executor,
+        const CancellationToken& token,
+        const Status& status) noexcept;
+
     void interrupt(Status status) override final;
 
     bool _removeDocument(OperationContext* opCtx);
@@ -207,12 +176,271 @@ private:
     ExecutorFuture<void> _acquireLockAsync(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                            const CancellationToken& token,
                                            StringData resource);
+    ExecutorFuture<void> _translateTimeseriesNss(
+        std::shared_ptr<executor::ScopedTaskExecutor> executor, const CancellationToken& token);
+
+    virtual boost::optional<Status> getAbortReason() const;
 
     Mutex _mutex = MONGO_MAKE_LATCH("ShardingDDLCoordinator::_mutex");
     SharedPromise<void> _constructionCompletionPromise;
     SharedPromise<void> _completionPromise;
 
-    std::stack<DistLockManager::ScopedLock> _scopedLocks;
+    std::stack<DDLLockManager::ScopedLock> _scopedLocks;
 };
+
+template <class StateDoc>
+class ShardingDDLCoordinatorImpl : public ShardingDDLCoordinator {
+public:
+    boost::optional<BSONObj> reportForCurrentOp(
+        MongoProcessInterface::CurrentOpConnectionsMode connMode,
+        MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override {
+        return basicReportBuilder().obj();
+    }
+
+protected:
+    ShardingDDLCoordinatorImpl(ShardingDDLCoordinatorService* service,
+                               const std::string& name,
+                               const BSONObj& initialStateDoc)
+        : ShardingDDLCoordinator(service, initialStateDoc),
+          _coordinatorName(name),
+          /*
+           * Force a deserialisation + serialisation of the initialStateDoc to ensure that
+           * _initialState is a full deep copy of the received parameter.
+           */
+          _initialState(
+              StateDoc::parse(IDLParserContext("CoordinatorInitialState"), initialStateDoc)
+                  .toBSON()),
+          _doc(StateDoc::parse(IDLParserContext("CoordinatorDocument"), _initialState)) {}
+
+    ShardingDDLCoordinatorMetadata const& metadata() const override {
+        return _doc.getShardingDDLCoordinatorMetadata();
+    }
+
+    void setMetadata(ShardingDDLCoordinatorMetadata&& metadata) override {
+        stdx::lock_guard lk{_docMutex};
+        _doc.setShardingDDLCoordinatorMetadata(std::move(metadata));
+    }
+
+    virtual void appendCommandInfo(BSONObjBuilder* cmdInfoBuilder) const {};
+
+    virtual BSONObjBuilder basicReportBuilder() const noexcept {
+        BSONObjBuilder bob;
+
+        // Append static info
+        bob.append("type", "op");
+        bob.append("ns", originalNss().toString());
+        bob.append("desc", _coordinatorName);
+        bob.append("op", "command");
+        bob.append("active", true);
+
+        // Append dynamic fields from the state doc
+        {
+            stdx::lock_guard lk{_docMutex};
+            if (const auto& bucketNss = _doc.getBucketNss()) {
+                // Bucket namespace is only present in case the collection is a sharded timeseries
+                bob.append("bucketNamespace", bucketNss.get().toString());
+            }
+        }
+
+        // Create command description
+        BSONObjBuilder cmdInfoBuilder;
+        {
+            stdx::lock_guard lk{_docMutex};
+            if (const auto& optComment = getForwardableOpMetadata().getComment()) {
+                cmdInfoBuilder.append(optComment.get().firstElement());
+            }
+        }
+        appendCommandInfo(&cmdInfoBuilder);
+        bob.append("command", cmdInfoBuilder.obj());
+
+        return bob;
+    }
+
+    const std::string _coordinatorName;
+    const BSONObj _initialState;
+    mutable Mutex _docMutex = MONGO_MAKE_LATCH("ShardingDDLCoordinator::_docMutex");
+    StateDoc _doc;
+};
+
+template <class StateDoc, class Phase>
+class RecoverableShardingDDLCoordinator : public ShardingDDLCoordinatorImpl<StateDoc> {
+protected:
+    using ShardingDDLCoordinatorImpl<StateDoc>::_doc;
+    using ShardingDDLCoordinatorImpl<StateDoc>::_docMutex;
+
+    RecoverableShardingDDLCoordinator(ShardingDDLCoordinatorService* service,
+                                      const std::string& name,
+                                      const BSONObj& initialStateDoc)
+        : ShardingDDLCoordinatorImpl<StateDoc>(service, name, initialStateDoc) {}
+
+    virtual StringData serializePhase(const Phase& phase) const = 0;
+
+    template <typename Func>
+    auto _buildPhaseHandler(const Phase& newPhase, Func&& handlerFn) {
+        return [=] {
+            const auto& currPhase = _doc.getPhase();
+
+            if (currPhase > newPhase) {
+                // Do not execute this phase if we already reached a subsequent one.
+                return;
+            }
+            if (currPhase < newPhase) {
+                // Persist the new phase if this is the first time we are executing it.
+                _enterPhase(newPhase);
+            }
+            return handlerFn();
+        };
+    }
+
+    virtual void _enterPhase(const Phase& newPhase) {
+        auto newDoc = [&] {
+            stdx::lock_guard lk{_docMutex};
+            return _doc;
+        }();
+
+        newDoc.setPhase(newPhase);
+
+        LOGV2_DEBUG(5390501,
+                    2,
+                    "DDL coordinator phase transition",
+                    "coordinatorId"_attr = _doc.getId(),
+                    "newPhase"_attr = serializePhase(newDoc.getPhase()),
+                    "oldPhase"_attr = serializePhase(_doc.getPhase()));
+
+        ServiceContext::UniqueOperationContext uniqueOpCtx;
+        auto opCtx = cc().getOperationContext();
+        if (!opCtx) {
+            uniqueOpCtx = cc().makeOperationContext();
+            opCtx = uniqueOpCtx.get();
+        }
+
+        if (_doc.getPhase() == Phase::kUnset) {
+            _insertStateDocument(opCtx, std::move(newDoc));
+        } else {
+            _updateStateDocument(opCtx, std::move(newDoc));
+        }
+    }
+
+    BSONObjBuilder basicReportBuilder() const noexcept override {
+        auto baseReportBuilder = ShardingDDLCoordinatorImpl<StateDoc>::basicReportBuilder();
+
+        const auto currPhase = [&]() {
+            stdx::lock_guard l{_docMutex};
+            return _doc.getPhase();
+        }();
+
+        baseReportBuilder.append("currentPhase", serializePhase(currPhase));
+        return baseReportBuilder;
+    }
+
+    void _insertStateDocument(OperationContext* opCtx, StateDoc&& newDoc) {
+        auto copyMetadata = newDoc.getShardingDDLCoordinatorMetadata();
+        copyMetadata.setRecoveredFromDisk(true);
+        newDoc.setShardingDDLCoordinatorMetadata(copyMetadata);
+
+        PersistentTaskStore<StateDoc> store(NamespaceString::kShardingDDLCoordinatorsNamespace);
+        try {
+            store.add(opCtx, newDoc, WriteConcerns::kMajorityWriteConcernNoTimeout);
+        } catch (const ExceptionFor<ErrorCodes::DuplicateKey>&) {
+            // A series of step-up and step-down events can cause a node to try and insert the
+            // document when it has already been persisted locally, but we must still wait for
+            // majority commit.
+            const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+            const auto lastLocalOpTime = replCoord->getMyLastAppliedOpTime();
+            WaitForMajorityService::get(opCtx->getServiceContext())
+                .waitUntilMajority(lastLocalOpTime, opCtx->getCancellationToken())
+                .get(opCtx);
+        }
+
+        {
+            stdx::lock_guard lk{_docMutex};
+            _doc = std::move(newDoc);
+        }
+    }
+
+    void _updateStateDocument(OperationContext* opCtx, StateDoc&& newDoc) {
+        PersistentTaskStore<StateDoc> store(NamespaceString::kShardingDDLCoordinatorsNamespace);
+        invariant(newDoc.getShardingDDLCoordinatorMetadata().getRecoveredFromDisk());
+        store.update(opCtx,
+                     BSON(StateDoc::kIdFieldName << newDoc.getId().toBSON()),
+                     newDoc.toBSON(),
+                     WriteConcerns::kMajorityWriteConcernNoTimeout);
+
+        {
+            stdx::lock_guard lk{_docMutex};
+            _doc = std::move(newDoc);
+        }
+    }
+
+    // lazily acquire Logical Session ID and a txn number
+    void _updateSession(OperationContext* opCtx) {
+        auto newDoc = [&] {
+            stdx::lock_guard lk{_docMutex};
+            return _doc;
+        }();
+        auto newShardingDDLCoordinatorMetadata = newDoc.getShardingDDLCoordinatorMetadata();
+
+        auto optSession = newShardingDDLCoordinatorMetadata.getSession();
+        if (optSession) {
+            auto txnNumber = optSession->getTxnNumber();
+            optSession->setTxnNumber(++txnNumber);
+            newShardingDDLCoordinatorMetadata.setSession(optSession);
+        } else {
+            auto session = InternalSessionPool::get(opCtx)->acquireSystemSession();
+            newShardingDDLCoordinatorMetadata.setSession(
+                ShardingDDLSession(session.getSessionId(), session.getTxnNumber()));
+        }
+
+        newDoc.setShardingDDLCoordinatorMetadata(std::move(newShardingDDLCoordinatorMetadata));
+        _updateStateDocument(opCtx, std::move(newDoc));
+    }
+
+    OperationSessionInfo getCurrentSession() const {
+        auto optSession = [&] {
+            stdx::lock_guard lk{_docMutex};
+            return _doc.getShardingDDLCoordinatorMetadata().getSession();
+        }();
+
+        invariant(optSession);
+
+        OperationSessionInfo osi;
+        osi.setSessionId(optSession->getLsid());
+        osi.setTxnNumber(optSession->getTxnNumber());
+        return osi;
+    }
+
+    virtual boost::optional<Status> getAbortReason() const override {
+        const auto& status = _doc.getAbortReason();
+        invariant(!status || !status->isOK(), "when persisted, status must be an error");
+        return status;
+    }
+
+    /**
+     * Persists the abort reason and throws it as an exception. This causes the coordinator to fail,
+     * and triggers the cleanup future chain since there is a the persisted reason.
+     */
+    void triggerCleanup(OperationContext* opCtx, const Status& status) {
+        LOGV2_INFO(7418502,
+                   "Coordinator failed, persisting abort reason",
+                   "coordinatorId"_attr = _doc.getId(),
+                   "phase"_attr = serializePhase(_doc.getPhase()),
+                   "reason"_attr = redact(status));
+
+        auto newDoc = [&] {
+            stdx::lock_guard lk{_docMutex};
+            return _doc;
+        }();
+
+        auto coordinatorMetadata = newDoc.getShardingDDLCoordinatorMetadata();
+        coordinatorMetadata.setAbortReason(status);
+        newDoc.setShardingDDLCoordinatorMetadata(std::move(coordinatorMetadata));
+
+        _updateStateDocument(opCtx, std::move(newDoc));
+
+        uassertStatusOK(status);
+    }
+};
+
+#undef MONGO_LOGV2_DEFAULT_COMPONENT
 
 }  // namespace mongo

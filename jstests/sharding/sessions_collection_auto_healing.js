@@ -1,8 +1,12 @@
 /**
+ * Requires no shards.
  * @tags: [
+ *   catalog_shard_incompatible,
+ *   requires_fcv_70,
  * ]
  */
 load('jstests/libs/sessions_collection.js');
+load("jstests/libs/feature_flag_util.js");
 
 (function() {
 "use strict";
@@ -46,7 +50,8 @@ var mongosConfig = mongos.getDB("config");
 {
     assert.eq(mongosConfig.shards.countDocuments({}), 0);
 
-    assert.commandWorked(configSvr.adminCommand({refreshLogicalSessionCacheNow: 1}));
+    assert.commandFailedWithCode(configSvr.adminCommand({refreshLogicalSessionCacheNow: 1}),
+                                 [ErrorCodes.ShardNotFound]);
 
     validateSessionsCollection(configSvr, false, false);
 }
@@ -102,7 +107,8 @@ var shardConfig = shard.getDB("config");
     validateSessionsCollection(configSvr, false, false);
     validateSessionsCollection(shard, false, false);
 
-    assert.commandWorked(shard.adminCommand({refreshLogicalSessionCacheNow: 1}));
+    assert.commandFailedWithCode(shard.adminCommand({refreshLogicalSessionCacheNow: 1}),
+                                 [ErrorCodes.NamespaceNotSharded]);
 
     validateSessionsCollection(configSvr, false, false);
     validateSessionsCollection(shard, false, false);
@@ -117,19 +123,29 @@ var shardConfig = shard.getDB("config");
 
     validateSessionsCollection(shard, true, true);
 
-    // We will have two sessions because of the session used in the shardCollection's retryable
-    // write to shard the sessions collection. It will disappear after we run the refresh
-    // function on the shard.
-    assert.eq(shardConfig.system.sessions.countDocuments({}), 2, "did not flush config's sessions");
+    const sessionsOpenedByAddShardCmd = 1;
+    const sessionsOpenedByShardCollectionCmd = 3;
+    const sessionsOpenedByDDLOps = sessionsOpenedByAddShardCmd + sessionsOpenedByShardCollectionCmd;
+
+    // We will have sessionsOpenedByDDLOps sessions because of the sessions used in the
+    // shardCollection's retryable write to shard the sessions collection. It will disappear after
+    // we run the refresh function on the shard.
+    assert.eq(shardConfig.system.sessions.countDocuments({}),
+              sessionsOpenedByDDLOps,
+              "did not flush config's sessions");
 
     // Now, if we do refreshes on the other servers, their in-mem records will
     // be written to the collection.
     assert.commandWorked(shard.adminCommand({refreshLogicalSessionCacheNow: 1}));
-    assert.eq(shardConfig.system.sessions.countDocuments({}), 3, "did not flush shard's sessions");
+    assert.eq(shardConfig.system.sessions.countDocuments({}),
+              sessionsOpenedByDDLOps + 1,
+              "did not flush shard's sessions");
 
     rs.awaitLastOpCommitted();
     assert.commandWorked(mongos.adminCommand({refreshLogicalSessionCacheNow: 1}));
-    assert.eq(shardConfig.system.sessions.countDocuments({}), 5, "did not flush mongos' sessions");
+    assert.eq(shardConfig.system.sessions.countDocuments({}),
+              sessionsOpenedByDDLOps + 3,
+              "did not flush mongos' sessions");
 }
 
 // Test that if we drop the index on the sessions collection, only a refresh on the config

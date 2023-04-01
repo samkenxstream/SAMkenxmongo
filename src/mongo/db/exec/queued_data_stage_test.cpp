@@ -49,12 +49,11 @@ namespace {
 
 using std::unique_ptr;
 
-const static NamespaceString kNss("db.dummy");
+const static NamespaceString kNss = NamespaceString::createNamespaceString_forTest("db.dummy");
 
 class QueuedDataStageTest : public ServiceContextMongoDTest {
 public:
-    QueuedDataStageTest() {
-        getServiceContext()->setFastClockSource(std::make_unique<ClockSourceMock>());
+    QueuedDataStageTest() : ServiceContextMongoDTest(Options{}.useMockClock(true)) {
         _opCtx = makeOperationContext();
     }
 

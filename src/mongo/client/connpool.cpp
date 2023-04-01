@@ -29,7 +29,6 @@
 
 // _ todo: reconnect?
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -44,10 +43,12 @@
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/config.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/logv2/log.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/net/socket_exception.h"
 
 #if !defined(__has_feature)
@@ -58,6 +59,9 @@
 #include <sanitizer/lsan_interface.h>
 #endif
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
+
 namespace mongo {
 
 namespace {
@@ -67,7 +71,15 @@ const int kDefaultMaxInUse = std::numeric_limits<int>::max();
 auto makeDuration(double secs) {
     return Milliseconds(static_cast<Milliseconds::rep>(1000 * secs));
 }
+
+void recordWaitTime(PoolForHost& p, DBClientBase* conn, Date_t connRequestedAt) {
+    if (gFeatureFlagConnHealthMetrics.isEnabledAndIgnoreFCV() && conn) {
+        p.recordConnectionWaitTime(connRequestedAt);
+    }
+}
 }  // namespace
+
+MONGO_FAIL_POINT_DEFINE(injectWaitTimeForConnpoolAcquisition);
 
 using std::endl;
 using std::list;
@@ -252,7 +264,9 @@ void PoolForHost::initializeHostName(const std::string& hostName) {
 }
 
 void PoolForHost::waitForFreeConnection(int timeout, stdx::unique_lock<Latch>& lk) {
-    auto condition = [&] { return (numInUse() < _maxInUse || _inShutdown.load()); };
+    auto condition = [&] {
+        return (numInUse() < _maxInUse || _inShutdown.load());
+    };
 
     if (timeout > 0) {
         stdx::chrono::seconds timeoutSeconds{timeout};
@@ -284,9 +298,16 @@ public:
                              const std::string& host,
                              double timeout,
                              Connect connect) {
+        auto connRequestedAt = Date_t::now();
+        if (MONGO_unlikely(injectWaitTimeForConnpoolAcquisition.shouldFail())) {
+            injectWaitTimeForConnpoolAcquisition.execute([&](const BSONObj& data) {
+                sleepFor(Milliseconds(data["sleepTimeMillis"].numberInt()));
+            });
+        }
+
         while (!(_this->_inShutdown.load())) {
             // Get a connection from the pool, if there is one.
-            std::unique_ptr<DBClientBase> c(_this->_get(host, timeout));
+            std::unique_ptr<DBClientBase> c(_this->_get(host, timeout, connRequestedAt));
             if (c) {
                 // This call may throw.
                 _this->onHandedOut(c.get());
@@ -316,7 +337,8 @@ public:
                     // should throw if they cannot create a connection.
                     auto c = connect();
                     invariant(c);
-                    return _this->_finishCreate(host, timeout, c);
+                    auto conn = _this->_finishCreate(host, timeout, c, connRequestedAt);
+                    return conn;
                 }
             }
         }
@@ -352,7 +374,9 @@ void DBConnectionPool::shutdown() {
     }
 }
 
-DBClientBase* DBConnectionPool::_get(const string& ident, double socketTimeout) {
+DBClientBase* DBConnectionPool::_get(const string& ident,
+                                     double socketTimeout,
+                                     Date_t& connRequestedAt) {
     uassert(ErrorCodes::ShutdownInProgress,
             "Can't use connection pool during shutdown",
             !globalInShutdownDeprecated());
@@ -361,7 +385,9 @@ DBClientBase* DBConnectionPool::_get(const string& ident, double socketTimeout) 
     p.setMaxPoolSize(_maxPoolSize);
     p.setSocketTimeout(socketTimeout);
     p.initializeHostName(ident);
-    return p.get(this, socketTimeout);
+    auto c = p.get(this, socketTimeout);
+    recordWaitTime(p, c, connRequestedAt);
+    return c;
 }
 
 int DBConnectionPool::openConnections(const string& ident, double socketTimeout) {
@@ -372,13 +398,15 @@ int DBConnectionPool::openConnections(const string& ident, double socketTimeout)
 
 DBClientBase* DBConnectionPool::_finishCreate(const string& ident,
                                               double socketTimeout,
-                                              DBClientBase* conn) {
+                                              DBClientBase* conn,
+                                              Date_t& connRequestedAt) {
     {
         stdx::lock_guard<Latch> L(_mutex);
         PoolForHost& p = _pools[PoolKey(ident, socketTimeout)];
         p.setMaxPoolSize(_maxPoolSize);
         p.initializeHostName(ident);
         p.createdOne(conn);
+        recordWaitTime(p, conn, connRequestedAt);
     }
 
     try {
@@ -434,7 +462,8 @@ DBClientBase* DBConnectionPool::get(const string& host, double socketTimeout) {
 DBClientBase* DBConnectionPool::get(const MongoURI& uri, double socketTimeout) {
     auto connect = [&] {
         string errmsg;
-        std::unique_ptr<DBClientBase> c(uri.connect(uri.getAppName().get(), errmsg, socketTimeout));
+        std::unique_ptr<DBClientBase> c(
+            uri.connect(uri.getAppName().value(), errmsg, socketTimeout));
         uassert(40356, fmt::format("{}: connect failed {} : {}", _name, uri.toString(), errmsg), c);
         return c.release();
     };
@@ -589,9 +618,16 @@ void DBConnectionPool::appendConnectionStats(executor::ConnectionPoolStats* stat
 
             executor::ConnectionStatsPer hostStats{static_cast<size_t>(i->second.numInUse()),
                                                    static_cast<size_t>(i->second.numAvailable()),
+                                                   0,
                                                    static_cast<size_t>(i->second.numCreated()),
                                                    0,
-                                                   0};
+                                                   0,
+                                                   0,
+                                                   0,
+                                                   Milliseconds{0}};
+            if (gFeatureFlagConnHealthMetrics.isEnabledAndIgnoreFCV()) {
+                hostStats.acquisitionWaitTimes = i->second.connectionWaitTimeStats();
+            }
             stats->updateStatsForHost("global", host, hostStats);
         }
     }

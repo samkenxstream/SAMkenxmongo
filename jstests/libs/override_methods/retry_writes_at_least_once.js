@@ -21,19 +21,14 @@ Mongo.prototype.runCommand = function runCommand(dbName, cmdObj, options) {
 function runWithRetries(mongo, cmdObj, clientFunction, clientFunctionArguments) {
     let cmdName = Object.keys(cmdObj)[0];
 
-    // If the command is in a wrapped form, then we look for the actual command object
-    // inside the query/$query object.
-    if (cmdName === "query" || cmdName === "$query") {
-        cmdObj = cmdObj[cmdName];
-        cmdName = Object.keys(cmdObj)[0];
-    }
-
-    const isRetryableWriteCmd = RetryableWritesUtil.isRetryableWriteCmdName(cmdName);
+    const isRetryableWriteCmd = cmdObj.hasOwnProperty("lsid") &&
+        cmdObj.hasOwnProperty("txnNumber") && RetryableWritesUtil.isRetryableWriteCmdName(cmdName);
     const canRetryWrites = _ServerSession.canRetryWrites(cmdObj);
 
     let res = clientFunction.apply(mongo, clientFunctionArguments);
 
     if (isRetryableWriteCmd && canRetryWrites) {
+        print("*** Initial response: " + tojsononeline(res));
         let retryAttempt = 1;
         do {
             print("*** Retry attempt: " + retryAttempt + ", for command: " + cmdName +
@@ -41,6 +36,7 @@ function runWithRetries(mongo, cmdObj, clientFunction, clientFunctionArguments) 
                   ", and lsid: " + tojson(cmdObj.lsid));
             ++retryAttempt;
             res = clientFunction.apply(mongo, clientFunctionArguments);
+            print("*** Retry response: " + tojsononeline(res));
         } while (Random.rand() <= kExtraRetryProbability);
     }
 

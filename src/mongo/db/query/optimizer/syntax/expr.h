@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/platform/decimal128.h"
 #include <ostream>
 
 #include "mongo/db/exec/sbe/values/value.h"
@@ -36,19 +37,34 @@
 
 namespace mongo::optimizer {
 
-class Constant final : public Operator<Constant, 0>, public ExpressionSyntaxSort {
+/**
+ * Marker class for expressions. Mutually exclusive with paths and nodes.
+ */
+class ExpressionSyntaxSort {};
+
+/**
+ * Holds a constant SBE value with corresponding type tag.
+ */
+class Constant final : public ABTOpFixedArity<0>, public ExpressionSyntaxSort {
 public:
     Constant(sbe::value::TypeTags tag, sbe::value::Value val);
 
-    static ABT str(std::string str);
+    static ABT createFromCopy(sbe::value::TypeTags tag, sbe::value::Value val);
+
+    static ABT str(StringData str);
 
     static ABT int32(int32_t valueInt32);
     static ABT int64(int64_t valueInt64);
 
     static ABT fromDouble(double value);
 
+    static ABT fromDecimal(const Decimal128& value);
+
     static ABT emptyObject();
     static ABT emptyArray();
+
+    static ABT timestamp(const Timestamp& t);
+    static ABT date(const Date_t& d);
 
     static ABT nothing();
     static ABT null();
@@ -78,12 +94,25 @@ public:
     bool isValueInt32() const;
     int32_t getValueInt32() const;
 
+    bool isValueDouble() const;
+    double getValueDouble() const;
+
+    bool isValueDecimal() const;
+    Decimal128 getValueDecimal() const;
+
+    bool isValueBool() const;
+    bool getValueBool() const;
+
     bool isNumber() const {
         return sbe::value::isNumber(_tag);
     }
 
     bool isNothing() const {
         return _tag == sbe::value::TypeTags::Nothing;
+    }
+
+    bool isNull() const {
+        return _tag == sbe::value::TypeTags::Null;
     }
 
     bool isObject() const {
@@ -99,11 +128,16 @@ private:
     sbe::value::Value _val;
 };
 
-class Variable final : public Operator<Variable, 0>, public ExpressionSyntaxSort {
-    std::string _name;
+/**
+ * Represents a reference to a binding. The binding is specified by identifier (string). The logic
+ * for checking that the reference is valid (e.g., that the referenced binding is in scope) happens
+ * elsewhere.
+ */
+class Variable final : public ABTOpFixedArity<0>, public ExpressionSyntaxSort {
+    ProjectionName _name;
 
 public:
-    Variable(std::string inName) : _name(std::move(inName)) {}
+    Variable(ProjectionName inName) : _name(std::move(inName)) {}
 
     bool operator==(const Variable& other) const {
         return _name == other._name;
@@ -114,12 +148,16 @@ public:
     }
 };
 
-class UnaryOp final : public Operator<UnaryOp, 1>, public ExpressionSyntaxSort {
-    using Base = Operator<UnaryOp, 1>;
+/**
+ * Models arithmetic and other operations that accept a single argument, for instance negate.
+ */
+class UnaryOp final : public ABTOpFixedArity<1>, public ExpressionSyntaxSort {
+    using Base = ABTOpFixedArity<1>;
     Operations _op;
 
 public:
     UnaryOp(Operations inOp, ABT inExpr) : Base(std::move(inExpr)), _op(inOp) {
+        tassert(6684501, "Unary op expected", isUnaryOp(_op));
         assertExprSort(getChild());
     }
 
@@ -134,15 +172,23 @@ public:
     const ABT& getChild() const {
         return get<0>();
     }
+    ABT& getChild() {
+        return get<0>();
+    }
 };
 
-class BinaryOp final : public Operator<BinaryOp, 2>, public ExpressionSyntaxSort {
-    using Base = Operator<BinaryOp, 2>;
+/**
+ * Models arithmetic, comparison, or logical operations that take two arguments, for instance add or
+ * subtract.
+ */
+class BinaryOp final : public ABTOpFixedArity<2>, public ExpressionSyntaxSort {
+    using Base = ABTOpFixedArity<2>;
     Operations _op;
 
 public:
     BinaryOp(Operations inOp, ABT inLhs, ABT inRhs)
         : Base(std::move(inLhs), std::move(inRhs)), _op(inOp) {
+        tassert(6684502, "Binary op expected", isBinaryOp(_op));
         assertExprSort(getLeftChild());
         assertExprSort(getRightChild());
     }
@@ -165,8 +211,11 @@ public:
     }
 };
 
-class If final : public Operator<If, 3>, public ExpressionSyntaxSort {
-    using Base = Operator<If, 3>;
+/**
+ * Branching operator with a condition expression, "then" expression, and an "else" expression.
+ */
+class If final : public ABTOpFixedArity<3>, public ExpressionSyntaxSort {
+    using Base = ABTOpFixedArity<3>;
 
 public:
     If(ABT inCond, ABT inThen, ABT inElse)
@@ -194,13 +243,17 @@ public:
     }
 };
 
-class Let final : public Operator<Let, 2>, public ExpressionSyntaxSort {
-    using Base = Operator<Let, 2>;
+/**
+ * Defines a variable from one expression and a specified name which is available to be referenced
+ * in a second expression.
+ */
+class Let final : public ABTOpFixedArity<2>, public ExpressionSyntaxSort {
+    using Base = ABTOpFixedArity<2>;
 
-    std::string _varName;
+    ProjectionName _varName;
 
 public:
-    Let(std::string var, ABT inBind, ABT inExpr)
+    Let(ProjectionName var, ABT inBind, ABT inExpr)
         : Base(std::move(inBind), std::move(inExpr)), _varName(std::move(var)) {
         assertExprSort(bind());
         assertExprSort(in());
@@ -223,13 +276,18 @@ public:
     }
 };
 
-class LambdaAbstraction final : public Operator<LambdaAbstraction, 1>, public ExpressionSyntaxSort {
-    using Base = Operator<LambdaAbstraction, 1>;
+/**
+ * Represents a single argument lambda. Defines a local variable (representing the argument) which
+ * can be referenced within the lambda. The variable takes on the value to which LambdaAbstraction
+ * is applied by its parent.
+ */
+class LambdaAbstraction final : public ABTOpFixedArity<1>, public ExpressionSyntaxSort {
+    using Base = ABTOpFixedArity<1>;
 
-    std::string _varName;
+    ProjectionName _varName;
 
 public:
-    LambdaAbstraction(std::string var, ABT inBody)
+    LambdaAbstraction(ProjectionName var, ABT inBody)
         : Base(std::move(inBody)), _varName(std::move(var)) {
         assertExprSort(getBody());
     }
@@ -251,8 +309,12 @@ public:
     }
 };
 
-class LambdaApplication final : public Operator<LambdaApplication, 2>, public ExpressionSyntaxSort {
-    using Base = Operator<LambdaApplication, 2>;
+/**
+ * Evaluates an expression representing a function over an expression representing the argument to
+ * the function.
+ */
+class LambdaApplication final : public ABTOpFixedArity<2>, public ExpressionSyntaxSort {
+    using Base = ABTOpFixedArity<2>;
 
 public:
     LambdaApplication(ABT inLambda, ABT inArgument)
@@ -274,9 +336,12 @@ public:
     }
 };
 
-class FunctionCall final : public OperatorDynamicHomogenous<FunctionCall>,
-                           public ExpressionSyntaxSort {
-    using Base = OperatorDynamicHomogenous<FunctionCall>;
+/**
+ * Dynamic arity operator which passes its children as arguments to a function specified by SBE
+ * function expression name.
+ */
+class FunctionCall final : public ABTOpDynamicArity<0>, public ExpressionSyntaxSort {
+    using Base = ABTOpDynamicArity<0>;
     std::string _name;
 
 public:
@@ -296,8 +361,16 @@ public:
     }
 };
 
-class EvalPath final : public Operator<EvalPath, 2>, public ExpressionSyntaxSort {
-    using Base = Operator<EvalPath, 2>;
+/**
+ * EvalPath defines one context for path behavior used for manipulation and replacement. Some path
+ * elements have special behavior under this context.
+ *
+ * EvalPath evaluates its path child according to its context over the result of its expression
+ * child. That is, the expression is evaluated first, and it is used as an input value to the root
+ * path element, which can then continue the computation recursively.
+ */
+class EvalPath final : public ABTOpFixedArity<2>, public ExpressionSyntaxSort {
+    using Base = ABTOpFixedArity<2>;
 
 public:
     EvalPath(ABT inPath, ABT inInput) : Base(std::move(inPath), std::move(inInput)) {
@@ -322,8 +395,16 @@ public:
     }
 };
 
-class EvalFilter final : public Operator<EvalFilter, 2>, public ExpressionSyntaxSort {
-    using Base = Operator<EvalFilter, 2>;
+/**
+ * EvalFilter defines a context for path behavior used to evaluate boolean conditions for the
+ * purposes of filtering. Some path elements have special behavior under this context.
+ *
+ * The intermediate result of all path operators in the path child of an EvalFilter should evaluate
+ * to true, false, or Nothing. It is assumed that that Nothing is equivalent to false within an
+ * EvalFilter context.
+ */
+class EvalFilter final : public ABTOpFixedArity<2>, public ExpressionSyntaxSort {
+    using Base = ABTOpFixedArity<2>;
 
 public:
     EvalFilter(ABT inPath, ABT inInput) : Base(std::move(inPath), std::move(inInput)) {
@@ -346,12 +427,15 @@ public:
     const ABT& getInput() const {
         return get<1>();
     }
+    ABT& getInput() {
+        return get<1>();
+    }
 };
 
 /**
- * This class represents a source of values originating from relational nodes.
+ * Represents a source of values typically from a collection.
  */
-class Source final : public Operator<Source, 0>, public ExpressionSyntaxSort {
+class Source final : public ABTOpFixedArity<0>, public ExpressionSyntaxSort {
 public:
     bool operator==(const Source& other) const {
         return true;

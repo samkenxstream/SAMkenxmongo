@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -36,7 +35,10 @@
 #include "mongo/db/pipeline/change_stream_filter_helpers.h"
 #include "mongo/db/pipeline/change_stream_rewrite_helpers.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
-#include "mongo/db/transaction_history_iterator.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
@@ -62,6 +64,13 @@ std::unique_ptr<MatchExpression> buildUnwindTransactionFilter(
     // includes a namespace filter, which ensures that it will discard all documents that would be
     // filtered out by the default 'ns' filter this stage gets initialized with.
     auto unwindFilter = std::make_unique<AndMatchExpression>(buildOperationFilter(expCtx, nullptr));
+
+    // To correctly handle filtering out entries of direct write operations on orphaned documents,
+    // we include a filter for "fromMigrate" flagged operations, unless "fromMigrate" events are
+    // explicitly requested in the spec.
+    if (!expCtx->changeStreamSpec->getShowMigrationEvents()) {
+        unwindFilter->add(buildNotFromMigrateFilter(expCtx, userMatch));
+    }
 
     // Attempt to rewrite the user's filter and combine it with the standard operation filter. We do
     // this separately because we need to exclude certain fields from the user's filters. Unwound
@@ -91,7 +100,7 @@ DocumentSourceChangeStreamUnwindTransaction::createFromBson(
             str::stream() << "the '" << kStageName << "' stage spec must be an object",
             elem.type() == BSONType::Object);
     auto parsedSpec = DocumentSourceChangeStreamUnwindTransactionSpec::parse(
-        IDLParserErrorContext("DocumentSourceChangeStreamUnwindTransactionSpec"), elem.Obj());
+        IDLParserContext("DocumentSourceChangeStreamUnwindTransactionSpec"), elem.Obj());
     return new DocumentSourceChangeStreamUnwindTransaction(parsedSpec.getFilter(), expCtx);
 }
 
@@ -119,19 +128,26 @@ StageConstraints DocumentSourceChangeStreamUnwindTransaction::constraints(
                             ChangeStreamRequirement::kChangeStreamStage);
 }
 
-Value DocumentSourceChangeStreamUnwindTransaction::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    tassert(5467604, "expression has not been initialized", _expression);
+Value DocumentSourceChangeStreamUnwindTransaction::serialize(SerializationOptions opts) const {
+    tassert(7481400, "expression has not been initialized", _expression);
 
-    if (explain) {
-        return Value(
-            DOC(DocumentSourceChangeStream::kStageName << DOC("stage"
-                                                              << "internalUnwindTransaction"_sd
-                                                              << "filter" << _filter)));
+    if (opts.verbosity) {
+        BSONObjBuilder builder;
+        builder.append("stage"_sd, "internalUnwindTransaction"_sd);
+        builder.append(DocumentSourceChangeStreamUnwindTransactionSpec::kFilterFieldName,
+                       _expression->serialize(opts));
+
+        return Value(DOC(DocumentSourceChangeStream::kStageName << builder.obj()));
     }
 
-    DocumentSourceChangeStreamUnwindTransactionSpec spec(_filter);
-    return Value(Document{{kStageName, Value(spec.toBSON())}});
+    Value spec;
+    if (opts.replacementForLiteralArgs || opts.redactFieldNames) {
+        spec = Value(DOC(DocumentSourceChangeStreamUnwindTransactionSpec::kFilterFieldName
+                         << _expression->serialize(opts)));
+    } else {
+        spec = Value(DocumentSourceChangeStreamUnwindTransactionSpec(_filter).toBSON());
+    }
+    return Value(Document{{kStageName, spec}});
 }
 
 DepsTracker::State DocumentSourceChangeStreamUnwindTransaction::getDependencies(
@@ -150,7 +166,7 @@ DepsTracker::State DocumentSourceChangeStreamUnwindTransaction::getDependencies(
 
 DocumentSource::GetModPathsReturn DocumentSourceChangeStreamUnwindTransaction::getModifiedPaths()
     const {
-    return {DocumentSource::GetModPathsReturn::Type::kAllPaths, std::set<std::string>{}, {}};
+    return {DocumentSource::GetModPathsReturn::Type::kAllPaths, OrderedPathSet{}, {}};
 }
 
 DocumentSource::GetNextResult DocumentSourceChangeStreamUnwindTransaction::doGetNext() {
@@ -200,8 +216,7 @@ DocumentSource::GetNextResult DocumentSourceChangeStreamUnwindTransaction::doGet
 
 bool DocumentSourceChangeStreamUnwindTransaction::_isTransactionOplogEntry(const Document& doc) {
     auto op = doc[repl::OplogEntry::kOpTypeFieldName];
-    auto opType =
-        repl::OpType_parse(IDLParserErrorContext("ChangeStreamEntry.op"), op.getStringData());
+    auto opType = repl::OpType_parse(IDLParserContext("ChangeStreamEntry.op"), op.getStringData());
     auto commandVal = doc["o"];
 
     if (opType != repl::OpTypeEnum::kCommand ||
@@ -222,13 +237,16 @@ DocumentSourceChangeStreamUnwindTransaction::TransactionOpIterator::TransactionO
     const Document& input,
     const MatchExpression* expression)
     : _mongoProcessInterface(mongoProcessInterface), _expression(expression) {
-    Value lsidValue = input["lsid"];
-    DocumentSourceChangeStream::checkValueType(lsidValue, "lsid", BSONType::Object);
-    _lsid = lsidValue.getDocument();
 
+    // The lsid and txnNumber can be missing in case of batched writes.
+    Value lsidValue = input["lsid"];
+    DocumentSourceChangeStream::checkValueTypeOrMissing(lsidValue, "lsid", BSONType::Object);
+    _lsid = lsidValue.missing() ? boost::none : boost::optional<Document>(lsidValue.getDocument());
     Value txnNumberValue = input["txnNumber"];
-    DocumentSourceChangeStream::checkValueType(txnNumberValue, "txnNumber", BSONType::NumberLong);
-    _txnNumber = txnNumberValue.getLong();
+    DocumentSourceChangeStream::checkValueTypeOrMissing(
+        txnNumberValue, "txnNumber", BSONType::NumberLong);
+    _txnNumber = txnNumberValue.missing() ? boost::none
+                                          : boost::optional<TxnNumber>(txnNumberValue.getLong());
 
     // We want to parse the OpTime out of this document using the BSON OpTime parser. Instead of
     // converting the entire Document back to BSON, we convert only the fields we need.
@@ -380,9 +398,9 @@ DocumentSourceChangeStreamUnwindTransaction::TransactionOpIterator::_addRequired
     newDoc.addField(DocumentSourceChangeStream::kApplyOpsTsField, Value(applyOpsTs()));
 
     newDoc.addField(repl::OplogEntry::kTimestampFieldName, Value(_clusterTime));
-    newDoc.addField(repl::OplogEntry::kSessionIdFieldName, Value(_lsid));
+    newDoc.addField(repl::OplogEntry::kSessionIdFieldName, _lsid ? Value(*_lsid) : Value());
     newDoc.addField(repl::OplogEntry::kTxnNumberFieldName,
-                    Value(static_cast<long long>(_txnNumber)));
+                    _txnNumber ? Value(static_cast<long long>(*_txnNumber)) : Value());
     newDoc.addField(repl::OplogEntry::kWallClockTimeFieldName, Value(_wallTime));
 
     return newDoc.freeze();

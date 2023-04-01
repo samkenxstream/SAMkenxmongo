@@ -31,7 +31,6 @@
  * Unit tests of the unittest framework itself.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -45,6 +44,9 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+
 namespace {
 namespace stdx = mongo::stdx;
 
@@ -53,11 +55,17 @@ bool containsPattern(const std::string& pattern, const std::string& value) {
 }
 
 #define ASSERT_TEST_FAILS(TEST_STMT) \
-    ASSERT_THROWS([&] { TEST_STMT; }(), mongo::unittest::TestAssertionFailureException)
+    ASSERT_THROWS(                   \
+        [&] {                        \
+            TEST_STMT;               \
+        }(),                         \
+        mongo::unittest::TestAssertionFailureException)
 
 #define ASSERT_TEST_FAILS_MATCH(TEST_STMT, PATTERN)     \
     ASSERT_THROWS_WITH_CHECK(                           \
-        [&] { TEST_STMT; }(),                           \
+        [&] {                                           \
+            TEST_STMT;                                  \
+        }(),                                            \
         mongo::unittest::TestAssertionFailureException, \
         ([&](const auto& ex) { ASSERT_STRING_CONTAINS(ex.getMessage(), (PATTERN)); }))
 
@@ -140,10 +148,14 @@ TEST(UnitTestSelfTest, TestAssertStringOmits) {
 }
 
 TEST(UnitTestSelfTest, TestAssertIdentity) {
-    auto intIdentity = [](int x) { return x; };
+    auto intIdentity = [](int x) {
+        return x;
+    };
     ASSERT_IDENTITY(123, intIdentity);
     ASSERT_IDENTITY(123, [](int x) { return x; });
-    auto zero = [](auto) { return 0; };
+    auto zero = [](auto) {
+        return 0;
+    };
     ASSERT_TEST_FAILS(ASSERT_IDENTITY(1, zero));
     ASSERT_TEST_FAILS_MATCH(ASSERT_IDENTITY(1, zero) << "XmsgX", "XmsgX");
 }
@@ -161,108 +173,88 @@ TEST(UnitTestSelfTest, TestNoDoubleEvaluation) {
     ASSERT_TEST_FAILS_MATCH(ASSERT_EQ(0, ++i), "(0 == 1)");
 }
 
-TEST(UnitTestSelfTest, BSONObjEQ) {
-    ASSERT_BSONOBJ_EQ(BSON("foo"
-                           << "bar"),
-                      BSON("foo"
-                           << "bar"));
+TEST(UnitTestSelfTest, BSONObjComparisons) {
+    auto a = mongo::BSONObjBuilder{}.append("foo", "bar").obj();
+    auto b = mongo::BSONObjBuilder{}.append("foo", "baz").obj();
+    ASSERT_BSONOBJ_EQ(a, a);
+    ASSERT_BSONOBJ_NE(a, b);
+    ASSERT_BSONOBJ_LT(a, b);
+    ASSERT_BSONOBJ_LTE(a, b);
+    ASSERT_BSONOBJ_LTE(a, b);
+    ASSERT_BSONOBJ_GT(b, a);
+    ASSERT_BSONOBJ_GTE(b, a);
+    ASSERT_BSONOBJ_GTE(a, a);
 }
 
-TEST(UnitTestSelfTest, BSONObjNE) {
-    ASSERT_BSONOBJ_NE(BSON("foo"
-                           << "bar"),
-                      BSON("foo"
-                           << "baz"));
+TEST(UnitTestSelfTest, BSONElementComparisons) {
+    auto ao = mongo::BSONObjBuilder{}.append("foo", "bar").obj();
+    auto bo = mongo::BSONObjBuilder{}.append("foo", "baz").obj();
+    auto a = ao.firstElement();
+    auto b = bo.firstElement();
+    ASSERT_BSONELT_EQ(a, a);
+    ASSERT_BSONELT_NE(a, b);
+    ASSERT_BSONELT_LT(a, b);
+    ASSERT_BSONELT_LTE(a, a);
+    ASSERT_BSONELT_LTE(a, b);
+    ASSERT_BSONELT_GT(b, a);
+    ASSERT_BSONELT_GTE(b, a);
+    ASSERT_BSONELT_GTE(a, a);
 }
 
-TEST(UnitTestSelfTest, BSONObjLT) {
-    ASSERT_BSONOBJ_LT(BSON("foo"
-                           << "bar"),
-                      BSON("foo"
-                           << "baz"));
+class UnitTestFormatTest : public mongo::unittest::Test {
+public:
+    template <template <typename...> class Optional, typename T, typename... As>
+    auto mkOptional(As&&... as) {
+        return Optional<T>(std::forward<As>(as)...);  // NOLINT
+    }
+
+    template <template <typename...> class OptionalTemplate>
+    void runFormatOptionalTest() {
+        using mongo::unittest::stringify::stringifyForAssert;
+        ASSERT_EQ(stringifyForAssert(mkOptional<OptionalTemplate, int>()), "--");
+        ASSERT_EQ(stringifyForAssert(mkOptional<OptionalTemplate, std::string>()), "--");
+        ASSERT_EQ(stringifyForAssert(mkOptional<OptionalTemplate, int>(123)), " 123");
+        ASSERT_EQ(stringifyForAssert(mkOptional<OptionalTemplate, std::string>("hey")), " hey");
+    }
+
+    template <template <typename...> class OptionalTemplate, class None>
+    void runEqOptionalTest(None none) {
+        ASSERT_EQ(OptionalTemplate<int>{1}, OptionalTemplate<int>{1});  // NOLINT
+        ASSERT_NE(OptionalTemplate<int>{1}, OptionalTemplate<int>{2});  // NOLINT
+        ASSERT_EQ(OptionalTemplate<int>{}, OptionalTemplate<int>{});    // NOLINT
+        ASSERT_EQ(OptionalTemplate<int>{}, none);                       // NOLINT
+    }
+};
+
+TEST_F(UnitTestFormatTest, FormatBoostOptional) {
+    runFormatOptionalTest<boost::optional>();
 }
 
-TEST(UnitTestSelfTest, BSONObjLTE) {
-    ASSERT_BSONOBJ_LTE(BSON("foo"
-                            << "bar"),
-                       BSON("foo"
-                            << "baz"));
-    ASSERT_BSONOBJ_LTE(BSON("foo"
-                            << "bar"),
-                       BSON("foo"
-                            << "bar"));
+TEST_F(UnitTestFormatTest, EqBoostOptional) {
+    runEqOptionalTest<boost::optional>(boost::none);
 }
 
-TEST(UnitTestSelfTest, BSONObjGT) {
-    ASSERT_BSONOBJ_GT(BSON("foo"
-                           << "baz"),
-                      BSON("foo"
-                           << "bar"));
+TEST_F(UnitTestFormatTest, FormatStdOptional) {
+    runFormatOptionalTest<std::optional>();  // NOLINT
 }
 
-TEST(UnitTestSelfTest, BSONObjGTE) {
-    ASSERT_BSONOBJ_GTE(BSON("foo"
-                            << "baz"),
-                       BSON("foo"
-                            << "bar"));
-    ASSERT_BSONOBJ_GTE(BSON("foo"
-                            << "bar"),
-                       BSON("foo"
-                            << "bar"));
+TEST_F(UnitTestFormatTest, EqStdOptional) {
+    runEqOptionalTest<std::optional>(std::nullopt);  // NOLINT
 }
 
-TEST(UnitTestSelfTest, BSONElementEQ) {
-    mongo::BSONObj obj1 = BSON("foo"
-                               << "bar");
-    mongo::BSONObj obj2 = BSON("foo"
-                               << "bar");
-    ASSERT_BSONELT_EQ(obj1.firstElement(), obj2.firstElement());
+enum class Color { r, g, b };
+enum class NamedColor { r, g, b };
+
+inline std::ostream& operator<<(std::ostream& os, const NamedColor& e) {
+    return os << std::array{"r", "g", "b"}[static_cast<size_t>(e)];
 }
 
-TEST(UnitTestSelfTest, BSONElementNE) {
-    mongo::BSONObj obj1 = BSON("foo"
-                               << "bar");
-    mongo::BSONObj obj2 = BSON("foo"
-                               << "baz");
-    ASSERT_BSONELT_NE(obj1.firstElement(), obj2.firstElement());
-}
-
-TEST(UnitTestSelfTest, BSONElementLT) {
-    mongo::BSONObj obj1 = BSON("foo"
-                               << "bar");
-    mongo::BSONObj obj2 = BSON("foo"
-                               << "baz");
-    ASSERT_BSONELT_LT(obj1.firstElement(), obj2.firstElement());
-}
-
-TEST(UnitTestSelfTest, BSONElementLTE) {
-    mongo::BSONObj obj1 = BSON("foo"
-                               << "bar");
-    mongo::BSONObj obj2 = BSON("foo"
-                               << "bar");
-    mongo::BSONObj obj3 = BSON("foo"
-                               << "baz");
-    ASSERT_BSONELT_LTE(obj1.firstElement(), obj2.firstElement());
-    ASSERT_BSONELT_LTE(obj1.firstElement(), obj3.firstElement());
-}
-
-TEST(UnitTestSelfTest, BSONElementGT) {
-    mongo::BSONObj obj1 = BSON("foo"
-                               << "bar");
-    mongo::BSONObj obj2 = BSON("foo"
-                               << "baz");
-    ASSERT_BSONELT_GT(obj2.firstElement(), obj1.firstElement());
-}
-
-TEST(UnitTestSelfTest, BSONElementGTE) {
-    mongo::BSONObj obj1 = BSON("foo"
-                               << "bar");
-    mongo::BSONObj obj2 = BSON("foo"
-                               << "bar");
-    mongo::BSONObj obj3 = BSON("foo"
-                               << "baz");
-    ASSERT_BSONELT_GTE(obj3.firstElement(), obj2.firstElement());
-    ASSERT_BSONELT_GTE(obj2.firstElement(), obj1.firstElement());
+TEST_F(UnitTestFormatTest, FormatEnumClass) {
+    using mongo::unittest::stringify::stringifyForAssert;
+    ASSERT_STRING_CONTAINS(stringifyForAssert(Color::r), "Color=0");
+    ASSERT_EQ(stringifyForAssert(NamedColor::r), "r");
+    ASSERT_EQ(Color::r, Color::r);
+    ASSERT_EQ(NamedColor::r, NamedColor::r);
 }
 
 DEATH_TEST_REGEX(DeathTestSelfTest, TestDeath, "Invariant failure.*false") {

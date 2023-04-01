@@ -49,6 +49,19 @@ public:
     static boost::intrusive_ptr<DocumentSourceMock> createForTest(
         Document doc, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
+    /**
+     * Convenience constructor that works with a vector of BSONObj or vector of Documents.
+     */
+    template <typename Doc>
+    static boost::intrusive_ptr<DocumentSourceMock> createForTest(
+        const std::vector<Doc>& docs, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+        std::deque<GetNextResult> results;
+        for (auto&& doc : docs) {
+            results.emplace_back(Document(doc));
+        }
+        return new DocumentSourceMock(std::move(results), expCtx);
+    }
+
     static boost::intrusive_ptr<DocumentSourceMock> createForTest(
         const GetNextResult& result, const boost::intrusive_ptr<ExpressionContext>& expCtx);
     static boost::intrusive_ptr<DocumentSourceMock> createForTest(
@@ -62,8 +75,7 @@ public:
 
     DocumentSourceMock(std::deque<GetNextResult>, const boost::intrusive_ptr<ExpressionContext>&);
 
-    Value serialize(
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override {
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override {
         // Unlike the queue, it's okay to serialize this stage for testing purposes.
         return Value(Document{{getSourceName(), Document()}});
     }
@@ -93,7 +105,7 @@ public:
      * This stage does not modify anything.
      */
     GetModPathsReturn getModifiedPaths() const override {
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {}};
     }
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() override {

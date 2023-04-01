@@ -50,7 +50,7 @@ public:
     OpTimeWithTerm getCurrentTermAndLastCommittedOpTime() override;
 
     void processMetadata(const rpc::ReplSetMetadata& metadata,
-                         rpc::OplogQueryMetadata oqMetadata) override;
+                         const rpc::OplogQueryMetadata& oqMetadata) override;
 
     ChangeSyncSourceAction shouldStopFetching(const HostAndPort& source,
                                               const rpc::ReplSetMetadata& replMetadata,
@@ -76,6 +76,8 @@ public:
     StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx) const override;
 
     Status storeLocalConfigDocument(OperationContext* opCtx, const BSONObj& config) override;
+
+    StatusWith<LastVote> loadLocalLastVoteDocument(OperationContext* opCtx) const override;
 
     JournalListener* getReplicationJournalListener() override;
 

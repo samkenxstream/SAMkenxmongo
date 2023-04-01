@@ -30,6 +30,7 @@
 #include "mongo/platform/basic.h"
 
 #include <boost/filesystem.hpp>
+#include <boost/filesystem/fstream.hpp>
 
 #include "mongo/base/string_data.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -159,7 +160,8 @@ TEST(SecurityFile, Test) {
 }
 
 TEST(SecurityKey, Test) {
-    internalSecurity.setUser(std::make_shared<UserHandle>(User(UserName("__system", "local"))));
+    UserRequest systemLocal(UserName("__system"_sd, "local"_sd), boost::none);
+    internalSecurity.setUser(std::make_shared<UserHandle>(User(systemLocal)));
 
     for (const auto& testCase : testCases) {
         TestFile file(testCase.fileContents, testCase.mode != TestCase::FailureMode::Permissions);

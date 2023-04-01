@@ -1,8 +1,9 @@
 ####################################################
-#               Static Definitions                 #
-####################################################
-# This file contains static definitions used by other YAML files.
+# This file contains static Evergreen config definitions used by other YAML files.
 # It is not run directly by any Evergreen project.
+#
+# Any global task, function, or taskgroup definition can be added here. Note that if
+# the definition is added to another file, YAML anchors from this file can't be used.
 
 command_type: system
 exec_timeout_secs: 21600  # 6 hours.
@@ -44,8 +45,16 @@ parameters:
 - key: antithesis_image_tag
   description: "The docker tag to use when pushing images to Antithesis"
 
-- key: burn_in_tests
-  description: "Comma separated list of jstests to include when running burn_in_tests"
+## Cron parameters.
+- key: project_required_suggested_cron
+  value: "0 */4 * * *" # Every 4 hours starting at 0000 UTC
+  description: "Cron schedule for required and suggested variants"
+- key: project_nightly_cron
+  value: "0 4 * * *" # Every day starting at 0400 UTC
+  description: "Cron schedule for nightly variants"
+- key: project_weekly_cron
+  value: "0 4 * * 0" # Every week starting 0400 UTC Sunday
+  description: "Cron schedule for nightly variants"
 
 
 #######################################
@@ -70,7 +79,7 @@ modules:
 ## Some variables for convenience:
 variables:
 
-# Used when the tests it runs depend only on mongod, mongos, the mongo shell and the tools.
+# Used when the tests it runs depend only on mongod, mongos, the jstestshell and the tools.
 - &task_template
   name: template
   depends_on:
@@ -85,8 +94,22 @@ variables:
 - &gen_task_template
   name: gen_task_template
   depends_on:
-  - name: build_variant_gen
-  - name: archive_dist_test
+  - name: version_gen
+    variant: generate-tasks-for-version
+  - name: archive_dist_test_debug
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      resmoke_args: --help
+
+- &gen_burn_in_task_template
+  name: gen_burn_in_task_template
+  depends_on:
+  - name: version_gen
+    variant: generate-tasks-for-version
+  - name: version_burn_in_gen
+    variant: generate-tasks-for-version
+  - name: archive_dist_test_debug
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -95,7 +118,7 @@ variables:
 - &benchmark_template
   name: benchmark_template
   depends_on:
-  - name: compile_benchmarks
+  - name: compile_upload_benchmarks
   commands:
   - func: "do benchmark setup"
   - func: "run tests"
@@ -103,7 +126,7 @@ variables:
       resmoke_args: --help
       resmoke_jobs_max: 1
   - func: "send benchmark results"
-  - func: "analyze benchmark results"
+#  - func: "analyze benchmark results"
     vars:
       suite: benchmark_suite
 
@@ -150,8 +173,9 @@ variables:
   name: jstestfuzz_template
   exec_timeout_secs: 14400 # Time out the task if it runs for more than 4 hours.
   depends_on:
-  - build_variant_gen
-  - archive_dist_test
+  - name: version_gen
+    variant: generate-tasks-for-version
+  - archive_dist_test_debug
   commands:
   - func: "generate resmoke tasks"
 
@@ -172,8 +196,10 @@ variables:
   teardown_task:
   - func: "f_expansions_write"
   - func: "attach scons logs"
+  - func: "send scons cedar report"
   - func: "attach report"
   - func: "attach artifacts"
+  - func: "attach local resmoke invocation"
   - func: "kill processes"
   - func: "save code coverage data"
   - func: "save mongo coredumps"
@@ -241,6 +267,7 @@ variables:
   - func: "f_expansions_write"
   teardown_task:
   - func: "attach scons logs"
+  - func: "send scons cedar report"
   setup_group_can_fail_task: true
   setup_group:
   - command: manifest.load
@@ -264,31 +291,34 @@ variables:
 - mongocryptd_variants: &mongocryptd_variants
   - enterprise-amazon2
   - enterprise-amazon2-arm64
-  - enterprise-debian92-64
+  - enterprise-amazon2022
+  - enterprise-amazon2022-arm64
   - enterprise-debian10-64
+  - enterprise-debian11-64
   - enterprise-linux-64-amazon-ami
   - enterprise-macos
+  - enterprise-macos-arm64
   - enterprise-rhel-70-64-bit
-  #  - enterprise-rhel-70-64-bit-kitchen-sink
-  - enterprise-rhel-70-64-bit-no-libunwind
   - enterprise-rhel-81-ppc64le
   - enterprise-rhel-72-s390x
   - enterprise-rhel-80-64-bit
   - enterprise-rhel-80-64-bit-coverage
-  - enterprise-rhel-80-64-bit-inmem
-  - enterprise-rhel-80-64-bit-multiversion
   - enterprise-rhel-80-64-bit-suggested
   - enterprise-rhel-82-arm64
+  - enterprise-rhel-83-s390x
+  - enterprise-rhel-90-64-bit
+  - enterprise-rhel-90-arm64
   - enterprise-suse12-64
   - enterprise-suse15-64
   - enterprise-ubuntu1804-64
   - enterprise-ubuntu1804-arm64
   - enterprise-ubuntu2004-arm64
+  - enterprise-ubuntu2204-arm64
   - enterprise-ubuntu2004-64
+  - enterprise-ubuntu2204-64
   - enterprise-windows
   - enterprise-windows-debug-unoptimized
   - enterprise-windows-inmem
-  - enterprise-windows-required
   - enterprise-windows-wtdevelop
   - ubuntu1804-debug-asan
   - ubuntu1804-debug-ubsan
@@ -299,28 +329,37 @@ variables:
 # List of all variants that make mh artifacts.
 # If a variant is listed here and has a push task, the mh artifacts are pushed
 - mh_variants: &mh_variants
-  - enterprise-debian92-64
   - enterprise-macos
+  - enterprise-macos-arm64
   - enterprise-rhel-80-64-bit
-  - enterprise-rhel-80-64-bit-dynamic-required
+  - enterprise-rhel-80-64-bit-dynamic-all-feature-flags-required
   - enterprise-rhel-70-64-bit
   - enterprise-rhel-82-arm64
+  - enterprise-rhel-90-64-bit
+  - enterprise-rhel-90-arm64
   - enterprise-amazon2-arm64
+  - enterprise-amazon2022
+  - enterprise-amazon2022-arm64
   - enterprise-ubuntu1804-64
+  - enterprise-ubuntu2004-64
+  - enterprise-ubuntu2204-64
   - enterprise-windows
-  - enterprise-windows-required
 
 # List of all variants that use the packages.tgz
 - package_variants: &package_variants
   - amazon
   - enterprise-linux-64-amazon-ami
   - amazon2
+  - amazon2022
+  - amazon2022-arm64
   - enterprise-amazon2
   - enterprise-amazon2-arm64
+  - enterprise-amazon2022
+  - enterprise-amazon2022-arm64
   - debian10
+  - debian11
   - enterprise-debian10-64
-  - debian92
-  - enterprise-debian92-64
+  - enterprise-debian11-64
   - rhel70
   - rhel76_compile_rhel70
   - enterprise-rhel-70-64-bit
@@ -329,8 +368,14 @@ variables:
   - ubi8
   - rhel80
   - rhel-82-arm64
+  - rhel90
+  - rhel90-arm64
   - enterprise-rhel-80-64-bit
+  - enterprise-rhel-80-64-bit-suggested  # For testing selinux.
   - enterprise-rhel-82-arm64
+  - enterprise-rhel-83-s390x
+  - enterprise-rhel-90-64-bit
+  - enterprise-rhel-90-arm64
   - suse12
   - enterprise-suse12-64
   - suse15
@@ -338,10 +383,13 @@ variables:
   - ubuntu1804
   - ubuntu1804-arm64
   - ubuntu2004-arm64
+  - ubuntu2204-arm64
   - ubuntu2004
+  - ubuntu2204
   - enterprise-ubuntu1804-64
   - enterprise-ubuntu1804-arm64
   - enterprise-ubuntu2004-arm64
+  - enterprise-ubuntu2204-arm64
   - enterprise-ubuntu2004-64
   - enterprise-windows
   - windows
@@ -374,19 +422,6 @@ functions:
       args:
       - "src/evergreen/functions/evergreen_api_credentials_configure.sh"
 
-  "configure selected tests credentials": &configure_selected_tests_credentials
-    command: subprocess.exec
-    type: test
-    params:
-      binary: bash
-      silent: true
-      args:
-      - "src/evergreen/functions/selected_tests_credentials_configure.sh"
-      env:
-        project: ${project}
-        selected_tests_auth_user: ${selected_tests_auth_user}
-        selected_tests_auth_token: ${selected_tests_auth_token}
-
   "git get project": &git_get_project
     command: git.get_project
     params:
@@ -418,12 +453,20 @@ functions:
   - *git_get_project
   - *add_git_tag
 
+  "gen feature flags": &gen_feature_flags
+    command: subprocess.exec
+    type: test
+    params:
+      binary: bash
+      args:
+      - "src/evergreen/gen_feature_flags.sh"
+
   "fetch artifacts": &fetch_artifacts
     command: s3.get
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
-      remote_file: ${project}/${build_variant}/${revision}/artifacts/${build_id}.tgz
+      remote_file: ${mongo_artifacts}
       bucket: mciuploads
       extract_to: src
 
@@ -432,7 +475,7 @@ functions:
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
-      remote_file: ${project}/${build_variant}/${revision}/venv/${build_id}.tgz
+      remote_file: ${mongo_venv}
       bucket: mciuploads
       extract_to: "."
 
@@ -488,12 +531,23 @@ functions:
       args:
       - "src/evergreen/functions/binaries_extract.sh"
 
-  "check binary version": &check_binary_version
-    command: subprocess.exec
+  "get version expansions": &get_version_expansions
+    command: s3.get
     params:
-      binary: bash
-      args:
-      - "src/evergreen/functions/binary_version_check.sh"
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      remote_file: ${project}/${version_id}/${bv_future_git_tag|version}_expansions.yml
+      bucket: mciuploads
+      local_file: src/version_expansions.yml
+
+  "apply version expansions": &apply_version_expansions
+    command: expansions.update
+    params:
+      file: src/version_expansions.yml
+
+  "get and apply version expansions":
+    - *get_version_expansions
+    - *apply_version_expansions
 
   "fetch benchmarks": &fetch_benchmarks
     command: s3.get
@@ -725,6 +779,7 @@ functions:
     command: timeout.update
     params:
       exec_timeout_secs: ${exec_timeout_secs}
+      timeout_secs: ${timeout_secs}
 
   ### Set expansion macros used in each task.
   "set task expansion macros": &set_task_expansion_macros
@@ -732,23 +787,27 @@ functions:
     params:
       updates:
       - key: mongo_binaries
-        value: ${project}/${build_variant}/${revision}/binaries/mongo-${build_id}.${ext|tgz}
+        value: ${project}/${compile_variant}/${version_id}/binaries/mongo-${revision_order_id}.${ext|tgz}
       - key: mongo_cryptd
-        value: ${project}/${build_variant}/${revision}/binaries/mongo-cryptd-${build_id}.${ext|tgz}
+        value: ${project}/${compile_variant}/${version_id}/binaries/mongo-cryptd-${revision_order_id}.${ext|tgz}
       - key: mongo_cryptd_debugsymbols
-        value: ${project}/${build_variant}/${revision}/binaries/mongo-cryptd-debugsymbols-${build_id}.${ext|tgz}
+        value: ${project}/${compile_variant}/${version_id}/binaries/mongo-cryptd-debugsymbols-${revision_order_id}.${ext|tgz}
       - key: mh_archive
-        value: ${project}/${build_variant}/${revision}/binaries/mh-${build_id}.${ext|tgz}
+        value: ${project}/${compile_variant}/${version_id}/binaries/mh-${revision_order_id}.${ext|tgz}
       - key: mh_debugsymbols
-        value: ${project}/${build_variant}/${revision}/debugsymbols/mh-debugsymbols-${build_id}.${ext|tgz}
+        value: ${project}/${compile_variant}/${version_id}/debugsymbols/mh-debugsymbols-${revision_order_id}.${ext|tgz}
       - key: mongo_debugsymbols
-        value: ${project}/${build_variant}/${revision}/debugsymbols/debugsymbols-${build_id}.${ext|tgz}
-      - key: mongo_shell
-        value: ${project}/${build_variant}/${revision}/binaries/mongo-shell-${build_id}.${ext|tgz}
-      - key: mongo_shell_debugsymbols
-        value: ${project}/${build_variant}/${revision}/binaries/mongo-shell-debugsymbols-${build_id}.${ext|tgz}
+        value: ${project}/${compile_variant}/${version_id}/debugsymbols/debugsymbols-${revision_order_id}.${ext|tgz}
+      - key: mongo_jstestshell
+        value: ${project}/${compile_variant}/${version_id}/binaries/mongo-jstestshell-${revision_order_id}.${ext|tgz}
+      - key: mongo_jstestshell_debugsymbols
+        value: ${project}/${compile_variant}/${version_id}/binaries/mongo-jstestshell-debugsymbols-${revision_order_id}.tgz
+      - key: mongo_artifacts
+        value: ${project}/${compile_variant}/${version_id}/artifacts/${revision_order_id}.tgz
+      - key: mongo_venv
+        value: ${project}/${compile_variant}/${version_id}/venv/${revision_order_id}.tgz
       - key: mongo_fuzzer_corpus_mciuploads
-        value: ${project}/${build_variant}/${revision}/libfuzzer-corpora/corpora-${build_id}.${ext|tgz}
+        value: ${project}/${build_variant}/${version_id}/libfuzzer-corpora/corpora-${revision_order_id}.${ext|tgz}
       - key: mongo_fuzzer_corpus
         value: corpora-${project}-${build_variant}.${ext|tgz}
       - key: skip_tests
@@ -769,18 +828,35 @@ functions:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       local_file: pip-requirements.txt
-      remote_file: ${project}/${build_variant}/${revision}/pip-requirements-${task_id}-${execution}.txt
+      remote_file: ${project}/${build_variant}/${version_id}/pip-requirements-${task_id}-${execution}.txt
       bucket: mciuploads
       permissions: public-read
-      content_type: atext-plain
+      content_type: text/plain
       display_name: Pip Requirements
 
-  "send benchmark results":
-  - command: json.send
-    params:
-      name: perf
-      file: src/perf.json
+  "upload clang tidy results": &upload_clang_tidy_results
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/clang_tidy_fixes.tgz
+        remote_file: ${project}/${build_variant}/${version_id}/${task_id}/clang_tidy_fixes.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/gzip
+        display_name: clang_tidy_fixes.tgz
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/clang_tidy_fixes/clang_tidy_fixes.json
+        remote_file: ${project}/${build_variant}/${version_id}/${task_id}/clang_tidy_fixes.json
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/json
+        display_name: clang_tidy_fixes.json
 
+  "send benchmark results":
   - command: perf.send
     params:
       aws_key: ${aws_key}
@@ -823,7 +899,6 @@ functions:
   - *adjust_venv
   - *fetch_binaries
   - *extract_binaries
-  - *check_binary_version
   - *get_buildnumber
   - *f_expansions_write
   - *set_up_credentials
@@ -868,6 +943,7 @@ functions:
 
   "do multiversion setup":
   - *f_expansions_write
+  - *set_up_venv
   - *do_multiversion_setup
 
   # Used by generator
@@ -949,11 +1025,7 @@ functions:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       bucket: mciuploads
-      # This expansion's name was shortened to reduce the overall size of
-      # the generated configuration file
-      # gtcl = gen_task_config_location
-      # gtcl expansion is a variable included in the call of the parent function.
-      remote_file: ${project}/${gtcl}
+      remote_file: ${project}/${revision}/generate_tasks/generated-config-${version_id}.tgz
       local_file: "generate_tasks_config.tgz"
 
   "extract generated test configuration": &extract_generated_test_configuration
@@ -964,7 +1036,7 @@ functions:
       args:
       - "./src/evergreen/extract_generated_test_configuration.sh"
 
-  "minimize jstestfuzz": &minimize_jstestfuzz
+  "minimize jstestfuzz":
     command: subprocess.exec
     type: test
     params:
@@ -972,34 +1044,35 @@ functions:
       args:
       - "./src/evergreen/jstestfuzz_minimize.sh"
 
-  "generate selected tests":
+  "generate version":
   - *f_expansions_write
   - *configure_evergreen_api_credentials
-  - *configure_selected_tests_credentials
   - command: subprocess.exec
     type: test
     params:
       binary: bash
       args:
-      - "./src/evergreen/selected_tests_generate.sh"
-  # this sets the gtcl expansion
-  - command: expansions.update
-    params:
-      ignore_missing_file: false
-      file: src/gtcl_update_expansions.yml
-  - *f_expansions_write
+      - "./src/evergreen/generate_version.sh"
   - command: archive.targz_pack
     params:
       target: generate_tasks_config.tgz
       source_dir: src/generated_resmoke_config
       include:
       - "*"
+  - command: subprocess.exec
+    type: test
+    params:
+      binary: bash
+      args:
+      - "src/evergreen/run_python_script.sh"
+      - "buildscripts/validate_file_size.py"
+      - "generate_tasks_config.tgz"
   - command: s3.put
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       local_file: generate_tasks_config.tgz
-      remote_file: ${project}/${gtcl}
+      remote_file: ${project}/${revision}/generate_tasks/generated-config-${version_id}.tgz
       bucket: mciuploads
       permissions: public-read
       content_type: ${content_type|application/gzip}
@@ -1011,7 +1084,7 @@ functions:
       files:
       - src/generated_resmoke_config/*.json
 
-  "generate build variant":
+  "generate version burn in":
   - *f_expansions_write
   - *configure_evergreen_api_credentials
   - command: subprocess.exec
@@ -1019,71 +1092,45 @@ functions:
     params:
       binary: bash
       args:
-      - "./src/evergreen/generate_build_variant.sh"
-  # this sets the gtcl expansion
-  - command: expansions.update
-    params:
-      ignore_missing_file: false
-      file: src/gtcl_update_expansions.yml
-  - *f_expansions_write
+      - "./src/evergreen/generate_version_burn_in.sh"
   - command: archive.targz_pack
     params:
       target: generate_tasks_config.tgz
       source_dir: src/generated_resmoke_config
       include:
       - "*"
+  - command: subprocess.exec
+    type: test
+    params:
+      binary: bash
+      args:
+      - "src/evergreen/run_python_script.sh"
+      - "buildscripts/validate_file_size.py"
+      - "generate_tasks_config.tgz"
   - command: s3.put
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       local_file: generate_tasks_config.tgz
-      remote_file: ${project}/${gtcl}
+      remote_file: ${project}/${revision}/generate_tasks/generated-burn-in-config-${version_id}.tgz
       bucket: mciuploads
       permissions: public-read
       content_type: ${content_type|application/gzip}
-      display_name: Generated Task Config - Execution ${execution}
+      display_name: Generated Burn In Task Config - Execution ${execution}
       optional: true
   - command: generate.tasks
     params:
       optional: true
       files:
       - src/generated_resmoke_config/*.json
-
-  "generate burn in tags":
-  - *f_expansions_write
-  - *configure_evergreen_api_credentials
-  - command: subprocess.exec
-    type: test
-    params:
-      binary: bash
-      args:
-      - "./src/evergreen/burn_in_tests_generate.sh"
-  - command: archive.targz_pack
-    params:
-      target: burn_in_tags_gen.tgz
-      source_dir: src/generated_burn_in_tags_config
-      include:
-      - "*"
-  - command: s3.put
-    params:
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: burn_in_tags_gen.tgz
-      remote_file: ${project}/${build_variant}/${revision}/burn_in_tags_gen/burn_in_tags_gen-${build_id}.tgz
-      bucket: mciuploads
-      permissions: public-read
-      content_type: application/gzip
-      display_name: Burn_in_tags Task Config - Execution ${execution}
-  - command: generate.tasks
-    params:
-      files:
-      - src/generated_burn_in_tags_config/burn_in_tags_gen.json
 
   "generate resmoke tasks":
   - *fetch_artifacts
   - *f_expansions_write
   - *kill_processes
   - *cleanup_environment
+  - *get_version_expansions
+  - *apply_version_expansions
   - *fetch_venv
   - *adjust_venv
   - *f_expansions_write
@@ -1131,6 +1178,7 @@ functions:
   - *configure_evergreen_api_credentials
   - *determine_task_timeout
   - *update_task_timeout_expansions
+  - *update_task_timeout
   - *f_expansions_write
   - command: subprocess.exec
     params:
@@ -1138,7 +1186,6 @@ functions:
       args:
       - "./src/evergreen/multiversion_exclude_tags_generate.sh"
   - *execute_resmoke_tests
-  - *minimize_jstestfuzz
     # The existence of the "run_tests_infrastructure_failure" file indicates this failure isn't
     # directly actionable. We use type=setup rather than type=system or type=test for this command
   # because we don't intend for any human to look at this failure.
@@ -1214,13 +1261,98 @@ functions:
       - "src/evergreen/scons_lint.sh"
 
   "scons compile":
+  - *get_version_expansions
+  - *apply_version_expansions
   - *f_expansions_write
+  - command: subprocess.exec
+    params:
+      background: true
+      continue_on_err: true
+      binary: bash
+      args:
+      - "./src/evergreen/scons_splunk.sh"
   - command: subprocess.exec
     type: test
     params:
       binary: bash
       args:
       - "src/evergreen/scons_compile.sh"
+
+  "ninja compile":
+  - *f_expansions_write
+  - command: subprocess.exec
+    type: test
+    params:
+      binary: bash
+      args:
+      - "./src/evergreen/ninja_compile.sh"
+
+  "generate version expansions": &generate_version_expansions
+    command: subprocess.exec
+    params:
+      binary: bash
+      args:
+      - "src/evergreen/functions/version_expansions_generate.sh"
+
+  "upload version expansions": &upload_version_expansions
+   command: s3.put
+   params:
+     aws_key: ${aws_key}
+     aws_secret: ${aws_secret}
+     local_file: src/version_expansions.yml
+     remote_file: ${project}/${version_id}/${bv_future_git_tag|version}_expansions.yml
+     bucket: mciuploads
+     permissions: public-read
+     content_type: application/x-yaml
+     display_name: version expansions
+
+  "generate and upload version expansions":
+  - *generate_version_expansions
+  - *upload_version_expansions
+
+  "generate resmoke constants": &generate_resmoke_constants
+    command: subprocess.exec
+    type: test
+    params:
+      binary: bash
+      args:
+        - "src/evergreen/get_bin_and_fcv_versions.sh"
+
+  "archive resmoke constants": &archive_resmoke_constants
+    command: archive.targz_pack
+    params:
+      target: resmoke_constants.tgz
+      source_dir: "src"
+      include:
+        - ".resmoke_mongo_version.yml"
+        - ".resmoke_mongo_release_values.yml"
+
+  "upload resmoke constants": &upload_remoske_constants
+    command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: resmoke_constants.tgz
+      remote_file: ${project}/${version_id}/${bv_future_git_tag|version}-resmoke-constants.tgz
+      bucket: mciuploads
+      permissions: private
+      visibility: signed
+      content_type: application/tar
+      display_name: resmoke constants
+
+  "generate and upload resmoke constants":
+    - *generate_resmoke_constants
+    - *archive_resmoke_constants
+    - *upload_remoske_constants
+
+  "fetch resmoke constants": &fetch_resmoke_constants
+    command: s3.get
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      remote_file: ${project}/${version_id}/${bv_future_git_tag|version}-resmoke-constants.tgz
+      bucket: mciuploads
+      extract_to: src
 
   "generate compile expansions":
   - *f_expansions_write
@@ -1329,15 +1461,6 @@ functions:
       binary: bash
       args:
       - "./src/evergreen/jepsen_test_fail.sh"
-
-  "load aws test credentials":
-  - *f_expansions_write
-  - command: subprocess.exec
-    params:
-      binary: bash
-      silent: true
-      args:
-      - "./src/evergreen/functions/aws_test_credentials_load.sh"
 
   "setup jstestfuzz":
   - *f_expansions_write
@@ -1496,19 +1619,14 @@ functions:
       - "./src/evergreen/powercycle_exit.sh"
 
   "run packager.py":
+  - *get_version_expansions
+  - *apply_version_expansions
   - *f_expansions_write
   - command: subprocess.exec
     params:
       binary: bash
       args:
       - "./src/evergreen/packager.py_run.sh"
-
-  "do snmp setup":
-    command: subprocess.exec
-    params:
-      binary: bash
-      args:
-      - "./src/evergreen/do_snmp_setup.sh"
 
   "do watchdog setup":
     command: subprocess.exec
@@ -1517,14 +1635,39 @@ functions:
       args:
       - "./src/evergreen/do_watchdog_setup.sh"
 
-  "run kitchen":
+  "run package test":
+  - *get_version_expansions
+  - *apply_version_expansions
   - *f_expansions_write
   - command: subprocess.exec
     type: test
     params:
       binary: bash
+      add_expansions_to_env: true
       args:
-      - "./src/evergreen/kitchen_run.sh"
+      - "src/evergreen/run_python_script.sh"
+      - "buildscripts/package_test.py"
+      - "--arch=${packager_arch}"
+      - "branch"
+      - "--test"
+      - "${packager_distro}"
+      - "https://s3.amazonaws.com/mciuploads/${project}/${build_variant}/${revision}/artifacts/${build_id}-packages.tgz"
+      - "--edition"
+      - "${repo_edition}"
+      - "--server-version"
+      - "${version}"
+
+  "run release package test":
+  - *f_expansions_write
+  - command: subprocess.exec
+    type: test
+    params:
+      binary: bash
+      add_expansions_to_env: true
+      args:
+      - "src/evergreen/run_python_script.sh"
+      - "buildscripts/package_test.py"
+      - "release"
 
   "set up EC2 instance": &set_up_ec2_instance
 
@@ -1667,6 +1810,8 @@ functions:
       binary: bash
       args:
       - "./src/evergreen/functions/code_coverage_data_process.sh"
+      env:
+        GCOV_TOOL: ${gcov_tool}
 
   "tar code coverage data": &tar_code_coverage_data
     command: archive.targz_pack
@@ -1737,11 +1882,43 @@ functions:
       display_name: Jepsen Test Results - ${execution}
       optional: true
 
+  "upload jepsen_log": &upload_jepsen_log
+    command: s3.put
+    params:
+      optional: true
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/jepsen-mongodb/jepsen_${task_name}_${execution}.log
+      remote_file: ${project}/${build_variant}/${revision}/jepsen_${task_name}_${execution}.log
+      bucket: mciuploads
+      permissions: public-read
+      content_type: text/plain
+      display_name: Jepsen Test Log
+
   "save jepsen artifacts":
   - *tar_jepsen_logs
   - *archive_jepsen_logs
   - *tar_jepsen_results
   - *archive_jepsen_results
+  - *upload_jepsen_log
+
+  "save blackduck artifacts":
+  - command: archive.targz_pack
+    params:
+      target: blackduck.tgz
+      source_dir: /home/ec2-user/blackduck/runs/
+      include:
+      - "**"
+  - command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: blackduck.tgz
+      remote_file: ${project}/${build_variant}/${version_id}/blackduck-${task_id}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/gzip}
+      display_name: BlackDuck logs
 
   ### Process & archive mongo coredumps ###
   "gather mongo coredumps": &gather_mongo_coredumps
@@ -1996,18 +2173,118 @@ functions:
       permissions: public-read
       display_name: SCons cache debug log
 
-  - *f_expansions_write
-  - command: subprocess.exec
+  - command: s3.put
     params:
-      continue_on_err: true
-      binary: bash
-      args:
-      - "./src/evergreen/scons_splunk.sh"
+      optional: true
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/scons_stdout.log
+      content_type: text/plain
+      remote_file: ${project}/${build_variant}/${revision}/artifacts/scons-stdout.log.${build_id}-${task_name}.${execution}
+      bucket: mciuploads
+      permissions: public-read
+      display_name: SCons stdout log
+
+  "send scons cedar report":
+    - command: subprocess.exec
+      params:
+        binary: bash
+        args:
+          - "./src/evergreen/scons_metrics_report.sh"
+
+    - command: perf.send
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        bucket: mciuploads
+        prefix: ${task_id}_${execution}
+        file: src/scons_cedar_report.json
 
   "attach report":
     command: attach.results
     params:
       file_location: ${report_file|src/report.json}
+
+  "print top N metrics":
+    - command: subprocess.exec
+      params:
+        binary: bash
+        add_expansions_to_env: true
+        args:
+        - "src/evergreen/run_python_script.sh"
+        - "site_scons/site_tools/build_metrics/top_n_metrics.py"
+        - "--input=build_metrics.json"
+        - "--output=top_15_metrics.txt"
+        - "--num=15"
+
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/top_15_metrics.txt
+        remote_file: ${project}/${build_variant}/${revision}/${build_id}-${task_name}-${execution}-top_15_metrics.txt
+        bucket: mciuploads
+        permissions: public-read
+        content_type: text/plain
+        display_name: Top 15 Metrics
+
+  "attach build metrics":
+    - command: archive.targz_pack
+      params:
+        target: build-metrics.tgz
+        source_dir: src
+        include:
+        - "./build_metrics.json"
+        - "./populate_cache.json"
+        - "./pull_cache.json"
+
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: build-metrics.tgz
+        remote_file: ${project}/${build_variant}/${revision}/${build_id}-${task_name}-${execution}-build-metrics.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/gzip
+        display_name: Metrics JSON
+
+    - command: subprocess.exec
+      params:
+        binary: bash
+        add_expansions_to_env: true
+        args:
+        - "src/evergreen/run_python_script.sh"
+        - "evergreen/build_metric_cedar_report.py"
+        - "--build-metrics=build_metrics.json"
+        - "--cache-push-metrics=populate_cache.json"
+        - "--cache-pull-metrics=pull_cache.json"
+
+    - command: archive.targz_pack
+      params:
+        target: build_metrics_cedar_report.tgz
+        source_dir: src
+        include:
+        - "./build_metrics_cedar_report.json"
+
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: build_metrics_cedar_report.tgz
+        remote_file: ${project}/${build_variant}/${revision}/${build_id}-${task_name}-${execution}-build_metrics_cedar_report.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/gzip
+        display_name: Cedar Report JSON
+
+    - command: perf.send
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        bucket: mciuploads
+        prefix: ${task_id}_${execution}
+        file: src/build_metrics_cedar_report.json
 
   "attach artifacts":
     command: attach.artifacts
@@ -2039,9 +2316,21 @@ functions:
       remote_file: ${project}/${build_variant}/${revision}/local-resmoke-invocation-${task_id}-${execution}.txt
       bucket: mciuploads
       permissions: public-read
-      content_type: atext-plain
+      content_type: text/plain
       display_name: Resmoke.py Invocation for Local Usage
 
+  "attach multiversion exclude tags":
+    command: s3.put
+    params:
+      optional: true
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/generated_resmoke_config/multiversion_exclude_tags.yml
+      remote_file: ${project}/${build_variant}/${revision}/multiversion_exclude_tags-${task_id}-${execution}.yml
+      bucket: mciuploads
+      permissions: public-read
+      content_type: text/plain
+      display_name: Generated multiversion exclude tags options
 
 # Pre task steps
 pre:
@@ -2053,6 +2342,7 @@ post:
 - func: "f_expansions_write"
 - func: "upload npm logs"
 - func: "attach local resmoke invocation"
+- func: "attach multiversion exclude tags"
 - func: "attach report"
 - func: "attach artifacts"
 - func: "save ec2 task artifacts"
@@ -2062,6 +2352,7 @@ post:
 - func: "save local client logs"
 - func: "save code coverage data"
 - func: "save jepsen artifacts"
+- func: "save blackduck artifacts"
 - func: "save mongo coredumps"
 - func: "save failed unittests"
 - func: "save hang analyzer debugger files"
@@ -2088,7 +2379,9 @@ tasks:
 ## compile - build all scons targets except unittests ##
 - name: compile_dist_test
   tags: []
-  depends_on: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - func: "scons compile"
     vars:
@@ -2097,6 +2390,52 @@ tasks:
         ${additional_compile_targets|}
       task_compile_flags: >-
         PREFIX=dist-test
+
+- name: compile_upload_benchmarks
+  tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
+  commands:
+  - func: "scons compile"
+    vars:
+      targets: install-benchmarks
+      compiling_for_test: true
+  - command: archive.targz_pack
+    params:
+      target: "benchmarks.tgz"
+      source_dir: "src"
+      include:
+      - "./build/benchmarks.txt"
+      - "./build/**_bm"
+      - "./build/**_bm.gcno"
+      - "./build/**_bm.exe"
+      - "./build/**_bm.pdb"
+  - command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: benchmarks.tgz
+      remote_file: ${project}/${build_variant}/${revision}/benchmarks/${build_id}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: application/tar
+      display_name: Benchmarks
+
+- name: compile_venv_deps_check
+  commands:
+  - *f_expansions_write
+  - command: manifest.load
+  - func: "git get project and add git tag"
+  - *f_expansions_write
+  - *kill_processes
+  - *cleanup_environment
+  - command: subprocess.exec
+    type: test
+    params:
+      binary: bash
+      args:
+      - "src/evergreen/compile_venv_dependency_check.sh"
 
 - name: determine_patch_tests
   commands:
@@ -2113,13 +2452,20 @@ tasks:
   depends_on:
   - name: compile_dist_test
   commands:
-  - *f_expansions_write
   - func: "scons compile"
     vars:
       targets: >-
         archive-dist-test
       task_compile_flags: >-
         PREFIX=dist-test
+  - command: subprocess.exec
+    params:
+      binary: bash
+      add_expansions_to_env: true
+      args:
+      - "src/evergreen/run_python_script.sh"
+      - "evergreen/macos_notary.py"
+      - "mongodb-binaries.${ext|tgz}"
 
   - command: s3.put
     params:
@@ -2134,20 +2480,8 @@ tasks:
       display_name: Binaries
 
   - *f_expansions_write
-  - command: subprocess.exec
-    type: test
-    params:
-      binary: bash
-      args:
-      - "src/evergreen/gen_feature_flags.sh"
-
-  - *f_expansions_write
-  - command: subprocess.exec
-    type: test
-    params:
-      binary: bash
-      args:
-      - "src/evergreen/get_bin_and_fcv_versions.sh"
+  - *gen_feature_flags
+  - *fetch_resmoke_constants
 
   - command: archive.targz_pack
     params:
@@ -2162,12 +2496,13 @@ tasks:
       - "./etc/backports_required_for_multiversion_tests.yml"
       - "./etc/evergreen_timeouts.yml"
       - "./etc/expansions.default.yml"
+      - "./etc/evergreen_nightly.yml"
       - "./etc/evergreen.yml"
+      - "./etc/evergreen_yml_components/**"
       - "./etc/pip/**"
       - "./etc/repo_config.yaml"
       - "./etc/scons/**"
       - "buildscripts/**"
-      - "compile_expansions.yml"
       - "all_feature_flags.txt"  # Must correspond to the definition in buildscripts/idl/lib.py.
       - "jstests/**"
       - "patch_files.txt"
@@ -2189,7 +2524,7 @@ tasks:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       local_file: artifacts.tgz
-      remote_file: ${project}/${build_variant}/${revision}/artifacts/${build_id}.tgz
+      remote_file: ${mongo_artifacts}
       bucket: mciuploads
       permissions: private
       visibility: signed
@@ -2209,7 +2544,7 @@ tasks:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       local_file: venv.tgz
-      remote_file: ${project}/${build_variant}/${revision}/venv/${build_id}.tgz
+      remote_file: ${mongo_venv}
       bucket: mciuploads
       permissions: private
       visibility: signed
@@ -2232,47 +2567,182 @@ tasks:
 
 - name: compile_ninja
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - func: "scons compile"
     vars:
       generating_for_ninja: true
       separate_debug: off
-      task_install_action:
-        default
       task_compile_flags: >-
         --ninja
-      targets:
-        generate-ninja
   - *f_expansions_write
-  - command: subprocess.exec
-    params:
-      binary: bash
-      args:
-      - "./src/evergreen/ninja_compile.sh"
+  - func: "ninja compile"
+    vars:
+      ninja_file: "build.ninja"
+      targets: "install-devcore compiledb"
+
+- name: compile_ninja_quick
+  tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
+  commands:
+  - func: "scons compile"
+    vars:
+      generating_for_ninja: true
+      separate_debug: off
+      task_compile_flags: >-
+        --ninja
+  - *f_expansions_write
+  - func: "ninja compile"
+    vars:
+      ninja_file: "build.ninja"
+      targets: "install-wiredtiger compiledb"
+
+- name: compile_ninja_default_profile
+  tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
+  commands:
+  - func: "scons compile"
+    vars:
+      generating_for_ninja: true
+      separate_debug: off
+      task_compile_flags: >-
+        --build-profile=default
+        --ninja
+  - *f_expansions_write
+  - func: "ninja compile"
+    vars:
+      ninja_file: "build.ninja"
+
+- name: compile_ninja_default_profile_linux
+  tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
+  commands:
+  - func: "scons compile"
+    vars:
+      generating_for_ninja: true
+      separate_debug: off
+      task_compile_flags: >-
+        --build-profile=default
+        --variables-files=etc/scons/mongodbtoolchain_stable_clang.vars
+        --ninja
+  - *f_expansions_write
+  - func: "ninja compile"
+    vars:
+      ninja_file: "build.ninja"
+      targets: "install-devcore compiledb"
+
+- name: compile_ninja_opt_profile
+  tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
+  commands:
+  - func: "scons compile"
+    vars:
+      generating_for_ninja: true
+      separate_debug: off
+      task_compile_flags: >-
+        --build-profile=opt
+        CCACHE=
+        ICECC=
+  - *f_expansions_write
+  - func: "ninja compile"
+    vars:
+      ninja_file: "opt.ninja"
+      targets: "install-devcore compiledb"
+
+- name: compile_ninja_fast_profile
+  tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
+  commands:
+  - func: "scons compile"
+    vars:
+      generating_for_ninja: true
+      separate_debug: off
+      task_compile_flags: >-
+        --build-profile=fast
+        CCACHE=
+        ICECC=
+  - *f_expansions_write
+  - func: "ninja compile"
+    vars:
+      ninja_file: "fast.ninja"
+      targets: "install-devcore compiledb"
+
+- name: compile_ninja_san_profile
+  tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
+  commands:
+  - func: "scons compile"
+    vars:
+      generating_for_ninja: true
+      separate_debug: off
+      task_compile_flags: >-
+        --build-profile=san
+        --linker=lld
+        CCACHE=
+        ICECC=
+  - *f_expansions_write
+  - func: "ninja compile"
+    vars:
+      ninja_file: "san.ninja"
+      targets: "install-devcore compiledb"
+
+- name: compile_ninja_compiledb_profile
+  tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
+  commands:
+  - func: "scons compile"
+    vars:
+      generating_for_ninja: true
+      separate_debug: off
+      task_compile_flags: >-
+        --build-profile=compiledb
+        --ninja
+  - *f_expansions_write
+  - func: "ninja compile"
+    vars:
+      ninja_file: "compiledb.ninja"
+      targets: "install-devcore compiledb"
 
 - name: compile_ninja_next
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - func: "scons compile"
     vars:
       generating_for_ninja: true
       separate_debug: off
-      task_install_action:
-        default
       task_compile_flags: >-
         --build-tools=next
         --ninja
-      targets:
-        generate-ninja
   - *f_expansions_write
-  - command: subprocess.exec
-    params:
-      binary: bash
-      args:
-      - "./src/evergreen/ninja_compile.sh"
+  - func: "ninja compile"
+    vars:
+      ninja_file: "build.ninja"
+      targets: "install-devcore compiledb"
 
 - name: compile_build_tools_next
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - func: "scons compile"
     vars:
@@ -2283,6 +2753,9 @@ tasks:
 
 - name: libdeps_graph_linting
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - *f_expansions_write
   - command: subprocess.exec
@@ -2295,6 +2768,7 @@ tasks:
     vars:
       task_compile_flags: >-
         --link-model=dynamic
+        --force-macos-dynamic-link
         --build-tools=next
       targets:
         generate-libdeps-graph
@@ -2338,23 +2812,44 @@ tasks:
       targets: install-all-meta
       compiling_for_test: true
 
+- name: compile_all_but_not_unittests
+  tags: []
+  depends_on:
+  - name: compile_dist_test
+  commands:
+  - func: "scons compile"
+    vars:
+      targets: install-all-meta-but-not-unittests
+      compiling_for_test: true
+
 ## clang_tidy - run clang_tidy
 - name: clang_tidy
   tags: []
-  exec_timeout_secs: 3600 # 1 hour timeout for the task overall
+  exec_timeout_secs: 7200 # 1 hour timeout for the task overall
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
-  - *f_expansions_write
   - func: "scons compile"
     vars:
-      targets: generated-sources compiledb
+      task_compile_flags: >-
+        --build-profile=compiledb
+      targets: compiledb +mongo-tidy-tests
       compiling_for_test: true
+      compile_flags: >-
+        --link-model=dynamic
+        -j$(grep -c ^processor /proc/cpuinfo)
+        --variables-files=etc/scons/mongodbtoolchain_${clang_tidy_toolchain}_clang.vars
+      show_scons_timings: false
   - command: subprocess.exec
     type: test
-    timeout_secs: 3600 # 1 hour timeout for no output
+    timeout_secs: 7000 # 1 hour timeout for no output
     params:
       binary: bash
       args:
       - "./src/evergreen/run_clang_tidy.sh"
+      env:
+        clang_tidy_file: ".clang-tidy"
 
 ## compile_unittests ##
 - &compile_unittests
@@ -2366,6 +2861,43 @@ tasks:
     vars:
       targets: install-unittests install-unittests-debug
       compiling_for_test: true
+
+- name: build_metrics_tasks_gen
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
+  commands:
+
+  - command: subprocess.exec
+    params:
+      binary: bash
+      add_expansions_to_env: true
+      args:
+      - "src/evergreen/run_python_script.sh"
+      - "buildscripts/evergreen_gen_build_metrics_tasks.py"
+
+  - command: archive.targz_pack
+    params:
+      target: build_metrics_task_gen.tgz
+      source_dir: "src"
+      include:
+      - "build_metrics_task_gen.json"
+
+  - command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: build_metrics_task_gen.tgz
+      remote_file: ${project}/${build_variant}/${revision}/build-metrics/${task_name}-${build_id}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: application/gzip
+      display_name: Build Metrics Task Gen JSON
+
+  - command: generate.tasks
+    params:
+      files:
+      - src/build_metrics_task_gen.json
 
 ## A copy of the compile_unittests task for the recorded unittest taskgroup ##
 - <<: *compile_unittests
@@ -2385,11 +2917,12 @@ tasks:
   - func: "run tests"
     vars:
       suite: unittests
+      install_dir: build/install/bin
 
 ## run_unittests with UndoDB live-record ##
 #- name: run_unittests_with_recording
 #  depends_on:
-#    - name: compile_unittests_for_recorded_unittest
+#  - name: compile_unittests_for_recorded_unittest
 #  commands:
 #    - *f_expansions_write
 #    - func: "run diskstats"
@@ -2412,11 +2945,15 @@ tasks:
 #        # Start fewer jobs since there's a constant amount of overhead of starting
 #        # live-record for each job.
 #        resmoke_jobs_factor: 0.3
+#        install_dir: build/install/bin
 
 
 ##compile_and_archive_libfuzzertests - build libfuzzertests ##
 - name: compile_and_archive_libfuzzertests
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - func: "scons compile"
     vars:
@@ -2447,22 +2984,30 @@ tasks:
 
 - name: server_discovery_and_monitoring_json_test
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - func: "scons compile"
     vars:
       targets: install-sdam-json-test
       compiling_for_test: true
+      install_dir: build/install/bin
   - func: "run tests"
     vars:
       suite: sdam_json_test
 
 - name: server_selection_json_test
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - func: "scons compile"
     vars:
       targets: install-server-selection-json-test
       compiling_for_test: true
+      install_dir: build/install/bin
   - func: "run tests"
 
 ## compile_dbtest ##
@@ -2502,8 +3047,21 @@ tasks:
       targets: archive-dbtest archive-dbtest-debug
       compiling_for_test: true
 
+- name: compile_integration_test
+  tags: []
+  depends_on:
+  - name: compile_dist_test
+  commands:
+  - func: "scons compile"
+    vars:
+      targets: install-integration-tests
+      compiling_for_test: true
+
 - name: compile_visibility_test
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - func: "scons compile"
     vars:
@@ -2513,6 +3071,7 @@ tasks:
         --dbg=on
         --opt=on
         --link-model=dynamic
+        --force-macos-dynamic-link
         --visibility-support=on
 
   - command: s3.put
@@ -2527,167 +3086,11 @@ tasks:
       content_type: ${content_type|application/gzip}
       display_name: Binaries
 
-## embedded_sdk_build_and_test_* - build the embedded-dev and embedded-test targets only ##
-
-- name: embedded_sdk_build_cdriver
-  tags: []
-  commands:
-  - func: f_expansions_write
-  - command: subprocess.exec
-    params:
-      binary: bash
-      args:
-      - "src/evergreen/embedded_sdk_build_cdriver.sh"
-
-- name: embedded_sdk_install_dev
-  tags: []
-  depends_on:
-  - name: embedded_sdk_build_cdriver
-  commands:
-  - func: "scons compile"
-    vars:
-      targets: install-embedded-dev
-      task_compile_flags: &embedded_sdk_compile_flags >-
-        --allocator=system
-        --dbg=off
-        --enable-free-mon=off
-        --enable-http-client=off
-        --js-engine=none
-        --opt=size
-        --ssl=off
-        --use-system-mongo-c=on
-        DESTDIR='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION'
-        CPPPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/include/libbson-1.0 $BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/include/libmongoc-1.0'
-      task_compile_flags_extra: >-
-        --link-model=dynamic-sdk
-
-- name: embedded_sdk_s3_put
-  tags: []
-  depends_on:
-  - name: embedded_sdk_install_dev
-  commands:
-  - *f_expansions_write
-  - command: subprocess.exec
-    params:
-      binary: bash
-      args:
-      - "src/evergreen/embedded_sdk_s3_tar.sh"
-
-  # Upload it so we can download from EVG.
-  - command: s3.put
-    params:
-      optional: true
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: "src/build/embedded-sdk.tgz"
-      remote_file: ${project}/embedded-sdk/${build_variant}/${revision}/mongo-embedded-sdk-${version}.tgz
-      bucket: mciuploads
-      permissions: public-read
-      content_type: application/tar
-      display_name: "Embedded SDK Tar Archive"
-
-- name: embedded_sdk_install_tests
-  tags: []
-  depends_on:
-  - name: embedded_sdk_install_dev
-  commands:
-  - func: "scons compile"
-    vars:
-      targets: install-embedded-test
-      compiling_for_test: true
-      task_compile_flags: *embedded_sdk_compile_flags
-      task_compile_flags_extra: >-
-        --link-model=dynamic
-      # Unlike static builds, dynamic builds have no need to
-      # constrain the number of link jobs. Unfortunately, --jlink=1
-      # means one link job, not 100%. So this is a bit gross but set
-      # it to .99.
-      num_scons_link_jobs_available: 0.99
-
-- name: embedded_sdk_tests_s3_put
-  tags: []
-  depends_on:
-  - name: embedded_sdk_install_tests
-  commands:
-  - *f_expansions_write
-  - command: subprocess.exec
-    type: test
-    params:
-      binary: bash
-      args:
-      - "src/evergreen/embedded_sdk_tests_s3_tar.sh"
-
-  # Upload it so we can download from EVG.
-  - command: s3.put
-    params:
-      optional: true
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: "src/build/embedded-sdk-tests.tgz"
-      remote_file: ${project}/embedded-sdk-test/${build_variant}/${revision}/mongo-embedded-sdk-test-${version}.tgz
-      bucket: mciuploads
-      permissions: public-read
-      content_type: application/tar
-      display_name: "Embedded SDK Tests Tar Archive"
-
-- name: embedded_sdk_run_tests
-  tags: []
-  depends_on:
-  - name: embedded_sdk_install_tests
-  commands:
-  - *f_expansions_write
-  - command: subprocess.exec
-    type: test
-    params:
-      binary: bash
-      args:
-      - "src/evergreen/embedded_sdk_run_tests.sh"
-  - command: subprocess.exec
-    params:
-      binary: bash
-      args:
-      - "src/evergreen/embedded_sdk_run_tests_post.sh"
-
-- name: embedded_sdk_s3_put_latest
-  tags: []
-  depends_on:
-  - name: embedded_sdk_run_tests
-  commands:
-  # A second put, this time to -latest, to give devs a reasonable
-  # way to get the most recent build.
-  - command: s3.put
-    params:
-      visibility: none
-      optional: true
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: "src/build/embedded-sdk.tgz"
-      remote_file: ${project}/embedded-sdk/mongo-${build_variant}-latest.tgz
-      bucket: mciuploads
-      permissions: public-read
-      content_type: ${content_type|application/x-gzip}
-
-- name: embedded_sdk_tests_s3_put_latest
-  tags: []
-  depends_on:
-  - name: embedded_sdk_run_tests
-  commands:
-  # A second put, this time to -latest, to give devs a reasonable
-  # way to get the most recent build.
-  - command: s3.put
-    params:
-      visibility: none
-      optional: true
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: "src/build/embedded-sdk-tests.tgz"
-      remote_file: ${project}/embedded-sdk-test/mongo-${build_variant}-latest.tgz
-      bucket: mciuploads
-      permissions: public-read
-      content_type: ${content_type|application/x-gzip}
-
 - name: stitch_support_create_lib
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - *f_expansions_write
   - func: "scons compile"
@@ -2738,6 +3141,7 @@ tasks:
   depends_on:
   - name: stitch_support_install_tests
   commands:
+  - func: "get and apply version expansions"
   - *f_expansions_write
   - command: subprocess.exec
     type: test
@@ -2746,161 +3150,124 @@ tasks:
       args:
       - "src/evergreen/stitch_support_run_tests.sh"
 
-- name: csfle_create_lib
+- name: crypt_create_lib
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - *f_expansions_write
   - func: "scons compile"
     vars:
-      targets: archive-mongo-csfle-dev
+      targets: archive-mongo-crypt-dev
       task_compile_flags: >-
         --allocator=system
         --enable-free-mon=off
-        --enterprise-features=fle
+        --enterprise-features=fle,search
         --js-engine=none
         --link-model=dynamic-sdk
-        ${csfle_task_compile_flags}
-        DESTDIR='$BUILD_ROOT/csfle-lib-$MONGO_VERSION'
+        --enable-http-client=off
+        --ssl=off
+        ${crypt_task_compile_flags}
+        DESTDIR='$BUILD_ROOT/crypt-lib-$MONGO_VERSION'
   - command: subprocess.exec
     params:
       binary: bash
       args:
-      - "src/evergreen/csfle_run_tests.sh"
+      - "src/evergreen/crypt_run_tests.sh"
   - command: s3.put
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
-      local_file: "src/mongo-csfle-dev.${ext|tgz}"
-      remote_file: "${project}/mongo_csfle/${build_variant}/${revision}/mongo_csfle_v1-${version}.${ext|tgz}"
+      local_file: "src/mongo-crypt-dev.${ext|tgz}"
+      remote_file: "${project}/mongo_crypt/${build_variant}/${revision}/mongo_crypt_shared_v1-${version}.${ext|tgz}"
       bucket: mciuploads
       permissions: public-read
       content_type: ${content_type|application/tar}
-      display_name: "Mongo CSFLE Library"
+      display_name: "Mongo crypt Library"
 
-- name: csfle_create_debug_lib
+- name: crypt_create_debug_lib
   tags: []
+  depends_on:
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - *f_expansions_write
   - func: "scons compile"
     vars:
-      targets: archive-mongo-csfle-dev archive-mongo-csfle-debug
+      targets: archive-mongo-crypt-dev archive-mongo-crypt-debug
       task_compile_flags: >-
         --dbg=on
         --opt=off
         --allocator=system
         --enable-free-mon=off
-        --enterprise-features=fle
+        --enterprise-features=fle,search
         --js-engine=none
         --link-model=dynamic-sdk
-        DESTDIR='$BUILD_ROOT/csfle-lib-$MONGO_VERSION'
+        DESTDIR='$BUILD_ROOT/crypt-lib-$MONGO_VERSION'
   - command: s3.put
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
-      local_file: "src/mongo-csfle-dev.${ext|tgz}"
-      remote_file: "${project}/mongo_csfle/${build_variant}/${revision}/mongo_csfle_v1_dev-${version}.${ext|tgz}"
+      local_file: "src/mongo-crypt-dev.${ext|tgz}"
+      remote_file: "${project}/mongo_crypt/${build_variant}/${revision}/mongo_crypt_shared_v1_dev-${version}.${ext|tgz}"
       bucket: mciuploads
       permissions: public-read
       content_type: ${content_type|application/tar}
-      display_name: "Mongo CSFLE Library dev"
+      display_name: "Mongo Crypt Library dev"
   - command: s3.put
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
-      local_file: "src/mongo-csfle-debug.${ext|tgz}"
-      remote_file: "${project}/mongo_csfle/${build_variant}/${revision}/mongo_csfle_v1_debug-${version}.${ext|tgz}"
+      local_file: "src/mongo-crypt-debug.${ext|tgz}"
+      remote_file: "${project}/mongo_crypt/${build_variant}/${revision}/mongo_crypt_shared_v1_debug-${version}.${ext|tgz}"
       bucket: mciuploads
       permissions: public-read
       content_type: ${content_type|application/tar}
-      display_name: "Mongo CSFLE Library debug"
+      display_name: "Mongo Crypt Library debug"
 
-- name: csfle_install_tests
+- name: crypt_install_tests
   tags: []
   depends_on:
-  - name: csfle_create_debug_lib
+  - name: crypt_create_debug_lib
   commands:
   - *f_expansions_write
   - func: "scons compile"
     vars:
-      targets: archive-mongo-csfle-shlib-test
+      targets: archive-mongo-crypt-shlib-test
       compiling_for_test: true
-      task_install_action:
-        default
       task_compile_flags: >-
         --allocator=system
         --enable-free-mon=off
-        --enterprise-features=fle
+        --enterprise-features=fle,search
         --js-engine=none
         --link-model=static
-        DESTDIR='$BUILD_ROOT/csfle-lib-$MONGO_VERSION'
+        DESTDIR='$BUILD_ROOT/crypt-lib-$MONGO_VERSION'
+        RPATH='$$RPATH_ESCAPED_DOLLAR_ORIGIN/../lib'
   - command: s3.put
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
-      local_file: "src/mongo-csfle-shlib-test-runtime.${ext|tgz}"
-      remote_file: "${project}/mongo_csfle/${build_variant}/${revision}/mongo_csfle_shlib_test-${version}.${ext|tgz}"
+      local_file: "src/mongo-crypt-shlib-test-runtime.${ext|tgz}"
+      remote_file: "${project}/mongo_crypt/${build_variant}/${revision}/mongo_crypt_shlib_test-${version}.${ext|tgz}"
       bucket: mciuploads
       permissions: public-read
       content_type: ${content_type|application/tar}
-      display_name: "Mongo CSFLE Shared Library Test"
+      display_name: "Mongo Crypt Shared Library Test"
 
-- name: csfle_run_tests
+- name: crypt_run_tests
   tags: []
   depends_on:
-  - name: csfle_install_tests
+  - name: crypt_install_tests
   commands:
+  - func: "get and apply version expansions"
   - *f_expansions_write
   - command: subprocess.exec
     type: test
     params:
       binary: bash
       args:
-      - "src/evergreen/csfle_run_tests.sh"
-
-- name: compile_benchmarks
-  tags: []
-  depends_on: []
-  commands:
-  - command: manifest.load
-  - func: "git get project and add git tag"
-  - *f_expansions_write
-  - *kill_processes
-  - *cleanup_environment
-  - func: "set up venv"
-  - func: "upload pip requirements"
-  - func: "get buildnumber"
-  - func: "f_expansions_write"
-  - func: "set up credentials"
-  - func: "use WiredTiger develop" # noop if ${use_wt_develop} is not "true"
-  - func: "set up win mount script"
-  - func: "generate compile expansions"
-  # Then we load the generated version data into the agent so we can use it in task definitions
-  - func: "apply compile expansions"
-  - func: "scons compile"
-    vars:
-      targets: install-benchmarks
-      compiling_for_test: true
-  - func: "attach scons logs"
-  - command: archive.targz_pack
-    params:
-      target: "benchmarks.tgz"
-      source_dir: "src"
-      include:
-      - "./build/benchmarks.txt"
-      - "./build/**_bm"
-      - "./build/**_bm.gcno"
-      - "./build/**_bm.exe"
-      - "./build/**_bm.pdb"
-  - command: s3.put
-    params:
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: benchmarks.tgz
-      remote_file: ${project}/${build_variant}/${revision}/benchmarks/${build_id}.tgz
-      bucket: mciuploads
-      permissions: public-read
-      content_type: application/tar
-      display_name: Benchmarks
+      - "src/evergreen/crypt_run_tests.sh"
 
 ## lint ##
 - name: lint_pylinters
@@ -2921,6 +3288,25 @@ tasks:
   - func: "scons lint"
     vars:
       targets: lint-pylinters
+
+- name: lint_sconslinters
+  tags: ["lint"]
+  commands:
+  - command: timeout.update
+    params:
+      # 40 minutes
+      exec_timeout_secs: 2400
+  - *f_expansions_write
+  - command: manifest.load
+  - func: "git get project and add git tag"
+  - *f_expansions_write
+  - *kill_processes
+  - *cleanup_environment
+  - func: "set up venv"
+  - func: "upload pip requirements"
+  - func: "scons lint"
+    vars:
+      targets: lint-sconslinters
 
 - name: lint_clang_format
   tags: ["lint"]
@@ -3006,6 +3392,8 @@ tasks:
   - *f_expansions_write
   - *kill_processes
   - *cleanup_environment
+  - func: "set up venv"
+  - func: "upload pip requirements"
   - command: subprocess.exec
     type: test
     params:
@@ -3048,46 +3436,26 @@ tasks:
       args:
       - "src/evergreen/check_idl_compat.sh"
 
-- name: burn_in_tests_gen
+- <<: *gen_burn_in_task_template
+  name: burn_in_tests_gen
   tags: []
+  patch_only: true
   commands:
-  - command: manifest.load
-  - func: "git get project and add git tag"
-  - *f_expansions_write
-  - *kill_processes
-  - *cleanup_environment
-  - func: "set up venv"
-  - func: "upload pip requirements"
-  - func: "configure evergreen api credentials"
-  - command: subprocess.exec
-    type: test
-    params:
-      binary: bash
-      args:
-      - "src/evergreen/burn_in_tests.sh"
-      env:
-        BURN_IN_TESTS: ${burn_in_tests}
-  - command: archive.targz_pack
-    params:
-      target: src/burn_in_tests_gen.tgz
-      source_dir: src
-      include:
-      - burn_in_tests_gen.json
+  - func: "generate resmoke tasks"
 
-  - command: s3.put
-    params:
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: src/burn_in_tests_gen.tgz
-      remote_file: ${project}/${build_variant}/${revision}/burn_in_tests_gen/burn_in_tests_gen-${build_id}.tgz
-      bucket: mciuploads
-      permissions: public-read
-      content_type: application/gzip
-      display_name: Burn_in_tests Task Config - Execution ${execution}
-  - command: generate.tasks
-    params:
-      files:
-      - src/burn_in_tests_gen.json
+- <<: *gen_burn_in_task_template
+  name: burn_in_tags_gen
+  tags: []
+  patch_only: true
+  commands:
+  - func: "generate resmoke tasks"
+
+- <<: *gen_burn_in_task_template
+  name: burn_in_tasks_gen
+  tags: []
+  patch_only: true
+  commands:
+  - func: "generate resmoke tasks"
 
 - <<: *benchmark_template
   name: benchmarks_orphaned
@@ -3097,10 +3465,10 @@ tasks:
   - func: "run tests"
     vars:
       suite: benchmarks
-      exec_timeout_secs: 10800  # 3 hour timeout.
+      exec_timeout_secs: 18000  # 5 hour timeout.
       resmoke_jobs_max: 1
   - func: "send benchmark results"
-  - func: "analyze benchmark results"
+#  - func: "analyze benchmark results"
     vars:
       suite: benchmarks
 
@@ -3114,19 +3482,92 @@ tasks:
       suite: benchmarks_sharding
       resmoke_jobs_max: 1
   - func: "send benchmark results"
-  - func: "analyze benchmark results"
+#  - func: "analyze benchmark results"
+
+# Disabled under SERVER-64949.
+# - <<: *benchmark_template
+#   name: benchmarks_cst
+#   tags: ["benchmarks"]
+#   commands:
+#   - func: "do benchmark setup"
+#   - func: "run tests"
+#     vars:
+#       suite: benchmarks_cst
+#       resmoke_jobs_max: 1
+#   - func: "send benchmark results"
+#   - func: "analyze benchmark results"
 
 - <<: *benchmark_template
-  name: benchmarks_cst
+  name: benchmarks_expression
+  tags: ["benchmarks"]
+  commands:
+    - func: "do benchmark setup"
+    - func: "run tests"
+      vars:
+        suite: benchmarks_expression
+        exec_timeout_secs: 18000  # 5 hour timeout.
+        resmoke_jobs_max: 1
+    - func: "send benchmark results"
+
+- <<: *benchmark_template
+  name: benchmarks_expression_sbe
+  tags: ["benchmarks"]
+  commands:
+    - func: "do benchmark setup"
+    - func: "run tests"
+      vars:
+        suite: benchmarks_expression_sbe
+        exec_timeout_secs: 18000  # 5 hour timeout.
+        resmoke_jobs_max: 1
+    - func: "send benchmark results"
+
+- <<: *benchmark_template
+  name: benchmarks_abt
   tags: ["benchmarks"]
   commands:
   - func: "do benchmark setup"
   - func: "run tests"
     vars:
-      suite: benchmarks_cst
+      suites: benchmarks_abt
+      exec_timeout_secs: 18000  # 5 hour timeout.
       resmoke_jobs_max: 1
   - func: "send benchmark results"
-  - func: "analyze benchmark results"
+
+- <<: *benchmark_template
+  name: benchmarks_abt_lowering
+  tags: ["benchmarks"]
+  commands:
+  - func: "do benchmark setup"
+  - func: "run tests"
+    vars:
+      suites: benchmarks_abt_lowering
+      exec_timeout_secs: 18000  # 5 hour timeout.
+      resmoke_jobs_max: 1
+  - func: "send benchmark results"
+
+- <<: *benchmark_template
+  name: benchmarks_abt_path_lowering
+  tags: ["benchmarks"]
+  commands:
+  - func: "do benchmark setup"
+  - func: "run tests"
+    vars:
+      suites: benchmarks_abt_path_lowering
+      exec_timeout_secs: 18000  # 5 hour timeout.
+      resmoke_jobs_max: 1
+  - func: "send benchmark results"
+
+- <<: *benchmark_template
+  name: benchmarks_streams
+  tags: ["benchmarks"]
+  commands:
+  - func: "do benchmark setup"
+  - func: "run tests"
+    vars:
+      suites: benchmarks_streams
+      exec_timeout_secs: 18000  # 5 hour timeout.
+      resmoke_jobs_max: 1
+  - func: "send benchmark results"
 
 - <<: *run_jepsen_template
   name: jepsen_register_findAndModify
@@ -3227,6 +3668,7 @@ tasks:
       npm_command: initsync-fuzzer
       suite: initial_sync_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      run_no_feature_flag_tests: "true"
 
 ## initial sync generational fuzzer ##
 - <<: *jstestfuzz_template
@@ -3255,6 +3697,7 @@ tasks:
       suite: generational_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       npm_command: agg-fuzzer
+      run_no_feature_flag_tests: "true"
 
 ## Standalone generational fuzzer for multiversion aggregation expressions ##
 - <<: *jstestfuzz_template
@@ -3269,6 +3712,7 @@ tasks:
       suite: generational_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       npm_command: agg-expr-fuzzer
+      run_no_feature_flag_tests: "true"
 
 ## Standalone generational fuzzer for checking optimized and unoptimized expression equivalence
 - <<: *jstestfuzz_template
@@ -3315,10 +3759,25 @@ tasks:
       suite: generational_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
 
+## Standalone fuzzer for checking columnstore index correctness ##
+- <<: *jstestfuzz_template
+  name: aggregation_columnstore_fuzzer_gen
+  tags: ["aggfuzzer", "common", "columnstore", "require_npm", "random_name", "sbe_only", "feature_flag_guarded"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      <<: *jstestfuzz_config_vars
+      num_files: 5
+      num_tasks: 5
+      jstestfuzz_vars: --diffTestingMode columnstore
+      npm_command: agg-fuzzer
+      suite: generational_fuzzer
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+
 ## Standalone fuzzer for checking timeseries optimizations correctness ##
 - <<: *jstestfuzz_template
   name: aggregation_timeseries_fuzzer_gen
-  tags: ["aggfuzzer", "common", "timeseries", "require_npm", "random_name"]
+  tags: ["aggfuzzer", "common", "timeseries", "require_npm", "random_name", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -3360,6 +3819,21 @@ tasks:
       suite: generational_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
 
+## jstestfuzz standalone fuzzer for checking find equivalence with and without plan cache ##
+- <<: *jstestfuzz_template
+  name: query_fuzzer_plan_cache_gen
+  tags: ["query_fuzzer", "require_npm", "random_name"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      <<: *jstestfuzz_config_vars
+      num_files: 5
+      num_tasks: 5
+      jstestfuzz_vars: --diffTestingMode plan_cache
+      npm_command: query-fuzzer
+      suite: generational_fuzzer
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+
 ## jstestfuzz sharded fuzzer for checking find and aggregate equivalence ##
 - <<: *jstestfuzz_template
   name: query_fuzzer_sharded_gen
@@ -3386,13 +3860,14 @@ tasks:
       num_files: 5
       num_tasks: 5
       npm_command: update-fuzzer
-      suite: generational_fuzzer
+      suite: update_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      run_no_feature_flag_tests: "true"
 
 ## jstestfuzz standalone update time-series generational fuzzer ##
 - <<: *jstestfuzz_template
   name: update_timeseries_fuzzer_gen
-  tags: ["updatefuzzer", "require_npm", "random_name"]
+  tags: ["updatefuzzer", "require_npm", "random_name", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -3407,7 +3882,7 @@ tasks:
 ## jstestfuzz replication update generational fuzzer ##
 - <<: *jstestfuzz_template
   name: update_fuzzer_replication_gen
-  tags: ["updatefuzzer", "require_npm", "random_name", "multiversion"]
+  tags: ["updatefuzzer", "require_npm", "random_name", "multiversion", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -3415,8 +3890,9 @@ tasks:
       num_files: 5
       num_tasks: 5
       npm_command: update-fuzzer
-      suite: generational_fuzzer_replication
+      suite: update_fuzzer_replication
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      run_no_feature_flag_tests: "true"
 
 ## rollback multiversion fuzzer ##
 - <<: *jstestfuzz_template
@@ -3433,6 +3909,7 @@ tasks:
       # Rollback suites create indexes with majority of nodes not available for replication. So, disabling
       # index build commit quorum.
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}, enableIndexBuildCommitQuorum: false}'"
+      run_no_feature_flag_tests: "true"
 
 ## rollback generational fuzzer ##
 - <<: *jstestfuzz_template
@@ -3745,6 +4222,7 @@ tasks:
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       suite: jstestfuzz_replication
       npm_command: jstestfuzz
+      run_no_feature_flag_tests: "true"
 
 ## jstestfuzz initial sync replica set ##
 - <<: *jstestfuzz_template
@@ -3811,6 +4289,7 @@ tasks:
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       suite: jstestfuzz_sharded
       npm_command: jstestfuzz
+      run_no_feature_flag_tests: "true"
 
 ## jstestfuzz sharded cluster causal consistency ##
 - <<: *jstestfuzz_template
@@ -3937,6 +4416,8 @@ tasks:
   tags: ["multiversion", "multiversion_sanity_check"]
   commands:
   - func: "generate resmoke tasks"
+    vars:
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: replica_sets_jscore_multiversion_gen
@@ -3945,6 +4426,7 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       suite: replica_sets_jscore_passthrough
+      run_no_feature_flag_tests: "true"
 
 
 # Check that the mutational fuzzer can parse JS files modified in a patch build.
@@ -3980,6 +4462,14 @@ tasks:
 - <<: *task_template
   name: aggregation
   tags: ["aggregation", "common"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+
+- <<: *task_template
+  name: aggregation_repeat_queries
+  depends_on:
+  - name: aggregation
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -4049,7 +4539,7 @@ tasks:
 
 - <<: *task_template
   name: aggregation_read_concern_majority_passthrough
-  tags: ["aggregation", "read_write_concern"]
+  tags: ["aggregation", "read_write_concern", "no_debug_mode"]
   depends_on:
   - name: aggregation
   commands:
@@ -4086,8 +4576,19 @@ tasks:
   - func: "run tests"
 
 - <<: *task_template
+  name: aggregation_column_store_index_passthrough
+  # TODO SERVER-75026 Remove the 'feature_flag_guarded' tag and ensure this suite is run on all
+  # variants.
+  tags: ["aggregation", "sbe_only", "feature_flag_guarded"]
+  depends_on:
+  - name: aggregation
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+
+- <<: *task_template
   name: audit
-  tags: []
+  tags: ["audit", "patch_build"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -4098,27 +4599,7 @@ tasks:
   commands:
   - func: "generate resmoke tasks"
 
-- name: burn_in_tags_gen
-  tags: []
-  depends_on:
-  - name: archive_dist_test
-  commands:
-  - command: manifest.load
-  - func: "git get project and add git tag"
-  - *f_expansions_write
-  - *kill_processes
-  - *cleanup_environment
-  - func: "set up venv"
-  - func: "upload pip requirements"
-  - func: "configure evergreen api credentials"
-  - func: "generate burn in tags"
-    vars:
-      max_revisions: 25
-      repeat_tests_secs: 600
-      repeat_tests_min: 2
-      repeat_tests_max: 1000
-
-- name: build_variant_gen
+- name: version_gen
   commands:
   - command: manifest.load
   - *git_get_project
@@ -4128,28 +4609,48 @@ tasks:
   - *cleanup_environment
   - func: "set up venv"
   - func: "upload pip requirements"
-  - func: "generate build variant"
+  - func: "generate version"
 
-- name: selected_tests_gen
-  tags: []
+- name: version_burn_in_gen
   commands:
   - command: manifest.load
-  - func: "git get project and add git tag"
+  - *git_get_project
   - *f_expansions_write
+  - *add_git_tag
   - *kill_processes
   - *cleanup_environment
   - func: "set up venv"
   - func: "upload pip requirements"
-  - func: "generate selected tests"
+  - func: "generate version burn in"
+
+- name: version_expansions_gen
+  commands:
+  - command: manifest.load
+  - *git_get_project
+  - *f_expansions_write
+  - *add_git_tag
+  - *kill_processes
+  - *cleanup_environment
+  - func: "set up venv"
+  - func: "upload pip requirements"
+  - func: "generate and upload version expansions"
+  - func: "generate and upload resmoke constants"
 
 - <<: *gen_task_template
   name: auth_audit_gen
-  tags: ["auth", "audit"]
+  tags: ["auth", "audit", "patch_build"]
   commands:
   - func: "generate resmoke tasks"
 
 - <<: *task_template
   name: change_streams
+  tags: ["change_streams"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+
+- <<: *task_template
+  name: change_streams_v1_resume_token_passthrough
   tags: ["change_streams"]
   commands:
   - func: "do setup"
@@ -4162,19 +4663,15 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       suite: change_streams
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: change_streams_downgrade_gen
   tags: ["multiversion_passthrough", "multiversion"]
   commands:
   - func: "generate resmoke tasks"
-
-- <<: *task_template
-  name: change_streams_update_v1_oplog
-  tags: ["change_streams"]
-  commands:
-  - func: "do setup"
-  - func: "run tests"
+    vars:
+      run_no_feature_flag_tests: "true"
 
 - <<: *task_template
   name: change_streams_mongos_sessions_passthrough
@@ -4186,16 +4683,7 @@ tasks:
   - func: "run tests"
 
 - <<: *task_template
-  name: change_streams_mongos_passthrough
-  tags: ["change_streams"]
-  depends_on:
-  - name: change_streams
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-
-- <<: *task_template
-  name: change_streams_secondary_reads
+  name: change_streams_secondary_reads_sharded_collections
   tags: ["change_streams", "secondary_reads"]
   depends_on:
   - name: change_streams
@@ -4204,7 +4692,7 @@ tasks:
   - func: "run tests"
 
 - <<: *task_template
-  name: change_streams_sharded_collections_passthrough
+  name: change_streams_v1_resume_token_sharded_collections_passthrough
   tags: ["change_streams"]
   depends_on:
   - name: change_streams
@@ -4219,6 +4707,7 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       suite: change_streams_sharded_collections_passthrough
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: multiversion_future_git_tag_gen
@@ -4246,28 +4735,10 @@ tasks:
   - func: "run tests"
 
 - <<: *task_template
-  name: change_streams_whole_db_mongos_passthrough
-  tags: ["change_streams"]
-  depends_on:
-  - name: change_streams_mongos_passthrough
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-
-- <<: *task_template
-  name: change_streams_whole_db_secondary_reads_passthrough
+  name: change_streams_whole_db_secondary_reads_sharded_collections
   tags: ["change_streams", "secondary_reads"]
   depends_on:
-  - name: change_streams_secondary_reads
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-
-- <<: *task_template
-  name: change_streams_whole_db_sharded_collections_passthrough
-  tags: ["change_streams"]
-  depends_on:
-  - name: change_streams_sharded_collections_passthrough
+  - name: change_streams_secondary_reads_sharded_collections
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -4282,28 +4753,10 @@ tasks:
   - func: "run tests"
 
 - <<: *task_template
-  name: change_streams_whole_cluster_mongos_passthrough
-  tags: ["change_streams"]
-  depends_on:
-  - name: change_streams_mongos_passthrough
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-
-- <<: *task_template
-  name: change_streams_whole_cluster_secondary_reads_passthrough
+  name: change_streams_whole_cluster_secondary_reads_sharded_collections
   tags: ["change_streams", "secondary_reads"]
   depends_on:
-  - name: change_streams_secondary_reads
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-
-- <<: *task_template
-  name: change_streams_whole_cluster_sharded_collections_passthrough
-  tags: ["change_streams"]
-  depends_on:
-  - name: change_streams_sharded_collections_passthrough
+  - name: change_streams_secondary_reads_sharded_collections
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -4337,7 +4790,21 @@ tasks:
 
 - <<: *task_template
   name: change_streams_per_shard_cursor_passthrough
-  tags: []
+  tags: ["change_streams"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+
+- <<: *task_template
+  name: change_streams_multitenant_passthrough
+  tags: ["change_streams"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+
+- <<: *task_template
+  name: change_streams_multitenant_sharded_collections_passthrough
+  tags: ["change_streams"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -4352,7 +4819,7 @@ tasks:
 
 - <<: *task_template
   name: ese
-  tags: ["encrypt"]
+  tags: ["encrypt", "patch_build"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -4374,88 +4841,77 @@ tasks:
 - <<: *task_template
   name: integration_tests_standalone
   tags: ["integration", "standalone"]
+  depends_on:
+  - name: compile_integration_test
   commands:
-  - command: manifest.load
-  - func: "git get project and add git tag"
-  - func: "do setup"
-  - func: "set up win mount script"
-  - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
-  - func: "apply compile expansions"
-  - func: "scons compile"
-    vars:
-      targets: install-integration-tests
-      compiling_for_test: true
-  - func: "attach scons logs"
+  - *f_expansions_write
+  - *run_diskstats
+  - *monitor_process_threads
+  - *collect_system_resource_info
+  - *collect_ulimit_info
   - func: "run tests"
+    vars:
+      install_dir: build/install/bin
 
 - <<: *task_template
   name: integration_tests_standalone_audit
   tags: ["integration", "audit"]
+  depends_on:
+  - name: compile_integration_test
   commands:
-  - command: manifest.load
-  - func: "git get project and add git tag"
-  - func: "do setup"
-  - func: "set up win mount script"
-  - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
-  - func: "apply compile expansions"
-  - func: "scons compile"
-    vars:
-      targets: install-integration-tests
-      compiling_for_test: true
-  - func: "attach scons logs"
+  - *f_expansions_write
+  - *run_diskstats
+  - *monitor_process_threads
+  - *collect_system_resource_info
+  - *collect_ulimit_info
   - func: "run tests"
+    vars:
+      install_dir: build/install/bin
 
 - <<: *task_template
   name: integration_tests_replset
   tags: ["integration"]
+  depends_on:
+  - name: compile_integration_test
   commands:
-  - command: manifest.load
-  - func: "git get project and add git tag"
-  - func: "do setup"
-  - func: "set up win mount script"
-  - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
-  - func: "apply compile expansions"
-  - func: "scons compile"
-    vars:
-      targets: install-integration-tests
-      compiling_for_test: true
-  - func: "attach scons logs"
+  - *f_expansions_write
+  - *run_diskstats
+  - *monitor_process_threads
+  - *collect_system_resource_info
+  - *collect_ulimit_info
   - func: "run tests"
+    vars:
+      install_dir: build/install/bin
 
 - <<: *task_template
   name: integration_tests_replset_ssl_auth
   tags: ["integration"]
+  depends_on:
+  - name: compile_integration_test
   commands:
-  - command: manifest.load
-  - func: "git get project and add git tag"
-  - func: "do setup"
-  - func: "set up win mount script"
-  - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
-  - func: "apply compile expansions"
-  - func: "scons compile"
-    vars:
-      targets: install-integration-tests
-      compiling_for_test: true
-  - func: "attach scons logs"
+  - *f_expansions_write
+  - *run_diskstats
+  - *monitor_process_threads
+  - *collect_system_resource_info
+  - *collect_ulimit_info
   - func: "run tests"
+    vars:
+      install_dir: build/install/bin
 
 - <<: *task_template
   name: integration_tests_sharded
   tags: ["integration", "sharded"]
+  depends_on:
+  - name: compile_integration_test
   commands:
-  - command: manifest.load
-  - func: "git get project and add git tag"
   - *f_expansions_write
-  - func: "do setup"
-  - func: "set up win mount script"
-  - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
-  - func: "apply compile expansions"
-  - func: "scons compile"
-    vars:
-      targets: install-integration-tests
-      compiling_for_test: true
-  - func: "attach scons logs"
+  - *run_diskstats
+  - *monitor_process_threads
+  - *collect_system_resource_info
+  - *collect_ulimit_info
   - func: "run tests"
+    vars:
+      install_dir: build/install/bin
 
 - <<: *task_template
   name: external_auth
@@ -4471,9 +4927,7 @@ tasks:
       - "src/evergreen/external_auth_pip.sh"
   - func: "run tests"
     vars:
-      # TODO SERVER-64323
-      # restore concurrency for this suite when the issue on windows is resolved.
-      resmoke_jobs_max: 1
+      resmoke_jobs_max: ${external_auth_jobs_max|4}
       resmoke_args: --excludeWithAnyTags=requires_domain_controller
 
 - <<: *task_template
@@ -4496,6 +4950,24 @@ tasks:
       - "src/evergreen/external_auth_aws_pip.sh"
   - func: "run tests"
 
+- <<: *task_template
+  name: external_auth_oidc
+  tags: []
+  commands:
+  - *f_expansions_write
+  - func: "do setup"
+  - func: "f_expansions_write"
+  - command: subprocess.exec
+    params:
+      binary: bash
+      args:
+      - "src/evergreen/external_auth_pip.sh"
+  - command: subprocess.exec
+    params:
+      binary: bash
+      args:
+      - "src/evergreen/external_auth_oidc_setup.sh"
+  - func: "run tests"
 
 - <<: *task_template
   name: external_auth_windows
@@ -4518,53 +4990,115 @@ tasks:
 
 - <<: *task_template
   name: config_fuzzer_jsCore
-  tags: []
+  tags: ["config_fuzzer"]
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
       suite: core
-      resmoke_args: --fuzzMongodConfigs
+      resmoke_args: >-
+        --fuzzMongodConfigs=normal
+        --excludeWithAnyTags=does_not_support_config_fuzzer
 
 - <<: *task_template
   name: config_fuzzer_concurrency
-  tags: []
+  tags: ["config_fuzzer"]
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
       suite: concurrency
-      resmoke_args: --fuzzMongodConfigs
+      resmoke_args: >-
+        --fuzzMongodConfigs=normal
+        --excludeWithAnyTags=does_not_support_config_fuzzer
 
 - <<: *task_template
-  name: config_fuzzer_simulate_crash_concurrency_replication
-  tags: []
+  name: config_fuzzer_simulate_crash_concurrency_replication_gen
+  tags: ["config_fuzzer", "large"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
     vars:
       suite: simulate_crash_concurrency_replication
-      resmoke_args: --fuzzMongodConfigs
+      resmoke_args: >-
+        --fuzzMongodConfigs=normal
+        --excludeWithAnyTags=does_not_support_config_fuzzer
+      use_large_distro: "true"
 
 - <<: *task_template
-  name: config_fuzzer_concurrency_replication
-  tags: []
+  name: config_fuzzer_concurrency_replication_gen
+  tags: ["config_fuzzer", "large"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
     vars:
       suite: concurrency_replication
-      resmoke_args: --fuzzMongodConfigs
+      resmoke_args: >-
+        --fuzzMongodConfigs=normal
+        --excludeWithAnyTags=does_not_support_config_fuzzer
+      use_large_distro: "true"
+
+- <<: *gen_task_template
+  name: config_fuzzer_concurrency_sharded_replication_gen
+  tags: ["config_fuzzer", "large"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      suite: concurrency_sharded_replication
+      resmoke_args: >-
+        --fuzzMongodConfigs=normal
+        --excludeWithAnyTags=does_not_support_config_fuzzer
+      use_large_distro: "true"
 
 - <<: *task_template
-  name: config_fuzzer_replica_sets_jscore_passthrough
-  tags: []
+  name: config_fuzzer_stress_concurrency_replication_gen
+  tags: ["config_fuzzer_stress"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
+    vars:
+      suite: concurrency_replication
+      resmoke_args: >-
+        --fuzzMongodConfigs=stress
+        --excludeWithAnyTags=does_not_support_config_fuzzer
+      use_large_distro: "true"
+      exec_timeout_secs: 14400 # 4 hours
+      timeout_secs: 14400 # 4 hours
+
+- <<: *gen_task_template
+  name: config_fuzzer_stress_concurrency_sharded_replication_gen
+  tags: ["config_fuzzer_stress"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      suite: concurrency_sharded_replication
+      resmoke_args: >-
+        --fuzzMongodConfigs=stress
+        --excludeWithAnyTags=does_not_support_config_fuzzer
+      use_large_distro: "true"
+      exec_timeout_secs: 14400 # 4 hours
+      timeout_secs: 14400 # 4 hours
+
+- <<: *task_template
+  name: config_fuzzer_replica_sets_jscore_passthrough_gen
+  tags: ["config_fuzzer", "large"]
+  commands:
+  - func: "generate resmoke tasks"
     vars:
       suite: replica_sets_jscore_passthrough
-      resmoke_args: --fuzzMongodConfigs
+      resmoke_args: >-
+        --fuzzMongodConfigs=normal
+        --excludeWithAnyTags=does_not_support_config_fuzzer
+      use_large_distro: "true"
+
+- <<: *task_template
+  name: config_fuzzer_sharding_jscore_passthrough_gen
+  tags: ["config_fuzzer", "large"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      suite: sharding_jscore_passthrough
+      resmoke_args: >-
+        --fuzzMongodConfigs=normal
+        --excludeWithAnyTags=does_not_support_config_fuzzer
+      use_large_distro: "true"
 
 - <<: *task_template
   name: jsCore_ese
@@ -4576,13 +5110,13 @@ tasks:
       suite: core_ese
 
 - <<: *task_template
-  name: jsCore_ese_gcm
+  name: jsCore_min_batch_repeat_queries_ese_gsm
   tags: ["jscore", "encrypt", "gcm"]
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
-      suite: core_ese_gcm
+      suite: core_min_batch_repeat_queries_ese_gsm
 
 - <<: *task_template
   name: jsCore_auth
@@ -4592,15 +5126,6 @@ tasks:
   - func: "run tests"
     vars:
       suite: core_auth
-
-- <<: *task_template
-  name: jsCore_minimum_batch_size
-  tags: ["jscore"]
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      suite: core_minimum_batch_size
 
 - <<: *task_template
   name: jsCore_txns
@@ -4774,12 +5299,6 @@ tasks:
   - func: "run tests"
 
 - <<: *gen_task_template
-  name: replica_sets_update_v1_oplog_jscore_passthrough_gen
-  tags: ["replica_sets", "non_maj_read"]
-  commands:
-  - func: "generate resmoke tasks"
-
-- <<: *gen_task_template
   name: replica_sets_initsync_jscore_passthrough_gen
   tags: ["replica_sets", "san", "large"]
   commands:
@@ -4815,10 +5334,34 @@ tasks:
 
 - <<: *task_template
   name: replica_sets_kill_secondaries_jscore_passthrough
-  tags: ["replica_sets", "san", "large", "non_live_record"]
+  tags: ["replica_sets", "san", "large", "non_live_record", "ignore_on_code_coverage"]
   commands:
   - func: "do setup"
   - func: "run tests"
+
+- <<: *task_template
+  name: jsCore_column_store_indexes
+  # TODO SERVER-75026 Remove the 'feature_flag_guarded' tag and ensure this suite is run on all
+  # variants.
+  depends_on:
+  - name: jsCore
+  tags: ["jscore", "sbe_only", "feature_flag_guarded"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      suite: core_column_store_indexes
+
+- <<: *task_template
+  name: jsCore_wildcard_indexes
+  depends_on:
+  - name: jsCore
+  tags: ["jscore"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      suite: core_wildcard_indexes
 
 - <<: *task_template
   name: mongosTest
@@ -4856,11 +5399,12 @@ tasks:
   commands:
   - func: "generate resmoke tasks"
     vars:
+      exec_timeout_secs: 3600
       use_large_distro: "true"
 
 - <<: *gen_task_template
   name: noPassthrough_gen
-  tags: ["misc_js"]
+  tags: ["misc_js", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -4912,6 +5456,13 @@ tasks:
   - func: "do setup"
   - func: "run tests"
 
+- <<: *task_template
+  name: sharded_collections_jscore_passthrough_with_catalog_shard
+  tags: []
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+
 - <<: *gen_task_template
   name: sharded_collections_jscore_multiversion_gen
   tags: ["multiversion_passthrough", "multiversion"]
@@ -4919,10 +5470,18 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       suite: sharded_collections_jscore_passthrough
+      run_no_feature_flag_tests: "true"
 
 - <<: *task_template
   name: sharding_jscore_passthrough
   tags: ["sharding", "jscore", "common"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+
+- <<: *task_template
+  name: sharding_jscore_passthrough_with_catalog_shard
+  tags: []
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -4934,6 +5493,7 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       suite: sharding_jscore_passthrough
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: sharding_api_version_jscore_passthrough_gen
@@ -4942,15 +5502,6 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       fallback_num_sub_suites: 5
-
-- <<: *task_template
-  name: sharding_update_v1_oplog_jscore_passthrough
-  tags: ["sharding", "jscore"]
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      suite: sharding_jscore_passthrough
 
 - <<: *task_template
   name: sharded_multi_stmt_txn_jscore_passthrough
@@ -4992,22 +5543,89 @@ tasks:
 
 - <<: *gen_task_template
   name: multi_shard_multi_stmt_txn_stepdown_primary_jscore_passthrough_gen
-  tags: ["multi_shard"]
+  tags: ["multi_shard", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
       use_large_distro: "true"
+
+# TODO(SERVER-65178): Add "serverless" tag to shard split passthrough when no longer feature flagged
+- <<: *gen_task_template
+  name: shard_split_jscore_passthrough_gen
+  tags: ["shard_split"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+
+- <<: *gen_task_template
+  name: shard_split_causally_consistent_jscore_passthrough_gen
+  tags: ["shard_split"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+
+- <<: *gen_task_template
+  name: shard_split_multi_stmt_txn_jscore_passthrough_gen
+  tags: ["shard_split"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+
+- <<: *gen_task_template
+  name: shard_split_stepdown_jscore_passthrough_gen
+  tags: ["shard_split"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+
+- <<: *gen_task_template
+  name: shard_split_terminate_primary_jscore_passthrough_gen
+  tags: ["shard_split"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+      fallback_num_sub_suites: 10
+
+- <<: *gen_task_template
+  name: shard_split_kill_primary_jscore_passthrough_gen
+  tags: ["shard_split"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+      fallback_num_sub_suites: 10
+
+# TODO(SERVER-57896): Add "serverless" tag to shard merge passthrough when no longer feature flagged
+- <<: *gen_task_template
+  name: shard_merge_jscore_passthrough_gen
+  tags: ["shard_merge"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+
+- <<: *gen_task_template
+  name: shard_merge_causally_consistent_jscore_passthrough_gen
+  tags: ["shard_merge"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+
+- <<: *task_template
+  name: telemetry_passthrough
+  tags: []
+  commands:
+  - func: "do setup"
+  - func: "run tests"
 
 - <<: *gen_task_template
   name: tenant_migration_jscore_passthrough_gen
-  tags: ["serverless"]
-  commands:
-  - func: "generate resmoke tasks"
-    vars:
-      use_large_distro: "true"
-
-- <<: *gen_task_template
-  name: talk_directly_to_shardsvrs_jscore_passthrough_gen
   tags: ["serverless"]
   commands:
   - func: "generate resmoke tasks"
@@ -5025,6 +5643,15 @@ tasks:
 - <<: *gen_task_template
   name: tenant_migration_multi_stmt_txn_jscore_passthrough_gen
   tags: ["serverless", "txn"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+
+# TODO(SERVER-68643): Add "serverless" tag to shard merge passthrough when no longer feature flagged
+- <<: *gen_task_template
+  name: shard_merge_multi_stmt_txn_jscore_passthrough_gen
+  tags: ["shard_merge"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5055,6 +5682,38 @@ tasks:
     vars:
       use_large_distro: "true"
       fallback_num_sub_suites: 10
+
+- <<: *gen_task_template
+  name: talk_directly_to_shardsvrs_jscore_passthrough_gen
+  tags: ["serverless"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+
+- <<: *gen_task_template
+  name: talk_directly_to_shardsvrs_kill_primary_jscore_passthrough_gen
+  tags: ["serverless"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+
+- <<: *gen_task_template
+  name: native_tenant_data_isolation_with_security_token_jscore_passthrough_gen
+  tags: ["serverless"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+
+- <<: *gen_task_template
+  name: native_tenant_data_isolation_with_dollar_tenant_jscore_passthrough_gen
+  tags: ["serverless"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
 
 - <<: *gen_task_template
   name: clustered_collection_passthrough_gen
@@ -5097,6 +5756,14 @@ tasks:
       resmoke_jobs_max: 1
 
 - <<: *gen_task_template
+  name: concurrency_compute_mode_gen
+  tags: ["concurrency", "no_passthrough", "compute_mode", "no_debug_mode"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      resmoke_jobs_max: 1
+
+- <<: *gen_task_template
   name: concurrency_replication_metrics_gen
   tags: ["concurrency", "repl", "disabled_on_code_coverage"]
   commands:
@@ -5119,6 +5786,7 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       suite: concurrency_replication
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: concurrency_replication_causal_consistency_gen
@@ -5131,7 +5799,7 @@ tasks:
 
 - <<: *gen_task_template
   name: concurrency_replication_multi_stmt_txn_gen
-  tags: ["concurrency", "common", "repl", "txn"]
+  tags: ["concurrency", "common", "repl", "txn", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5183,7 +5851,16 @@ tasks:
 
 - <<: *gen_task_template
   name: concurrency_sharded_replication_gen
-  tags: ["concurrency", "common", "read_concern_maj", "large", "sharded"]
+  tags: ["concurrency", "common", "read_concern_maj", "large", "sharded", "no_debug_mode"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+      resmoke_jobs_max: 1
+
+- <<: *gen_task_template
+  name: concurrency_sharded_with_catalog_shard_gen
+  tags: ["catalog_shard", "large"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5197,10 +5874,20 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       suite: concurrency_sharded_replication
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: concurrency_sharded_replication_with_balancer_gen
-  tags: ["concurrency", "common", "read_concern_maj", "large", "sharded"]
+  tags: ["concurrency", "common", "read_concern_maj", "large", "sharded", "no_debug_mode"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+      resmoke_jobs_max: 1
+
+- <<: *gen_task_template
+  name: concurrency_sharded_with_balancer_and_catalog_shard_gen
+  tags: ["catalog_shard", "large"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5231,7 +5918,7 @@ tasks:
 
 - <<: *gen_task_template
   name: concurrency_sharded_clusterwide_ops_add_remove_shards_gen
-  tags: ["concurrency", "common", "read_concern_maj", "large", "sharded"]
+  tags: ["concurrency", "common", "read_concern_maj", "large", "sharded", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5240,7 +5927,7 @@ tasks:
 
 - <<: *gen_task_template
   name: concurrency_sharded_causal_consistency_gen
-  tags: ["concurrency", "non_live_record", "sharded"]
+  tags: ["concurrency", "non_live_record", "sharded", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5249,7 +5936,7 @@ tasks:
 
 - <<: *gen_task_template
   name: concurrency_sharded_causal_consistency_and_balancer_gen
-  tags: ["concurrency", "large", "non_live_record", "sharded"]
+  tags: ["concurrency", "large", "non_live_record", "sharded", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5258,7 +5945,7 @@ tasks:
 
 - <<: *gen_task_template
   name: concurrency_sharded_with_stepdowns_gen
-  tags: ["concurrency", "stepdowns", "large", "sharded"]
+  tags: ["concurrency", "stepdowns", "large", "sharded", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5267,7 +5954,16 @@ tasks:
 
 - <<: *gen_task_template
   name: concurrency_sharded_with_stepdowns_and_balancer_gen
-  tags: ["concurrency", "stepdowns", "large", "sharded"]
+  tags: ["concurrency", "stepdowns", "large", "sharded", "no_debug_mode"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+      resmoke_jobs_max: 1
+
+- <<: *gen_task_template
+  name: concurrency_sharded_initial_sync_gen
+  tags: ["concurrency", "stepdowns", "initsync", "large", "sharded", "no_debug_mode", "requires_wt"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5276,7 +5972,7 @@ tasks:
 
 - <<: *gen_task_template
   name: concurrency_sharded_terminate_primary_with_balancer_gen
-  tags: ["concurrency", "stepdowns", "kill_terminate", "sharded"]
+  tags: ["concurrency", "stepdowns", "kill_terminate", "sharded", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5285,7 +5981,7 @@ tasks:
 
 - <<: *gen_task_template
   name: concurrency_sharded_kill_primary_with_balancer_gen
-  tags: ["concurrency", "stepdowns", "kill_terminate", "sharded"]
+  tags: ["concurrency", "stepdowns", "kill_terminate", "sharded", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5294,7 +5990,7 @@ tasks:
 
 - <<: *gen_task_template
   name: concurrency_sharded_multi_stmt_txn_gen
-  tags: ["concurrency", "large", "sharded"]
+  tags: ["concurrency", "large", "sharded", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5303,7 +5999,7 @@ tasks:
 
 - <<: *gen_task_template
   name: concurrency_sharded_multi_stmt_txn_with_balancer_gen
-  tags: ["concurrency", "large", "sharded"]
+  tags: ["concurrency", "large", "sharded", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5312,7 +6008,7 @@ tasks:
 
 - <<: *gen_task_template
   name: concurrency_sharded_local_read_write_multi_stmt_txn_gen
-  tags: ["concurrency", "large", "sharded"]
+  tags: ["concurrency", "large", "sharded", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5321,7 +6017,7 @@ tasks:
 
 - <<: *gen_task_template
   name: concurrency_sharded_local_read_write_multi_stmt_txn_with_balancer_gen
-  tags: ["concurrency", "large", "sharded"]
+  tags: ["concurrency", "large", "sharded", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5330,7 +6026,7 @@ tasks:
 
 - <<: *gen_task_template
   name: concurrency_sharded_multi_stmt_txn_with_stepdowns_gen
-  tags: ["concurrency", "stepdowns", "large", "sharded"]
+  tags: ["concurrency", "stepdowns", "large", "sharded", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5339,7 +6035,7 @@ tasks:
 
 - <<: *gen_task_template
   name: concurrency_sharded_multi_stmt_txn_terminate_primary_gen
-  tags: ["concurrency", "stepdowns", "kill_terminate", "sharded"]
+  tags: ["concurrency", "stepdowns", "kill_terminate", "sharded", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5348,7 +6044,7 @@ tasks:
 
 - <<: *gen_task_template
   name: concurrency_sharded_multi_stmt_txn_kill_primary_gen
-  tags: ["concurrency", "stepdowns", "kill_terminate", "sharded"]
+  tags: ["concurrency", "stepdowns", "kill_terminate", "sharded", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5404,12 +6100,13 @@ tasks:
     vars:
       use_large_distro: "true"
 
-- <<: *task_template
-  name: write_concern_majority_passthrough
+- <<: *gen_task_template
+  name: write_concern_majority_passthrough_gen
   tags: ["read_write_concern", "large", "write"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
 
 - <<: *task_template
   name: cwrwc_passthrough
@@ -5426,12 +6123,13 @@ tasks:
     vars:
       use_large_distro: "true"
 
-- <<: *task_template
-  name: cwrwc_wc_majority_passthrough
-  tags: ["read_write_concern", "large", "write"]
+- <<: *gen_task_template
+  name: cwrwc_wc_majority_passthrough_gen
+  tags: ["read_write_concern", "write"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
 
 - <<: *gen_task_template
   name: secondary_reads_passthrough_gen
@@ -5448,16 +6146,22 @@ tasks:
   - func: "generate resmoke tasks"
 
 - <<: *gen_task_template
-  name: replica_sets_ese_gen
-  tags: ["replica_sets", "encrypt", "san"]
+  name: replica_sets_max_mirroring_large_txns_format_gen
+  tags: []
+  commands:
+  - func: "generate resmoke tasks"
+
+- <<: *gen_task_template
+  name: replica_sets_max_mirroring_large_txns_format_ese_gen
+  tags: ["replica_sets", "encrypt", "san", "no_debug_mode", "multi_oplog"]
   commands:
   - func: "generate resmoke tasks"
     vars:
       use_large_distro: "true"
 
 - <<: *gen_task_template
-  name: replica_sets_ese_gcm_gen
-  tags: ["replica_sets", "encrypt", "san", "gcm"]
+  name: replica_sets_max_mirroring_large_txns_format_ese_gcm_gen
+  tags: ["replica_sets", "encrypt", "san", "gcm", "no_debug_mode", "multi_oplog"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5465,29 +6169,11 @@ tasks:
 
 - <<: *gen_task_template
   name: replica_sets_auth_gen
-  tags: ["replica_sets", "common", "san", "auth"]
+  tags: ["replica_sets", "common", "san", "auth", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
       use_large_distro: "true"
-
-- <<: *gen_task_template
-  name: replica_sets_large_txns_format_gen
-  tags: ["replica_sets", "multi_oplog", "san"]
-  commands:
-  - func: "generate resmoke tasks"
-
-- <<: *gen_task_template
-  name: replica_sets_max_mirroring_gen
-  tags: ["replica_sets", "san"]
-  commands:
-  - func: "generate resmoke tasks"
-
-- <<: *gen_task_template
-  name: replica_sets_update_v1_oplog_gen
-  tags: ["replica_sets", "san"]
-  commands:
-  - func: "generate resmoke tasks"
 
 - <<: *gen_task_template
   name: replica_sets_multiversion_gen
@@ -5496,10 +6182,11 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       suite: replica_sets
+      run_no_feature_flag_tests: "true"
 
 - <<: *task_template
   name: sasl
-  tags: []
+  tags: ["sasl", "patch_build"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5520,6 +6207,14 @@ tasks:
       use_large_distro: "true"
 
 - <<: *gen_task_template
+  name: sharding_catalog_shard_gen
+  tags: []
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+
+- <<: *gen_task_template
   name: sharding_multiversion_gen
   tags: ["random_multiversion_ds", "multiversion"]
   commands:
@@ -5527,14 +6222,7 @@ tasks:
     vars:
       use_large_distro: "true"
       suite: sharding
-
-- <<: *gen_task_template
-  name: sharding_max_mirroring_gen
-  tags: ["sharding", "common"]
-  commands:
-  - func: "generate resmoke tasks"
-    vars:
-      use_large_distro: "true"
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: sharding_csrs_continuous_config_stepdown_gen
@@ -5545,17 +6233,28 @@ tasks:
       suite: sharding_continuous_config_stepdown
       use_large_distro: "true"
 
+# This is a subset of sharding_max_mirroring_opportunistic_secondary_targeting_ese_gen and
+# sharding_max_mirroring_opportunistic_secondary_targeting_ese_gcm_gen and should not be ran
+# in the same varient as them
 - <<: *gen_task_template
-  name: sharding_ese_gen
-  tags: ["sharding", "encrypt"]
+  name: sharding_max_mirroring_opportunistic_secondary_targeting_gen
+  tags: []
   commands:
   - func: "generate resmoke tasks"
     vars:
       use_large_distro: "true"
 
 - <<: *gen_task_template
-  name: sharding_ese_gcm_gen
-  tags: ["sharding", "encrypt", "gcm"]
+  name: sharding_max_mirroring_opportunistic_secondary_targeting_ese_gen
+  tags: ["sharding", "common", "encrypt", "no_debug_mode"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+
+- <<: *gen_task_template
+  name: sharding_max_mirroring_opportunistic_secondary_targeting_ese_gcm_gen
+  tags: ["sharding", "common", "encrypt", "gcm", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5563,7 +6262,15 @@ tasks:
 
 - <<: *gen_task_template
   name: sharding_auth_gen
-  tags: ["sharding", "auth"]
+  tags: []
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+
+- <<: *gen_task_template
+  name: sharding_auth_catalog_shard_gen
+  tags: []
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5571,7 +6278,15 @@ tasks:
 
 - <<: *gen_task_template
   name: sharding_auth_audit_gen
-  tags: ["auth", "audit", "non_live_record"]
+  tags: ["sharding", "auth", "audit", "non_live_record", "no_debug_mode"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
+
+- <<: *gen_task_template
+  name: sharding_api_strict_passthrough_gen
+  tags: ["sharding"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5579,7 +6294,7 @@ tasks:
 
 - <<: *gen_task_template
   name: sharding_hello_failures_gen
-  tags: ["concurrency", "large", "sharded"]
+  tags: ["concurrency", "large", "sharded", "no_debug_mode"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5593,29 +6308,18 @@ tasks:
   - func: "generate resmoke tasks"
     vars:
       use_large_distro: "true"
+      multiversion_exclude_tags_version: last_lts
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
-  name: sharding_update_v1_oplog_gen
-  tags: ["sharding", "common"]
+  name: analyze_shard_key_jscore_passthrough_gen
+  tags: ["sharding"]
   commands:
   - func: "generate resmoke tasks"
-    vars:
-      use_large_distro: "true"
-
-- <<: *task_template
-  name: snmp
-  tags: []
-  commands:
-  - *f_expansions_write
-  - func: "do setup"
-  - func: "do snmp setup"
-  - func: "run tests"
-    vars:
-      snmp_config_path: SNMPCONFPATH=snmpconf
 
 - <<: *gen_task_template
   name: ssl_gen
-  tags: ["encrypt", "ssl"]
+  tags: ["encrypt", "ssl", "patch_build"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5623,7 +6327,7 @@ tasks:
 
 - <<: *gen_task_template
   name: sslSpecial_gen
-  tags: ["encrypt", "ssl"]
+  tags: ["encrypt", "ssl", "patch_build"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5631,7 +6335,7 @@ tasks:
 
 - <<: *gen_task_template
   name: ssl_x509_gen
-  tags: ["encrypt", "ssl"]
+  tags: ["encrypt", "ssl", "patch_build"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -5712,18 +6416,26 @@ tasks:
   tags: ["multiversion_passthrough", "multiversion", "no_version_combination"]
   commands:
   - func: "generate resmoke tasks"
+    vars:
+      multiversion_exclude_tags_version: last_continuous
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: retryable_writes_downgrade_last_lts_gen
   tags: ["multiversion_passthrough", "multiversion", "no_version_combination"]
   commands:
   - func: "generate resmoke tasks"
+    vars:
+      multiversion_exclude_tags_version: last_lts
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: sharded_retryable_writes_downgrade_gen
   tags: ["multiversion_passthrough", "multiversion"]
   commands:
   - func: "generate resmoke tasks"
+    vars:
+      run_no_feature_flag_tests: "true"
 
 - <<: *gen_task_template
   name: logical_session_cache_replication_default_refresh_jscore_passthrough_gen
@@ -5846,7 +6558,7 @@ tasks:
 
 - <<: *task_template
   name: client_encrypt
-  tags: ["ssl", "encrypt"]
+  tags: ["ssl", "encrypt", "patch_build"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5855,24 +6567,43 @@ tasks:
 
 - <<: *task_template
   name: fle
-  tags: ["encrypt"]
+  tags: ["encrypt", "patch_build"]
   commands:
   - func: "do setup"
-  - func: "load aws test credentials"
   - func: "run tests"
     vars:
       resmoke_jobs_max: 1
 
 - <<: *task_template
   name: fle2_query_analysis
-  tags: []
+  tags: ["encrypt", "patch_build"]
   commands:
   - func: "do setup"
-  - func: "load aws test credentials"
   - func: "run tests"
 
 - <<: *task_template
   name: fle2
+  tags: ["encrypt", "patch_build"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+
+- <<: *task_template
+  name: fle2_sharding
+  tags: ["encrypt", "patch_build"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+
+- <<: *task_template
+  name: fle2_high_cardinality
+  tags: ["encrypt"]
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+
+- <<: *task_template
+  name: fle2_sharding_high_cardinality
   tags: ["encrypt"]
   commands:
   - func: "do setup"
@@ -5880,7 +6611,7 @@ tasks:
 
 - <<: *task_template
   name: ocsp
-  tags: ["ssl", "encrypt", "ocsp"]
+  tags: ["ssl", "encrypt", "ocsp", "patch_build", "no_debug_mode"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6045,6 +6776,7 @@ tasks:
 - name: selinux_rhel8_org
   tags: []
   depends_on:
+  - name: archive_dist_test
   - name: package
   commands:
   - command: manifest.load
@@ -6052,6 +6784,8 @@ tasks:
   - *f_expansions_write
   - func: "set up venv"
   - func: "fetch packages"
+  - func: "fetch binaries"
+  - func: "extract binaries"
   - func: "run selinux tests"
     vars:
       distro: rhel80-selinux
@@ -6060,6 +6794,7 @@ tasks:
 - name: selinux_rhel8_enterprise
   tags: []
   depends_on:
+  - name: archive_dist_test
   - name: package
   commands:
   - command: manifest.load
@@ -6067,14 +6802,51 @@ tasks:
   - *f_expansions_write
   - func: "set up venv"
   - func: "fetch packages"
+  - func: "fetch binaries"
+  - func: "extract binaries"
   - func: "run selinux tests"
     vars:
       distro: rhel80-selinux
+- name: selinux_rhel9_org
+  tags: []
+  depends_on:
+  - name: archive_dist_test
+  - name: package
+  commands:
+  - command: manifest.load
+  - func: "git get project and add git tag"
+  - *f_expansions_write
+  - func: "set up venv"
+  - func: "fetch packages"
+  - func: "fetch binaries"
+  - func: "extract binaries"
+  - func: "run selinux tests"
+    vars:
+      distro: rhel90-selinux
+      test_list: jstests/selinux/*.js
+- name: selinux_rhel9_enterprise
+  tags: []
+  depends_on:
+  - name: archive_dist_test
+  - name: package
+  commands:
+  - command: manifest.load
+  - func: "git get project and add git tag"
+  - *f_expansions_write
+  - func: "set up venv"
+  - func: "fetch packages"
+  - func: "fetch binaries"
+  - func: "extract binaries"
+  - func: "run selinux tests"
+    vars:
+      distro: rhel90-selinux
       test_list: jstests/selinux/*.js src/mongo/db/modules/enterprise/jstests/selinux/*.js
+
 
 - name: selinux_rhel7_org
   tags: []
   depends_on:
+  - name: archive_dist_test
   - name: package
   commands:
   - command: manifest.load
@@ -6082,6 +6854,8 @@ tasks:
   - *f_expansions_write
   - func: "set up venv"
   - func: "fetch packages"
+  - func: "fetch binaries"
+  - func: "extract binaries"
   - func: "run selinux tests"
     vars:
       user: root
@@ -6091,6 +6865,7 @@ tasks:
 - name: selinux_rhel7_enterprise
   tags: []
   depends_on:
+  - name: archive_dist_test
   - name: package
   commands:
   - command: manifest.load
@@ -6098,6 +6873,8 @@ tasks:
   - *f_expansions_write
   - func: "set up venv"
   - func: "fetch packages"
+  - func: "fetch binaries"
+  - func: "extract binaries"
   - func: "run selinux tests"
     vars:
       user: root
@@ -6162,7 +6939,7 @@ tasks:
   - func: "set up remote credentials"
   - *f_expansions_write
   - func: "configure evergreen api credentials"
-  - func: "do multiversion setup"
+  - *gen_feature_flags
   - func: "run tests"
     vars:
       resmoke_jobs_max: 1
@@ -6185,19 +6962,16 @@ tasks:
   - *kill_processes
   - *cleanup_environment
   - *set_up_venv
-  - func: "fetch packages"
-  - func: "set up remote credentials"
+  - func: "run package test"
     vars:
-      private_key_file: ~/.ssh/kitchen.pem
-      private_key_remote: ${kitchen_private_key}
-      aws_key_remote: ${kitchen_aws_key}
-      aws_secret_remote: ${kitchen_aws_secret}
-  - func: "run kitchen"
+      docker_username: ${dockerhub_username}
+      docker_password: ${dockerhub_password}
 
-- name: package
+- name: test_packages_release
   tags: []
   depends_on:
-  - name: compile_dist_test
+  - name: version_expansions_gen
+    variant: generate-tasks-for-version
   commands:
   - command: manifest.load
   - func: "git get project and add git tag"
@@ -6205,17 +6979,36 @@ tasks:
   - *kill_processes
   - *cleanup_environment
   - *set_up_venv
+  - func: "run release package test"
+    vars:
+      docker_username: ${dockerhub_username}
+      docker_password: ${dockerhub_password}
+
+- name: package
+  tags: []
+  depends_on:
+  - name: compile_dist_test
+  commands:
+  - *f_expansions_write
   - func: "scons compile"
     vars:
       targets: >-
         distsrc-${ext|tgz}
         archive-dist
         archive-dist-debug
-        archive-shell
-        archive-shell-debug
+        archive-jstestshell
+        archive-jstestshell-debug
         ${additional_package_targets|}
       task_compile_flags: >-
         --legacy-tarball
+  - command: subprocess.exec
+    params:
+      binary: bash
+      add_expansions_to_env: true
+      args:
+      - "src/evergreen/run_python_script.sh"
+      - "evergreen/macos_notary.py"
+      - "mongodb-dist.${ext|tgz}"
   - func: "f_expansions_write"
   - command: subprocess.exec
     params:
@@ -6259,26 +7052,24 @@ tasks:
       display_name: Dist Debugsymbols
   - command: s3.put
     params:
-      optional: true
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
-      local_file: src/mongodb-shell.${ext|tgz}
-      remote_file: ${mongo_shell}
+      local_file: src/mongodb-jstestshell.${ext|tgz}
+      remote_file: ${mongo_jstestshell}
       bucket: mciuploads
       permissions: public-read
       content_type: ${content_type|application/gzip}
-      display_name: Shell
+      display_name: Jstestshell
   - command: s3.put
     params:
-      optional: true
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
-      local_file: src/mongodb-shell-debugsymbols.${ext|tgz}
-      remote_file: ${mongo_shell_debugsymbols}
+      local_file: src/mongodb-jstestshell-debugsymbols.${ext|tgz}
+      remote_file: ${mongo_jstestshell_debugsymbols}
       bucket: mciuploads
       permissions: public-read
       content_type: ${content_type|application/gzip}
-      display_name: Shell Debugsymbols
+      display_name: Jstestshell Debugsymbols
   - command: s3.put
     params:
       optional: true
@@ -6345,6 +7136,7 @@ tasks:
 
 
 - name: publish_packages
+  run_on: rhel80-small
   tags: ["publish"]
   # This should prevent this task from running in patch builds, where we
   # don't want to publish packages.
@@ -6359,6 +7151,7 @@ tasks:
   commands:
   - command: manifest.load
   - func: "git get project and add git tag"
+  - func: "get and apply version expansions"
   - func: "f_expansions_write"
   - func: "kill processes"
   - func: "cleanup environment"
@@ -6379,6 +7172,7 @@ tasks:
       - "./src/evergreen/packages_publish.sh"
 
 - name: push
+  run_on: rhel80-small
   tags: ["publish"]
   patchable: false
   depends_on:
@@ -6390,20 +7184,13 @@ tasks:
   commands:
   - command: manifest.load
   - func: "git get project and add git tag"
+  - func: "get and apply version expansions"
   - func: "f_expansions_write"
   - func: "kill processes"
   - func: "cleanup environment"
   - func: "set up venv"
   - func: "fetch packages"
   - func: "fetch dist tarball"
-  # Fetch the shell
-  - command: s3.get
-    params:
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      remote_file: ${mongo_shell}
-      bucket: mciuploads
-      local_file: src/mongo-shell.tgz
   # Fetch mongocryptd
   - command: s3.get
     params:
@@ -6457,16 +7244,6 @@ tasks:
       permissions: public-read
       content_type: ${content_type|application/gzip}
       remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}
-  # Put the shell tarball/zipfile
-  - command: s3.put
-    params:
-      aws_secret: ${aws_secret}
-      local_file: src/mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}
-      aws_key: ${aws_key}
-      bucket: build-push-testing
-      permissions: public-read
-      content_type: ${content_type|application/gzip}
-      remote_file: ${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}
   # Put the cryptd tarball/zipfile
   - command: s3.put
     params:
@@ -6524,17 +7301,6 @@ tasks:
       permissions: public-read
       content_type: ${content_type|application/gzip}
       remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig
-
-  # Put the shell tarball signature
-  - command: s3.put
-    params:
-      aws_secret: ${aws_secret}
-      local_file: src/mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sig
-      aws_key: ${aws_key}
-      bucket: build-push-testing
-      permissions: public-read
-      content_type: ${content_type|application/gzip}
-      remote_file: ${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig
 
   # Put the cryptd tarball signature
   - command: s3.put
@@ -6595,17 +7361,6 @@ tasks:
       content_type: text/plain
       remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1
 
-  # Put the shell tarball sha1
-  - command: s3.put
-    params:
-      aws_secret: ${aws_secret}
-      local_file: src/mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha1
-      aws_key: ${aws_key}
-      permissions: public-read
-      bucket: build-push-testing
-      content_type: text/plain
-      remote_file: ${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1
-
   # Put the cryptd tarball sha1
   - command: s3.put
     params:
@@ -6664,17 +7419,6 @@ tasks:
       bucket: build-push-testing
       content_type: text/plain
       remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256
-
-  # Put the shell tarball sha256
-  - command: s3.put
-    params:
-      aws_secret: ${aws_secret}
-      local_file: src/mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256
-      permissions: public-read
-      aws_key: ${aws_key}
-      bucket: build-push-testing
-      content_type: text/plain
-      remote_file: ${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256
 
   # Put the cryptd tarball sha256
   - command: s3.put
@@ -6735,17 +7479,6 @@ tasks:
       content_type: text/plain
       remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5
 
-  # Put the shell tarball md5
-  - command: s3.put
-    params:
-      aws_secret: ${aws_secret}
-      local_file: src/mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}.md5
-      aws_key: ${aws_key}
-      bucket: build-push-testing
-      permissions: public-read
-      content_type: text/plain
-      remote_file: ${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5
-
   # Put the cryptd tarball md5
   - command: s3.put
     params:
@@ -6803,10 +7536,6 @@ tasks:
       - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}', 'bucket': 'build-push-testing'},
          'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}', 'bucket': '${push_bucket}'}}
 
-      #Shell
-      - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}', 'bucket': 'build-push-testing'},
-         'destination': {'path': '${push_path}/mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}', 'bucket': '${push_bucket}'}}
-
       #Cryptd
       - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}', 'bucket': 'build-push-testing'},
          'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}', 'bucket': '${push_bucket}'},
@@ -6831,10 +7560,6 @@ tasks:
       - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig', 'bucket': 'build-push-testing'},
          'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sig', 'bucket': '${push_bucket}'}}
 
-      #Shell Signature
-      - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig', 'bucket': 'build-push-testing'},
-         'destination': {'path': '${push_path}/mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sig', 'bucket': '${push_bucket}'}}
-
       #Cryptd Signature
       - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig', 'bucket': 'build-push-testing'},
          'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sig', 'bucket': '${push_bucket}'},
@@ -6848,10 +7573,6 @@ tasks:
       #SHA1 for binaries
       - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'},
          'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha1', 'bucket': '${push_bucket}'}}
-
-      #SHA1 for shell
-      - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'},
-         'destination': {'path': '${push_path}/mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha1', 'bucket': '${push_bucket}'}}
 
       #SHA1 for cryptd
       - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'},
@@ -6872,10 +7593,6 @@ tasks:
       - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256', 'bucket': 'build-push-testing'},
          'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256', 'bucket': '${push_bucket}'}}
 
-      #SHA256 for shell
-      - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256', 'bucket': 'build-push-testing'},
-         'destination': {'path': '${push_path}/mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256', 'bucket': '${push_bucket}'}}
-
       #SHA256 for cryptd
       - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256', 'bucket': 'build-push-testing'},
          'destination': {'path': '${push_path}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256', 'bucket': '${push_bucket}'},
@@ -6894,10 +7611,6 @@ tasks:
       #MD5 for binaries
       - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'},
          'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'}}
-
-      #MD5 for shell
-      - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-shell-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'},
-         'destination': {'path': '${push_path}/mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'}}
 
       #MD5 for cryptd
       - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-cryptd-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'},
@@ -6938,12 +7651,13 @@ tasks:
       - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'},
          'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'}}
 
-- name: csfle_push
-  tags: ["publish_csfle"]
+- name: crypt_push
+  run_on: rhel80-small
+  tags: ["publish_crypt"]
   patchable: false
   stepback: false
   depends_on:
-  - name: csfle_create_lib
+  - name: crypt_create_lib
   commands:
   - command: manifest.load
   - func: "f_expansions_write"
@@ -6956,6 +7670,8 @@ tasks:
   - func: "upload pip requirements"
   - func: "get buildnumber"
   - func: "f_expansions_write"
+  - func: "get and apply version expansions"
+  - func: "f_expansions_write"
   - func: "generate compile expansions"
   - func: "apply compile expansions"
   - func: "f_expansions_write"
@@ -6963,9 +7679,9 @@ tasks:
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
-      remote_file: ${project}/mongo_csfle/${build_variant}/${revision}/mongo_csfle_v1-${version}.${ext|tgz}
+      remote_file: ${project}/mongo_crypt/${build_variant}/${revision}/mongo_crypt_shared_v1-${version}.${ext|tgz}
       bucket: mciuploads
-      local_file: src/mongo_csfle_v1.${ext|tgz}
+      local_file: src/mongo_crypt_shared_v1.${ext|tgz}
   - func: "generate compile expansions"
   - func: "apply compile expansions"
   - func: "set up remote credentials"
@@ -6979,74 +7695,74 @@ tasks:
     params:
       binary: bash
       args:
-      - "./src/evergreen/notary_client_csfle_run.sh"
-  # Put the csfle tarball/zipfile
+      - "./src/evergreen/notary_client_crypt_run.sh"
+  # Put the crypt tarball/zipfile
   - command: s3.put
     params:
       aws_secret: ${aws_secret}
-      local_file: src/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}
+      local_file: src/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}
       aws_key: ${aws_key}
       bucket: build-push-testing
       permissions: public-read
       content_type: ${content_type|application/gzip}
-      remote_file: ${push_path}-STAGE/${push_name}/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}
-  # Put the csfle tarball signature
+      remote_file: ${push_path}-STAGE/${push_name}/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}
+  # Put the crypt tarball signature
   - command: s3.put
     params:
       aws_secret: ${aws_secret}
-      local_file: src/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sig
+      local_file: src/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sig
       aws_key: ${aws_key}
       bucket: build-push-testing
       permissions: public-read
       content_type: ${content_type|application/gzip}
-      remote_file: ${push_path}-STAGE/${push_name}/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig
-  # Put the csfle tarball sha1
+      remote_file: ${push_path}-STAGE/${push_name}/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig
+  # Put the crypt tarball sha1
   - command: s3.put
     params:
       aws_secret: ${aws_secret}
-      local_file: src/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha1
+      local_file: src/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha1
       aws_key: ${aws_key}
       permissions: public-read
       bucket: build-push-testing
       content_type: text/plain
-      remote_file: ${push_path}-STAGE/${push_name}/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1
-  # Put the csfle tarball sha256
+      remote_file: ${push_path}-STAGE/${push_name}/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1
+  # Put the crypt tarball sha256
   - command: s3.put
     params:
       aws_secret: ${aws_secret}
-      local_file: src/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256
+      local_file: src/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256
       permissions: public-read
       aws_key: ${aws_key}
       bucket: build-push-testing
       content_type: text/plain
-      remote_file: ${push_path}-STAGE/${push_name}/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256
-  # Put the csfle tarball md5
+      remote_file: ${push_path}-STAGE/${push_name}/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256
+  # Put the crypt tarball md5
   - command: s3.put
     params:
       aws_secret: ${aws_secret}
-      local_file: src/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}.md5
+      local_file: src/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}.md5
       aws_key: ${aws_key}
       bucket: build-push-testing
       permissions: public-read
       content_type: text/plain
-      remote_file: ${push_path}-STAGE/${push_name}/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5
+      remote_file: ${push_path}-STAGE/${push_name}/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5
   - command: s3Copy.copy
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       s3_copy_files:
       #Binaries
-      - {'source': {'path': '${push_path}-STAGE/${push_name}/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}', 'bucket': 'build-push-testing'},
-         'destination': {'path': '${push_path}/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}', 'bucket': '${push_bucket}'}}
+      - {'source': {'path': '${push_path}-STAGE/${push_name}/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}', 'bucket': 'build-push-testing'},
+         'destination': {'path': '${push_path}/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}', 'bucket': '${push_bucket}'}}
       #SHA1 for binaries
-      - {'source': {'path': '${push_path}-STAGE/${push_name}/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'},
-         'destination': {'path': '${push_path}/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha1', 'bucket': '${push_bucket}'}}
+      - {'source': {'path': '${push_path}-STAGE/${push_name}/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'},
+         'destination': {'path': '${push_path}/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha1', 'bucket': '${push_bucket}'}}
       #SHA256 for binaries
-      - {'source': {'path': '${push_path}-STAGE/${push_name}/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256', 'bucket': 'build-push-testing'},
-         'destination': {'path': '${push_path}/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256', 'bucket': '${push_bucket}'}}
+      - {'source': {'path': '${push_path}-STAGE/${push_name}/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256', 'bucket': 'build-push-testing'},
+         'destination': {'path': '${push_path}/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256', 'bucket': '${push_bucket}'}}
       #MD5 for binaries
-      - {'source': {'path': '${push_path}-STAGE/${push_name}/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'},
-         'destination': {'path': '${push_path}/mongo_csfle_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'}}
+      - {'source': {'path': '${push_path}-STAGE/${push_name}/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'},
+         'destination': {'path': '${push_path}/mongo_crypt_shared_v1-${push_name}-${push_arch}-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'}}
 
 - <<: *task_template
   name: search
@@ -7083,7 +7799,28 @@ tasks:
   - func: "run tests"
 
 - <<: *task_template
+  name: cqf_disabled_pipeline_opt
+  tags: []
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+
+- <<: *task_template
+  name: cqf_passthrough
+  tags: []
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+
+- <<: *task_template
   name: cqf_parallel
+  tags: []
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+
+- <<: *task_template
+  name: streams
   tags: []
   commands:
   - func: "do setup"
@@ -7184,12 +7921,6 @@ tasks:
 
 - name: antithesis_image_build
   tags: ["antithesis"]
-  # this is not patchable to avoid hitting the docker registry excessively.
-  # When iterating on this task, feel free to make this patchable for
-  # testing purposes. Your image changes will be pushed with the
-  # evergreen-patch tag, so as to not clobber the waterfall. Use the
-  # antithesis_image_tag build parameter to override this if required.
-  patchable: false
   depends_on:
   - name: archive_dist_test_debug
   commands:
@@ -7199,13 +7930,6 @@ tasks:
   - func: "kill processes"
   - func: "cleanup environment"
   - func: "set up venv"
-  - command: s3.get
-    params:
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      remote_file: ${project}/${build_variant}/antithesis_last_push.txt
-      local_file: antithesis_last_push.txt
-      bucket: mciuploads
   - func: "do setup"
   - command: s3.get
     params:
@@ -7213,23 +7937,35 @@ tasks:
       aws_secret: ${aws_secret}
       remote_file: ${mongo_debugsymbols}
       bucket: mciuploads
-      local_file: src/mongo-debugsymbols.tgz
+      local_file: src/mongo-debugsymbols.${ext|tgz}
   - command: subprocess.exec
     params:
       binary: bash
       args:
       - "./src/evergreen/antithesis_image_build.sh"
-  - command: s3.put
+
+- name: antithesis_image_push
+  tags: ["antithesis"]
+  depends_on:
+  - name: antithesis_image_build
+  commands:
+  - command: subprocess.exec
     params:
-      optional: true
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: antithesis_next_push.txt
-      remote_file: ${project}/${build_variant}/antithesis_last_push.txt
-      bucket: mciuploads
-      permissions: private
-      content_type: text/plain
-      display_name: Last Push Date (seconds since epoch)
+      binary: bash
+      args:
+      - "./src/evergreen/antithesis_image_push.sh"
+
+- name: antithesis_image_test
+  tags: ["antithesis"]
+  exec_timeout_secs: 14400 # Time out the task if it runs for more than 4 hours.
+  depends_on:
+  - name: antithesis_image_build
+  commands:
+  - command: subprocess.exec
+    params:
+      binary: bash
+      args:
+      - "./src/evergreen/antithesis_dry_run.sh"
 
 - name: generate_buildid_to_debug_symbols_mapping
   tags: ["symbolizer"]
@@ -7247,6 +7983,37 @@ tasks:
       args:
       - "./src/evergreen/generate_buildid_debug_symbols_mapping.sh"
 
+- <<: *task_template
+  name: query_golden_classic
+  tags: []
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      suite: query_golden_classic
+
+- <<: *task_template
+  name: query_golden_cqf
+  tags: []
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      suite: query_golden_cqf
+
+- name: tooling_metrics_test
+  tags: []
+  depends_on: []
+  commands:
+  - *f_expansions_write
+  - func: "do non-compile setup"
+  - func: "set up remote credentials"
+  - *f_expansions_write
+  - func: "configure evergreen api credentials"
+  - func: "run tests"
+    vars:
+      resmoke_jobs_max: 1
+
 #######################################
 #             Task Groups             #
 #######################################
@@ -7255,6 +8022,11 @@ task_groups:
   name: compile_dist_test_TG
   tasks:
   - compile_dist_test
+
+- <<: *compile_task_group_template
+  name: compile_upload_benchmarks_TG
+  tasks:
+  - compile_upload_benchmarks
 
 - <<: *compile_task_group_template
   name: compile_and_archive_dist_test_TG
@@ -7304,6 +8076,41 @@ task_groups:
       display_name: build.ninja
 
 - <<: *compile_task_group_template
+  name: compile_ninja_quick_TG
+  tasks:
+  - compile_ninja_quick
+
+- <<: *compile_task_group_template
+  name: compile_ninja_default_profile_TG
+  tasks:
+  - compile_ninja_default_profile
+
+- <<: *compile_task_group_template
+  name: compile_ninja_default_profile_linux_TG
+  tasks:
+  - compile_ninja_default_profile_linux
+
+- <<: *compile_task_group_template
+  name: compile_ninja_opt_profile_TG
+  tasks:
+  - compile_ninja_opt_profile
+
+- <<: *compile_task_group_template
+  name: compile_ninja_san_profile_TG
+  tasks:
+  - compile_ninja_san_profile
+
+- <<: *compile_task_group_template
+  name: compile_ninja_fast_profile_TG
+  tasks:
+  - compile_ninja_fast_profile
+
+- <<: *compile_task_group_template
+  name: compile_ninja_compiledb_profile_TG
+  tasks:
+  - compile_ninja_compiledb_profile
+
+- <<: *compile_task_group_template
   name: server_discovery_and_monitoring_json_test_TG
   tasks:
   - server_discovery_and_monitoring_json_test
@@ -7338,6 +8145,52 @@ task_groups:
   - run_dbtest
   - archive_dbtest
   - compile_all
+  - package
+
+# The *no_unittests_TG taskgroups are useful for static builds,
+# were the static binaries of the unittests can take up to
+# a terabyte of data.
+- <<: *compile_task_group_template
+  name: compile_test_and_package_serial_no_unittests_TG
+  tasks:
+  - compile_dist_test
+  - archive_dist_test
+  - archive_dist_test_debug
+  - compile_dbtest
+  - run_dbtest
+  - archive_dbtest
+  - compile_all_but_not_unittests
+  - package
+
+- <<: *compile_task_group_template
+  name: compile_test_benchmark_and_package_serial_TG
+  tasks:
+  - compile_dist_test
+  - archive_dist_test
+  - archive_dist_test_debug
+  - compile_unittests
+  - run_unittests
+  - compile_dbtest
+  - run_dbtest
+  - archive_dbtest
+  - compile_upload_benchmarks
+  - compile_all
+  - package
+
+# The *no_unittests_TG taskgroups are useful for static builds,
+# were the static binaries of the unittests can take up to
+# a terabyte of data.
+- <<: *compile_task_group_template
+  name: compile_test_benchmark_and_package_serial_no_unittests_TG
+  tasks:
+  - compile_dist_test
+  - archive_dist_test
+  - archive_dist_test_debug
+  - compile_dbtest
+  - run_dbtest
+  - archive_dbtest
+  - compile_upload_benchmarks
+  - compile_all_but_not_unittests
   - package
 
 - <<: *compile_task_group_template
@@ -7388,6 +8241,30 @@ task_groups:
   - run_dbtest
   - archive_dbtest
 
+- <<: *compile_task_group_template
+  name: build_metrics_gen_TG
+  tasks:
+  - build_metrics_tasks_gen
+
+- <<: *compile_task_group_template
+  name: compile_integration_and_test_parallel_stream_TG
+  tasks:
+  - compile_integration_test
+  - integration_tests_standalone
+  - integration_tests_standalone_audit
+  - integration_tests_replset
+  - integration_tests_replset_ssl_auth
+  - integration_tests_sharded
+
+- <<: *compile_task_group_template
+  name: compile_integration_and_test_no_audit_parallel_stream_TG
+  tasks:
+  - compile_integration_test
+  - integration_tests_standalone
+  - integration_tests_replset
+  - integration_tests_replset_ssl_auth
+  - integration_tests_sharded
+
 - name: clang_tidy_TG
   setup_group_can_fail_task: true
   setup_group:
@@ -7407,6 +8284,8 @@ task_groups:
   - func: "generate compile expansions"
   teardown_group:
   - func: "f_expansions_write"
+  - func: "attach report"
+  - func: "upload clang tidy results"
   - func: "umount shared scons directory"
   - func: "cleanup environment"
   setup_task:
@@ -7441,47 +8320,16 @@ task_groups:
   - func: "f_expansions_write"
   teardown_task:
   - func: "attach scons logs"
+  - func: "send scons cedar report"
   tasks:
   - compile_visibility_test
-
-- name: embedded_sdk_build_and_test
-  setup_group_can_fail_task: true
-  max_hosts: 1
-  setup_group:
-  - command: manifest.load
-  - func: "git get project and add git tag"
-  - func: "set task expansion macros"
-  - func: "f_expansions_write"
-  - func: "get buildnumber"
-  - func: "set up venv"
-  - func: "upload pip requirements"
-  - func: "set up credentials"
-  - func: "set up win mount script"
-  - func: "generate compile expansions"
-  teardown_group:
-  - func: "umount shared scons directory"
-  setup_task:
-  - func: "set task expansion macros"
-  - func: "f_expansions_write"
-  - func: "apply compile expansions"
-  - func: "f_expansions_write"
-  teardown_task:
-  - func: "attach scons logs"
-  tasks:
-  - "embedded_sdk_build_cdriver"
-  - "embedded_sdk_install_dev"
-  - "embedded_sdk_s3_put"
-  - "embedded_sdk_install_tests"
-  - "embedded_sdk_tests_s3_put"
-  - "embedded_sdk_run_tests"
-  - "embedded_sdk_s3_put_latest"
-  - "embedded_sdk_tests_s3_put_latest"
 
 - <<: *stitch_support_task_group_template
   name: stitch_support_lib_build_and_archive
   tags: ["stitch"]
   tasks:
   - "stitch_support_create_lib"
+
 - <<: *stitch_support_task_group_template
   name: stitch_support_lib_build_and_test
   tags: ["stitch"]
@@ -7490,7 +8338,7 @@ task_groups:
   - "stitch_support_install_tests"
   - "stitch_support_run_tests"
 
-- name: csfle_build
+- name: crypt_build
   setup_task:
   - func: "f_expansions_write"
   - func: "apply compile expansions"
@@ -7498,6 +8346,7 @@ task_groups:
   - func: "f_expansions_write"
   teardown_task:
   - func: "attach scons logs"
+  - func: "send scons cedar report"
   setup_group_can_fail_task: true
   setup_group:
   - command: manifest.load
@@ -7514,12 +8363,12 @@ task_groups:
   - func: "generate compile expansions"
   teardown_group:
   - func: "umount shared scons directory"
-  tags: ["csfle"]
+  tags: ["crypt"]
   max_hosts: 1
   tasks:
-  - "csfle_create_lib"
+  - "crypt_create_lib"
 
-- name: csfle_build_debug_and_test
+- name: crypt_build_debug_and_test
   setup_task:
   - func: "f_expansions_write"
   - func: "apply compile expansions"
@@ -7527,6 +8376,7 @@ task_groups:
   - func: "f_expansions_write"
   teardown_task:
   - func: "attach scons logs"
+  - func: "send scons cedar report"
   setup_group_can_fail_task: true
   setup_group:
   - command: manifest.load
@@ -7545,6 +8395,17 @@ task_groups:
   - func: "umount shared scons directory"
   max_hosts: 1
   tasks:
-  - "csfle_create_debug_lib"
-  - "csfle_install_tests"
-  - "csfle_run_tests"
+  - "crypt_create_debug_lib"
+  - "crypt_install_tests"
+  - "crypt_run_tests"
+
+- name: antithesis_build_test_push_TG
+  max_hosts: 1
+  share_processes: true
+  setup_task:
+  - func: "set task expansion macros"
+  - func: "f_expansions_write"
+  tasks:
+    - antithesis_image_build
+    - antithesis_image_push
+    - antithesis_image_test

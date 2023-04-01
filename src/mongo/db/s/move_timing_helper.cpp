@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -39,13 +38,16 @@
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
+
 namespace mongo {
 
 MoveTimingHelper::MoveTimingHelper(OperationContext* opCtx,
                                    const std::string& where,
                                    const std::string& ns,
-                                   const BSONObj& min,
-                                   const BSONObj& max,
+                                   const boost::optional<BSONObj>& min,
+                                   const boost::optional<BSONObj>& max,
                                    int totalNumSteps,
                                    std::string* cmdErrmsg,
                                    const ShardId& toShard,
@@ -55,17 +57,19 @@ MoveTimingHelper::MoveTimingHelper(OperationContext* opCtx,
       _ns(ns),
       _to(toShard),
       _from(fromShard),
+      _min(min),
+      _max(max),
       _totalNumSteps(totalNumSteps),
       _cmdErrmsg(cmdErrmsg),
-      _nextStep(0) {
-    _b.append("min", min);
-    _b.append("max", max);
-}
+      _nextStep(0) {}
 
 MoveTimingHelper::~MoveTimingHelper() {
     // even if logChange doesn't throw, bson does
     // sigh
     try {
+        _b.append("min", _min.get_value_or(BSONObj()));
+        _b.append("max", _max.get_value_or(BSONObj()));
+
         if (_to.isValid()) {
             _b.append("to", _to.toString());
         }

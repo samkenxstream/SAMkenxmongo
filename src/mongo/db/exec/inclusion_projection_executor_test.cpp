@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -49,6 +48,9 @@
 #include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+
 namespace mongo::projection_executor {
 namespace {
 using std::vector;
@@ -64,7 +66,7 @@ BSONObj wrapInLiteral(const T& arg) {
  *
  * The 'AllowFallBackToDefault' parameter should be set to 'true', if the executor is allowed to
  * fall back to the default inclusion projection implementation if the fast-path projection cannot
- * be used for a specific test. If set to 'false', an invariant will be triggered if fast-path
+ * be used for a specific test. If set to 'false', a tassert will be triggered if fast-path
  * projection was expected to be chosen, but the default one has been picked instead.
  */
 template <bool AllowFallBackToDefault>
@@ -113,8 +115,9 @@ protected:
         }
 
         auto executor = buildProjectionExecutor(expCtx, &projection, policies, builderParams);
-        invariant(executor->getType() ==
-                  TransformerInterface::TransformerType::kInclusionProjection);
+        tassert(7241743,
+                "projection executor must be inclusion projections",
+                executor->getType() == TransformerInterface::TransformerType::kInclusionProjection);
         auto inclusionExecutor = static_cast<InclusionProjectionExecutor*>(executor.get());
         auto fastPathRootNode =
             exact_pointer_cast<FastPathEligibleInclusionNode*>(inclusionExecutor->getRoot());
@@ -1066,8 +1069,8 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault, ExtractComputedPro
     ASSERT_EQ(deleteFlag, false);
 
     auto expectedProjection =
-        Document(fromjson("{_id: true, computedMeta1: true, computed2: {$add: [\"$c\", {$const: "
-                          "1}]}, computedMeta3: \"$computedMeta3\"}"));
+        Document(fromjson("{_id: true, computedMeta1: true, computed2: {$add: [{$const: "
+                          "1}, \"$c\"]}, computedMeta3: \"$computedMeta3\"}"));
     ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation(boost::none));
 }
 
@@ -1087,6 +1090,62 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
     ASSERT_EQ(deleteFlag, false);
 
     auto expectedProjection = Document(fromjson("{_id: true, a: '$myMeta', b: '$a'}"));
+    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation(boost::none));
+}
+
+TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ExtractComputedProjectionInProjectShouldNotIncludeId) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("a" << BSON("$sum" << BSON_ARRAY("$myMeta"
+                                              << "$_id"))));
+
+    auto r = static_cast<InclusionProjectionExecutor*>(inclusion.get())->getRoot();
+    const std::set<StringData> reservedNames{};
+    auto [addFields, deleteFlag] =
+        r->extractComputedProjectionsInProject("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(addFields.nFields(), 0);
+    ASSERT_EQ(deleteFlag, false);
+
+    auto expectedProjection = Document(fromjson("{_id: true, a: {$sum: ['$myMeta', '$_id']}}"));
+    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation(boost::none));
+}
+
+TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ExtractComputedProjectionInProjectShouldNotHideDependentSubFields) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a"
+                                                                     << "$myMeta"
+                                                                     << "b"
+                                                                     << "$a.x"));
+
+    auto r = static_cast<InclusionProjectionExecutor*>(inclusion.get())->getRoot();
+    const std::set<StringData> reservedNames{};
+    auto [addFields, deleteFlag] =
+        r->extractComputedProjectionsInProject("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(addFields.nFields(), 0);
+    ASSERT_EQ(deleteFlag, false);
+
+    auto expectedProjection = Document(fromjson("{_id: true, a: '$myMeta', b: '$a.x'}"));
+    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation(boost::none));
+}
+
+TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ExtractComputedProjectionInProjectShouldNotHideDependentSubFieldsWithDottedSibling) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a"
+                                                                     << "$myMeta"
+                                                                     << "c.b"
+                                                                     << "$a.x"));
+
+    auto r = static_cast<InclusionProjectionExecutor*>(inclusion.get())->getRoot();
+    const std::set<StringData> reservedNames{};
+    auto [addFields, deleteFlag] =
+        r->extractComputedProjectionsInProject("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(addFields.nFields(), 0);
+    ASSERT_EQ(deleteFlag, false);
+
+    auto expectedProjection = Document(fromjson("{_id: true, a: '$myMeta', c: {b: '$a.x'}}"));
     ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation(boost::none));
 }
 

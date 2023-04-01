@@ -6,7 +6,6 @@
  * Incompatible with shard merge, which can't handle rollback.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
@@ -16,19 +15,21 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {makeX509OptionsForTest} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");           // for 'extractUUIDFromObject'
 load("jstests/libs/write_concern_util.js");  // for 'stopReplicationOnSecondaries'
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
-const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
+const migrationX509Options = makeX509OptionsForTest();
 
-const recipientRst =
-    new ReplSetTest({name: "recipientRst", nodes: 1, nodeOptions: migrationX509Options.recipient});
+const recipientRst = new ReplSetTest({
+    name: "recipientRst",
+    nodes: 1,
+    serverless: true,
+    nodeOptions: migrationX509Options.recipient
+});
 
 recipientRst.startSet();
 recipientRst.initiateWithHighElectionTimeout();
@@ -58,6 +59,7 @@ function runTest(tenantId,
     const donorRst = new ReplSetTest({
         name: "donorRst",
         nodes: 5,
+        serverless: true,
         nodeOptions: Object.assign(migrationX509Options.donor, {
             setParameter: {
                 // Allow non-timestamped reads on donor after migration completes for testing.
@@ -145,14 +147,14 @@ function runTest(tenantId,
     // this situation. Allow replication once again.
     fpAfterListCall.wait();
     const newDonorPrimary = otherNodes[0];
-    newDonorPrimary.adminCommand({replSetStepUp: 1});
+    donorRst.stepUp(newDonorPrimary, {awaitReplicationBeforeStepUp: false});
     restartServerReplication(otherNodes);
 
     // Advance the cluster time by applying new operations on the new primary. We insert documents
     // into a non-tenant DB, so this data will not be migrated but will still advance the cluster
     // time.
     tenantMigrationTest.insertDonorDB(
-        tenantMigrationTest.nonTenantDB(tenantId, 'alternateDB'),
+        tenantMigrationTest.tenantDB(ObjectId().str, 'alternateDB'),
         'alternateColl',
         [{x: "Tom Petty", y: "Free Fallin"}, {x: "Sushin Shyam", y: "Cherathukal"}]);
 
@@ -332,21 +334,21 @@ function listIndexesPostMigrationFunction(tenantId, tenantMigrationTest) {
     assert(indexNames.includes("a_1"), indexes);
 }
 
-runTest('tenantId1',
+runTest(ObjectId().str,
         listCollectionsSetupFunction,
         listCollectionsWhilePausedFunction,
         listCollectionsPostMigrationFunction,
         {cloner: "TenantDatabaseCloner", stage: "listCollections"},
         "tenantDatabaseClonerHangAfterGettingOperationTime");
 
-runTest('tenantId2',
+runTest(ObjectId().str,
         listDatabasesSetupFunction,
         listDatabasesWhilePausedFunction,
         listDatabasesPostMigrationFunction,
         {cloner: "TenantAllDatabaseCloner", stage: "listDatabases"},
         "tenantAllDatabaseClonerHangAfterGettingOperationTime");
 
-runTest('tenantId3',
+runTest(ObjectId().str,
         listIndexesSetupFunction,
         listIndexesWhilePausedFunction,
         listIndexesPostMigrationFunction,
@@ -354,4 +356,3 @@ runTest('tenantId3',
         "tenantCollectionClonerHangAfterGettingOperationTime");
 
 recipientRst.stopSet();
-})();

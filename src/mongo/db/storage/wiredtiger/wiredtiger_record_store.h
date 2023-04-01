@@ -34,7 +34,8 @@
 #include <string>
 #include <wiredtiger.h>
 
-#include "mongo/db/storage/capped_callback.h"
+#include "mongo/db/catalog/capped_visibility.h"
+#include "mongo/db/storage/collection_markers.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_cursor.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
@@ -95,24 +96,25 @@ public:
      * fail with the constructed configuration string.
      */
     static StatusWith<std::string> generateCreateString(const std::string& engineName,
-                                                        StringData ns,
+                                                        const NamespaceString& nss,
                                                         StringData ident,
                                                         const CollectionOptions& options,
                                                         StringData extraStrings,
-                                                        KeyFormat keyFormat);
+                                                        KeyFormat keyFormat,
+                                                        bool loggingEnabled);
 
     struct Params {
-        StringData ns;
+        NamespaceString nss;
+        boost::optional<UUID> uuid;
         std::string ident;
         std::string engineName;
         bool isCapped;
         KeyFormat keyFormat;
         bool overwrite;
         bool isEphemeral;
+        bool isLogged;
         boost::optional<int64_t> oplogMaxSize;
-        CappedCallback* cappedCallback;
         WiredTigerSizeStorer* sizeStorer;
-        bool isReadOnly;
         bool tracksSizeAdjustments;
         bool forceUpdateWithFullDocument;
     };
@@ -123,7 +125,8 @@ public:
 
     virtual ~WiredTigerRecordStore();
 
-    virtual void postConstructorInit(OperationContext* opCtx);
+    // Pass in NamespaceString, it is not possible to resolve the UUID to NamespaceString yet.
+    virtual void postConstructorInit(OperationContext* opCtx, const NamespaceString& ns);
 
     // name of the RecordStore implementation
     virtual const char* name() const;
@@ -148,33 +151,40 @@ public:
 
     virtual bool findRecord(OperationContext* opCtx, const RecordId& id, RecordData* out) const;
 
-    virtual void deleteRecord(OperationContext* opCtx, const RecordId& id);
+    void doDeleteRecord(OperationContext* opCtx, const RecordId& id) final;
 
-    virtual Status insertRecords(OperationContext* opCtx,
-                                 std::vector<Record>* records,
-                                 const std::vector<Timestamp>& timestamps);
+    Status doInsertRecords(OperationContext* opCtx,
+                           std::vector<Record>* records,
+                           const std::vector<Timestamp>& timestamps) final;
 
-    virtual Status updateRecord(OperationContext* opCtx,
-                                const RecordId& recordId,
-                                const char* data,
-                                int len);
+    Status doUpdateRecord(OperationContext* opCtx,
+                          const RecordId& recordId,
+                          const char* data,
+                          int len) final;
 
     virtual bool updateWithDamagesSupported() const;
 
-    virtual StatusWith<RecordData> updateWithDamages(OperationContext* opCtx,
-                                                     const RecordId& id,
-                                                     const RecordData& oldRec,
-                                                     const char* damageSource,
-                                                     const mutablebson::DamageVector& damages);
+    StatusWith<RecordData> doUpdateWithDamages(OperationContext* opCtx,
+                                               const RecordId& id,
+                                               const RecordData& oldRec,
+                                               const char* damageSource,
+                                               const mutablebson::DamageVector& damages) final;
 
-    virtual void printRecordMetadata(OperationContext* opCtx, const RecordId& recordId) const;
+    virtual void printRecordMetadata(OperationContext* opCtx,
+                                     const RecordId& recordId,
+                                     std::set<Timestamp>* recordTimestamps) const;
 
     virtual std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx,
                                                             bool forward) const = 0;
 
     std::unique_ptr<RecordCursor> getRandomCursor(OperationContext* opCtx) const final;
 
-    virtual Status truncate(OperationContext* opCtx);
+    Status doTruncate(OperationContext* opCtx) final;
+    Status doRangeTruncate(OperationContext* opCtx,
+                           const RecordId& minRecordId,
+                           const RecordId& maxRecordId,
+                           int64_t hintDataSizeDiff,
+                           int64_t hintNumRecordsDiff) final;
 
     virtual bool compactSupported() const {
         return !_isEphemeral;
@@ -185,11 +195,9 @@ public:
 
     virtual Timestamp getPinnedOplog() const final;
 
-    virtual Status compact(OperationContext* opCtx) final;
+    Status doCompact(OperationContext* opCtx) final;
 
-    virtual void validate(OperationContext* opCtx,
-                          ValidateResults* results,
-                          BSONObjBuilder* output);
+    virtual void validate(OperationContext* opCtx, bool full, ValidateResults* results);
 
     virtual void appendNumericCustomStats(OperationContext* opCtx,
                                           BSONObjBuilder* result,
@@ -199,19 +207,17 @@ public:
                                       BSONObjBuilder* result,
                                       double scale) const;
 
-    virtual void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive);
+    void doCappedTruncateAfter(OperationContext* opCtx,
+                               const RecordId& end,
+                               bool inclusive,
+                               const AboutToDeleteRecordCallback& aboutToDelete) final;
 
     virtual void updateStatsAfterRepair(OperationContext* opCtx,
                                         long long numRecords,
                                         long long dataSize);
 
 
-    Status updateOplogSize(long long newOplogSize) final;
-
-    void setCappedCallback(CappedCallback* cb) {
-        stdx::lock_guard<Latch> lk(_cappedCallbackMutex);
-        _cappedCallback = cb;
-    }
+    Status updateOplogSize(OperationContext* opCtx, long long newOplogSize) final;
 
     const std::string& getURI() const {
         return _uri;
@@ -220,6 +226,8 @@ public:
     uint64_t tableId() const {
         return _tableId;
     }
+
+    std::string ns(OperationContext* opCtx) const final;
 
     /*
      * Check the size information for this RecordStore. This function opens a cursor on the
@@ -244,34 +252,29 @@ public:
 
     bool isOpHidden_forTest(const RecordId& id) const;
 
-    bool inShutdown() const;
-
     bool yieldAndAwaitOplogDeletionRequest(OperationContext* opCtx) override;
 
+    /**
+     * Attempts to truncate oplog entries before the pinned oplog timestamp. Truncation will occur
+     * if the oplog is at capacity and the maximum retention time has elapsed.
+     */
     void reclaimOplog(OperationContext* opCtx) override;
 
     StatusWith<Timestamp> getLatestOplogTimestamp(OperationContext* opCtx) const override;
     StatusWith<Timestamp> getEarliestOplogTimestamp(OperationContext* opCtx) override;
 
-    /**
-     * The `recoveryTimestamp` is when replication recovery would need to replay from for
-     * recoverable rollback, or restart for durable engines. `reclaimOplog` will not
-     * truncate oplog entries in front of this time.
-     */
-    void reclaimOplog(OperationContext* opCtx, Timestamp recoveryTimestamp);
-
-    bool haveCappedWaiters();
-
-    void notifyCappedWaitersIfNeeded();
-
-    class OplogStones;
+    class OplogTruncateMarkers;
 
     // Exposed only for testing.
-    OplogStones* oplogStones() {
-        return _oplogStones.get();
+    OplogTruncateMarkers* oplogTruncateMarkers() {
+        return _oplogTruncateMarkers.get();
     };
 
     typedef stdx::variant<int64_t, WiredTigerItem> CursorKey;
+
+    void reserveRecordIds(OperationContext* opCtx,
+                          std::vector<RecordId>* out,
+                          size_t nRecords) final;
 
 protected:
     virtual RecordId getKey(WT_CURSOR* cursor) const = 0;
@@ -291,8 +294,7 @@ private:
                           Record* records,
                           const Timestamp* timestamps,
                           size_t nRecords);
-
-    RecordId _nextId(OperationContext* opCtx);
+    long long _reserveIdBlock(OperationContext* opCtx, size_t nRecords);
     RecordData _getData(const WiredTigerCursor& cursor) const;
 
 
@@ -304,9 +306,9 @@ private:
     void _initNextIdIfNeeded(OperationContext* opCtx);
 
     /**
-     * Adjusts the record count and data size metadata for this record store, respectively. These
-     * functions consult the SizeRecoveryState to determine whether or not to actually change the
-     * size metadata if the server is undergoing recovery.
+     * Adjusts the record count and data size metadata for this record store. The function consults
+     * the SizeRecoveryState to determine whether or not to actually change the size metadata if the
+     * server is undergoing recovery.
      *
      * For most record stores, we will not update the size metadata during recovery, as we trust
      * that the values in the SizeStorer are accurate with respect to the end state of recovery.
@@ -320,8 +322,9 @@ private:
      *      are pending writes to this ident as part of the recovery process, and so we must
      *      always adjust size metadata for these idents.
      */
-    void _changeNumRecords(OperationContext* opCtx, int64_t diff);
-    void _increaseDataSize(OperationContext* opCtx, int64_t amount);
+    void _changeNumRecordsAndDataSize(OperationContext* opCtx,
+                                      int64_t numRecordDiff,
+                                      int64_t dataSizeDiff);
 
     const std::string _uri;
     const uint64_t _tableId;  // not persisted
@@ -340,17 +343,15 @@ private:
     const bool _isLogged;
     // True if the namespace of this record store starts with "local.oplog.", and false otherwise.
     const bool _isOplog;
+    // True if the namespace of this record store starts with "config.system.change_collection", and
+    // false otherwise.
+    const bool _isChangeCollection;
+
     // TODO (SERVER-57482): Remove special handling of skipping "wiredtiger_calc_modify()".
     // True if force to update with the full document, and false otherwise.
     const bool _forceUpdateWithFullDocument;
     boost::optional<int64_t> _oplogMaxSize;
-    RecordId _oplogFirstRecord;
-
-    // Guards _cappedCallback and _shuttingDown.
-    mutable Mutex _cappedCallbackMutex =
-        MONGO_MAKE_LATCH("WiredTigerRecordStore::_cappedCallbackMutex");
-    CappedCallback* _cappedCallback;
-    bool _shuttingDown;
+    AtomicWord<Timestamp> _oplogFirstRecordTimestamp{Timestamp()};
 
     // Protects initialization of the _nextIdNum.
     mutable Mutex _initNextIdMutex = MONGO_MAKE_LATCH("WiredTigerRecordStore::_initNextIdMutex");
@@ -362,7 +363,7 @@ private:
     WiredTigerKVEngine* _kvEngine;  // not owned.
 
     // Non-null if this record store is underlying the active oplog.
-    std::shared_ptr<OplogStones> _oplogStones;
+    std::shared_ptr<OplogTruncateMarkers> _oplogTruncateMarkers;
 
     AtomicWord<int64_t>
         _totalTimeTruncating;            // Cumulative amount of time spent truncating the oplog.
@@ -411,6 +412,13 @@ public:
         _saveStorageCursorOnDetachFromOperationContext = saveCursor;
     }
 
+    /**
+     *  Returns the checkpoint ID for checkpoint cursors, otherwise 0.
+     */
+    uint64_t getCheckpointId() const override {
+        return _cursor->getCheckpointId();
+    }
+
 protected:
     virtual RecordId getKey(WT_CURSOR* cursor) const = 0;
 
@@ -421,18 +429,24 @@ protected:
      */
     virtual void initCursorToBeginning() = 0;
 
-    const WiredTigerRecordStore& _rs;
-    OperationContext* _opCtx;
-    const bool _forward;
-    bool _skipNextAdvance = false;
-    boost::optional<WiredTigerCursor> _cursor;
-    bool _eof = false;
+    const uint64_t _tableId;
     RecordId _lastReturnedId;  // If null, need to seek to first/last record.
+    OperationContext* _opCtx;
+    const std::string _uri;
+    const std::string _ident;
+    boost::optional<WiredTigerCursor> _cursor;
+    const KeyFormat _keyFormat;
+    const bool _forward;
+    const bool _isOplog;
+    const bool _isCapped;
+    const boost::optional<UUID> _uuid;
+    bool _skipNextAdvance = false;
+    bool _eof = false;
     bool _hasRestored = true;
 
 private:
     bool isVisible(const RecordId& id);
-    void initOplogVisibility(OperationContext* opCtx);
+    void initCappedVisibility(OperationContext* opCtx);
 
     /**
      * This value is used for visibility calculations on what oplog entries can be returned to a
@@ -440,6 +454,7 @@ private:
      * established.
      */
     boost::optional<std::int64_t> _oplogVisibleTs = boost::none;
+    boost::optional<CappedVisibilitySnapshot> _cappedSnapshot;
 
     /**
      * With WT-8601, WiredTiger no longer maintains commit_timestamp information on writes to logged

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -37,13 +36,16 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/migration_chunk_cloner_source_legacy.h"
+#include "mongo/db/s/migration_chunk_cloner_source.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/write_concern.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 /**
  * This file contains commands, which are specific to the legacy chunk cloner source.
@@ -75,12 +77,10 @@ public:
                 _autoColl->getCollection());
 
         {
-            auto csr = CollectionShardingRuntime::get(opCtx, *nss);
-            auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
+            const auto scopedCsr =
+                CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, *nss);
 
-            if (auto cloner = MigrationSourceManager::getCurrentCloner(csr, csrLock)) {
-                _chunkCloner = std::dynamic_pointer_cast<MigrationChunkClonerSourceLegacy,
-                                                         MigrationChunkClonerSource>(cloner);
+            if ((_chunkCloner = MigrationSourceManager::getCurrentCloner(*scopedCsr))) {
                 invariant(_chunkCloner);
             } else {
                 uasserted(ErrorCodes::IllegalOperation,
@@ -101,17 +101,12 @@ public:
             _autoColl = boost::none;
     }
 
-    Database* getDb() const {
-        invariant(_autoColl);
-        return _autoColl->getDb();
-    }
-
     const CollectionPtr& getColl() const {
         invariant(_autoColl);
         return _autoColl->getCollection();
     }
 
-    MigrationChunkClonerSourceLegacy* getCloner() const {
+    MigrationChunkClonerSource* getCloner() const {
         invariant(_chunkCloner);
         return _chunkCloner.get();
     }
@@ -121,7 +116,7 @@ private:
     boost::optional<AutoGetCollection> _autoColl;
 
     // Contains the active cloner for the namespace
-    std::shared_ptr<MigrationChunkClonerSourceLegacy> _chunkCloner;
+    std::shared_ptr<MigrationChunkClonerSource> _chunkCloner;
 };
 
 class InitialCloneCommand : public BasicCommand {
@@ -149,16 +144,20 @@ public:
         return true;
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        ActionSet actions;
-        actions.addAction(ActionType::internal);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                  ActionType::internal)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string&,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         const MigrationSessionId migrationSessionId(
@@ -216,16 +215,20 @@ public:
         return true;
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        ActionSet actions;
-        actions.addAction(ActionType::internal);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                  ActionType::internal)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string&,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         const MigrationSessionId migrationSessionId(
@@ -233,7 +236,7 @@ public:
 
         AutoGetActiveCloner autoCloner(opCtx, migrationSessionId, true);
 
-        uassertStatusOK(autoCloner.getCloner()->nextModsBatch(opCtx, autoCloner.getDb(), &result));
+        uassertStatusOK(autoCloner.getCloner()->nextModsBatch(opCtx, &result));
         return true;
     }
 
@@ -258,7 +261,7 @@ public:
         return "internal";
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -266,16 +269,20 @@ public:
         return AllowedOnSecondary::kNever;
     }
 
-    virtual bool adminOnly() const {
+    bool adminOnly() const override {
         return true;
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        ActionSet actions;
-        actions.addAction(ActionType::internal);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                  ActionType::internal)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     /**
@@ -319,7 +326,7 @@ public:
             WriteConcernOptions majorityWC{WriteConcernOptions::kMajority,
                                            WriteConcernOptions::SyncMode::UNSET,
                                            WriteConcernOptions::kNoTimeout};
-            uassertStatusOK(waitForWriteConcern(opCtx, opTime.get(), majorityWC, &wcResult));
+            uassertStatusOK(waitForWriteConcern(opCtx, opTime.value(), majorityWC, &wcResult));
 
             auto rollbackIdAtMigrationInit = [&]() {
                 AutoGetActiveCloner autoCloner(opCtx, migrationSessionId, false);
@@ -339,7 +346,7 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const std::string&,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         const MigrationSessionId migrationSessionId(

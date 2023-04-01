@@ -109,7 +109,8 @@ public:
         /**
          * Interrupts the migration for garbage collection.
          */
-        void onReceiveRecipientForgetMigration(OperationContext* opCtx);
+        void onReceiveRecipientForgetMigration(OperationContext* opCtx,
+                                               const TenantMigrationRecipientStateEnum& nextState);
 
         /**
          * Returns a Future that will be resolved when data sync associated with this Instance has
@@ -120,11 +121,11 @@ public:
         }
 
         /**
-         * Returns a Future that will be resolved when the work associated with this Instance has
-         * completed to indicate whether the migration is forgotten successfully.
+         * Returns a Future that will be resolved when the instance has been durably marked garbage
+         * collectable.
          */
-        SharedSemiFuture<void> getCompletionFuture() const {
-            return _taskCompletionPromise.getFuture();
+        SharedSemiFuture<void> getForgetMigrationDurableFuture() const {
+            return _forgetMigrationDurablePromise.getFuture();
         }
 
         /**
@@ -152,14 +153,9 @@ public:
         /*
          * Returns the recipient document state.
          */
-        const TenantMigrationRecipientDocument getState() const;
+        TenantMigrationRecipientDocument getState() const;
 
-        /**
-         * To be called on the instance returned by PrimaryOnlyService::getOrCreate(). Returns an
-         * error if the options this Instance was created with are incompatible with the options
-         * given in 'stateDoc'.
-         */
-        Status checkIfOptionsConflict(const TenantMigrationRecipientDocument& stateDoc) const;
+        void checkIfOptionsConflict(const BSONObj& stateDoc) const final;
 
         /*
          * Blocks the thread until the tenant migration reaches consistent state in an interruptible
@@ -218,6 +214,18 @@ public:
 
     private:
         friend class TenantMigrationRecipientServiceTest;
+        friend class TenantMigrationRecipientServiceShardMergeTest;
+
+        /**
+         * Only used for testing. Allows setting a custom task executor for backup cursor fetcher.
+         */
+        void setBackupCursorFetcherExecutor_forTest(
+            std::shared_ptr<executor::TaskExecutor> taskExecutor) {
+            _backupCursorExecutor = taskExecutor;
+        }
+
+        const NamespaceString _stateDocumentsNS =
+            NamespaceString::kTenantMigrationRecipientsNamespace;
 
         using ConnectionPair =
             std::pair<std::unique_ptr<DBClientConnection>, std::unique_ptr<DBClientConnection>>;
@@ -315,12 +323,6 @@ public:
         };
 
         /*
-         * Returns false if the protocol is FCV incompatible. Also, resets the 'protocol' field in
-         * the _stateDoc to boost::none for FCV < 5.2.
-         */
-        bool _checkifProtocolRemainsFCVCompatible();
-
-        /*
          * Helper for interrupt().
          * The _receivedForgetMigrationPromise is resolved when skipWaitingForForgetMigration is
          * set (e.g. stepDown/shutDown). And we use skipWaitingForForgetMigration=false for
@@ -345,6 +347,16 @@ public:
         SemiFuture<void> _markStateDocAsGarbageCollectable();
 
         /**
+         * Deletes the state document. Does not return the opTime for the delete, since it's not
+         * necessary to wait for this delete to be majority committed (this is one of the last steps
+         * in the chain, and if the delete rolls back, the new primary will re-do the delete).
+         */
+        SemiFuture<void> _removeStateDoc(const CancellationToken& token);
+
+        SemiFuture<void> _waitForGarbageCollectionDelayThenDeleteStateDoc(
+            const CancellationToken& token);
+
+        /**
          * Creates a client, connects it to the donor. If '_transientSSLParams' is not none, uses
          * the migration certificate to do SSL authentication. Otherwise, uses the default
          * authentication mode. Throws a user assertion on failure.
@@ -357,7 +369,7 @@ public:
          * Creates and connects both the oplog fetcher client and the client used for other
          * operations.
          */
-        SemiFuture<ConnectionPair> _createAndConnectClients();
+        SemiFuture<void> _createAndConnectClients();
 
         /**
          * Fetches all key documents from the donor's admin.system.keys collection, stores them in
@@ -366,19 +378,39 @@ public:
         void _fetchAndStoreDonorClusterTimeKeyDocs(const CancellationToken& token);
 
         /**
-         * Creates a backup cursor wrapped in a Fetcher.
+         * Opens a backup cursor on the donor primary and fetches the
+         * list of donor files to be cloned.
          */
-        ExecutorFuture<void> _getDonorFilenames(const CancellationToken& token);
+        SemiFuture<void> _openBackupCursor(const CancellationToken& token);
+        SemiFuture<void> _openBackupCursorWithRetry(const CancellationToken& token);
+
+        /**
+         * Keeps the donor backup cursor alive.
+         */
+        void _keepBackupCursorAlive(const CancellationToken& token);
 
         /**
          * Kills the Donor backup cursor
          */
-        ExecutorFuture<void> _killBackupCursor();
+        SemiFuture<void> _killBackupCursor();
 
         /**
-         * Retrieves the start optimes from the donor and updates the in-memory state accordingly.
+         * Gets the backup cursor metadata info.
          */
-        void _getStartOpTimesFromDonor(WithLock lk);
+        const BackupCursorInfo& _getDonorBackupCursorInfo(WithLock) const;
+
+        /**
+         * Get the oldest active multi-statement transaction optime by reading
+         * config.transactions collection at given ReadTimestamp (i.e, equal to
+         * startApplyingDonorOpTime) snapshot.
+         */
+        boost::optional<OpTime> _getOldestActiveTransactionAt(Timestamp ReadTimestamp);
+
+        /**
+         * Retrieves the start/fetch optimes from the donor and updates the in-memory/on-disk states
+         * accordingly.
+         */
+        SemiFuture<void> _getStartOpTimesFromDonor();
 
         /**
          * Pushes documents from oplog fetcher to oplog buffer.
@@ -391,10 +423,10 @@ public:
                                  const OplogFetcher::DocumentsInfo& info);
 
         /**
-         * Creates the oplog buffer that will be populated by donor oplog entries from the retryable
-         * writes fetching stage and oplog fetching stage.
+         * Validates the tenantIds field is consistent with the protocol given. Throws an exception
+         * if there is a mismatch.
          */
-        void _createOplogBuffer();
+        void _validateTenantIdsForProtocol();
 
         /**
          * Runs an aggregation that gets the entire oplog chain for every retryable write entry in
@@ -404,10 +436,20 @@ public:
         SemiFuture<void> _fetchRetryableWritesOplogBeforeStartOpTime();
 
         /**
-         * Runs the aggregation from '_makeCommittedTransactionsAggregation()' and migrates the
-         * resulting committed transactions entries into 'config.transactions'.
+         * Migrates committed transactions entries into 'config.transactions'.
          */
         SemiFuture<void> _fetchCommittedTransactionsBeforeStartOpTime();
+
+        /**
+         * Opens and returns a cursor for all entries with 'lastWriteOpTime' <=
+         * 'startApplyingDonorOpTime' and state 'committed'.
+         */
+        std::unique_ptr<DBClientCursor> _openCommittedTransactionsFindCursor();
+
+        /**
+         * Opens and returns a cursor for entries from '_makeCommittedTransactionsAggregation()'.
+         */
+        std::unique_ptr<DBClientCursor> _openCommittedTransactionsAggregationCursor();
 
         /**
          * Creates an aggregation pipeline to fetch transaction entries with 'lastWriteOpTime' <
@@ -439,17 +481,11 @@ public:
         BSONObj _getOplogFetcherFilter() const;
 
         /*
-         * Indicates that the recipient has completed the tenant cloning phase.
-         */
-        bool _isCloneCompletedMarkerSet(WithLock) const;
-
-        /*
          * Traverse backwards through the oplog to find the optime which tenant oplog application
          * should resume from. The oplog applier should resume applying entries that have a greater
          * optime than the returned value.
          */
-        OpTime _getOplogResumeApplyingDonorOptime(OpTime startApplyingDonorOpTime,
-                                                  OpTime cloneFinishedRecipientOpTime) const;
+        OpTime _getOplogResumeApplyingDonorOptime(const OpTime& cloneFinishedRecipientOpTime) const;
 
         /*
          * Starts the tenant cloner.
@@ -458,16 +494,36 @@ public:
         Future<void> _startTenantAllDatabaseCloner(WithLock lk);
 
         /*
-         * Advances the stableTimestamp to be >= startApplyingDonorOpTime by:
-         * 1. Advancing the clusterTime to startApplyingDonorOpTime
-         * 2. Writing a no-op oplog entry with ts > startApplyingDonorOpTime
-         * 3. Waiting for the majority commit timestamp to be the time of the no-op write
+         * Starts the tenant oplog applier.
          */
-        void _advanceStableTimestampToStartApplyingDonorOpTime(OperationContext* opCtx,
-                                                               const CancellationToken& token);
+        void _startOplogApplier();
 
         /*
-         * Gets called when the cloner completes cloning data successfully.
+         * Waits for tenant oplog applier to stop.
+         */
+        SemiFuture<TenantOplogApplier::OpTimePair> _waitForOplogApplierToStop();
+
+        /*
+         * Advances the majority commit timestamp to be >= donor's backup cursor checkpoint
+         * timestamp(CkptTs) by:
+         * 1. Advancing the clusterTime to CkptTs.
+         * 2. Writing a no-op oplog entry with ts > CkptTs
+         * 3. Waiting for the majority commit timestamp to be the time of the no-op write.
+         *
+         * Notes: This method should be called before transitioning the instance state to
+         * 'kLearnedFilenames' which causes donor collections to get imported. Current import rule
+         * is that the import table's checkpoint timestamp can't be later than the recipient's
+         * stable timestamp. Due to the fact, we don't have a mechanism to wait until a specific
+         * stable timestamp on a given node or set of nodes in the replica set and the majority
+         * commit point and stable timestamp aren't atomically updated, advancing the majority
+         * commit point on the recipient before import collection stage is a best-effort attempt to
+         * prevent import retry attempts on import timestamp rule violation.
+         */
+        SemiFuture<void> _advanceMajorityCommitTsToBkpCursorCheckpointTs(
+            const CancellationToken& token);
+
+        /*
+         * Gets called when the logical/file cloner completes cloning data successfully.
          * And, it is responsible to populate the 'dataConsistentStopDonorOpTime'
          * and 'cloneFinishedRecipientOpTime' fields in the state doc.
          */
@@ -478,6 +534,27 @@ public:
          * state.
          */
         SemiFuture<void> _getDataConsistentFuture();
+
+        /*
+         * Wait for the data cloned via logical cloner to be consistent.
+         */
+        SemiFuture<TenantOplogApplier::OpTimePair> _waitForDataToBecomeConsistent();
+
+        /*
+         * Transitions the instance state to 'kLearnedFilenames'.
+         */
+        SemiFuture<void> _enterLearnedFilenamesState();
+
+        /*
+         * Transitions the instance state to 'kConsistent'.
+         */
+        SemiFuture<void> _enterConsistentState();
+
+        /*
+         * Persists the instance state doc and waits for it to be majority replicated.
+         * Throws an user assertion on failure.
+         */
+        SemiFuture<void> _persistConsistentState();
 
         /*
          * Cancels the tenant migration recipient instance task work.
@@ -507,6 +584,13 @@ public:
          */
         void _stopOrHangOnFailPoint(FailPoint* fp, OperationContext* opCtx = nullptr);
 
+        /*
+         * Parse the "state" field contained in the failpoint into a
+         * TenantMigrationRecipientStateEnum. The field must be present and be a valid terminal
+         * state.
+         */
+        TenantMigrationRecipientStateEnum _getTerminalStateFromFailpoint(FailPoint* fp);
+
         /**
          * Updates the state doc in the database and waits for that to be propagated to a majority.
          */
@@ -515,18 +599,40 @@ public:
         /*
          * Returns the majority OpTime on the donor node that 'client' is connected to.
          */
-
         OpTime _getDonorMajorityOpTime(std::unique_ptr<mongo::DBClientConnection>& client);
+
+        /*
+         * Detects recipient FCV changes during migration.
+         */
+        SemiFuture<void> _checkIfFcvHasChangedSinceLastAttempt();
+
         /**
          * Enforces that the donor and recipient share the same featureCompatibilityVersion.
          */
         void _compareRecipientAndDonorFCV() const;
 
-        /**
-         * Increments either 'totalSuccessfulMigrationsReceived' or 'totalFailedMigrationsReceived'
-         * in TenantMigrationStatistics by examining status and promises.
+        /*
+         * Sets up internal state to begin migration.
          */
-        void _setMigrationStatsOnCompletion(Status completionStatus) const;
+        void _setup();
+
+        SemiFuture<TenantOplogApplier::OpTimePair> _migrateUsingMTMProtocol(
+            const CancellationToken& token);
+
+        SemiFuture<TenantOplogApplier::OpTimePair> _migrateUsingShardMergeProtocol(
+            const CancellationToken& token);
+
+        /*
+         * Drops ephemeral collections used for tenant migrations.
+         */
+        void _dropTempCollections();
+
+        /*
+         * Send the killBackupCursor command to the remote in order to close the backup cursor
+         * connection on the donor.
+         */
+        StatusWith<executor::TaskExecutor::CallbackHandle> _scheduleKillBackupCursorWithLock(
+            WithLock lk, std::shared_ptr<executor::TaskExecutor> executor);
 
         mutable Mutex _mutex = MONGO_MAKE_LATCH("TenantMigrationRecipientService::_mutex");
 
@@ -541,11 +647,13 @@ public:
         ServiceContext* const _serviceContext;
         const TenantMigrationRecipientService* const _recipientService;  // (R) (not owned)
         std::shared_ptr<executor::ScopedTaskExecutor> _scopedExecutor;   // (M)
+        std::shared_ptr<executor::TaskExecutor> _backupCursorExecutor;   // (M)
         TenantMigrationRecipientDocument _stateDoc;                      // (M)
 
         // This data is provided in the initial state doc and never changes.  We keep copies to
         // avoid having to obtain the mutex to access them.
         const std::string _tenantId;                                                     // (R)
+        const std::vector<TenantId> _tenantIds;                                          // (R)
         const MigrationProtocolEnum _protocol;                                           // (R)
         const UUID _migrationUuid;                                                       // (R)
         const std::string _donorConnectionString;                                        // (R)
@@ -571,15 +679,13 @@ public:
         std::unique_ptr<DBClientConnection> _client;              // (S)
         std::unique_ptr<DBClientConnection> _oplogFetcherClient;  // (S)
 
-        CursorId _donorFilenameBackupCursorId;                           // (M)
-        NamespaceString _donorFilenameBackupCursorNamespaceString;       // (M)
         std::unique_ptr<Fetcher> _donorFilenameBackupCursorFileFetcher;  // (M)
         CancellationSource _backupCursorKeepAliveCancellation = {};      // (X)
         boost::optional<SemiFuture<void>> _backupCursorKeepAliveFuture;  // (M)
 
         std::unique_ptr<OplogFetcherFactory> _createOplogFetcherFn =
             std::make_unique<CreateOplogFetcherFn>();                               // (M)
-        std::unique_ptr<OplogBufferCollection> _donorOplogBuffer;                   // (M)
+        std::shared_ptr<OplogBufferCollection> _donorOplogBuffer;                   // (M)
         std::unique_ptr<DataReplicatorExternalState> _dataReplicatorExternalState;  // (M)
         std::unique_ptr<OplogFetcher> _donorOplogFetcher;                           // (M)
         std::unique_ptr<TenantAllDatabaseCloner> _tenantAllDatabaseCloner;          // (M)
@@ -610,16 +716,16 @@ public:
         SharedPromise<void> _dataSyncCompletionPromise;  // (W)
         // Promise that is resolved when the recipientForgetMigration command is received or on
         // stepDown/shutDown with errors.
-        SharedPromise<void> _receivedRecipientForgetMigrationPromise;  // (W)
-        // Promise that is resolved when the chain of work kicked off by run() has completed to
-        // indicate whether the state doc is successfully marked as garbage collectable.
-        SharedPromise<void> _taskCompletionPromise;  // (W)
-
+        SharedPromise<TenantMigrationRecipientStateEnum>
+            _receivedRecipientForgetMigrationPromise;  // (W)
+        // Promise that is resolved when the instance has been durably marked garbage collectable
+        SharedPromise<void> _forgetMigrationDurablePromise;  // (W)
         // Waiters are notified when 'tenantOplogApplier' is valid on restart.
         stdx::condition_variable _restartOplogApplierCondVar;  // (M)
-        // Indicates that the oplog applier is being cleaned up due to restart of the future chain.
-        // This is set to true when the oplog applier is started up again.
-        bool _isRestartingOplogApplier = false;  // (M)
+        // Waiters are notified when 'tenantOplogApplier' is ready to use.
+        stdx::condition_variable _oplogApplierReadyCondVar;  // (M)
+        // Indicates whether 'tenantOplogApplier' is ready to use or not.
+        bool _oplogApplierReady = false;  // (M)
     };
 
 private:

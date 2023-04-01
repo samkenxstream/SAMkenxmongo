@@ -31,27 +31,81 @@
 
 #include "mongo/crypto/fle_crypto.h"
 #include "mongo/crypto/fle_tags.h"
-#include "mongo/stdx/unordered_set.h"
+#include "mongo/db/fle_crud.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/query_knobs_gen.h"
 
 namespace mongo::fle {
 
 using DerivedToken = FLEDerivedFromDataTokenAndContentionFactorTokenGenerator;
 using TwiceDerived = FLETwiceDerivedTokenGenerator;
 
+size_t sizeArrayElementsMemory(size_t tagCount);
+
+namespace {
+
+inline constexpr size_t arrayElementSize(int digits) {
+    constexpr size_t sizeOfType = 1;
+    constexpr size_t sizeOfBinDataLength = 4;
+    constexpr size_t sizeOfNullMarker = 1;
+    constexpr size_t sizeOfSubType = 1;
+    constexpr size_t sizeOfData = sizeof(PrfBlock);
+    return sizeOfType + sizeOfBinDataLength + sizeOfNullMarker + digits + sizeOfSubType +
+        sizeOfData;
+}
+
+void verifyTagsWillFit(size_t tagCount, size_t memoryLimit) {
+    constexpr size_t largestElementSize = arrayElementSize(std::numeric_limits<size_t>::digits10);
+    constexpr size_t ridiculousNumberOfTags =
+        std::numeric_limits<size_t>::max() / largestElementSize;
+
+    uassert(ErrorCodes::FLEMaxTagLimitExceeded,
+            "Encrypted rewrite too many tags",
+            tagCount < ridiculousNumberOfTags);
+    uassert(ErrorCodes::FLEMaxTagLimitExceeded,
+            "Encrypted rewrite memory limit exceeded",
+            sizeArrayElementsMemory(tagCount) <= memoryLimit);
+}
+
+void generateTags(uint64_t numInserts,
+                  EDCDerivedFromDataTokenAndContentionFactorToken edcTok,
+                  std::vector<PrfBlock>& binaryTags) {
+
+    auto edcTag = TwiceDerived::generateEDCTwiceDerivedToken(edcTok);
+
+    for (uint64_t i = 1; i <= numInserts; i++) {
+        binaryTags.emplace_back(EDCServerCollection::generateTag(edcTag, i));
+    }
+}
+
+}  // namespace
+
+size_t sizeArrayElementsMemory(size_t tagCount) {
+    size_t size = 0;
+    size_t power = 1;
+    size_t digits = 1;
+    size_t accountedTags = 0;
+    while (tagCount >= power) {
+        power *= 10;
+        size_t count = std::min(tagCount, power) - accountedTags;
+        size += arrayElementSize(digits) * count;
+        accountedTags += count;
+        digits++;
+    }
+    return size;
+}
+
+
+// TODO: SERVER-73303 remove when v2 is enabled by default
 // The algorithm for constructing a list of tags matching an equality predicate on an encrypted
 // field is as follows:
 //
 // (1) Query ESC to obtain the counter value (n) after the most recent insert.
-// (2) Set the initial candidate set of tags to 1..n inclusive.
-//      (a) We know there have been (n) inserts into the collection for this field/value pair,
-//          however there could have been deletes, so this represents a superset of the true set of
-//          tags.
-// (3) Query ECC for a null document.
-//      (a) A null document means there has been at least one compaction. Therefore the deletes that
-//          were present in ECC before the compaction, have now been reflected in ESC.
+// (2) Query ECC for a null document.
+//      (a) A null document means there has been at least one compaction of ECC.
 //      (b) No null document means there has not been a compaction. Therefore we have to check all
 //          the tags from 1..n to see if they have been deleted.
-// (4) Return the surviving set of tags from 1..n (encrypted).
+// (3) Return the surviving set of tags from 1..n (encrypted).
 //
 // Given:
 //      s: ESCDerivedFromDataToken
@@ -59,94 +113,192 @@ using TwiceDerived = FLETwiceDerivedTokenGenerator;
 //      d: EDCDerivedFromDataToken
 // Do:
 //      n = ESC::emuBinary(s)
-//      tags = [1..n]
+//      deletedTags = []
 //      pos = ECC::nullDocument(c) ? ECC::nullDocument(c).position : 1
-//      LOOP:
-//          doc = ECC::getDocument(c, pos)
-//          if doc {
-//              tags = tags \ [doc.start..doc.end]
+//      while true {
+//          if (doc = ECC::getDocument(c, pos); doc != null) {
+//              deletedTags = [doc | deletedTags]
 //          } else {
 //              break
 //          }
 //          pos++
-//      return [EDC::encrypt(i) | i in tags]
-//
-// Note, a positive contention factor (cm) means we must repeat the above process (cm) times.
-std::vector<PrfBlock> readTags(const FLEStateCollectionReader& esc,
-                               const FLEStateCollectionReader& ecc,
+//      }
+//      return [EDC::encrypt(i) | i in [1..n] where i not in deletedTags]
+std::vector<PrfBlock> readTagsWithContention(const FLEStateCollectionReader& esc,
+                                             const FLEStateCollectionReader& ecc,
+                                             ESCDerivedFromDataToken s,
+                                             ECCDerivedFromDataToken c,
+                                             EDCDerivedFromDataToken d,
+                                             uint64_t cf,
+                                             size_t memoryLimit,
+                                             std::vector<PrfBlock>&& binaryTags) {
+
+    auto escTok = DerivedToken::generateESCDerivedFromDataTokenAndContentionFactorToken(s, cf);
+    auto escTag = TwiceDerived::generateESCTwiceDerivedTagToken(escTok);
+    auto escVal = TwiceDerived::generateESCTwiceDerivedValueToken(escTok);
+
+    auto eccTok = DerivedToken::generateECCDerivedFromDataTokenAndContentionFactorToken(c, cf);
+    auto eccTag = TwiceDerived::generateECCTwiceDerivedTagToken(eccTok);
+    auto eccVal = TwiceDerived::generateECCTwiceDerivedValueToken(eccTok);
+
+    auto edcTok = DerivedToken::generateEDCDerivedFromDataTokenAndContentionFactorToken(d, cf);
+    auto edcTag = TwiceDerived::generateEDCTwiceDerivedToken(edcTok);
+
+    // (1) Query ESC for the counter value after the most recent insert.
+    //     0 => 0 inserts for this field value pair.
+    //     n => n inserts for this field value pair.
+    //     none => compaction => query ESC for null document to find # of inserts.
+    auto insertCounter = ESCCollection::emuBinary(esc, escTag, escVal);
+    if (insertCounter && insertCounter.value() == 0) {
+        return std::move(binaryTags);
+    }
+
+    auto numInserts = insertCounter
+        ? uassertStatusOK(
+              ESCCollection::decryptDocument(
+                  escVal, esc.getById(ESCCollection::generateId(escTag, insertCounter))))
+              .count
+        : uassertStatusOK(ESCCollection::decryptNullDocument(
+                              escVal, esc.getById(ESCCollection::generateId(escTag, boost::none))))
+              .count;
+
+    // (2) Query ECC for a null document.
+    auto eccNullDoc = ecc.getById(ECCCollection::generateId(eccTag, boost::none));
+    auto pos = eccNullDoc.isEmpty()
+        ? 1
+        : uassertStatusOK(ECCCollection::decryptNullDocument(eccVal, eccNullDoc)).position + 2;
+
+    std::vector<ECCDocument> deletes;
+
+    // (2) Search ECC for deleted tag(counter) values.
+    while (true) {
+        auto eccObj = ecc.getById(ECCCollection::generateId(eccTag, pos));
+        if (eccObj.isEmpty()) {
+            break;
+        }
+        auto eccDoc = uassertStatusOK(ECCCollection::decryptDocument(eccVal, eccObj));
+        // Compaction placeholders only present for positive contention factors (cm).
+        if (eccDoc.valueType == ECCValueType::kCompactionPlaceholder) {
+            break;
+        }
+        // Note, in the worst case where no compactions have occurred, the deletes vector will grow
+        // proportionally to the number of deletes. This is not likely to present a significant
+        // problem but we should still track the memory we consume here.
+        deletes.emplace_back(eccDoc);
+        pos++;
+    }
+
+    std::sort(deletes.begin(), deletes.end());
+
+    auto numDeletes = std::accumulate(deletes.begin(), deletes.end(), 0, [](auto acc, auto eccDoc) {
+        return acc + eccDoc.end - eccDoc.start + 1;
+    });
+    auto cumTagCount = binaryTags.size() + numInserts - numDeletes;
+
+    verifyTagsWillFit(cumTagCount, memoryLimit);
+
+    for (uint64_t i = 1; i <= numInserts; i++) {
+        if (auto it = std::lower_bound(
+                deletes.begin(),
+                deletes.end(),
+                i,
+                [](ECCDocument& eccDoc, uint64_t tag) { return eccDoc.end < tag; });
+            it != deletes.end() && it->start <= i && i <= it->end) {
+            continue;
+        }
+        // (3) Return the surviving set of tags from 1..n (encrypted).
+        binaryTags.emplace_back(EDCServerCollection::generateTag(edcTag, i));
+    }
+    return std::move(binaryTags);
+}
+
+// A positive contention factor (cm) means we must run the above algorithm (cm) times.
+std::vector<PrfBlock> readTags(FLETagQueryInterface* queryImpl,
+                               const NamespaceString& nssEsc,
+                               ESCDerivedFromDataToken s,
+                               EDCDerivedFromDataToken d,
+                               boost::optional<int64_t> cm) {
+
+    auto memoryLimit = static_cast<size_t>(internalQueryFLERewriteMemoryLimit.load());
+    auto contentionMax = cm.value_or(0);
+    std::vector<PrfBlock> binaryTags;
+
+    std::vector<FLEEdgePrfBlock> blocks;
+    blocks.reserve(contentionMax + 1);
+
+    for (auto cf = 0; cf <= contentionMax; cf++) {
+        auto escToken =
+            DerivedToken::generateESCDerivedFromDataTokenAndContentionFactorToken(s, cf);
+        auto edcToken =
+            DerivedToken::generateEDCDerivedFromDataTokenAndContentionFactorToken(d, cf);
+
+        FLEEdgePrfBlock edgeSet{escToken.data, edcToken.data};
+
+        blocks.push_back(edgeSet);
+    }
+
+    std::vector<std::vector<FLEEdgePrfBlock>> blockSets;
+    blockSets.push_back(blocks);
+
+    auto countInfoSets =
+        queryImpl->getTags(nssEsc, blockSets, FLETagQueryInterface::TagQueryType::kQuery);
+
+
+    // Count how many tags we will need and check once if we they will fit
+    //
+    uint32_t totalTagCount = 0;
+
+    for (const auto& countInfoSet : countInfoSets) {
+        for (const auto& countInfo : countInfoSet) {
+            totalTagCount += countInfo.count;
+        }
+    }
+
+    verifyTagsWillFit(totalTagCount, memoryLimit);
+
+    binaryTags.reserve(totalTagCount);
+
+    for (const auto& countInfoSet : countInfoSets) {
+        for (const auto& countInfo : countInfoSet) {
+
+            uassert(7415001, "Missing EDC value", countInfo.edc.has_value());
+            generateTags(countInfo.count, countInfo.edc.value(), binaryTags);
+        }
+    }
+
+    return binaryTags;
+}
+
+// TODO: SERVER-73303 remove when v2 is enabled by default
+// A positive contention factor (cm) means we must run the above algorithm (cm) times.
+std::vector<PrfBlock> readTags(FLETagQueryInterface* queryImpl,
+                               const NamespaceString& nssEsc,
+                               const NamespaceString& nssEcc,
                                ESCDerivedFromDataToken s,
                                ECCDerivedFromDataToken c,
                                EDCDerivedFromDataToken d,
                                boost::optional<int64_t> cm) {
 
+    // The output of readTags will be used as the argument to a $in expression, so make sure we
+    // don't exceed the configured memory limit.
+    auto memoryLimit = static_cast<size_t>(internalQueryFLERewriteMemoryLimit.load());
+    auto contentionMax = cm.value_or(0);
     std::vector<PrfBlock> binaryTags;
 
-    for (auto i = 0; cm && i <= cm.get(); i++) {
-        auto escTok = DerivedToken::generateESCDerivedFromDataTokenAndContentionFactorToken(s, i);
-        auto escTag = TwiceDerived::generateESCTwiceDerivedTagToken(escTok);
-        auto escVal = TwiceDerived::generateESCTwiceDerivedValueToken(escTok);
+    auto makeCollectionReader = [](FLETagQueryInterface* queryImpl, const NamespaceString& nss) {
+        auto docCount = queryImpl->countDocuments(nss);
+        return TxnCollectionReader(docCount, queryImpl, nss);
+    };
 
-        auto eccTok = DerivedToken::generateECCDerivedFromDataTokenAndContentionFactorToken(c, i);
-        auto eccTag = TwiceDerived::generateECCTwiceDerivedTagToken(eccTok);
-        auto eccVal = TwiceDerived::generateECCTwiceDerivedValueToken(eccTok);
+    // Construct FLE rewriter from the transaction client and encryptionInformation.
+    auto esc = makeCollectionReader(queryImpl, nssEsc);
+    auto ecc = makeCollectionReader(queryImpl, nssEcc);
 
-        auto edcTok = DerivedToken::generateEDCDerivedFromDataTokenAndContentionFactorToken(d, i);
-        auto edcTag = TwiceDerived::generateEDCTwiceDerivedToken(edcTok);
-
-        // (1) Query ESC for the counter value after the most recent insert.
-        //     0 => 0 inserts for this field value pair.
-        //     n => n inserts for this field value pair.
-        //     none => compaction => query ESC for null document to find # of inserts.
-        auto insertCounter = ESCCollection::emuBinary(esc, escTag, escVal);
-        if (insertCounter && insertCounter.get() == 0) {
-            continue;
-        }
-
-        stdx::unordered_set<int64_t> tags;
-
-        auto numInserts = insertCounter
-            ? uassertStatusOK(
-                  ESCCollection::decryptDocument(
-                      escVal, esc.getById(ESCCollection::generateId(escTag, insertCounter))))
-                  .count
-            : uassertStatusOK(
-                  ESCCollection::decryptNullDocument(
-                      escVal, esc.getById(ESCCollection::generateId(escTag, boost::none))))
-                  .count;
-
-        // (2) Set the initial set of tags to 1..n inclusive - a superset of the true tag set.
-        for (uint64_t i = 1; i <= numInserts; i++) {
-            tags.insert(i);
-        }
-
-        // (3) Query ECC for a null document.
-        auto eccNullDoc = ecc.getById(ECCCollection::generateId(eccTag, boost::none));
-        auto pos = eccNullDoc.isEmpty()
-            ? 1
-            : uassertStatusOK(ECCCollection::decryptNullDocument(eccVal, eccNullDoc)).position + 2;
-
-        // (3) Search ECC for deleted tag(counter) values.
-        while (true) {
-            auto eccObj = ecc.getById(ECCCollection::generateId(eccTag, pos));
-            if (eccObj.isEmpty()) {
-                break;
-            }
-            auto eccDoc = uassertStatusOK(ECCCollection::decryptDocument(eccVal, eccObj));
-            // Compaction placeholders only present for positive contention factors (cm).
-            if (eccDoc.valueType == ECCValueType::kCompactionPlaceholder) {
-                break;
-            }
-            for (uint64_t i = eccDoc.start; i <= eccDoc.end; i++) {
-                tags.erase(i);
-            }
-            pos++;
-        }
-
-        for (auto counter : tags) {
-            // (4) Derive binary tag values (encrypted) from the set of counter values (tags).
-            binaryTags.emplace_back(EDCServerCollection::generateTag(edcTag, counter));
-        }
+    for (auto i = 0; i <= contentionMax; i++) {
+        binaryTags =
+            readTagsWithContention(esc, ecc, s, c, d, i, memoryLimit, std::move(binaryTags));
     }
+
     return binaryTags;
 }
 }  // namespace mongo::fle

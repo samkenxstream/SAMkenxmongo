@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <boost/optional.hpp>
 
 #include "mongo/bson/bsonobjbuilder.h"
@@ -46,6 +44,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/stdx/condition_variable.h"
@@ -57,7 +56,7 @@ namespace {
 
 using unittest::assertGet;
 
-const NamespaceString kNss("TestDB", "TestColl");
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("TestDB", "TestColl");
 const std::string kPattern = "key";
 const KeyPattern kShardKeyPattern(BSON(kPattern << 1));
 const std::string kThisShard{"thisShard"};
@@ -70,6 +69,12 @@ protected:
         _manager = std::make_shared<MetadataManager>(
             getServiceContext(), kNss, executor(), makeEmptyMetadata());
         orphanCleanupDelaySecs.store(1);
+    }
+
+    void tearDown() override {
+        // Restore original `orphanCleanupDelaySecs` value for next unit tests
+        orphanCleanupDelaySecs.store(_defaultOrphanCleanupDelaySecs);
+        ShardServerTestFixture::tearDown();
     }
 
     /**
@@ -90,10 +95,10 @@ protected:
             epoch,
             Timestamp(1, 1),
             boost::none /* timeseriesFields */,
-            boost::none,
-            boost::none /* chunkSizeBytes */,
+            boost::none /* reshardingFields */,
+
             true,
-            {ChunkType{uuid, range, ChunkVersion(1, 0, epoch, Timestamp(1, 1)), kOtherShard}});
+            {ChunkType{uuid, range, ChunkVersion({epoch, Timestamp(1, 1)}, {1, 0}), kOtherShard}});
 
         return CollectionMetadata(ChunkManager(kThisShard,
                                                DatabaseVersion(UUID::gen(), Timestamp(1, 1)),
@@ -144,8 +149,11 @@ protected:
                                  chunkVersion,
                                  kOtherShard);
 
-        auto rt = cm->getRoutingTableHistory_ForTest().makeUpdated(
-            boost::none /* timeseriesFields */, boost::none, boost::none, true, splitChunks);
+        auto rt =
+            cm->getRoutingTableHistory_ForTest().makeUpdated(boost::none /* timeseriesFields */,
+                                                             boost::none /* reshardingFields */,
+                                                             true,
+                                                             splitChunks);
 
         return CollectionMetadata(ChunkManager(cm->dbPrimary(),
                                                cm->dbVersion(),
@@ -171,8 +179,7 @@ protected:
 
         auto rt = cm->getRoutingTableHistory_ForTest().makeUpdated(
             boost::none /* timeseriesFields */,
-            boost::none,
-            boost::none,
+            boost::none /* reshardingFields */,
             true,
             {ChunkType(metadata.getUUID(), ChunkRange(minKey, maxKey), chunkVersion, kOtherShard)});
 
@@ -184,6 +191,9 @@ protected:
     }
 
     std::shared_ptr<MetadataManager> _manager;
+
+private:
+    const int _defaultOrphanCleanupDelaySecs = orphanCleanupDelaySecs.load();
 };
 
 // The 'pending' field must not be set in order for a range deletion task to succeed, but the
@@ -216,6 +226,7 @@ RangeDeletionTask insertRangeDeletionTask(OperationContext* opCtx,
 }
 
 TEST_F(MetadataManagerTest, TrackOrphanedDataCleanupBlocksOnScheduledRangeDeletions) {
+    RAIIServerParameterControllerForTest enableFeatureFlag{"featureFlagRangeDeleterService", false};
     ChunkRange cr1(BSON("key" << 0), BSON("key" << 10));
     const auto task =
         insertRangeDeletionTask(operationContext(), kNss, _manager->getCollectionUuid(), cr1, 0);
@@ -223,18 +234,19 @@ TEST_F(MetadataManagerTest, TrackOrphanedDataCleanupBlocksOnScheduledRangeDeleti
     // Enable fail point to suspendRangeDeletion.
     globalFailPointRegistry().find("suspendRangeDeletion")->setMode(FailPoint::alwaysOn);
 
-    auto notifn1 = _manager->cleanUpRange(cr1, task.getId(), false /*delayBeforeDeleting*/);
+    auto notifn1 = _manager->cleanUpRange(cr1, false /*delayBeforeDeleting*/);
     ASSERT_FALSE(notifn1.isReady());
     ASSERT_EQ(_manager->numberOfRangesToClean(), 1UL);
 
-    auto optNotifn = _manager->trackOrphanedDataCleanup(cr1);
+    auto future = _manager->trackOrphanedDataCleanup(cr1);
     ASSERT_FALSE(notifn1.isReady());
-    ASSERT_FALSE(optNotifn->isReady());
+    ASSERT_FALSE(future.isReady());
 
     globalFailPointRegistry().find("suspendRangeDeletion")->setMode(FailPoint::off);
 }
 
 TEST_F(MetadataManagerTest, CleanupNotificationsAreSignaledWhenMetadataManagerIsDestroyed) {
+    RAIIServerParameterControllerForTest enableFeatureFlag{"featureFlagRangeDeleterService", false};
     const ChunkRange rangeToClean(BSON("key" << 20), BSON("key" << 30));
     const auto task = insertRangeDeletionTask(
         operationContext(), kNss, _manager->getCollectionUuid(), rangeToClean, 0);
@@ -253,18 +265,17 @@ TEST_F(MetadataManagerTest, CleanupNotificationsAreSignaledWhenMetadataManagerIs
     _manager->setFilteringMetadata(
         cloneMetadataMinusChunk(_manager->getActiveMetadata(boost::none)->get(), rangeToClean));
 
-    auto notif = _manager->cleanUpRange(rangeToClean, task.getId(), false /*delayBeforeDeleting*/);
+    auto notif = _manager->cleanUpRange(rangeToClean, false /*delayBeforeDeleting*/);
     ASSERT(!notif.isReady());
 
-    auto optNotif = _manager->trackOrphanedDataCleanup(rangeToClean);
-    ASSERT(optNotif);
-    ASSERT(!optNotif->isReady());
+    auto future = _manager->trackOrphanedDataCleanup(rangeToClean);
+    ASSERT(!future.isReady());
 
     // Reset the original shared_ptr. The cursorOnMovedMetadata will still contain its own copy of
     // the shared_ptr though, so the destructor of ~MetadataManager won't yet be called.
     _manager.reset();
     ASSERT(!notif.isReady());
-    ASSERT(!optNotif->isReady());
+    ASSERT(!future.isReady());
 
     // Destroys the ScopedCollectionDescription object and causes the destructor of MetadataManager
     // to run, which should trigger all deletion notifications.
@@ -277,7 +288,7 @@ TEST_F(MetadataManagerTest, CleanupNotificationsAreSignaledWhenMetadataManagerIs
     }
 
     notif.wait();
-    optNotif->wait();
+    future.wait();
 }
 
 TEST_F(MetadataManagerTest, RefreshAfterSuccessfulMigrationSinglePending) {
@@ -329,6 +340,7 @@ TEST_F(MetadataManagerTest, BeginReceiveWithOverlappingRange) {
 
 // Tests membership functions for _rangesToClean
 TEST_F(MetadataManagerTest, RangesToCleanMembership) {
+    RAIIServerParameterControllerForTest enableFeatureFlag{"featureFlagRangeDeleterService", false};
     ChunkRange cr(BSON("key" << 0), BSON("key" << 10));
     const auto task =
         insertRangeDeletionTask(operationContext(), kNss, _manager->getCollectionUuid(), cr, 0);
@@ -338,7 +350,7 @@ TEST_F(MetadataManagerTest, RangesToCleanMembership) {
     // Enable fail point to suspendRangeDeletion.
     globalFailPointRegistry().find("suspendRangeDeletion")->setMode(FailPoint::alwaysOn);
 
-    auto notifn = _manager->cleanUpRange(cr, task.getId(), false /*delayBeforeDeleting*/);
+    auto notifn = _manager->cleanUpRange(cr, false /*delayBeforeDeleting*/);
     ASSERT(!notifn.isReady());
     ASSERT_EQ(1UL, _manager->numberOfRangesToClean());
 

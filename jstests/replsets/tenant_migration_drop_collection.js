@@ -2,9 +2,12 @@
  * Tests that TenantCollectionCloner completes without error when a collection is dropped during
  * cloning as part of a tenant migration.
  *
+ * TODO SERVER-61231: relies on various failpoints and such in TenantCollectionCloner, which is
+ * not used for by Shard Merge, but we should likely test similar behavior, adapt for Shard Merge
+ *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
+ *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
  *   requires_persistence,
@@ -12,22 +15,25 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    makeX509OptionsForTest,
+    runMigrationAsync
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 load('jstests/replsets/libs/two_phase_drops.js');
+load("jstests/replsets/rslib.js");  // 'createRstArgs'
 
 function runDropTest({failPointName, failPointData, expectedLog, createNew}) {
     // Configure batch size for recipient clone.
     const recipientRst = new ReplSetTest({
         nodes: 1,
         name: "recipient",
-        nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().recipient,
+        serverless: true,
+        nodeOptions: Object.assign(makeX509OptionsForTest().recipient,
                                    {setParameter: {collectionClonerBatchSize: 1}})
     });
 
@@ -37,7 +43,7 @@ function runDropTest({failPointName, failPointData, expectedLog, createNew}) {
     const tenantMigrationTest =
         new TenantMigrationTest({name: jsTestName(), recipientRst: recipientRst});
 
-    const tenantId = "testTenantId";
+    const tenantId = ObjectId().str;
     const dbName = tenantMigrationTest.tenantDB(tenantId, "testDB");
     const collName = "testColl";
 
@@ -56,17 +62,16 @@ function runDropTest({failPointName, failPointData, expectedLog, createNew}) {
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(migrationId),
         recipientConnString: tenantMigrationTest.getRecipientConnString(),
-        tenantId: tenantId,
+        tenantId,
     };
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst());
+    const donorRstArgs = createRstArgs(tenantMigrationTest.getDonorRst());
 
     // Set failpoint for recipient.
     const failPoint = configureFailPoint(recipientPrimary, failPointName, failPointData);
 
     // Start migration and wait for failpoint.
     jsTestLog("Waiting to hit recipient failpoint");
-    const migrationThread =
-        new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
+    const migrationThread = new Thread(runMigrationAsync, migrationOpts, donorRstArgs);
     migrationThread.start();
     failPoint.wait();
 
@@ -193,4 +198,3 @@ runDropTest({
         '{code: 5289701, attr: { namespace: nss, uuid: (x)=>(x.uuid.$uuid === uuid), tenantId: tenantId}}',
     createNew: true
 });
-})();

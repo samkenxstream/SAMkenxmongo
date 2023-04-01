@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -40,6 +39,9 @@
 #include "mongo/db/write_concern_options.h"
 #include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -193,7 +195,6 @@ protected:
     }
 
     TxnNumberAndRetryCounter _txnNumberAndRetryCounter{1, 1};
-    RAIIServerParameterControllerForTest _controller{"featureFlagInternalTransactions", true};
 };
 
 using TransactionCoordinatorServiceStepUpStepDownTest = TransactionCoordinatorServiceTestFixture;
@@ -250,8 +251,8 @@ TEST_F(TransactionCoordinatorServiceStepUpStepDownTest, OperationsBlockBeforeSte
 TEST_F(TransactionCoordinatorServiceStepUpStepDownTest, StepUpFailsDueToBadCoordinatorDocument) {
     DBDirectClient client(operationContext());
 
-    auto response = client.insertAcknowledged(
-        NamespaceString::kTransactionCoordinatorsNamespace.ns(), {BSON("IllegalKey" << 1)});
+    auto response = client.insertAcknowledged(NamespaceString::kTransactionCoordinatorsNamespace,
+                                              {BSON("IllegalKey" << 1)});
     ASSERT_OK(getStatusFromWriteCommandReply(response));
     ASSERT_EQ(1, response["n"].Int());
 
@@ -285,8 +286,8 @@ TEST_F(TransactionCoordinatorServiceStepUpStepDownTest, StepUpRecoverTxnRetryCou
     doc.setParticipants(kOneShardIdList);
 
     DBDirectClient client(operationContext());
-    auto response = client.insertAcknowledged(
-        NamespaceString::kTransactionCoordinatorsNamespace.ns(), {doc.toBSON()});
+    auto response = client.insertAcknowledged(NamespaceString::kTransactionCoordinatorsNamespace,
+                                              {doc.toBSON()});
     ASSERT_OK(getStatusFromWriteCommandReply(response));
     ASSERT_EQ(1, response["n"].Int());
 
@@ -836,7 +837,9 @@ TEST_F(TransactionCoordinatorServiceTest,
 
     // Vote commit before the deadline
     onCommands({[&](const executor::RemoteCommandRequest&) { return kPrepareOk; },
-                [&](const executor::RemoteCommandRequest&) { return kPrepareOk; }});
+                [&](const executor::RemoteCommandRequest&) {
+                    return kPrepareOk;
+                }});
 
     // Reach the deadline.
     network()->enterNetwork();
@@ -881,7 +884,9 @@ TEST_F(TransactionCoordinatorServiceTestSingleTxn,
 
     // Simulate a participant voting to abort.
     onCommands({[&](const executor::RemoteCommandRequest& request) { return kPrepareOk; },
-                [&](const executor::RemoteCommandRequest& request) { return kNoSuchTransaction; }});
+                [&](const executor::RemoteCommandRequest& request) {
+                    return kNoSuchTransaction;
+                }});
 
     assertAbortSentAndRespondWithSuccess();
     assertAbortSentAndRespondWithSuccess();

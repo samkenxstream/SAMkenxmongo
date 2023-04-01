@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -38,14 +37,18 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/clustered_collection_util.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/uuid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 // Failpoint which causes to hang "listIndexes" cmd after acquiring the DB lock.
 MONGO_FAIL_POINT_DEFINE(hangBeforeListIndexes);
@@ -73,58 +76,79 @@ std::list<BSONObj> listIndexesInLock(OperationContext* opCtx,
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &hangBeforeListIndexes, opCtx, "hangBeforeListIndexes", []() {}, nss);
 
-    return writeConflictRetry(opCtx, "listIndexes", nss.ns(), [&] {
-        std::vector<std::string> indexNames;
-        std::list<BSONObj> indexSpecs;
-        collection->getAllIndexes(&indexNames);
+    std::vector<std::string> indexNames;
+    std::list<BSONObj> indexSpecs;
+    collection->getAllIndexes(&indexNames);
 
-        if (collection->isClustered() && !collection->ns().isTimeseriesBucketsCollection()) {
-            BSONObj collation;
-            if (auto collator = collection->getDefaultCollator()) {
-                collation = collator->getSpec().toBSON();
-            }
-            auto clusteredSpec = clustered_util::formatClusterKeyForListIndexes(
-                collection->getClusteredInfo().get(), collation);
-            if (additionalInclude == ListIndexesInclude::IndexBuildInfo) {
-                indexSpecs.push_back(BSON("spec"_sd << clusteredSpec));
-            } else {
-                indexSpecs.push_back(clusteredSpec);
-            }
+    if (collection->isClustered() && !collection->ns().isTimeseriesBucketsCollection()) {
+        BSONObj collation;
+        if (auto collator = collection->getDefaultCollator()) {
+            collation = collator->getSpec().toBSON();
         }
-        for (size_t i = 0; i < indexNames.size(); i++) {
-            auto spec = collection->getIndexSpec(indexNames[i]);
-            auto durableBuildUUID = collection->getIndexBuildUUID(indexNames[i]);
-            // The durable catalog will not have a build UUID for the given index name if it was
-            // not being built with two-phase -- in this case we have no relevant index build info
-            bool inProgressInformationExists =
-                !collection->isIndexReady(indexNames[i]) && durableBuildUUID;
-            switch (additionalInclude) {
-                case ListIndexesInclude::Nothing:
+        auto clusteredSpec = clustered_util::formatClusterKeyForListIndexes(
+            collection->getClusteredInfo().value(), collation);
+        if (additionalInclude == ListIndexesInclude::IndexBuildInfo) {
+            indexSpecs.push_back(BSON("spec"_sd << clusteredSpec));
+        } else {
+            indexSpecs.push_back(clusteredSpec);
+        }
+    }
+    for (size_t i = 0; i < indexNames.size(); i++) {
+        auto spec = collection->getIndexSpec(indexNames[i]);
+        auto durableBuildUUID = collection->getIndexBuildUUID(indexNames[i]);
+        // The durable catalog will not have a build UUID for the given index name if it was
+        // not being built with two-phase -- in this case we have no relevant index build info
+        bool inProgressInformationExists =
+            !collection->isIndexReady(indexNames[i]) && durableBuildUUID;
+        switch (additionalInclude) {
+            case ListIndexesInclude::Nothing:
+                indexSpecs.push_back(spec);
+                break;
+            case ListIndexesInclude::BuildUUID:
+                if (inProgressInformationExists) {
+                    indexSpecs.push_back(
+                        BSON("spec"_sd << spec << "buildUUID"_sd << *durableBuildUUID));
+                } else {
                     indexSpecs.push_back(spec);
-                    break;
-                case ListIndexesInclude::BuildUUID:
-                    if (inProgressInformationExists) {
-                        indexSpecs.push_back(
-                            BSON("spec"_sd << spec << "buildUUID"_sd << *durableBuildUUID));
-                    } else {
-                        indexSpecs.push_back(spec);
-                    }
-                    break;
-                case ListIndexesInclude::IndexBuildInfo:
-                    if (inProgressInformationExists) {
-                        indexSpecs.push_back(BSON("spec"_sd
-                                                  << spec << "indexBuildInfo"_sd
-                                                  << BSON("buildUUID"_sd << *durableBuildUUID)));
-                    } else {
-                        indexSpecs.push_back(BSON("spec"_sd << spec));
-                    }
-                    break;
-                default:
-                    MONGO_UNREACHABLE;
-            }
+                }
+                break;
+            case ListIndexesInclude::IndexBuildInfo:
+                if (inProgressInformationExists) {
+                    // Constructs a sub-document "indexBuildInfo" in the following
+                    // format with sample values:
+                    //
+                    // indexBuildInfo: {
+                    //     buildUUID: UUID("00836550-d10e-4ec8-84df-cb5166bc085b"),
+                    //     method: "Hybrid",
+                    //     phase: 1,
+                    //     phaseStr: "collection scan",
+                    //     opid: 654,
+                    //     resumable: true,
+                    //     replicationState: {
+                    //         state: "In progress"
+                    //     }
+                    // }
+                    //
+                    // The information here is gathered by querying the various index build
+                    // classes accessible through the IndexBuildCoordinator interface. The
+                    // example above is intended to provide a general idea of the information
+                    // gathered for an in-progress index build and is subject to change.
+
+                    BSONObjBuilder builder;
+                    durableBuildUUID->appendToBuilder(&builder, "buildUUID"_sd);
+                    IndexBuildsCoordinator::get(opCtx)->appendBuildInfo(*durableBuildUUID,
+                                                                        &builder);
+                    indexSpecs.push_back(
+                        BSON("spec"_sd << spec << "indexBuildInfo"_sd << builder.obj()));
+                } else {
+                    indexSpecs.push_back(BSON("spec"_sd << spec));
+                }
+                break;
+            default:
+                MONGO_UNREACHABLE;
         }
-        return indexSpecs;
-    });
+    }
+    return indexSpecs;
 }
 std::list<BSONObj> listIndexesEmptyListIfMissing(OperationContext* opCtx,
                                                  const NamespaceStringOrUUID& nss,

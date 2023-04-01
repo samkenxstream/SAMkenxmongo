@@ -39,29 +39,15 @@
 #include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 namespace mongo {
 namespace repl {
 
 namespace {
-
-/**
- * Checks if the node with the given config index is electable, returning a useful
- * status message if not.
- */
-Status checkElectable(const ReplSetConfig& newConfig, int configIndex) {
-    const MemberConfig& myConfig = newConfig.getMemberAt(configIndex);
-    if (!myConfig.isElectable()) {
-        return Status(ErrorCodes::NodeNotElectable,
-                      str::stream() << "This node, " << myConfig.getHostAndPort().toString()
-                                    << ", with _id " << myConfig.getId()
-                                    << " is not electable under the new configuration with "
-                                    << newConfig.getConfigVersionAndTerm().toString()
-                                    << " for replica set " << newConfig.getReplSetName());
-    }
-    return Status::OK();
-}
 
 /**
  * Checks that the priorities of all the arbiters in the configuration are 0.  If they were 1,
@@ -109,10 +95,10 @@ Status ensureNoNewlyAddedMembers(const ReplSetConfig& config) {
 Status validateSingleNodeChange(const ReplSetConfig& oldConfig, const ReplSetConfig& newConfig) {
     // Add MemberId of voting nodes from each config into respective sets.
     std::set<MemberId> oldIdSet, newIdSet;
-    for (MemberConfig m : oldConfig.votingMembers()) {
+    for (const MemberConfig& m : oldConfig.votingMembers()) {
         oldIdSet.insert(m.getId());
     }
-    for (MemberConfig m : newConfig.votingMembers()) {
+    for (const MemberConfig& m : newConfig.votingMembers()) {
         newIdSet.insert(m.getId());
     }
 
@@ -302,6 +288,23 @@ Status validateOldAndNewConfigsCompatible(const ReplSetConfig& oldConfig,
 }
 }  // namespace
 
+/**
+ * Checks if the node with the given config index is electable, returning a useful
+ * status message if not.
+ */
+Status checkElectable(const ReplSetConfig& newConfig, int configIndex) {
+    const MemberConfig& myConfig = newConfig.getMemberAt(configIndex);
+    if (!myConfig.isElectable()) {
+        return Status(ErrorCodes::NodeNotElectable,
+                      str::stream() << "This node, " << myConfig.getHostAndPort().toString()
+                                    << ", with _id " << myConfig.getId()
+                                    << " is not electable under the new configuration with "
+                                    << newConfig.getConfigVersionAndTerm().toString()
+                                    << " for replica set " << newConfig.getReplSetName());
+    }
+    return Status::OK();
+}
+
 bool sameConfigContents(const ReplSetConfig& oldConfig, const ReplSetConfig& newConfig) {
     auto oldBSON = oldConfig.toBSON();
     auto newBSON = newConfig.toBSON();
@@ -321,8 +324,18 @@ StatusWith<int> findSelfInConfig(ReplicationCoordinatorExternalState* externalSt
     for (ReplSetConfig::MemberIterator iter = newConfig.membersBegin();
          iter != newConfig.membersEnd();
          ++iter) {
-        if (externalState->isSelf(iter->getHostAndPort(), ctx)) {
+        if (externalState->isSelfFastPath(iter->getHostAndPort())) {
             meConfigs.push_back(iter);
+        }
+    }
+    if (meConfigs.empty()) {
+        // No self-hosts were found using the fastpath; check with the slow path.
+        for (ReplSetConfig::MemberIterator iter = newConfig.membersBegin();
+             iter != newConfig.membersEnd();
+             ++iter) {
+            if (externalState->isSelfSlowPath(iter->getHostAndPort(), ctx, Seconds(30))) {
+                meConfigs.push_back(iter);
+            }
         }
     }
     if (meConfigs.empty()) {
@@ -361,6 +374,30 @@ StatusWith<int> findSelfInConfigIfElectable(ReplicationCoordinatorExternalState*
         }
     }
     return result;
+}
+
+int findOwnHostInConfigQuick(const ReplSetConfig& newConfig, HostAndPort host) {
+    if (host.empty()) {
+        return -1;
+    }
+
+    int firstMatchIndex = -1;
+    int currIndex = 0;
+
+    for (ReplSetConfig::MemberIterator iter = newConfig.membersBegin();
+         iter != newConfig.membersEnd();
+         ++iter) {
+
+        if (iter->getHostAndPort() == host) {
+            firstMatchIndex = currIndex;
+            invariant(firstMatchIndex >= 0);
+            break;
+        }
+
+        currIndex++;
+    }
+
+    return firstMatchIndex;
 }
 
 StatusWith<int> validateConfigForStartUp(ReplicationCoordinatorExternalState* externalState,
@@ -468,6 +505,7 @@ Status validateConfigForReconfig(const ReplSetConfig& oldConfig,
 StatusWith<int> validateConfigForHeartbeatReconfig(
     ReplicationCoordinatorExternalState* externalState,
     const ReplSetConfig& newConfig,
+    HostAndPort ownHost,
     ServiceContext* ctx) {
     Status status = newConfig.validateAllowingSplitHorizonIP();
     if (!status.isOK()) {
@@ -480,6 +518,14 @@ StatusWith<int> validateConfigForHeartbeatReconfig(
             "been deprecated and is now ignored. Use setDefaultRWConcern instead to "
             "set a cluster-wide default writeConcern.",
             !newConfig.containsCustomizedGetLastErrorDefaults());
+
+    auto quickIndex = findOwnHostInConfigQuick(newConfig, ownHost);
+    if (quickIndex >= 0) {
+        LOGV2(6475001,
+              "Was able to quickly find new index in config. Skipping full isSelf checks",
+              "index"_attr = quickIndex);
+        return quickIndex;
+    }
 
     return findSelfInConfig(externalState, newConfig, ctx);
 }

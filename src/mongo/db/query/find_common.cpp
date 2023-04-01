@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -40,6 +39,9 @@
 #include "mongo/db/query/query_request_helper.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -65,9 +67,6 @@ const size_t FindCommon::kInitReplyBufferSize = 32768;
 
 bool FindCommon::enoughForFirstBatch(const FindCommandRequest& findCommand, long long numDocs) {
     auto batchSize = findCommand.getBatchSize();
-    tassert(5746104,
-            "ntoreturn on the find command should not be set",
-            findCommand.getNtoreturn() == boost::none);
     if (!batchSize) {
         // We enforce a default batch size for the initial find if no batch size is specified.
         return numDocs >= query_request_helper::kDefaultBatchSize;
@@ -133,5 +132,17 @@ std::size_t FindCommon::getBytesToReserveForGetMoreReply(bool isTailable,
     // command metadata to the reply.
     return kMaxBytesToReturnToClientAtOnce;
 }
+bool FindCommon::BSONArrayResponseSizeTracker::haveSpaceForNext(const BSONObj& document) {
+    return FindCommon::haveSpaceForNext(document, _numberOfDocuments, _bsonArraySizeInBytes);
+}
+void FindCommon::BSONArrayResponseSizeTracker::add(const BSONObj& document) {
+    dassert(haveSpaceForNext(document));
+    ++_numberOfDocuments;
+    _bsonArraySizeInBytes += (document.objsize() + kPerDocumentOverheadBytesUpperBound);
+}
 
+// Upper bound of BSON array element overhead. The overhead is 1 byte/doc for the type + 1 byte/doc
+// for the field name's null terminator + 1 byte per digit of the maximum array index value.
+const size_t FindCommon::BSONArrayResponseSizeTracker::kPerDocumentOverheadBytesUpperBound{
+    2 + std::to_string(BSONObjMaxUserSize / BSONObj::kMinBSONLength).length()};
 }  // namespace mongo

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -41,6 +40,7 @@
 #include "mongo/db/repl/replication_coordinator_external_state_mock.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
+#include "mongo/db/serverless/shard_split_utils.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/logv2/log.h"
@@ -48,6 +48,9 @@
 #include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/fail_point.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 namespace repl {
@@ -155,11 +158,42 @@ TEST_F(ReplCoordTest, NodeReturnsNotPrimaryErrorWhenReconfigCmdReceivedWhileInDr
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
     // Reconfig command first waits for config commitment and will get an error.
-    auto status = getReplCoord()->awaitConfigCommitment(opCtx.get(), true);
+    auto status = getReplCoord()->awaitConfigCommitment(opCtx.get(), true, 1 /* config term */);
     ASSERT_EQUALS(ErrorCodes::PrimarySteppedDown, status);
     ASSERT_STRING_CONTAINS(status.reason(), "should only be run on a writable PRIMARY");
 }
 
+TEST_F(ReplCoordTest,
+       NodeReturnsPrimarySteppedDownErrorWhenHigherTermConfigInstalledWaitingForCommitment) {
+    init();
+
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 1 << "members"
+                            << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                     << "test1:1234")
+                                          << BSON("_id" << 1 << "host"
+                                                        << "test2:1234"))
+                            << "protocolVersion" << 1),
+                       HostAndPort("test1", 1234));
+    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
+
+    simulateSuccessfulV1Election();
+    ASSERT_EQUALS(1, getReplCoord()->getTerm());
+    ASSERT_TRUE(getReplCoord()->getMemberState().primary());
+
+    const auto opCtx = makeOperationContext();
+    // Trying to wait on a config that has a term lower than the node's installed config
+    // term will result in a PrimarySteppedDown error.
+    auto status = getReplCoord()->awaitConfigCommitment(opCtx.get(), true, 0 /* config term */);
+    ASSERT_EQUALS(ErrorCodes::PrimarySteppedDown, status);
+    ASSERT_STRING_CONTAINS(status.reason(),
+                           "Term changed from 0 to 1 while waiting for replication, indicating "
+                           "that this node must have stepped down");
+}
 
 TEST_F(ReplCoordTest, NodeReturnsInvalidReplicaSetConfigWhenReconfigReceivedWithInvalidConfig) {
     // start up, become primary, receive uninitializable config
@@ -1304,7 +1338,7 @@ TEST_F(ReplCoordReconfigTest, MustFindSelfAndBeElectableInNewConfig) {
                              << "mySet"
                              << "version" << 2 << "protocolVersion" << 1 << "members"
                              << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                      << "h1:1")
+                                                      << "newhost:1")  // bypass quickfind
                                            << BSON("_id" << 2 << "host"
                                                          << "h2:1")
                                            << BSON("_id" << 3 << "host"
@@ -1346,6 +1380,86 @@ TEST_F(ReplCoordReconfigTest, MustFindSelfAndBeElectableInNewConfig) {
     args.force = true;
     status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result);
     ASSERT_OK(status.code());
+}
+
+TEST_F(ReplCoordReconfigTest, MustSendHeartbeatToSplitConfigRecipients) {
+    const std::string recipientTagName{"recipientTag"};
+
+    // Start up as a secondary and then get elected.
+    init();
+
+    // We only check for ourselves if the config contents actually change.
+    auto oldConfigObj = BSON(
+        "_id"
+        << "mySet"
+        << "version" << 1 << "protocolVersion" << 1 << "members"
+        << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                 << "h1:1")
+                      << BSON("_id" << 1 << "host"
+                                    << "h2:1")
+                      << BSON("_id" << 2 << "host"
+                                    << "h3:1")
+                      << BSON("_id" << 3 << "host"
+                                    << "h4:1"
+                                    << "priority" << 0 << "votes" << 0 << "tags"
+                                    << BSON(recipientTagName << "one"))
+                      << BSON("_id" << 4 << "host"
+                                    << "h5:1"
+                                    << "priority" << 0 << "votes" << 0 << "tags"
+                                    << BSON(recipientTagName << "one"))
+                      << BSON("_id" << 5 << "host"
+                                    << "h6:1"
+                                    << "priority" << 0 << "votes" << 0 << "tags"
+                                    << BSON(recipientTagName << "one")))
+        << "settings" << BSON("heartbeatIntervalMillis" << 1000 << "replicaSetId" << OID::gen()));
+
+    assertStartSuccess(oldConfigObj, HostAndPort("h1", 1));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    replCoordSetMyLastAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0));
+    simulateSuccessfulV1Election();
+    ASSERT_EQ(getReplCoord()->getMemberState(), MemberState::RS_PRIMARY);
+
+    BSONObjBuilder result;
+    const auto opCtx = makeOperationContext();
+
+    auto newConfig = mongo::serverless::makeSplitConfig(
+        ReplSetConfig::parse(oldConfigObj), "recipientSet", recipientTagName);
+    Status status(ErrorCodes::InternalError, "Not Set");
+
+    stdx::thread reconfigThread;
+    reconfigThread = stdx::thread([&] {
+        status = getReplCoord()->processReplSetReconfig(
+            opCtx.get(), ReplSetReconfigArgs{newConfig.toBSON(), false}, &result);
+    });
+
+    // Satisfy the quorum check.
+    enterNetwork();
+    respondToHeartbeat();
+    respondToHeartbeat();
+    exitNetwork();
+
+    reconfigThread.join();
+
+    ASSERT_EQUALS(status.code(), ErrorCodes::OK);
+
+    // Verify an heartbeat to each of the recipient members has been scheduled at the end of
+    // reconfig to inform them of the new split config.
+    std::vector<MemberConfig> recipients = newConfig.getRecipientConfig()->members();
+    enterNetwork();
+    while (!recipients.empty()) {
+        auto net = getNet();
+        auto noi = net->getNextReadyRequest();
+        auto target = noi->getRequest().target;
+
+        if (auto it = std::find_if(
+                recipients.begin(),
+                recipients.end(),
+                [target](const auto& member) { return member.getHostAndPort() == target; });
+            it != recipients.end()) {
+            recipients.erase(it);
+        }
+    }
+    exitNetwork();
 }
 
 TEST_F(ReplCoordReconfigTest,
@@ -1517,8 +1631,9 @@ TEST_F(ReplCoordReconfigTest, WaitForConfigCommitmentTimesOutIfConfigIsNotCommit
     ASSERT_OK(doSafeReconfig(opCtx.get(), configVersion, Cb_members, 1 /* quorumHbs */));
 
     opCtx->setDeadlineAfterNowBy(Milliseconds(1), ErrorCodes::MaxTimeMSExpired);
-    stdx::thread reconfigThread =
-        stdx::thread([&] { status = getReplCoord()->awaitConfigCommitment(opCtx.get(), true); });
+    stdx::thread reconfigThread = stdx::thread([&] {
+        status = getReplCoord()->awaitConfigCommitment(opCtx.get(), true, 1 /* config term */);
+    });
 
     // Run clock past the deadline.
     enterNetwork();
@@ -1557,7 +1672,7 @@ TEST_F(ReplCoordReconfigTest, WaitForConfigCommitmentReturnsOKIfConfigIsCommitte
 
     // Replicate op to ensure config is committed.
     replicateOpTo(2, commitPoint);
-    ASSERT_OK(getReplCoord()->awaitConfigCommitment(opCtx.get(), true));
+    ASSERT_OK(getReplCoord()->awaitConfigCommitment(opCtx.get(), true, 1 /* config term */));
 }
 
 TEST_F(ReplCoordReconfigTest,
@@ -2564,6 +2679,147 @@ TEST_F(ReplCoordTest, StepUpReconfigConcurrentWithForceHeartbeatReconfig) {
     // the force config.
     ASSERT_EQUALS(getReplCoord()->getTerm(), 1);
     ASSERT_EQUALS(getReplCoord()->getConfigTerm(), OpTime::kUninitializedTerm);
+}
+
+TEST_F(ReplCoordReconfigTest, FindOwnHostForCommandReconfigQuick) {
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 2 << "members"
+                            << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                     << "node1:12345")
+                                          << BSON("_id" << 2 << "host"
+                                                        << "node2:12345"))),
+                       HostAndPort("node1", 12345));
+    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    simulateSuccessfulV1Election();
+
+    // Reconfig to add third member.
+    BSONObjBuilder result;
+    ReplSetReconfigArgs args;
+    args.force = false;
+    args.newConfigObj = BSON("_id"
+                             << "mySet"
+                             << "version" << 3 << "members"
+                             << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                      << "node1:12345")
+                                           << BSON("_id" << 2 << "host"
+                                                         << "node2:12345")
+                                           << BSON("_id" << 3 << "host"
+                                                         << "node3:12345")));
+
+    startCapturingLogMessages();
+
+    Status status(ErrorCodes::InternalError, "Not Set");
+    const auto opCtx = makeOperationContext();
+    auto reconfigThread = stdx::thread(
+        [&] { status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result); });
+
+    // Satisfy the quorum check.
+    enterNetwork();
+    respondToHeartbeat();
+    exitNetwork();
+
+    // Satisfy config replication check.
+    enterNetwork();
+    respondToHeartbeat();
+    exitNetwork();
+
+    reconfigThread.join();
+    ASSERT_OK(status);
+
+    stopCapturingLogMessages();
+    ASSERT_EQUALS(
+        1, countTextFormatLogLinesContaining("Was able to quickly find new index in config"));
+}
+
+TEST_F(ReplCoordReconfigTest, FindOwnHostForCommandReconfigQuickUnelectableError) {
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 2 << "members"
+                            << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                     << "node1:12345")
+                                          << BSON("_id" << 2 << "host"
+                                                        << "node2:12345"))),
+                       HostAndPort("node1", 12345));
+    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    simulateSuccessfulV1Election();
+
+    // Reconfig to add third member.
+    BSONObjBuilder result;
+    ReplSetReconfigArgs args;
+    args.force = false;
+    args.newConfigObj = BSON("_id"
+                             << "mySet"
+                             << "version" << 3 << "members"
+                             << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                      << "node1:12345"
+                                                      << "priority" << 0)
+                                           << BSON("_id" << 2 << "host"
+                                                         << "node2:12345")
+                                           << BSON("_id" << 3 << "host"
+                                                         << "node3:12345")));
+
+    const auto opCtx = makeOperationContext();
+    auto status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result);
+    ASSERT_EQUALS(status.code(), ErrorCodes::NodeNotElectable);
+}
+
+TEST_F(ReplCoordReconfigTest, FindOwnHostForCommandReconfigQuickUnelectableButForceTrue) {
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 2 << "members"
+                            << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                     << "node1:12345")
+                                          << BSON("_id" << 2 << "host"
+                                                        << "node2:12345"))),
+                       HostAndPort("node1", 12345));
+    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    simulateSuccessfulV1Election();
+
+    // Reconfig to add third member.
+    BSONObjBuilder result;
+    ReplSetReconfigArgs args;
+    args.force = true;
+    args.newConfigObj = BSON("_id"
+                             << "mySet"
+                             << "version" << 3 << "members"
+                             << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                      << "node1:12345"
+                                                      << "priority" << 0)
+                                           << BSON("_id" << 2 << "host"
+                                                         << "node2:12345")
+                                           << BSON("_id" << 3 << "host"
+                                                         << "node3:12345")));
+
+    startCapturingLogMessages();
+
+    Status status(ErrorCodes::InternalError, "Not Set");
+    const auto opCtx = makeOperationContext();
+    auto reconfigThread = stdx::thread(
+        [&] { status = getReplCoord()->processReplSetReconfig(opCtx.get(), args, &result); });
+
+    // Satisfy the quorum check.
+    enterNetwork();
+    respondToHeartbeat();
+    exitNetwork();
+
+    // Satisfy config replication check.
+    enterNetwork();
+    respondToHeartbeat();
+    exitNetwork();
+
+    reconfigThread.join();
+    ASSERT_OK(status);
+
+    stopCapturingLogMessages();
+    ASSERT_EQUALS(
+        1, countTextFormatLogLinesContaining("Was able to quickly find new index in config"));
 }
 
 }  // anonymous namespace

@@ -6,7 +6,6 @@
  * This test is based on "tenant_migration_retryable_write_retry.js".
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
@@ -15,15 +14,13 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {makeX509OptionsForTest} from "jstests/replsets/libs/tenant_migration_util.js";
 
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 load("jstests/libs/uuid_util.js");
 
 function testOplogCloning(ordered) {
-    const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
+    const migrationX509Options = makeX509OptionsForTest();
     const kGarbageCollectionParams = {
         // Set the delay before a donor state doc is garbage collected to be short to speed up
         // the test.
@@ -36,12 +33,14 @@ function testOplogCloning(ordered) {
     const donorRst = new ReplSetTest({
         nodes: 1,
         name: "donor",
+        serverless: true,
         nodeOptions:
             Object.assign(migrationX509Options.donor, {setParameter: kGarbageCollectionParams})
     });
     const recipientRst = new ReplSetTest({
         nodes: 1,
         name: "recipient",
+        serverless: true,
         nodeOptions:
             Object.assign(migrationX509Options.recipient, {setParameter: kGarbageCollectionParams})
     });
@@ -57,7 +56,7 @@ function testOplogCloning(ordered) {
 
     const donorPrimary = donorRst.getPrimary();
 
-    const kTenantId = "testTenantId";
+    const kTenantId = ObjectId().str;
     const kDbName = kTenantId + "_" +
         "tsDb";
     const kCollName = "tsColl";
@@ -119,9 +118,8 @@ function testOplogCloning(ordered) {
     TenantMigrationTest.assertCommitted(
         tenantMigrationTest.runMigration(migrationOpts, {automaticForgetMigration: false}));
 
-    const donorDoc = donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS).findOne({
-        tenantId: kTenantId
-    });
+    const donorDoc =
+        donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS).findOne({_id: migrationId});
 
     assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
     tenantMigrationTest.waitForMigrationGarbageCollection(migrationId, kTenantId);
@@ -284,4 +282,3 @@ function testOplogCloning(ordered) {
 
 testOplogCloning(true);
 testOplogCloning(false);
-})();

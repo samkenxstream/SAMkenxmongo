@@ -33,8 +33,8 @@
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/s/chunk_version.h"
 #include "mongo/s/database_version.h"
+#include "mongo/s/shard_version.h"
 #include "mongo/util/future.h"
 #include "mongo/util/string_map.h"
 
@@ -49,7 +49,7 @@ class ScopedSetShardRole {
 public:
     ScopedSetShardRole(OperationContext* opCtx,
                        NamespaceString nss,
-                       boost::optional<ChunkVersion> shardVersion,
+                       boost::optional<ShardVersion> shardVersion,
                        boost::optional<DatabaseVersion> databaseVersion);
     ~ScopedSetShardRole();
 
@@ -58,7 +58,7 @@ private:
 
     NamespaceString _nss;
 
-    boost::optional<ChunkVersion> _shardVersion;
+    boost::optional<ShardVersion> _shardVersion;
     boost::optional<DatabaseVersion> _databaseVersion;
 };
 
@@ -84,11 +84,11 @@ public:
     static OperationShardingState& get(OperationContext* opCtx);
 
     /**
-     * Returns true if the the current operation was sent by the caller with shard version
-     * information attached, meaning that it must perform shard version checking and orphan
-     * filtering.
+     * Returns true if the the current operation was sent from an upstream router, rather than it
+     * being a direct connection against the shard. The way this decision is made is based on
+     * whether there is shard version declared for any namespace.
      */
-    static bool isOperationVersioned(OperationContext* opCtx);
+    static bool isComingFromRouter(OperationContext* opCtx);
 
     /**
      * NOTE: DO NOT ADD any new usages of this class without including someone from the Sharding
@@ -113,21 +113,23 @@ public:
      */
     static void setShardRole(OperationContext* opCtx,
                              const NamespaceString& nss,
-                             const boost::optional<ChunkVersion>& shardVersion,
+                             const boost::optional<ShardVersion>& shardVersion,
                              const boost::optional<DatabaseVersion>& dbVersion);
 
     /**
-     * Returns whether or not there is a shard version for the namespace associated with this
-     * operation.
+     * Used to clear the shard role from the opCtx for ddl operations which are not required to send
+     * the index version (ex. split, merge). These operations will do their own metadata checks
+     * rather than us the collection sharding runtime checks.
      */
-    bool hasShardVersion(const NamespaceString& nss) const;
+    static void unsetShardRoleForLegacyDDLOperationsSentWithShardVersionIfNeeded(
+        OperationContext* opCtx, const NamespaceString& nss);
 
     /**
      * Returns the shard version (i.e. maximum chunk version) of a namespace being used by the
      * operation. Documents in chunks which did not belong on this shard at this shard version
      * will be filtered out.
      */
-    boost::optional<ChunkVersion> getShardVersion(const NamespaceString& nss);
+    boost::optional<ShardVersion> getShardVersion(const NamespaceString& nss);
 
     /**
      * Returns true if the client sent a databaseVersion for any namespace.
@@ -176,10 +178,11 @@ private:
 
     // Stores the shard version expected for each collection that will be accessed
     struct ShardVersionTracker {
-        ShardVersionTracker(ChunkVersion v) : v(v) {}
+        ShardVersionTracker(ShardVersion v) : v(v) {}
         ShardVersionTracker(ShardVersionTracker&&) = default;
         ShardVersionTracker(const ShardVersionTracker&) = delete;
-        ChunkVersion v;
+        ShardVersionTracker& operator=(const ShardVersionTracker&) = delete;
+        ShardVersion v;
         int recursion{0};
     };
     StringMap<ShardVersionTracker> _shardVersions;
@@ -189,6 +192,7 @@ private:
         DatabaseVersionTracker(DatabaseVersion v) : v(v) {}
         DatabaseVersionTracker(DatabaseVersionTracker&&) = default;
         DatabaseVersionTracker(const DatabaseVersionTracker&) = delete;
+        DatabaseVersionTracker& operator=(const DatabaseVersionTracker&) = delete;
         DatabaseVersion v;
         int recursion{0};
     };

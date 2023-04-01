@@ -65,7 +65,6 @@ def _find_linter(linter, config_dict):
     Return a LinterInstance with the location of the linter binary if a linter binary with the
     matching version is found. None otherwise.
     """
-    # pylint: disable=too-many-branches,too-many-return-statements
 
     if linter.cmd_name in config_dict and config_dict[linter.cmd_name] is not None:
         cmd = [config_dict[linter.cmd_name]]
@@ -79,7 +78,7 @@ def _find_linter(linter, config_dict):
     # 1. In the same directory as the interpreter
     # 2. Check user base -- i.e. site.USERBASE. With "pip install --user" puts files
     # 3. The current path
-    # 4. In '/opt/mongodbtoolchain/v3/bin' if virtualenv is set up.
+    # 4. In '/opt/mongodbtoolchain/v4/bin' if virtualenv is set up.
     python_dir = os.path.dirname(sys.executable)
     if sys.platform == "win32":
         # On Windows, these scripts are installed in %PYTHONDIR%\scripts like
@@ -95,7 +94,7 @@ def _find_linter(linter, config_dict):
             python_dir = '/usr/local/bin'
 
         # On Linux, these scripts are installed in %PYTHONDIR%\bin like
-        # '/opt/mongodbtoolchain/v3/bin', but they may point to the wrong interpreter.
+        # '/opt/mongodbtoolchain/v4/bin', but they may point to the wrong interpreter.
         cmd_str = os.path.join(python_dir, linter.cmd_name)
         cmd = [sys.executable, cmd_str]
 
@@ -117,8 +116,8 @@ def _find_linter(linter, config_dict):
         return base.LinterInstance(linter, cmd)
 
     # Check 4: When a virtualenv is setup the linter modules are not installed, so we need
-    # to use the linters installed in '/opt/mongodbtoolchain/v3/bin'.
-    cmd = [sys.executable, os.path.join('/opt/mongodbtoolchain/v3/bin', linter.cmd_name)]
+    # to use the linters installed in '/opt/mongodbtoolchain/v4/bin'.
+    cmd = [sys.executable, os.path.join('/opt/mongodbtoolchain/v4/bin', linter.cmd_name)]
     if _check_version(linter, cmd, linter.get_lint_version_cmd_args()):
         return base.LinterInstance(linter, cmd)
 
@@ -169,10 +168,9 @@ class LintRunner(object):
         with self.print_lock:
             print(line)
 
-    def run_lint(self, linter, file_name):
-        # type: (base.LinterInstance, str) -> bool
+    def run_lint(self, linter: base.LinterInstance, file_name: str, mongo_path: str,
+                 fix_command: str) -> bool:
         """Run the specified linter for the file."""
-        # pylint: disable=too-many-locals
 
         linter_args = linter.linter.get_lint_cmd_args(file_name)
         if not linter_args:
@@ -203,8 +201,11 @@ class LintRunner(object):
 
                     # Take a lock to ensure diffs do not get mixed when printed to the screen
                     with self.print_lock:
+                        file_name = os.path.relpath(file_name, mongo_path)
                         print("ERROR: Found diff for " + file_name)
-                        print("To fix formatting errors, run pylinters.py fix %s" % (file_name))
+                        print(
+                            f"To fix formatting errors, run buildscripts/pylinters.py {fix_command} {file_name}"
+                        )
 
                         count = 0
                         for line in result:

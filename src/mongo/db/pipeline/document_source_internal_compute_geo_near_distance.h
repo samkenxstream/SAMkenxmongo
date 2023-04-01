@@ -76,18 +76,17 @@ public:
     }
 
     DocumentSource::GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kFiniteSet,
-                std::set<std::string>{_distanceField.fullPath()},
-                {}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{_distanceField.fullPath()}, {}};
     }
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() override {
         return boost::none;
     }
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
 private:
-    Value serialize(
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     GetNextResult doGetNext() override;
 

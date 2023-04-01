@@ -17,13 +17,13 @@
 
 #include <string>
 
-#include "asio/detail/assert.hpp"
-#include "asio/detail/config.hpp"
 #include "mongo/util/errno_util.h"
 #include "mongo/util/net/ssl/apple.hpp"
 #include "mongo/util/net/ssl/error.hpp"
+#include <asio/detail/assert.hpp>
+#include <asio/detail/config.hpp>
 
-#include "asio/detail/push_options.hpp"
+#include <asio/detail/push_options.hpp>
 
 namespace asio {
 namespace error {
@@ -40,7 +40,7 @@ public:
         if (value == asio::ssl::error::no_renegotiation) {
             return "peer requested renegotiation, which is not supported";
         }
-        return mongo::errnoWithDescription(value);
+        return std::system_category().message(value);
     }
 #elif MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
     std::string message(int value) const {
@@ -110,6 +110,6 @@ const asio::error_category& get_stream_category() {
 }  // namespace ssl
 }  // namespace asio
 
-#include "asio/detail/pop_options.hpp"
+#include <asio/detail/pop_options.hpp>
 
 #endif  // ASIO_SSL_IMPL_ERROR_IPP

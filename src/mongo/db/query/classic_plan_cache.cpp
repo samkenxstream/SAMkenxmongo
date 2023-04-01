@@ -32,12 +32,8 @@
 #include "mongo/db/commands/server_status_metric.h"
 
 namespace mongo {
-namespace {
-ServerStatusMetricField<Counter64> totalPlanCacheSizeEstimateBytesMetric(
-    "query.planCacheTotalSizeEstimateBytes", &mongo::planCacheTotalSizeEstimateBytes);
-}  // namespace
-
-Counter64 planCacheTotalSizeEstimateBytes;
+CounterMetric planCacheTotalSizeEstimateBytes("query.planCacheTotalSizeEstimateBytes");
+CounterMetric planCacheEntries("query.planCacheTotalQueryShapes");
 
 std::ostream& operator<<(std::ostream& stream, const PlanCacheKey& key) {
     stream << key.toString();
@@ -126,15 +122,23 @@ std::string SolutionCacheData::toString() const {
 }
 
 bool shouldCacheQuery(const CanonicalQuery& query) {
+    if (internalQueryDisablePlanCache.load()) {
+        return false;
+    }
+
     const FindCommandRequest& findCommand = query.getFindCommandRequest();
     const MatchExpression* expr = query.root();
 
     if (!query.getSortPattern() && expr->matchType() == MatchExpression::AND &&
-        expr->numChildren() == 0) {
+        expr->numChildren() == 0 && !query.isSbeCompatible()) {
         return false;
     }
 
-    if (!findCommand.getHint().isEmpty()) {
+    // The classic plan cache doesn't have the plan itself, but only some data to re-construct the
+    // plan. It is only useful for skipping multiplanning, and hinted queries are generally not
+    // multi-planned, so it is not necessary to cache the plan. In contrast, the SBE plan cache has
+    // the plan itself, so caching hinted queries could help to skip the plan construction.
+    if (!query.isSbeCompatible() && !findCommand.getHint().isEmpty()) {
         return false;
     }
 
@@ -149,7 +153,13 @@ bool shouldCacheQuery(const CanonicalQuery& query) {
     // We don't read or write from the plan cache for explain. This ensures that explain queries
     // don't affect cache state, and it also makes sure that we can always generate information
     // regarding rejected plans and/or trial period execution of candidate plans.
-    if (query.getExplain()) {
+    //
+    // There is one exception: $lookup's implementation in the DocumentSource engine relies on
+    // caching the plan on the inner side in order to avoid repeating the planning process for every
+    // document on the outer side. To ensure that the 'executionTime' value is accurate for $lookup,
+    // we allow the inner side to use the cache even if the query is an explain.
+    tassert(6497600, "expCtx is null", query.getExpCtxRaw());
+    if (query.getExplain() && !query.getExpCtxRaw()->inLookup) {
         return false;
     }
 

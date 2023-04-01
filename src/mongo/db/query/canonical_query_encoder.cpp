@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/query/canonical_query_encoder.h"
 
@@ -41,12 +40,17 @@
 #include "mongo/db/matcher/expression_text_noop.h"
 #include "mongo/db/matcher/expression_where.h"
 #include "mongo/db/matcher/expression_where_noop.h"
+#include "mongo/db/pipeline/document_source_group.h"
+#include "mongo/db/pipeline/document_source_lookup.h"
+#include "mongo/db/query/analyze_regex.h"
 #include "mongo/db/query/projection.h"
-#include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/tree_walker.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/base64.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -73,27 +77,6 @@ bool isQueryNegatingEqualToNull(const mongo::MatchExpression* tree) {
 
 namespace {
 
-// Delimiters for cache key encoding.
-const char kEncodeChildrenBegin = '[';
-const char kEncodeChildrenEnd = ']';
-const char kEncodeChildrenSeparator = ',';
-const char kEncodeCollationSection = '#';
-const char kEncodeProjectionSection = '|';
-const char kEncodeProjectionRequirementSeparator = '-';
-const char kEncodeRegexFlagsSeparator = '/';
-const char kEncodeSortSection = '~';
-const char kEncodeEngineSection = '@';
-
-// These special bytes are used in the encoding of auto-parameterized match expressions in the SBE
-// plan cache key.
-
-// Precedes the id number of a parameter marker.
-const char kEncodeParamMarker = '?';
-// Precedes the encoding of a constant when that constant has not been auto-paramterized. The
-// constant is typically encoded as a BSON type byte followed by a BSON value (without the
-// BSONElement's field name).
-const char kEncodeConstantLiteralMarker = ':';
-
 /**
  * AppendChar provides the compiler with a type for a "appendChar(...)" member function.
  */
@@ -119,12 +102,9 @@ void encodeUserString(StringData s, BuilderType* builder) {
             case kEncodeChildrenBegin:
             case kEncodeChildrenEnd:
             case kEncodeChildrenSeparator:
-            case kEncodeCollationSection:
-            case kEncodeProjectionSection:
+            case kEncodeSectionDelimiter:
             case kEncodeProjectionRequirementSeparator:
             case kEncodeRegexFlagsSeparator:
-            case kEncodeSortSection:
-            case kEncodeEngineSection:
             case kEncodeParamMarker:
             case kEncodeConstantLiteralMarker:
             case '\\':
@@ -133,7 +113,7 @@ void encodeUserString(StringData s, BuilderType* builder) {
                 } else {
                     *builder << '\\';
                 }
-            // Fall through to default case.
+                [[fallthrough]];
             default:
                 if constexpr (hasAppendChar<BuilderType>) {
                     builder->appendChar(c);
@@ -399,13 +379,13 @@ char encodeEnum(T val) {
 }
 
 void encodeCollation(const CollatorInterface* collation, StringBuilder* keyBuilder) {
+    *keyBuilder << kEncodeSectionDelimiter;
     if (!collation) {
         return;
     }
 
     const Collation& spec = collation->getSpec();
 
-    *keyBuilder << kEncodeCollationSection;
     *keyBuilder << spec.getLocale();
     *keyBuilder << spec.getCaseLevel();
 
@@ -421,6 +401,30 @@ void encodeCollation(const CollatorInterface* collation, StringBuilder* keyBuild
 
     // We do not encode 'spec.version' because query shape strings are never persisted, and need
     // not be stable between versions.
+}
+
+void encodePipeline(const std::vector<std::unique_ptr<InnerPipelineStageInterface>>& pipeline,
+                    BufBuilder* bufBuilder) {
+    bufBuilder->appendChar(kEncodeSectionDelimiter);
+    for (auto& stage : pipeline) {
+        std::vector<Value> serializedArray;
+        if (auto lookupStage = dynamic_cast<DocumentSourceLookUp*>(stage->documentSource())) {
+            lookupStage->serializeToArray(serializedArray);
+            tassert(6443201,
+                    "$lookup stage isn't serialized to a single bson object",
+                    serializedArray.size() == 1 && serializedArray[0].getType() == Object);
+            const auto bson = serializedArray[0].getDocument().toBson();
+            bufBuilder->appendBuf(bson.objdata(), bson.objsize());
+        } else if (auto groupStage = dynamic_cast<DocumentSourceGroup*>(stage->documentSource())) {
+            auto serializedGroup = groupStage->serialize();
+            const auto bson = serializedGroup.getDocument().toBson();
+            bufBuilder->appendBuf(bson.objdata(), bson.objsize());
+        } else {
+            tasserted(6443200,
+                      str::stream() << "Pipeline stage cannot be encoded in plan cache key: "
+                                    << stage->documentSource()->getSourceName());
+        }
+    }
 }
 
 template <class RegexIterator>
@@ -451,7 +455,9 @@ void encodeRegexFlagsForMatch(RegexIterator first, RegexIterator last, StringBui
 // Helper overload to prepare a vector of unique_ptrs for the heavy-lifting function above.
 void encodeRegexFlagsForMatch(const std::vector<std::unique_ptr<RegexMatchExpression>>& regexes,
                               StringBuilder* keyBuilder) {
-    const auto transformFunc = [](const auto& regex) { return regex.get(); };
+    const auto transformFunc = [](const auto& regex) {
+        return regex.get();
+    };
     encodeRegexFlagsForMatch(boost::make_transform_iterator(regexes.begin(), transformFunc),
                              boost::make_transform_iterator(regexes.end(), transformFunc),
                              keyBuilder);
@@ -532,11 +538,10 @@ void encodeKeyForMatch(const MatchExpression* tree, StringBuilder* keyBuilder) {
  * FindCommandRequest.
  */
 void encodeKeyForSort(const BSONObj& sortObj, StringBuilder* keyBuilder) {
+    *keyBuilder << kEncodeSectionDelimiter;
     if (sortObj.isEmpty()) {
         return;
     }
-
-    *keyBuilder << kEncodeSortSection;
 
     BSONObjIterator it(sortObj);
     while (it.more()) {
@@ -572,26 +577,22 @@ void encodeKeyForSort(const BSONObj& sortObj, StringBuilder* keyBuilder) {
  * expressions), the projection section is empty.
  */
 void encodeKeyForProj(const projection_ast::Projection* proj, StringBuilder* keyBuilder) {
+    *keyBuilder << kEncodeSectionDelimiter;
     if (!proj || proj->requiresDocument()) {
         // Don't encode anything for the projection section to indicate the entire document is
         // required.
         return;
     }
 
-    std::vector<std::string> requiredFields = proj->getRequiredFields();
+    auto requiredFields = proj->getRequiredFields();
 
     // If the only requirement is that $sortKey be included with some value, we just act as if the
     // entire document is needed.
-    if (requiredFields.size() == 1 && requiredFields.front() == "$sortKey") {
+    if (requiredFields.size() == 1 && *requiredFields.begin() == "$sortKey") {
         return;
     }
 
-    // If the projection just re-writes the entire document and has no dependencies on the original
-    // document (e.g. {a: "foo", _id: 0}), then just include the projection delimiter.
-    *keyBuilder << kEncodeProjectionSection;
-
     // Encode the fields required by the projection in order.
-    std::sort(requiredFields.begin(), requiredFields.end());
     bool isFirst = true;
     for (auto&& requiredField : requiredFields) {
         invariant(!requiredField.empty());
@@ -643,8 +644,16 @@ void encodeFindCommandRequest(const FindCommandRequest& findCommand, BufBuilder*
         bufBuilder->appendBuf(obj.objdata(), obj.objsize());
     };
     encodeBSONObj(findCommand.getResumeAfter());
-    encodeBSONObj(findCommand.getMin());
-    encodeBSONObj(findCommand.getMax());
+
+    // Read concern "available" results in SBE plans that do not perform shard filtering, so it must
+    // be encoded differently from other read concerns.
+    bool isAvailableReadConcern{false};
+    if (const auto readConcern = findCommand.getReadConcern()) {
+        isAvailableReadConcern =
+            readConcern->getField(repl::ReadConcernArgs::kLevelFieldName).valueStringDataSafe() ==
+            repl::readConcernLevels::kAvailableName;
+    }
+    bufBuilder->appendChar(isAvailableReadConcern ? 't' : 'f');
 }
 }  // namespace
 
@@ -659,7 +668,13 @@ CanonicalQuery::QueryShapeString encode(const CanonicalQuery& cq) {
 
     // This encoding can be removed once the classic query engine reaches EOL and SBE is used
     // exclusively for all query execution.
-    keyBuilder << kEncodeEngineSection << (cq.getForceClassicEngine() ? "f" : "t");
+    keyBuilder << kEncodeSectionDelimiter << (cq.getForceClassicEngine() ? "f" : "t");
+
+    // The apiStrict flag can cause the query to see different set of indexes. For example, all
+    // sparse indexes will be ignored with apiStrict is used.
+    const bool apiStrict =
+        cq.getOpCtx() && APIParameters::get(cq.getOpCtx()).getAPIStrict().value_or(false);
+    keyBuilder << (apiStrict ? "t" : "f");
 
     return keyBuilder.str();
 }
@@ -719,24 +734,30 @@ public:
 
     void visit(const InMatchExpression* expr) final {
         encodeSingleParamPathNode(expr);
+        // Encode the number of unique $in values as part of the plan cache key. If the query is
+        // optimized by exploding for sort, the number of unique elements in $in determines how many
+        // merge branches we get in the query plan.
+        if (expr->getInputParamId()) {
+            _builder->appendNum(static_cast<int>(expr->getEqualities().size()));
+        }
     }
 
     void visit(const ModMatchExpression* expr) final {
         auto divisorParam = expr->getDivisorInputParamId();
         auto remainderParam = expr->getRemainderInputParamId();
         if (divisorParam) {
-            tassert(6142105,
-                    "$mod expression had divisor param but not remainder param",
+            tassert(6512902,
+                    "$mod expression should have divisor and remainder params",
                     remainderParam);
+
             encodeParamMarker(*divisorParam);
             encodeParamMarker(*remainderParam);
         } else {
-            // TODO SERVER-64137: remove this branch and assert the existence of both params once
-            // auto-parameterization flag is removed.
-            tassert(6142106,
-                    "$mod expression had remainder param but not divisor param",
+            tassert(6579300,
+                    "If divisor param is not set in $mod expression reminder param must be unset "
+                    "as well",
                     !remainderParam);
-            encodeRhs(expr);
+            encodeFull(expr);
         }
     }
 
@@ -744,18 +765,28 @@ public:
         auto sourceRegexParam = expr->getSourceRegexInputParamId();
         auto compiledRegexParam = expr->getCompiledRegexInputParamId();
         if (sourceRegexParam) {
-            tassert(6142107,
-                    "regex expression had source param but not compiled param",
+            tassert(6512904,
+                    "regex expression should have source and compiled params",
                     compiledRegexParam);
+
             encodeParamMarker(*sourceRegexParam);
             encodeParamMarker(*compiledRegexParam);
+
+            // Encode a discriminator so that a "simple" regex which is exactly convertible into
+            // index bounds has a different shape from a non-simple regex.
+            //
+            // We don't actually need to know the contents of the prefix string, so we ignore the
+            // first member of the pair.
+            auto [_, isExact] = analyze_regex::getRegexPrefixMatch(expr->getString().c_str(),
+                                                                   expr->getFlags().c_str());
+            _builder->appendChar(kEncodeBoundsTightnessDiscriminator);
+            _builder->appendChar(static_cast<char>(isExact));
         } else {
-            // TODO SERVER-64137: remove this branch and assert the existence of both params once
-            // auto-parameterization flag is removed.
-            tassert(6142108,
-                    "regex expression had compiled param but not source param",
+            tassert(6579301,
+                    "If source param is not set in $regex expression compiled param must be unset "
+                    "as well",
                     !compiledRegexParam);
-            encodeRhs(expr);
+            encodeFull(expr);
         }
     }
 
@@ -788,6 +819,7 @@ public:
     void visit(const AlwaysFalseMatchExpression* expr) final {}
     void visit(const AlwaysTrueMatchExpression* expr) final {}
     void visit(const AndMatchExpression* expr) final {}
+    void visit(const ElemMatchValueMatchExpression* matchExpr) final {}
     void visit(const ElemMatchObjectMatchExpression* matchExpr) final {}
     void visit(const NorMatchExpression* expr) final {}
     void visit(const NotMatchExpression* expr) final {}
@@ -803,9 +835,6 @@ public:
     /**
      * These node types are not yet supported in SBE.
      */
-    void visit(const ElemMatchValueMatchExpression* matchExpr) final {
-        MONGO_UNREACHABLE_TASSERT(6142110);
-    }
     void visit(const GeoMatchExpression* expr) final {
         MONGO_UNREACHABLE_TASSERT(6142111);
     }
@@ -917,18 +946,19 @@ private:
         auto bitPositionsParam = expr->getBitPositionsParamId();
         auto bitMaskParam = expr->getBitMaskParamId();
         if (bitPositionsParam) {
-            tassert(6142100,
-                    "bit-test expression had bit positions param but not bitmask param",
+
+            tassert(6512906,
+                    "bit-test expression should have bit positions and bitmask params",
                     bitMaskParam);
+
             encodeParamMarker(*bitPositionsParam);
             encodeParamMarker(*bitMaskParam);
         } else {
-            // TODO SERVER-64137: remove this branch and assert the existence of both params once
-            // auto-parameterization flag is removed.
-            tassert(6142101,
-                    "bit-test expression had bitmask param but not bit positions param",
+            tassert(6579302,
+                    "If positions param is not set in a bit-test expression bitmask param must be "
+                    "unset as well",
                     !bitMaskParam);
-            encodeRhs(expr);
+            encodeFull(expr);
         }
     }
 
@@ -1044,7 +1074,7 @@ std::string encodeSBE(const CanonicalQuery& cq) {
     const auto& filter = cq.getQueryObj();
     const auto& proj = cq.getFindCommandRequest().getProjection();
     const auto& sort = cq.getFindCommandRequest().getSort();
-    const auto& let = cq.getFindCommandRequest().getLet();
+    const auto& hint = cq.getFindCommandRequest().getHint();
 
     StringBuilder strBuilder;
     encodeKeyForSort(sort, &strBuilder);
@@ -1054,31 +1084,41 @@ std::string encodeSBE(const CanonicalQuery& cq) {
     // A constant for reserving buffer size. It should be large enough to reserve the space required
     // to encode various properties from the FindCommandRequest and query knobs.
     const int kBufferSizeConstant = 200;
-    size_t bufSize = filter.objsize() + proj.objsize() + strBuilderEncoded.size() +
-        kBufferSizeConstant + (let ? let->objsize() : 0);
+    size_t bufSize = filter.objsize() + proj.objsize() + strBuilderEncoded.size() + hint.objsize() +
+        kBufferSizeConstant;
 
     BufBuilder bufBuilder(bufSize);
-    if (feature_flags::gFeatureFlagAutoParameterization.isEnabledAndIgnoreFCV()) {
-        encodeKeyForAutoParameterizedMatchSBE(cq.root(), &bufBuilder);
-    } else {
-        // When auto-parameterization is off, just add the entire filter BSON to the cache key,
-        // including any constants.
-        bufBuilder.appendBuf(filter.objdata(), filter.objsize());
-    }
+    encodeKeyForAutoParameterizedMatchSBE(cq.root(), &bufBuilder);
 
     bufBuilder.appendBuf(proj.objdata(), proj.objsize());
-    // TODO SERVER-62100: No need to encode the entire "let" object.
-    if (let) {
-        bufBuilder.appendBuf(let->objdata(), let->objsize());
-    }
     bufBuilder.appendStr(strBuilderEncoded, false /* includeEndingNull */);
+    bufBuilder.appendChar(kEncodeSectionDelimiter);
+    if (!hint.isEmpty()) {
+        bufBuilder.appendBuf(hint.objdata(), hint.objsize());
+    }
+    bufBuilder.appendChar(kEncodeSectionDelimiter);
+    bufBuilder.appendChar(cq.getForceGenerateRecordId() ? 1 : 0);
+    bufBuilder.appendChar(cq.isCountLike() ? 1 : 0);
+    // The apiStrict flag can cause the query to see different set of indexes. For example, all
+    // sparse indexes will be ignored with apiStrict is used.
+    const bool apiStrict =
+        cq.getOpCtx() && APIParameters::get(cq.getOpCtx()).getAPIStrict().value_or(false);
+    bufBuilder.appendChar(apiStrict ? 1 : 0);
+
+    // We can wind up with different query plans for aggregate commands if 'needsMerge' is set or
+    // not. For instance, when 'needsMerge' is true, $group queries will produce partial aggregates
+    // as output, and complete output otherwise.
+    const bool needsMerge = cq.getExpCtx()->needsMerge;
+    bufBuilder.appendChar(needsMerge ? 1 : 0);
 
     encodeFindCommandRequest(cq.getFindCommandRequest(), &bufBuilder);
+
+    encodePipeline(cq.pipeline(), &bufBuilder);
 
     return base64::encode(StringData(bufBuilder.buf(), bufBuilder.len()));
 }
 
-CanonicalQuery::QueryShapeString encodeForIndexFilters(const CanonicalQuery& cq) {
+CanonicalQuery::PlanCacheCommandKey encodeForPlanCacheCommand(const CanonicalQuery& cq) {
     StringBuilder keyBuilder;
     encodeKeyForMatch(cq.root(), &keyBuilder);
     encodeKeyForSort(cq.getFindCommandRequest().getSort(), &keyBuilder);
@@ -1088,6 +1128,8 @@ CanonicalQuery::QueryShapeString encodeForIndexFilters(const CanonicalQuery& cq)
     // be encoded.
     if (!cq.getFindCommandRequest().getCollation().isEmpty()) {
         encodeCollation(cq.getCollator(), &keyBuilder);
+    } else {
+        keyBuilder << kEncodeSectionDelimiter;
     }
 
     return keyBuilder.str();

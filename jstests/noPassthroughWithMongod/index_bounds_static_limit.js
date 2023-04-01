@@ -9,10 +9,8 @@
 load("jstests/libs/analyze_plan.js");  // For explain helpers.
 load("jstests/libs/sbe_util.js");      // For checkSBEEnabled.
 
-const isSBEEnabled = checkSBEEnabled(db);
-
-if (!isSBEEnabled) {
-    // This test is only relevant when SBE is enabled.
+if (!checkSBEEnabled(db)) {
+    jsTest.log("Skipping test because SBE is not enabled");
     return;
 }
 
@@ -32,25 +30,42 @@ const setStaticLimit = function(limit) {
         {setParameter: 1, internalQuerySlotBasedExecutionMaxStaticIndexScanIntervals: limit});
 };
 
+/**
+ * Takes and output of explain("executionStats") command and verifieies whether generic or optimized
+ * index scan plan used.
+ * @param {*} explain - output of explain("executionStats") command.
+ * @param {*} isGeneric - true if generic plan expected and false if an optimized plan expected.
+ */
+function assertIndexScanPlan(explain, isGeneric) {
+    const stages = explain.executionStats.executionStages;
+
+    // Asserts whether this plan is generic or optimized.
+    const branchStage = getPlanStage(stages, "branch");
+    const filterSlot = branchStage.filter.trim();
+    const isGenericSlotValue = `${filterSlot} = ${isGeneric}`;
+    const slotValues = explain.queryPlanner.winningPlan.slotBasedPlan.slots;
+    assert(slotValues.search(isGenericSlotValue) != -1, explain);
+
+    // Asserts that this plan contains ixseek stage.
+    const ixseekStages = getPlanStages(stages, "ixseek");
+    assert.neq(0, ixseekStages.length, explain);
+}
+
 try {
     // Verify that when the number of statically generated single interval bounds is less than the
     // static limit, the optimized plan is used.
     const optimized =
         coll.find({a: {$in: [1, 2, 3]}, b: {$in: [10, 11, 12]}, c: {$in: [42]}, d: {$lt: 3}})
-            .explain("executionStats")
-            .executionStats.executionStages;
-    assert(planHasStage(db, optimized, "ixseek"), optimized);
-    assert(!planHasStage(db, optimized, "chkbounds"), optimized);
+            .explain("executionStats");
+    assertIndexScanPlan(optimized, /*isGeneric*/ false);
 
     // Verify that when the number of statically generated single interval bounds is greater than
     // the static limit, the generic plan is used.
     setStaticLimit(2);
     const generic =
         coll.find({a: {$in: [1, 2, 3]}, b: {$in: [10, 11, 12]}, c: {$in: [42]}, d: {$lt: 3}})
-            .explain("executionStats")
-            .executionStats.executionStages;
-    assert(planHasStage(db, generic, "chkbounds"), generic);
-    assert(planHasStage(db, generic, "ixseek"), generic);
+            .explain("executionStats");
+    assertIndexScanPlan(generic, /*isGeneric*/ true);
 } finally {
     setStaticLimit(staticLimit);
 }

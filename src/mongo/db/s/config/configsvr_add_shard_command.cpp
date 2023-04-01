@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -47,10 +46,10 @@
 #include "mongo/s/request_types/add_shard_request_type.h"
 #include "mongo/util/str.h"
 
-namespace mongo {
-namespace {
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-const long long kMaxSizeMBDefault = 0;
+
+namespace mongo {
 
 /**
  * Internal sharding command run on config servers to add a shard to the cluster.
@@ -81,23 +80,24 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                    ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& unusedDbName,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         uassert(ErrorCodes::IllegalOperation,
                 "_configsvrAddShard can only be run on config servers",
-                serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
         CommandHelpers::uassertCommandRunWithMajority(getName(), opCtx->getWriteConcern());
 
         // Set the operation context read concern level to local for reads into the config database.
@@ -115,15 +115,13 @@ public:
 
         audit::logAddShard(Client::getCurrent(),
                            parsedRequest.hasName() ? parsedRequest.getName() : "",
-                           parsedRequest.getConnString().toString(),
-                           parsedRequest.hasMaxSize() ? parsedRequest.getMaxSize()
-                                                      : kMaxSizeMBDefault);
+                           parsedRequest.getConnString().toString());
 
         StatusWith<std::string> addShardResult = ShardingCatalogManager::get(opCtx)->addShard(
             opCtx,
             parsedRequest.hasName() ? &parsedRequest.getName() : nullptr,
             parsedRequest.getConnString(),
-            parsedRequest.hasMaxSize() ? parsedRequest.getMaxSize() : kMaxSizeMBDefault);
+            false);
 
         if (!addShardResult.isOK()) {
             LOGV2(21920,
@@ -140,5 +138,4 @@ public:
     }
 } configsvrAddShardCmd;
 
-}  // namespace
 }  // namespace mongo

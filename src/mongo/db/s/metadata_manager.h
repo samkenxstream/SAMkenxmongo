@@ -30,14 +30,10 @@
 #pragma once
 
 #include <list>
-#include <memory>
 
-#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/range_arithmetic.h"
 #include "mongo/db/s/scoped_collection_metadata.h"
-#include "mongo/db/service_context.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/util/concurrency/with_lock.h"
@@ -73,12 +69,12 @@ public:
         const boost::optional<LogicalTime>& atClusterTime);
 
     /**
-     * Returns the shard version of the active metadata object.
+     * Returns the placement version of the active metadata object.
      */
-    ChunkVersion getActiveShardVersion() {
+    ChunkVersion getActivePlacementVersion() {
         stdx::lock_guard<Latch> lg(_managerLock);
         invariant(!_metadata.empty());
-        return _metadata.back()->metadata->getShardVersion();
+        return _metadata.back()->metadata->getShardPlacementVersion();
     }
 
     /**
@@ -119,9 +115,7 @@ public:
      *
      * Returns a future that will be fulfilled when the range deletion completes or fails.
      */
-    SharedSemiFuture<void> cleanUpRange(ChunkRange const& range,
-                                        const UUID& migrationId,
-                                        bool shouldDelayBeforeDeletion);
+    SharedSemiFuture<void> cleanUpRange(ChunkRange const& range, bool shouldDelayBeforeDeletion);
 
     /**
      * Returns the number of ranges scheduled to be cleaned, exclusive of such ranges that might
@@ -148,8 +142,12 @@ public:
      * returns a future that will be resolved when the newest overlapping range's deletion (possibly
      * the one of interest) completes or fails.
      */
-    boost::optional<SharedSemiFuture<void>> trackOrphanedDataCleanup(
-        ChunkRange const& orphans) const;
+    SharedSemiFuture<void> trackOrphanedDataCleanup(ChunkRange const& orphans) const;
+
+    /**
+     * Returns a future marked as ready when all the ongoing queries retaining the range complete
+     */
+    SharedSemiFuture<void> getOngoingQueriesCompletionFuture(ChunkRange const& range);
 
 private:
     // Management of the _metadata list is implemented in RangePreserver
@@ -226,7 +224,6 @@ private:
         const WithLock&,
         SemiFuture<void> waitForActiveQueriesToComplete,
         const ChunkRange& range,
-        const UUID& migrationId,
         Seconds delayForActiveQueriesOnSecondariesToComplete);
 
     // ServiceContext from which to obtain instances of global support objects

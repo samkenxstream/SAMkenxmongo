@@ -285,6 +285,27 @@ Value::Value(const vector<Document>& vec) : _storage(Array) {
     _storage.putVector(std::move(storageVec));
 }
 
+Value::Value(const SafeNum& value) : _storage(value.type()) {
+    switch (value.type()) {
+        case EOO:
+            break;
+        case NumberInt:
+            _storage.intValue = value._value.int32Val;
+            break;
+        case NumberLong:
+            _storage.longValue = value._value.int64Val;
+            break;
+        case NumberDouble:
+            _storage.doubleValue = value._value.doubleVal;
+            break;
+        case NumberDecimal:
+            _storage.putDecimal(Decimal128(value._value.decimalVal));
+            break;
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
 Value Value::createIntOrLong(long long longValue) {
     int intValue = longValue;
     if (intValue != longValue) {
@@ -908,6 +929,7 @@ void Value::hash_combine(size_t& seed,
             // Else, fall through and convert the decimal to a double and hash.
             // At this point the decimal fits into the range of doubles, is infinity, or is NaN,
             // which doubles have a cheaper representation for.
+            [[fallthrough]];
         }
         // This converts all numbers to doubles, which ignores the low-order bits of
         // NumberLongs > 2**53 and precise decimal numbers without double representations,

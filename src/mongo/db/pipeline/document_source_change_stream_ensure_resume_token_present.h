@@ -47,14 +47,14 @@ public:
 
     GetModPathsReturn getModifiedPaths() const final {
         // This stage neither modifies nor renames any field.
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {}};
     }
 
     static boost::intrusive_ptr<DocumentSourceChangeStreamEnsureResumeTokenPresent> create(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const DocumentSourceChangeStreamSpec& spec);
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
 private:
     /**

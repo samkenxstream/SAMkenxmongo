@@ -4,10 +4,7 @@
  * the primary node but does not exist on the secondary.
  *
  * @tags: [
- * # Change streams are only supported on WiredTiger.
- * requires_wiredtiger,
- * requires_fcv_53,
- * featureFlagChangeStreamPreAndPostImages,
+ * requires_fcv_60,
  * ]
  */
 (function() {
@@ -90,8 +87,10 @@ function oplogIsRolledOver() {
 }
 
 while (!oplogIsRolledOver()) {
-    assert.commandWorked(
-        otherColl.insert({long_str: largeString}, {writeConcern: {w: "majority"}}));
+    // Insert a large document with a write concern that ensures that before proceeding the
+    // operation gets replicated to all 3 nodes in the replica set, since, otherwise, the node that
+    // is being initial synced may not be able to catchup due to a small size of the oplog.
+    assert.commandWorked(otherColl.insert({long_str: largeString}, {writeConcern: {w: 3}}));
 }
 
 // Wait until 'PeriodicChangeStreamExpiredPreImagesRemover' job deletes the expired pre-images

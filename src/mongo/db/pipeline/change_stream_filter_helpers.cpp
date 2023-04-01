@@ -39,6 +39,7 @@
 
 namespace mongo {
 namespace change_stream_filter {
+
 std::unique_ptr<MatchExpression> buildTsFilter(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     Timestamp startFromInclusive,
@@ -47,9 +48,40 @@ std::unique_ptr<MatchExpression> buildTsFilter(
                                                     expCtx);
 }
 
+std::unique_ptr<MatchExpression> buildFromMigrateSystemOpFilter(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, const MatchExpression* userMatch) {
+    auto cmdNsRegex = DocumentSourceChangeStream::getCmdNsRegexForChangeStream(expCtx);
+
+    // The filter {fromMigrate:true} allows quickly skip nonrelevant oplog entries
+    auto andMigrateEvents = std::make_unique<AndMatchExpression>();
+    andMigrateEvents->add(
+        MatchExpressionParser::parseAndNormalize(BSON("fromMigrate" << true), expCtx));
+    andMigrateEvents->add(
+        MatchExpressionParser::parseAndNormalize(BSON("ns" << BSONRegEx(cmdNsRegex)), expCtx));
+
+    auto orMigrateEvents = std::make_unique<OrMatchExpression>();
+    auto collRegex = DocumentSourceChangeStream::getCollRegexForChangeStream(expCtx);
+    orMigrateEvents->add(
+        MatchExpressionParser::parseAndNormalize(BSON("o.create" << BSONRegEx(collRegex)), expCtx));
+    orMigrateEvents->add(MatchExpressionParser::parseAndNormalize(
+        BSON("o.createIndexes" << BSONRegEx(collRegex)), expCtx));
+    andMigrateEvents->add(std::move(orMigrateEvents));
+    return andMigrateEvents;
+}
+
 std::unique_ptr<MatchExpression> buildNotFromMigrateFilter(
     const boost::intrusive_ptr<ExpressionContext>& expCtx, const MatchExpression* userMatch) {
-    return MatchExpressionParser::parseAndNormalize(BSON("fromMigrate" << NE << true), expCtx);
+    // Exclude any events that are marked as 'fromMigrate' in the oplog.
+    auto fromMigrateFilter =
+        MatchExpressionParser::parseAndNormalize(BSON("fromMigrate" << NE << true), expCtx);
+
+    // If 'showSystemEvents' is set, however, we do return some specific 'fromMigrate' events.
+    if (expCtx->changeStreamSpec->getShowSystemEvents()) {
+        auto orMigrateEvents = std::make_unique<OrMatchExpression>(std::move(fromMigrateFilter));
+        orMigrateEvents->add(buildFromMigrateSystemOpFilter(expCtx, userMatch));
+        fromMigrateFilter = std::move(orMigrateEvents);
+    }
+    return fromMigrateFilter;
 }
 
 std::unique_ptr<MatchExpression> buildOperationFilter(
@@ -145,6 +177,26 @@ std::unique_ptr<MatchExpression> buildOperationFilter(
     return operationFilter;
 }
 
+std::unique_ptr<MatchExpression> buildViewDefinitionEventFilter(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, const MatchExpression* userMatch) {
+    // The view op filter is as follows:
+    // {
+    //   ns: nsSystemViewsRegex, // match system.views for relevant DBs
+    //   $nor: [                 // match only CRUD events
+    //     {op: "n"},
+    //     {op: "c"}
+    //   ]
+    // }
+    auto nsSystemViewsRegex = DocumentSourceChangeStream::getViewNsRegexForChangeStream(expCtx);
+    auto viewEventsFilter = BSON("ns" << BSONRegEx(nsSystemViewsRegex) << "$nor"
+                                      << BSON_ARRAY(BSON("op"
+                                                         << "n")
+                                                    << BSON("op"
+                                                            << "c")));
+
+    return MatchExpressionParser::parseAndNormalize(viewEventsFilter, expCtx);
+}
+
 std::unique_ptr<MatchExpression> buildInvalidationFilter(
     const boost::intrusive_ptr<ExpressionContext>& expCtx, const MatchExpression* userMatch) {
     auto nss = expCtx->ns;
@@ -184,8 +236,6 @@ std::unique_ptr<MatchExpression> buildTransactionFilter(
     applyOpsBuilder.append("o.applyOps",
                            BSON("$type"
                                 << "array"));
-    applyOpsBuilder.append("lsid", BSON("$exists" << true));
-    applyOpsBuilder.append("txnNumber", BSON("$exists" << true));
     applyOpsBuilder.append("o.prepare", BSON("$not" << BSON("$eq" << true)));
     applyOpsBuilder.append("o.partialTxn", BSON("$not" << BSON("$eq" << true)));
     {
@@ -204,8 +254,12 @@ std::unique_ptr<MatchExpression> buildTransactionFilter(
             // Match relevant command events on the monitored namespaces.
             orBuilder.append(BSON(
                 "o.applyOps" << BSON(
-                    "$elemMatch" << BSON("ns" << BSONRegEx(cmdNsRegex)
-                                              << OR(BSON("o.create" << BSONRegEx(collRegex)))))));
+                    "$elemMatch" << BSON(
+                        "ns" << BSONRegEx(cmdNsRegex)
+                             << OR(BSON("o.create" << BSONRegEx(collRegex)),
+                                   // We don't need to consider 'o.commitIndexBuild' here because
+                                   // creating an index on a non-empty collection is not allowed.
+                                   BSON("o.createIndexes" << BSONRegEx(collRegex)))))));
 
             // The default repl::OpTime is the value used to indicate a null "prevOpTime" link.
             orBuilder.append(BSON(repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName
@@ -240,7 +294,9 @@ std::unique_ptr<MatchExpression> buildInternalOpFilter(
     // Noop change events:
     //   - reshardBegin: A resharding operation begins.
     //   - reshardDoneCatchUp: "Catch up" phase of reshard operation completes.
-    std::vector<StringData> internalOpTypes = {"reshardBegin"_sd, "reshardDoneCatchUp"_sd};
+    //   - shardCollection: A shardCollection operation has completed.
+    std::vector<StringData> internalOpTypes = {
+        "reshardBegin"_sd, "reshardDoneCatchUp"_sd, "shardCollection"_sd};
 
     // Noop change events that are only applicable when merging results on mongoS:
     //   - migrateChunkToNewShard: A chunk migrated to a shard that didn't have any chunks.
@@ -248,27 +304,34 @@ std::unique_ptr<MatchExpression> buildInternalOpFilter(
         internalOpTypes.push_back("migrateChunkToNewShard"_sd);
     }
 
+    // Only return the 'migrateLastChunkFromShard' event if 'showSystemEvents' is set.
+    if (expCtx->changeStreamSpec->getShowSystemEvents()) {
+        internalOpTypes.push_back("migrateLastChunkFromShard"_sd);
+    }
+
+    if (feature_flags::gFeatureFlagChangeStreamsFurtherEnrichedEvents.isEnabled(
+            serverGlobalParams.featureCompatibility)) {
+        internalOpTypes.push_back("refineCollectionShardKey"_sd);
+        internalOpTypes.push_back("reshardCollection"_sd);
+    }
+
     // Build the oplog filter to match the required internal op types.
     BSONArrayBuilder internalOpTypeOrBuilder;
     for (const auto& eventName : internalOpTypes) {
-        internalOpTypeOrBuilder.append(BSON("o2.type" << eventName));
+        internalOpTypeOrBuilder.append(BSON("o2." + eventName << BSON("$exists" << true)));
     }
 
-    // Also filter for shardCollection events, which are recorded as {op: 'n'} in the oplog.
-    auto nsRegex = DocumentSourceChangeStream::getNsRegexForChangeStream(expCtx);
-    internalOpTypeOrBuilder.append(BSON("o2.shardCollection" << BSONRegEx(nsRegex)));
-
-    // Only return the 'migrateLastChunkFromShard' event if 'showSystemEvents' is set.
-    if (expCtx->changeStreamSpec->getShowSystemEvents()) {
-        internalOpTypeOrBuilder.append(BSON("o2.migrateLastChunkFromShard" << BSONRegEx(nsRegex)));
-    }
+    // TODO SERVER-66138: This filter can be removed after 7.0 release.
+    change_stream_legacy::populateInternalOperationFilter(expCtx, &internalOpTypeOrBuilder);
 
     // Finalize the array of $or filter predicates.
     internalOpTypeOrBuilder.done();
 
+    auto nsRegex = DocumentSourceChangeStream::getNsRegexForChangeStream(expCtx);
     return MatchExpressionParser::parseAndNormalize(BSON("op"
                                                          << "n"
-                                                         << "$or" << internalOpTypeOrBuilder.arr()),
+                                                         << "ns" << BSONRegEx(nsRegex) << "$or"
+                                                         << internalOpTypeOrBuilder.arr()),
                                                     expCtx);
 }
 

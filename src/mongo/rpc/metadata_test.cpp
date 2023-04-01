@@ -50,7 +50,7 @@ void checkUpconvert(const BSONObj& legacyCommand,
                     const int legacyQueryFlags,
                     BSONObj upconvertedCommand) {
     upconvertedCommand = addDollarDB(std::move(upconvertedCommand), "db");
-    auto converted = upconvertRequest("db", legacyCommand, legacyQueryFlags);
+    auto converted = upconvertRequest({boost::none, "db"}, legacyCommand, legacyQueryFlags);
 
     // We don't care about the order of the fields in the metadata object
     const auto sorted = [](const BSONObj& obj) {
@@ -66,34 +66,6 @@ void checkUpconvert(const BSONObj& legacyCommand,
 }
 
 TEST(Metadata, UpconvertValidMetadata) {
-    // Wrapped in $query, with readPref and slaveOk bit set.
-    checkUpconvert(BSON("$query" << BSON("ping" << 1) <<  //
-                        "$readPreference"
-                                 << BSON("mode"
-                                         << "secondary")),
-                   mongo::QueryOption_SecondaryOk,
-                   BSON("ping" << 1 << "$readPreference"
-                               << BSON("mode"
-                                       << "secondary")));
-
-    // Wrapped in 'query', with readPref.
-    checkUpconvert(BSON("query" << BSON("pong" << 1 << "foo"
-                                               << "bar")
-                                << "$readPreference"
-                                << BSON("mode"
-                                        << "primary"
-                                        << "tags"
-                                        << BSON("dc"
-                                                << "ny"))),
-                   0,
-                   BSON("pong" << 1 << "foo"
-                               << "bar"
-                               << "$readPreference"
-                               << BSON("mode"
-                                       << "primary"
-                                       << "tags"
-                                       << BSON("dc"
-                                               << "ny"))));
     // Unwrapped, no readPref, no slaveOk
     checkUpconvert(BSON("ping" << 1), 0, BSON("ping" << 1));
 
@@ -117,38 +89,6 @@ TEST(Metadata, UpconvertValidMetadata) {
                                         << "city"))));
 }
 
-TEST(Metadata, UpconvertInvalidMetadata) {
-    // has $maxTimeMS option
-    ASSERT_THROWS_CODE(upconvertRequest("db",
-                                        BSON("query" << BSON("foo"
-                                                             << "bar")
-                                                     << "$maxTimeMS" << 200),
-                                        0),
-                       AssertionException,
-                       ErrorCodes::InvalidOptions);
-    ASSERT_THROWS_CODE(upconvertRequest("db",
-                                        BSON("$query" << BSON("foo"
-                                                              << "bar")
-                                                      << "$maxTimeMS" << 200),
-                                        0),
-                       AssertionException,
-                       ErrorCodes::InvalidOptions);
-
-    // invalid wrapped query
-    ASSERT_THROWS(upconvertRequest("db", BSON("$query" << 1), 0), AssertionException);
-    ASSERT_THROWS(upconvertRequest("db",
-                                   BSON("$query"
-                                        << ""),
-                                   0),
-                  AssertionException);
-    ASSERT_THROWS(upconvertRequest("db", BSON("query" << 0), 0), AssertionException);
-    ASSERT_THROWS(upconvertRequest("db",
-                                   BSON("query"
-                                        << ""),
-                                   0),
-                  AssertionException);
-}
-
 TEST(Metadata, UpconvertDuplicateReadPreference) {
     auto secondaryReadPref = BSON("mode"
                                   << "secondary");
@@ -156,11 +96,12 @@ TEST(Metadata, UpconvertDuplicateReadPreference) {
                                 << "nearest");
 
     BSONObjBuilder bob;
-    bob.append("query", BSON("$readPreference" << secondaryReadPref));
+    bob.append("$queryOptions", BSON("$readPreference" << secondaryReadPref));
     bob.append("$readPreference", nearestReadPref);
 
-    ASSERT_THROWS_CODE(
-        rpc::upconvertRequest("db", bob.obj(), 0), AssertionException, ErrorCodes::InvalidOptions);
+    ASSERT_THROWS_CODE(rpc::upconvertRequest({boost::none, "db"}, bob.obj(), 0),
+                       AssertionException,
+                       ErrorCodes::InvalidOptions);
 }
 
 TEST(Metadata, UpconvertUsesDocumentSequecesCorrectly) {
@@ -181,8 +122,8 @@ TEST(Metadata, UpconvertUsesDocumentSequecesCorrectly) {
         fromjson("{NOT_insert: 'coll', documents:[{a:1}]}"),
     };
 
-    for (auto cmd : valid) {
-        const auto converted = rpc::upconvertRequest("db", cmd, 0);
+    for (const auto& cmd : valid) {
+        const auto converted = rpc::upconvertRequest({boost::none, "db"}, cmd, 0);
         ASSERT_BSONOBJ_EQ(converted.body, fromjson("{insert: 'coll', $db: 'db'}"));
         ASSERT_EQ(converted.sequences.size(), 1u);
         ASSERT_EQ(converted.sequences[0].name, "documents");
@@ -203,8 +144,8 @@ TEST(Metadata, UpconvertUsesDocumentSequecesCorrectly) {
         }
     }
 
-    for (auto cmd : invalid) {
-        const auto converted = rpc::upconvertRequest("db", cmd, 0);
+    for (const auto& cmd : invalid) {
+        const auto converted = rpc::upconvertRequest({boost::none, "db"}, cmd, 0);
         ASSERT_BSONOBJ_EQ(converted.body, addDollarDB(cmd, "db"));
         ASSERT_EQ(converted.sequences.size(), 0u);
     }

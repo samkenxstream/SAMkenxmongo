@@ -39,7 +39,10 @@ using EncryptedDBClientCallback = std::unique_ptr<DBClientBase>(std::unique_ptr<
                                                                 JS::HandleValue,
                                                                 JS::HandleObject,
                                                                 JSContext*);
-void setEncryptedDBClientCallback(EncryptedDBClientCallback* callback);
+
+using GetNestedConnectionCallback = DBClientBase*(DBClientBase*);
+void setEncryptedDBClientCallbacks(EncryptedDBClientCallback* encCallback,
+                                   GetNestedConnectionCallback* getCallback);
 
 /**
  * Shared code for the "Mongo" javascript object.
@@ -55,6 +58,7 @@ struct MongoBase : public BaseInfo {
     struct Functions {
         MONGO_DECLARE_JS_FUNCTION(auth);
         MONGO_DECLARE_JS_FUNCTION(close);
+        MONGO_DECLARE_JS_FUNCTION(cleanup);
         MONGO_DECLARE_JS_FUNCTION(compact);
         MONGO_DECLARE_JS_FUNCTION(cursorHandleFromId);
         MONGO_DECLARE_JS_FUNCTION(find);
@@ -76,9 +80,11 @@ struct MongoBase : public BaseInfo {
         MONGO_DECLARE_JS_FUNCTION(getApiParameters);
         MONGO_DECLARE_JS_FUNCTION(_runCommandImpl);
         MONGO_DECLARE_JS_FUNCTION(_startSession);
+        MONGO_DECLARE_JS_FUNCTION(_setOIDCIdPAuthCallback);
+        MONGO_DECLARE_JS_FUNCTION(_refreshAccessToken);
     };
 
-    static const JSFunctionSpec methods[21];
+    static const JSFunctionSpec methods[24];
 
     static const char* const className;
     static const unsigned classFlags = JSCLASS_HAS_PRIVATE;
@@ -105,6 +111,7 @@ public:
     virtual void getDataKeyCollection(JSContext* cx, JS::CallArgs args) = 0;
     virtual void encrypt(MozJSImplScope* scope, JSContext* cx, JS::CallArgs args) = 0;
     virtual void decrypt(MozJSImplScope* scope, JSContext* cx, JS::CallArgs args) = 0;
+    virtual void cleanup(JSContext* cx, JS::CallArgs args) = 0;
     virtual void compact(JSContext* cx, JS::CallArgs args) = 0;
     virtual void trace(JSTracer* trc) = 0;
 };

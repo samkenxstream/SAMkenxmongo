@@ -55,23 +55,24 @@ public:
 protected:
     void setUp() override {
         CatalogTestFixture::setUp();
+        Lock::GlobalWrite lk(operationContext());
 
-        std::shared_ptr<Collection> collection =
-            std::make_shared<CollectionMock>(TenantNamespace(boost::none, kNss));
+        std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(kNss);
         CollectionCatalog::write(getServiceContext(), [&](CollectionCatalog& catalog) {
-            catalog.registerCollection(operationContext(), UUID::gen(), std::move(collection));
+            auto uuid = collection->uuid();
+            catalog.registerCollection(
+                operationContext(), uuid, std::move(collection), /*ts=*/boost::none);
         });
     }
 
     CollectionPtr lookupCollectionFromCatalog() {
-        return CollectionCatalog::get(operationContext())
-            ->lookupCollectionByNamespace(operationContext(), kNss);
+        return CollectionPtr(CollectionCatalog::get(operationContext())
+                                 ->lookupCollectionByNamespace(operationContext(), kNss));
     }
 
     const Collection* lookupCollectionFromCatalogForRead() {
         return CollectionCatalog::get(operationContext())
-            ->lookupCollectionByNamespaceForRead(operationContext(), kNss)
-            .get();
+            ->lookupCollectionByNamespace(operationContext(), kNss);
     }
 
     void verifyCollectionInCatalogUsingDifferentClient(const Collection* expected) {
@@ -80,30 +81,17 @@ protected:
             auto opCtx = client->makeOperationContext();
             ASSERT_EQ(expected,
                       CollectionCatalog::get(opCtx.get())
-                          ->lookupCollectionByNamespace(opCtx.get(), kNss)
-                          .get());
+                          ->lookupCollectionByNamespace(opCtx.get(), kNss));
         });
         t.join();
     }
 
-    const NamespaceString kNss{"testdb", "testcol"};
+    const NamespaceString kNss =
+        NamespaceString::createNamespaceString_forTest("testdb", "testcol");
 };
 
-TEST_F(CollectionWriterTest, Inplace) {
-    CollectionWriter writer(operationContext(), kNss, CollectionCatalog::LifetimeMode::kInplace);
-
-    // CollectionWriter in Inplace mode should operate directly on the Collection instance stored in
-    // the catalog. So no Collection copy should be made.
-    ASSERT_EQ(writer.get(), lookupCollectionFromCatalog());
-    ASSERT_EQ(lookupCollectionFromCatalog().get(), lookupCollectionFromCatalogForRead());
-
-
-    auto writable = writer.getWritableCollection();
-    ASSERT_EQ(writable, lookupCollectionFromCatalog().get());
-    ASSERT_EQ(lookupCollectionFromCatalog().get(), lookupCollectionFromCatalogForRead());
-}
-
 TEST_F(CollectionWriterTest, Commit) {
+    AutoGetCollection lock(operationContext(), kNss, MODE_X);
     CollectionWriter writer(operationContext(), kNss);
 
     const Collection* before = lookupCollectionFromCatalog().get();
@@ -114,9 +102,8 @@ TEST_F(CollectionWriterTest, Commit) {
     ASSERT_EQ(lookupCollectionFromCatalog().get(), lookupCollectionFromCatalogForRead());
 
     {
-        AutoGetCollection lock(operationContext(), kNss, MODE_X);
         WriteUnitOfWork wuow(operationContext());
-        auto writable = writer.getWritableCollection();
+        auto writable = writer.getWritableCollection(operationContext());
 
         // get() and getWritableCollection() should return the same instance
         ASSERT_EQ(writer.get().get(), writable);
@@ -124,14 +111,12 @@ TEST_F(CollectionWriterTest, Commit) {
         // Regular catalog lookups for this OperationContext should see the uncommitted Collection
         ASSERT_EQ(writable, lookupCollectionFromCatalog().get());
 
+        // Lookup for read should also see uncommitted collection. This in theory supports nested
+        // read-only operations, if they ever occur during a top level write operation.
+        ASSERT_EQ(writable, lookupCollectionFromCatalogForRead());
+
         // Regular catalog lookups for different clients should not see any change in the catalog
         verifyCollectionInCatalogUsingDifferentClient(before);
-
-        // Lookup for read should not see the uncommitted Collection. This is fine as in reality
-        // this API should only be used for readers and there should be no uncommitted writes as
-        // there are in this unittest.
-        ASSERT_NE(writable, lookupCollectionFromCatalogForRead());
-
         wuow.commit();
     }
 
@@ -143,14 +128,14 @@ TEST_F(CollectionWriterTest, Commit) {
     before = lookupCollectionFromCatalog().get();
 
     {
-        AutoGetCollection lock(operationContext(), kNss, MODE_X);
         WriteUnitOfWork wuow(operationContext());
-        auto writable = writer.getWritableCollection();
+        auto writable = writer.getWritableCollection(operationContext());
 
         ASSERT_EQ(writer.get().get(), writable);
         ASSERT_EQ(writable, lookupCollectionFromCatalog().get());
+        ASSERT_EQ(writable, lookupCollectionFromCatalogForRead());
+
         verifyCollectionInCatalogUsingDifferentClient(before);
-        ASSERT_NE(writable, lookupCollectionFromCatalogForRead());
         wuow.commit();
     }
 
@@ -159,6 +144,7 @@ TEST_F(CollectionWriterTest, Commit) {
 }
 
 TEST_F(CollectionWriterTest, Rollback) {
+    AutoGetCollection lock(operationContext(), kNss, MODE_X);
     CollectionWriter writer(operationContext(), kNss);
 
     const Collection* before = lookupCollectionFromCatalog().get();
@@ -167,14 +153,13 @@ TEST_F(CollectionWriterTest, Rollback) {
     ASSERT_EQ(lookupCollectionFromCatalog().get(), lookupCollectionFromCatalogForRead());
 
     {
-        AutoGetCollection lock(operationContext(), kNss, MODE_X);
         WriteUnitOfWork wuow(operationContext());
-        auto writable = writer.getWritableCollection();
+        auto writable = writer.getWritableCollection(operationContext());
 
         ASSERT_EQ(writer.get().get(), writable);
         ASSERT_EQ(writable, lookupCollectionFromCatalog().get());
+        ASSERT_EQ(writable, lookupCollectionFromCatalogForRead());
         verifyCollectionInCatalogUsingDifferentClient(before);
-        ASSERT_NE(writable, lookupCollectionFromCatalogForRead());
     }
 
     // No update in the catalog should have happened
@@ -195,7 +180,7 @@ TEST_F(CollectionWriterTest, CommitAfterDestroy) {
             CollectionWriter writer(operationContext(), kNss);
 
             // Request a writable Collection and destroy CollectionWriter before WUOW commits
-            writable = writer.getWritableCollection();
+            writable = writer.getWritableCollection(operationContext());
         }
 
         wuow.commit();
@@ -206,17 +191,16 @@ TEST_F(CollectionWriterTest, CommitAfterDestroy) {
 }
 
 TEST_F(CollectionWriterTest, CatalogWrite) {
-    auto catalog = CollectionCatalog::get(getServiceContext());
+    auto catalog = CollectionCatalog::latest(getServiceContext());
     CollectionCatalog::write(
         getServiceContext(), [this, &catalog](CollectionCatalog& writableCatalog) {
             // We should see a different catalog instance than a reader would
             ASSERT_NE(&writableCatalog, catalog.get());
             // However, it should be a shallow copy. The collection instance should be the same
-            ASSERT_EQ(
-                writableCatalog.lookupCollectionByNamespaceForRead(operationContext(), kNss).get(),
-                catalog->lookupCollectionByNamespaceForRead(operationContext(), kNss).get());
+            ASSERT_EQ(writableCatalog.lookupCollectionByNamespace(operationContext(), kNss),
+                      catalog->lookupCollectionByNamespace(operationContext(), kNss));
         });
-    auto after = CollectionCatalog::get(getServiceContext());
+    auto after = CollectionCatalog::latest(getServiceContext());
     ASSERT_NE(&catalog, &after);
 }
 
@@ -265,14 +249,16 @@ public:
 
     void setUp() override {
         CatalogTestFixture::setUp();
+        Lock::GlobalWrite lk(operationContext());
 
         CollectionCatalog::write(getServiceContext(), [&](CollectionCatalog& catalog) {
             for (size_t i = 0; i < NumCollections; ++i) {
                 catalog.registerCollection(
                     operationContext(),
                     UUID::gen(),
-                    std::make_shared<CollectionMock>(TenantNamespace(
-                        boost::none, NamespaceString("many", fmt::format("coll{}", i)))));
+                    std::make_shared<CollectionMock>(NamespaceString::createNamespaceString_forTest(
+                        "many", fmt::format("coll{}", i))),
+                    /*ts=*/boost::none);
             }
         });
     }
@@ -307,6 +293,38 @@ TEST_F(CatalogReadCopyUpdateTest, ConcurrentCatalogWriteBatchingMayThrow) {
     for (auto&& thread : threads) {
         thread.join();
     }
+}
+
+class BatchedCollectionCatalogWriterTest : public CollectionWriterTest {
+public:
+    Collection* lookupCollectionFromCatalogForMetadataWrite() {
+        return CollectionCatalog::get(operationContext())
+            ->lookupCollectionByNamespaceForMetadataWrite(operationContext(), kNss);
+    }
+};
+
+TEST_F(BatchedCollectionCatalogWriterTest, BatchedTest) {
+
+    const Collection* before = lookupCollectionFromCatalogForRead();
+    const Collection* after = nullptr;
+    {
+        Lock::GlobalWrite lock(operationContext());
+        BatchedCollectionCatalogWriter batched(operationContext());
+
+        // We should get a unique clone the first time we request a writable collection
+        Collection* firstWritable = lookupCollectionFromCatalogForMetadataWrite();
+        ASSERT_NE(firstWritable, before);
+
+        // Subsequent requests should return the same instance.
+        Collection* secondWritable = lookupCollectionFromCatalogForMetadataWrite();
+        ASSERT_EQ(secondWritable, firstWritable);
+
+        after = firstWritable;
+    }
+
+    // When the batched writer commits our collection instance should be replaced.
+    ASSERT_NE(lookupCollectionFromCatalogForRead(), before);
+    ASSERT_EQ(lookupCollectionFromCatalogForRead(), after);
 }
 
 }  // namespace

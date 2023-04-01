@@ -29,7 +29,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include <boost/optional/optional_io.hpp>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -95,9 +94,14 @@ public:
         values.pop_front();
         return true;
     }
-    bool waitForData(Seconds) override {
+    bool waitForDataFor(Milliseconds, Interruptible*) override {
         // Blocking not supported.
         waitForDataCalled = true;
+        return !values.empty();
+    }
+    bool waitForDataUntil(Date_t, Interruptible*) override {
+        // Blocking not supported.
+        waitForDataUntilCalled = true;
         return !values.empty();
     }
     bool peek(OperationContext*, Value* value) override {
@@ -120,6 +124,7 @@ public:
     bool shutdownCalled = false;
     bool waitForSpaceCalled = false;
     bool waitForDataCalled = false;
+    bool waitForDataUntilCalled = false;
     bool tryPopCalled = false;
     bool peekCalled = false;
     mutable bool lastObjectPushedCalled = false;
@@ -264,11 +269,29 @@ TEST_F(OplogBufferProxyTest, WaitForDataReturnsTrueImmediatelyIfLastObjectPushed
     _proxy->push(_opCtx, values.cbegin(), values.cend());
     ASSERT_TRUE(_proxy->waitForData(Seconds(10)));
     ASSERT_FALSE(_mock->waitForDataCalled);
+    ASSERT_FALSE(_mock->waitForDataUntilCalled);
 }
 
 TEST_F(OplogBufferProxyTest, WaitForDataForwardsCallToTargetIfLastObjectPushedIsNotCached) {
     ASSERT_FALSE(_proxy->waitForData(Seconds(10)));
     ASSERT_TRUE(_mock->waitForDataCalled);
+    ASSERT_FALSE(_mock->waitForDataUntilCalled);
+}
+
+TEST_F(OplogBufferProxyTest, WaitForDataUntilReturnsTrueImmediatelyIfLastObjectPushedIsCached) {
+    OplogBuffer::Batch values = {BSON("x" << 1)};
+    _proxy->push(_opCtx, values.cbegin(), values.cend());
+    ASSERT_TRUE(
+        _proxy->waitForDataUntil(Date_t::now() + Seconds(10), Interruptible::notInterruptible()));
+    ASSERT_FALSE(_mock->waitForDataUntilCalled);
+    ASSERT_FALSE(_mock->waitForDataCalled);
+}
+
+TEST_F(OplogBufferProxyTest, WaitForDataUntilForwardsCallToTargetIfLastObjectPushedIsNotCached) {
+    ASSERT_FALSE(
+        _proxy->waitForDataUntil(Date_t::now() + Seconds(10), Interruptible::notInterruptible()));
+    ASSERT_TRUE(_mock->waitForDataUntilCalled);
+    ASSERT_FALSE(_mock->waitForDataCalled);
 }
 
 TEST_F(OplogBufferProxyTest, TryPopResetsLastPushedObjectIfBufferIsEmpty) {

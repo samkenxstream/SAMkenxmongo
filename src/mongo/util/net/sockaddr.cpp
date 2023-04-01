@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -41,7 +40,7 @@
 
 #if !defined(_WIN32)
 #include <arpa/inet.h>
-#include <errno.h>
+#include <cerrno>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -58,6 +57,9 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/itoa.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo {
 namespace {
@@ -97,8 +99,8 @@ AddrInfoPtr resolveAddrInfo(StringData hostOrIp, int port, sa_family_t familyHin
     };
 
     auto validateResolution = [](AddrError addrErr) -> AddrInfoPtr {
-        uassert(ErrorCodes::HostUnreachable, getAddrInfoStrError(addrErr.err), addrErr.err == 0);
-
+        auto ec = addrInfoError(addrErr.err);
+        uassert(ErrorCodes::HostUnreachable, errorMessage(ec), !ec);
         return std::move(addrErr.addr);
     };
 
@@ -116,15 +118,6 @@ AddrInfoPtr resolveAddrInfo(StringData hostOrIp, int port, sa_family_t familyHin
 }
 
 }  // namespace
-
-std::string getAddrInfoStrError(int code) {
-#if !defined(_WIN32)
-    return gai_strerror(code);
-#else
-    /* gai_strerrorA is not threadsafe on windows. don't use it. */
-    return errnoWithDescription(code);
-#endif
-}
 
 SockAddr::SockAddr() {
     addressSize = sizeof(sa);
@@ -301,6 +294,16 @@ unsigned SockAddr::getPort() const {
     }
 }
 
+void SockAddr::setPort(int port) {
+    if (auto type = getType(); type == AF_INET) {
+        as<sockaddr_in>().sin_port = htons(port);
+    } else if (type == AF_INET6) {
+        as<sockaddr_in6>().sin6_port = htons(port);
+    } else {
+        massert(SOCK_FAMILY_UNKNOWN_ERROR, "unsupported address family", false);
+    }
+}
+
 std::string SockAddr::getAddr() const {
     switch (getType()) {
         case AF_INET:
@@ -308,8 +311,9 @@ std::string SockAddr::getAddr() const {
             const int buflen = 128;
             char buffer[buflen];
             int ret = getnameinfo(raw(), addressSize, buffer, buflen, nullptr, 0, NI_NUMERICHOST);
-            massert(
-                13082, str::stream() << "getnameinfo error " << getAddrInfoStrError(ret), ret == 0);
+            massert(13082,
+                    str::stream() << "getnameinfo error " << errorMessage(addrInfoError(ret)),
+                    ret == 0);
             return buffer;
         }
 

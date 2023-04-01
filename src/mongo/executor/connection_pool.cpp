@@ -27,16 +27,16 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kConnectionPool
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/executor/connection_pool.h"
 
+#include "mongo/db/service_context.h"
 #include <fmt/format.h>
 #include <fmt/ostream.h>
+#include <memory>
 
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/logv2/log.h"
@@ -47,6 +47,9 @@
 #include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/lru_cache.h"
 #include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kConnectionPool
+
 
 using namespace fmt::literals;
 
@@ -62,6 +65,7 @@ namespace mongo {
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(refreshConnectionAfterEveryCommand);
+MONGO_FAIL_POINT_DEFINE(forceExecutorConnectionPoolTimeout);
 
 auto makeSeveritySuppressor() {
     return std::make_unique<logv2::KeyedSeveritySuppressor<HostAndPort>>(
@@ -94,6 +98,7 @@ void ConnectionPool::ConnectionInterface::indicateUsed() {
     // It is illegal to attempt to use a connection after calling indicateFailure().
     invariant(_status.isOK() || _status == ConnectionPool::kConnectionStateUnknown);
     _lastUsed = now();
+    _timesUsed++;
 }
 
 void ConnectionPool::ConnectionInterface::indicateSuccess() {
@@ -106,6 +111,10 @@ void ConnectionPool::ConnectionInterface::indicateFailure(Status status) {
 
 Date_t ConnectionPool::ConnectionInterface::getLastUsed() const {
     return _lastUsed;
+}
+
+size_t ConnectionPool::ConnectionInterface::getTimesUsed() const {
+    return _timesUsed;
 }
 
 const Status& ConnectionPool::ConnectionInterface::getStatus() const {
@@ -137,8 +146,8 @@ std::string ConnectionPool::ConnectionControls::toString() const {
 }
 
 std::string ConnectionPool::HostState::toString() const {
-    return "{{ requests: {}, ready: {}, pending: {}, active: {}, isExpired: {} }}"_format(
-        requests, ready, pending, active, health.isExpired);
+    return "{{ requests: {}, ready: {}, pending: {}, active: {}, leased: {}, isExpired: {} }}"_format(
+        requests, ready, pending, active, leased, health.isExpired);
 }
 
 /**
@@ -162,7 +171,7 @@ public:
         const auto minConns = getPool()->_options.minConnections;
         const auto maxConns = getPool()->_options.maxConnections;
 
-        data.target = stats.requests + stats.active;
+        data.target = stats.requests + stats.active + stats.leased;
         if (data.target < minConns) {
             data.target = minConns;
         } else if (data.target > maxConns) {
@@ -275,7 +284,9 @@ public:
      * Gets a connection from the specific pool. Sinks a unique_lock from the
      * parent to preserve the lock on _mutex
      */
-    Future<ConnectionHandle> getConnection(Milliseconds timeout);
+    Future<ConnectionHandle> getConnection(Milliseconds timeout,
+                                           bool lease,
+                                           ErrorCodes::Error timeoutCode);
 
     /**
      * Triggers the shutdown procedure. This function sets isShutdown to true
@@ -298,6 +309,11 @@ public:
     size_t inUseConnections() const;
 
     /**
+     * Returns the number of leased connections from the pool.
+     */
+    size_t leasedConnections() const;
+
+    /**
      * Returns the number of available connections in the pool.
      */
     size_t availableConnections() const;
@@ -318,9 +334,24 @@ public:
     size_t createdConnections() const;
 
     /**
+     * Returns the number of connections that expire and are destroyed before they are ever used.
+     */
+    size_t neverUsedConnections() const;
+
+    /**
+     * Returns the number of connections that were used only once before being destroyed.
+     */
+    size_t getOnceUsedConnections() const;
+
+    /**
+     * Returns the cumulative amount of time connections were in use by operations.
+     */
+    Milliseconds getTotalConnUsageTime() const;
+
+    /**
      * Returns the total number of connections currently open that belong to
      * this pool. This is the sum of refreshingConnections, availableConnections,
-     * and inUseConnections.
+     * inUseConnections, and leasedConnections.
      */
     size_t openConnections() const;
 
@@ -328,6 +359,22 @@ public:
      * Returns the number of unfulfilled requests pending.
      */
     size_t requestsPending() const;
+
+    /**
+     * Records the time it took to return the connection since it was requested, so that it can be
+     * reported in the connection pool stats.
+     */
+    void recordConnectionWaitTime(Date_t requestedAt) {
+        _connAcquisitionWaitTimeStats.increment(_parent->_factory->now() - requestedAt);
+    }
+
+    /**
+     * Returns connection acquisition wait time statistics to be included in the connection pool
+     * stats.
+     */
+    const ConnectionWaitTimeHistogram& connectionWaitTimeStats() {
+        return _connAcquisitionWaitTimeStats;
+    };
 
     /**
      * Returns the HostAndPort for this pool.
@@ -361,14 +408,46 @@ private:
     using OwnedConnection = std::shared_ptr<ConnectionInterface>;
     using OwnershipPool = stdx::unordered_map<ConnectionInterface*, OwnedConnection>;
     using LRUOwnershipPool = LRUCache<OwnershipPool::key_type, OwnershipPool::mapped_type>;
-    using Request = std::pair<Date_t, Promise<ConnectionHandle>>;
+    struct Request {
+        Date_t expiration;
+        Promise<ConnectionHandle> promise;
+        // Whether or not the requested connection should be "leased".
+        bool lease;
+        ErrorCodes::Error timeoutCode;
+    };
+
     struct RequestComparator {
-        bool operator()(const Request& a, const Request& b) {
-            return a.first > b.first;
+        bool operator()(const Request& a, const Request& b) const {
+            return a.expiration > b.expiration;
         }
     };
 
-    ConnectionHandle makeHandle(ConnectionInterface* connection);
+    ConnectionHandle makeHandle(ConnectionInterface* connection, bool isLeased);
+
+    /**
+     * Given a uniquely-owned OwnedConnection, returns an OwnedConnection
+     * pointing to the same object, but which gathers stats just before destruction.
+     */
+    OwnedConnection makeDeathNotificationWrapper(OwnedConnection h) {
+        invariant(h.use_count() == 1);
+        struct ConnWrap {
+            ConnWrap(OwnedConnection conn, std::weak_ptr<SpecificPool> owner)
+                : conn{std::move(conn)}, owner{std::move(owner)} {}
+            ~ConnWrap() {
+                if (conn->getTimesUsed() == 0) {
+                    if (auto ownerSp = owner.lock())
+                        ownerSp->_neverUsed.fetchAndAddRelaxed(1);
+                } else if (conn->getTimesUsed() == 1) {
+                    if (auto ownerSp = owner.lock())
+                        ownerSp->_usedOnce.fetchAndAddRelaxed(1);
+                }
+            }
+            const OwnedConnection conn;
+            const std::weak_ptr<SpecificPool> owner;
+        };
+        ConnectionInterface* ptr = h.get();
+        return {std::make_shared<ConnWrap>(std::move(h), shared_from_this()), ptr};
+    }
 
     /**
      * Establishes connections until the ControllerInterface's target is met.
@@ -381,11 +460,11 @@ private:
 
     void fulfillRequests();
 
-    void returnConnection(ConnectionInterface* connPtr);
+    void returnConnection(ConnectionInterface* connPtr, bool isLeased);
 
     // This internal helper is used both by get and by _fulfillRequests and differs in that it
     // skips some bookkeeping that the other callers do on their own
-    ConnectionHandle tryGetConnection();
+    ConnectionHandle tryGetConnection(bool lease);
 
     template <typename OwnershipPoolType>
     typename OwnershipPoolType::mapped_type takeFromPool(
@@ -414,6 +493,7 @@ private:
     OwnershipPool _processingPool;
     OwnershipPool _droppedProcessingPool;
     OwnershipPool _checkedOutPool;
+    OwnershipPool _leasedPool;
 
     std::vector<Request> _requests;
     Date_t _lastActiveTime;
@@ -436,6 +516,14 @@ private:
     size_t _created = 0;
 
     size_t _refreshed = 0;
+
+    AtomicWord<size_t> _neverUsed{0};
+
+    AtomicWord<size_t> _usedOnce{0};
+
+    Milliseconds _totalConnUsageTime{0};
+
+    ConnectionWaitTimeHistogram _connAcquisitionWaitTimeStats{};
 
     transport::Session::TagMask _tags = transport::Session::kPending;
 
@@ -548,21 +636,42 @@ void ConnectionPool::mutateTags(
     pool->mutateTags(mutateFunc);
 }
 
-void ConnectionPool::get_forTest(const HostAndPort& hostAndPort,
-                                 Milliseconds timeout,
-                                 GetConnectionCallback cb) {
+void ConnectionPool::retrieve_forTest(RetrieveConnection retrieve, GetConnectionCallback cb) {
     // We kick ourselves onto the executor queue to prevent us from deadlocking with our own thread
-    auto getConnectionFunc = [this, hostAndPort, timeout, cb = std::move(cb)](Status&&) mutable {
-        get(hostAndPort, transport::kGlobalSSLMode, timeout)
-            .thenRunOn(_factory->getExecutor())
-            .getAsync(std::move(cb));
-    };
+    auto getConnectionFunc =
+        [this, retrieve = std::move(retrieve), cb = std::move(cb)](Status&&) mutable {
+            retrieve().thenRunOn(_factory->getExecutor()).getAsync(std::move(cb));
+        };
     _factory->getExecutor()->schedule(std::move(getConnectionFunc));
 }
 
-SemiFuture<ConnectionPool::ConnectionHandle> ConnectionPool::get(const HostAndPort& hostAndPort,
-                                                                 transport::ConnectSSLMode sslMode,
-                                                                 Milliseconds timeout) {
+void ConnectionPool::get_forTest(const HostAndPort& hostAndPort,
+                                 Milliseconds timeout,
+                                 ErrorCodes::Error timeoutCode,
+                                 GetConnectionCallback cb) {
+    auto getConnectionFunc = [this, hostAndPort, timeout, timeoutCode]() mutable {
+        return get(hostAndPort, transport::kGlobalSSLMode, timeout, timeoutCode);
+    };
+    retrieve_forTest(getConnectionFunc, std::move(cb));
+}
+
+void ConnectionPool::lease_forTest(const HostAndPort& hostAndPort,
+                                   Milliseconds timeout,
+                                   ErrorCodes::Error timeoutCode,
+                                   GetConnectionCallback cb) {
+    auto getConnectionFunc = [this, hostAndPort, timeout, timeoutCode]() mutable {
+        return lease(hostAndPort, transport::kGlobalSSLMode, timeout, timeoutCode);
+    };
+    retrieve_forTest(getConnectionFunc, std::move(cb));
+}
+
+SemiFuture<ConnectionPool::ConnectionHandle> ConnectionPool::_get(const HostAndPort& hostAndPort,
+                                                                  transport::ConnectSSLMode sslMode,
+                                                                  Milliseconds timeout,
+                                                                  bool lease,
+                                                                  ErrorCodes::Error timeoutCode) {
+    auto connRequestedAt = _factory->now();
+
     stdx::lock_guard lk(_mutex);
 
     auto& pool = _pools[hostAndPort];
@@ -574,8 +683,16 @@ SemiFuture<ConnectionPool::ConnectionHandle> ConnectionPool::get(const HostAndPo
 
     invariant(pool);
 
-    auto connFuture = pool->getConnection(timeout);
+    auto connFuture = pool->getConnection(timeout, lease, timeoutCode);
     pool->updateState();
+
+    // Only count connections being checked-out for ordinary use, not lease, towards cumulative wait
+    // time.
+    if (gFeatureFlagConnHealthMetrics.isEnabledAndIgnoreFCV() && !lease) {
+        connFuture = std::move(connFuture).tap([connRequestedAt, pool = pool](const auto& conn) {
+            pool->recordConnectionWaitTime(connRequestedAt);
+        });
+    }
 
     return std::move(connFuture).semi();
 }
@@ -590,9 +707,17 @@ void ConnectionPool::appendConnectionStats(ConnectionPoolStats* stats) const {
         auto& pool = kv.second;
         ConnectionStatsPer hostStats{pool->inUseConnections(),
                                      pool->availableConnections(),
+                                     pool->leasedConnections(),
                                      pool->createdConnections(),
                                      pool->refreshingConnections(),
-                                     pool->refreshedConnections()};
+                                     pool->refreshedConnections(),
+                                     pool->neverUsedConnections(),
+                                     pool->getOnceUsedConnections(),
+                                     pool->getTotalConnUsageTime()};
+
+        if (gFeatureFlagConnHealthMetrics.isEnabledAndIgnoreFCV()) {
+            hostStats.acquisitionWaitTimes = pool->connectionWaitTimeStats();
+        }
         stats->updateStatsForHost(_name, host, hostStats);
     }
 }
@@ -625,6 +750,7 @@ ConnectionPool::SpecificPool::~SpecificPool() {
     if (shouldInvariantOnPoolCorrectness()) {
         invariant(_requests.empty());
         invariant(_checkedOutPool.empty());
+        invariant(_leasedPool.empty());
     }
 }
 
@@ -634,6 +760,10 @@ size_t ConnectionPool::SpecificPool::inUseConnections() const {
 
 size_t ConnectionPool::SpecificPool::availableConnections() const {
     return _readyPool.size();
+}
+
+size_t ConnectionPool::SpecificPool::leasedConnections() const {
+    return _leasedPool.size();
 }
 
 size_t ConnectionPool::SpecificPool::refreshingConnections() const {
@@ -648,8 +778,20 @@ size_t ConnectionPool::SpecificPool::createdConnections() const {
     return _created;
 }
 
+size_t ConnectionPool::SpecificPool::neverUsedConnections() const {
+    return _neverUsed.loadRelaxed();
+}
+
+size_t ConnectionPool::SpecificPool::getOnceUsedConnections() const {
+    return _usedOnce.loadRelaxed();
+}
+
+Milliseconds ConnectionPool::SpecificPool::getTotalConnUsageTime() const {
+    return _totalConnUsageTime;
+}
+
 size_t ConnectionPool::SpecificPool::openConnections() const {
-    return _checkedOutPool.size() + _readyPool.size() + _processingPool.size();
+    return _checkedOutPool.size() + _readyPool.size() + _processingPool.size() + _leasedPool.size();
 }
 
 size_t ConnectionPool::SpecificPool::requestsPending() const {
@@ -657,15 +799,41 @@ size_t ConnectionPool::SpecificPool::requestsPending() const {
 }
 
 Future<ConnectionPool::ConnectionHandle> ConnectionPool::SpecificPool::getConnection(
-    Milliseconds timeout) {
+    Milliseconds timeout, bool lease, ErrorCodes::Error timeoutCode) {
 
     // Reset our activity timestamp
     auto now = _parent->_factory->now();
     _lastActiveTime = now;
 
+    auto pendingTimeout = _parent->_controller->pendingTimeout();
+    if (timeout < Milliseconds(0) || timeout > pendingTimeout) {
+        timeout = pendingTimeout;
+        // If controller's pending timeout is closest, timeoutCode is rewritten to the internal time
+        // limit error
+        timeoutCode = ErrorCodes::NetworkInterfaceExceededTimeLimit;
+    }
+
+    if (auto sfp = forceExecutorConnectionPoolTimeout.scoped(); MONGO_unlikely(sfp.isActive())) {
+        if (const Milliseconds failpointTimeout{sfp.getData()["timeout"].numberInt()};
+            failpointTimeout > Milliseconds{0}) {
+            auto pf = makePromiseFuture<ConnectionHandle>();
+            auto request = std::make_shared<Request>();
+            request->expiration = now + failpointTimeout;
+            request->promise = std::move(pf.promise);
+            request->timeoutCode = timeoutCode;
+            auto timeoutTimer = _parent->_factory->makeTimer();
+            timeoutTimer->setTimeout(failpointTimeout, [request, timeoutTimer]() mutable {
+                request->promise.setError(Status(
+                    request->timeoutCode,
+                    "Connection timed out due to forceExecutorConnectionPoolTimeout failpoint"));
+            });
+            return std::move(pf.future);
+        }
+    }
+
     // If we do not have requests, then we can fulfill immediately
     if (_requests.size() == 0) {
-        auto conn = tryGetConnection();
+        auto conn = tryGetConnection(lease);
 
         if (conn) {
             LOGV2_DEBUG(22559,
@@ -677,10 +845,6 @@ Future<ConnectionPool::ConnectionHandle> ConnectionPool::SpecificPool::getConnec
         }
     }
 
-    auto pendingTimeout = _parent->_controller->pendingTimeout();
-    if (timeout < Milliseconds(0) || timeout > pendingTimeout) {
-        timeout = pendingTimeout;
-    }
     LOGV2_DEBUG(22560,
                 kDiagnosticLogLevel,
                 "Requesting new connection to {hostAndPort} with timeout {timeout}",
@@ -691,23 +855,32 @@ Future<ConnectionPool::ConnectionHandle> ConnectionPool::SpecificPool::getConnec
     const auto expiration = now + timeout;
     auto pf = makePromiseFuture<ConnectionHandle>();
 
-    _requests.push_back(make_pair(expiration, std::move(pf.promise)));
+    _requests.push_back({expiration, std::move(pf.promise), lease, timeoutCode});
     std::push_heap(begin(_requests), end(_requests), RequestComparator{});
 
     return std::move(pf.future);
 }
 
-auto ConnectionPool::SpecificPool::makeHandle(ConnectionInterface* connection) -> ConnectionHandle {
-    auto deleter = [this, anchor = shared_from_this()](ConnectionInterface* connection) {
+auto ConnectionPool::SpecificPool::makeHandle(ConnectionInterface* connection, bool isLeased)
+    -> ConnectionHandle {
+    auto connUseStartedAt = _parent->_getFastClockSource()->now();
+    auto deleter = [this, anchor = shared_from_this(), connUseStartedAt, isLeased](
+                       ConnectionInterface* connection) {
         stdx::lock_guard lk(_parent->_mutex);
-        returnConnection(connection);
+
+        // Leased connections don't count towards the pool's total connection usage time.
+        if (!isLeased) {
+            _totalConnUsageTime += _parent->_getFastClockSource()->now() - connUseStartedAt;
+        }
+
+        returnConnection(connection, isLeased);
         _lastActiveTime = _parent->_factory->now();
         updateState();
     };
     return ConnectionHandle(connection, std::move(deleter));
 }
 
-ConnectionPool::ConnectionHandle ConnectionPool::SpecificPool::tryGetConnection() {
+ConnectionPool::ConnectionHandle ConnectionPool::SpecificPool::tryGetConnection(bool lease) {
     while (_readyPool.size()) {
         // _readyPool is an LRUCache, so its begin() object is the MRU item.
         auto iter = _readyPool.begin();
@@ -729,12 +902,15 @@ ConnectionPool::ConnectionHandle ConnectionPool::SpecificPool::tryGetConnection(
 
         auto connPtr = conn.get();
 
-        // check out the connection
-        _checkedOutPool[connPtr] = std::move(conn);
+        if (lease) {
+            _leasedPool[connPtr] = std::move(conn);
+        } else {
+            _checkedOutPool[connPtr] = std::move(conn);
+        }
 
         // pass it to the user
         connPtr->resetToUnknown();
-        auto handle = makeHandle(connPtr);
+        auto handle = makeHandle(connPtr, lease);
         return handle;
     }
 
@@ -766,6 +942,17 @@ void ConnectionPool::SpecificPool::finishRefresh(ConnectionInterface* connPtr, S
                     "Pending connection did not complete within the timeout, "
                     "retrying with a new connection",
                     "hostAndPort"_attr = _hostAndPort,
+                    "numOpenConns"_attr = openConnections());
+        return;
+    }
+
+    // If the error can be contained to one connection, drop the one connection.
+    if (status.code() == ErrorCodes::ConnectionError) {
+        LOGV2_DEBUG(6832901,
+                    kDiagnosticLogLevel,
+                    "Dropping single connection",
+                    "hostAndPort"_attr = _hostAndPort,
+                    "error"_attr = redact(status),
                     "numOpenConns"_attr = openConnections());
         return;
     }
@@ -804,10 +991,10 @@ void ConnectionPool::SpecificPool::finishRefresh(ConnectionInterface* connPtr, S
     fulfillRequests();
 }
 
-void ConnectionPool::SpecificPool::returnConnection(ConnectionInterface* connPtr) {
+void ConnectionPool::SpecificPool::returnConnection(ConnectionInterface* connPtr, bool isLeased) {
     auto needsRefreshTP = connPtr->getLastUsed() + _parent->_controller->toRefreshTimeout();
 
-    auto conn = takeFromPool(_checkedOutPool, connPtr);
+    auto conn = takeFromPool(isLeased ? _leasedPool : _checkedOutPool, connPtr);
     invariant(conn);
 
     if (_health.isShutdown) {
@@ -842,8 +1029,7 @@ void ConnectionPool::SpecificPool::returnConnection(ConnectionInterface* connPtr
 
     if (shouldRefreshConnection) {
         auto controls = _parent->_controller->getControls(_id);
-        if (_readyPool.size() + _processingPool.size() + _checkedOutPool.size() >=
-            controls.targetConnections) {
+        if (openConnections() >= controls.targetConnections) {
             // If we already have minConnections, just let the connection lapse
             LOGV2(22567,
                   "Ending idle connection to host {hostAndPort} because the pool meets "
@@ -910,7 +1096,7 @@ void ConnectionPool::SpecificPool::addToReady(OwnedConnection conn) {
 
         connPtr->indicateSuccess();
 
-        returnConnection(connPtr);
+        returnConnection(connPtr, false);
     });
     connPtr->setTimeout(_parent->_controller->toRefreshTimeout(), std::move(returnConnectionFunc));
 }
@@ -977,7 +1163,7 @@ void ConnectionPool::SpecificPool::processFailure(const Status& status) {
     }
 
     for (auto& request : _requests) {
-        request.second.setError(status);
+        request.promise.setError(status);
     }
 
     LOGV2_DEBUG(22573,
@@ -999,14 +1185,14 @@ void ConnectionPool::SpecificPool::fulfillRequests() {
         // deadlock).
         //
         // None of the heap manipulation code throws, but it's something to keep in mind.
-        auto conn = tryGetConnection();
+        auto conn = tryGetConnection(_requests.front().lease);
 
         if (!conn) {
             break;
         }
 
         // Grab the request and callback
-        auto promise = std::move(_requests.front().second);
+        auto promise = std::move(_requests.front().promise);
         std::pop_heap(begin(_requests), end(_requests), RequestComparator{});
         _requests.pop_back();
 
@@ -1076,6 +1262,7 @@ void ConnectionPool::SpecificPool::spawnConnections() {
                         "reason"_attr = e.what());
         }
 
+        handle = makeDeathNotificationWrapper(std::move(handle));
         _processingPool[handle.get()] = handle;
         ++_created;
 
@@ -1114,7 +1301,8 @@ void ConnectionPool::SpecificPool::updateHealth() {
     const auto now = _parent->_factory->now();
 
     // We're expired if we have no sign of connection use and are past our expiry
-    _health.isExpired = _requests.empty() && _checkedOutPool.empty() && (_hostExpiration <= now);
+    _health.isExpired = _requests.empty() && _checkedOutPool.empty() && _leasedPool.empty() &&
+        (_hostExpiration <= now);
 
     // We're failed until we get new requests or our timer triggers
     if (_health.isFailed) {
@@ -1132,7 +1320,7 @@ void ConnectionPool::SpecificPool::updateEventTimer() {
     }
 
     // If our expiration comes before our next event, then it is the next event
-    if (_requests.empty() && _checkedOutPool.empty()) {
+    if (_requests.empty() && _checkedOutPool.empty() && _leasedPool.empty()) {
         _hostExpiration = _lastActiveTime + _parent->_controller->hostTimeout();
         if ((_hostExpiration > now) && (_hostExpiration < nextEventTime)) {
             nextEventTime = _hostExpiration;
@@ -1140,8 +1328,8 @@ void ConnectionPool::SpecificPool::updateEventTimer() {
     }
 
     // If a request would timeout before the next event, then it is the next event
-    if (_requests.size() && (_requests.front().first < nextEventTime)) {
-        nextEventTime = _requests.front().first;
+    if (_requests.size() && (_requests.front().expiration < nextEventTime)) {
+        nextEventTime = _requests.front().expiration;
     }
 
     // Clamp next event time to be either now or in the future. Next event time
@@ -1169,12 +1357,12 @@ void ConnectionPool::SpecificPool::updateEventTimer() {
 
         _health.isFailed = false;
 
-        while (_requests.size() && (_requests.front().first <= now)) {
+        while (_requests.size() && (_requests.front().expiration <= now)) {
             std::pop_heap(begin(_requests), end(_requests), RequestComparator{});
 
             auto& request = _requests.back();
-            request.second.setError(Status(ErrorCodes::NetworkInterfaceExceededTimeLimit,
-                                           "Couldn't get a connection within the time limit"));
+            request.promise.setError(
+                Status(request.timeoutCode, "Couldn't get a connection within the time limit"));
             _requests.pop_back();
 
             // Since we've failed a request, we've interacted with external users
@@ -1198,6 +1386,7 @@ void ConnectionPool::SpecificPool::updateController() {
         refreshingConnections(),
         availableConnections(),
         inUseConnections(),
+        leasedConnections(),
     };
     LOGV2_DEBUG(22578,
                 kDiagnosticLogLevel,
@@ -1236,6 +1425,7 @@ void ConnectionPool::SpecificPool::updateController() {
             if (shouldInvariantOnPoolCorrectness()) {
                 invariant(pool->_checkedOutPool.empty());
                 invariant(pool->_requests.empty());
+                invariant(pool->_leasedPool.empty());
             }
 
             pool->triggerShutdown(Status(ErrorCodes::ConnectionPoolExpired,
@@ -1282,6 +1472,10 @@ void ConnectionPool::SpecificPool::updateState() {
             _updateScheduled = false;
             updateController();
         });
+}
+
+ClockSource* ConnectionPool::DependentTypeFactoryInterface::getFastClockSource() {
+    return getGlobalServiceContext()->getFastClockSource();
 }
 
 }  // namespace executor

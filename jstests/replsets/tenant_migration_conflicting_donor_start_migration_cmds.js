@@ -3,7 +3,6 @@
  * conflicting donorStartMigration commands.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
@@ -11,19 +10,26 @@
  *   serverless,
  * ]
  */
-(function() {
-'use strict';
+
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    getCertificateAndPrivateKey,
+    isShardMergeEnabled,
+    makeX509OptionsForTest,
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
+
+function getRecipientSyncDataMetrics(recipientPrimary) {
+    return recipientPrimary.adminCommand({serverStatus: 1}).metrics.commands.recipientSyncData;
+}
 
 /**
  * Asserts that the number of recipientDataSync commands executed on the given recipient primary is
  * equal to the given number.
  */
 function checkNumRecipientSyncDataCmdExecuted(recipientPrimary, expectedNumExecuted) {
-    const recipientSyncDataMetrics =
-        recipientPrimary.adminCommand({serverStatus: 1}).metrics.commands.recipientSyncData;
+    const recipientSyncDataMetrics = getRecipientSyncDataMetrics(recipientPrimary);
     assert.eq(0, recipientSyncDataMetrics.failed);
     assert.eq(expectedNumExecuted, recipientSyncDataMetrics.total);
 }
@@ -45,60 +51,44 @@ function assertNoCertificateOrPrivateKey(string) {
     assert(!string.includes("PRIVATE KEY"), "found private key");
 }
 
-const kTenantIdPrefix = "testTenantId";
-let tenantCounter = 0;
+const {donor: donorNodeOptions} = makeX509OptionsForTest();
+donorNodeOptions.setParameter = donorNodeOptions.setParameter || {};
+Object.assign(donorNodeOptions.setParameter, {
+    tenantMigrationGarbageCollectionDelayMS: 1 * 1000,
+    ttlMonitorSleepSecs: 1,
+});
+const donorRst = new ReplSetTest({
+    nodes: 1,
+    name: 'donorRst',
+    serverless: true,
+    nodeOptions: donorNodeOptions,
+});
 
-/**
- * Returns a tenantId that will not match any existing prefix.
- */
-function generateUniqueTenantId() {
-    return kTenantIdPrefix + tenantCounter++;
-}
+donorRst.startSet();
+donorRst.initiate();
 
-function setup() {
-    const {donor: donorNodeOptions} = TenantMigrationUtil.makeX509OptionsForTest();
-    donorNodeOptions.setParameter = donorNodeOptions.setParameter || {};
-    Object.assign(donorNodeOptions.setParameter, {
-        tenantMigrationGarbageCollectionDelayMS: 1 * 1000,
-        ttlMonitorSleepSecs: 1,
-    });
-    const donorRst = new ReplSetTest({
-        nodes: 1,
-        name: 'donorRst',
-        nodeOptions: donorNodeOptions,
-    });
+const tenantMigrationTest =
+    new TenantMigrationTest({name: jsTestName(), donorRst, quickGarbageCollection: true});
 
-    donorRst.startSet();
-    donorRst.initiate();
+const donorPrimary = donorRst.getPrimary();
+const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 
-    const tenantMigrationTest =
-        new TenantMigrationTest({name: jsTestName(), donorRst, quickGarbageCollection: true});
-
-    const donorPrimary = donorRst.getPrimary();
-    const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
-
-    return {
-        tenantMigrationTest,
-        donorRst,
-        donorPrimary,
-        recipientPrimary,
-        teardown: function() {
-            tenantMigrationTest.stop();
-            donorRst.stopSet();
-        },
-    };
+function teardown() {
+    tenantMigrationTest.stop();
+    donorRst.stopSet();
 }
 
 // Test that a retry of a donorStartMigration command joins the existing migration that has
 // completed but has not been garbage-collected.
 (() => {
-    const tenantId = `${generateUniqueTenantId()}RetryAfterMigrationCompletes`;
+    const tenantId = ObjectId().str;
+    const migrationId = UUID();
     const migrationOpts = {
-        migrationIdString: extractUUIDFromObject(UUID()),
+        migrationIdString: extractUUIDFromObject(migrationId),
         tenantId,
     };
 
-    const {tenantMigrationTest, recipientPrimary, teardown} = setup();
+    const recipientSyncDataMetrics = getRecipientSyncDataMetrics(recipientPrimary);
 
     TenantMigrationTest.assertCommitted(
         tenantMigrationTest.runMigration(migrationOpts, {automaticForgetMigration: false}));
@@ -107,21 +97,22 @@ function setup() {
 
     // If the second donorStartMigration had started a duplicate migration, the recipient would have
     // received four recipientSyncData commands instead of two.
-    checkNumRecipientSyncDataCmdExecuted(recipientPrimary, 2);
+    checkNumRecipientSyncDataCmdExecuted(recipientPrimary, recipientSyncDataMetrics.total + 2);
 
     assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
-    teardown();
+    tenantMigrationTest.waitForMigrationGarbageCollection(migrationId, tenantId);
 })();
 
 // Test that a retry of a donorStartMigration command joins the ongoing migration.
 (() => {
-    const tenantId = `${generateUniqueTenantId()}RetryBeforeMigrationCompletes`;
+    const tenantId = ObjectId().str;
+    const migrationId = UUID();
     const migrationOpts = {
-        migrationIdString: extractUUIDFromObject(UUID()),
+        migrationIdString: extractUUIDFromObject(migrationId),
         tenantId,
     };
 
-    const {tenantMigrationTest, recipientPrimary, teardown} = setup();
+    const recipientSyncDataMetrics = getRecipientSyncDataMetrics(recipientPrimary);
 
     assert.commandWorked(tenantMigrationTest.startMigration(migrationOpts));
     assert.commandWorked(tenantMigrationTest.startMigration(migrationOpts));
@@ -133,10 +124,10 @@ function setup() {
 
     // If the second donorStartMigration had started a duplicate migration, the recipient would have
     // received four recipientSyncData commands instead of two.
-    checkNumRecipientSyncDataCmdExecuted(recipientPrimary, 2);
+    checkNumRecipientSyncDataCmdExecuted(recipientPrimary, recipientSyncDataMetrics.total + 2);
 
     assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
-    teardown();
+    tenantMigrationTest.waitForMigrationGarbageCollection(migrationId, tenantId);
 })();
 
 /**
@@ -229,6 +220,8 @@ function testConcurrentConflictingMigrations({
             tenantMigrationTest0.waitForMigrationToComplete(migrationOpts0));
         assert.commandWorked(
             tenantMigrationTest0.forgetMigration(migrationOpts0.migrationIdString));
+        tenantMigrationTest0.waitForMigrationGarbageCollection(migrationOpts0.migrationIdString,
+                                                               migrationOpts0.tenantId);
     } else {
         assert.commandFailedWithCode(res0, ErrorCodes.ConflictingOperationInProgress);
         assertNoCertificateOrPrivateKey(res0.errmsg);
@@ -251,16 +244,17 @@ function testConcurrentConflictingMigrations({
             tenantMigrationTest1.waitForMigrationToComplete(migrationOpts1));
         assert.commandWorked(
             tenantMigrationTest1.forgetMigration(migrationOpts1.migrationIdString));
+        tenantMigrationTest1.waitForMigrationGarbageCollection(migrationOpts1.migrationIdString,
+                                                               migrationOpts1.tenantId);
     }
 }
 
 // Test migrations with different migrationIds but identical settings.
 (() => {
-    const {tenantMigrationTest, donorPrimary, teardown} = setup();
     const makeTestParams = () => {
         const migrationOpts0 = {
             migrationIdString: extractUUIDFromObject(UUID()),
-            tenantId: generateUniqueTenantId() + "DiffMigrationId",
+            tenantId: ObjectId().str,
         };
         const migrationOpts1 = Object.extend({}, migrationOpts0, true);
         migrationOpts1.migrationIdString = extractUUIDFromObject(UUID());
@@ -275,21 +269,25 @@ function testConcurrentConflictingMigrations({
 
     testStartingConflictingMigrationAfterInitialMigrationCommitted(makeTestParams());
     testConcurrentConflictingMigrations(makeTestParams());
-    teardown();
 })();
 
 // Test reusing a migrationId for different migration settings.
 
 // Test different tenantIds.
 (() => {
-    const {tenantMigrationTest, donorPrimary, teardown} = setup();
+    if (isShardMergeEnabled(donorPrimary.getDB("admin"))) {
+        jsTestLog(
+            "Skip: featureFlagShardMerge is enabled and this test tests migrations with different tenant ids.");
+        return;
+    }
+
     const makeTestParams = () => {
         const migrationOpts0 = {
             migrationIdString: extractUUIDFromObject(UUID()),
-            tenantId: generateUniqueTenantId() + "DiffTenantId",
+            tenantId: ObjectId().str,
         };
         const migrationOpts1 = Object.extend({}, migrationOpts0, true);
-        migrationOpts1.tenantId = generateUniqueTenantId() + "DiffTenantId";
+        migrationOpts1.tenantId = ObjectId().str;
         return {
             tenantMigrationTest0: tenantMigrationTest,
             migrationOpts0,
@@ -301,30 +299,22 @@ function testConcurrentConflictingMigrations({
 
     testStartingConflictingMigrationAfterInitialMigrationCommitted(makeTestParams());
     testConcurrentConflictingMigrations(makeTestParams());
-    teardown();
 })();
 
 // Test different recipient connection strings.
 (() => {
-    const {
-        tenantMigrationTest: tenantMigrationTest0,
-        donorRst,
-        donorPrimary,
-        teardown,
-    } = setup();
-
     const tenantMigrationTest1 = new TenantMigrationTest({name: `${jsTestName()}1`, donorRst});
 
     const makeTestParams = () => {
         const migrationOpts0 = {
             migrationIdString: extractUUIDFromObject(UUID()),
-            tenantId: `${generateUniqueTenantId()}DiffRecipientConnString`,
+            tenantId: ObjectId().str,
         };
         // The recipient connection string will be populated by the TenantMigrationTest fixture, so
         // no need to set it here.
         const migrationOpts1 = Object.extend({}, migrationOpts0, true);
         return {
-            tenantMigrationTest0,
+            tenantMigrationTest0: tenantMigrationTest,
             migrationOpts0,
             tenantMigrationTest1,
             migrationOpts1,
@@ -336,17 +326,19 @@ function testConcurrentConflictingMigrations({
     testConcurrentConflictingMigrations(makeTestParams());
 
     tenantMigrationTest1.stop();
-    teardown();
 })();
 
 // Test different cloning read preference.
 (() => {
-    const {tenantMigrationTest, donorPrimary, teardown} = setup();
-
+    if (isShardMergeEnabled(donorPrimary.getDB("admin"))) {
+        jsTestLog(
+            "Skip: featureFlagShardMerge is enabled and this test tests migration's secondary read preference.");
+        return;
+    }
     const makeTestParams = () => {
         const migrationOpts0 = {
             migrationIdString: extractUUIDFromObject(UUID()),
-            tenantId: generateUniqueTenantId() + "DiffReadPref",
+            tenantId: ObjectId().str,
         };
         const migrationOpts1 = Object.extend({}, migrationOpts0, true);
         migrationOpts1.readPreference = {mode: "secondary"};
@@ -361,26 +353,23 @@ function testConcurrentConflictingMigrations({
 
     testStartingConflictingMigrationAfterInitialMigrationCommitted(makeTestParams());
     testConcurrentConflictingMigrations(makeTestParams());
-    teardown();
 })();
 
 const kDonorCertificateAndPrivateKey =
-    TenantMigrationUtil.getCertificateAndPrivateKey("jstests/libs/tenant_migration_donor.pem");
-const kExpiredDonorCertificateAndPrivateKey = TenantMigrationUtil.getCertificateAndPrivateKey(
-    "jstests/libs/tenant_migration_donor_expired.pem");
+    getCertificateAndPrivateKey("jstests/libs/tenant_migration_donor.pem");
+const kExpiredDonorCertificateAndPrivateKey =
+    getCertificateAndPrivateKey("jstests/libs/tenant_migration_donor_expired.pem");
 const kRecipientCertificateAndPrivateKey =
-    TenantMigrationUtil.getCertificateAndPrivateKey("jstests/libs/tenant_migration_recipient.pem");
-const kExpiredRecipientCertificateAndPrivateKey = TenantMigrationUtil.getCertificateAndPrivateKey(
-    "jstests/libs/tenant_migration_recipient_expired.pem");
+    getCertificateAndPrivateKey("jstests/libs/tenant_migration_recipient.pem");
+const kExpiredRecipientCertificateAndPrivateKey =
+    getCertificateAndPrivateKey("jstests/libs/tenant_migration_recipient_expired.pem");
 
 // Test different donor certificates.
 (() => {
-    const {tenantMigrationTest, donorPrimary, teardown} = setup();
-
     const makeTestParams = () => {
         const migrationOpts0 = {
             migrationIdString: extractUUIDFromObject(UUID()),
-            tenantId: generateUniqueTenantId() + "DiffDonorCertificate",
+            tenantId: ObjectId().str,
             donorCertificateForRecipient: kDonorCertificateAndPrivateKey,
             recipientCertificateForDonor: kRecipientCertificateAndPrivateKey
         };
@@ -397,17 +386,14 @@ const kExpiredRecipientCertificateAndPrivateKey = TenantMigrationUtil.getCertifi
 
     testStartingConflictingMigrationAfterInitialMigrationCommitted(makeTestParams());
     testConcurrentConflictingMigrations(makeTestParams());
-    teardown();
 })();
 
 // Test different recipient certificates.
 (() => {
-    const {tenantMigrationTest, donorPrimary, teardown} = setup();
-
     const makeTestParams = () => {
         const migrationOpts0 = {
             migrationIdString: extractUUIDFromObject(UUID()),
-            tenantId: generateUniqueTenantId() + "DiffRecipientCertificate",
+            tenantId: ObjectId().str,
             donorCertificateForRecipient: kDonorCertificateAndPrivateKey,
             recipientCertificateForDonor: kRecipientCertificateAndPrivateKey
         };
@@ -424,6 +410,6 @@ const kExpiredRecipientCertificateAndPrivateKey = TenantMigrationUtil.getCertifi
 
     testStartingConflictingMigrationAfterInitialMigrationCommitted(makeTestParams());
     testConcurrentConflictingMigrations(makeTestParams());
-    teardown();
 })();
-})();
+
+teardown();

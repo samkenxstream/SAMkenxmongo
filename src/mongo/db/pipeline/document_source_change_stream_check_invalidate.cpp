@@ -27,15 +27,18 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/pipeline/change_stream_helpers.h"
 #include "mongo/db/pipeline/change_stream_start_after_invalidate_info.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/db/pipeline/document_source_change_stream_check_invalidate.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
@@ -71,7 +74,7 @@ DocumentSourceChangeStreamCheckInvalidate::create(
     const DocumentSourceChangeStreamSpec& spec) {
     // If resuming from an "invalidate" using "startAfter", pass along the resume token data to
     // DSCSCheckInvalidate to signify that another invalidate should not be generated.
-    auto resumeToken = DocumentSourceChangeStream::resolveResumeTokenFromSpec(spec);
+    auto resumeToken = change_stream::resolveResumeTokenFromSpec(expCtx, spec);
     return new DocumentSourceChangeStreamCheckInvalidate(
         expCtx, boost::make_optional(resumeToken.fromInvalidate, std::move(resumeToken)));
 }
@@ -84,8 +87,7 @@ DocumentSourceChangeStreamCheckInvalidate::createFromBson(
             spec.type() == Object);
 
     auto parsed = DocumentSourceChangeStreamCheckInvalidateSpec::parse(
-        IDLParserErrorContext("DocumentSourceChangeStreamCheckInvalidateSpec"),
-        spec.embeddedObject());
+        IDLParserContext("DocumentSourceChangeStreamCheckInvalidateSpec"), spec.embeddedObject());
     return new DocumentSourceChangeStreamCheckInvalidate(
         expCtx,
         parsed.getStartAfterInvalidate() ? parsed.getStartAfterInvalidate()->getData()
@@ -97,7 +99,7 @@ DocumentSource::GetNextResult DocumentSourceChangeStreamCheckInvalidate::doGetNe
     // then throws a 'ChangeStreamInvalidated' exception on the next call to this method.
 
     if (_queuedInvalidate) {
-        const auto res = DocumentSource::GetNextResult(std::move(_queuedInvalidate.get()));
+        const auto res = DocumentSource::GetNextResult(std::move(_queuedInvalidate.value()));
         _queuedInvalidate.reset();
         return res;
     }
@@ -179,18 +181,28 @@ DocumentSource::GetNextResult DocumentSourceChangeStreamCheckInvalidate::doGetNe
     return nextInput;
 }
 
-Value DocumentSourceChangeStreamCheckInvalidate::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    if (explain) {
-        return Value(Document{{DocumentSourceChangeStream::kStageName,
-                               Document{{"stage"_sd, "internalCheckInvalidate"_sd}}}});
+Value DocumentSourceChangeStreamCheckInvalidate::serialize(SerializationOptions opts) const {
+    BSONObjBuilder builder;
+    if (opts.verbosity) {
+        BSONObjBuilder sub(builder.subobjStart(DocumentSourceChangeStream::kStageName));
+        sub.append("stage"_sd, kStageName);
+        sub.done();
+    } else {
+        BSONObjBuilder sub(builder.subobjStart(kStageName));
+        if (_startAfterInvalidate) {
+            if (opts.replacementForLiteralArgs) {
+                sub.append(
+                    DocumentSourceChangeStreamCheckInvalidateSpec::kStartAfterInvalidateFieldName,
+                    *opts.replacementForLiteralArgs);
+            } else {
+                DocumentSourceChangeStreamCheckInvalidateSpec spec;
+                spec.setStartAfterInvalidate(ResumeToken(*_startAfterInvalidate));
+                spec.serialize(&sub);
+            }
+        }
+        sub.done();
     }
-
-    DocumentSourceChangeStreamCheckInvalidateSpec spec;
-    if (_startAfterInvalidate) {
-        spec.setStartAfterInvalidate(ResumeToken(*_startAfterInvalidate));
-    }
-    return Value(Document{{DocumentSourceChangeStreamCheckInvalidate::kStageName, spec.toBSON()}});
+    return Value(builder.obj());
 }
 
 }  // namespace mongo

@@ -49,14 +49,13 @@ using namespace mongo;
 
 namespace {
 
-static const NamespaceString kNss("db.dummy");
+static const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("db.dummy");
 
 class SortStageDefaultTest : public ServiceContextMongoDTest {
 public:
     static constexpr uint64_t kMaxMemoryUsageBytes = 1024u * 1024u;
 
-    SortStageDefaultTest() {
-        getServiceContext()->setFastClockSource(std::make_unique<ClockSourceMock>());
+    SortStageDefaultTest() : ServiceContextMongoDTest(Options{}.useMockClock(true)) {
         _opCtx = makeOperationContext();
         CollatorFactoryInterface::set(getServiceContext(), std::make_unique<CollatorFactoryMock>());
     }

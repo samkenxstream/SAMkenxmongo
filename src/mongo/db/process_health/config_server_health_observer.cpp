@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kProcessHealth;
 
 #include <random>
 
@@ -39,6 +38,9 @@
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/future_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kProcessHealth
+
 
 namespace mongo {
 namespace process_health {
@@ -85,7 +87,7 @@ public:
      * previous one is filled, thus synchronization can be relaxed.
      */
     Future<HealthCheckStatus> periodicCheckImpl(
-        PeriodicHealthCheckContext&& periodicCheckContext) noexcept override;
+        PeriodicHealthCheckContext&& periodicCheckContext) override;
 
 private:
     // Collects the results of one check.
@@ -144,7 +146,7 @@ ConfigServerHealthObserver::ConfigServerHealthObserver(ServiceContext* svcCtx)
     : HealthObserverBase(svcCtx) {}
 
 Future<HealthCheckStatus> ConfigServerHealthObserver::periodicCheckImpl(
-    PeriodicHealthCheckContext&& periodicCheckContext) noexcept {
+    PeriodicHealthCheckContext&& periodicCheckContext) {
     // The chain is not capturing 'this' for the case the network call outlives the observer.
     return _checkImpl(std::move(periodicCheckContext))
         .then([type = getType()](CheckResult result) mutable -> Future<HealthCheckStatus> {
@@ -207,7 +209,7 @@ void ConfigServerHealthObserver::_runSmokeReadShardsCommand(std::shared_ptr<Chec
     }();
 
     BSONObjBuilder findCmdBuilder;
-    FindCommandRequest findCommand(ShardType::ConfigNS);
+    FindCommandRequest findCommand(NamespaceString::kConfigsvrShardsNamespace);
     findCommand.setReadConcern(readConcernObj);
     findCommand.setLimit(1);
     findCommand.setSingleBatch(true);
@@ -219,15 +221,16 @@ void ConfigServerHealthObserver::_runSmokeReadShardsCommand(std::shared_ptr<Chec
     StatusWith<Shard::CommandResponse> findOneShardResponse{ErrorCodes::HostUnreachable,
                                                             "Config server read was not run"};
     try {
-        findOneShardResponse = Grid::get(ctx->opCtx.get())
-                                   ->shardRegistry()
-                                   ->getConfigShard()
-                                   ->runCommand(ctx->opCtx.get(),
-                                                readPref,
-                                                ShardType::ConfigNS.db().toString(),
-                                                findCmdBuilder.done(),
-                                                kServerRequestTimeout,
-                                                Shard::RetryPolicy::kNoRetry);
+        findOneShardResponse =
+            Grid::get(ctx->opCtx.get())
+                ->shardRegistry()
+                ->getConfigShard()
+                ->runCommand(ctx->opCtx.get(),
+                             readPref,
+                             NamespaceString::kConfigsvrShardsNamespace.db().toString(),
+                             findCmdBuilder.done(),
+                             kServerRequestTimeout,
+                             Shard::RetryPolicy::kNoRetry);
     } catch (const DBException& exc) {
         findOneShardResponse = StatusWith<Shard::CommandResponse>(exc.toStatus());
     }

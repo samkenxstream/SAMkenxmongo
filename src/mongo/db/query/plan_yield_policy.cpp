@@ -32,23 +32,40 @@
 #include "mongo/db/query/plan_yield_policy.h"
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/catalog/collection_uuid_mismatch_info.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/shard_role.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
-PlanYieldPolicy::PlanYieldPolicy(YieldPolicy policy,
-                                 ClockSource* cs,
-                                 int yieldIterations,
-                                 Milliseconds yieldPeriod,
-                                 const Yieldable* yieldable,
-                                 std::unique_ptr<const YieldPolicyCallbacks> callbacks)
+PlanYieldPolicy::PlanYieldPolicy(
+    YieldPolicy policy,
+    ClockSource* cs,
+    int yieldIterations,
+    Milliseconds yieldPeriod,
+    stdx::variant<const Yieldable*, YieldThroughAcquisitions> yieldable,
+    std::unique_ptr<const YieldPolicyCallbacks> callbacks)
     : _policy(policy),
       _yieldable(yieldable),
       _callbacks(std::move(callbacks)),
-      _elapsedTracker(cs, yieldIterations, yieldPeriod) {}
+      _elapsedTracker(cs, yieldIterations, yieldPeriod) {
+    stdx::visit(OverloadedVisitor{[&](const Yieldable* collectionPtr) {
+                                      invariant(!collectionPtr || collectionPtr->yieldable() ||
+                                                policy == YieldPolicy::WRITE_CONFLICT_RETRY_ONLY ||
+                                                policy == YieldPolicy::NO_YIELD ||
+                                                policy == YieldPolicy::INTERRUPT_ONLY ||
+                                                policy == YieldPolicy::ALWAYS_TIME_OUT ||
+                                                policy == YieldPolicy::ALWAYS_MARK_KILLED);
+                                  },
+                                  [&](const YieldThroughAcquisitions& yieldThroughAcquisitions) {
+                                      // CollectionAcquisitions are always yieldable.
+                                  }},
+                _yieldable);
+}
 
 bool PlanYieldPolicy::shouldYieldOrInterrupt(OperationContext* opCtx) {
     if (_policy == YieldPolicy::INTERRUPT_ONLY) {
@@ -89,8 +106,8 @@ Status PlanYieldPolicy::yieldOrInterrupt(OperationContext* opCtx,
 
     for (int attempt = 1; true; attempt++) {
         try {
-            // Saving and restoring can modifies '_yieldable', so we make a copy before we start.
-            const Yieldable* yieldable = _yieldable;
+            // Saving and restoring can modify '_yieldable', so we make a copy before we start.
+            const auto yieldable = _yieldable;
 
             try {
                 saveState(opCtx);
@@ -121,16 +138,25 @@ Status PlanYieldPolicy::yieldOrInterrupt(OperationContext* opCtx,
                 invariant(!opCtx->isLockFreeReadsOp());
                 opCtx->recoveryUnit()->abandonSnapshot();
             } else {
-                performYield(opCtx, yieldable, whileYieldingFn);
+                if (usesCollectionAcquisitions()) {
+                    performYieldWithAcquisitions(opCtx, whileYieldingFn);
+                } else {
+                    const Yieldable* yieldablePtr = stdx::get<const Yieldable*>(yieldable);
+                    invariant(yieldablePtr);
+                    performYield(opCtx, *yieldablePtr, whileYieldingFn);
+                }
             }
 
-            restoreState(opCtx, yieldable);
+            restoreState(opCtx,
+                         stdx::holds_alternative<const Yieldable*>(yieldable)
+                             ? stdx::get<const Yieldable*>(yieldable)
+                             : nullptr);
             return Status::OK();
         } catch (const WriteConflictException&) {
             if (_callbacks) {
                 _callbacks->handledWriteConflict(opCtx);
             }
-            WriteConflictException::logAndBackoff(attempt, "query yield", ""_sd);
+            logWriteConflictAndBackoff(attempt, "query yield", ""_sd);
             // Retry the yielding process.
         } catch (...) {
             // Errors other than write conflicts don't get retried, and should instead result in
@@ -143,7 +169,7 @@ Status PlanYieldPolicy::yieldOrInterrupt(OperationContext* opCtx,
 }
 
 void PlanYieldPolicy::performYield(OperationContext* opCtx,
-                                   const Yieldable* yieldable,
+                                   const Yieldable& yieldable,
                                    std::function<void()> whileYieldingFn) {
     // Things have to happen here in a specific order:
     //   * Release 'yieldable'.
@@ -161,9 +187,7 @@ void PlanYieldPolicy::performYield(OperationContext* opCtx,
 
     // Since the locks are not recursively held, this is a top level operation and we can safely
     // clear the 'yieldable' state before unlocking and then re-establish it after re-locking.
-    if (yieldable) {
-        yieldable->yield();
-    }
+    yieldable.yield();
 
     Locker::LockSnapshot snapshot;
     auto unlocked = locker->saveLockStateAndUnlock(&snapshot);
@@ -178,9 +202,7 @@ void PlanYieldPolicy::performYield(OperationContext* opCtx,
     if (!unlocked) {
         // Nothing was unlocked. Recursively held locks are not the only reason locks cannot be
         // released. Restore the 'yieldable' state before returning.
-        if (yieldable) {
-            yieldable->restore();
-        }
+        yieldable.restore();
         return;
     }
 
@@ -198,14 +220,71 @@ void PlanYieldPolicy::performYield(OperationContext* opCtx,
 
     locker->restoreLockState(opCtx, snapshot);
 
-    // A yield has occurred, but there still may not be a 'yieldable'. This is true, for example,
-    // when executing a getMore for the slot-based execution engine. SBE uses the "locks internally"
-    // lock policy, and therefore the getMore code path does not acquire any db_raii object. As a
-    // result, there is no db_raii object to restore here when executing a getMore against a cursor
-    // using SBE.
-    if (yieldable) {
-        // Yieldable restore may set a new read source if necessary.
-        yieldable->restore();
+    // A yield has occurred, but there still may not be a 'yieldable' if the PlanExecutor
+    // has a 'locks internally' lock policy.
+    // Yieldable restore may set a new read source if necessary.
+    yieldable.restore();
+}
+
+void PlanYieldPolicy::performYieldWithAcquisitions(OperationContext* opCtx,
+                                                   std::function<void()> whileYieldingFn) {
+    // Things have to happen here in a specific order:
+    //   * Yield the acquired TransactionResources
+    //   * Check for interrupt if the yield policy requires.
+    //   * Abandon the query's current storage engine snapshot.
+    //   * Restore the yielded TransactionResources
+    Locker* locker = opCtx->lockState();
+
+    if (locker->isGlobalLockedRecursively()) {
+        // No purpose in yielding if the locks are recursively held and cannot be released.
+        return;
+    }
+
+    auto yieldedTransactionResources = yieldTransactionResourcesFromOperationContext(opCtx);
+    ScopeGuard disposeYieldedTransactionResourcesScopeGuard([&yieldedTransactionResources] {
+        if (yieldedTransactionResources) {
+            yieldedTransactionResources->dispose();
+        }
+    });
+
+    // After all steps to relinquish locks and save the execution plan have been taken, check
+    // for interrupt. This is the main interrupt check during query execution. Yield points and
+    // interrupt points are one and the same.
+    if (getPolicy() == PlanYieldPolicy::YieldPolicy::YIELD_AUTO) {
+        opCtx->checkForInterrupt();  // throws
+    }
+
+    if (!yieldedTransactionResources) {
+        // Nothing was unlocked. Recursively held locks are not the only reason locks cannot be
+        // released. Restore the 'yieldable' state before returning.
+        return;
+    }
+
+    // Top-level locks are freed, release any potential low-level (storage engine-specific
+    // locks). If we are yielding, we are at a safe place to do so.
+    opCtx->recoveryUnit()->abandonSnapshot();
+
+    if (_callbacks) {
+        _callbacks->duringYield(opCtx);
+    }
+
+    if (whileYieldingFn) {
+        whileYieldingFn();
+    }
+
+    disposeYieldedTransactionResourcesScopeGuard.dismiss();
+    try {
+        restoreTransactionResourcesToOperationContext(opCtx,
+                                                      std::move(*yieldedTransactionResources));
+    } catch (const ExceptionFor<ErrorCodes::CollectionUUIDMismatch>& ex) {
+        const auto extraInfo = ex.extraInfo<CollectionUUIDMismatchInfo>();
+        if (extraInfo->actualCollection()) {
+            throwCollectionRenamedError(NamespaceString(extraInfo->expectedCollection()),
+                                        NamespaceString(*extraInfo->actualCollection()),
+                                        extraInfo->collectionUUID());
+        } else {
+            throwCollectionDroppedError(extraInfo->collectionUUID());
+        }
     }
 }
 

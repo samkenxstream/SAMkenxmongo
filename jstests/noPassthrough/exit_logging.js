@@ -1,7 +1,6 @@
 /**
  * Tests that various forms of normal and abnormal shutdown write to the log files as expected.
  * @tags: [
- *   live_record_incompatible,
  *   requires_sharding,
  * ]
  */
@@ -59,12 +58,12 @@ function runAllTests(launcher) {
     testShutdownLogging(launcher,
                         makeShutdownByCrashFn('fault'),
                         makeRegExMatchFn(/Invalid access at address[\s\S]*printStackTrace/),
-                        -SIGSEGV);
+                        SIGSEGV);
 
     testShutdownLogging(launcher,
                         makeShutdownByCrashFn('abort'),
                         makeRegExMatchFn(/Got signal[\s\S]*printStackTrace/),
-                        -SIGABRT);
+                        SIGABRT);
 }
 
 if (_isWindows()) {
@@ -82,9 +81,7 @@ if (_isAddressSanitizerActive()) {
 
     runAllTests({
         start: function(opts) {
-            var actualOpts = {nojournal: ""};
-            Object.extend(actualOpts, opts);
-            return MongoRunner.runMongod(actualOpts);
+            return MongoRunner.runMongod(opts);
         },
 
         stop: MongoRunner.stopMongod

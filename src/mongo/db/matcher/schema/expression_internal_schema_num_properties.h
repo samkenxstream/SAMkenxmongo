@@ -58,7 +58,7 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const final {
-        MONGO_UNREACHABLE;
+        MONGO_UNREACHABLE_TASSERT(6400216);
     }
 
     void resetChild(size_t, MatchExpression*) override {
@@ -71,7 +71,7 @@ public:
 
     void debugString(StringBuilder& debug, int indentationLevel) const final;
 
-    void serialize(BSONObjBuilder* out, bool includePath) const final;
+    void serialize(BSONObjBuilder* out, SerializationOptions opts) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 
@@ -84,13 +84,11 @@ protected:
         return _numProperties;
     }
 
-    void _doAddDependencies(DepsTracker* deps) const final {
-        deps->needWholeDocument = true;
-    }
-
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     long long _numProperties;

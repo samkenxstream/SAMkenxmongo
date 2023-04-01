@@ -40,6 +40,7 @@
 #include "mongo/logv2/json_formatter.h"
 #include "mongo/logv2/log_detail.h"
 #include "mongo/logv2/shared_access_fstream.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/string_map.h"
@@ -163,7 +164,9 @@ Status FileRotateSink::rotate(bool rename,
 
 void FileRotateSink::consume(const boost::log::record_view& rec,
                              const string_type& formatted_string) {
-    auto isFailed = [](const auto& file) { return file.second->fail(); };
+    auto isFailed = [](const auto& file) {
+        return file.second->fail();
+    };
     boost::log::sinks::text_ostream_backend::consume(rec, formatted_string);
     if (std::any_of(_impl->files.begin(), _impl->files.end(), isFailed)) {
         try {
@@ -209,7 +212,7 @@ void FileRotateSink::consume(const boost::log::record_view& rec,
         }
 
         printStackTrace(std::cerr);
-        quickExitWithoutLogging(EXIT_FAILURE);
+        quickExitWithoutLogging(ExitCode::fail);
     }
 }
 

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -42,9 +41,14 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/bits.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/concurrency/priority_ticketholder.h"
+#include "mongo/util/concurrency/semaphore_ticketholder.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/timer.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace ThreadedTests {
 
@@ -226,13 +230,31 @@ private:
 
 // Tests waiting on the TicketHolder by running many more threads than can fit into the "hotel", but
 // only max _nRooms threads should ever get in at once
+template <class TicketHolderImpl>
 class TicketHolderWaits : public ThreadedTest<10> {
     static const int checkIns = 1000;
     static const int rooms = 3;
 
 public:
-    TicketHolderWaits()
-        : _hotel(rooms), _tickets(std::make_unique<SemaphoreTicketHolder>(_hotel._nRooms)) {}
+    TicketHolderWaits() : _hotel(rooms) {
+        auto client = Client::getCurrent();
+        // TODO SERVER-72616: We can only test PriorityTicketHolder on Linux. Remove ifdefs when
+        // it's available on other platforms.
+#ifdef __linux__
+        if constexpr (std::is_same_v<PriorityTicketHolder, TicketHolderImpl>) {
+            // When run with the PriorityTicketHolder, scale down the default
+            // 'lowPriorityAdmissionBypassThreshold' for test purposes.
+            int lowPriorityAdmissionBypassThreshold = 100;
+            _tickets = std::make_unique<TicketHolderImpl>(
+                _hotel._nRooms, lowPriorityAdmissionBypassThreshold, client->getServiceContext());
+        } else {
+            _tickets =
+                std::make_unique<TicketHolderImpl>(_hotel._nRooms, client->getServiceContext());
+        }
+#else
+        _tickets = std::make_unique<TicketHolderImpl>(_hotel._nRooms, client->getServiceContext());
+#endif
+    }
 
 private:
     class Hotel {
@@ -260,15 +282,20 @@ private:
     };
 
     Hotel _hotel;
-    std::unique_ptr<TicketHolder> _tickets;
 
     virtual void subthread(int x) {
         string threadName = (str::stream() << "ticketHolder" << x);
         Client::initThread(threadName.c_str());
+        auto opCtx = Client::getCurrent()->makeOperationContext();
 
         for (int i = 0; i < checkIns; i++) {
-            _tickets->waitForTicket();
-            TicketHolderReleaser whenDone(_tickets.get());
+            AdmissionContext admCtx;
+            if ((i % 3) == 0) {
+                // One of every three admissions is low priority.
+                admCtx.setPriority(AdmissionContext::Priority::kLow);
+            }
+
+            auto ticket = _tickets->waitForTicket(nullptr, &admCtx);
 
             _hotel.checkIn();
 
@@ -288,6 +315,9 @@ private:
         // check-out/check-in Time for test is then ~ #threads / _nRooms * 2 seconds
         verify(_hotel._maxRooms == _hotel._nRooms);
     }
+
+protected:
+    std::unique_ptr<TicketHolder> _tickets;
 };
 
 class All : public OldStyleSuiteSpecification {
@@ -304,7 +334,12 @@ public:
         add<IsAtomicWordAtomic<AtomicWord<unsigned long long>>>();
         add<ThreadPoolTest>();
 
-        add<TicketHolderWaits>();
+        add<TicketHolderWaits<SemaphoreTicketHolder>>();
+// TODO SERVER-72616: We can only test PriorityTicketHolder on Linux. Remove this when it's
+// available on other platforms.
+#ifdef __linux__
+        add<TicketHolderWaits<PriorityTicketHolder>>();
+#endif
     }
 };
 

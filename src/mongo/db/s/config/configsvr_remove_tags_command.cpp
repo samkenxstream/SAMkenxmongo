@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -36,12 +35,16 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/remove_tags_gen.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/request_types/remove_tags_gen.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -57,11 +60,11 @@ public:
         void typedRun(OperationContext* opCtx) {
             const NamespaceString& nss = ns();
 
-            opCtx->setAlwaysInterruptAtStepDownOrUp();
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrRemoveTags can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
@@ -87,19 +90,19 @@ public:
                 auto newOpCtxPtr = CancelableOperationContext(
                     cc().makeOperationContext(), opCtx->getCancellationToken(), executor);
 
-                uassertStatusOK(
-                    Grid::get(newOpCtxPtr.get())
-                        ->catalogClient()
-                        ->removeConfigDocuments(newOpCtxPtr.get(),
-                                                TagsType::ConfigNS,
-                                                BSON(TagsType::ns(nss.ns())),
-                                                ShardingCatalogClient::kLocalWriteConcern));
+                const auto catalogClient =
+                    ShardingCatalogManager::get(newOpCtxPtr.get())->localCatalogClient();
+                uassertStatusOK(catalogClient->removeConfigDocuments(
+                    newOpCtxPtr.get(),
+                    TagsType::ConfigNS,
+                    BSON(TagsType::ns(nss.ns())),
+                    ShardingCatalogClient::kLocalWriteConcern));
             }
 
             // Since we no write happened on this txnNumber, we need to make a dummy write so that
             // secondaries can be aware of this txn.
             DBDirectClient client(opCtx);
-            client.update(NamespaceString::kServerConfigurationNamespace.ns(),
+            client.update(NamespaceString::kServerConfigurationNamespace,
                           BSON("_id"
                                << "RemoveTagsMetadataStats"),
                           BSON("$inc" << BSON("count" << 1)),
@@ -141,6 +144,10 @@ public:
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
+    }
+
+    bool supportsRetryableWrite() const final {
+        return true;
     }
 } configsvrRemoveTagsCmd;
 

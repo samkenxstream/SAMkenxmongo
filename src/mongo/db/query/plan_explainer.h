@@ -29,12 +29,14 @@
 
 #pragma once
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/query/classic_plan_cache.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/plan_enumerator_explain_info.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 /**
@@ -90,6 +92,14 @@ public:
      * log.
      */
     virtual void getSummaryStats(PlanSummaryStats* statsOut) const = 0;
+
+    /**
+     * Fills out 'statsOut' for the secondary collection 'secondaryColl'. Subclasses may
+     * override this function if the summary stats for secondary collections need to be reported
+     * separately.
+     */
+    virtual void getSecondarySummaryStats(std::string secondaryColl,
+                                          PlanSummaryStats* statsOut) const {}
 
     /**
      * Returns statistics that detail the winning plan selected by the multi-planner, or, if no

@@ -2,21 +2,20 @@
  * Tests creating and using ascending and descending indexes on time-series measurement fields.
  *
  * @tags: [
- *     does_not_support_stepdowns,
- *     does_not_support_transactions,
- *     requires_fcv_50,
- *     requires_fcv_51,
- *     requires_find_command,
- *     requires_getmore,
+ *   # This test makes assertions on listIndexes and on the order of the indexes returned.
+ *   assumes_no_implicit_index_creation,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 (function() {
 "use strict";
 
 load("jstests/core/timeseries/libs/timeseries.js");
+load("jstests/libs/feature_flag_util.js");
 load("jstests/libs/fixture_helpers.js");
 
-if (!TimeseriesTest.timeseriesMetricIndexesEnabled(db.getMongo())) {
+if (!FeatureFlagUtil.isPresentAndEnabled(db, "TimeseriesMetricIndexes")) {
     jsTestLog(
         "Skipped test as the featureFlagTimeseriesMetricIndexes feature flag is not enabled.");
     return;
@@ -65,8 +64,10 @@ TimeseriesTest.run((insert) => {
         const bucketsColl = db.getCollection("system.buckets." + collName);
 
         // Tests hint() using the index name.
-        assert.eq(4, bucketsColl.find().hint(indexName).toArray().length);
-        assert.eq(4, coll.find().hint(indexName).toArray().length);
+        assert.eq(4,
+                  bucketsColl.find().hint(indexName).toArray().length,
+                  tojson(bucketsColl.getIndexes()));
+        assert.eq(4, coll.find().hint(indexName).toArray().length, tojson(coll.getIndexes()));
 
         // Tests that hint() cannot be used when the index is hidden.
         assert.commandWorked(coll.hideIndex(indexName));
@@ -156,17 +157,15 @@ TimeseriesTest.run((insert) => {
     assert.commandWorked(
         bucketsColl.createIndex({"control.max.x.y": -1, "control.min.x.y": -1, "data.x": 1}));
 
-    if (FixtureHelpers.isSharded(bucketsColl)) {
-        // There are more indexes for sharded collections because it includes the shard key index.
-        userIndexes = coll.getIndexes();
-        assert.eq(1, userIndexes.length);
-        bucketIndexes = bucketsColl.getIndexes();
-        assert.eq(14, bucketIndexes.length);
-    } else {
-        userIndexes = coll.getIndexes();
-        assert.eq(0, userIndexes.length);
-        bucketIndexes = bucketsColl.getIndexes();
-        assert.eq(13, bucketIndexes.length);
-    }
+    // There are more indexes for sharded collections because it includes the shard key index. When
+    // time-series scalability improvements are enabled, the {meta: 1, time: 1} index gets built by
+    // default on the time-series bucket collection.
+    const numExtraIndexes = (FixtureHelpers.isSharded(bucketsColl) ? 1 : 0) +
+        (FeatureFlagUtil.isPresentAndEnabled(db, "TimeseriesScalabilityImprovements") ? 1 : 0);
+
+    userIndexes = coll.getIndexes();
+    assert.eq(numExtraIndexes, userIndexes.length, tojson(userIndexes));
+    bucketIndexes = bucketsColl.getIndexes();
+    assert.eq(13 + numExtraIndexes, bucketIndexes.length, tojson(bucketIndexes));
 });
 }());

@@ -66,7 +66,7 @@ std::string causedBy(const std::string& e);
 /** Most mongo exceptions inherit from this; this is commonly caught in most threads */
 class DBException : public std::exception {
 public:
-    const char* what() const throw() final {
+    const char* what() const noexcept final {
         return reason().c_str();
     }
 
@@ -112,7 +112,7 @@ public:
     /**
      * Returns the generic ErrorExtraInfo if present.
      */
-    const std::shared_ptr<const ErrorExtraInfo> extraInfo() const {
+    std::shared_ptr<const ErrorExtraInfo> extraInfo() const {
         return _status.extraInfo();
     }
 
@@ -124,7 +124,14 @@ public:
         return _status.extraInfo<ErrorDetail>();
     }
 
-    static AtomicWord<bool> traceExceptions;
+    static inline AtomicWord<bool> traceExceptions{false};
+
+    /**
+     * Allows handling `ErrorCodes::WriteConflict` as a special case and if true, will call
+     * `printStackTrace` on every `WriteConflict` error. Can be set via the
+     * `traceWriteConflictExceptions` server parameter.
+     */
+    static inline AtomicWord<bool> traceWriteConflictExceptions{false};
 
 protected:
     DBException(const Status& status) : _status(status) {
@@ -150,6 +157,42 @@ public:
 };
 
 /**
+ * Use `throwWriteConflictException()` instead of throwing `WriteConflictException` directly.
+ */
+class WriteConflictException final : public DBException {
+public:
+    WriteConflictException(const Status& status) : DBException(status) {}
+
+private:
+    void defineOnlyInFinalSubclassToPreventSlicing() final {}
+};
+
+/**
+ * Use `throwTemporarilyUnavailableException()` instead of throwing
+ * `TemporarilyUnavailableException` directly.
+ */
+class TemporarilyUnavailableException final : public DBException {
+public:
+    TemporarilyUnavailableException(const Status& status) : DBException(status) {}
+
+private:
+    void defineOnlyInFinalSubclassToPreventSlicing() final {}
+};
+
+/**
+ * Use `throwTransactionTooLargeForCache()` instead of throwing
+ * `TransactionTooLargeForCache` directly.
+ */
+class TransactionTooLargeForCacheException final : public DBException {
+public:
+    TransactionTooLargeForCacheException(const Status& status) : DBException(status) {}
+
+private:
+    void defineOnlyInFinalSubclassToPreventSlicing() final {}
+};
+
+
+/**
  * The base class of all DBExceptions for codes of the given ErrorCategory to allow catching by
  * category.
  */
@@ -164,7 +207,6 @@ protected:
         invariant(isA<kCategory>());
     }
 };
-
 
 /**
  * This namespace contains implementation details for our error handling code and should not be used
@@ -201,6 +243,21 @@ struct ExceptionForDispatcher<code, CategoryList<categories...>> {
     using type = std::conditional_t<sizeof...(categories) == 0,
                                     ExceptionForImpl<code, AssertionException>,
                                     ExceptionForImpl<code, ExceptionForCat<categories>...>>;
+};
+
+template <>
+struct ExceptionForDispatcher<ErrorCodes::WriteConflict> {
+    using type = WriteConflictException;
+};
+
+template <>
+struct ExceptionForDispatcher<ErrorCodes::TemporarilyUnavailable> {
+    using type = TemporarilyUnavailableException;
+};
+
+template <>
+struct ExceptionForDispatcher<ErrorCodes::TransactionTooLargeForCache> {
+    using type = TransactionTooLargeForCacheException;
 };
 
 }  // namespace error_details
@@ -442,12 +499,14 @@ inline void massertStatusOKWithLocation(const Status& status, const char* file, 
     }
 }
 
-#define MONGO_BASE_ASSERT_VA_FAILED(fail_func, ...)                                              \
-    do {                                                                                         \
-        [&]() MONGO_COMPILER_COLD_FUNCTION {                                                     \
-            fail_func(::mongo::error_details::makeStatus(__VA_ARGS__), MONGO_SOURCE_LOCATION()); \
-        }();                                                                                     \
-        MONGO_COMPILER_UNREACHABLE;                                                              \
+#define MONGO_BASE_ASSERT_VA_FAILED(fail_func, ...)                                     \
+    do {                                                                                \
+        static constexpr auto _failedAssertionSourceLocation = MONGO_SOURCE_LOCATION(); \
+        [&]() MONGO_COMPILER_COLD_FUNCTION {                                            \
+            fail_func(::mongo::error_details::makeStatus(__VA_ARGS__),                  \
+                      _failedAssertionSourceLocation);                                  \
+        }();                                                                            \
+        MONGO_COMPILER_UNREACHABLE;                                                     \
     } while (false)
 
 #define MONGO_BASE_ASSERT_VA_4(fail_func, code, msg, cond)         \
@@ -670,3 +729,108 @@ Status exceptionToStatus() noexcept;
  * Like `MONGO_UNREACHABLE`, but triggers a `tassert` instead of an `invariant`
  */
 #define MONGO_UNREACHABLE_TASSERT(msgid) tasserted(msgid, "Hit a MONGO_UNREACHABLE_TASSERT!")
+
+/**
+ * Produces an invariant failure if executed. Subset of MONGO_UNREACHABLE, but specifically
+ * to indicate that the program has reached a function that is unimplemented and should be
+ * unreachable from production.
+ * Example:
+ *
+ *   void myFuncToDo() {
+ *       MONGO_UNIMPLEMENTED;
+ *   }
+ */
+#define MONGO_UNIMPLEMENTED \
+    ::mongo::invariantFailed("Hit a MONGO_UNIMPLEMENTED!", __FILE__, __LINE__);
+
+/**
+ * Like `MONGO_UNIMPLEMENTED`, but triggers a `tassert` instead of an `invariant`
+ */
+#define MONGO_UNIMPLEMENTED_TASSERT(msgid) tasserted(msgid, "Hit a MONGO_UNIMPLEMENTED_TASSERT!")
+
+namespace mongo {
+
+/**
+ * A stack of auxilliary information to be dumped on invariant failure.
+ * These are intended to carry only very lightweight objects like short strings
+ * and numbers, to give some basic clue as to what was going on when a thread
+ * suffered an invariant failure.
+ */
+class ScopedDebugInfoStack {
+public:
+    struct Rec {
+        virtual ~Rec() = default;
+        virtual std::string toString() const = 0;
+    };
+
+    void push(const Rec* rec) {
+        _stack.push_back(rec);
+    }
+    void pop() {
+        _stack.pop_back();
+    }
+
+    std::vector<std::string> getAll() const {
+        std::vector<std::string> r;
+        r.reserve(_stack.size());
+        std::transform(_stack.begin(), _stack.end(), std::back_inserter(r), [](auto&& e) {
+            return e->toString();
+        });
+        return r;
+    }
+
+private:
+    std::vector<const Rec*> _stack;
+};
+
+/** Each thread has its own stack of scoped debug info. */
+inline ScopedDebugInfoStack& scopedDebugInfoStack() {
+    thread_local ScopedDebugInfoStack tls;
+    return tls;
+}
+
+/**
+ * An RAII type that attaches a datum to a ScopedDebugInfoStack, intended as a
+ * broad hint as to what the thread is doing. Pops that datum at scope
+ * exit. By default, attaches to the thread_local ScopedDebugInfoStack.
+ * If the thread encounters a fatal error, the thread's ScopedDebugInfoStack
+ * is logged.
+ *
+ * Example:
+ *
+ *     void doSomethingAsUser(const User& currentUser) {
+ *         ScopedDebugInfo userNameDbg("userName", currentUser.nameStringData());
+ *         ScopedDebugInfo userIdDbg("userId", currentUser.id());
+ *         somethingThatMightCrash(currentUser);
+ *     }
+ */
+template <typename T>
+class ScopedDebugInfo {
+public:
+    ScopedDebugInfo(StringData label, T v, ScopedDebugInfoStack* stack = &scopedDebugInfoStack())
+        : label(label), v(std::move(v)), stack(stack) {
+        stack->push(&rec);
+    }
+    ~ScopedDebugInfo() {
+        stack->pop();
+    }
+    ScopedDebugInfo(const ScopedDebugInfo&) noexcept = delete;
+    ScopedDebugInfo& operator=(const ScopedDebugInfo&) noexcept = delete;
+
+private:
+    struct ThisRec : ScopedDebugInfoStack::Rec {
+        explicit ThisRec(const ScopedDebugInfo* owner) : owner(owner) {}
+        std::string toString() const override {
+            using namespace fmt::literals;
+            return "{}: {}"_format(owner->label, owner->v);
+        }
+        const ScopedDebugInfo* owner;
+    };
+
+    StringData label;
+    T v;
+    ScopedDebugInfoStack* stack;
+    ThisRec rec{this};
+};
+
+}  // namespace mongo

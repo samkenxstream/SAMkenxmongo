@@ -73,7 +73,7 @@ auto shardVersionRetry(OperationContext* opCtx,
                        CatalogCache* catalogCache,
                        NamespaceString nss,
                        StringData taskDescription,
-                       F&& callbackFn) {
+                       const F& callbackFn) {
     size_t numAttempts = 0;
 
     while (true) {
@@ -101,7 +101,7 @@ auto shardVersionRetry(ServiceContext* service,
                        StringData taskDescription,
                        ExecutorPtr executor,
                        CancellationToken cancelToken,
-                       Callable&& callbackFn) {
+                       Callable callbackFn) {
     auto numAttempts = std::make_shared<size_t>(0);
 
     auto body = [service,
@@ -111,9 +111,13 @@ auto shardVersionRetry(ServiceContext* service,
                  _callbackFn = std::move(callbackFn),
                  executor,
                  cancelToken] {
-        ThreadClient tc(taskDescription, service);
+        boost::optional<ThreadClient> threadClient;
+        if (!haveClient()) {
+            threadClient.emplace(taskDescription, service);
+        }
+
         CancelableOperationContextFactory opCtxFactory(cancelToken, executor);
-        auto cancelableOpCtx = opCtxFactory.makeOperationContext(tc.get());
+        auto cancelableOpCtx = opCtxFactory.makeOperationContext(&cc());
         auto opCtx = cancelableOpCtx.get();
 
         catalogCache->setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, *numAttempts);

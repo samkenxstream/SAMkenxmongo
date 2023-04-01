@@ -31,11 +31,11 @@
 
 #include "mongo/db/curop.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
 #include "mongo/db/query/explain.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -76,7 +76,10 @@ public:
     };
 
     UpdateRequest(const write_ops::UpdateOpEntry& updateOp = write_ops::UpdateOpEntry())
-        : _updateOp(updateOp) {}
+        : _updateOp(updateOp),
+          _sampleId(updateOp.getSampleId()),
+          _allowShardKeyUpdatesWithoutFullShardKeyInQuery(
+              updateOp.getAllowShardKeyUpdatesWithoutFullShardKeyInQuery()) {}
 
     void setNamespaceString(const NamespaceString& nsString) {
         _nsString = nsString;
@@ -257,7 +260,31 @@ public:
         return _stmtIds;
     }
 
-    const std::string toString() const {
+    void setSampleId(boost::optional<UUID> sampleId) {
+        if (_sampleId) {
+            tassert(ErrorCodes::InvalidOptions,
+                    "Cannot overwrite the existing sample id for the update query",
+                    _sampleId == sampleId);
+        } else {
+            _sampleId = sampleId;
+        }
+    }
+
+    const boost::optional<UUID>& getSampleId() const {
+        return _sampleId;
+    }
+
+    void setAllowShardKeyUpdatesWithoutFullShardKeyInQuery(
+        OptionalBool allowShardKeyUpdatesWithoutFullShardKeyInQuery) {
+        _allowShardKeyUpdatesWithoutFullShardKeyInQuery =
+            allowShardKeyUpdatesWithoutFullShardKeyInQuery;
+    }
+
+    const OptionalBool& getAllowShardKeyUpdatesWithoutFullShardKeyInQuery() const {
+        return _allowShardKeyUpdatesWithoutFullShardKeyInQuery;
+    }
+
+    std::string toString() const {
         StringBuilder builder;
         builder << " query: " << getQuery();
         builder << " projection: " << _proj;
@@ -290,6 +317,8 @@ public:
         builder << " multi: " << isMulti();
         builder << " fromOplogApplication: " << _fromOplogApplication;
         builder << " isExplain: " << static_cast<bool>(_explain);
+        builder << " $_allowShardKeyUpdatesWithoutFullShardKeyInQuery: "
+                << _allowShardKeyUpdatesWithoutFullShardKeyInQuery;
         return builder.str();
     }
 
@@ -313,6 +342,13 @@ private:
 
     // The statement ids of this request.
     std::vector<StmtId> _stmtIds = {kUninitializedStmtId};
+
+    // The unique sample id for this request if it has been chosen for sampling.
+    boost::optional<UUID> _sampleId;
+
+    // True if this update is allowed to modify the shard key without the specifying the full shard
+    // key.
+    OptionalBool _allowShardKeyUpdatesWithoutFullShardKeyInQuery;
 
     // Flags controlling the update.
 

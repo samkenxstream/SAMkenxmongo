@@ -5,7 +5,6 @@
  *
  * @tags: [
  *   requires_fcv_60,
- *   featureFlagUserWriteBlocking,
  * ]
  */
 
@@ -14,22 +13,7 @@
 
 load("jstests/libs/fail_point_util.js");
 load('jstests/libs/parallel_shell_helpers.js');
-
-function removeShard(shardName) {
-    assert.soon(function() {
-        let res = assert.commandWorked(st.s.adminCommand({removeShard: shardName}));
-        if (!res.ok && res.code === ErrorCodes.ShardNotFound) {
-            // If the config server primary steps down right after removing the config.shards doc
-            // for the shard but before responding with "state": "completed", the mongos would retry
-            // the _configsvrRemoveShard command against the new config server primary, which would
-            // not find the removed shard in its ShardRegistry if it has done a ShardRegistry reload
-            // after the config.shards doc for the shard was removed. This would cause the command
-            // to fail with ShardNotFound.
-            return true;
-        }
-        return res.state == 'completed';
-    });
-}
+load('jstests/sharding/libs/remove_shard_util.js');
 
 const st = new ShardingTest({shards: 2});
 
@@ -64,7 +48,7 @@ newShard.initiate();
     assert.commandWorked(st.s.adminCommand({addShard: newShard.getURL(), name: newShardName}));
 
     // Check that we cannot write on the new shard.
-    assert.commandFailedWithCode(newShardCollMongos.insert({x: 2}), ErrorCodes.OperationFailed);
+    assert.commandFailedWithCode(newShardCollMongos.insert({x: 2}), ErrorCodes.UserWritesBlocked);
 
     // Now unblock and check we can write to the new shard.
     assert.commandWorked(st.s.adminCommand({setUserWriteBlockMode: 1, global: false}));
@@ -75,7 +59,7 @@ newShard.initiate();
     // shard.
     assert.commandWorked(st.s.getDB(newShardDB).dropDatabase());
     assert.commandWorked(st.s.adminCommand({setUserWriteBlockMode: 1, global: true}));
-    removeShard(newShardName);
+    removeShard(st, newShardName);
 
     // Disable write blocking while 'newShard' is not part of the cluster.
     assert.commandWorked(st.s.adminCommand({setUserWriteBlockMode: 1, global: false}));
@@ -162,6 +146,134 @@ newShard.initiate();
     }
 
     assert.commandWorked(st.s.adminCommand({setUserWriteBlockMode: 1, global: false}));
+}
+
+// Test movePrimary works while user writes are blocked.
+{
+    // Create an unsharded collection so that its data needs to be cloned to the new db-primary.
+    const unshardedCollName = 'unshardedColl';
+    const unshardedColl = db[unshardedCollName];
+    assert.commandWorked(unshardedColl.createIndex({x: 1}));
+    unshardedColl.insert({x: 1});
+
+    // Start blocking user writes
+    assert.commandWorked(st.s.adminCommand({setUserWriteBlockMode: 1, global: true}));
+
+    const fromShard = st.getPrimaryShard(dbName);
+    const toShard = st.getOther(fromShard);
+    assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: toShard.name}));
+
+    // Check that the new primary has cloned the data.
+    assert.eq(1, toShard.getDB(dbName)[unshardedCollName].find().itcount());
+
+    // Check that the collection has been removed from the former primary.
+    assert.eq(0,
+              fromShard.getDB(dbName)
+                  .runCommand({listCollections: 1, filter: {name: unshardedCollName}})
+                  .cursor.firstBatch.length);
+
+    assert.commandWorked(st.s.adminCommand({setUserWriteBlockMode: 1, global: false}));
+}
+
+// Test setAllowMigrations works while user writes are blocked.
+{
+    coll.drop();
+    assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
+
+    // Start blocking user writes.
+    assert.commandWorked(st.s.adminCommand({setUserWriteBlockMode: 1, global: true}));
+
+    // Disable migrations for 'ns'.
+    assert.commandWorked(st.s.adminCommand({setAllowMigrations: ns, allowMigrations: false}));
+
+    const fromShard = st.getPrimaryShard(dbName);
+    const toShard = st.getOther(fromShard);
+    assert.commandFailedWithCode(
+        st.s.adminCommand({moveChunk: ns, find: {_id: 0}, to: toShard.shardName}),
+        ErrorCodes.ConflictingOperationInProgress);
+
+    // Reenable migrations for 'ns'.
+    assert.commandWorked(st.s.adminCommand({setAllowMigrations: ns, allowMigrations: true}));
+
+    assert.commandWorked(st.s.adminCommand({setUserWriteBlockMode: 1, global: false}));
+}
+
+{
+    const db2Name = 'db2';
+    assert.commandWorked(
+        st.s.adminCommand({enableSharding: db2Name, primaryShard: st.shard0.shardName}));
+    const db2 = st.s.getDB(db2Name);
+
+    let lsid = assert.commandWorked(st.s.getDB("admin").runCommand({startSession: 1})).id;
+
+    // Send _shardsvrSetUserWriteBlockMode commands to directly to shard0 so that it starts blocking
+    // user writes.
+    assert.commandWorked(st.shard0.adminCommand({
+        _shardsvrSetUserWriteBlockMode: 1,
+        global: true,
+        phase: 'prepare',
+        lsid: lsid,
+        txnNumber: NumberLong(1),
+        writeConcern: {w: "majority"}
+    }));
+    assert.commandWorked(st.shard0.adminCommand({
+        _shardsvrSetUserWriteBlockMode: 1,
+        global: true,
+        phase: 'complete',
+        lsid: lsid,
+        txnNumber: NumberLong(2),
+        writeConcern: {w: "majority"}
+    }));
+
+    // Check shard0 is now blocking writes.
+    assert.commandFailed(db2.bar.insert({x: 1}));
+
+    // Send _shardsvrSetUserWriteBlockMode commands to directly to shard0 so that it stops blocking
+    // user writes.
+    assert.commandWorked(st.shard0.adminCommand({
+        _shardsvrSetUserWriteBlockMode: 1,
+        global: false,
+        phase: 'prepare',
+        lsid: lsid,
+        txnNumber: NumberLong(3),
+        writeConcern: {w: "majority"}
+    }));
+    assert.commandWorked(st.shard0.adminCommand({
+        _shardsvrSetUserWriteBlockMode: 1,
+        global: false,
+        phase: 'complete',
+        lsid: lsid,
+        txnNumber: NumberLong(4),
+        writeConcern: {w: "majority"}
+    }));
+
+    // Check shard0 is no longer blocking writes.
+    assert.commandWorked(db2.bar.insert({x: 1}));
+
+    // Replay the first two _shardsvrSetUserWriteBlockMode commands (as if it was due to a duplicate
+    // network packet). These messages should fail to process, so write blocking should not be
+    // re-enabled.
+    assert.commandFailedWithCode(st.shard0.adminCommand({
+        _shardsvrSetUserWriteBlockMode: 1,
+        global: true,
+        phase: 'prepare',
+        lsid: lsid,
+        txnNumber: NumberLong(1),
+        writeConcern: {w: "majority"}
+    }),
+                                 ErrorCodes.TransactionTooOld);
+    assert.commandFailedWithCode(st.shard0.adminCommand({
+        _shardsvrSetUserWriteBlockMode: 1,
+        global: true,
+        phase: 'complete',
+        lsid: lsid,
+        txnNumber: NumberLong(2),
+        writeConcern: {w: "majority"}
+    }),
+                                 ErrorCodes.TransactionTooOld);
+
+    // Check shard0 is not blocking writes.
+    assert.commandWorked(db2.bar.insert({x: 2}));
 }
 
 st.stop();

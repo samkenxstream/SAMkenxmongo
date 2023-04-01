@@ -31,6 +31,7 @@
 
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/wildcard_access_method.h"
+#include "mongo/db/index_names.h"
 
 #include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/query/index_bounds_builder.h"
@@ -45,15 +46,7 @@ WildcardAccessMethod::WildcardAccessMethod(IndexCatalogEntry* wildcardState,
               _indexCatalogEntry->getCollator(),
               getSortedDataInterface()->getKeyStringVersion(),
               getSortedDataInterface()->getOrdering(),
-              getSortedDataInterface()->rsKeyFormat()) {
-    // Normalize the 'wildcardProjection' index option to facilitate its comparison as part of
-    // index signature.
-    if (!_descriptor->pathProjection().isEmpty()) {
-        auto* projExec = getWildcardProjection()->exec();
-        wildcardState->descriptor()->_setNormalizedPathProjection(
-            projExec->serializeTransformation(boost::none).toBson());
-    }
-}
+              getSortedDataInterface()->rsKeyFormat()) {}
 
 bool WildcardAccessMethod::shouldMarkIndexAsMultikey(size_t numberOfKeys,
                                                      const KeyStringSet& multikeyMetadataKeys,
@@ -69,7 +62,20 @@ void WildcardAccessMethod::doGetKeys(OperationContext* opCtx,
                                      KeyStringSet* keys,
                                      KeyStringSet* multikeyMetadataKeys,
                                      MultikeyPaths* multikeyPaths,
-                                     boost::optional<RecordId> id) const {
+                                     const boost::optional<RecordId>& id) const {
     _keyGen.generateKeys(pooledBufferBuilder, obj, keys, multikeyMetadataKeys, id);
+}
+
+Ordering WildcardAccessMethod::makeOrdering(const BSONObj& pattern) {
+    BSONObjBuilder newPattern;
+    for (auto elem : pattern) {
+        const auto fieldName = elem.fieldNameStringData();
+        if (WildcardNames::isWildcardFieldName(fieldName)) {
+            newPattern.append("$_path", 1);  // "$_path" should always be in ascending order.
+        }
+        newPattern.append(elem);
+    }
+
+    return Ordering::make(newPattern.obj());
 }
 }  // namespace mongo

@@ -16,6 +16,8 @@ var CollInfos = class {
         this.connName = connName;
         this.dbName = dbName;
         this.collInfosRes = conn.getDB(dbName).getCollectionInfos(listCollectionsFilter);
+        const result = assert.commandWorked(conn.getDB("admin").runCommand({serverStatus: 1}));
+        this.binVersion = MongoRunner.getBinVersionFor(result.version);
     }
 
     ns(collName) {
@@ -30,12 +32,10 @@ var CollInfos = class {
     }
 
     /**
-     * Get collInfo for non-capped collections.
-     *
-     * Don't call isCapped(), which calls listCollections.
+     * Get names for the clustered collections.
      */
-    getNonCappedCollNames() {
-        const infos = this.collInfosRes.filter(info => !info.options.capped);
+    getClusteredCollNames() {
+        const infos = this.collInfosRes.filter(info => info.options.clusteredIndex);
         return infos.map(info => info.name);
     }
 
@@ -104,7 +104,7 @@ var {DataConsistencyChecker} = (function() {
         }
 
         hasNext() {
-            return this.cursor.hasNext();
+            return this.stashedDoc !== undefined || this.cursor.hasNext();
         }
 
         peekNext() {
@@ -178,6 +178,58 @@ var {DataConsistencyChecker} = (function() {
             return {docsWithDifferentContents, docsMissingOnFirst, docsMissingOnSecond};
         }
 
+        // Like getDiff, but for index specs from listIndexes.  Index specs may not be in the
+        // same order on different nodes, and their primary key is "name", not "_id".
+        static getDiffIndexes(cursor1, cursor2) {
+            let map1 = {};
+            let map2 = {};
+            let indexesMissingOnFirst = [];
+            let indexesMissingOnSecond = [];
+            let indexesWithDifferentSpecs = [];
+            while (cursor1.hasNext()) {
+                let spec = cursor1.next();
+                map1[spec.name] = spec;
+            }
+            while (cursor2.hasNext()) {
+                let spec = cursor2.next();
+                if (!map1.hasOwnProperty(spec.name)) {
+                    indexesMissingOnFirst.push(spec);
+                } else {
+                    const ordering = bsonWoCompare(map1[spec.name], spec);
+                    if (ordering != 0) {
+                        indexesWithDifferentSpecs.push({first: map1[spec.name], second: spec});
+                    }
+                    map2[spec.name] = spec;
+                }
+            }
+            let map1keys = Object.keys(map1);
+            map1keys.forEach(function(key) {
+                if (!map2.hasOwnProperty(key)) {
+                    indexesMissingOnSecond.push(map1[key]);
+                }
+            });
+            return {indexesWithDifferentSpecs, indexesMissingOnFirst, indexesMissingOnSecond};
+        }
+
+        // Since listIndexes does not accept readAtClusterTime, we can only use this in the
+        // foreground dbchecks, not background ones.
+        static getIndexDiffUsingSessions(sourceSession, syncingSession, dbName, collNameOrUUID) {
+            const sourceDB = sourceSession.getDatabase(dbName);
+            const syncingDB = syncingSession.getDatabase(dbName);
+
+            const commandObj = {listIndexes: collNameOrUUID};
+            const sourceCursor = new DBCommandCursor(sourceDB, sourceDB.runCommand(commandObj));
+            const syncingCursor = new DBCommandCursor(syncingDB, syncingDB.runCommand(commandObj));
+            const diff = this.getDiffIndexes(sourceCursor, syncingCursor);
+
+            return {
+                indexesWithDifferentSpecs: diff.indexesWithDifferentSpecs.map(
+                    ({first, second}) => ({sourceNode: first, syncingNode: second})),
+                indexesMissingOnSource: diff.indexesMissingOnFirst,
+                indexesMissingOnSyncing: diff.indexesMissingOnSecond
+            };
+        }
+
         static getCollectionDiffUsingSessions(
             sourceSession, syncingSession, dbName, collNameOrUUID, readAtClusterTime) {
             const sourceDB = sourceSession.getDatabase(dbName);
@@ -229,7 +281,8 @@ var {DataConsistencyChecker} = (function() {
             return true;
         }
 
-        static dumpCollectionDiff(collectionPrinted, sourceCollInfos, syncingCollInfos, collName) {
+        static dumpCollectionDiff(
+            collectionPrinted, sourceCollInfos, syncingCollInfos, collName, indexDiffs) {
             print('Dumping collection: ' + sourceCollInfos.ns(collName));
 
             const sourceExists = sourceCollInfos.print(collectionPrinted, collName);
@@ -268,6 +321,32 @@ var {DataConsistencyChecker} = (function() {
                 print(
                     `The following documents are missing on the syncing node ${syncingNode.host}:`);
                 print(diff.docsMissingOnSyncing.map(doc => tojsononeline(doc)).join('\n'));
+            }
+
+            if (indexDiffs) {
+                this.dumpIndexDiffs(sourceNode, syncingNode, indexDiffs);
+            }
+        }
+
+        static dumpIndexDiffs(sourceNode, syncingNode, diff) {
+            for (let {
+                     sourceNode: sourceSpec,
+                     syncingNode: syncingSpec,
+                 } of diff.indexesWithDifferentSpecs) {
+                print(`Mismatching indexes between the source node ${sourceNode.host}` +
+                      ` and the syncing node ${syncingNode.host}:`);
+                print('    sourceNode:   ' + tojsononeline(sourceSpec));
+                print('    syncingNode: ' + tojsononeline(syncingSpec));
+            }
+
+            if (diff.indexesMissingOnSource.length > 0) {
+                print(`The following indexes are missing on the source node ${sourceNode.host}:`);
+                print(diff.indexesMissingOnSource.map(spec => tojsononeline(spec)).join('\n'));
+            }
+
+            if (diff.indexesMissingOnSyncing.length > 0) {
+                print(`The following indexes are missing on the syncing node ${syncingNode.host}:`);
+                print(diff.indexesMissingOnSyncing.map(spec => tojsononeline(spec)).join('\n'));
             }
         }
 
@@ -320,25 +399,21 @@ var {DataConsistencyChecker} = (function() {
                 success = false;
             }
 
-            const nonCappedCollNames = sourceCollInfos.getNonCappedCollNames();
             let didIgnoreFailure = false;
-            // Only compare the dbhashes of non-capped collections because capped
-            // collections are not necessarily truncated at the same points between the source and
-            // syncing nodes.
-            nonCappedCollNames.forEach(collName => {
-                if (sourceDBHash.collections[collName] !== syncingDBHash.collections[collName]) {
+            sourceCollInfos.collInfosRes.forEach(coll => {
+                if (sourceDBHash.collections[coll.name] !== syncingDBHash.collections[coll.name]) {
                     prettyPrint(`the two nodes have a different hash for the collection ${dbName}.${
-                        collName}: ${dbHashesMsg}`);
+                        coll.name}: ${dbHashesMsg}`);
                     // Although rare, the 'config.image_collection' table can be inconsistent after
                     // an initial sync or after a restart (see SERVER-60048). Dump the collection
                     // diff anyways for more visibility as a sanity check.
                     this.dumpCollectionDiff(
-                        collectionPrinted, sourceCollInfos, syncingCollInfos, collName);
+                        collectionPrinted, sourceCollInfos, syncingCollInfos, coll.name);
                     const shouldIgnoreFailure =
-                        this.canIgnoreCollectionDiff(sourceCollInfos, syncingCollInfos, collName);
+                        this.canIgnoreCollectionDiff(sourceCollInfos, syncingCollInfos, coll.name);
                     if (shouldIgnoreFailure) {
                         prettyPrint(
-                            `Collection diff in ${dbName}.${collName} can be ignored: ${dbHashesMsg}
+                            `Collection diff in ${dbName}.${coll.name} can be ignored: ${dbHashesMsg}
                             . Inconsistencies in the image collection can be expected in certain
                             restart scenarios.`);
                     }
@@ -417,6 +492,30 @@ var {DataConsistencyChecker} = (function() {
                 return true;
             };
 
+            // Returns true if we should skip comparing the index count between the source and the
+            // syncing node for a clustered collection. 6.1 added clustered indexes into collStat
+            // output. There will be a difference in the nindex count between versions before and
+            // after 6.1. So, skip comparing across 6.1 for clustered collections.
+            const skipIndexCountCheck = function(sourceCollInfos, syncingCollInfos, collName) {
+                const sourceVersion = sourceCollInfos.binVersion;
+                const syncingVersion = syncingCollInfos.binVersion;
+
+                // If both versions are before 6.1 or both are 6.1 onwards, we are good.
+                if ((MongoRunner.compareBinVersions(sourceVersion, "6.1") === -1 &&
+                     MongoRunner.compareBinVersions(syncingVersion, "6.1") === -1) ||
+                    (MongoRunner.compareBinVersions(sourceVersion, "6.1") >= 0 &&
+                     MongoRunner.compareBinVersions(syncingVersion, "6.1") >= 0)) {
+                    return false;
+                }
+
+                // Skip if this is a clustered collection
+                if (sourceCollInfos.getClusteredCollNames().includes(collName)) {
+                    return true;
+                }
+
+                return false;
+            };
+
             const sourceNode = sourceCollInfos.conn;
             const syncingNode = syncingCollInfos.conn;
 
@@ -447,7 +546,27 @@ var {DataConsistencyChecker} = (function() {
                     reasons.push('ns');
                 }
 
-                if (syncingHasIndexes && sourceCollStats.nindexes !== syncingCollStats.nindexes) {
+                let indexSpecsDiffer = false;
+                let indexDiffs;
+                if (syncingHasIndexes) {
+                    const sourceNode = sourceCollInfos.conn;
+                    const syncingNode = syncingCollInfos.conn;
+
+                    const sourceSession = sourceNode.getDB('test').getSession();
+                    const syncingSession = syncingNode.getDB('test').getSession();
+                    indexDiffs = this.getIndexDiffUsingSessions(
+                        sourceSession, syncingSession, sourceCollInfos.dbName, collName);
+                    indexSpecsDiffer = indexDiffs.indexesMissingOnSource.length > 0 ||
+                        indexDiffs.indexesMissingOnSyncing.length > 0 ||
+                        indexDiffs.indexesWithDifferentSpecs.length > 0;
+                }
+                if (skipIndexCountCheck(sourceCollInfos, syncingCollInfos, collName)) {
+                    prettyPrint(`Skipping comparison of collStats.nindex for clustered collection ${
+                        dbName}.${collName}. Versions ${sourceCollInfos.binVersion} and ${
+                        syncingCollInfos.binVersion} are expected to differ in the nindex count.`);
+                } else if (syncingHasIndexes &&
+                           (sourceCollStats.nindexes !== syncingCollStats.nindexes ||
+                            indexSpecsDiffer)) {
                     reasons.push('indexes');
                 }
 
@@ -464,27 +583,23 @@ var {DataConsistencyChecker} = (function() {
                 prettyPrint(`the two nodes have different states for the collection ${dbName}.${
                     collName}: ${reasons.join(', ')}`);
                 this.dumpCollectionDiff(
-                    collectionPrinted, sourceCollInfos, syncingCollInfos, collName);
+                    collectionPrinted, sourceCollInfos, syncingCollInfos, collName, indexDiffs);
                 success = false;
             });
 
-            if (nonCappedCollNames.length === sourceCollections.length) {
-                // If the two nodes have the same hashes for all the
-                // collections in the database and there aren't any capped collections,
-                // then the hashes for the whole database should match.
-                if (sourceDBHash.md5 !== syncingDBHash.md5) {
-                    prettyPrint(`the two nodes have a different hash for the ${dbName} database: ${
-                        dbHashesMsg}`);
-                    if (didIgnoreFailure) {
-                        // We only expect database hash mismatches on the config db, where
-                        // config.image_collection is expected to have inconsistencies in certain
-                        // scenarios.
-                        prettyPrint(`Ignoring hash mismatch for the ${dbName} database since
-                            inconsistencies in 'config.image_collection' can be expected`);
-                        return success;
-                    }
-                    success = false;
+            // The hashes for the whole database should match.
+            if (sourceDBHash.md5 !== syncingDBHash.md5) {
+                prettyPrint(`the two nodes have a different hash for the ${dbName} database: ${
+                    dbHashesMsg}`);
+                if (didIgnoreFailure) {
+                    // We only expect database hash mismatches on the config db, where
+                    // config.image_collection is expected to have inconsistencies in certain
+                    // scenarios.
+                    prettyPrint(`Ignoring hash mismatch for the ${dbName} database since
+                        inconsistencies in 'config.image_collection' can be expected`);
+                    return success;
                 }
+                success = false;
             }
 
             return success;

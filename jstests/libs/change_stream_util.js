@@ -15,24 +15,13 @@ const ChangeStreamWatchMode = Object.freeze({
 });
 
 /**
- * Returns true if server version is 5.1 or above. Version 5.1 and above optimizes the change stream
- * pipeline.
- *
- * TODO SERVER-60736: remove this function and update all call-sites.
+ * Returns a truncated json object if the size of 'jsonObj' is greater than 'maxErrorSizeBytes'.
  */
-function isChangeStreamsOptimizationEnabled(db) {
-    return MongoRunner.compareBinVersions(db.getSiblingDB("admin").serverStatus().version, "5.1") !=
-        -1;
-}
+function tojsonMaybeTruncate(jsonObj) {
+    // Maximum size for the json object.
+    const maxErrorSizeBytes = 1024 * 1024;
 
-/**
- * Returns true if feature flag 'featureFlagChangeStreamPreAndPostImages' is enabled, false
- * otherwise.
- */
-function isChangeStreamPreAndPostImagesEnabled(db) {
-    const getParam = db.adminCommand({getParameter: 1, featureFlagChangeStreamPreAndPostImages: 1});
-    return getParam.hasOwnProperty("featureFlagChangeStreamPreAndPostImages") &&
-        getParam.featureFlagChangeStreamPreAndPostImages.value;
+    return tojson(jsonObj).substring(0, maxErrorSizeBytes);
 }
 
 /**
@@ -42,15 +31,6 @@ function isChangeStreamsRewriteEnabled(db) {
     const getParam = db.adminCommand({getParameter: 1, featureFlagChangeStreamsRewrite: 1});
     return getParam.hasOwnProperty("featureFlagChangeStreamsRewrite") &&
         getParam.featureFlagChangeStreamsRewrite.value;
-}
-
-/**
- * Returns true if feature flag 'featureFlagChangeStreamsVisibility' is enabled, false otherwise.
- */
-function isChangeStreamsVisibilityEnabled(db) {
-    const getParam = db.adminCommand({getParameter: 1, featureFlagChangeStreamsVisibility: 1});
-    return getParam.hasOwnProperty("featureFlagChangeStreamsVisibility") &&
-        getParam.featureFlagChangeStreamsVisibility.value;
 }
 
 /**
@@ -115,35 +95,27 @@ function canonicalizeEventForTesting(event, expected) {
     if (!expected.hasOwnProperty("updateDescription"))
         delete event.updateDescription;
 
-    // TODO SERVER-50301: The 'truncatedArrays' field may not appear in the updateDescription
-    // depending on whether $v:2 update oplog entries are enabled. When the expected event has an
-    // empty 'truncatedFields' we do not require that the actual event contain the field. This
-    // logic can be removed when $v:2 update oplog entries are enabled on all configurations.
-    if (
-        // If the expected event has an empty 'truncatedArrays' field...
-        expected.hasOwnProperty("updateDescription") &&
-        Array.isArray(expected.updateDescription.truncatedArrays) &&
-        expected.updateDescription.truncatedArrays.length == 0 &&
-        // ...And the actual event has no truncated arrays field.
-        event.hasOwnProperty("updateDescription") &&
-        !event.updateDescription.hasOwnProperty("truncatedArrays")) {
-        // Treat the actual event as if it had an empty 'truncatedArrays' field.
-        event.updateDescription.truncatedArrays = [];
-    }
-
     return event;
 }
+
 /**
- * Helper to check whether a change stream event matches the given expected event. Ignores the
- * resume token and clusterTime unless they are explicitly listed in the expectedEvent.
+ * Returns true if a change stream event matches the given expected event, false otherwise. Ignores
+ * the resume token, clusterTime, and other unknowable fields unless they are explicitly listed in
+ * the expected event.
+ */
+function isChangeStreamEventEq(actualEvent, expectedEvent) {
+    const testEvent = canonicalizeEventForTesting(Object.assign({}, actualEvent), expectedEvent);
+    return friendlyEqual(sortDoc(testEvent), sortDoc(expectedEvent));
+}
+
+/**
+ * Helper to check whether a change event matches the given expected event. Throws assertion failure
+ * if change events do not match.
  */
 function assertChangeStreamEventEq(actualEvent, expectedEvent) {
-    const testEvent = canonicalizeEventForTesting(Object.assign({}, actualEvent), expectedEvent);
-
-    assert.docEq(testEvent,
-                 expectedEvent,
-                 "Change did not match expected change. Expected change: " + tojson(expectedEvent) +
-                     ", Actual change: " + tojson(testEvent));
+    assert(isChangeStreamEventEq(actualEvent, expectedEvent),
+           () => "Change events did not match. Expected: " + tojsonMaybeTruncate(expectedEvent) +
+               ", Actual: " + tojsonMaybeTruncate(actualEvent));
 }
 
 function ChangeStreamTest(_db, name = "ChangeStreamTest") {
@@ -227,7 +199,8 @@ function ChangeStreamTest(_db, name = "ChangeStreamTest") {
         if (nextBatch.length === 0) {
             return null;
         }
-        assert.eq(nextBatch.length, 1, "Batch length wasn't 0 or 1: " + tojson(cursor));
+        assert.eq(
+            nextBatch.length, 1, "Batch length wasn't 0 or 1: " + tojsonMaybeTruncate(cursor));
         return nextBatch[0];
     }
 
@@ -250,14 +223,14 @@ function ChangeStreamTest(_db, name = "ChangeStreamTest") {
                         cursor.id,
                         NumberLong(0),
                         "Cursor has been closed unexpectedly. Observed change stream events: " +
-                            tojson(changes));
+                            tojsonMaybeTruncate(changes));
                     cursor = self.getNextBatch(cursor);
                     changes[i] = getNextDocFromCursor(cursor);
                     return changes[i] !== null;
                 },
                 () => {
                     return "timed out waiting for another result from the change stream, observed changes: " +
-                        tojson(changes) + ", expected changes: " + numChanges;
+                        tojsonMaybeTruncate(changes) + ", expected changes: " + numChanges;
                 });
         }
 
@@ -286,8 +259,9 @@ function ChangeStreamTest(_db, name = "ChangeStreamTest") {
         } else if (!expectInvalidate) {
             assert(!isInvalidated(observedChanges[numChangesSeen]),
                    "Change was invalidated when it should not have been. Number of changes seen: " +
-                       numChangesSeen + ", observed changes: " + tojson(observedChanges) +
-                       ", expected changes: " + tojson(expectedChanges));
+                       numChangesSeen +
+                       ", observed changes: " + tojsonMaybeTruncate(observedChanges) +
+                       ", expected changes: " + tojsonMaybeTruncate(expectedChanges));
         }
     }
 
@@ -332,14 +306,12 @@ function ChangeStreamTest(_db, name = "ChangeStreamTest") {
 
         let changes = self.getNextChanges(cursor, expectedNumChanges, skipFirstBatch);
         if (ignoreOrder) {
-            const errMsgFunc = () => `${tojson(changes)} != ${tojson(expectedChanges)}`;
+            const errMsgFunc = () =>
+                `${tojsonMaybeTruncate(changes)} != ${tojsonMaybeTruncate(expectedChanges)}`;
             assert.eq(changes.length, expectedNumChanges, errMsgFunc);
             for (let i = 0; i < changes.length; i++) {
                 assert(expectedChanges.some(expectedChange => {
-                    return _convertExceptionToReturnStatus(() => {
-                        assertChangeStreamEventEq(changes[i], expectedChange);
-                        return true;
-                    })();
+                    return isChangeStreamEventEq(changes[i], expectedChange);
                 }),
                        errMsgFunc);
             }
@@ -352,11 +324,14 @@ function ChangeStreamTest(_db, name = "ChangeStreamTest") {
         // If we expect invalidation, the final change should have operation type "invalidate".
         if (expectInvalidate) {
             assert(isInvalidated(changes[changes.length - 1]),
-                   "Last change was not invalidated when it was expected: " + tojson(changes));
+                   "Last change was not invalidated when it was expected: " +
+                       tojsonMaybeTruncate(changes));
 
             // We make sure that the next batch kills the cursor after an invalidation entry.
             let finalCursor = self.getNextBatch(cursor);
-            assert.eq(finalCursor.id, 0, "Final cursor was not killed: " + tojson(finalCursor));
+            assert.eq(finalCursor.id,
+                      0,
+                      "Final cursor was not killed: " + tojsonMaybeTruncate(finalCursor));
         }
 
         return changes;
@@ -386,7 +361,8 @@ function ChangeStreamTest(_db, name = "ChangeStreamTest") {
      */
     self.assertNoChange = function(cursor) {
         cursor = self.getNextBatch(cursor);
-        assert.eq(0, cursor.nextBatch.length, () => "Cursor had changes: " + tojson(cursor));
+        assert.eq(
+            0, cursor.nextBatch.length, () => "Cursor had changes: " + tojsonMaybeTruncate(cursor));
     };
 
     /**
@@ -398,11 +374,14 @@ function ChangeStreamTest(_db, name = "ChangeStreamTest") {
 
         if (expectInvalidate) {
             assert(isInvalidated(changes[changes.length - 1]),
-                   "Last change was not invalidated when it was expected: " + tojson(changes));
+                   "Last change was not invalidated when it was expected: " +
+                       tojsonMaybeTruncate(changes));
 
             // We make sure that the next batch kills the cursor after an invalidation entry.
             let finalCursor = self.getNextBatch(cursor);
-            assert.eq(finalCursor.id, 0, "Final cursor was not killed: " + tojson(finalCursor));
+            assert.eq(finalCursor.id,
+                      0,
+                      "Final cursor was not killed: " + tojsonMaybeTruncate(finalCursor));
         }
 
         return changes[0];
@@ -520,9 +499,10 @@ ChangeStreamTest.assertChangeStreamThrowsCode = function assertChangeStreamThrow
         // csCursor.hasNext() to throw the expected code before assert.soon() times out.
         const csCursor = new DBCommandCursor(db, res, 1);
         assert.soon(() => csCursor.hasNext());
-        assert(false, `Unexpected result from cursor: ${tojson(csCursor.next())}`);
+        assert(false, `Unexpected result from cursor: ${tojsonMaybeTruncate(csCursor.next())}`);
     } catch (error) {
-        assert.eq(error.code, expectedCode, `Caught unexpected error: ${tojson(error)}`);
+        assert.eq(
+            error.code, expectedCode, `Caught unexpected error: ${tojsonMaybeTruncate(error)}`);
         return true;
     }
     assert(false, "expected this to be unreachable");
@@ -583,13 +563,13 @@ function assertChangeStreamPreAndPostImagesCollectionOptionIsAbsent(db, collName
     assert(!collectionInfos[0].options.hasOwnProperty("changeStreamPreAndPostImages"));
 }
 
-function getPreImagesCollection(db) {
-    return db.getSiblingDB(kPreImagesCollectionDatabase).getCollection(kPreImagesCollectionName);
+function getPreImagesCollection(connection) {
+    return connection.getDB(kPreImagesCollectionDatabase).getCollection(kPreImagesCollectionName);
 }
 
 // Returns the pre-images written while performing the write operations.
 function preImagesForOps(db, writeOps) {
-    const preImagesColl = getPreImagesCollection(db);
+    const preImagesColl = getPreImagesCollection(db.getMongo());
     const preImagesCollSortSpec = {"_id.ts": 1, "_id.applyOpsIndex": 1};
 
     // Determine the id of the last pre-image document written to be able to determine the pre-image
@@ -621,7 +601,7 @@ function preImagesForOps(db, writeOps) {
  * _id.applyOpsIndex ascending.
  */
 function getPreImages(connection) {
-    return connection.getDB(kPreImagesCollectionDatabase)[kPreImagesCollectionName]
+    return getPreImagesCollection(connection)
         .find()
         .sort({"_id.ts": 1, "_id.applyOpsIndex": 1})
         .allowDiskUse()

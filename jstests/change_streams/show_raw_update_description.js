@@ -14,26 +14,6 @@ load("jstests/aggregation/extras/utils.js");       // For arrayEq.
 load("jstests/libs/change_stream_util.js");        // For ChangeStreamTest.
 load("jstests/libs/collection_drop_recreate.js");  // For assertDropAndRecreateCollection.
 
-const isFeatureEnabled =
-    assert.commandWorked(db.adminCommand({getParameter: 1, featureFlagChangeStreamsVisibility: 1}))
-        .featureFlagChangeStreamsVisibility.value;
-if (!isFeatureEnabled) {
-    assert.commandFailedWithCode(db.runCommand({
-        aggregate: 1,
-        pipeline: [{$changeStream: {showRawUpdateDescription: true}}],
-        cursor: {},
-    }),
-                                 6189400);
-    return;
-}
-
-const oplogV2FlagName = "internalQueryEnableLoggingV2OplogEntries";
-const oplogV2Enabled =
-    assert.commandWorked(db.adminCommand({getParameter: 1, [oplogV2FlagName]: 1}))[oplogV2FlagName];
-if (!oplogV2Enabled) {
-    return;
-}
-
 // Drop and recreate the collections to be used in this set of tests.
 assertDropAndRecreateCollection(db, "t1");
 assertDropAndRecreateCollection(db, "t2");

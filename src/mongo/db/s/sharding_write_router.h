@@ -30,29 +30,33 @@
 #pragma once
 
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/s/catalog_cache.h"
+
 namespace mongo {
 
-class BSONObj;
-class CatalogCache;
-class ChunkManager;
-class OperationContext;
-class ShardId;
 class ShardingWriteRouter {
 public:
     ShardingWriteRouter(OperationContext* opCtx,
                         const NamespaceString& nss,
                         CatalogCache* catalogCache);
 
+    CollectionShardingState* getCss() const {
+        return _scopedCss ? &(**_scopedCss) : nullptr;
+    }
+
+    const boost::optional<ScopedCollectionDescription>& getCollDesc() const {
+        return _collDesc;
+    }
+
     boost::optional<ShardId> getReshardingDestinedRecipient(const BSONObj& fullDocument) const;
 
-    CollectionShardingState* getCollectionShardingState() const;
-
 private:
-    CollectionShardingState* _css{nullptr};
+    boost::optional<CollectionShardingState::ScopedCollectionShardingState> _scopedCss;
+    boost::optional<ScopedCollectionDescription> _collDesc;
 
     boost::optional<ScopedCollectionFilter> _ownershipFilter;
-    boost::optional<ShardKeyPattern> _shardKeyPattern;
-    boost::optional<ShardKeyPattern> _reshardKeyPattern;
+
+    boost::optional<ShardKeyPattern> _reshardingKeyPattern;
     boost::optional<ChunkManager> _reshardingChunkMgr;
 };
 

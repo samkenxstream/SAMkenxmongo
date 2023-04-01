@@ -3,7 +3,6 @@
  *
  * @tags: [
  *   assumes_read_concern_unchanged,
- *   requires_wiredtiger,
  *   # We are setting the failpoint only on primaries, so we need to disable reads from secondaries,
  *   # where the failpoint is not enabled.
  *   assumes_read_preference_unchanged,
@@ -69,6 +68,7 @@ let shardsFound = [];
 db.getSiblingDB("config").shards.find().forEach(function(shard) {
     allShards.push(shard._id);
 });
+const isShardedCluster = !!allShards.length;
 
 for (const indexStats of pausedOutput) {
     assert.hasFields(indexStats, ["building", "spec"]);
@@ -84,6 +84,8 @@ for (const indexStats of pausedOutput) {
     // names of known shards.
     if (indexStats.hasOwnProperty("shard")) {
         shardsFound.push(indexStats["shard"]);
+    } else {
+        assert(!isShardedCluster);
     }
 }
 

@@ -31,8 +31,8 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/s/database_sharding_state.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/s/request_types/move_primary_gen.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -60,6 +60,8 @@ class Status;
  *
  * At any point in time it is safe to let the MovePrimarySourceManager object go out of scope in
  * which case the destructor will take care of clean up based on how far we have advanced.
+ *
+ * TODO (SERVER-71309): Remove once 7.0 becomes last LTS.
  */
 class MovePrimarySourceManager {
     MovePrimarySourceManager(const MovePrimarySourceManager&) = delete;
@@ -75,7 +77,6 @@ public:
      *  - StaleConfigException if the expected database version does not match what we find it
      *      to be after acquiring the distributed lock.
      */
-
     MovePrimarySourceManager(OperationContext* opCtx,
                              ShardMovePrimary requestArgs,
                              StringData dbname,
@@ -145,10 +146,20 @@ private:
     }
 
     /**
-     * Updates CSRS metadata in config.databases collection to move the given primary database on
-     * its new shard.
+     * Invokes the _configsvrCommitMovePrimary command of the config server to reassign the primary
+     * shard of the database.
      */
-    Status _commitOnConfig(OperationContext* opCtx);
+    Status _commitOnConfig(OperationContext* opCtx, const DatabaseVersion& expectedDbVersion);
+
+    /**
+     * Updates the config server's metadata in config.databases collection to reassign the primary
+     * shard of the database.
+     *
+     * This logic is not synchronized with the removeShard command and simultaneous invocations of
+     * movePrimary and removeShard can lead to data loss.
+     */
+    Status _fallbackCommitOnConfig(OperationContext* opCtx,
+                                   const DatabaseVersion& expectedDbVersion);
 
     // Used to track the current state of the source manager. See the methods above, which have
     // comments explaining the various state transitions.

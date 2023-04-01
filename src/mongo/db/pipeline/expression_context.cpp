@@ -27,21 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <utility>
 
 #include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
-#include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
-
-using boost::intrusive_ptr;
 
 ExpressionContext::ResolvedNamespace::ResolvedNamespace(NamespaceString ns,
                                                         std::vector<BSONObj> pipeline,
@@ -54,12 +49,13 @@ ExpressionContext::ExpressionContext(OperationContext* opCtx,
                                      std::shared_ptr<MongoProcessInterface> processInterface,
                                      StringMap<ResolvedNamespace> resolvedNamespaces,
                                      boost::optional<UUID> collUUID,
-                                     bool mayDbProfile)
+                                     bool mayDbProfile,
+                                     bool allowDiskUseByDefault)
     : ExpressionContext(opCtx,
                         request.getExplain(),
                         request.getFromMongos(),
                         request.getNeedsMerge(),
-                        request.getAllowDiskUse(),
+                        request.getAllowDiskUse().value_or(allowDiskUseByDefault),
                         request.getBypassDocumentValidation().value_or(false),
                         request.getIsMapReduceCommand(),
                         request.getNamespace(),
@@ -76,6 +72,7 @@ ExpressionContext::ExpressionContext(OperationContext* opCtx,
         // 'jsHeapLimitMB' limit.
         jsHeapLimitMB = boost::none;
     }
+    forPerShardCursor = request.getPassthroughToShard().has_value();
 }
 
 ExpressionContext::ExpressionContext(
@@ -97,7 +94,8 @@ ExpressionContext::ExpressionContext(
     : explain(explain),
       fromMongos(fromMongos),
       needsMerge(needsMerge),
-      allowDiskUse(allowDiskUse),
+      allowDiskUse(allowDiskUse &&
+                   !(opCtx && opCtx->readOnly())),  // Disallow disk use if in read-only mode.
       bypassDocumentValidation(bypassDocumentValidation),
       ns(ns),
       uuid(std::move(collUUID)),
@@ -116,6 +114,7 @@ ExpressionContext::ExpressionContext(
         auto genConsts = variables.generateRuntimeConstants(opCtx);
         genConsts.setJsScope(runtimeConstants->getJsScope());
         genConsts.setIsMapReduce(runtimeConstants->getIsMapReduce());
+        genConsts.setUserRoles(runtimeConstants->getUserRoles());
         variables.setLegacyRuntimeConstants(genConsts);
     } else if (runtimeConstants) {
         variables.setLegacyRuntimeConstants(*runtimeConstants);
@@ -182,7 +181,7 @@ std::unique_ptr<ExpressionContext::CollatorStash> ExpressionContext::temporarily
     return std::unique_ptr<CollatorStash>(new CollatorStash(this, std::move(newCollator)));
 }
 
-intrusive_ptr<ExpressionContext> ExpressionContext::copyWith(
+boost::intrusive_ptr<ExpressionContext> ExpressionContext::copyWith(
     NamespaceString ns,
     boost::optional<UUID> uuid,
     boost::optional<std::unique_ptr<CollatorInterface>> updatedCollator) const {
@@ -203,13 +202,16 @@ intrusive_ptr<ExpressionContext> ExpressionContext::copyWith(
                                                     std::move(collator),
                                                     mongoProcessInterface,
                                                     _resolvedNamespaces,
-                                                    uuid);
+                                                    uuid,
+                                                    boost::none /* letParameters */,
+                                                    mayDbProfile);
 
     expCtx->inMongos = inMongos;
     expCtx->maxFeatureCompatibilityVersion = maxFeatureCompatibilityVersion;
     expCtx->subPipelineDepth = subPipelineDepth;
     expCtx->tempDir = tempDir;
     expCtx->jsHeapLimitMB = jsHeapLimitMB;
+    expCtx->isParsingViewDefinition = isParsingViewDefinition;
 
     expCtx->variables = variables;
     expCtx->variablesParseState = variablesParseState.copyWith(expCtx->variables.useIdGenerator());
@@ -217,7 +219,12 @@ intrusive_ptr<ExpressionContext> ExpressionContext::copyWith(
     expCtx->exprDeprectedForApiV1 = exprDeprectedForApiV1;
 
     expCtx->initialPostBatchResumeToken = initialPostBatchResumeToken.getOwned();
+    expCtx->changeStreamTokenVersion = changeStreamTokenVersion;
+    expCtx->changeStreamSpec = changeStreamSpec;
+
     expCtx->originalAggregateCommand = originalAggregateCommand.getOwned();
+
+    expCtx->inLookup = inLookup;
 
     // Note that we intentionally skip copying the value of '_interruptCounter' because 'expCtx' is
     // intended to be used for executing a separate aggregation pipeline.
@@ -233,23 +240,53 @@ void ExpressionContext::startExpressionCounters() {
 
 void ExpressionContext::incrementMatchExprCounter(StringData name) {
     if (enabledCounters && _expressionCounters) {
-        ++_expressionCounters.get().matchExprCountersMap[name];
+        ++_expressionCounters.value().matchExprCountersMap[name];
     }
 }
 
 void ExpressionContext::incrementAggExprCounter(StringData name) {
     if (enabledCounters && _expressionCounters) {
-        ++_expressionCounters.get().aggExprCountersMap[name];
+        ++_expressionCounters.value().aggExprCountersMap[name];
+    }
+}
+
+void ExpressionContext::incrementGroupAccumulatorExprCounter(StringData name) {
+    if (enabledCounters && _expressionCounters) {
+        ++_expressionCounters.value().groupAccumulatorExprCountersMap[name];
+    }
+}
+
+void ExpressionContext::incrementWindowAccumulatorExprCounter(StringData name) {
+    if (enabledCounters && _expressionCounters) {
+        ++_expressionCounters.value().windowAccumulatorExprCountersMap[name];
     }
 }
 
 void ExpressionContext::stopExpressionCounters() {
     if (enabledCounters && _expressionCounters) {
         operatorCountersMatchExpressions.mergeCounters(
-            _expressionCounters.get().matchExprCountersMap);
-        operatorCountersAggExpressions.mergeCounters(_expressionCounters.get().aggExprCountersMap);
+            _expressionCounters.value().matchExprCountersMap);
+        operatorCountersAggExpressions.mergeCounters(
+            _expressionCounters.value().aggExprCountersMap);
+        operatorCountersGroupAccumulatorExpressions.mergeCounters(
+            _expressionCounters.value().groupAccumulatorExprCountersMap);
+        operatorCountersWindowAccumulatorExpressions.mergeCounters(
+            _expressionCounters.value().windowAccumulatorExprCountersMap);
     }
     _expressionCounters = boost::none;
+}
+
+void ExpressionContext::setUserRoles() {
+    // We need to check the FCV here because the $$USER_ROLES variable will always appear in the
+    // serialized command when one shard is sending a sub-query to another shard. The query will
+    // fail in the case where the shards are running different binVersions and one of them does not
+    // have a notion of this variable. This FCV check prevents this from happening, as the value of
+    // the variable is not set (and therefore not serialized) if the FCV is too old.
+    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        feature_flags::gFeatureFlagUserRoles.isEnabled(serverGlobalParams.featureCompatibility) &&
+        enableAccessToUserRoles.load()) {
+        variables.defineUserRoles(opCtx);
+    }
 }
 
 }  // namespace mongo

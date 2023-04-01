@@ -27,13 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
 #include <cstring>
 
 #include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
@@ -41,6 +41,9 @@
 #include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
@@ -69,9 +72,14 @@ void WiredTigerOplogManager::startVisibilityThread(OperationContext* opCtx,
                     1,
                     "Initializing the oplog read timestamp (oplog visibility).",
                     "oplogReadTimestamp"_attr = topOfOplogTimestamp);
-    } else {
+    } else if (repl::ReplicationCoordinator::get(opCtx)->isReplEnabled()) {
         // Avoid setting oplog visibility to 0. That means "everything is visible".
         setOplogReadTimestamp(Timestamp(StorageEngine::kMinimumTimestamp));
+    } else {
+        // Use max Timestamp to disable oplog visibility in standalone mode. The read timestamp may
+        // be interpreted as signed so we need to use signed int64_t max to make sure it is always
+        // larger than any user 'ts' field.
+        setOplogReadTimestamp(Timestamp(std::numeric_limits<int64_t>::max()));
     }
 
     // Need to obtain the mutex before starting the thread, as otherwise it may race ahead
@@ -137,7 +145,7 @@ void WiredTigerOplogManager::waitForAllEarlierOplogWritesToBeVisible(
         opCtx->recoveryUnit()->abandonSnapshot();
         return;
     }
-    const auto waitingFor = lastOplogRecord->id;
+    const auto& waitingFor = lastOplogRecord->id;
 
     // Close transaction before we wait.
     opCtx->recoveryUnit()->abandonSnapshot();
@@ -231,8 +239,6 @@ void WiredTigerOplogManager::_updateOplogVisibilityLoop(WiredTigerSessionCache* 
         invariant(_triggerOplogVisibilityUpdate);
         _triggerOplogVisibilityUpdate = false;
 
-        lk.unlock();
-
         // Fetch the all_durable timestamp from the storage engine, which is guaranteed not to have
         // any holes behind it in-memory.
         const uint64_t newTimestamp = sessionCache->getKVEngine()->getAllDurableTimestamp().asULL();
@@ -248,7 +254,6 @@ void WiredTigerOplogManager::_updateOplogVisibilityLoop(WiredTigerSessionCache* 
             continue;
         }
 
-        lk.lock();
         // Publish the new timestamp value. Avoid going backward.
         auto currentVisibleTimestamp = getOplogReadTimestamp();
         if (newTimestamp > currentVisibleTimestamp) {

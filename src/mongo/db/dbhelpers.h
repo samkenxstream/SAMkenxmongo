@@ -50,11 +50,8 @@ class FindCommandRequest;
 struct Helpers {
     /**
      * Executes the given match expression ('query') and returns true if there is at least one
-     * one matching document. The first found matching document is returned via the 'result' output
+     * matching document. The first found matching document is returned via the 'result' output
      * parameter.
-     *
-     * If 'requireIndex' is true, then this forces the query system to choose an indexed plan. An
-     * exception is thrown if no 'requireIndex' is set to true but no indexed plan exists.
      *
      * Performs the read successfully regardless of a replica set node's state, meaning that the
      * node does not need to be primary or secondary.
@@ -62,12 +59,11 @@ struct Helpers {
     static bool findOne(OperationContext* opCtx,
                         const CollectionPtr& collection,
                         const BSONObj& query,
-                        BSONObj& result,
-                        bool requireIndex = false);
+                        BSONObj& result);
 
     /**
-     * If `invariantOnError` is true, an error (e.g: no document found) will crash the
-     * process. Otherwise the empty BSONObj will be returned.
+     * If `invariantOnError` is true, an error (e.g: no document found) will crash the process.
+     * Otherwise the empty BSONObj will be returned.
      */
     static BSONObj findOneForTesting(OperationContext* opCtx,
                                      const CollectionPtr& collection,
@@ -80,20 +76,19 @@ struct Helpers {
      */
     static RecordId findOne(OperationContext* opCtx,
                             const CollectionPtr& collection,
-                            const BSONObj& query,
-                            bool requireIndex);
+                            const BSONObj& query);
     static RecordId findOne(OperationContext* opCtx,
                             const CollectionPtr& collection,
-                            std::unique_ptr<FindCommandRequest> qr,
-                            bool requireIndex);
+                            std::unique_ptr<FindCommandRequest> qr);
 
     /**
-     * @param foundIndex if passed in will be set to 1 if ns and index found
-     * @return true if object found
+     * If 'indexFound' is not nullptr,  will be set to true if the query was answered using the _id
+     * index or using a clustered _id index.
+     *
+     * Returns true if a matching document was found.
      */
     static bool findById(OperationContext* opCtx,
-                         Database* db,
-                         StringData ns,
+                         const NamespaceString& nss,
                          BSONObj query,
                          BSONObj& result,
                          bool* nsFound = nullptr,
@@ -115,18 +110,18 @@ struct Helpers {
      *
      * Returns false if there is no such object.
      */
-    static bool getSingleton(OperationContext* opCtx, const char* ns, BSONObj& result);
+    static bool getSingleton(OperationContext* opCtx, const NamespaceString& nss, BSONObj& result);
 
     /**
      * Same as getSingleton, but with a reverse natural-order scan on "ns".
      */
-    static bool getLast(OperationContext* opCtx, const char* ns, BSONObj& result);
+    static bool getLast(OperationContext* opCtx, const NamespaceString& nss, BSONObj& result);
 
     /**
      * Performs an upsert of "obj" into the collection "ns", with an empty update predicate.
      * Callers must have "ns" locked.
      */
-    static void putSingleton(OperationContext* opCtx, const char* ns, BSONObj obj);
+    static void putSingleton(OperationContext* opCtx, const NamespaceString& nss, BSONObj obj);
 
     /**
      * Callers are expected to hold the collection lock.
@@ -134,7 +129,7 @@ struct Helpers {
      * o has to have an _id field or will assert
      */
     static UpdateResult upsert(OperationContext* opCtx,
-                               const std::string& ns,
+                               const NamespaceString& nss,
                                const BSONObj& o,
                                bool fromMigrate = false);
 
@@ -145,7 +140,7 @@ struct Helpers {
      * on the same storage snapshot.
      */
     static UpdateResult upsert(OperationContext* opCtx,
-                               const std::string& ns,
+                               const NamespaceString& nss,
                                const BSONObj& filter,
                                const BSONObj& updateMod,
                                bool fromMigrate = false);
@@ -157,7 +152,7 @@ struct Helpers {
      * on the same storage snapshot.
      */
     static void update(OperationContext* opCtx,
-                       const std::string& ns,
+                       const NamespaceString& nss,
                        const BSONObj& filter,
                        const BSONObj& updateMod,
                        bool fromMigrate = false);

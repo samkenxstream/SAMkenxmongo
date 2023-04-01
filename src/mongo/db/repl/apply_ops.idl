@@ -32,7 +32,7 @@ global:
     cpp_namespace: "mongo::repl"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 structs:
     ApplyOpsCommandInfoBase:
@@ -45,14 +45,6 @@ structs:
                 type: array<object>
                 description: "The operations to apply"
 
-            allowAtomic:
-                cpp_name: allowAtomic
-                type: bool
-                default: true
-                description: "If 'allowAtomic' is true, applyOps() determines if all the given
-                              operations can be processed inside one WriteUnitOfWork. Set this flag
-                              to false to disable this 'atomic' mode."
-
             alwaysUpsert:
                 cpp_name: alwaysUpsert
                 type: bool
@@ -64,9 +56,10 @@ structs:
                 cpp_name: preCondition
                 type: array<object>
                 optional: true
-                description: "applyOps supports checking the documents of existing collections
-                              before proceeding to execute the given operations. This flag is set to
-                              true if the 'preCondition' option is provided."
+                description: "No longer supported, but kept here to improve the error message
+                              returned to the client. In older versions, applyOps used to support
+                              checking the documents of existing collections before proceeding to
+                              execute the given operations."
 
             prepare:
                 type: bool

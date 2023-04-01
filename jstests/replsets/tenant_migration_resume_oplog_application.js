@@ -2,7 +2,6 @@
  * Tests that in a tenant migration, the recipient primary will resume oplog application on
  * failover.
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
@@ -12,22 +11,26 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    checkTenantDBHashes,
+    makeX509OptionsForTest,
+    runMigrationAsync,
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");            // for 'extractUUIDFromObject'
 load("jstests/libs/parallelTester.js");       // for 'Thread'
 load("jstests/libs/write_concern_util.js");   // for 'stopReplicationOnSecondaries'
 load("jstests/aggregation/extras/utils.js");  // For assertArrayEq.
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+load('jstests/replsets/rslib.js');            // For 'createRstArgs'
 
 const recipientRst = new ReplSetTest({
     nodes: 3,
     name: jsTestName() + "_recipient",
+    serverless: true,
     // Use a batch size of 2 so that we can hang in the middle of tenant oplog application.
-    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().recipient,
+    nodeOptions: Object.assign(makeX509OptionsForTest().recipient,
                                {setParameter: {tenantApplierBatchSizeOps: 2}})
 });
 
@@ -37,7 +40,7 @@ recipientRst.initiate();
 const tenantMigrationTest =
     new TenantMigrationTest({name: jsTestName(), recipientRst: recipientRst});
 
-const tenantId = "testTenantId";
+const tenantId = ObjectId().str;
 const dbName = tenantMigrationTest.tenantDB(tenantId, "testDB");
 const collName = "testColl";
 
@@ -55,7 +58,7 @@ const migrationId = UUID();
 const migrationOpts = {
     migrationIdString: extractUUIDFromObject(migrationId),
     recipientConnString: tenantMigrationTest.getRecipientConnString(),
-    tenantId: tenantId,
+    tenantId,
 };
 
 // Configure fail point to have the recipient primary hang after the cloner completes and the oplog
@@ -66,9 +69,8 @@ let waitAfterDatabaseClone = configureFailPoint(
 let waitInOplogApplier = configureFailPoint(recipientPrimary, "hangInTenantOplogApplication");
 
 // Start a migration and wait for recipient to hang in the tenant database cloner.
-const donorRstArgs = TenantMigrationUtil.createRstArgs(donorRst);
-const migrationThread =
-    new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
+const donorRstArgs = createRstArgs(donorRst);
+const migrationThread = new Thread(runMigrationAsync, migrationOpts, donorRstArgs);
 migrationThread.start();
 waitAfterDatabaseClone.wait();
 
@@ -94,7 +96,7 @@ if (appliedNoOps.count() === 2) {
 // Step up a new node in the recipient set and trigger a failover. The new primary should resume
 // fetching starting from the unapplied documents.
 const newRecipientPrimary = recipientRst.getSecondaries()[0];
-assert.commandWorked(newRecipientPrimary.adminCommand({replSetStepUp: 1}));
+recipientRst.stepUp(newRecipientPrimary);
 waitAfterDatabaseClone.off();
 waitInOplogApplier.off();
 recipientRst.getPrimary();
@@ -108,8 +110,10 @@ resultsArr = appliedNoOps.toArray();
 assert.eq(3, appliedNoOps.count(), appliedNoOps);
 assert.eq(docsToApply[2], resultsArr[2].o2.o, resultsArr);
 
-TenantMigrationUtil.checkTenantDBHashes(
-    tenantMigrationTest.getDonorRst(), tenantMigrationTest.getRecipientRst(), tenantId);
+checkTenantDBHashes({
+    donorRst: tenantMigrationTest.getDonorRst(),
+    recipientRst: tenantMigrationTest.getRecipientRst(),
+    tenantId
+});
 tenantMigrationTest.stop();
 recipientRst.stopSet();
-})();

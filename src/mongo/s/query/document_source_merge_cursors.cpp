@@ -52,7 +52,6 @@ DocumentSourceMergeCursors::DocumentSourceMergeCursors(
     : DocumentSource(kStageName, expCtx),
       _armParamsObj(std::move(ownedParamsSpec)),
       _armParams(std::move(armParams)) {
-    _armParams->setRecordRemoteOpWaitTime(true);
 
     // Populate the shard ids from the 'RemoteCursor'.
     recordRemoteCursorShardIds(_armParams->getRemotes());
@@ -83,7 +82,6 @@ bool DocumentSourceMergeCursors::remotesExhausted() const {
 void DocumentSourceMergeCursors::populateMerger() {
     invariant(!_blockingResultsMerger);
     invariant(_armParams);
-    invariant(_armParams->getRecordRemoteOpWaitTime());
 
     _blockingResultsMerger.emplace(
         pExpCtx->opCtx,
@@ -116,10 +114,13 @@ DocumentSource::GetNextResult DocumentSourceMergeCursors::doGetNext() {
     return Document::fromBsonWithMetaData(*next.getResult());
 }
 
-Value DocumentSourceMergeCursors::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceMergeCursors::serialize(SerializationOptions opts) const {
     invariant(!_blockingResultsMerger);
     invariant(_armParams);
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484301);
+    }
+
     return Value(Document{{kStageName, _armParams->toBSON()}});
 }
 
@@ -129,7 +130,8 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceMergeCursors::createFromBson(
             "$mergeCursors stage expected an object as argument",
             elem.type() == BSONType::Object);
     auto ownedObj = elem.embeddedObject().getOwned();
-    auto armParams = AsyncResultsMergerParams::parse(IDLParserErrorContext(kStageName), ownedObj);
+    auto armParams = AsyncResultsMergerParams::parse(
+        IDLParserContext(kStageName, false /*apiStrict*/, expCtx->ns.tenantId()), ownedObj);
     return new DocumentSourceMergeCursors(expCtx, std::move(armParams), std::move(ownedObj));
 }
 

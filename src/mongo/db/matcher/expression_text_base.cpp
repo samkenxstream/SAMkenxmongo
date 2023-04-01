@@ -46,22 +46,24 @@ void TextMatchExpressionBase::debugString(StringBuilder& debug, int indentationL
     _debugAddSpace(debug, indentationLevel);
     debug << "TEXT : query=" << ftsQuery.getQuery() << ", language=" << ftsQuery.getLanguage()
           << ", caseSensitive=" << ftsQuery.getCaseSensitive()
-          << ", diacriticSensitive=" << ftsQuery.getDiacriticSensitive() << ", tag=";
-    MatchExpression::TagData* td = getTag();
-    if (nullptr != td) {
-        td->debugString(&debug);
-    } else {
-        debug << "NULL";
-    }
-    debug << "\n";
+          << ", diacriticSensitive=" << ftsQuery.getDiacriticSensitive();
+    _debugStringAttachTagInfo(&debug);
 }
 
-void TextMatchExpressionBase::serialize(BSONObjBuilder* out, bool includePath) const {
+void TextMatchExpressionBase::serialize(BSONObjBuilder* out, SerializationOptions opts) const {
     const fts::FTSQuery& ftsQuery = getFTSQuery();
-    out->append("$text",
-                BSON("$search" << ftsQuery.getQuery() << "$language" << ftsQuery.getLanguage()
-                               << "$caseSensitive" << ftsQuery.getCaseSensitive()
-                               << "$diacriticSensitive" << ftsQuery.getDiacriticSensitive()));
+    if (opts.replacementForLiteralArgs) {
+        out->append("$text",
+                    BSON("$search" << *opts.replacementForLiteralArgs << "$language"
+                                   << *opts.replacementForLiteralArgs << "$caseSensitive"
+                                   << *opts.replacementForLiteralArgs << "$diacriticSensitive"
+                                   << *opts.replacementForLiteralArgs));
+    } else {
+        out->append("$text",
+                    BSON("$search" << ftsQuery.getQuery() << "$language" << ftsQuery.getLanguage()
+                                   << "$caseSensitive" << ftsQuery.getCaseSensitive()
+                                   << "$diacriticSensitive" << ftsQuery.getDiacriticSensitive()));
+    }
 }
 
 bool TextMatchExpressionBase::equivalent(const MatchExpression* other) const {

@@ -31,65 +31,15 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/s/balancer/balancer_policy.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/s/request_types/move_chunk_request.h"
 #include "mongo/s/request_types/move_range_request_gen.h"
-#include "mongo/s/shard_id.h"
 
 namespace mongo {
 
 class ChunkType;
 class KeyPattern;
 class MigrationSecondaryThrottleOptions;
-
-/**
- * Default values for MoveChunkRequests that the Scheduler might recover from a prior
- * step-down or crash as part of its self-initialisation
- */
-struct MigrationsRecoveryDefaultValues {
-    MigrationsRecoveryDefaultValues(int64_t maxChunkSizeBytes,
-                                    const MigrationSecondaryThrottleOptions& secondaryThrottle)
-        : maxChunkSizeBytes(maxChunkSizeBytes), secondaryThrottle(secondaryThrottle) {}
-    const int64_t maxChunkSizeBytes;
-    const MigrationSecondaryThrottleOptions secondaryThrottle;
-};
-
-/**
- * Set of command-specific aggregations of submission settings
- */
-struct MoveChunkSettings {
-    MoveChunkSettings(int64_t maxChunkSizeBytes,
-                      const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                      bool waitForDelete)
-        : maxChunkSizeBytes(maxChunkSizeBytes),
-          secondaryThrottle(secondaryThrottle),
-          waitForDelete(waitForDelete) {}
-
-    int64_t maxChunkSizeBytes;
-    const MigrationSecondaryThrottleOptions secondaryThrottle;
-    bool waitForDelete;
-};
-
-struct SplitVectorSettings {
-    SplitVectorSettings()
-        : force(false),
-          maxSplitPoints(boost::none),
-          maxChunkObjects(boost::none),
-          maxChunkSizeBytes(boost::none) {}
-    SplitVectorSettings(boost::optional<long long> maxSplitPoints,
-                        boost::optional<long long> maxChunkObjects,
-                        boost::optional<long long> maxChunkSizeBytes,
-                        bool force)
-        : force(force),
-          maxSplitPoints(maxSplitPoints),
-          maxChunkObjects(maxChunkObjects),
-          maxChunkSizeBytes(maxChunkSizeBytes) {}
-
-    bool force;
-    boost::optional<long long> maxSplitPoints;
-    boost::optional<long long> maxChunkObjects;
-    boost::optional<long long> maxChunkSizeBytes;
-};
 
 /**
  * Interface for the asynchronous submission of chunk-related commands.
@@ -104,8 +54,7 @@ public:
      * Triggers an asynchronous self-initialisation of the component,
      * which will start accepting request<Command>() invocations.
      */
-    virtual void start(OperationContext* opCtx,
-                       const MigrationsRecoveryDefaultValues& defaultValues) = 0;
+    virtual void start(OperationContext* opCtx) = 0;
 
     /**
      * Stops the scheduler and the processing of any outstanding and incoming request
@@ -113,46 +62,29 @@ public:
      */
     virtual void stop() = 0;
 
-    virtual SemiFuture<void> requestMoveChunk(OperationContext* opCtx,
-                                              const MigrateInfo& migrateInfo,
-                                              const MoveChunkSettings& commandSettings,
-                                              bool issuedByRemoteUser = false) = 0;
-
     virtual SemiFuture<void> requestMergeChunks(OperationContext* opCtx,
                                                 const NamespaceString& nss,
                                                 const ShardId& shardId,
                                                 const ChunkRange& chunkRange,
                                                 const ChunkVersion& version) = 0;
 
-    virtual SemiFuture<AutoSplitVectorResponse> requestAutoSplitVector(
-        OperationContext* opCtx,
-        const NamespaceString& nss,
-        const ShardId& shardId,
-        const BSONObj& keyPattern,
-        const BSONObj& minKey,
-        const BSONObj& maxKey,
-        int64_t maxChunkSizeBytes) = 0;
-
-    virtual SemiFuture<void> requestSplitChunk(OperationContext* opCtx,
-                                               const NamespaceString& nss,
-                                               const ShardId& shardId,
-                                               const ChunkVersion& collectionVersion,
-                                               const KeyPattern& keyPattern,
-                                               const BSONObj& minKey,
-                                               const BSONObj& maxKey,
-                                               const SplitPoints& splitPoints) = 0;
-
     virtual SemiFuture<DataSizeResponse> requestDataSize(OperationContext* opCtx,
                                                          const NamespaceString& nss,
                                                          const ShardId& shardId,
                                                          const ChunkRange& chunkRange,
-                                                         const ChunkVersion& version,
+                                                         const ShardVersion& version,
                                                          const KeyPattern& keyPattern,
-                                                         bool estimatedValue) = 0;
+                                                         bool estimatedValue,
+                                                         int64_t maxSize) = 0;
 
     virtual SemiFuture<void> requestMoveRange(OperationContext* opCtx,
-                                              ShardsvrMoveRange& request,
+                                              const ShardsvrMoveRange& request,
+                                              const WriteConcernOptions& secondaryThrottleWC,
                                               bool issuedByRemoteUser) = 0;
+
+    virtual SemiFuture<NumMergedChunks> requestMergeAllChunksOnShard(OperationContext* opCtx,
+                                                                     const NamespaceString& nss,
+                                                                     const ShardId& shardId) = 0;
 };
 
 }  // namespace mongo

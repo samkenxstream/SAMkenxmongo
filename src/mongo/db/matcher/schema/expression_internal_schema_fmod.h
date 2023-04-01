@@ -39,12 +39,12 @@ namespace mongo {
  */
 class InternalSchemaFmodMatchExpression final : public LeafMatchExpression {
 public:
-    InternalSchemaFmodMatchExpression(StringData path,
+    InternalSchemaFmodMatchExpression(boost::optional<StringData> path,
                                       Decimal128 divisor,
                                       Decimal128 remainder,
                                       clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<InternalSchemaFmodMatchExpression> m =
             std::make_unique<InternalSchemaFmodMatchExpression>(
                 path(), _divisor, _remainder, _errorAnnotation);
@@ -58,7 +58,7 @@ public:
 
     void debugString(StringBuilder& debug, int indentationLevel) const final;
 
-    BSONObj getSerializedRightHandSide() const final;
+    BSONObj getSerializedRightHandSide(SerializationOptions opts) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 
@@ -79,7 +79,9 @@ public:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     Decimal128 _divisor;

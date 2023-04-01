@@ -5,20 +5,20 @@
  * with a least one host.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
+ *   incompatible_with_shard_merge,
  *   requires_persistence,
- *   requires_fcv_51,
+ *   requires_fcv_63,
  *   serverless,
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    donorStartMigrationWithProtocol,
+    makeMigrationCertificatesForTest
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 const tenantMigrationTest =
     new TenantMigrationTest({name: jsTestName(), enableRecipientTesting: false});
@@ -26,91 +26,101 @@ const tenantMigrationTest =
 const donorPrimary = tenantMigrationTest.getDonorPrimary();
 const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 
-const tenantId = "testTenantId";
+const tenantId = ObjectId().str;
 const readPreference = {
     mode: 'primary'
 };
-const migrationCertificates = TenantMigrationUtil.makeMigrationCertificatesForTest();
+const migrationCertificates = makeMigrationCertificatesForTest();
 
 jsTestLog("Testing 'donorStartMigration' command provided with invalid options.");
 
 // Test missing tenantId field for protocol 'multitenant migrations'.
 assert.commandFailedWithCode(
-    donorPrimary.adminCommand(
-        TenantMigrationUtil.donorStartMigrationWithProtocol({
-            donorStartMigration: 1,
-            protocol: 'multitenant migrations',
-            migrationId: UUID(),
-            recipientConnectionString: tenantMigrationTest.getRecipientRst().getURL(),
-            readPreference: readPreference,
-            donorCertificateForRecipient: migrationCertificates.donorCertificateForRecipient,
-            recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
-        },
-                                                            donorPrimary.getDB("admin"))),
+    donorPrimary.adminCommand(donorStartMigrationWithProtocol({
+        donorStartMigration: 1,
+        migrationId: UUID(),
+        recipientConnectionString: tenantMigrationTest.getRecipientRst().getURL(),
+        readPreference,
+        donorCertificateForRecipient: migrationCertificates.donorCertificateForRecipient,
+        recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
+    },
+                                                              donorPrimary.getDB("admin"))),
     ErrorCodes.InvalidOptions);
 
-// Test unsupported database prefixes.
+// Test empty tenantId and unsupported database prefixes.
 const unsupportedtenantIds = ['', 'admin', 'local', 'config'];
 unsupportedtenantIds.forEach((invalidTenantId) => {
     assert.commandFailedWithCode(
-        donorPrimary.adminCommand(
-            TenantMigrationUtil.donorStartMigrationWithProtocol({
-                donorStartMigration: 1,
-                migrationId: UUID(),
-                recipientConnectionString: tenantMigrationTest.getRecipientRst().getURL(),
-                tenantId: invalidTenantId,
-                readPreference: readPreference,
-                donorCertificateForRecipient: migrationCertificates.donorCertificateForRecipient,
-                recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
-            },
-                                                                donorPrimary.getDB("admin"))),
-        ErrorCodes.BadValue);
+        donorPrimary.adminCommand(donorStartMigrationWithProtocol({
+            donorStartMigration: 1,
+            migrationId: UUID(),
+            recipientConnectionString: tenantMigrationTest.getRecipientRst().getURL(),
+            tenantId: invalidTenantId,
+            readPreference,
+            donorCertificateForRecipient: migrationCertificates.donorCertificateForRecipient,
+            recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
+        },
+                                                                  donorPrimary.getDB("admin"))),
+        [ErrorCodes.InvalidOptions, ErrorCodes.BadValue]);
 });
 
 // Test migrating a tenant to the donor itself.
 assert.commandFailedWithCode(
-    donorPrimary.adminCommand(
-        TenantMigrationUtil.donorStartMigrationWithProtocol({
-            donorStartMigration: 1,
-            migrationId: UUID(),
-            recipientConnectionString: tenantMigrationTest.getDonorRst().getURL(),
-            tenantId: tenantId,
-            readPreference: readPreference,
-            donorCertificateForRecipient: migrationCertificates.donorCertificateForRecipient,
-            recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
-        },
-                                                            donorPrimary.getDB("admin"))),
+    donorPrimary.adminCommand(donorStartMigrationWithProtocol({
+        donorStartMigration: 1,
+        migrationId: UUID(),
+        recipientConnectionString: tenantMigrationTest.getDonorRst().getURL(),
+        tenantId,
+        readPreference,
+        donorCertificateForRecipient: migrationCertificates.donorCertificateForRecipient,
+        recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
+    },
+                                                              donorPrimary.getDB("admin"))),
     ErrorCodes.BadValue);
 
 // Test migrating a tenant to a recipient that shares one or more hosts with the donor.
 assert.commandFailedWithCode(
-    donorPrimary.adminCommand(
-        TenantMigrationUtil.donorStartMigrationWithProtocol({
-            donorStartMigration: 1,
-            migrationId: UUID(),
-            recipientConnectionString:
-                tenantMigrationTest.getRecipientRst().getURL() + "," + donorPrimary.host,
-            tenantId: tenantId,
-            readPreference: readPreference,
-            donorCertificateForRecipient: migrationCertificates.donorCertificateForRecipient,
-            recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
-        },
-                                                            donorPrimary.getDB("admin"))),
+    donorPrimary.adminCommand(donorStartMigrationWithProtocol({
+        donorStartMigration: 1,
+        migrationId: UUID(),
+        recipientConnectionString:
+            tenantMigrationTest.getRecipientRst().getURL() + "," + donorPrimary.host,
+        tenantId,
+        readPreference,
+        donorCertificateForRecipient: migrationCertificates.donorCertificateForRecipient,
+        recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
+    },
+                                                              donorPrimary.getDB("admin"))),
+    ErrorCodes.BadValue);
+
+// Test setting tenantIds field for protocol 'multitenant migrations'.
+assert.commandFailedWithCode(
+    donorPrimary.adminCommand(donorStartMigrationWithProtocol({
+        donorStartMigration: 1,
+        migrationId: UUID(),
+        recipientConnectionString:
+            tenantMigrationTest.getRecipientRst().getURL() + "," + donorPrimary.host,
+        tenantId,
+        tenantIds: [ObjectId(), ObjectId()],
+        readPreference,
+        donorCertificateForRecipient: migrationCertificates.donorCertificateForRecipient,
+        recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
+    },
+                                                              donorPrimary.getDB("admin"))),
     ErrorCodes.BadValue);
 
 // Test migrating a tenant to a standalone recipient.
 assert.commandFailedWithCode(
-    donorPrimary.adminCommand(
-        TenantMigrationUtil.donorStartMigrationWithProtocol({
-            donorStartMigration: 1,
-            migrationId: UUID(),
-            recipientConnectionString: recipientPrimary.host,
-            tenantId: tenantId,
-            readPreference: readPreference,
-            donorCertificateForRecipient: migrationCertificates.donorCertificateForRecipient,
-            recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
-        },
-                                                            donorPrimary.getDB("admin"))),
+    donorPrimary.adminCommand(donorStartMigrationWithProtocol({
+        donorStartMigration: 1,
+        migrationId: UUID(),
+        recipientConnectionString: recipientPrimary.host,
+        tenantId,
+        readPreference,
+        donorCertificateForRecipient: migrationCertificates.donorCertificateForRecipient,
+        recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
+    },
+                                                              donorPrimary.getDB("admin"))),
     ErrorCodes.BadValue);
 
 jsTestLog("Testing 'recipientSyncData' command provided with invalid options.");
@@ -118,11 +128,22 @@ jsTestLog("Testing 'recipientSyncData' command provided with invalid options.");
 // Test missing tenantId field for protocol 'multitenant migrations'.
 assert.commandFailedWithCode(recipientPrimary.adminCommand({
     recipientSyncData: 1,
-    protocol: 'multitenant migrations',
     migrationId: UUID(),
     donorConnectionString: tenantMigrationTest.getDonorRst().getURL(),
     startMigrationDonorTimestamp: Timestamp(1, 1),
-    readPreference: readPreference,
+    readPreference,
+    recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
+}),
+                             ErrorCodes.InvalidOptions);
+
+// Test setting tenantIds field for protocol 'multitenant migration'.
+assert.commandFailedWithCode(recipientPrimary.adminCommand({
+    recipientSyncData: 1,
+    migrationId: UUID(),
+    tenantIds: [ObjectId()],
+    donorConnectionString: tenantMigrationTest.getDonorRst().getURL(),
+    startMigrationDonorTimestamp: Timestamp(1, 1),
+    readPreference,
     recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
 }),
                              ErrorCodes.InvalidOptions);
@@ -135,10 +156,10 @@ unsupportedtenantIds.forEach((invalidTenantId) => {
         donorConnectionString: tenantMigrationTest.getDonorRst().getURL(),
         tenantId: invalidTenantId,
         startMigrationDonorTimestamp: Timestamp(1, 1),
-        readPreference: readPreference,
+        readPreference,
         recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
     }),
-                                 ErrorCodes.BadValue);
+                                 [ErrorCodes.InvalidOptions, ErrorCodes.BadValue]);
 });
 
 // Test migrating a tenant from the recipient itself.
@@ -148,7 +169,7 @@ assert.commandFailedWithCode(recipientPrimary.adminCommand({
     donorConnectionString: tenantMigrationTest.getRecipientRst().getURL(),
     tenantId: tenantId,
     startMigrationDonorTimestamp: Timestamp(1, 1),
-    readPreference: readPreference,
+    readPreference,
     recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
 }),
                              ErrorCodes.BadValue);
@@ -157,10 +178,10 @@ assert.commandFailedWithCode(recipientPrimary.adminCommand({
 assert.commandFailedWithCode(recipientPrimary.adminCommand({
     recipientSyncData: 1,
     migrationId: UUID(),
-    donorConnectionString: tenantMigrationTest.getDonorRst().getURL() + "," + recipientPrimary.host,
+    donorConnectionString: `${tenantMigrationTest.getDonorRst().getURL()},${recipientPrimary.host}`,
     tenantId: tenantId,
     startMigrationDonorTimestamp: Timestamp(1, 1),
-    readPreference: readPreference,
+    readPreference,
     recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
 }),
                              ErrorCodes.BadValue);
@@ -172,7 +193,7 @@ assert.commandFailedWithCode(recipientPrimary.adminCommand({
     donorConnectionString: recipientPrimary.host,
     tenantId: tenantId,
     startMigrationDonorTimestamp: Timestamp(1, 1),
-    readPreference: readPreference,
+    readPreference,
     recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
 }),
                              ErrorCodes.BadValue);
@@ -186,12 +207,23 @@ nullTimestamps.forEach((nullTs) => {
         donorConnectionString: tenantMigrationTest.getDonorRst().getURL(),
         tenantId: tenantId,
         startMigrationDonorTimestamp: Timestamp(1, 1),
-        readPreference: readPreference,
+        readPreference,
         returnAfterReachingDonorTimestamp: nullTs,
         recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
     }),
                                  ErrorCodes.BadValue);
 });
 
+// The decision field must not be set for recipientForgetMigration with multitenant migration
+assert.commandFailedWithCode(recipientPrimary.adminCommand({
+    recipientForgetMigration: 1,
+    migrationId: UUID(),
+    tenantId: ObjectId().str,
+    donorConnectionString: tenantMigrationTest.getDonorRst().getURL(),
+    readPreference,
+    recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
+    decision: "committed"
+}),
+                             ErrorCodes.InvalidOptions);
+
 tenantMigrationTest.stop();
-})();

@@ -27,19 +27,23 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/ops/write_ops_retryability.h"
 
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/write_ops_gen.h"
 #include "mongo/db/repl/image_collection_entry_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/redaction.h"
+#include "mongo/stdx/mutex.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -54,7 +58,7 @@ void validateFindAndModifyRetryability(const write_ops::FindAndModifyCommandRequ
                                        const repl::OplogEntry& oplogWithCorrectLinks) {
     auto opType = oplogEntry.getOpType();
     auto ts = oplogEntry.getTimestamp();
-    const bool needsRetryImage = oplogEntry.getNeedsRetryImage().is_initialized();
+    const bool needsRetryImage = oplogEntry.getNeedsRetryImage().has_value();
 
     if (opType == repl::OpTypeEnum::kDelete) {
         uassert(
@@ -115,11 +119,17 @@ BSONObj extractPreOrPostImage(OperationContext* opCtx, const repl::OplogEntry& o
     DBDirectClient client(opCtx);
     if (oplog.getNeedsRetryImage()) {
         // Extract image from side collection.
-        LogicalSessionId sessionId = oplog.getSessionId().get();
-        TxnNumber txnNumber = oplog.getTxnNumber().get();
+        LogicalSessionId sessionId = oplog.getSessionId().value();
+        TxnNumber txnNumber = oplog.getTxnNumber().value();
         Timestamp ts = oplog.getTimestamp();
+        auto curOp = CurOp::get(opCtx);
+        const auto existingNS = curOp->getNSS();
         BSONObj imageDoc = client.findOne(NamespaceString::kConfigImagesNamespace,
                                           BSON("_id" << sessionId.toBSON()));
+        {
+            stdx::lock_guard<Client> clientLock(*opCtx->getClient());
+            curOp->setNS_inlock(existingNS);
+        }
         if (imageDoc.isEmpty()) {
             LOGV2_WARNING(5676402,
                           "Image lookup for a retryable findAndModify was not found",
@@ -134,8 +144,7 @@ BSONObj extractPreOrPostImage(OperationContext* opCtx, const repl::OplogEntry& o
                     << sessionId.toBSON() << " cannot be found");
         }
 
-        auto entry =
-            repl::ImageEntry::parse(IDLParserErrorContext("ImageEntryForRequest"), imageDoc);
+        auto entry = repl::ImageEntry::parse(IDLParserContext("ImageEntryForRequest"), imageDoc);
         if (entry.getInvalidated()) {
             // This case is expected when a node could not correctly compute a retry image due
             // to data inconsistency while in initial sync.

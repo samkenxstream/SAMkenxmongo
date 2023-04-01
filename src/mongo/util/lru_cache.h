@@ -67,9 +67,9 @@ struct KeyConstraints {
 
 template <typename Hasher, typename Comparator, typename T, typename TT>
 inline constexpr bool IsComparableWith =
-    decltype(KeyConstraints<Hasher, Comparator>::IsHashable(std::declval<TT>()))::value&& decltype(
-        KeyConstraints<Hasher, Comparator>::IsComparable(std::declval<T>(),
-                                                         std::declval<TT>()))::value;
+    decltype(KeyConstraints<Hasher, Comparator>::IsHashable(std::declval<TT>()))::
+        value&& decltype(KeyConstraints<Hasher, Comparator>::IsComparable(
+            std::declval<T>(), std::declval<TT>()))::value;
 
 
 template <typename K,
@@ -77,17 +77,9 @@ template <typename K,
           typename Hash = typename stdx::unordered_map<K, V>::hasher,
           typename KeyEqual = typename stdx::unordered_map<K, V, Hash>::key_equal>
 class LRUCache {
-    LRUCache(const LRUCache&) = delete;
-    LRUCache& operator=(const LRUCache&) = delete;
-
-    LRUCache(LRUCache&&) = delete;
-    LRUCache& operator=(LRUCache&&) = delete;
-
 public:
     template <typename T>
     static constexpr bool IsComparable = IsComparableWith<Hash, KeyEqual, K, T>;
-
-    explicit LRUCache(std::size_t maxSize) : _maxSize(maxSize) {}
 
     using ListEntry = std::pair<K, V>;
     using List = std::list<ListEntry>;
@@ -99,6 +91,12 @@ public:
 
     using key_type = K;
     using mapped_type = V;
+
+    explicit LRUCache(std::size_t maxSize) : _maxSize(maxSize) {}
+    LRUCache(LRUCache&&) = default;
+    LRUCache& operator=(LRUCache&&) = default;
+    LRUCache(const LRUCache&) = default;
+    LRUCache& operator=(const LRUCache&) = default;
 
     /**
      * Inserts a new entry into the cache. If the given key already exists in the cache,
@@ -159,9 +157,6 @@ public:
     REQUIRES(IsComparable<KeyType>)
     const_iterator cfind(const KeyType& key) const {
         auto it = _map.find(key);
-        // TODO(SERVER-28890): Remove the function-style cast when MSVC's
-        // `std::list< ... >::iterator` implementation doesn't conflict with their `/Zc:ternary`
-        // flag support .
         return (it == _map.end()) ? end() : const_iterator(it->second);
     }
 

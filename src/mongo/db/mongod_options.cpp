@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/db/mongod_options.h"
 
@@ -63,6 +62,9 @@
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/str.h"
 #include "mongo/util/version.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 
@@ -159,11 +161,6 @@ Status validateMongodOptions(const moe::Environment& params) {
         return ret;
     }
 
-    if (params.count("nojournal") && params.count("storage.journal.enabled")) {
-        return Status(ErrorCodes::BadValue,
-                      "Can't specify both --journal and --nojournal options.");
-    }
-
 #ifdef _WIN32
     if (params.count("install") || params.count("reinstall")) {
         if (params.count("storage.dbPath") &&
@@ -206,18 +203,6 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
     Status ret = canonicalizeServerOptions(params);
     if (!ret.isOK()) {
         return ret;
-    }
-
-    if (params->count("nojournal")) {
-        Status ret =
-            params->set("storage.journal.enabled", moe::Value(!(*params)["nojournal"].as<bool>()));
-        if (!ret.isOK()) {
-            return ret;
-        }
-        ret = params->remove("nojournal");
-        if (!ret.isOK()) {
-            return ret;
-        }
     }
 
     // "security.authorization" comes from the config file, so override it if "auth" is
@@ -438,21 +423,14 @@ Status storeMongodOptions(const moe::Environment& params) {
 
     if (params.count("storage.queryableBackupMode") &&
         params["storage.queryableBackupMode"].as<bool>()) {
-        storageGlobalParams.readOnly = true;
+        storageGlobalParams.queryableBackupMode = true;
     }
 
     if (params.count("storage.groupCollections")) {
         storageGlobalParams.groupCollections = params["storage.groupCollections"].as<bool>();
     }
 
-    if (params.count("storage.journal.enabled")) {
-        storageGlobalParams.dur = params["storage.journal.enabled"].as<bool>();
-    }
-
     if (params.count("storage.journal.commitIntervalMs")) {
-        // don't check if dur is false here as many will just use the default, and will default
-        // to off on win32.  ie no point making life a little more complex by giving an error on
-        // a dev environment.
         auto journalCommitIntervalMs = params["storage.journal.commitIntervalMs"].as<int>();
         storageGlobalParams.journalCommitIntervalMs.store(journalCommitIntervalMs);
         if (journalCommitIntervalMs < 1 ||
@@ -499,6 +477,9 @@ Status storeMongodOptions(const moe::Environment& params) {
                           str::stream() << "Cannot specify both --repair and --restore");
         }
     }
+    if (params.count("magicRestore") && params["magicRestore"].as<bool>() == true) {
+        storageGlobalParams.magicRestore = 1;
+    }
 
     repl::ReplSettings replSettings;
     if (params.count("replication.serverless")) {
@@ -528,9 +509,9 @@ Status storeMongodOptions(const moe::Environment& params) {
         // a replica set member could be deleted. Replication can need history older than the last
         // checkpoint to support transactions.
         //
-        // Note: we only use this to defer oplog collection truncation via OplogStones in WT. Non-WT
-        // storage engines will continue to perform regular capped collection handling for the oplog
-        // collection, regardless of this parameter setting.
+        // Note: we only use this to defer oplog collection truncation via OplogTruncateMarkers in
+        // WT. Non-WT storage engines will continue to perform regular capped collection handling
+        // for the oplog collection, regardless of this parameter setting.
         storageGlobalParams.allowOplogTruncation = false;
     }
 
@@ -547,9 +528,7 @@ Status storeMongodOptions(const moe::Environment& params) {
 
     serverGlobalParams.enableMajorityReadConcern = true;
 
-    if (storageGlobalParams.engineSetByUser &&
-        (storageGlobalParams.engine == "ephemeralForTest" ||
-         storageGlobalParams.engine == "devnull")) {
+    if (storageGlobalParams.engineSetByUser && (storageGlobalParams.engine == "devnull")) {
         LOGV2(5324701,
               "Test storage engine does not support enableMajorityReadConcern=true, forcibly "
               "setting to false",
@@ -624,8 +603,8 @@ Status storeMongodOptions(const moe::Environment& params) {
     }
     if (params.count("sharding.clusterRole")) {
         auto clusterRoleParam = params["sharding.clusterRole"].as<std::string>();
-        const bool replicationEnabled =
-            params.count("replication.replSet") || params.count("replication.replSetName");
+        const bool replicationEnabled = params.count("replication.replSet") ||
+            params.count("replication.replSetName") || params.count("replication.serverless");
         // Force to set up the node as a replica set, unless we're a shard and we're using queryable
         // backup mode.
         if ((clusterRoleParam == "configsvr" || !params.count("storage.queryableBackupMode")) &&
@@ -642,12 +621,6 @@ Status storeMongodOptions(const moe::Environment& params) {
                     str::stream() << "Cannot initialize config server with "
                                   << "enableMajorityReadConcern=false",
                     serverGlobalParams.enableMajorityReadConcern);
-
-            // If we haven't explicitly specified a journal option, default journaling to true for
-            // the config server role
-            if (!params.count("storage.journal.enabled")) {
-                storageGlobalParams.dur = true;
-            }
 
             if (!params.count("storage.dbPath")) {
                 storageGlobalParams.dbpath = storageGlobalParams.kDefaultConfigDbPath;
@@ -691,13 +664,6 @@ Status storeMongodOptions(const moe::Environment& params) {
     }
 #endif
 
-    // Check if we are 32 bit and have not explicitly specified any journaling options
-    if (sizeof(void*) == 4 && !params.count("storage.journal.enabled")) {
-        LOGV2_WARNING(20880,
-                      "32-bit servers don't have journaling enabled by default. Please use "
-                      "--journal if you want durability");
-    }
-
     bool isClusterRoleShard = params.count("shardsvr");
     bool isClusterRoleConfig = params.count("configsvr");
     if (params.count("sharding.clusterRole")) {
@@ -735,6 +701,17 @@ Status storeMongodOptions(const moe::Environment& params) {
 
     setGlobalReplSettings(replSettings);
     return Status::OK();
+}
+
+namespace {
+std::function<ExitCode(ServiceContext* svcCtx)> _magicRestoreMainFn = nullptr;
+}
+
+void setMagicRestoreMain(std::function<ExitCode(ServiceContext* svcCtx)> magicRestoreMainFn) {
+    _magicRestoreMainFn = magicRestoreMainFn;
+}
+std::function<ExitCode(ServiceContext* svcCtx)> getMagicRestoreMain() {
+    return _magicRestoreMainFn;
 }
 
 }  // namespace mongo

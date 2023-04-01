@@ -31,7 +31,6 @@
  * Connect to a Mongo database as a database, from C++.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -78,8 +77,12 @@
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/password_digest.h"
+#include "mongo/util/testing_proctor.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/version.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo {
 
@@ -210,10 +213,10 @@ executor::RemoteCommandResponse initWireVersion(
 
     BSONObj isMasterObj = result->getCommandReply().getOwned();
 
-    if (isMasterObj.hasField("minWireVersion") && isMasterObj.hasField("maxWireVersion")) {
-        int minWireVersion = isMasterObj["minWireVersion"].numberInt();
-        int maxWireVersion = isMasterObj["maxWireVersion"].numberInt();
-        conn->setWireVersions(minWireVersion, maxWireVersion);
+    auto replyWireVersion = wire_version::parseWireVersionFromHelloReply(isMasterObj);
+    if (replyWireVersion.isOK()) {
+        conn->setWireVersions(replyWireVersion.getValue().minWireVersion,
+                              replyWireVersion.getValue().maxWireVersion);
     }
 
     if (isMasterObj.hasField("saslSupportedMechs") &&
@@ -432,7 +435,7 @@ Status DBClientConnection::connectSocketOnly(
 void DBClientConnection::logout(const string& dbname, BSONObj& info) {
     authCache.erase(dbname);
     _internalAuthOnReconnect = false;
-    runCommand(dbname, BSON("logout" << 1), info);
+    runCommand(DatabaseName(boost::none, dbname), BSON("logout" << 1), info);
 }
 
 std::pair<rpc::UniqueReply, DBClientBase*> DBClientConnection::runCommandWithTarget(
@@ -479,7 +482,7 @@ void DBClientConnection::_markFailed(FailAction action) {
         if (action == kEndSession) {
             _session->end();
         } else if (action == kReleaseSession) {
-            transport::SessionHandle destroyedOutsideMutex;
+            std::shared_ptr<transport::Session> destroyedOutsideMutex;
 
             stdx::lock_guard<Latch> lk(_sessionMutex);
             _session.swap(destroyedOutsideMutex);
@@ -622,67 +625,6 @@ uint64_t DBClientConnection::getSockCreationMicroSec() const {
     }
 }
 
-unsigned long long DBClientConnection::query_DEPRECATED(
-    std::function<void(DBClientCursorBatchIterator&)> f,
-    const NamespaceStringOrUUID& nsOrUuid,
-    const BSONObj& filter,
-    const Query& querySettings,
-    const BSONObj* fieldsToReturn,
-    int queryOptions,
-    int batchSize,
-    boost::optional<BSONObj> readConcernObj) {
-    if (!(queryOptions & QueryOption_Exhaust)) {
-        return DBClientBase::query_DEPRECATED(f,
-                                              nsOrUuid,
-                                              filter,
-                                              querySettings,
-                                              fieldsToReturn,
-                                              queryOptions,
-                                              batchSize,
-                                              readConcernObj);
-    }
-
-    // mask options
-    queryOptions &=
-        (int)(QueryOption_NoCursorTimeout | QueryOption_SecondaryOk | QueryOption_Exhaust);
-
-    unique_ptr<DBClientCursor> c(this->query_DEPRECATED(nsOrUuid,
-                                                        filter,
-                                                        querySettings,
-                                                        0,
-                                                        0,
-                                                        fieldsToReturn,
-                                                        queryOptions,
-                                                        batchSize,
-                                                        readConcernObj));
-    // Note that this->query will throw for network errors, so it is OK to return a numeric
-    // error code here.
-    uassert(13386, "socket error for mapping query", c.get());
-
-    unsigned long long n = 0;
-
-    try {
-        while (1) {
-            while (c->moreInCurrentBatch()) {
-                DBClientCursorBatchIterator i(*c);
-                f(i);
-                n += i.n();
-            }
-
-            if (!c->more())
-                break;
-        }
-    } catch (std::exception&) {
-        /* connection CANNOT be used anymore as more data may be on the way from the server.
-           we have to reconnect.
-           */
-        _markFailed(kEndSession);
-        throw;
-    }
-
-    return n;
-}
-
 DBClientConnection::DBClientConnection(bool _autoReconnect,
                                        double so_timeout,
                                        MongoURI uri,
@@ -704,7 +646,7 @@ void DBClientConnection::say(Message& toSend, bool isRetry, string* actualServer
     toSend.header().setResponseToMsgId(0);
     if (!MONGO_unlikely(dbClientConnectionDisableChecksum.shouldFail())) {
 #ifdef MONGO_CONFIG_SSL
-        if (!SSLPeerInfo::forSession(_session).isTLS) {
+        if (!SSLPeerInfo::forSession(_session).isTLS()) {
             OpMsg::appendChecksum(&toSend);
         }
 #else
@@ -736,25 +678,15 @@ Status DBClientConnection::recv(Message& m, int lastRequestId) {
     return Status::OK();
 }
 
-bool DBClientConnection::call(Message& toSend,
-                              Message& response,
-                              bool assertOk,
-                              string* actualServer) {
+void DBClientConnection::_call(Message& toSend, Message& response, string* actualServer) {
     checkConnection();
     ScopeGuard killSessionOnError([this] { _markFailed(kEndSession); });
-    auto maybeThrow = [&](const auto& errStatus) {
-        if (assertOk)
-            uassertStatusOKWithContext(errStatus,
-                                       str::stream() << "dbclient error communicating with server "
-                                                     << getServerAddress());
-        return false;
-    };
 
     toSend.header().setId(nextMessageId());
     toSend.header().setResponseToMsgId(0);
     if (!MONGO_unlikely(dbClientConnectionDisableChecksum.shouldFail())) {
 #ifdef MONGO_CONFIG_SSL
-        if (!SSLPeerInfo::forSession(_session).isTLS) {
+        if (!SSLPeerInfo::forSession(_session).isTLS()) {
             OpMsg::appendChecksum(&toSend);
         }
 #else
@@ -771,7 +703,9 @@ bool DBClientConnection::call(Message& toSend,
               "DBClientConnection failed to send message",
               "connString"_attr = getServerAddress(),
               "error"_attr = redact(sinkStatus));
-        return maybeThrow(sinkStatus);
+        uassertStatusOKWithContext(sinkStatus,
+                                   str::stream() << "dbclient error communicating with server "
+                                                 << getServerAddress());
     }
 
     swm = _session->sourceMessage();
@@ -783,7 +717,9 @@ bool DBClientConnection::call(Message& toSend,
               "DBClientConnection failed to receive message",
               "connString"_attr = getServerAddress(),
               "error"_attr = redact(swm.getStatus()));
-        return maybeThrow(swm.getStatus());
+        uassertStatusOKWithContext(swm.getStatus(),
+                                   str::stream() << "dbclient error communicating with server "
+                                                 << getServerAddress());
     }
 
     if (response.operation() == dbCompressed) {
@@ -791,7 +727,6 @@ bool DBClientConnection::call(Message& toSend,
     }
 
     killSessionOnError.dismiss();
-    return true;
 }
 
 void DBClientConnection::setParentReplSetName(const string& replSetName) {
@@ -821,7 +756,11 @@ void DBClientConnection::handleNotPrimaryResponse(const BSONObj& replyBody,
 
 #ifdef MONGO_CONFIG_SSL
 const SSLConfiguration* DBClientConnection::getSSLConfiguration() {
-    return _session->getSSLConfiguration();
+    auto& sslManager = _session->getSSLManager();
+    if (!sslManager) {
+        return nullptr;
+    }
+    return &sslManager->getSSLConfiguration();
 }
 
 bool DBClientConnection::isUsingTransientSSLParams() const {
@@ -829,7 +768,7 @@ bool DBClientConnection::isUsingTransientSSLParams() const {
 }
 
 bool DBClientConnection::isTLS() {
-    return SSLPeerInfo::forSession(_session).isTLS;
+    return SSLPeerInfo::forSession(_session).isTLS();
 }
 
 #endif

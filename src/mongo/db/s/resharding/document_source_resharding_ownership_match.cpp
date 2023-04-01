@@ -27,17 +27,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/resharding/document_source_resharding_ownership_match.h"
 
 #include "mongo/db/s/resharding/resharding_util.h"
-#include "mongo/db/transaction_history_iterator.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/resharding/common_types_gen.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
@@ -63,7 +65,7 @@ DocumentSourceReshardingOwnershipMatch::createFromBson(
             elem.type() == Object);
 
     auto parsed = DocumentSourceReshardingOwnershipMatchSpec::parse(
-        {"DocumentSourceReshardingOwnershipMatchSpec"}, elem.embeddedObject());
+        IDLParserContext{"DocumentSourceReshardingOwnershipMatchSpec"}, elem.embeddedObject());
 
     return new DocumentSourceReshardingOwnershipMatch(
         parsed.getRecipientShardId(), ShardKeyPattern(parsed.getReshardingKey()), expCtx);
@@ -90,8 +92,11 @@ StageConstraints DocumentSourceReshardingOwnershipMatch::constraints(
                             ChangeStreamRequirement::kDenylist);
 }
 
-Value DocumentSourceReshardingOwnershipMatch::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceReshardingOwnershipMatch::serialize(SerializationOptions opts) const {
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484302);
+    }
+
     return Value{Document{{kStageName,
                            DocumentSourceReshardingOwnershipMatchSpec(
                                _recipientShardId, _reshardingKey.getKeyPattern())
@@ -109,18 +114,20 @@ DepsTracker::State DocumentSourceReshardingOwnershipMatch::getDependencies(
 
 DocumentSource::GetModPathsReturn DocumentSourceReshardingOwnershipMatch::getModifiedPaths() const {
     // This stage does not modify or rename any paths.
-    return {DocumentSource::GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {}};
+    return {DocumentSource::GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {}};
 }
 
 DocumentSource::GetNextResult DocumentSourceReshardingOwnershipMatch::doGetNext() {
     if (!_tempReshardingChunkMgr) {
         // TODO: Actually propagate the temporary resharding namespace from the recipient.
-        auto tempReshardingNss = constructTemporaryReshardingNss(pExpCtx->ns.db(), *pExpCtx->uuid);
+        auto tempReshardingNss =
+            resharding::constructTemporaryReshardingNss(pExpCtx->ns.db(), *pExpCtx->uuid);
 
         auto* catalogCache = Grid::get(pExpCtx->opCtx)->catalogCache();
         _tempReshardingChunkMgr =
-            uassertStatusOK(catalogCache->getShardedCollectionRoutingInfoWithRefresh(
-                pExpCtx->opCtx, tempReshardingNss));
+            uassertStatusOK(catalogCache->getShardedCollectionRoutingInfoWithPlacementRefresh(
+                                pExpCtx->opCtx, tempReshardingNss))
+                .cm;
     }
 
     auto nextInput = pSource->getNext();

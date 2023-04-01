@@ -36,6 +36,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/s/balancer/balancer.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/sharding_logging.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/grid.h"
@@ -70,18 +71,19 @@ public:
         return false;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                    ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& unusedDbName,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) final {
         uassert(ErrorCodes::InternalError,
@@ -91,7 +93,7 @@ public:
 
         uassert(ErrorCodes::IllegalOperation,
                 str::stream() << getName() << " can only be run on config servers",
-                serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 
         _run(opCtx, &result);
 
@@ -111,8 +113,17 @@ private:
         auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
         uassertStatusOK(balancerConfig->setBalancerMode(opCtx, BalancerSettingsType::kFull));
         uassertStatusOK(balancerConfig->enableAutoSplit(opCtx, true));
-        Balancer::get(opCtx)->notifyPersistedBalancerSettingsChanged();
-        ShardingLogging::get(opCtx)->logAction(opCtx, "balancer.start", "", BSONObj()).ignore();
+        uassertStatusOK(balancerConfig->changeAutoMergeSettings(opCtx, true));
+        Balancer::get(opCtx)->notifyPersistedBalancerSettingsChanged(opCtx);
+        auto catalogManager = ShardingCatalogManager::get(opCtx);
+        ShardingLogging::get(opCtx)
+            ->logAction(opCtx,
+                        "balancer.start",
+                        "",
+                        BSONObj(),
+                        catalogManager->localConfigShard(),
+                        catalogManager->localCatalogClient())
+            .ignore();
     }
 };
 
@@ -130,11 +141,20 @@ private:
         auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
         uassertStatusOK(balancerConfig->setBalancerMode(opCtx, BalancerSettingsType::kOff));
         uassertStatusOK(balancerConfig->enableAutoSplit(opCtx, false));
+        uassertStatusOK(balancerConfig->changeAutoMergeSettings(opCtx, false));
 
-        Balancer::get(opCtx)->notifyPersistedBalancerSettingsChanged();
+        Balancer::get(opCtx)->notifyPersistedBalancerSettingsChanged(opCtx);
         Balancer::get(opCtx)->joinCurrentRound(opCtx);
 
-        ShardingLogging::get(opCtx)->logAction(opCtx, "balancer.stop", "", BSONObj()).ignore();
+        auto catalogManager = ShardingCatalogManager::get(opCtx);
+        ShardingLogging::get(opCtx)
+            ->logAction(opCtx,
+                        "balancer.stop",
+                        "",
+                        BSONObj(),
+                        catalogManager->localConfigShard(),
+                        catalogManager->localCatalogClient())
+            .ignore();
     }
 };
 

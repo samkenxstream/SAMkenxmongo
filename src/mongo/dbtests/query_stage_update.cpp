@@ -38,7 +38,6 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
@@ -56,15 +55,6 @@
 #include "mongo/db/update/update_driver.h"
 #include "mongo/dbtests/dbtests.h"
 
-#define ASSERT_DOES_NOT_THROW(EXPRESSION)                                          \
-    try {                                                                          \
-        EXPRESSION;                                                                \
-    } catch (const AssertionException& e) {                                        \
-        ::str::stream err;                                                         \
-        err << "Threw an exception incorrectly: " << e.toString();                 \
-        ::mongo::unittest::TestAssertionFailure(__FILE__, __LINE__, err).stream(); \
-    }
-
 namespace QueryStageUpdate {
 
 using std::make_unique;
@@ -77,21 +67,21 @@ class QueryStageUpdateBase {
 public:
     QueryStageUpdateBase() : _client(&_opCtx) {
         dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
-        _client.dropCollection(nss.ns());
-        _client.createCollection(nss.ns());
+        _client.dropCollection(nss);
+        _client.createCollection(nss);
     }
 
     virtual ~QueryStageUpdateBase() {
         dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
-        _client.dropCollection(nss.ns());
+        _client.dropCollection(nss);
     }
 
     void insert(const BSONObj& doc) {
-        _client.insert(nss.ns(), doc);
+        _client.insert(nss, doc);
     }
 
     void remove(const BSONObj& obj) {
-        _client.remove(nss.ns(), obj);
+        _client.remove(nss, obj);
     }
 
     size_t count(const BSONObj& query) {
@@ -275,8 +265,8 @@ public:
             CurOp& curOp = *CurOp::get(_opCtx);
             OpDebug* opDebug = &curOp.debug();
             UpdateDriver driver(_expCtx);
-            CollectionPtr coll =
-                CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss);
+            CollectionPtr coll(
+                CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss));
             ASSERT(coll);
 
             // Get the RecordIds that would be returned by an in-order scan.

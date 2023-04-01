@@ -28,7 +28,6 @@
  */
 
 #include "mongo/client/sdam/server_description.h"
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
@@ -40,6 +39,8 @@
 #include "mongo/client/sdam/sdam_datatypes.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/duration.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 
 namespace mongo::sdam {
@@ -277,7 +278,7 @@ const boost::optional<std::string>& ServerDescription::getSetName() const {
     return _setName;
 }
 
-const ElectionIdSetVersionPair ServerDescription::getElectionIdSetVersionPair() const {
+ElectionIdSetVersionPair ServerDescription::getElectionIdSetVersionPair() const {
     return ElectionIdSetVersionPair{_electionId, _setVersion};
 }
 
@@ -285,7 +286,7 @@ const boost::optional<HostAndPort>& ServerDescription::getPrimary() const {
     return _primary;
 }
 
-const mongo::Date_t ServerDescription::getLastUpdateTime() const {
+mongo::Date_t ServerDescription::getLastUpdateTime() const {
     return *_lastUpdateTime;
 }
 
@@ -436,7 +437,7 @@ ServerDescriptionPtr ServerDescription::cloneWithRTT(HelloRTT rtt) {
     return newServerDescription;
 }
 
-const boost::optional<TopologyDescriptionPtr> ServerDescription::getTopologyDescription() {
+boost::optional<TopologyDescriptionPtr> ServerDescription::getTopologyDescription() {
     if (_topologyDescription) {
         const auto result = _topologyDescription->lock();
         invariant(result);

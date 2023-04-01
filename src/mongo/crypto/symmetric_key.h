@@ -29,12 +29,12 @@
 
 #pragma once
 
+#include <MurmurHash3.h>
 #include <cstdint>
 #include <memory>
 
 #include "mongo/base/secure_allocator.h"
 #include "mongo/platform/atomic_word.h"
-#include "third_party/murmurhash3/MurmurHash3.h"
 
 namespace mongo {
 class Status;

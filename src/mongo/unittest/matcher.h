@@ -40,6 +40,7 @@
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/matcher_core.h"
 
 /**
@@ -151,7 +152,7 @@ public:
     explicit RelOpBase(T v) : _v{std::move(v)} {}
 
     std::string describe() const {
-        return format(FMT_STRING("{}({})"), self().name, stringifyForAssert(_v));
+        return format(FMT_STRING("{}({})"), self().name, stringify::stringifyForAssert(_v));
     }
 
     template <typename X, std::enable_if_t<stdx::is_detected_v<CanMatchOp, X>, int> = 0>
@@ -172,7 +173,7 @@ struct Eq : detail::RelOpBase<Eq, T, std::equal_to<>> {
     static constexpr auto name = "Eq"_sd;
 };
 template <typename T>
-Eq(T v)->Eq<T>;
+Eq(T v) -> Eq<T>;
 
 /** Not equal. */
 template <typename T>
@@ -181,7 +182,7 @@ struct Ne : detail::RelOpBase<Ne, T, std::not_equal_to<>> {
     static constexpr auto name = "Ne"_sd;
 };
 template <typename T>
-Ne(T v)->Ne<T>;
+Ne(T v) -> Ne<T>;
 
 /** Less than. */
 template <typename T>
@@ -190,7 +191,7 @@ struct Lt : detail::RelOpBase<Lt, T, std::less<>> {
     static constexpr auto name = "Lt"_sd;
 };
 template <typename T>
-Lt(T v)->Lt<T>;
+Lt(T v) -> Lt<T>;
 
 /** Greater than. */
 template <typename T>
@@ -199,7 +200,7 @@ struct Gt : detail::RelOpBase<Gt, T, std::greater<>> {
     static constexpr auto name = "Gt"_sd;
 };
 template <typename T>
-Gt(T v)->Gt<T>;
+Gt(T v) -> Gt<T>;
 
 /** Less than or equal to. */
 template <typename T>
@@ -208,7 +209,7 @@ struct Le : detail::RelOpBase<Le, T, std::less_equal<>> {
     static constexpr auto name = "Le"_sd;
 };
 template <typename T>
-Le(T v)->Le<T>;
+Le(T v) -> Le<T>;
 
 /** Greater than or equal to. */
 template <typename T>
@@ -217,7 +218,7 @@ struct Ge : detail::RelOpBase<Ge, T, std::greater_equal<>> {
     static constexpr auto name = "Ge"_sd;
 };
 template <typename T>
-Ge(T v)->Ge<T>;
+Ge(T v) -> Ge<T>;
 
 /**
  * Wrapper that inverts the sense of a matcher.
@@ -396,7 +397,7 @@ private:
         auto it = begin(x);
         std::array arr{std::get<Is>(_ms).match(*it++)...};
         bool allOk = true;
-        detail::Joiner joiner;
+        stringify::Joiner joiner;
         for (size_t i = 0; i != sizeof...(Ms); ++i) {
             if (!arr[i]) {
                 allOk = false;
@@ -556,7 +557,7 @@ public:
     MatchResult match(const Status& st) const {
         MatchResult cr = _code.match(st.code());
         MatchResult rr = _reason.match(st.reason());
-        detail::Joiner joiner;
+        stringify::Joiner joiner;
         if (!cr.message().empty())
             joiner(format(FMT_STRING("code:{}"), cr.message()));
         if (!rr.message().empty()) {

@@ -2,7 +2,6 @@
 // by triggering a stepdown.
 // This test uses the WiredTiger storage engine, which does not support running without journaling.
 // @tags: [
-//   requires_journaling,
 //   requires_majority_read_concern,
 //   requires_replication,
 // ]
@@ -38,7 +37,7 @@ for (let key of Object.keys(ChangeStreamWatchMode)) {
     assert.commandWorked(coll.insert({_id: 2}, {writeConcern: {w: "majority"}}));
 
     const firstChange = cst.getOneChange(changeStream);
-    assert.docEq(firstChange.fullDocument, {_id: 0});
+    assert.docEq({_id: 0}, firstChange.fullDocument);
 
     // Make the primary step down
     assert.commandWorked(primaryDB.adminCommand({replSetStepDown: 30}));

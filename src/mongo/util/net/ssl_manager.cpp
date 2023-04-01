@@ -28,8 +28,6 @@
  */
 
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/net/ssl_manager.h"
@@ -38,6 +36,7 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/data_view.h"
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/internal_auth.h"
@@ -46,8 +45,8 @@
 #include "mongo/db/commands/server_status.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/overflow_arithmetic.h"
+#include "mongo/transport/asio/asio_transport_layer.h"
 #include "mongo/transport/session.h"
-#include "mongo/transport/transport_layer_asio.h"
 #include "mongo/util/ctype.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/icu.h"
@@ -56,6 +55,9 @@
 #include "mongo/util/str.h"
 #include "mongo/util/synchronized_value.h"
 #include "mongo/util/text.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo {
 
@@ -152,11 +154,15 @@ std::string RFC4514Parser::extractAttributeName() {
     // If the first character is a digit, then this is an OID and can only contain
     // numbers and '.'
     if (ctype::isDigit(ch)) {
-        characterCheck = [](char ch) { return ctype::isDigit(ch) || ch == '.'; };
+        characterCheck = [](char ch) {
+            return ctype::isDigit(ch) || ch == '.';
+        };
         // If the first character is an alpha, then this is a short name and can only
         // contain alpha/digit/hyphen characters.
     } else if (ctype::isAlpha(ch)) {
-        characterCheck = [](char ch) { return ctype::isAlnum(ch) || ch == '-'; };
+        characterCheck = [](char ch) {
+            return ctype::isAlnum(ch) || ch == '-';
+        };
         // Otherwise this is an invalid attribute name
     } else {
         uasserted(ErrorCodes::BadValue,
@@ -362,10 +368,10 @@ void logSSLInfo(const SSLInformationToLog& info,
         logCert(info.server, "Server", logNumPEM);
     }
     if (info.cluster.has_value()) {
-        logCert(info.cluster.get(), "Cluster", logNumCluster);
+        logCert(info.cluster.value(), "Cluster", logNumCluster);
     }
     if (info.crl.has_value()) {
-        logCRL(info.crl.get(), logNumCrl);
+        logCRL(info.crl.value(), logNumCrl);
     }
 }
 
@@ -401,15 +407,16 @@ SSLManagerCoordinator::SSLManagerCoordinator()
 }
 
 void ClusterMemberDNOverride::append(OperationContext* opCtx,
-                                     BSONObjBuilder& b,
-                                     const std::string& name) {
+                                     BSONObjBuilder* b,
+                                     StringData name,
+                                     const boost::optional<TenantId>&) {
     auto value = clusterMemberOverride.get();
     if (value) {
-        b.append(name, value->fullDN.toString());
+        b->append(name, value->fullDN.toString());
     }
 }
 
-Status ClusterMemberDNOverride::setFromString(const std::string& str) {
+Status ClusterMemberDNOverride::setFromString(StringData str, const boost::optional<TenantId>&) {
     if (str.empty()) {
         *clusterMemberOverride = boost::none;
         return Status::OK();
@@ -1048,7 +1055,7 @@ StatusWith<DERToken> DERToken::parse(ConstDataRange cdr, size_t* outLength) {
         derLength = ConstDataView(lengthBuffer.data()).read<BigEndian<uint64_t>>();
     } else {
         // Length is <= 127 bytes, i.e. short form of length
-        derLength = initialLengthByte;
+        derLength = ConstDataView(&initialLengthByte).read<uint8_t>();
     }
 
     // This is the total length of the TLV and all data

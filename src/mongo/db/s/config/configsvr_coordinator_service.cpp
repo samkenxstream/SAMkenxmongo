@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -39,6 +38,9 @@
 #include "mongo/db/s/config/set_cluster_parameter_coordinator.h"
 #include "mongo/db/s/config/set_user_write_block_mode_coordinator.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 
@@ -91,6 +93,30 @@ ConfigsvrCoordinatorService::constructInstance(BSONObj initialState) {
                           << "Encountered unknown ConfigsvrCoordinator operation type: "
                           << ConfigsvrCoordinatorType_serializer(op.getId().getCoordinatorType()));
     }
+}
+
+bool ConfigsvrCoordinatorService::areAllCoordinatorsOfTypeFinished(
+    OperationContext* opCtx, ConfigsvrCoordinatorTypeEnum coordinatorType) {
+
+    // First, check if all in-memory ConfigsvrCoordinators are finished.
+    const auto& instances = getAllInstances(opCtx);
+    for (const auto& instance : instances) {
+        auto typedInstance = checked_pointer_cast<ConfigsvrCoordinator>(instance);
+        if (typedInstance->coordinatorType() == coordinatorType) {
+            if (!typedInstance->getCompletionFuture().isReady()) {
+                return false;
+            }
+        }
+    }
+
+    // If the POS has just been rebuilt on a newly-elected primary, there is a chance that the
+    // the coordinator instance does not exist yet. Query the state document namespace for any
+    // documents that will be built into instances.
+    DBDirectClient client(opCtx);
+    FindCommandRequest findStateDocs{NamespaceString::kConfigsvrCoordinatorsNamespace};
+    findStateDocs.setFilter(BSON("_id" << BSON("coordinatorType" << coordinatorType)));
+
+    return !client.find(std::move(findStateDocs))->more();
 }
 
 }  // namespace mongo

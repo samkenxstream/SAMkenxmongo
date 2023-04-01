@@ -156,7 +156,21 @@ def setup_args_parser():
     parser.add_argument(
         '--critical-edges', nargs='+', action='append', default=[], help=
         "[from_node] [to_node]: Print edges between two nodes, which if removed would break the dependency between those "
-        + "nodes,.")
+        + "nodes.")
+
+    parser.add_argument(
+        '--symbol-depends', nargs='+', action='append', default=[],
+        help="[from_node] [to_node]: Print symbols defined in from_node used by to_node.")
+
+    parser.add_argument(
+        '--efficiency', nargs='+', action='append', default=[], help=
+        "[from_node ...]: Print efficiencies of public direct edges off each from_node in a list of nodes."
+    )
+
+    parser.add_argument(
+        '--efficiency-lint', nargs='?', type=int, const=2, help=
+        "[threshold]: Analyze efficiency of all public direct edges, print those below efficiency threshold percentage."
+    )
 
     parser.add_argument(
         '--indegree-one', action='store_true', default=False, help=
@@ -175,13 +189,21 @@ def setup_args_parser():
             parser.error(
                 f'Must pass two args for --critical-edges, [from_node] [to_node], not {arg_list}')
 
+    for arg_list in args.symbol_depends:
+        if len(arg_list) != 2:
+            parser.error(
+                f'Must pass two args for --symbol-depends, [from_node] [to_node], not {arg_list}')
+
     return parser.parse_args()
 
 
 def strip_build_dir(build_dir, node):
     """Small util function for making args match the graph paths."""
 
-    return str(Path(node).relative_to(build_dir))
+    try:
+        return str(Path(node).relative_to(build_dir))
+    except ValueError:
+        return node
 
 
 def strip_build_dirs(build_dir, nodes):
@@ -234,6 +256,21 @@ def main():
         analysis.append(
             libdeps_analyzer.GraphPaths(libdeps_graph, strip_build_dir(build_dir, analyzer_args[0]),
                                         strip_build_dir(build_dir, analyzer_args[1])))
+
+    for analyzer_args in args.symbol_depends:
+        analysis.append(
+            libdeps_analyzer.SymbolDependents(libdeps_graph,
+                                              strip_build_dir(build_dir, analyzer_args[0]),
+                                              strip_build_dir(build_dir, analyzer_args[1])))
+
+    for analyzer_args in args.efficiency:
+        nodes = []
+        for arg in analyzer_args:
+            nodes.append(strip_build_dir(build_dir, arg))
+        analysis.append(libdeps_analyzer.Efficiency(libdeps_graph, nodes))
+
+    if args.efficiency_lint:
+        analysis.append(libdeps_analyzer.EfficiencyLinter(libdeps_graph, args.efficiency_lint))
 
     for analyzer_args in args.critical_edges:
         analysis.append(

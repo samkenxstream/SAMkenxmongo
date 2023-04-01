@@ -50,6 +50,8 @@ std::ostream& operator<<(std::ostream& stream, const PlanCacheKeyInfo& key) {
 }
 
 namespace {
+using PlanCacheKeyInfoTest = CanonicalQueryTest;
+
 PlanCacheKeyInfo makeKey(const CanonicalQuery& cq,
                          const std::vector<CoreIndexInfo>& indexCores = {}) {
     PlanCacheIndexabilityState indexabilityState;
@@ -108,20 +110,25 @@ void assertPlanCacheKeysUnequalDueToForceClassicEngineValue(const PlanCacheKeyIn
     auto bStablePart = b.getQueryShape();
 
     ASSERT_EQ(aUnstablePart, bUnstablePart);
-    // The last character of the stable part encodes the engine that uses this PlanCacheKey. So the
-    // stable parts except for the last character should be identical.
-    ASSERT_EQ(aStablePart.substr(0, aStablePart.size() - 1),
-              bStablePart.substr(0, bStablePart.size() - 1));
+    // The last 2 characters (plus separator) of the stable part encodes the engine that uses this
+    // PlanCacheKey and if apiStrict was used. So the stable parts except for the last two
+    // characters should be identical.
+    ASSERT_EQ(aStablePart.substr(0, aStablePart.size() - 2),
+              bStablePart.substr(0, bStablePart.size() - 2));
 
-    // Should have at least 1 byte to represent whether we must use the classic engine.
-    ASSERT_GTE(aStablePart.size(), 1);
+    // Should have at least 2 byte to represent whether we must use the classic engine and stable
+    // API.
+    ASSERT_GTE(aStablePart.size(), 2);
 
     // The indexability discriminators should match.
     ASSERT_EQ(a.getIndexabilityDiscriminators(), b.getIndexabilityDiscriminators());
 
-    // The stable parts should not match because of the last character.
+    // The stable parts should not match because of the second character from the back, encoding the
+    // engine type.
     ASSERT_NE(aStablePart, bStablePart);
-    ASSERT_NE(aStablePart.back(), bStablePart.back());
+    ASSERT_NE(aStablePart[aStablePart.size() - 2], bStablePart[bStablePart.size() - 2]);
+    // Ensure that the the apiStrict values are equal.
+    ASSERT_EQ(aStablePart.back(), bStablePart.back());
 }
 
 /**
@@ -141,7 +148,7 @@ void assertPlanCacheKeysUnequalDueToDiscriminators(const PlanCacheKeyInfo& a,
 
 // When a sparse index is present, computeKey() should generate different keys depending on
 // whether or not the predicates in the given query can use the index.
-TEST(PlanCacheKeyInfoTest, ComputeKeySparseIndex) {
+TEST_F(PlanCacheKeyInfoTest, ComputeKeySparseIndex) {
     const auto keyPattern = BSON("a" << 1);
     const std::vector<CoreIndexInfo> indexCores = {
         CoreIndexInfo(keyPattern,
@@ -170,7 +177,7 @@ TEST(PlanCacheKeyInfoTest, ComputeKeySparseIndex) {
 // When a partial index is present, computeKey() should generate different keys depending on
 // whether or not the predicates in the given query "match" the predicates in the partial index
 // filter.
-TEST(PlanCacheKeyInfoTest, ComputeKeyPartialIndex) {
+TEST_F(PlanCacheKeyInfoTest, ComputeKeyPartialIndex) {
     BSONObj filterObj = BSON("f" << BSON("$gt" << 0));
     unique_ptr<MatchExpression> filterExpr(parseMatchExpression(filterObj));
 
@@ -194,8 +201,109 @@ TEST(PlanCacheKeyInfoTest, ComputeKeyPartialIndex) {
                                                   makeKey(*cqGtZero, indexCores));
 }
 
+TEST_F(PlanCacheKeyInfoTest, ComputeKeyPartialIndexConjunction) {
+    BSONObj filterObj = fromjson("{f: {$gt: 0, $lt: 10}}");
+    unique_ptr<MatchExpression> filterExpr(parseMatchExpression(filterObj));
+
+    const auto keyPattern = BSON("a" << 1);
+    const std::vector<CoreIndexInfo> indexCores = {
+        CoreIndexInfo(keyPattern,
+                      IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                      false,                       // sparse
+                      IndexEntry::Identifier{""},  // name
+                      filterExpr.get())};          // filterExpr
+
+    unique_ptr<CanonicalQuery> satisfySinglePredicate(canonicalize("{f: {$gt: 0}}"));
+    ASSERT_EQ(makeKey(*satisfySinglePredicate, indexCores).getIndexabilityDiscriminators(), "(0)");
+
+    unique_ptr<CanonicalQuery> satisfyBothPredicates(canonicalize("{f: {$eq: 5}}"));
+    ASSERT_EQ(makeKey(*satisfyBothPredicates, indexCores).getIndexabilityDiscriminators(), "(1)");
+
+    unique_ptr<CanonicalQuery> conjSingleField(canonicalize("{f: {$gt: 2, $lt: 9}}"));
+    ASSERT_EQ(makeKey(*conjSingleField, indexCores).getIndexabilityDiscriminators(), "(1)");
+
+    unique_ptr<CanonicalQuery> conjSingleFieldNoMatch(canonicalize("{f: {$gt: 2, $lt: 11}}"));
+    ASSERT_EQ(makeKey(*conjSingleFieldNoMatch, indexCores).getIndexabilityDiscriminators(), "(0)");
+
+    // Note that these queries get optimized to a single $in over 'f'.
+    unique_ptr<CanonicalQuery> disjSingleFieldBothSatisfy(
+        canonicalize("{$or: [{f: {$eq: 2}}, {f: {$eq: 3}}]}"));
+    ASSERT_EQ(makeKey(*disjSingleFieldBothSatisfy, indexCores).getIndexabilityDiscriminators(),
+              "(1)");
+
+    unique_ptr<CanonicalQuery> disjSingleFieldNotSubset(
+        canonicalize("{$or: [{f: {$eq: 2}}, {f: {$eq: 11}}]}"));
+    ASSERT_EQ(makeKey(*disjSingleFieldNotSubset, indexCores).getIndexabilityDiscriminators(),
+              "(0)");
+}
+
+TEST_F(PlanCacheKeyInfoTest, ComputeKeyPartialIndexDisjunction) {
+    BSONObj filterObj = fromjson("{$or: [{f: {$gt: 10}}, {f: {$lt: 0}}]}");
+    unique_ptr<MatchExpression> filterExpr(parseMatchExpression(filterObj));
+
+    const auto keyPattern = BSON("a" << 1);
+    const std::vector<CoreIndexInfo> indexCores = {
+        CoreIndexInfo(keyPattern,
+                      IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                      false,                       // sparse
+                      IndexEntry::Identifier{""},  // name
+                      filterExpr.get())};          // filterExpr
+
+    unique_ptr<CanonicalQuery> satisfySinglePredicate(canonicalize("{f: {$eq: 11}}"));
+    ASSERT_EQ(makeKey(*satisfySinglePredicate, indexCores).getIndexabilityDiscriminators(), "(1)");
+
+    unique_ptr<CanonicalQuery> satisfyNeither(canonicalize("{f: {$eq: 5}}"));
+    ASSERT_EQ(makeKey(*satisfyNeither, indexCores).getIndexabilityDiscriminators(), "(0)");
+
+    unique_ptr<CanonicalQuery> conjSingleFieldMatch(canonicalize("{f: {$lt: 20, $gt: 10}}"));
+    ASSERT_EQ(makeKey(*conjSingleFieldMatch, indexCores).getIndexabilityDiscriminators(), "(1)");
+
+    unique_ptr<CanonicalQuery> conjSingleFieldNoMatch(canonicalize("{f: {$gt: 2, $lt: 10}}"));
+    ASSERT_EQ(makeKey(*conjSingleFieldNoMatch, indexCores).getIndexabilityDiscriminators(), "(0)");
+
+    unique_ptr<CanonicalQuery> conjSingleFieldOverlap(canonicalize("{f: {$gt: 2, $lt: 12}}"));
+    ASSERT_EQ(makeKey(*conjSingleFieldOverlap, indexCores).getIndexabilityDiscriminators(), "(0)");
+
+    // Although this query is technically a subset of the partial filter, the logic to determine
+    // such ('isSubsetOf' in the code) is conservative in how it compares certain shapes of
+    // expression trees.
+    unique_ptr<CanonicalQuery> disjSingleFieldBothSatisfy(
+        canonicalize("{$or: [{f: {$eq: -1}}, {f: {$gt: 10}}]}"));
+    ASSERT_EQ(makeKey(*disjSingleFieldBothSatisfy, indexCores).getIndexabilityDiscriminators(),
+              "(0)");
+
+    unique_ptr<CanonicalQuery> disjSingleFieldNotSubset(
+        canonicalize("{$or: [{f: {$eq: 2}}, {f: {$eq: 11}}]}"));
+    ASSERT_EQ(makeKey(*disjSingleFieldNotSubset, indexCores).getIndexabilityDiscriminators(),
+              "(0)");
+}
+
+TEST_F(PlanCacheKeyInfoTest, ComputeKeyPartialIndexNestedDisjunction) {
+    BSONObj filterObj = fromjson(R"(
+        {$and: [
+            {$or: [{f: {$gt: 10}}, {f: {$lt: 0}}]}, 
+            {$or: [{f: {$gt: 11}}, {f: {$lt: 1}}]} 
+        ]})");
+    unique_ptr<MatchExpression> filterExpr(parseMatchExpression(filterObj));
+
+    const auto keyPattern = BSON("a" << 1);
+    const std::vector<CoreIndexInfo> indexCores = {
+        CoreIndexInfo(keyPattern,
+                      IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                      false,                       // sparse
+                      IndexEntry::Identifier{""},  // name
+                      filterExpr.get())};          // filterExpr
+
+
+    unique_ptr<CanonicalQuery> satisfySinglePredicate(canonicalize("{f: {$eq: 11}}"));
+    ASSERT_EQ(makeKey(*satisfySinglePredicate, indexCores).getIndexabilityDiscriminators(), "(0)");
+
+    unique_ptr<CanonicalQuery> notCompat(canonicalize("{f: {$eq: 12}}"));
+    ASSERT_EQ(makeKey(*notCompat, indexCores).getIndexabilityDiscriminators(), "(1)");
+}
+
 // Query shapes should get the same plan cache key if they have the same collation indexability.
-TEST(PlanCacheKeyInfoTest, ComputeKeyCollationIndex) {
+TEST_F(PlanCacheKeyInfoTest, ComputeKeyCollationIndex) {
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
 
     const auto keyPattern = BSON("a" << 1);
@@ -262,7 +370,7 @@ TEST(PlanCacheKeyInfoTest, ComputeKeyCollationIndex) {
               makeKey(*inContainsStringHasCollation, indexCores).getIndexabilityDiscriminators());
 }
 
-TEST(PlanCacheKeyInfoTest, ComputeKeyWildcardIndex) {
+TEST_F(PlanCacheKeyInfoTest, ComputeKeyWildcardIndex) {
     auto entryProjUpdatePair = makeWildcardUpdate(BSON("a.$**" << 1));
 
     const std::vector<CoreIndexInfo> indexCores = {entryProjUpdatePair.first};
@@ -322,7 +430,7 @@ TEST(PlanCacheKeyInfoTest, ComputeKeyWildcardIndex) {
               "<0><0>");
 }
 
-TEST(PlanCacheKeyInfoTest, ComputeKeyWildcardIndexDiscriminatesEqualityToEmptyObj) {
+TEST_F(PlanCacheKeyInfoTest, ComputeKeyWildcardIndexDiscriminatesEqualityToEmptyObj) {
     auto entryProjUpdatePair = makeWildcardUpdate(BSON("a.$**" << 1));
 
     const std::vector<CoreIndexInfo> indexCores = {entryProjUpdatePair.first};
@@ -344,7 +452,8 @@ TEST(PlanCacheKeyInfoTest, ComputeKeyWildcardIndexDiscriminatesEqualityToEmptyOb
     ASSERT_EQ(makeKey(*inWithEmptyObj, indexCores).getIndexabilityDiscriminators(), "<1>");
 }
 
-TEST(PlanCacheKeyInfoTest, ComputeKeyWildcardDiscriminatesCorrectlyBasedOnPartialFilterExpression) {
+TEST_F(PlanCacheKeyInfoTest,
+       ComputeKeyWildcardDiscriminatesCorrectlyBasedOnPartialFilterExpression) {
     BSONObj filterObj = BSON("x" << BSON("$gt" << 0));
     std::unique_ptr<MatchExpression> filterExpr(parseMatchExpression(filterObj));
 
@@ -366,8 +475,8 @@ TEST(PlanCacheKeyInfoTest, ComputeKeyWildcardDiscriminatesCorrectlyBasedOnPartia
         // The discriminator strings have the format "<xx>". That is, there are two discriminator
         // bits for the "x" predicate, the first pertaining to the partialFilterExpression and the
         // second around applicability to the wildcard index.
-        ASSERT_EQ(compatibleKey.getIndexabilityDiscriminators(), "<11>");
-        ASSERT_EQ(incompatibleKey.getIndexabilityDiscriminators(), "<01>");
+        ASSERT_EQ(compatibleKey.getIndexabilityDiscriminators(), "(1)<1>");
+        ASSERT_EQ(incompatibleKey.getIndexabilityDiscriminators(), "(0)<1>");
     }
 
     // The partialFilterExpression should lead to a discriminator over field 'x', but not over 'y'.
@@ -382,8 +491,8 @@ TEST(PlanCacheKeyInfoTest, ComputeKeyWildcardDiscriminatesCorrectlyBasedOnPartia
         // The discriminator strings have the format "<xx><y>". That is, there are two discriminator
         // bits for the "x" predicate (the first pertaining to the partialFilterExpression, the
         // second around applicability to the wildcard index) and one discriminator bit for "y".
-        ASSERT_EQ(compatibleKey.getIndexabilityDiscriminators(), "<11><1>");
-        ASSERT_EQ(incompatibleKey.getIndexabilityDiscriminators(), "<01><1>");
+        ASSERT_EQ(compatibleKey.getIndexabilityDiscriminators(), "(1)<1><1>");
+        ASSERT_EQ(incompatibleKey.getIndexabilityDiscriminators(), "(0)<1><1>");
     }
 
     // $eq:null predicates cannot be assigned to a wildcard index. Make sure that this is
@@ -398,8 +507,8 @@ TEST(PlanCacheKeyInfoTest, ComputeKeyWildcardDiscriminatesCorrectlyBasedOnPartia
         // The discriminator strings have the format "<xx><y>". That is, there are two discriminator
         // bits for the "x" predicate (the first pertaining to the partialFilterExpression, the
         // second around applicability to the wildcard index) and one discriminator bit for "y".
-        ASSERT_EQ(compatibleKey.getIndexabilityDiscriminators(), "<11><1>");
-        ASSERT_EQ(incompatibleKey.getIndexabilityDiscriminators(), "<11><0>");
+        ASSERT_EQ(compatibleKey.getIndexabilityDiscriminators(), "(1)<1><1>");
+        ASSERT_EQ(incompatibleKey.getIndexabilityDiscriminators(), "(1)<1><0>");
     }
 
     // Test that the discriminators are correct for an $eq:null predicate on 'x'. This predicate is
@@ -408,11 +517,11 @@ TEST(PlanCacheKeyInfoTest, ComputeKeyWildcardDiscriminatesCorrectlyBasedOnPartia
     // result in two "0" bits inside the discriminator string.
     {
         auto key = makeKey(*canonicalize("{x: {$eq: null}}"), indexCores);
-        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<00>");
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "(0)<0>");
     }
 }
 
-TEST(PlanCacheKeyInfoTest, DifferentQueryEngines) {
+TEST_F(PlanCacheKeyInfoTest, DifferentQueryEngines) {
     const auto keyPattern = BSON("a" << 1);
     const std::vector<CoreIndexInfo> indexCores = {
         CoreIndexInfo(keyPattern,
@@ -422,22 +531,24 @@ TEST(PlanCacheKeyInfoTest, DifferentQueryEngines) {
 
     // Helper to construct a plan cache key given the 'forceClassicEngine' flag.
     auto constructPlanCacheKey = [&](bool forceClassicEngine) {
-        RAIIServerParameterControllerForTest controller{"internalQueryForceClassicEngine",
-                                                        forceClassicEngine};
+        RAIIServerParameterControllerForTest controller{"internalQueryFrameworkControl",
+                                                        forceClassicEngine ? "forceClassicEngine"
+                                                                           : "trySbeEngine"};
         const auto queryStr = "{a: 0}";
         unique_ptr<CanonicalQuery> cq(canonicalize(queryStr));
         return makeKey(*cq, indexCores);
     };
 
-    const auto classicEngineKey = constructPlanCacheKey(false);
-    const auto noClassicEngineKey = constructPlanCacheKey(true);
+    const auto classicEngineKey = constructPlanCacheKey(true);
+    const auto noClassicEngineKey = constructPlanCacheKey(false);
 
     // Check that the two plan cache keys are not equal because the plans were created under
     // different engines.
     assertPlanCacheKeysUnequalDueToForceClassicEngineValue(classicEngineKey, noClassicEngineKey);
 }
 
-TEST(PlanCacheKeyInfoTest, ComputeKeyWildcardDiscriminatesCorrectlyWithPartialFilterAndExpression) {
+TEST_F(PlanCacheKeyInfoTest,
+       ComputeKeyWildcardDiscriminatesCorrectlyWithPartialFilterAndExpression) {
     // Partial filter is an AND of multiple conditions.
     BSONObj filterObj = BSON("x" << BSON("$gt" << 0) << "y" << BSON("$gt" << 0));
     std::unique_ptr<MatchExpression> filterExpr(parseMatchExpression(filterObj));
@@ -449,11 +560,11 @@ TEST(PlanCacheKeyInfoTest, ComputeKeyWildcardDiscriminatesCorrectlyWithPartialFi
     const std::vector<CoreIndexInfo> indexCores = {indexInfo};
 
     {
-        // The discriminators should have the format <xx><yy><z>. The 'z' predicate has just one
-        // discriminator because it is not referenced in the partial filter expression.  All
+        // TODO update The discriminators should have the format <xx><yy><z>. The 'z' predicate has
+        // just one discriminator because it is not referenced in the partial filter expression. All
         // predicates are compatible.
         auto key = makeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: 2}, z: {$eq: 3}}"), indexCores);
-        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<11><11><1>");
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "(1)<1><1><1>");
     }
 
     {
@@ -461,11 +572,12 @@ TEST(PlanCacheKeyInfoTest, ComputeKeyWildcardDiscriminatesCorrectlyWithPartialFi
         // compatible with the partial filter expression, leading to one of the 'y' bits being set
         // to zero.
         auto key = makeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: -2}, z: {$eq: 3}}"), indexCores);
-        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<11><01><1>");
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "(0)<1><1><1>");
     }
 }
 
-TEST(PlanCacheKeyInfoTest, ComputeKeyDiscriminatesCorrectlyWithPartialFilterAndWildcardProjection) {
+TEST_F(PlanCacheKeyInfoTest,
+       ComputeKeyDiscriminatesCorrectlyWithPartialFilterAndWildcardProjection) {
     BSONObj filterObj = BSON("x" << BSON("$gt" << 0));
     std::unique_ptr<MatchExpression> filterExpr(parseMatchExpression(filterObj));
 
@@ -480,24 +592,25 @@ TEST(PlanCacheKeyInfoTest, ComputeKeyDiscriminatesCorrectlyWithPartialFilterAndW
         // the predicate is compatible with the partial filter expression, whereas the disciminator
         // for 'y' is about compatibility with the wildcard index.
         auto key = makeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: 2}, z: {$eq: 3}}"), indexCores);
-        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<1><1>");
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "(1)<1>");
     }
 
     {
         // Similar to the previous case, except with an 'x' predicate that is incompatible with the
         // partial filter expression.
         auto key = makeKey(*canonicalize("{x: {$eq: -1}, y: {$eq: 2}, z: {$eq: 3}}"), indexCores);
-        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<0><1>");
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "(0)<1>");
     }
 
     {
         // Case where the 'y' predicate is not compatible with the wildcard index.
         auto key = makeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: null}, z: {$eq: 3}}"), indexCores);
-        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<1><0>");
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "(1)<0>");
     }
 }
 
-TEST(PlanCacheKeyInfoTest, ComputeKeyWildcardDiscriminatesCorrectlyWithPartialFilterOnNestedField) {
+TEST_F(PlanCacheKeyInfoTest,
+       ComputeKeyWildcardDiscriminatesCorrectlyWithPartialFilterOnNestedField) {
     BSONObj filterObj = BSON("x.y" << BSON("$gt" << 0));
     std::unique_ptr<MatchExpression> filterExpr(parseMatchExpression(filterObj));
 
@@ -511,18 +624,18 @@ TEST(PlanCacheKeyInfoTest, ComputeKeyWildcardDiscriminatesCorrectlyWithPartialFi
         // The discriminators have the format <x><(x.y)(x.y)<y>. All predicates are compatible
         auto key =
             makeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: 2}, 'x.y': {$eq: 3}}"), indexCores);
-        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<1><11><1>");
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "(1)<1><1><1>");
     }
 
     {
         // Here, the predicate on "x.y" is not compatible with the partial filter expression.
         auto key =
             makeKey(*canonicalize("{x: {$eq: 1}, y: {$eq: 2}, 'x.y': {$eq: -3}}"), indexCores);
-        ASSERT_EQ(key.getIndexabilityDiscriminators(), "<1><01><1>");
+        ASSERT_EQ(key.getIndexabilityDiscriminators(), "(0)<1><1><1>");
     }
 }
 
-TEST(PlanCacheKeyInfoTest, StableKeyDoesNotChangeAcrossIndexCreation) {
+TEST_F(PlanCacheKeyInfoTest, StableKeyDoesNotChangeAcrossIndexCreation) {
     unique_ptr<CanonicalQuery> cq(canonicalize("{a: 0}}"));
     const auto preIndexKey = makeKey(*cq);
     const auto preIndexStableKey = preIndexKey.getQueryShape();
@@ -543,7 +656,7 @@ TEST(PlanCacheKeyInfoTest, StableKeyDoesNotChangeAcrossIndexCreation) {
     ASSERT_EQ(postIndexKey.getIndexabilityDiscriminators(), "<1>");
 }
 
-TEST(PlanCacheKeyInfoTest, ComputeKeyNotEqualsArray) {
+TEST_F(PlanCacheKeyInfoTest, ComputeKeyNotEqualsArray) {
     unique_ptr<CanonicalQuery> cqNeArray(canonicalize("{a: {$ne: [1]}}"));
     unique_ptr<CanonicalQuery> cqNeScalar(canonicalize("{a: {$ne: 123}}"));
 
@@ -576,7 +689,7 @@ TEST(PlanCacheKeyInfoTest, ComputeKeyNotEqualsArray) {
     ASSERT_EQ(withIndexNeArrayKey.getIndexabilityDiscriminators(), "<0><1>");
 }
 
-TEST(PlanCacheKeyInfoTest, ComputeKeyNinArray) {
+TEST_F(PlanCacheKeyInfoTest, ComputeKeyNinArray) {
     unique_ptr<CanonicalQuery> cqNinArray(canonicalize("{a: {$nin: [123, [1]]}}"));
     unique_ptr<CanonicalQuery> cqNinScalar(canonicalize("{a: {$nin: [123, 456]}}"));
 
@@ -617,7 +730,7 @@ TEST(PlanCacheKeyInfoTest, ComputeKeyNinArray) {
 // Whether the discriminator referred to the first not-eq node or the second would be
 // ambiguous. This would make it possible for two queries with different shapes (and different
 // plans) to get the same plan cache key. We test that this does not happen for a simple example.
-TEST(PlanCacheKeyInfoTest, PlanCacheKeyCollision) {
+TEST_F(PlanCacheKeyInfoTest, PlanCacheKeyCollision) {
     unique_ptr<CanonicalQuery> cqNeA(canonicalize("{$or: [{a: {$ne: 5}}, {a: {$ne: [12]}}]}"));
     unique_ptr<CanonicalQuery> cqNeB(canonicalize("{$or: [{a: {$ne: [12]}}, {a: {$ne: 5}}]}"));
 

@@ -30,7 +30,6 @@
 #pragma once
 
 #include "mongo/db/repl/replication_coordinator_mock.h"
-#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/s/sharding_test_fixture_common.h"
 
@@ -52,11 +51,15 @@ namespace mongo {
 class ShardingMongodTestFixture : public ShardingTestFixtureCommon,
                                   public ServiceContextMongoDTest {
 protected:
-    ShardingMongodTestFixture();
+    ShardingMongodTestFixture(Options options = {}, bool allowMajorityReads = true);
     ~ShardingMongodTestFixture();
 
     void setUp() override;
     void tearDown() override;
+
+    // Set a catalog cache to be used when initializing the Grid. Must be called before
+    // initializeGlobalShardingStateForMongodForTest() in order to take effect.
+    void setCatalogCache(std::unique_ptr<CatalogCache> cache);
 
     /**
      * Initializes sharding components according to the cluster role in
@@ -108,11 +111,6 @@ protected:
     virtual std::unique_ptr<ShardRegistry> makeShardRegistry(ConnectionString configConnStr);
 
     /**
-     * Allows tests to conditionally construct a DistLockManager
-     */
-    virtual std::unique_ptr<DistLockManager> makeDistLockManager();
-
-    /**
      * Base class returns nullptr.
      */
     virtual std::unique_ptr<ClusterCursorManager> makeClusterCursorManager();
@@ -121,6 +119,12 @@ protected:
      * Base class returns nullptr.
      */
     virtual std::unique_ptr<BalancerConfiguration> makeBalancerConfiguration();
+
+    /**
+     * Base class returns CatalogCache created from the CatalogCacheLoader set on the
+     * ServiceContext.
+     */
+    virtual std::unique_ptr<CatalogCache> makeCatalogCache();
 
     /**
      * Setups the op observer listeners depending on cluster role.
@@ -143,6 +147,10 @@ private:
 
     // Records if a component has been shut down, so that it is only shut down once.
     bool _executorPoolShutDown = false;
+
+    // Whether the test fixture should set a committed snapshot during setup so that tests can
+    // perform majority reads without doing any writes.
+    bool _setUpMajorityReads;
 };
 
 }  // namespace mongo

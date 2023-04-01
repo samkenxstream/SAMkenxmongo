@@ -3,7 +3,6 @@
  * primary is made to step down before creating the oplog buffer collection.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
@@ -13,19 +12,15 @@
  * ]
  */
 
-(function() {
-
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/libs/uuid_util.js");        // For extractUUIDFromObject().
 load("jstests/libs/fail_point_util.js");  // For configureFailPoint().
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
 const tenantMigrationTest =
     new TenantMigrationTest({name: jsTestName(), sharedOptions: {nodes: 2}});
 
 const kMigrationId = UUID();
-const kTenantId = 'testTenantId';
+const kTenantId = ObjectId().str;
 const kReadPreference = {
     mode: "primary"
 };
@@ -48,8 +43,8 @@ jsTestLog("Waiting until the recipient primary is about to create an oplog buffe
 fpBeforeCreatingOplogBuffer.wait();
 
 jsTestLog("Stepping a new primary up.");
-assert.commandWorked(tenantMigrationTest.getRecipientRst().getSecondaries()[0].adminCommand(
-    {replSetStepUp: ReplSetTest.kForeverSecs, force: true}));
+tenantMigrationTest.getRecipientRst().stepUp(
+    tenantMigrationTest.getRecipientRst().getSecondaries()[0]);
 
 fpBeforeCreatingOplogBuffer.off();
 
@@ -57,4 +52,3 @@ jsTestLog("Waiting for migration to complete.");
 TenantMigrationTest.assertCommitted(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
 
 tenantMigrationTest.stop();
-})();

@@ -27,20 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
-
 #include "mongo/platform/basic.h"
 
 #include <vector>
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/pipeline/document_source_mock.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/resharding/resharding_collection_cloner.h"
 #include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 
@@ -71,35 +72,51 @@ public:
         return pipeline;
     }
 
+    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+        const AggregateCommandRequest& aggRequest,
+        Pipeline* pipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        boost::optional<BSONObj> shardCursorsSortSpec = boost::none,
+        ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
+        boost::optional<BSONObj> readConcern = boost::none) final {
+        return attachCursorSourceToPipeline(pipeline, shardTargetingPolicy, std::move(readConcern));
+    }
+
 private:
     std::deque<DocumentSource::GetNextResult> _mockResults;
 };
 
-class ReshardingCollectionClonerTest : public ServiceContextTest {
+class ReshardingCollectionClonerTest : public ShardServerTestFixtureWithCatalogCacheMock {
 protected:
-    std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
-        ShardKeyPattern newShardKeyPattern,
-        ShardId recipientShard,
-        std::deque<DocumentSource::GetNextResult> sourceCollectionData,
-        std::deque<DocumentSource::GetNextResult> configCacheChunksData) {
-        auto tempNss = constructTemporaryReshardingNss(_sourceNss.db(), _sourceUUID);
+    void initializePipelineTest(
+        const ShardKeyPattern& newShardKeyPattern,
+        const ShardId& recipientShard,
+        const std::deque<DocumentSource::GetNextResult>& sourceCollectionData,
+        const std::deque<DocumentSource::GetNextResult>& configCacheChunksData) {
+        _metrics = ReshardingMetrics::makeInstance(_sourceUUID,
+                                                   newShardKeyPattern.toBSON(),
+                                                   _sourceNss,
+                                                   ReshardingMetrics::Role::kRecipient,
+                                                   getServiceContext()->getFastClockSource()->now(),
+                                                   getServiceContext());
 
-        ReshardingCollectionCloner cloner(
-            std::make_unique<ReshardingCollectionCloner::Env>(&*_metrics),
-            std::move(newShardKeyPattern),
+        _cloner = std::make_unique<ReshardingCollectionCloner>(
+            _metrics.get(),
+            ShardKeyPattern(newShardKeyPattern.toBSON()),
             _sourceNss,
             _sourceUUID,
-            std::move(recipientShard),
+            recipientShard,
             Timestamp(1, 0), /* dummy value */
-            std::move(tempNss));
+            tempNss);
 
-        auto pipeline = cloner.makePipeline(
-            _opCtx.get(), std::make_shared<MockMongoInterface>(std::move(configCacheChunksData)));
+        getCatalogCacheMock()->setChunkManagerReturnValue(
+            createChunkManager(newShardKeyPattern, configCacheChunksData));
+        auto [rawPipeline, expCtx] = _cloner->makeRawPipeline(
+            operationContext(), std::make_shared<MockMongoInterface>(configCacheChunksData));
+        _pipeline = Pipeline::parse(std::move(rawPipeline), std::move(expCtx));
 
-        pipeline->addInitialSource(DocumentSourceMock::createForTest(
-            std::move(sourceCollectionData), pipeline->getContext()));
-
-        return pipeline;
+        _pipeline->addInitialSource(
+            DocumentSourceMock::createForTest(sourceCollectionData, _pipeline->getContext()));
     }
 
     template <class T>
@@ -109,25 +126,272 @@ protected:
     }
 
     void setUp() override {
-        ServiceContextTest::setUp();
-        _metrics = std::make_unique<ReshardingMetrics>(getServiceContext());
-        _metrics->onStart(ReshardingMetrics::Role::kRecipient,
-                          getServiceContext()->getFastClockSource()->now());
-        _metrics->setRecipientState(RecipientStateEnum::kCloning);
+        ShardServerTestFixtureWithCatalogCacheMock::setUp();
+
+        OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
+            operationContext());
+        uassertStatusOK(createCollection(
+            operationContext(), tempNss.dbName(), BSON("create" << tempNss.coll())));
     }
 
     void tearDown() override {
-        _metrics = nullptr;
-        ServiceContextTest::tearDown();
+        ShardServerTestFixtureWithCatalogCacheMock::tearDown();
     }
 
-private:
-    const NamespaceString _sourceNss = NamespaceString("test"_sd, "collection_being_resharded"_sd);
-    const UUID _sourceUUID = UUID::gen();
+    ChunkManager createChunkManager(
+        const ShardKeyPattern& shardKeyPattern,
+        std::deque<DocumentSource::GetNextResult> configCacheChunksData) {
+        const OID epoch = OID::gen();
+        std::vector<ChunkType> chunks;
+        for (const auto& chunkData : configCacheChunksData) {
+            const auto bson = chunkData.getDocument().toBson();
+            ChunkRange range{bson.getField("_id").Obj().getOwned(),
+                             bson.getField("max").Obj().getOwned()};
+            ShardId shard{bson.getField("shard").valueStringDataSafe().toString()};
+            chunks.emplace_back(_sourceUUID,
+                                std::move(range),
+                                ChunkVersion({epoch, Timestamp(1, 1)}, {1, 0}),
+                                std::move(shard));
+        }
 
-    ServiceContext::UniqueOperationContext _opCtx = makeOperationContext();
+        auto rt = RoutingTableHistory::makeNew(_sourceNss,
+                                               _sourceUUID,
+                                               shardKeyPattern.getKeyPattern(),
+                                               nullptr,
+                                               false,
+                                               epoch,
+                                               Timestamp(1, 1),
+                                               boost::none /* timeseriesFields */,
+                                               boost::none /* reshardingFields */,
+                                               false,
+                                               chunks);
+
+        return ChunkManager(_sourceId.getShardId(),
+                            _sourceDbVersion,
+                            makeStandaloneRoutingTableHistory(std::move(rt)),
+                            boost::none);
+    }
+
+    void runPipelineTest(
+        ShardKeyPattern shardKey,
+        const ShardId& recipientShard,
+        std::deque<DocumentSource::GetNextResult> collectionData,
+        std::deque<DocumentSource::GetNextResult> configData,
+        int64_t expectedDocumentsCount,
+        std::function<void(std::unique_ptr<SeekableRecordCursor>)> verifyFunction) {
+        initializePipelineTest(shardKey, recipientShard, collectionData, configData);
+        auto opCtx = operationContext();
+        AutoGetCollection tempColl{opCtx, tempNss, MODE_IX};
+        while (_cloner->doOneBatch(operationContext(), *_pipeline)) {
+            ASSERT_EQ(tempColl->numRecords(opCtx), _metrics->getDocumentsProcessedCount());
+            ASSERT_EQ(tempColl->dataSize(opCtx), _metrics->getBytesWrittenCount());
+        }
+        ASSERT_EQ(tempColl->numRecords(operationContext()), expectedDocumentsCount);
+        ASSERT_EQ(_metrics->getDocumentsProcessedCount(), expectedDocumentsCount);
+        ASSERT_GT(tempColl->dataSize(opCtx), 0);
+        ASSERT_EQ(tempColl->dataSize(opCtx), _metrics->getBytesWrittenCount());
+        verifyFunction(tempColl->getCursor(opCtx));
+    }
+
+protected:
+    const NamespaceString _sourceNss =
+        NamespaceString::createNamespaceString_forTest("test"_sd, "collection_being_resharded"_sd);
+    const NamespaceString tempNss =
+        resharding::constructTemporaryReshardingNss(_sourceNss.db(), _sourceUUID);
+    const UUID _sourceUUID = UUID::gen();
+    const ReshardingSourceId _sourceId{UUID::gen(), _myShardName};
+    const DatabaseVersion _sourceDbVersion{UUID::gen(), Timestamp(1, 1)};
+
     std::unique_ptr<ReshardingMetrics> _metrics;
+    std::unique_ptr<ReshardingCollectionCloner> _cloner;
+    std::unique_ptr<Pipeline, PipelineDeleter> _pipeline;
 };
+
+TEST_F(ReshardingCollectionClonerTest, MinKeyChunk) {
+    ShardKeyPattern sk{fromjson("{x: 1}")};
+    std::deque<DocumentSource::GetNextResult> collectionData{
+        Doc(fromjson("{_id: 1, x: {$minKey: 1}}")),
+        Doc(fromjson("{_id: 2, x: -0.001}")),
+        Doc(fromjson("{_id: 3, x: NumberLong(0)}")),
+        Doc(fromjson("{_id: 4, x: 0.0}")),
+        Doc(fromjson("{_id: 5, x: 0.001}")),
+        Doc(fromjson("{_id: 6, x: {$maxKey: 1}}"))};
+    std::deque<DocumentSource::GetNextResult> configData{
+        Doc(fromjson("{_id: {x: {$minKey: 1}}, max: {x: 0.0}, shard: 'myShardName'}")),
+        Doc(fromjson("{_id: {x: 0.0}, max: {x: {$maxKey: 1}}, shard: 'shard2' }"))};
+    constexpr auto kExpectedCopiedCount = 2;
+    const auto verify = [](auto cursor) {
+        auto next = cursor->next();
+        ASSERT(next);
+        ASSERT_BSONOBJ_BINARY_EQ(BSON("_id" << 1 << "x" << MINKEY << "$sortKey" << BSON_ARRAY(1)),
+                                 next->data.toBson());
+
+        next = cursor->next();
+        ASSERT(next);
+        ASSERT_BSONOBJ_BINARY_EQ(BSON("_id" << 2 << "x" << -0.001 << "$sortKey" << BSON_ARRAY(2)),
+                                 next->data.toBson());
+
+        ASSERT_FALSE(cursor->next());
+    };
+
+    runPipelineTest(std::move(sk),
+                    _myShardName,
+                    std::move(collectionData),
+                    std::move(configData),
+                    kExpectedCopiedCount,
+                    verify);
+}
+
+TEST_F(ReshardingCollectionClonerTest, MaxKeyChunk) {
+    ShardKeyPattern sk{fromjson("{x: 1}")};
+    std::deque<DocumentSource::GetNextResult> collectionData{
+        Doc(fromjson("{_id: 1, x: {$minKey: 1}}")),
+        Doc(fromjson("{_id: 2, x: -0.001}")),
+        Doc(fromjson("{_id: 3, x: NumberLong(0)}")),
+        Doc(fromjson("{_id: 4, x: 0.0}")),
+        Doc(fromjson("{_id: 5, x: 0.001}")),
+        Doc(fromjson("{_id: 6, x: {$maxKey: 1}}"))};
+    std::deque<DocumentSource::GetNextResult> configData{
+        Doc(fromjson("{_id: {x: {$minKey: 1}}, max: {x: 0.0}, shard: 'myShardName'}")),
+        Doc(fromjson("{_id: {x: 0.0}, max: {x: {$maxKey: 1}}, shard: 'shard2' }")),
+    };
+    // TODO SERVER-67529: Change expected documents to 4.
+    constexpr auto kExpectedCopiedCount = 3;
+    const auto verify = [](auto cursor) {
+        auto next = cursor->next();
+        ASSERT(next);
+        ASSERT_BSONOBJ_BINARY_EQ(BSON("_id" << 3 << "x" << 0LL << "$sortKey" << BSON_ARRAY(3)),
+                                 next->data.toBson());
+
+        next = cursor->next();
+        ASSERT(next);
+        ASSERT_BSONOBJ_BINARY_EQ(BSON("_id" << 4 << "x" << 0.0 << "$sortKey" << BSON_ARRAY(4)),
+                                 next->data.toBson());
+
+        next = cursor->next();
+        ASSERT(next);
+        ASSERT_BSONOBJ_BINARY_EQ(BSON("_id" << 5 << "x" << 0.001 << "$sortKey" << BSON_ARRAY(5)),
+                                 next->data.toBson());
+
+        // TODO SERVER-67529: Enable after ChunkManager can handle documents with $maxKey.
+        // next = cursor->next();
+        // ASSERT(next);
+        // ASSERT_BSONOBJ_BINARY_EQ(
+        //     BSON("_id" << 6 << "x" << MAXKEY << "$sortKey" << BSON_ARRAY(6)),
+        //     next->data.toBson());
+
+        ASSERT_FALSE(cursor->next());
+    };
+
+    runPipelineTest(std::move(sk),
+                    ShardId("shard2"),
+                    std::move(collectionData),
+                    std::move(configData),
+                    kExpectedCopiedCount,
+                    verify);
+}
+
+TEST_F(ReshardingCollectionClonerTest, HashedShardKey) {
+    ShardKeyPattern sk{fromjson("{x: 'hashed'}")};
+    std::deque<DocumentSource::GetNextResult> collectionData{
+        Doc(fromjson("{_id: 1, x: {$minKey: 1}}")),
+        Doc(fromjson("{_id: 2, x: -1}")),
+        Doc(fromjson("{_id: 3, x: -0.123}")),
+        Doc(fromjson("{_id: 4, x: 0}")),
+        Doc(fromjson("{_id: 5, x: NumberLong(0)}")),
+        Doc(fromjson("{_id: 6, x: 0.123}")),
+        Doc(fromjson("{_id: 7, x: 1}")),
+        Doc(fromjson("{_id: 8, x: {$maxKey: 1}}"))};
+    // Documents in a mock config.cache.chunks collection. Mocked collection boundaries:
+    // - [MinKey, hash(0))      : shard1
+    // - [hash(0), hash(0) + 1) : shard2
+    // - [hash(0) + 1, MaxKey]  : shard3
+    std::deque<DocumentSource::GetNextResult> configData{
+        Doc{{"_id", Doc{{"x", V(MINKEY)}}},
+            {"max", Doc{{"x", getHashedElementValue(0)}}},
+            {"shard", "shard1"_sd}},
+        Doc{{"_id", Doc{{"x", getHashedElementValue(0)}}},
+            {"max", Doc{{"x", getHashedElementValue(0) + 1}}},
+            {"shard", "shard2"_sd}},
+        Doc{{"_id", Doc{{"x", getHashedElementValue(0) + 1}}},
+            {"max", Doc{{"x", V(MAXKEY)}}},
+            {"shard", "shard3"_sd}}};
+    constexpr auto kExpectedCopiedCount = 4;
+    const auto verify = [](auto cursor) {
+        auto next = cursor->next();
+        ASSERT(next);
+        ASSERT_BSONOBJ_BINARY_EQ(BSON("_id" << 3 << "x" << -0.123 << "$sortKey" << BSON_ARRAY(3)),
+                                 next->data.toBson());
+
+        next = cursor->next();
+        ASSERT(next);
+        ASSERT_BSONOBJ_BINARY_EQ(BSON("_id" << 4 << "x" << 0 << "$sortKey" << BSON_ARRAY(4)),
+                                 next->data.toBson());
+
+        next = cursor->next();
+        ASSERT(next);
+        ASSERT_BSONOBJ_BINARY_EQ(BSON("_id" << 5 << "x" << 0LL << "$sortKey" << BSON_ARRAY(5)),
+                                 next->data.toBson());
+
+        next = cursor->next();
+        ASSERT(next);
+        ASSERT_BSONOBJ_BINARY_EQ(BSON("_id" << 6 << "x" << 0.123 << "$sortKey" << BSON_ARRAY(6)),
+                                 next->data.toBson());
+
+        ASSERT_FALSE(cursor->next());
+    };
+
+    runPipelineTest(std::move(sk),
+                    ShardId("shard2"),
+                    std::move(collectionData),
+                    std::move(configData),
+                    kExpectedCopiedCount,
+                    verify);
+}
+
+TEST_F(ReshardingCollectionClonerTest, CompoundHashedShardKey) {
+    ShardKeyPattern sk{fromjson("{x: 'hashed', y: 1}")};
+    std::deque<DocumentSource::GetNextResult> collectionData{
+        Doc(fromjson("{_id: 1, x: {$minKey: 1}}")),
+        Doc(fromjson("{_id: 2, x: -1}")),
+        Doc(fromjson("{_id: 3, x: -0.123, y: -1}")),
+        Doc(fromjson("{_id: 4, x: 0, y: 0}")),
+        Doc(fromjson("{_id: 5, x: NumberLong(0), y: 1}")),
+        Doc(fromjson("{_id: 6, x: 0.123}")),
+        Doc(fromjson("{_id: 7, x: 1}")),
+        Doc(fromjson("{_id: 8, x: {$maxKey: 1}}"))};
+    // Documents in a mock config.cache.chunks collection. Mocked collection boundaries:
+    // - [{x: MinKey, y: MinKey}, {x: hash(0), y: 0}) : shard1
+    // - [{x: hash(0), y: 0}, {x: hash(0), y: 1})     : shard2
+    // - [{x: hash(0), y: 1}, {x: MaxKey, y: MaxKey}] : shard3
+    std::deque<DocumentSource::GetNextResult> configData{
+        Doc{{"_id", Doc{{"x", V(MINKEY)}, {"y", V(MINKEY)}}},
+            {"max", Doc{{"x", getHashedElementValue(0)}, {"y", 0}}},
+            {"shard", "shard1"_sd}},
+        Doc{{"_id", Doc{{"x", getHashedElementValue(0)}, {"y", 0}}},
+            {"max", Doc{{"x", getHashedElementValue(0)}, {"y", 1}}},
+            {"shard", "shard2"_sd}},
+        Doc{{"_id", Doc{{"x", getHashedElementValue(0)}, {"y", 1}}},
+            {"max", Doc{{"x", V(MAXKEY)}, {"y", V(MAXKEY)}}},
+            {"shard", "shard3"_sd}}};
+    constexpr auto kExpectedCopiedCount = 1;
+    const auto verify = [](auto cursor) {
+        auto next = cursor->next();
+        ASSERT(next);
+        ASSERT_BSONOBJ_BINARY_EQ(
+            BSON("_id" << 4 << "x" << 0 << "y" << 0 << "$sortKey" << BSON_ARRAY(4)),
+            next->data.toBson());
+
+        ASSERT_FALSE(cursor->next());
+    };
+
+    runPipelineTest(std::move(sk),
+                    ShardId("shard2"),
+                    std::move(collectionData),
+                    std::move(configData),
+                    kExpectedCopiedCount,
+                    verify);
+}
 
 }  // namespace
 }  // namespace mongo

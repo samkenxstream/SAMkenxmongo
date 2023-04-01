@@ -6,6 +6,7 @@
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallel_shell_helpers.js");
+load("jstests/libs/feature_flag_util.js");
 
 const conn = MongoRunner.runMongod();
 
@@ -88,12 +89,18 @@ testWithInsertPaused([
 ]);
 
 // Once the insert is complete, the closed bucket goes away and the open bucket becomes idle.
-expectedMetrics.numBuckets--;
+if (!FeatureFlagUtil.isEnabled(conn, "TimeseriesScalabilityImprovements")) {
+    // If archiving is enabled, the bucket will be archived, and still count towards numBuckets
+    expectedMetrics.numBuckets--;
+}
 expectedMetrics.numIdleBuckets++;
 checkServerStatus();
 
-// Insert a measurement which will close the existing bucket right away.
+// Insert a measurement which will close/archive the existing bucket right away.
 expectedMetrics.numIdleBuckets--;
+if (FeatureFlagUtil.isEnabled(conn, "TimeseriesScalabilityImprovements")) {
+    expectedMetrics.numBuckets++;
+}
 testWithInsertPaused({[timeFieldName]: ISODate("2021-01-01T01:00:00Z"), [metaFieldName]: {a: 1}});
 
 // Once the insert is complete, the new bucket becomes idle.
@@ -101,7 +108,9 @@ expectedMetrics.numIdleBuckets++;
 checkServerStatus();
 
 assert(coll.drop());
-checkNoServerStatus();
+if (!FeatureFlagUtil.isEnabled(conn, "TimeseriesScalabilityImprovements")) {
+    checkNoServerStatus();
+}
 
 MongoRunner.stopMongod(conn);
 })();

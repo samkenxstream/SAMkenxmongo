@@ -53,7 +53,7 @@ enum class TopologyType {
     kSharded,
     kUnknown
 };
-const std::vector<TopologyType> allTopologyTypes();
+std::vector<TopologyType> allTopologyTypes();
 std::string toString(TopologyType topologyType);
 StatusWith<TopologyType> parseTopologyType(StringData strTopologyType);
 std::ostream& operator<<(std::ostream& os, TopologyType topologyType);
@@ -68,7 +68,7 @@ enum class ServerType {
     kRSGhost,
     kUnknown
 };
-const std::vector<ServerType> allServerTypes();
+std::vector<ServerType> allServerTypes();
 std::string toString(ServerType serverType);
 StatusWith<ServerType> parseServerType(StringData strServerType);
 std::ostream& operator<<(std::ostream& os, ServerType serverType);
@@ -85,7 +85,7 @@ public:
         : _server(std::move(server)), _success(true), _response(response), _rtt(rtt) {
         const auto topologyVersionField = response.getField("topologyVersion");
         if (topologyVersionField) {
-            _topologyVersion = TopologyVersion::parse(IDLParserErrorContext("TopologyVersion"),
+            _topologyVersion = TopologyVersion::parse(IDLParserContext("TopologyVersion"),
                                                       topologyVersionField.Obj());
         }
     }
@@ -95,7 +95,7 @@ public:
         : _server(std::move(server)), _success(false), _errorMsg(errorMsg) {
         const auto topologyVersionField = response.getField("topologyVersion");
         if (topologyVersionField) {
-            _topologyVersion = TopologyVersion::parse(IDLParserErrorContext("TopologyVersion"),
+            _topologyVersion = TopologyVersion::parse(IDLParserContext("TopologyVersion"),
                                                       topologyVersionField.Obj());
         }
     }

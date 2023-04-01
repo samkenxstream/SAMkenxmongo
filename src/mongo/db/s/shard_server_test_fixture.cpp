@@ -44,7 +44,8 @@ namespace mongo {
 
 const HostAndPort ShardServerTestFixture::kConfigHostAndPort("dummy", 123);
 
-ShardServerTestFixture::ShardServerTestFixture() = default;
+ShardServerTestFixture::ShardServerTestFixture(Options options, bool setUpMajorityReads)
+    : ShardingMongodTestFixture(std::move(options), setUpMajorityReads) {}
 
 ShardServerTestFixture::~ShardServerTestFixture() = default;
 
@@ -90,7 +91,22 @@ void ShardServerTestFixture::tearDown() {
 }
 
 std::unique_ptr<ShardingCatalogClient> ShardServerTestFixture::makeShardingCatalogClient() {
-    return std::make_unique<ShardingCatalogClientImpl>();
+    return std::make_unique<ShardingCatalogClientImpl>(nullptr /* overrideConfigShard */);
+}
+
+void ShardServerTestFixtureWithCatalogCacheMock::setUp() {
+    auto loader = std::make_unique<CatalogCacheLoaderMock>();
+    _cacheLoaderMock = loader.get();
+    setCatalogCacheLoader(std::move(loader));
+    ShardServerTestFixture::setUp();
+}
+
+std::unique_ptr<CatalogCache> ShardServerTestFixtureWithCatalogCacheMock::makeCatalogCache() {
+    return std::make_unique<CatalogCacheMock>(getServiceContext(), *_cacheLoaderMock);
+}
+
+CatalogCacheMock* ShardServerTestFixtureWithCatalogCacheMock::getCatalogCacheMock() {
+    return static_cast<CatalogCacheMock*>(catalogCache());
 }
 
 }  // namespace mongo

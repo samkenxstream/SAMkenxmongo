@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -36,6 +35,9 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/redaction.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace repl {
@@ -86,22 +88,17 @@ bool ApplyOpsCommandInfo::areOpsCrudOnly() const {
     return _areOpsCrudOnly;
 }
 
-bool ApplyOpsCommandInfo::isAtomic() const {
-    return getAllowAtomic() && areOpsCrudOnly();
-}
-
 ApplyOpsCommandInfo::ApplyOpsCommandInfo(const BSONObj& applyOpCmd)
     : _areOpsCrudOnly(_parseAreOpsCrudOnly(applyOpCmd)) {
-    parseProtected(IDLParserErrorContext("applyOps"), applyOpCmd);
-
-    if (getPreCondition()) {
-        uassert(ErrorCodes::InvalidOptions,
-                "Cannot use preCondition with {allowAtomic: false}",
-                getAllowAtomic());
-        uassert(ErrorCodes::InvalidOptions,
-                "Cannot use preCondition when operations include commands.",
-                areOpsCrudOnly());
+    boost::optional<TenantId> tid;
+    if (applyOpCmd.hasElement("tid")) {
+        tid = TenantId::parseFromBSON(applyOpCmd["tid"]);
     }
+    parseProtected(IDLParserContext("applyOps", false, tid), applyOpCmd);
+
+    uassert(6711600,
+            "applyOps command no longer supports the 'preCondition' option",
+            !getPreCondition());
 }
 
 // static
@@ -133,7 +130,12 @@ void ApplyOps::extractOperationsTo(const OplogEntry& applyOpsOplogEntry,
     uint64_t applyOpsIdx{0};
     for (const auto& operationDoc : operationDocs) {
         // Make sure that the inner ops are not malformed or over-specified.
-        ReplOperation::parse(IDLParserErrorContext("extractOperations"), operationDoc);
+
+        boost::optional<TenantId> tid;
+        if (operationDoc.hasElement("tid")) {
+            tid = TenantId::parseFromBSON(operationDoc["tid"]);
+        }
+        ReplOperation::parse(IDLParserContext("extractOperations", false, tid), operationDoc);
 
         BSONObjBuilder builder(operationDoc);
 

@@ -38,6 +38,7 @@
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/collection_sharding_state_factory_shard.h"
+#include "mongo/db/s/collection_sharding_state_factory_standalone.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_write_router.h"
@@ -47,6 +48,7 @@
 #include "mongo/s/catalog_cache_loader_mock.h"
 #include "mongo/s/catalog_cache_mock.h"
 #include "mongo/s/chunk_manager.h"
+#include "mongo/s/shard_version_factory.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/processinfo.h"
@@ -103,7 +105,7 @@ std::pair<std::vector<mongo::ChunkType>, mongo::ChunkManager> createChunks(
     for (uint32_t i = 0; i < nChunks; ++i) {
         chunks.emplace_back(collIdentifier,
                             getRangeForChunk(i, nChunks),
-                            ChunkVersion{i + 1, 0, collEpoch, collTimestamp},
+                            ChunkVersion({collEpoch, collTimestamp}, {i + 1, 0}),
                             pessimalShardSelector(i, nShards, nChunks));
     }
 
@@ -124,7 +126,6 @@ std::pair<std::vector<mongo::ChunkType>, mongo::ChunkManager> createChunks(
                                                      collTimestamp,
                                                      boost::none /* timeseriesFields */,
                                                      reshardingFields, /* reshardingFields */
-                                                     boost::none /* chunkSizeBytes */,
                                                      true,
                                                      chunks)),
                     boost::none);
@@ -150,12 +151,15 @@ std::unique_ptr<CatalogCacheMock> createCatalogCacheMock(OperationContext* opCtx
     OperationShardingState::setShardRole(
         opCtx,
         kNss,
-        chunkManager.getVersion(originatorShard) /* shardVersion */,
+        ShardVersionFactory::make(
+            chunkManager,
+            originatorShard,
+            boost::optional<CollectionIndexes>(boost::none)) /* shardVersion */,
         boost::none /* databaseVersion */);
 
     // Configuring the filtering metadata such that calls to getCollectionDescription return what we
     // want. Specifically the reshardingFields are what we use. Its specified by the chunkManager.
-    CollectionShardingRuntime::get(opCtx, kNss)
+    CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(opCtx, kNss)
         ->setFilteringMetadata(opCtx, CollectionMetadata(chunkManager, originatorShard));
 
     auto catalogCache = CatalogCacheMock::make();
@@ -210,6 +214,10 @@ void BM_UnshardedDestinedRecipient(benchmark::State& state) {
     const auto client = serviceContext->makeClient("test");
     serviceContext->registerClientObserver(std::make_unique<LockerNoopClientObserver>());
     const auto opCtx = client->makeOperationContext();
+
+    CollectionShardingStateFactory::set(
+        opCtx->getServiceContext(),
+        std::make_unique<CollectionShardingStateFactoryStandalone>(opCtx->getServiceContext()));
 
     const auto catalogCache = CatalogCacheMock::make();
 

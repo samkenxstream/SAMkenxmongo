@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -42,6 +41,9 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_pool_interface.h"
 #include "mongo/util/concurrency/thread_pool_test_fixture.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 namespace {
@@ -243,7 +245,7 @@ COMMON_THREAD_POOL_TEST(RepeatedScheduleDoesntSmashStack) {
 
 void addTestsForThreadPool(const std::string& suiteName, ThreadPoolFactory makeThreadPool) {
     auto& suite = unittest::Suite::getSuite(suiteName);
-    for (auto testCase : threadPoolTestCaseRegistry()) {
+    for (const auto& testCase : threadPoolTestCaseRegistry()) {
         suite.add(str::stream() << suiteName << "::" << testCase.first,
                   __FILE__,
                   [testCase, makeThreadPool] { testCase.second(makeThreadPool)->run(); });

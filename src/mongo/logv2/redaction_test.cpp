@@ -27,13 +27,18 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/logv2/redaction.h"
 
+#include "mongo/base/error_extra_info.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/logv2/log_util.h"
 #include "mongo/unittest/unittest.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 namespace {
@@ -46,7 +51,7 @@ TEST(RedactStringTest, NoRedact) {
     logv2::setShouldRedactLogs(false);
 
     std::string toRedact[] = {"", "abc", "*&$@!_\\\\\\\"*&$@!_\"*&$@!_\"*&$@!_"};
-    for (auto s : toRedact) {
+    for (const auto& s : toRedact) {
         ASSERT_EQ(redact(s), s);
     }
 }
@@ -55,7 +60,7 @@ TEST(RedactStringTest, BasicStrings) {
     logv2::setShouldRedactLogs(true);
 
     std::string toRedact[] = {"", "abc", "*&$@!_\\\\\\\"*&$@!_\"*&$@!_\"*&$@!_"};
-    for (auto s : toRedact) {
+    for (const auto& s : toRedact) {
         ASSERT_EQ(redact(s), kRedactionDefaultMask);
     }
 }
@@ -79,15 +84,20 @@ TEST(RedactStatusTest, StatusOK) {
 
 TEST(RedactExceptionTest, NoRedact) {
     logv2::setShouldRedactLogs(false);
-    ASSERT_THROWS_WITH_CHECK([] { uasserted(ErrorCodes::InternalError, kMsg); }(),
-                             DBException,
-                             [](const DBException& ex) { ASSERT_EQ(redact(ex), ex.toString()); });
+    ASSERT_THROWS_WITH_CHECK(
+        [] {
+            uasserted(ErrorCodes::InternalError, kMsg);
+        }(),
+        DBException,
+        [](const DBException& ex) { ASSERT_EQ(redact(ex), ex.toString()); });
 }
 
 TEST(RedactExceptionTest, BasicException) {
     logv2::setShouldRedactLogs(true);
     ASSERT_THROWS_WITH_CHECK(
-        [] { uasserted(ErrorCodes::InternalError, kMsg); }(),
+        [] {
+            uasserted(ErrorCodes::InternalError, kMsg);
+        }(),
         DBException,
         [](const DBException& ex) { ASSERT_EQ(redact(ex), "InternalError ###"); });
 }
@@ -99,7 +109,7 @@ TEST(RedactBSONTest, NoRedact) {
 }
 
 void testBSONCases(std::initializer_list<BSONStringPair> testCases) {
-    for (auto m : testCases) {
+    for (const auto& m : testCases) {
         ASSERT_EQ(redact(m.first).toString(), m.second);
     }
 }
@@ -122,8 +132,32 @@ TEST(RedactBSONTest, BasicBSON) {
                                   "{ a: \"###\", a: \"###\" }")});
 }
 
+unsigned char zero[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+TEST(RedactEncryptedStringTest, BasicStrings) {
+    logv2::setShouldRedactBinDataEncrypt(true);
+    logv2::setShouldRedactLogs(false);
+
+    BSONObjBuilder builder{};
+    builder.appendBinData("type6", sizeof(zero), BinDataType::Encrypt, zero);
+    builder.append("string", "string");
+    {
+        BSONObjBuilder sub(builder.subobjStart("nestedobj"));
+        sub.appendBinData("subobj", sizeof(zero), BinDataType::Encrypt, zero);
+    }
+    BSONObj obj = builder.done();
+
+    std::cout << "This is obj: " << obj.toString() << std::endl;
+
+    auto redactedStr = R"({ type6: "###", string: "string", nestedobj: { subobj: "###" } })";
+    ASSERT_EQ(redact(obj).toString(), redactedStr);
+
+    logv2::setShouldRedactBinDataEncrypt(false);
+    ASSERT_EQ(redact(obj).toString(), obj.toString());
+}
+
 void testBSONCases(std::vector<BSONStringPair>& testCases) {
-    for (auto m : testCases) {
+    for (const auto& m : testCases) {
         ASSERT_EQ(redact(m.first).toString(), m.second);
     }
 }

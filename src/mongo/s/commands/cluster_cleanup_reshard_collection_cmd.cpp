@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -37,6 +36,9 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/cleanup_reshard_collection_gen.h"
 #include "mongo/s/resharding/resharding_feature_flag_gen.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -52,7 +54,7 @@ public:
         void typedRun(OperationContext* opCtx) {
             const NamespaceString& nss = ns();
 
-            LOGV2(5403502, "Beginning reshard cleanup operation", "namespace"_attr = ns());
+            LOGV2(5403502, "Beginning reshard cleanup operation", logAttrs(ns()));
 
             ConfigsvrCleanupReshardCollection configsvrCleanupReshardCollection(nss);
             configsvrCleanupReshardCollection.setDbName(request().getDbName());

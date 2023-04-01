@@ -5,7 +5,6 @@
  * (like primary step down) that the donor can retry on.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
@@ -15,20 +14,16 @@
  * ]
  */
 
-(function() {
-
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");  // For extractUUIDFromObject()
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
 // Make the batch size small so that we can pause before all the batches are applied.
 const tenantMigrationTest = new TenantMigrationTest(
     {name: jsTestName(), sharedOptions: {setParameter: {tenantApplierBatchSizeOps: 2}}});
 
 const kMigrationId = UUID();
-const kTenantId = 'testTenantId';
+const kTenantId = ObjectId().str;
 const kReadPreference = {
     mode: "primary"
 };
@@ -97,4 +92,3 @@ jsTestLog("Waiting for migration to complete.");
 TenantMigrationTest.assertCommitted(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
 
 tenantMigrationTest.stop();
-})();

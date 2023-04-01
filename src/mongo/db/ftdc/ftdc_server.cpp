@@ -73,24 +73,24 @@ synchronized_value<boost::filesystem::path> ftdcDirectoryPathParameter;
 
 FTDCStartupParams ftdcStartupParams;
 
-void DiagnosticDataCollectionDirectoryPathServerParameter::append(OperationContext* opCtx,
-                                                                  BSONObjBuilder& b,
-                                                                  const std::string& name) {
-    b.append(name, ftdcDirectoryPathParameter->generic_string());
+void DiagnosticDataCollectionDirectoryPathServerParameter::append(
+    OperationContext* opCtx, BSONObjBuilder* b, StringData name, const boost::optional<TenantId>&) {
+    b->append(name, ftdcDirectoryPathParameter->generic_string());
 }
 
-Status DiagnosticDataCollectionDirectoryPathServerParameter::setFromString(const std::string& str) {
+Status DiagnosticDataCollectionDirectoryPathServerParameter::setFromString(
+    StringData str, const boost::optional<TenantId>&) {
     if (hasGlobalServiceContext()) {
         FTDCController* controller = FTDCController::get(getGlobalServiceContext());
         if (controller) {
-            Status s = controller->setDirectory(str);
+            Status s = controller->setDirectory(str.toString());
             if (!s.isOK()) {
                 return s;
             }
         }
     }
 
-    ftdcDirectoryPathParameter = str;
+    ftdcDirectoryPathParameter = str.toString();
 
     return Status::OK();
 }
@@ -181,8 +181,11 @@ FTDCSimpleInternalCommandCollector::FTDCSimpleInternalCommandCollector(StringDat
 }
 
 void FTDCSimpleInternalCommandCollector::collect(OperationContext* opCtx, BSONObjBuilder& builder) {
-    auto result = CommandHelpers::runCommandDirectly(opCtx, _request);
-    builder.appendElements(result);
+    if (auto result = CommandHelpers::runCommandDirectly(opCtx, _request);
+        result.hasElement("cursor"))
+        builder.appendElements(result["cursor"]["firstBatch"]["0"].Obj());
+    else
+        builder.appendElements(result);
 }
 
 std::string FTDCSimpleInternalCommandCollector::name() const {
@@ -213,6 +216,8 @@ public:
         // mirrored by this process in FTDC collections.
         // "tenantMigrationAccessBlocker" section is filtered out because its variability in
         // document shape hurts FTDC compression.
+        // "oplog" is included to append the earliest and latest optimes, which allow calculation of
+        // the oplog window.
 
         BSONObjBuilder commandBuilder;
         commandBuilder.append(kCommand, 1);
@@ -222,14 +227,20 @@ public:
         commandBuilder.append(MirrorMaestro::kServerStatusSectionName, true);
         commandBuilder.append("tenantMigrationAccessBlocker", false);
 
+        // Avoid requesting metrics that aren't available during a shutdown.
         if (_serverShuttingDown) {
-            // Avoid requesting metrics that aren't available during a shutdown.
             commandBuilder.append("repl", false);
+        } else {
+            commandBuilder.append("oplog", true);
         }
 
         // Exclude 'serverStatus.transactions.lastCommittedTransactions' because it triggers
         // frequent schema changes.
         commandBuilder.append("transactions", BSON("includeLastCommitted" << false));
+
+        // Exclude detailed query planning statistics.
+        commandBuilder.append("metrics",
+                              BSON("query" << BSON("multiPlanner" << BSON("histograms" << false))));
 
         if (gDiagnosticDataCollectionEnableLatencyHistograms.load()) {
             BSONObjBuilder subObjBuilder(commandBuilder.subobjStart("opLatencies"));

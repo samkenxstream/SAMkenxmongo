@@ -3,8 +3,11 @@
  * collection.
  *
  * @tags: [
- *   incompatible_with_embedded,
  *   requires_fastcount,
+ *   # Commands using UUIDs are not compatible with name-based auth.
+ *   tenant_migration_incompatible,
+ *   # Runs listCollections and asserts on the output.
+ *   assumes_no_implicit_index_creation
  * ]
  */
 

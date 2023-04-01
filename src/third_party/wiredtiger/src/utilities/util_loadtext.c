@@ -13,13 +13,14 @@ static int text(WT_SESSION *, const char *);
 
 /*
  * usage --
- *     TODO: Add a comment describing this function.
+ *     Display a usage message for the loadtext command.
  */
 static int
 usage(void)
 {
-    static const char *options[] = {
-      "-f", "read from the specified file (by default rows are read from stdin)", NULL, NULL};
+    static const char *options[] = {"-f",
+      "read from the specified file (by default rows are read from stdin)", "-?",
+      "show this message", NULL, NULL};
 
     util_usage("loadtext [-f input-file] uri", "options:", options);
     return (1);
@@ -27,7 +28,7 @@ usage(void)
 
 /*
  * util_loadtext --
- *     TODO: Add a comment describing this function.
+ *     The loadtext command.
  */
 int
 util_loadtext(WT_SESSION *session, int argc, char *argv[])
@@ -37,13 +38,15 @@ util_loadtext(WT_SESSION *session, int argc, char *argv[])
     char *uri;
 
     uri = NULL;
-    while ((ch = __wt_getopt(progname, argc, argv, "f:")) != EOF)
+    while ((ch = __wt_getopt(progname, argc, argv, "f:?")) != EOF)
         switch (ch) {
         case 'f': /* input file */
             if (freopen(__wt_optarg, "r", stdin) == NULL)
                 return (util_err(session, errno, "%s: reopen", __wt_optarg));
             break;
         case '?':
+            usage();
+            return (0);
         default:
             return (usage());
         }

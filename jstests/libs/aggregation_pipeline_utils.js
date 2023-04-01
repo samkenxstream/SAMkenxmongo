@@ -18,9 +18,11 @@ function executeAggregationTestCase(collection, testCase) {
     // Issue an aggregate command and verify the result.
     try {
         const actualResults = collection.aggregate(testCase.pipeline).toArray();
-        assert(testCase.expectedErrorCode === undefined,
-               `Expected an exception with code ${testCase.expectedErrorCode}`);
-        assert.docEq(actualResults, testCase.expectedResults);
+        if (testCase.expectedResults === undefined) {
+            assert(testCase.expectedErrorCode === undefined,
+                   `Expected an exception with code ${testCase.expectedErrorCode}`);
+        }
+        assert.docEq(testCase.expectedResults, actualResults);
     } catch (error) {
         if (testCase.expectedErrorCode === undefined) {
             throw error;

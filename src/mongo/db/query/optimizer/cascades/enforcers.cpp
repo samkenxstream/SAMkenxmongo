@@ -29,6 +29,7 @@
 
 #include "mongo/db/query/optimizer/cascades/enforcers.h"
 
+#include "mongo/db/query/optimizer/cascades/rewriter_rules.h"
 #include "mongo/db/query/optimizer/utils/memo_utils.h"
 
 namespace mongo::optimizer::cascades {
@@ -66,14 +67,12 @@ public:
     PropEnforcerVisitor(const GroupIdType groupId,
                         const Metadata& metadata,
                         const RIDProjectionsMap& ridProjections,
-                        PrefixId& prefixId,
                         PhysRewriteQueue& queue,
                         const PhysProps& physProps,
                         const LogicalProps& logicalProps)
         : _groupId(groupId),
           _metadata(metadata),
           _ridProjections(ridProjections),
-          _prefixId(prefixId),
           _queue(queue),
           _physProps(physProps),
           _logicalProps(logicalProps) {}
@@ -107,7 +106,7 @@ public:
         }
 
         ABT enforcer = make<CollationNode>(prop, make<MemoLogicalDelegatorNode>(_groupId));
-        optimizeChild<CollationNode>(
+        optimizeChild<CollationNode, PhysicalRewriteType::EnforceCollation>(
             _queue, kDefaultPriority, std::move(enforcer), std::move(childProps));
     }
 
@@ -124,10 +123,10 @@ public:
         PhysProps childProps = _physProps;
         removeProperty<LimitSkipRequirement>(childProps);
         setPropertyOverwrite<LimitEstimate>(
-            childProps, LimitEstimate{static_cast<CEType>(prop.getAbsoluteLimit())});
+            childProps, LimitEstimate{{static_cast<double>(prop.getAbsoluteLimit())}});
 
         ABT enforcer = make<LimitSkipNode>(prop, make<MemoLogicalDelegatorNode>(_groupId));
-        optimizeChild<LimitSkipNode>(
+        optimizeChild<LimitSkipNode, PhysicalRewriteType::EnforceLimitSkip>(
             _queue, kDefaultPriority, std::move(enforcer), std::move(childProps));
     }
 
@@ -147,7 +146,8 @@ public:
             return;
         }
 
-        if (prop.getDistributionAndProjections()._type == DistributionType::UnknownPartitioning) {
+        const auto& requiredDistrAndProj = prop.getDistributionAndProjections();
+        if (requiredDistrAndProj._type == DistributionType::UnknownPartitioning) {
             // Cannot exchange into unknown partitioning.
             return;
         }
@@ -162,26 +162,26 @@ public:
             return;
         }
 
-        const auto& distributions =
+        const auto& availableDistrs =
             getPropertyConst<DistributionAvailability>(_logicalProps).getDistributionSet();
-        for (const auto& distribution : distributions) {
-            if (distribution == prop.getDistributionAndProjections()) {
+        for (const auto& availableDistr : availableDistrs) {
+            if (availableDistr == requiredDistrAndProj) {
                 // Same distribution.
                 continue;
             }
-            if (distribution._type == DistributionType::Replicated) {
+            if (availableDistr._type == DistributionType::Replicated) {
                 // Cannot switch "away" from replicated distribution.
                 continue;
             }
 
             PhysProps childProps = _physProps;
-            setPropertyOverwrite<DistributionRequirement>(childProps, distribution);
+            setPropertyOverwrite<DistributionRequirement>(childProps, availableDistr);
 
-            addProjectionsToProperties(childProps, distribution._projectionNames);
+            addProjectionsToProperties(childProps, requiredDistrAndProj._projectionNames);
             getProperty<DistributionRequirement>(childProps).setDisableExchanges(true);
 
             ABT enforcer = make<ExchangeNode>(prop, make<MemoLogicalDelegatorNode>(_groupId));
-            optimizeChild<ExchangeNode>(
+            optimizeChild<ExchangeNode, PhysicalRewriteType::EnforceDistribution>(
                 _queue, kDefaultPriority, std::move(enforcer), std::move(childProps));
         }
     }
@@ -190,7 +190,7 @@ public:
         const ProjectionNameSet& availableProjections =
             getPropertyConst<ProjectionAvailability>(_logicalProps).getProjections();
 
-        ProjectionName ridProjName;
+        boost::optional<ProjectionName> ridProjName;
         if (hasProperty<IndexingAvailability>(_logicalProps)) {
             const auto& scanDefName =
                 getPropertyConst<IndexingAvailability>(_logicalProps).getScanDefName();
@@ -227,7 +227,7 @@ public:
         const ProjectionNameOrderPreservingSet& requiredProjections =
             getPropertyConst<ProjectionRequirement>(_physProps).getProjections();
         const ProjectionName& scanProjection = indexingAvailability.getScanProjection();
-        const bool requiresScanProjection = requiredProjections.find(scanProjection).second;
+        const bool requiresScanProjection = requiredProjections.find(scanProjection).has_value();
 
         if (!requiresScanProjection) {
             // Try indexScanOnly (covered index) if we do not require scan projection.
@@ -237,10 +237,11 @@ public:
                                                        prop.getDedupRID(),
                                                        prop.getSatisfiedPartialIndexesGroupId()});
 
-            optimizeUnderNewProperties(_queue,
-                                       kDefaultPriority,
-                                       make<MemoLogicalDelegatorNode>(_groupId),
-                                       std::move(newProps));
+            optimizeUnderNewProperties<PhysicalRewriteType::AttemptCoveringQuery>(
+                _queue,
+                kDefaultPriority,
+                make<MemoLogicalDelegatorNode>(_groupId),
+                std::move(newProps));
         }
     }
 
@@ -259,7 +260,6 @@ private:
     // We don't own any of those.
     const Metadata& _metadata;
     const RIDProjectionsMap& _ridProjections;
-    PrefixId& _prefixId;
     PhysRewriteQueue& _queue;
     const PhysProps& _physProps;
     const LogicalProps& _logicalProps;
@@ -268,12 +268,10 @@ private:
 void addEnforcers(const GroupIdType groupId,
                   const Metadata& metadata,
                   const RIDProjectionsMap& ridProjections,
-                  PrefixId& prefixId,
                   PhysRewriteQueue& queue,
                   const PhysProps& physProps,
                   const LogicalProps& logicalProps) {
-    PropEnforcerVisitor visitor(
-        groupId, metadata, ridProjections, prefixId, queue, physProps, logicalProps);
+    PropEnforcerVisitor visitor(groupId, metadata, ridProjections, queue, physProps, logicalProps);
     for (const auto& entry : physProps) {
         entry.second.visit(visitor);
     }

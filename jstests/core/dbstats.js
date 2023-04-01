@@ -1,8 +1,12 @@
 // Confirms that the dbStats command returns expected content.
 //
 // @tags: [
+//   # Asserts on the total number of indexes in dbStats.
+//   assumes_no_implicit_index_creation,
 //   requires_dbstats,
-//   requires_fcv_53
+//   requires_fcv_53,
+//   # The `dbstats` command builds in-memory structures that are not causally consistent.
+//   does_not_support_causal_consistency,
 // ]
 
 (function() {

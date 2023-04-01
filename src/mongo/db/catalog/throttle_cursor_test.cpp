@@ -27,14 +27,11 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/catalog/throttle_cursor.h"
-
 #include "mongo/db/catalog/catalog_test_fixture.h"
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/catalog/throttle_cursor.h"
 #include "mongo/db/catalog/validate_gen.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_access_method.h"
@@ -46,8 +43,7 @@ namespace mongo {
 
 namespace {
 
-const NamespaceString kNss = NamespaceString("test.throttleCursor");
-const KeyString::Value kMinKeyString = KeyString::Value();
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test.throttleCursor");
 const uint8_t kTickDelay = 200;
 
 class ThrottleCursorTest : public CatalogTestFixture {
@@ -55,14 +51,28 @@ private:
     void setUp() override;
     void tearDown() override;
 
+protected:
+    const KeyString::Value kMinKeyString = KeyString::Builder{KeyString::Version::kLatestVersion,
+                                                              kMinBSONKey,
+                                                              KeyString::ALL_ASCENDING}
+                                               .getValueCopy();
+
+    explicit ThrottleCursorTest(Milliseconds clockIncrement = Milliseconds{kTickDelay})
+        : CatalogTestFixture(Options{}.useMockClock(true, clockIncrement)) {}
+
 public:
     void setMaxMbPerSec(int maxMbPerSec);
 
     Date_t getTime();
-    int64_t getDifferenceInMillis(Date_t start, Date_t end);
     SortedDataInterfaceThrottleCursor getIdIndex(const CollectionPtr& coll);
 
     std::unique_ptr<DataThrottle> _dataThrottle;
+};
+
+class ThrottleCursorTestFastClock : public ThrottleCursorTest {
+protected:
+    // Move the clock faster to speed up the test.
+    ThrottleCursorTestFastClock() : ThrottleCursorTest(Milliseconds{1000}) {}
 };
 
 void ThrottleCursorTest::setUp() {
@@ -80,15 +90,11 @@ void ThrottleCursorTest::setUp() {
     for (int i = 0; i < 10; i++) {
         WriteUnitOfWork wuow(operationContext());
 
-        ASSERT_OK(collection->insertDocument(
-            operationContext(), InsertStatement(BSON("_id" << i)), nullOpDebug));
+        ASSERT_OK(collection_internal::insertDocument(
+            operationContext(), *collection, InsertStatement(BSON("_id" << i)), nullOpDebug));
         wuow.commit();
     }
 
-    std::unique_ptr<ClockSourceMock> clkSource =
-        std::make_unique<AutoAdvancingClockSourceMock>(Milliseconds(kTickDelay));
-
-    operationContext()->getServiceContext()->setFastClockSource(std::move(clkSource));
     _dataThrottle = std::make_unique<DataThrottle>(operationContext());
 }
 
@@ -102,10 +108,6 @@ void ThrottleCursorTest::setMaxMbPerSec(int maxMbPerSec) {
 
 Date_t ThrottleCursorTest::getTime() {
     return operationContext()->getServiceContext()->getFastClockSource()->now();
-}
-
-int64_t ThrottleCursorTest::getDifferenceInMillis(Date_t start, Date_t end) {
-    return end.toMillisSinceEpoch() - start.toMillisSinceEpoch();
 }
 
 SortedDataInterfaceThrottleCursor ThrottleCursorTest::getIdIndex(const CollectionPtr& coll) {
@@ -146,7 +148,7 @@ TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOff) {
     Date_t end = getTime();
 
     ASSERT_EQ(numRecords, 20);
-    ASSERT_EQ(getDifferenceInMillis(start, end), kTickDelay * numRecords + kTickDelay);
+    ASSERT_EQ(end - start, Milliseconds(kTickDelay * numRecords + kTickDelay));
 }
 
 TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOn) {
@@ -177,7 +179,7 @@ TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOn) {
         Date_t end = getTime();
 
         ASSERT_EQ(numRecords, 10);
-        ASSERT_TRUE(getDifferenceInMillis(start, end) >= 5000);
+        ASSERT_GTE(end - start, Milliseconds(5000));
     }
 
     // Using a throttle with a limit of 5MB per second, all operations should take at least 1
@@ -197,11 +199,11 @@ TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOn) {
         Date_t end = getTime();
 
         ASSERT_EQ(numRecords, 10);
-        ASSERT_TRUE(getDifferenceInMillis(start, end) >= 1000);
+        ASSERT_GTE(end - start, Milliseconds(1000));
     }
 }
 
-TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOnLargeDocs) {
+TEST_F(ThrottleCursorTestFastClock, TestSeekableRecordThrottleCursorOnLargeDocs1MBps) {
     auto opCtx = operationContext();
     AutoGetCollection autoColl(opCtx, kNss, MODE_X);
     const CollectionPtr& coll = autoColl.getCollection();
@@ -209,57 +211,58 @@ TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOnLargeDocs) {
     // Use a fixed record data size to simplify the timing calculations.
     FailPointEnableBlock failPoint("fixedCursorDataSizeOf2MBForDataThrottle");
 
-    // Move the clock faster to speed up the test.
-    operationContext()->getServiceContext()->setFastClockSource(
-        std::make_unique<AutoAdvancingClockSourceMock>(Milliseconds(1000)));
-
     SeekableRecordThrottleCursor cursor =
         SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), _dataThrottle.get());
 
     // Using a throttle with a limit of 1MB per second, all operations should take at least 10
     // seconds to finish. We scan 5 records, each of which is 2MB courtesy of the fail point, so
     // 1 record every 2 seconds.
-    {
-        setMaxMbPerSec(1);
-        Date_t start = getTime();
+    setMaxMbPerSec(1);
+    Date_t start = getTime();
 
-        // Seek to the first record, then iterate through 4 more.
-        ASSERT_TRUE(cursor.seekExact(opCtx, RecordId(1)));
-        int scanRecords = 4;
+    // Seek to the first record, then iterate through 4 more.
+    ASSERT_TRUE(cursor.seekExact(opCtx, RecordId(1)));
+    int scanRecords = 4;
 
-        while (scanRecords > 0 && cursor.next(opCtx)) {
-            scanRecords--;
-        }
-
-        Date_t end = getTime();
-
-        ASSERT_EQ(scanRecords, 0);
-        ASSERT_GTE(getDifferenceInMillis(start, end), 10 * 1000);
+    while (scanRecords > 0 && cursor.next(opCtx)) {
+        scanRecords--;
     }
 
-    operationContext()->getServiceContext()->setFastClockSource(
-        std::make_unique<AutoAdvancingClockSourceMock>(Milliseconds(kTickDelay)));
+    Date_t end = getTime();
+
+    ASSERT_EQ(scanRecords, 0);
+    ASSERT_GTE(end - start, Milliseconds(10 * 1000));
+}
+
+TEST_F(ThrottleCursorTest, TestSeekableRecordThrottleCursorOnLargeDocs5MBps) {
+    auto opCtx = operationContext();
+    AutoGetCollection autoColl(opCtx, kNss, MODE_X);
+    const CollectionPtr& coll = autoColl.getCollection();
+
+    // Use a fixed record data size to simplify the timing calculations.
+    FailPointEnableBlock failPoint("fixedCursorDataSizeOf2MBForDataThrottle");
+
+    SeekableRecordThrottleCursor cursor =
+        SeekableRecordThrottleCursor(opCtx, coll->getRecordStore(), _dataThrottle.get());
 
     // Using a throttle with a limit of 5MB per second, all operations should take at least 2
     // second to finish. We scan 5 records, each of which is 2MB courtesy of the fail point, so
     // 2.5 records per second.
-    {
-        setMaxMbPerSec(5);
-        Date_t start = getTime();
+    setMaxMbPerSec(5);
+    Date_t start = getTime();
 
-        // Seek to the first record, then iterate through 4 more.
-        ASSERT_TRUE(cursor.seekExact(opCtx, RecordId(1)));
-        int scanRecords = 4;
+    // Seek to the first record, then iterate through 4 more.
+    ASSERT_TRUE(cursor.seekExact(opCtx, RecordId(1)));
+    int scanRecords = 4;
 
-        while (scanRecords > 0 && cursor.next(opCtx)) {
-            scanRecords--;
-        }
-
-        Date_t end = getTime();
-
-        ASSERT_EQ(scanRecords, 0);
-        ASSERT_GTE(getDifferenceInMillis(start, end), 2000);
+    while (scanRecords > 0 && cursor.next(opCtx)) {
+        scanRecords--;
     }
+
+    Date_t end = getTime();
+
+    ASSERT_EQ(scanRecords, 0);
+    ASSERT_GTE(end - start, Milliseconds(2000));
 }
 
 TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOff) {
@@ -286,7 +289,7 @@ TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOff) {
     Date_t end = getTime();
 
     ASSERT_EQ(numRecords, 10);
-    ASSERT_EQ(getDifferenceInMillis(start, end), kTickDelay * numRecords + kTickDelay);
+    ASSERT_EQ(end - start, Milliseconds(kTickDelay * numRecords + kTickDelay));
 }
 
 TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOn) {
@@ -316,7 +319,7 @@ TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOn) {
         Date_t end = getTime();
 
         ASSERT_EQ(numRecords, 10);
-        ASSERT_TRUE(getDifferenceInMillis(start, end) >= 5000);
+        ASSERT_GTE(end - start, Milliseconds(5000));
     }
 
     // Using a throttle with a limit of 5MB per second, all operations should take at least 1
@@ -336,7 +339,7 @@ TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOn) {
         Date_t end = getTime();
 
         ASSERT_EQ(numRecords, 10);
-        ASSERT_TRUE(getDifferenceInMillis(start, end) >= 1000);
+        ASSERT_GTE(end - start, Milliseconds(1000));
     }
 }
 
@@ -379,7 +382,7 @@ TEST_F(ThrottleCursorTest, TestMixedCursorsWithSharedThrottleOff) {
     Date_t end = getTime();
 
     ASSERT_EQ(numRecords, 30);
-    ASSERT_EQ(getDifferenceInMillis(start, end), kTickDelay * numRecords + kTickDelay);
+    ASSERT_EQ(end - start, Milliseconds(kTickDelay * numRecords + kTickDelay));
 }
 
 TEST_F(ThrottleCursorTest, TestMixedCursorsWithSharedThrottleOn) {
@@ -414,7 +417,7 @@ TEST_F(ThrottleCursorTest, TestMixedCursorsWithSharedThrottleOn) {
         Date_t end = getTime();
 
         ASSERT_EQ(numRecords, 20);
-        ASSERT_TRUE(getDifferenceInMillis(start, end) >= 5000);
+        ASSERT_GTE(end - start, Milliseconds(5000));
     }
 
     // Using a throttle with a limit of 5MB per second, all operations should take at least 2
@@ -436,7 +439,7 @@ TEST_F(ThrottleCursorTest, TestMixedCursorsWithSharedThrottleOn) {
         Date_t end = getTime();
 
         ASSERT_EQ(numRecords, 20);
-        ASSERT_TRUE(getDifferenceInMillis(start, end) >= 2000);
+        ASSERT_GTE(end - start, Milliseconds(2000));
     }
 }
 

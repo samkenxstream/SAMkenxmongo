@@ -31,6 +31,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/timeseries/timeseries_options.h"
 
 /**
@@ -71,10 +72,11 @@ std::list<BSONObj> createTimeseriesIndexesFromBucketsIndexes(
     const TimeseriesOptions& timeseriesOptions, const std::list<BSONObj>& bucketsIndexes);
 
 /**
- * Returns true if the 'bucketsIndex' is compatible for FCV downgrade.
+ * Returns true if the original index specification should be included when creating an index on the
+ * time-series buckets collection.
  */
-bool isBucketsIndexSpecCompatibleForDowngrade(const TimeseriesOptions& timeseriesOptions,
-                                              const BSONObj& bucketsIndex);
+bool shouldIncludeOriginalSpec(const TimeseriesOptions& timeseriesOptions,
+                               const BSONObj& bucketsIndex);
 
 /**
  * Returns true if 'bucketsIndex' uses a measurement field, excluding the time field. Checks both
@@ -87,5 +89,22 @@ bool doesBucketsIndexIncludeMeasurement(OperationContext* opCtx,
                                         const NamespaceString& bucketNs,
                                         const TimeseriesOptions& timeseriesOptions,
                                         const BSONObj& bucketsIndex);
+
+/**
+ * Takes a 'hint' object, in the same format used by FindCommandRequest, and returns
+ * true if the hint is an index key.
+ *
+ * Besides an index key, a hint can be {$hint: <index name>} or {$natural: <direction>},
+ * or it can be {} which means no hint is given.
+ */
+bool isHintIndexKey(const BSONObj& obj);
+
+/**
+ * Returns true if the IndexCatalog contains an index for a time-series collection which we can use
+ * for query based reopening.
+ */
+bool collectionHasIndexSupportingReopeningQuery(OperationContext* opCtx,
+                                                const IndexCatalog* indexCatalog,
+                                                const TimeseriesOptions& tsOptions);
 
 }  // namespace mongo::timeseries

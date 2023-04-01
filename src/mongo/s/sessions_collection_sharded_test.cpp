@@ -33,7 +33,7 @@
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/logical_session_id.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache_test_fixture.h"
 #include "mongo/s/client/shard_registry.h"
@@ -98,6 +98,29 @@ TEST_F(SessionsCollectionShardedTest, RefreshOneSessionOKTest) {
     future.default_timed_get();
 }
 
+TEST_F(SessionsCollectionShardedTest, CheckReadConcern) {
+    // Set up routing table for the logical sessions collection.
+    loadRoutingTableWithTwoChunksAndTwoShardsImpl(NamespaceString::kLogicalSessionsNamespace,
+                                                  BSON("_id" << 1));
+    auto future = launchAsync([&] {
+        auto notInsertedRecord = makeRecord();
+        LogicalSessionIdSet lsids{notInsertedRecord.getId()};
+
+        _collection.findRemovedSessions(operationContext(), lsids);
+    });
+
+    onCommandForPoolExecutor([&](const RemoteCommandRequest& request) {
+        BSONObj obj = request.cmdObj;
+        auto readConcern = obj.getObjectField("readConcern");
+        ASSERT_FALSE(readConcern.isEmpty());
+        auto level = readConcern.getStringField("level");
+        ASSERT_EQ(level, "local");
+
+        return CursorResponse().toBSONAsInitialResponse();
+    });
+
+    future.default_timed_get();
+}
 
 TEST_F(SessionsCollectionShardedTest, RefreshOneSessionStatusErrTest) {
     // Set up routing table for the logical sessions collection.
@@ -134,12 +157,8 @@ TEST_F(SessionsCollectionShardedTest, RefreshOneSessionWriteErrTest) {
         BatchedCommandResponse response;
         response.setStatus(Status::OK());
         response.setNModified(0);
-        response.addToErrDetails([&] {
-            WriteErrorDetail* errDetail = new WriteErrorDetail();
-            errDetail->setIndex(0);
-            errDetail->setStatus({ErrorCodes::NotWritablePrimary, "not primary"});
-            return errDetail;
-        }());
+        response.addToErrDetails(
+            write_ops::WriteError(0, {ErrorCodes::NotWritablePrimary, "not primary"}));
         return response.toBSON();
     });
 
@@ -189,12 +208,8 @@ TEST_F(SessionsCollectionShardedTest, RemoveOneSessionWriteErrTest) {
         BatchedCommandResponse response;
         response.setStatus(Status::OK());
         response.setNModified(0);
-        response.addToErrDetails([&] {
-            WriteErrorDetail* errDetail = new WriteErrorDetail();
-            errDetail->setIndex(0);
-            errDetail->setStatus({ErrorCodes::NotWritablePrimary, "not primary"});
-            return errDetail;
-        }());
+        response.addToErrDetails(
+            write_ops::WriteError(0, {ErrorCodes::NotWritablePrimary, "not primary"}));
         return response.toBSON();
     });
 

@@ -27,16 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
-
+#include "mongo/crypto/fle_crypto.h"
 #include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/create_gen.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -44,6 +42,8 @@
 #include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/timeseries/timeseries_constants.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
 namespace {
@@ -69,6 +69,82 @@ constexpr auto kCreateCommandHelp =
     "  writeConcern: <document: write concern expression for the operation>]\n"
     "}"_sd;
 
+BSONObj pipelineAsBsonObj(const std::vector<BSONObj>& pipeline) {
+    BSONArrayBuilder builder;
+    for (const auto& stage : pipeline) {
+        builder.append(stage);
+    }
+    return builder.obj();
+}
+
+/**
+ * Compares the provided `CollectionOptions` to the the options for the provided `NamespaceString`
+ * in the storage catalog.
+ * If the options match, does nothing.
+ * If the options do not match, throws an exception indicating what doesn't match.
+ * If `ns` is not found in the storage catalog (because it was dropped between checking for its
+ * existence and calling this function), throws the original `NamespaceExists` exception.
+ */
+void checkCollectionOptions(OperationContext* opCtx,
+                            const Status& originalStatus,
+                            const NamespaceString& ns,
+                            const CollectionOptions& options) {
+    auto collOrView = AutoGetCollectionForReadLockFree(
+        opCtx,
+        ns,
+        AutoGetCollection::Options{}.viewMode(auto_get_collection::ViewMode::kViewsPermitted));
+    auto collatorFactory = CollatorFactoryInterface::get(opCtx->getServiceContext());
+
+    auto& coll = collOrView.getCollection();
+    if (coll) {
+        auto actualOptions = coll->getCollectionOptions();
+        uassert(ErrorCodes::NamespaceExists,
+                str::stream() << "namespace " << ns.ns()
+                              << " already exists, but with different options: "
+                              << actualOptions.toBSON(),
+                options.matchesStorageOptions(actualOptions, collatorFactory));
+        return;
+    }
+    auto view = collOrView.getView();
+    if (!view) {
+        // If the collection/view disappeared in between attempting to create it
+        // and retrieving the options, just propagate the original error.
+        uassertStatusOK(originalStatus);
+        // The assertion above should always fail, as this function should only ever be called
+        // if the original attempt to create the collection failed.
+        MONGO_UNREACHABLE;
+    }
+
+    auto fullNewNamespace =
+        NamespaceStringUtil::parseNamespaceFromRequest(ns.dbName(), options.viewOn);
+    uassert(ErrorCodes::NamespaceExists,
+            str::stream() << "namespace " << ns.ns() << " already exists, but is a view on "
+                          << view->viewOn() << " rather than " << fullNewNamespace,
+            view->viewOn() == fullNewNamespace);
+
+    auto existingPipeline = pipelineAsBsonObj(view->pipeline());
+    uassert(ErrorCodes::NamespaceExists,
+            str::stream() << "namespace " << ns.ns() << " already exists, but with pipeline "
+                          << existingPipeline << " rather than " << options.pipeline,
+            existingPipeline.woCompare(options.pipeline) == 0);
+
+    // Note: the server can add more values to collation options which were not
+    // specified in the original user request. Use the collator to check for
+    // equivalence.
+    auto newCollator = options.collation.isEmpty()
+        ? nullptr
+        : uassertStatusOK(collatorFactory->makeFromBSON(options.collation));
+
+    if (!CollatorInterface::collatorsMatch(view->defaultCollator(), newCollator.get())) {
+        const auto defaultCollatorSpecBSON =
+            view->defaultCollator() ? view->defaultCollator()->getSpec().toBSON() : BSONObj();
+        uasserted(ErrorCodes::NamespaceExists,
+                  str::stream() << "namespace " << ns.ns()
+                                << " already exists, but with collation: "
+                                << defaultCollatorSpecBSON << " rather than " << options.collation);
+    }
+}
+
 class CmdCreate final : public CreateCmdVersion1Gen<CmdCreate> {
 public:
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
@@ -79,12 +155,20 @@ public:
         return false;
     }
 
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
     bool collectsResourceConsumptionMetrics() const final {
         return true;
     }
 
     std::string help() const final {
         return kCreateCommandHelp.toString();
+    }
+
+    bool allowedInTransactions() const final {
+        return true;
     }
 
     class Invocation final : public InvocationBaseGen {
@@ -97,7 +181,7 @@ public:
 
         void doCheckAuthorization(OperationContext* opCtx) const final {
             uassertStatusOK(auth::checkAuthForCreate(
-                AuthorizationSession::get(opCtx->getClient()), request(), false));
+                opCtx, AuthorizationSession::get(opCtx->getClient()), request(), false));
         }
 
         NamespaceString ns() const final {
@@ -188,6 +272,14 @@ public:
                         "Encrypted collections are not supported on standalone",
                         repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() ==
                             repl::ReplicationCoordinator::Mode::modeReplSet);
+
+                if (hasQueryType(cmd.getEncryptedFields().get(), QueryTypeEnum::RangePreview)) {
+                    uassert(
+                        6775220,
+                        "Queryable Encryption Range support is only supported when FCV supports "
+                        "6.1",
+                        gFeatureFlagFLE2Range.isEnabled(serverGlobalParams.featureCompatibility));
+                }
             }
 
             if (auto timeseries = cmd.getTimeseries()) {
@@ -245,19 +337,10 @@ public:
             }
 
             if (cmd.getExpireAfterSeconds()) {
-                if (feature_flags::gClusteredIndexes.isEnabled(
-                        serverGlobalParams.featureCompatibility)) {
-                    uassert(ErrorCodes::InvalidOptions,
-                            "'expireAfterSeconds' is only supported on time-series collections or "
-                            "when the 'clusteredIndex' option is specified",
-                            cmd.getTimeseries() || cmd.getClusteredIndex());
-                } else {
-                    uassert(ErrorCodes::InvalidOptions,
-                            "'expireAfterSeconds' is only supported on time-series collections",
-                            cmd.getTimeseries() ||
-                                (cmd.getClusteredIndex() &&
-                                 cmd.getNamespace().isTimeseriesBucketsCollection()));
-                }
+                uassert(ErrorCodes::InvalidOptions,
+                        "'expireAfterSeconds' is only supported on time-series collections or "
+                        "when the 'clusteredIndex' option is specified",
+                        cmd.getTimeseries() || cmd.getClusteredIndex());
             }
 
             // Validate _id index spec and fill in missing fields.
@@ -308,26 +391,32 @@ public:
                 cmd.setIdIndex(idIndexSpec);
             }
 
-            const auto isChangeStreamPreAndPostImagesEnabled =
-                (cmd.getChangeStreamPreAndPostImages() &&
-                 cmd.getChangeStreamPreAndPostImages()->getEnabled());
-
-            if (feature_flags::gFeatureFlagChangeStreamPreAndPostImages.isEnabled(
-                    serverGlobalParams.featureCompatibility)) {
-                const auto isRecordPreImagesEnabled = cmd.getRecordPreImages().get_value_or(false);
+            if (cmd.getValidator() || cmd.getValidationLevel() || cmd.getValidationAction()) {
+                // Check for config.settings in the user command since a validator is allowed
+                // internally on this collection but the user may not modify the validator.
                 uassert(ErrorCodes::InvalidOptions,
-                        "'recordPreImages' and 'changeStreamPreAndPostImages.enabled' can not be "
-                        "set to true simultaneously",
-                        !(isChangeStreamPreAndPostImagesEnabled && isRecordPreImagesEnabled));
-            } else {
-                uassert(ErrorCodes::InvalidOptions,
-                        "BSON field 'changeStreamPreAndPostImages' is an unknown field.",
-                        !cmd.getChangeStreamPreAndPostImages().has_value());
+                        str::stream()
+                            << "Document validators not allowed on system collection " << ns(),
+                        ns() != NamespaceString::kConfigSettingsNamespace);
             }
 
             OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
                 unsafeCreateCollection(opCtx);
-            uassertStatusOK(createCollection(opCtx, cmd.getNamespace(), cmd));
+
+            const auto createStatus = createCollection(opCtx, cmd);
+            // NamespaceExists will cause multi-document transactions to implicitly abort, so
+            // in that case we should surface the error to the client. Otherwise, return success
+            // if a collection with identical options already exists.
+            if (createStatus == ErrorCodes::NamespaceExists &&
+                !opCtx->inMultiDocumentTransaction()) {
+                checkCollectionOptions(opCtx,
+                                       createStatus,
+                                       cmd.getNamespace(),
+                                       CollectionOptions::fromCreateCommand(cmd));
+            } else {
+                uassertStatusOK(createStatus);
+            }
+
             return reply;
         }
     };

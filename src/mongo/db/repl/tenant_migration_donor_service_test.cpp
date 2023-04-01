@@ -27,15 +27,15 @@
  *    it in the license file.
  */
 
-#include <boost/optional/optional_io.hpp>
 #include <fstream>
 #include <memory>
 
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/client/replica_set_monitor_protocol_test_util.h"
 #include "mongo/config.h"
-#include "mongo/db/op_observer_impl.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/op_observer/oplog_writer_mock.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/repl/primary_only_service_op_observer.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
@@ -60,11 +60,6 @@ class TenantMigrationDonorServiceTest : public ServiceContextMongoDTest {
         ServiceContextMongoDTest::setUp();
         auto serviceContext = getServiceContext();
 
-        // Set up clocks.
-        serviceContext->setFastClockSource(std::make_unique<SharedClockSourceAdapter>(_clkSource));
-        serviceContext->setPreciseClockSource(
-            std::make_unique<SharedClockSourceAdapter>(_clkSource));
-
         WaitForMajorityService::get(getServiceContext()).startup(getServiceContext());
 
         {
@@ -77,7 +72,8 @@ class TenantMigrationDonorServiceTest : public ServiceContextMongoDTest {
             // ReplClientInfo.
             OpObserverRegistry* opObserverRegistry =
                 dynamic_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
-            opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
+            opObserverRegistry->addObserver(
+                std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterMock>()));
             opObserverRegistry->addObserver(
                 std::make_unique<PrimaryOnlyServiceOpObserver>(serviceContext));
 
@@ -130,9 +126,11 @@ class TenantMigrationDonorServiceTest : public ServiceContextMongoDTest {
     }
 
 protected:
+    TenantMigrationDonorServiceTest() : ServiceContextMongoDTest(Options{}.useMockClock(true)) {}
+
     PrimaryOnlyServiceRegistry* _registry;
     PrimaryOnlyService* _service;
-    std::shared_ptr<ClockSourceMock> _clkSource = std::make_shared<ClockSourceMock>();
+    ClockSourceMock _clkSource;
     long long _term = 0;
 
     const TenantMigrationPEMPayload kDonorPEMPayload = [&] {
@@ -170,19 +168,19 @@ protected:
 
 TEST_F(TenantMigrationDonorServiceTest, CheckSettingMigrationStartDate) {
     // Advance the clock by some arbitrary amount of time so we are not starting at 0 seconds.
-    _clkSource->advance(Milliseconds(10000));
+    _clkSource.advance(Milliseconds(10000));
 
     auto taskFp =
         globalFailPointRegistry().find("pauseTenantMigrationAfterPersistingInitialDonorStateDoc");
     auto initialTimesEntered = taskFp->setMode(FailPoint::alwaysOn);
 
     const UUID migrationUUID = UUID::gen();
-
+    const TenantId kTenantId = TenantId(OID::gen());
     TenantMigrationDonorDocument initialStateDocument(
         migrationUUID,
         "donor-rs/localhost:12345",
         ReadPreferenceSetting(ReadPreference::PrimaryOnly, TagSet::primaryOnly()),
-        "tenantA");
+        kTenantId.toString());
     initialStateDocument.setProtocol(MigrationProtocolEnum::kMultitenantMigrations);
     initialStateDocument.setDonorCertificateForRecipient(kDonorPEMPayload);
     initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);

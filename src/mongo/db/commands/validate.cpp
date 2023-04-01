@@ -27,19 +27,26 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/testing_proctor.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
@@ -54,12 +61,85 @@ Mutex _validationMutex;
 // Holds the set of full `databaseName.collectionName` namespace strings in progress. Validation
 // commands register themselves in this data structure so that subsequent commands on the same
 // namespace will wait rather than run in parallel.
-std::set<std::string> _validationsInProgress;
+std::set<NamespaceString> _validationsInProgress;
 
 // This is waited upon if there is found to already be a validation command running on the targeted
 // namespace, as _validationsInProgress would indicate. This is signaled when a validation command
 // finishes on any namespace.
 stdx::condition_variable _validationNotifier;
+
+/**
+ * Creates an aggregation command with a $collStats pipeline that fetches 'storageStats' and
+ * 'count'.
+ */
+BSONObj makeCollStatsCommand(StringData collectionNameOnly) {
+    BSONArrayBuilder pipelineBuilder;
+    pipelineBuilder << BSON("$collStats"
+                            << BSON("storageStats" << BSONObj() << "count" << BSONObj()));
+    return BSON("aggregate" << collectionNameOnly << "pipeline" << pipelineBuilder.arr() << "cursor"
+                            << BSONObj());
+}
+
+/**
+ * $collStats never returns more than a single document. If that ever changes in future, validate
+ * must invariant so that the handling can be updated, but only invariant in testing environments,
+ * never invariant because of debug logging in production situations.
+ */
+void verifyCommandResponse(const BSONObj& collStatsResult) {
+    if (TestingProctor::instance().isEnabled()) {
+        invariant(
+            !collStatsResult.getObjectField("cursor").isEmpty() &&
+                !collStatsResult.getObjectField("cursor").getObjectField("firstBatch").isEmpty(),
+            str::stream() << "Expected a cursor to be present in the $collStats results: "
+                          << collStatsResult.toString());
+        invariant(collStatsResult.getObjectField("cursor").getIntField("id") == 0,
+                  str::stream() << "Expected cursor ID to be 0: " << collStatsResult.toString());
+    } else {
+        uassert(
+            7463202,
+            str::stream() << "Expected a cursor to be present in the $collStats results: "
+                          << collStatsResult.toString(),
+            !collStatsResult.getObjectField("cursor").isEmpty() &&
+                !collStatsResult.getObjectField("cursor").getObjectField("firstBatch").isEmpty());
+        uassert(7463203,
+                str::stream() << "Expected cursor ID to be 0: " << collStatsResult.toString(),
+                collStatsResult.getObjectField("cursor").getIntField("id") == 0);
+    }
+}
+
+/**
+ * Log the $collStats results for 'nss' to provide additional debug information for validation
+ * failures.
+ */
+void logCollStats(OperationContext* opCtx, const NamespaceString& nss) {
+    DBDirectClient client(opCtx);
+
+    BSONObj collStatsResult;
+    try {
+        // Run $collStats via aggregation.
+        client.runCommand(nss.dbName() /* DatabaseName */,
+                          makeCollStatsCommand(nss.coll()),
+                          collStatsResult /* command return results */);
+        // Logging $collStats information is best effort. If the collection doesn't exist, for
+        // example, then the $collStats query will fail and the failure reason will be logged.
+        uassertStatusOK(getStatusFromWriteCommandReply(collStatsResult));
+        verifyCommandResponse(collStatsResult);
+
+        LOGV2_OPTIONS(7463200,
+                      logv2::LogTruncation::Disabled,
+                      "Corrupt namespace $collStats results",
+                      logAttrs(nss),
+                      "collStats"_attr =
+                          collStatsResult.getObjectField("cursor").getObjectField("firstBatch"));
+    } catch (const DBException& ex) {
+        // Catch the error so that the validate error does not get overwritten by the attempt to add
+        // debug logging.
+        LOGV2_WARNING(7463201,
+                      "Failed to fetch $collStats for validation error",
+                      logAttrs(nss),
+                      "error"_attr = ex.toStatus());
+    }
+}
 
 }  // namespace
 
@@ -69,6 +149,8 @@ stdx::condition_variable _validationNotifier;
  *       validate: "collectionNameWithoutTheDBPart",
  *       full: <bool>  // If true, a more thorough (and slower) collection validation is performed.
  *       background: <bool>  // If true, performs validation on the checkpoint of the collection.
+ *       checkBSONConformance: <bool> // If true, validates BSON documents more thoroughly.
+ *       metadata: <bool>  // If true, performs a faster validation only on metadata.
  *   }
  */
 class ValidateCmd : public BasicCommand {
@@ -80,12 +162,15 @@ public:
     }
 
     std::string help() const override {
-        return str::stream() << "Validate contents of a namespace by scanning its data structures "
-                             << "for correctness.\nThis is a slow operation.\n"
-                             << "\tAdd {full: true} option to do a more thorough check.\n"
-                             << "\tAdd {background: true} to validate in the background.\n"
-                             << "\tAdd {repair: true} to run repair mode.\n"
-                             << "Cannot specify both {full: true, background: true}.";
+        return str::stream()
+            << "Validate contents of a namespace by scanning its data structures "
+            << "for correctness.\nThis is a slow operation.\n"
+            << "\tAdd {full: true} option to do a more thorough check.\n"
+            << "\tAdd {background: true} to validate in the background.\n"
+            << "\tAdd {repair: true} to run repair mode.\n"
+            << "\tAdd {checkBSONConformance: true} to validate BSON documents more thoroughly.\n"
+            << "\tAdd {metadata: true} to only check collection metadata.\n"
+            << "Cannot specify both {full: true, background: true}.";
     }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -104,16 +189,24 @@ public:
         return false;
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        ActionSet actions;
-        actions.addAction(ActionType::validate);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::validate)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         if (MONGO_unlikely(validateCmdCollectionNotValid.shouldFail())) {
@@ -121,17 +214,9 @@ public:
             return true;
         }
 
-        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
         bool background = cmdObj["background"].trueValue();
-
-        // Background validation is not supported on the ephemeralForTest storage engine due to its
-        // lack of support for timestamps. Switch the mode to foreground validation instead.
-        if (background && storageGlobalParams.engine == "ephemeralForTest") {
-            LOGV2(4775400,
-                  "ephemeralForTest does not support background validation, switching to "
-                  "foreground validation");
-            background = false;
-        }
+        bool logDiagnostics = cmdObj["logDiagnostics"].trueValue();
 
         const bool fullValidate = cmdObj["full"].trueValue();
         if (background && fullValidate) {
@@ -147,8 +232,24 @@ public:
                                     << " and { enforceFastCount: true } is not supported.");
         }
 
+        const auto rawcheckBSONConformance = cmdObj["checkBSONConformance"];
+        const bool checkBSONConformance = rawcheckBSONConformance.trueValue();
+        if (rawcheckBSONConformance &&
+            !feature_flags::gExtendValidateCommand.isEnabled(
+                serverGlobalParams.featureCompatibility)) {
+            uasserted(ErrorCodes::InvalidOptions,
+                      str::stream() << "The 'checkBSONConformance' option is not supported by the "
+                                       "validate command.");
+        }
+        if (rawcheckBSONConformance && !checkBSONConformance &&
+            (fullValidate || enforceFastCount)) {
+            uasserted(ErrorCodes::InvalidOptions,
+                      str::stream() << "Cannot explicitly set 'checkBSONConformance: false' with "
+                                       "full validation set.");
+        }
+
         const bool repair = cmdObj["repair"].trueValue();
-        if (storageGlobalParams.readOnly && repair) {
+        if (opCtx->readOnly() && repair) {
             uasserted(ErrorCodes::InvalidOptions,
                       str::stream() << "Running the validate command with { repair: true } in"
                                     << " read-only mode is not supported.");
@@ -164,6 +265,12 @@ public:
                           << "Running the validate command with both { enforceFastCount: true }"
                           << " and { repair: true } is not supported.");
         }
+        if (checkBSONConformance && repair) {
+            uasserted(ErrorCodes::InvalidOptions,
+                      str::stream()
+                          << "Running the validate command with both { checkBSONConformance: true }"
+                          << " and { repair: true } is not supported.");
+        }
         repl::ReplicationCoordinator* replCoord = repl::ReplicationCoordinator::get(opCtx);
         if (repair && replCoord->isReplEnabled()) {
             uasserted(ErrorCodes::InvalidOptions,
@@ -173,7 +280,8 @@ public:
         }
 
         const bool metadata = cmdObj["metadata"].trueValue();
-        if (metadata && (background || fullValidate || enforceFastCount || repair)) {
+        if (metadata &&
+            (background || fullValidate || enforceFastCount || checkBSONConformance || repair)) {
             uasserted(ErrorCodes::InvalidOptions,
                       str::stream() << "Running the validate command with { metadata: true } is not"
                                     << " supported with any other options");
@@ -182,10 +290,11 @@ public:
         if (!serverGlobalParams.quiet.load()) {
             LOGV2(20514,
                   "CMD: validate",
-                  "namespace"_attr = nss,
+                  logAttrs(nss),
                   "background"_attr = background,
                   "full"_attr = fullValidate,
                   "enforceFastCount"_attr = enforceFastCount,
+                  "checkBSONConformance"_attr = checkBSONConformance,
                   "repair"_attr = repair);
         }
 
@@ -194,7 +303,7 @@ public:
             stdx::unique_lock<Latch> lock(_validationMutex);
             try {
                 opCtx->waitForConditionOrInterrupt(_validationNotifier, lock, [&] {
-                    return _validationsInProgress.find(nss.ns()) == _validationsInProgress.end();
+                    return _validationsInProgress.find(nss) == _validationsInProgress.end();
                 });
             } catch (AssertionException& e) {
                 CommandHelpers::appendCommandStatusNoThrow(
@@ -204,34 +313,45 @@ public:
                 return false;
             }
 
-            _validationsInProgress.insert(nss.ns());
+            _validationsInProgress.insert(nss);
         }
 
         ON_BLOCK_EXIT([&] {
             stdx::lock_guard<Latch> lock(_validationMutex);
-            _validationsInProgress.erase(nss.ns());
+            _validationsInProgress.erase(nss);
             _validationNotifier.notify_all();
         });
 
         auto mode = [&] {
-            if (metadata)
+            if (metadata) {
                 return CollectionValidation::ValidateMode::kMetadata;
-            if (background)
+            }
+            if (background) {
+                if (checkBSONConformance) {
+                    return CollectionValidation::ValidateMode::kBackgroundCheckBSON;
+                }
                 return CollectionValidation::ValidateMode::kBackground;
-            if (enforceFastCount)
+            }
+            if (enforceFastCount) {
                 return CollectionValidation::ValidateMode::kForegroundFullEnforceFastCount;
-            if (fullValidate)
+            }
+            if (fullValidate) {
                 return CollectionValidation::ValidateMode::kForegroundFull;
+            }
+            if (checkBSONConformance) {
+                return CollectionValidation::ValidateMode::kForegroundCheckBSON;
+            }
             return CollectionValidation::ValidateMode::kForeground;
         }();
 
         auto repairMode = [&] {
-            if (storageGlobalParams.readOnly) {
+            if (opCtx->readOnly()) {
                 // On read-only mode we can't make any adjustments.
                 return CollectionValidation::RepairMode::kNone;
             }
             switch (mode) {
                 case CollectionValidation::ValidateMode::kForeground:
+                case CollectionValidation::ValidateMode::kForegroundCheckBSON:
                 case CollectionValidation::ValidateMode::kForegroundFull:
                 case CollectionValidation::ValidateMode::kForegroundFullIndexOnly:
                     // Foreground validation may not repair data while running as a replica set node
@@ -255,8 +375,8 @@ public:
         }
 
         ValidateResults validateResults;
-        Status status =
-            CollectionValidation::validate(opCtx, nss, mode, repairMode, &validateResults, &result);
+        Status status = CollectionValidation::validate(
+            opCtx, nss, mode, repairMode, &validateResults, &result, logDiagnostics);
         if (!status.isOK()) {
             return CommandHelpers::appendCommandStatusNoThrow(result, status);
         }
@@ -267,6 +387,7 @@ public:
             result.append("advice",
                           "A corrupt namespace has been detected. See "
                           "http://dochub.mongodb.org/core/data-recovery for recovery steps.");
+            logCollStats(opCtx, nss);
         }
 
         return true;

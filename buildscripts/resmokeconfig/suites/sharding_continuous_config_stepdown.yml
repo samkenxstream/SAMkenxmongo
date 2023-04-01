@@ -11,6 +11,12 @@ selector:
   - jstests/sharding/query/*[aA]uth*.js
   - jstests/sharding/change_streams/*[aA]uth*.js
   - jstests/sharding/internal_txns/internal_client_restrictions.js
+  - jstests/sharding/internal_txns/non_retryable_writes_during_migration.js
+  - jstests/sharding/internal_txns/retry_on_transient_error_validation.js
+  - jstests/sharding/internal_txns/retryable_findAndModify_during_migration_oplog.js
+  - jstests/sharding/internal_txns/retryable_findAndModify_during_migration_side_coll.js
+  - jstests/sharding/internal_txns/retryable_writes_aborted_during_migration.js
+  - jstests/sharding/internal_txns/retryable_writes_committed_during_migration.js
 
   - jstests/sharding/localhostAuthBypass.js
   - jstests/sharding/kill_sessions.js
@@ -22,17 +28,13 @@ selector:
   # Count/write/aggregate commands against the config shard do not support retries yet
   - jstests/sharding/addshard1.js
   - jstests/sharding/addshard2.js
-  - jstests/sharding/autosplit.js
-  - jstests/sharding/auto_rebalance_parallel.js
   - jstests/sharding/basic_merge.js
   - jstests/sharding/count1.js
   - jstests/sharding/count2.js
   - jstests/sharding/query/current_op_with_drop_shard.js
   - jstests/sharding/cursor1.js
   - jstests/sharding/diffservers1.js
-  - jstests/sharding/disable_autosplit.js
   - jstests/sharding/findandmodify1.js
-  - jstests/sharding/findandmodify_autosplit.js
   - jstests/sharding/query/geo_near_sharded.js
   - jstests/sharding/hash_basic.js
   - jstests/sharding/hash_shard1.js
@@ -45,12 +47,10 @@ selector:
   - jstests/sharding/limit_push.js
   - jstests/sharding/merge_with_drop_shard.js
   - jstests/sharding/merge_with_move_primary.js
-  - jstests/sharding/migrateBig_balancer.js
   - jstests/sharding/move_chunk_basic.js
   - jstests/sharding/movePrimary1.js
   - jstests/sharding/names.js
   - jstests/sharding/prefix_shard_key.js
-  - jstests/sharding/presplit.js
   - jstests/sharding/query_config.js
   - jstests/sharding/range_deleter_interacts_correctly_with_refine_shard_key.js
   - jstests/sharding/remove1.js
@@ -58,14 +58,7 @@ selector:
   - jstests/sharding/shard2.js
   - jstests/sharding/shard3.js
   - jstests/sharding/shard_collection_basic.js
-  - jstests/sharding/shard_existing_coll_chunk_count.js
-  - jstests/sharding/sharding_balance1.js
-  - jstests/sharding/sharding_balance2.js
-  - jstests/sharding/sharding_balance3.js
-  - jstests/sharding/sharding_balance4.js
-  - jstests/sharding/sharding_migrate_cursor1.js
   - jstests/sharding/tag_range.js
-  - jstests/sharding/top_chunk_autosplit.js
   - jstests/sharding/count_config_servers.js
   - jstests/sharding/split_large_key.js
   - jstests/sharding/balancer_window.js
@@ -78,6 +71,7 @@ selector:
   - jstests/sharding/printShardingStatus.js
   - jstests/sharding/refresh_sessions.js
   - jstests/sharding/shard_collection_existing_zones.js
+  - jstests/sharding/catalog_shard_mongos_ops_on_config_and_admin.js
   # Balancer writes (direct write to config database with no retries)
   - jstests/sharding/convert_to_and_from_sharded.js
   - jstests/sharding/remove2.js
@@ -88,6 +82,11 @@ selector:
   - jstests/sharding/sharding_rs1.js
   - jstests/sharding/move_primary_fails_without_database_version.js
   # Calls the config server primary directly (not through mongos)
+  - jstests/sharding/analyze_shard_key/configure_query_analyzer_basic.js
+  - jstests/sharding/analyze_shard_key/persist_sampled_diffs.js
+  - jstests/sharding/analyze_shard_key/persist_sampled_read_queries.js
+  - jstests/sharding/analyze_shard_key/persist_sampled_write_queries.js
+  - jstests/sharding/analyze_shard_key/refresh_sample_rates.js
   - jstests/sharding/configsvr_metadata_commands_require_majority_write_concern.js
   - jstests/sharding/min_optime_recovery_on_successful_move_chunk_commit.js
   - jstests/sharding/read_after_optime.js
@@ -113,7 +112,6 @@ selector:
   # Runs setShardVersion/getShardVersion against the config server and we don't support retries
   # for this command
   - jstests/sharding/major_version_check.js
-  - jstests/sharding/ssv_config_check.js
   # Runs replSetGetStatus -- via awaitLastOpCommitted -- directly against the config server:
   # retries aren't supported.
   - jstests/sharding/coll_epoch_test1.js
@@ -163,11 +161,9 @@ selector:
   # Test expects a specific chunk distribution after shardCollection and it can be broken when
   # a step down occurs.
   - jstests/sharding/regex_targeting.js
-  # Sets a failpoint on a config server secondary.
-  - jstests/sharding/shards_and_config_return_last_committed_optime.js
   # Calls movePrimary after data has been inserted into an unsharded collection, so will fail if
   # a stepdown causes the command to be sent again.
-  - jstests/sharding/move_primary_clone_test.js
+  - jstests/sharding/move_primary_clone.js
   - jstests/sharding/mongos_validate_writes.js
   - jstests/sharding/movePrimary1.js
   # Asserts that the _flushDatabaseCacheUpdates at the end of _configsvrCreateDatabase is sent, but
@@ -206,6 +202,8 @@ selector:
   # Runs commands directly on the config server primary and is not robust to the primary changing.
   - jstests/sharding/read_write_concern_defaults_commands_api.js
   - jstests/sharding/read_write_concern_defaults_propagation.js
+  - jstests/sharding/live_shard_startup_recovery_config_server.js
+  - jstests/sharding/live_shard_logical_initial_sync_config_server.js
 
   # On stepdown there is not gurantee that changelog entries have been inserted [SERVER-45655]
   - jstests/sharding/refine_collection_shard_key_changelog.js
@@ -232,6 +230,14 @@ selector:
 
   # SERVER-51805 splitChunk op is not idempotent
   - jstests/sharding/mongos_get_shard_version.js
+
+  # Expects reshardCollection executes without config server stepdown
+  - jstests/sharding/shard_encrypted_collection.js
+
+  # Runs commands against mongos which target the config server primary and may fail with
+  # FailedToSatisfyReadPreference when electing a new primary of the config server replica
+  # set takes a while.
+  - jstests/sharding/move_chunk_respects_maxtimems.js
 
   exclude_with_any_tags:
   - does_not_support_stepdowns

@@ -27,27 +27,42 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/ops/parsed_delete.h"
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_operation_source.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/matcher/expression_algo.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/ops/delete_request_gen.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
+
+
 namespace mongo {
 
-ParsedDelete::ParsedDelete(OperationContext* opCtx, const DeleteRequest* request)
-    : _opCtx(opCtx), _request(request) {}
+ParsedDelete::ParsedDelete(OperationContext* opCtx,
+                           const DeleteRequest* request,
+                           boost::optional<TimeseriesOptions> timeseriesOptions)
+    : _opCtx(opCtx), _request(request) {
+    if (feature_flags::gTimeseriesDeletesSupport.isEnabled(
+            serverGlobalParams.featureCompatibility) &&
+        timeseriesOptions) {
+        _timeseriesDeleteDetails = std::make_unique<TimeseriesDeleteDetails>(*timeseriesOptions);
+    }
+}
 
 Status ParsedDelete::parseRequest() {
     dassert(!_canonicalQuery.get());
@@ -75,7 +90,8 @@ Status ParsedDelete::parseRequest() {
                                                 _request->getLegacyRuntimeConstants(),
                                                 _request->getLet());
 
-    if (CanonicalQuery::isSimpleIdQuery(_request->getQuery())) {
+    // The '_id' field of a time-series collection needs to be handled as other fields.
+    if (CanonicalQuery::isSimpleIdQuery(_request->getQuery()) && !_timeseriesDeleteDetails) {
         return Status::OK();
     }
 
@@ -83,15 +99,66 @@ Status ParsedDelete::parseRequest() {
     return parseQueryToCQ();
 }
 
+Status ParsedDelete::splitOutBucketMatchExpression(const ExtensionsCallback& extensionsCallback) {
+    tassert(7307300,
+            "Can split out the bucket-level match expression only for timeseries deletes",
+            _timeseriesDeleteDetails);
+
+    auto& details = _timeseriesDeleteDetails;
+    const auto& timeseriesOptions = details->_timeseriesOptions;
+
+    auto swMatchExpr =
+        MatchExpressionParser::parse(_request->getQuery(),
+                                     _expCtx,
+                                     extensionsCallback,
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
+    if (!swMatchExpr.isOK()) {
+        return swMatchExpr.getStatus();
+    }
+
+    if (auto optMetaField = timeseriesOptions.getMetaField()) {
+        auto metaField = optMetaField->toString();
+        std::tie(details->_bucketMatchExpr, details->_residualExpr) =
+            expression::splitMatchExpressionBy(
+                swMatchExpr.getValue()->clone(),
+                {metaField},
+                {{metaField, timeseries::kBucketMetaFieldName.toString()}},
+                expression::isOnlyDependentOn);
+    } else {
+        // The '_residualExpr' becomes the same as the original query predicate because nothing is
+        // to be split out if there is no meta field in the timeseries collection.
+        details->_residualExpr = swMatchExpr.getValue()->clone();
+    }
+
+    return Status::OK();
+}
+
 Status ParsedDelete::parseQueryToCQ() {
     dassert(!_canonicalQuery.get());
 
     const ExtensionsCallbackReal extensionsCallback(_opCtx, &_request->getNsString());
 
+    // If we're deleting documents from a time-series collection, splits the match expression into
+    // a bucket-level match expression and a residual expression so that we can push down the
+    // bucket-level match expression to the system bucket collection scan or fetch.
+    if (_timeseriesDeleteDetails) {
+        if (auto status = splitOutBucketMatchExpression(extensionsCallback); !status.isOK()) {
+            return status;
+        }
+    }
+
     // The projection needs to be applied after the delete operation, so we do not specify a
     // projection during canonicalization.
     auto findCommand = std::make_unique<FindCommandRequest>(_request->getNsString());
-    findCommand->setFilter(_request->getQuery().getOwned());
+    if (_timeseriesDeleteDetails) {
+        // Only sets the filter if the query predicate has bucket match components.
+        if (_timeseriesDeleteDetails->_bucketMatchExpr) {
+            findCommand->setFilter(
+                _timeseriesDeleteDetails->_bucketMatchExpr->serialize().getOwned());
+        }
+    } else {
+        findCommand->setFilter(_request->getQuery().getOwned());
+    }
     findCommand->setSort(_request->getSort().getOwned());
     findCommand->setCollation(_request->getCollation().getOwned());
     findCommand->setHint(_request->getHint());
@@ -103,6 +170,13 @@ Status ParsedDelete::parseQueryToCQ() {
     // has not actually deleted a document. This behavior is fine for findAndModify, but should
     // not apply to deletes in general.
     if (!_request->getMulti() && !_request->getSort().isEmpty()) {
+        // TODO: Due to the complexity which is related to the efficient sort support, we don't
+        // support yet findAndModify with a query and sort but it should not be impossible.
+        // This code assumes that in findAndModify code path, the parsed delete constructor should
+        // be called with source == kTimeseriesDelete for a time-series collection.
+        uassert(ErrorCodes::InvalidOptions,
+                "Cannot perform a findAndModify with a query and sort on a time-series collection.",
+                !_timeseriesDeleteDetails);
         findCommand->setLimit(1);
     }
 
@@ -143,6 +217,21 @@ bool ParsedDelete::hasParsedQuery() const {
 std::unique_ptr<CanonicalQuery> ParsedDelete::releaseParsedQuery() {
     invariant(_canonicalQuery.get() != nullptr);
     return std::move(_canonicalQuery);
+}
+
+void ParsedDelete::setCollator(std::unique_ptr<CollatorInterface> collator) {
+    if (_timeseriesDeleteDetails && _timeseriesDeleteDetails->_residualExpr) {
+        _timeseriesDeleteDetails->_residualExpr->setCollator(collator.get());
+    }
+    if (_canonicalQuery) {
+        _canonicalQuery->setCollator(std::move(collator));
+    } else {
+        _expCtx->setCollator(std::move(collator));
+    }
+}
+
+bool ParsedDelete::isEligibleForArbitraryTimeseriesDelete() const {
+    return _timeseriesDeleteDetails && (getResidualExpr() || !_request->getMulti());
 }
 
 }  // namespace mongo

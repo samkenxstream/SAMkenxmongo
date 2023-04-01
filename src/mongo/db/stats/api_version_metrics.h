@@ -52,15 +52,15 @@ public:
     APIVersionMetrics() = default;
 
     // Update the timestamp for the API version used by the application.
-    void update(std::string appName, const APIParameters& apiParams);
+    void update(const std::string& appName, const APIParameters& apiParams);
 
     void appendAPIVersionMetricsInfo(BSONObjBuilder* b);
 
     APIVersionMetricsMap getAPIVersionMetrics_forTest();
 
-private:
     class APIVersionMetricsSSM;
 
+private:
     void _removeStaleTimestamps(WithLock lk, Date_t now);
 
     mutable Mutex _mutex = MONGO_MAKE_LATCH("APIVersionMetrics::_mutex");

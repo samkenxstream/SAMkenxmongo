@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -45,6 +44,9 @@
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
@@ -77,7 +79,9 @@ TaskRunner::NextAction runSingleTask(const TaskRunner::Task& task,
 
 // static
 TaskRunner::Task TaskRunner::makeCancelTask() {
-    return [](OperationContext* opCtx, const Status& status) { return NextAction::kCancel; };
+    return [](OperationContext* opCtx, const Status& status) {
+        return NextAction::kCancel;
+    };
 }
 
 TaskRunner::TaskRunner(ThreadPool* threadPool)

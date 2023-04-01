@@ -39,7 +39,8 @@ namespace mongo {
  */
 class ChangeStreamEventTransformation {
 public:
-    ChangeStreamEventTransformation(const DocumentSourceChangeStreamSpec& spec);
+    ChangeStreamEventTransformation(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                    const DocumentSourceChangeStreamSpec& spec);
 
     virtual ~ChangeStreamEventTransformation() {}
 
@@ -54,7 +55,17 @@ public:
     virtual std::set<std::string> getFieldNameDependencies() const = 0;
 
 protected:
+    // Construct a resume token for the specified event.
+    ResumeTokenData makeResumeToken(Value tsVal,
+                                    Value txnOpIndexVal,
+                                    Value uuidVal,
+                                    StringData operationType,
+                                    Value documentKey,
+                                    Value opDescription) const;
+
     const DocumentSourceChangeStreamSpec _changeStreamSpec;
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
+    ResumeTokenData _resumeToken;
 
     // Set to true if the pre-image should be included in the output documents.
     bool _preImageRequested = false;
@@ -68,14 +79,11 @@ protected:
  */
 class ChangeStreamDefaultEventTransformation final : public ChangeStreamEventTransformation {
 public:
-    ChangeStreamDefaultEventTransformation(const DocumentSourceChangeStreamSpec& spec);
+    ChangeStreamDefaultEventTransformation(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                           const DocumentSourceChangeStreamSpec& spec);
 
     Document applyTransformation(const Document& fromDoc) const override;
     std::set<std::string> getFieldNameDependencies() const override;
-
-private:
-    // Records the documentKey fields from the client's resume token, if present.
-    boost::optional<std::pair<UUID, std::vector<FieldPath>>> _documentKeyCache;
 };
 
 /**
@@ -83,8 +91,9 @@ private:
  */
 class ChangeStreamViewDefinitionEventTransformation final : public ChangeStreamEventTransformation {
 public:
-    ChangeStreamViewDefinitionEventTransformation(const DocumentSourceChangeStreamSpec& spec)
-        : ChangeStreamEventTransformation(spec) {}
+    ChangeStreamViewDefinitionEventTransformation(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const DocumentSourceChangeStreamSpec& spec);
 
     Document applyTransformation(const Document& fromDoc) const override;
 

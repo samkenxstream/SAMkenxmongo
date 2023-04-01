@@ -11,7 +11,6 @@
 
 load("jstests/aggregation/extras/utils.js");  // for arrayEq
 load("jstests/libs/discover_topology.js");    // For findDataBearingNodes.
-load("jstests/libs/sbe_util.js");             // For checkSBEEnabled.
 
 function runTests(withDefaultCollationColl, withoutDefaultCollationColl, collation) {
     // Test that the $lookup stage respects the inherited collation.
@@ -553,28 +552,12 @@ function runTests(withDefaultCollationColl, withoutDefaultCollationColl, collati
 
 const st = new ShardingTest({shards: 2});
 
-const getShardedLookupParam = st.s.adminCommand({getParameter: 1, featureFlagShardedLookup: 1});
-const isShardedLookupEnabled = getShardedLookupParam.hasOwnProperty("featureFlagShardedLookup") &&
-    getShardedLookupParam.featureFlagShardedLookup.value;
-
-if (!isShardedLookupEnabled) {
-    st.stop();
-    return;
-}
-
 const testName = "collation_lookup";
 const caseInsensitive = {
     collation: {locale: "en_US", strength: 2}
 };
 
 const mongosDB = st.s0.getDB(testName);
-
-// TODO SERVER-64482 Reenable this test when SERVER-64482 is done.
-if (checkSBEEnabled(mongosDB, ["featureFlagSBELookupPushdown"])) {
-    jsTestLog("Skipping test because SBE and SBE $lookup features are both enabled.");
-    st.stop();
-    return;
-}
 
 const withDefaultCollationColl = mongosDB[testName + "_with_default"];
 const withoutDefaultCollationColl = mongosDB[testName + "_without_default"];

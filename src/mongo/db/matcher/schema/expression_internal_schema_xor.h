@@ -56,10 +56,10 @@ public:
 
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
-    virtual std::unique_ptr<MatchExpression> shallowClone() const {
+    virtual std::unique_ptr<MatchExpression> clone() const {
         auto xorCopy = std::make_unique<InternalSchemaXorMatchExpression>(_errorAnnotation);
         for (size_t i = 0; i < numChildren(); ++i) {
-            xorCopy->add(getChild(i)->shallowClone());
+            xorCopy->add(getChild(i)->clone());
         }
         if (getTag()) {
             xorCopy->setTag(getTag()->clone());
@@ -69,7 +69,7 @@ public:
 
     void debugString(StringBuilder& debug, int indentationLevel = 0) const final;
 
-    void serialize(BSONObjBuilder* out, bool includePath) const final;
+    void serialize(BSONObjBuilder* out, SerializationOptions opts) const final;
 
     void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
         visitor->visit(this);

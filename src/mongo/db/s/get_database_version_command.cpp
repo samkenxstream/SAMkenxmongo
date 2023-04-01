@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -40,6 +39,9 @@
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/s/request_types/get_database_version_gen.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -60,7 +62,8 @@ public:
         // The command parameter happens to be string so it's historically been interpreted
         // by parseNs as a collection. Continuing to do so here for unexamined compatibility.
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), _targetDb());
+            return NamespaceStringUtil::parseNamespaceFromRequest(request().getDbName(),
+                                                                  _targetDb());
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
@@ -75,14 +78,15 @@ public:
         void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
             uassert(ErrorCodes::IllegalOperation,
                     str::stream() << definition()->getName() << " can only be run on shard servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
+
+            DatabaseName dbName(boost::none, _targetDb());
+            AutoGetDb autoDb(opCtx, dbName, MODE_IS);
+            const auto scopedDss =
+                DatabaseShardingState::assertDbLockedAndAcquireShared(opCtx, dbName);
+
             BSONObj versionObj;
-            AutoGetDb autoDb(opCtx, _targetDb(), MODE_IS);
-
-            const auto dss = DatabaseShardingState::get(opCtx, _targetDb());
-            auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
-
-            if (auto dbVersion = dss->getDbVersion(opCtx, dssLock)) {
+            if (const auto dbVersion = scopedDss->getDbVersion(opCtx)) {
                 versionObj = dbVersion->toBSON();
             }
             result->getBodyBuilder().append("dbVersion", versionObj);

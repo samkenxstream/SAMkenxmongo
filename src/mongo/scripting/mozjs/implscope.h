@@ -30,8 +30,9 @@
 #pragma once
 
 #include <jsapi.h>
+#include <jsfriendapi.h>
+#include <mongo/scripting/mozjs/freeOpToJSContext.h>
 #include <vm/PosixNSPR.h>
-
 
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/scripting/mozjs/bindata.h"
@@ -47,12 +48,12 @@
 #include "mongo/scripting/mozjs/dbref.h"
 #include "mongo/scripting/mozjs/engine.h"
 #include "mongo/scripting/mozjs/error.h"
-#include "mongo/scripting/mozjs/freeOpToJSContext.h"
 #include "mongo/scripting/mozjs/global.h"
 #include "mongo/scripting/mozjs/internedstring.h"
 #include "mongo/scripting/mozjs/jsthread.h"
 #include "mongo/scripting/mozjs/maxkey.h"
 #include "mongo/scripting/mozjs/minkey.h"
+#include "mongo/scripting/mozjs/module_loader.h"
 #include "mongo/scripting/mozjs/mongo.h"
 #include "mongo/scripting/mozjs/mongohelpers.h"
 #include "mongo/scripting/mozjs/nativefunction.h"
@@ -320,6 +321,7 @@ public:
         return _globalProto;
     }
 
+    static const char* const kInteractiveShellName;
     static const char* const kExecResult;
     static const char* const kInvokeResult;
 
@@ -369,6 +371,8 @@ public:
 
     void setStatus(Status status);
 
+    ModuleLoader* getModuleLoader() const;
+
 private:
     template <typename ImplScopeFunction>
     auto _runSafely(ImplScopeFunction&& functionToRun) -> decltype(functionToRun());
@@ -410,6 +414,20 @@ private:
 
     void setCompileOptions(JS::CompileOptions* co);
 
+    static bool onSyncPromiseResolved(JSContext* cx, unsigned argc, JS::Value* vp);
+    static bool onSyncPromiseRejected(JSContext* cx, unsigned argc, JS::Value* vp);
+    static bool awaitPromise(JSContext* cx, JS::HandleObject promise, JS::MutableHandleValue out);
+
+    // SpiderMonkey requires that an environment preparer is installed in order to dynamically load
+    // modules.
+    struct EnvironmentPreparer final : public js::ScriptEnvironmentPreparer {
+        JSContext* _context;
+        explicit EnvironmentPreparer(JSContext* cx) : _context(cx) {
+            js::SetScriptEnvironmentPreparer(cx, this);
+        }
+        void invoke(JS::HandleObject global, Closure& closure) override;
+    };
+
     ASANHandles _asanHandles;
     MozJSScriptEngine* _engine;
     MozRuntime _mr;
@@ -436,6 +454,10 @@ private:
     bool _hasOutOfMemoryException;
 
     bool _inReportError;
+
+    std::unique_ptr<ModuleLoader> _moduleLoader;
+    std::unique_ptr<EnvironmentPreparer> _environmentPreparer;
+    boost::optional<JS::RootedValue> _promiseResult;
 
     WrapType<BinDataInfo> _binDataProto;
     WrapType<BSONInfo> _bsonProto;

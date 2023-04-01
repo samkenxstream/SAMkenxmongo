@@ -79,7 +79,8 @@ public:
      * string is not known. 'c' must either be NULL, or a pointer to a
      * null-terminated string.
      */
-    StringData(const char* str) : StringData(str, str ? std::strlen(str) : 0) {}
+    StringData(const char* str)
+        : StringData(str, (str != nullptr && str[0] != '\0') ? std::strlen(str) : 0) {}
 
     /**
      * Constructs a StringData, for the case of a std::string. We can

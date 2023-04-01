@@ -27,13 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/s/commands/cluster_command_test_fixture.h"
 #include "mongo/s/query/cluster_aggregate.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 namespace {
@@ -92,7 +94,7 @@ protected:
      */
     Status testRunAggregateEarlyExit(const BSONObj& inputBson) {
         BSONObjBuilder result;
-        NamespaceString nss{"a.collection"};
+        NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.collection");
         auto client = getServiceContext()->makeClient("ClusterCmdClient");
         auto opCtx = client->makeOperationContext();
         auto request = aggregation_request_helper::parseFromBSONForTests(nss, inputBson);

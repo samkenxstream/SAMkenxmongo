@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -38,6 +37,9 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
@@ -94,12 +96,12 @@ public:
                "node is the primary of a replica set, waits up to 'timeoutSecs' for an electable "
                "node to be caught up before stepping down. If 'force' is false and no electable "
                "node was able to catch up, does not shut down. If the node is in state SECONDARY "
-               "after the attempted stepdown, any remaining time in 'timeoutSecs' is used for "
+               "after the attempted stepdown, any remaining time in 'timeout' is used for "
                "quiesce mode, where the database continues to allow operations to run, but directs "
                "clients to route new operations to other replica set members.";
     }
 
-    static void beginShutdown(OperationContext* opCtx, bool force, long long timeoutSecs) {
+    static void beginShutdown(OperationContext* opCtx, bool force, Milliseconds timeout) {
         // This code may race with a new index build starting up. We may get 0 active index builds
         // from the IndexBuildsCoordinator shutdown to proceed, but there is nothing to prevent a
         // new index build from starting after that check.
@@ -113,7 +115,7 @@ public:
                     numIndexBuilds == 0U);
         }
 
-        uassertStatusOK(stepDownForShutdown(opCtx, Seconds(timeoutSecs), force));
+        uassertStatusOK(stepDownForShutdown(opCtx, timeout, force));
     }
 
 } cmdShutdownMongoD;

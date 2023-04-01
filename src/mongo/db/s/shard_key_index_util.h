@@ -67,12 +67,16 @@ private:
 
 /**
  * Returns true if the given index is compatible with the shard key pattern.
+ *
+ * If return value is false and errMsg is non-null, the reasons that the existing index is
+ * incompatible will be appended to errMsg.
  */
 bool isCompatibleWithShardKey(OperationContext* opCtx,
                               const CollectionPtr& collection,
                               const IndexCatalogEntry* indexEntry,
                               const BSONObj& shardKey,
-                              bool requireSingleKey);
+                              bool requireSingleKey,
+                              std::string* errMsg = nullptr);
 
 /**
  * Returns an index suitable for shard key range scans if it exists.
@@ -81,24 +85,24 @@ bool isCompatibleWithShardKey(OperationContext* opCtx,
  * - must be prefixed by 'shardKey', and
  * - must not be a partial index.
  * - must have the simple collation.
+ * - must not be hidden.
  *
  * If the parameter 'requireSingleKey' is true, then this index additionally must not be
  * multi-key.
  */
-const boost::optional<ShardKeyIndex> findShardKeyPrefixedIndex(OperationContext* opCtx,
-                                                               const CollectionPtr& collection,
-                                                               const IndexCatalog* indexCatalog,
-                                                               const BSONObj& shardKey,
-                                                               bool requireSingleKey);
+boost::optional<ShardKeyIndex> findShardKeyPrefixedIndex(OperationContext* opCtx,
+                                                         const CollectionPtr& collection,
+                                                         const BSONObj& shardKey,
+                                                         bool requireSingleKey,
+                                                         std::string* errMsg = nullptr);
 
 /**
- * Returns true if the given index name is the last remaining index that is compatible with the
- * shard key index.
+ * Returns true if the given index exists and it is the last non-hidden index compatible with the
+ * shard key. False otherwise.
  */
-bool isLastShardKeyIndex(OperationContext* opCtx,
-                         const CollectionPtr& collection,
-                         const IndexCatalog* indexCatalog,
-                         const std::string& indexName,
-                         const BSONObj& shardKey);
+bool isLastNonHiddenShardKeyIndex(OperationContext* opCtx,
+                                  const CollectionPtr& collection,
+                                  const std::string& indexName,
+                                  const BSONObj& shardKey);
 
 }  // namespace mongo

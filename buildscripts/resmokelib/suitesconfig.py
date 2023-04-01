@@ -3,13 +3,14 @@ import collections
 import os
 from threading import Lock
 from typing import Dict, List
+import buildscripts.resmokelib.logging.loggers as loggers
 
 import buildscripts.resmokelib.utils.filesystem as fs
 from buildscripts.resmokelib import config as _config
 from buildscripts.resmokelib import errors, utils
 from buildscripts.resmokelib.testing import suite as _suite
 from buildscripts.resmokelib.utils import load_yaml_file
-from buildscripts.resmokelib.utils.dictionary import merge_dicts
+from buildscripts.resmokelib.utils.dictionary import get_dict_value, merge_dicts, set_dict_value
 
 SuiteName = str
 
@@ -101,10 +102,20 @@ def get_suites(suite_names_or_paths, test_files):
     suites = []
     for suite_filename in suite_names_or_paths:
         suite_config = _get_suite_config(suite_filename)
+        suite = _suite.Suite(suite_filename, suite_config)
         if suite_roots:
             # Override the suite's default test files with those passed in from the command line.
-            suite_config.update(suite_roots)
-        suite = _suite.Suite(suite_filename, suite_config)
+            override_suite_config = suite_config.copy()
+            override_suite_config.update(suite_roots)
+            override_suite = _suite.Suite(suite_filename, override_suite_config)
+            for test in override_suite.tests:
+                if test in suite.excluded:
+                    if _config.FORCE_EXCLUDED_TESTS:
+                        loggers.ROOT_EXECUTOR_LOGGER.warning("Will forcibly run excluded test: %s",
+                                                             test)
+                    else:
+                        raise errors.ResmokeError(f"'{test}' excluded in '{suite.get_name()}'")
+            suite = override_suite
         suites.append(suite)
     return suites
 
@@ -226,19 +237,63 @@ class MatrixSuiteConfig(SuiteConfigInterface):
         base_suite_name = suite["base_suite"]
         suite_name = suite["suite_name"]
         override_names = suite.get("overrides", None)
+        excludes_names = suite.get("excludes", None)
+        eval_names = suite.get("eval", None)
+        description = suite.get("description")
 
         base_suite = ExplicitSuiteConfig.get_config_obj(base_suite_name)
 
         if base_suite is None:
-            # pylint: disable=too-many-format-args
-            raise ValueError("Unknown base suite %s for matrix suite %s".format(
-                base_suite_name, suite_name))
+            raise ValueError(f"Unknown base suite {base_suite_name} for matrix suite {suite_name}")
 
         res = base_suite.copy()
+        res['matrix_suite'] = True
+
+        if description:
+            res['description'] = description
 
         if override_names:
             for override_name in override_names:
                 merge_dicts(res, overrides[override_name])
+
+        if excludes_names:
+            for excludes_name in excludes_names:
+                excludes_dict = overrides[excludes_name]
+
+                for key in excludes_dict:
+                    if key not in ["exclude_with_any_tags", "exclude_files"]:
+                        raise ValueError(f"{excludes_name}  is not supported in the 'excludes' tag")
+                    value = excludes_dict[key]
+
+                    if not isinstance(value, list):
+                        raise ValueError(f"the {key} field must be a list")
+
+                    base_value = get_dict_value(res, ["selector", key])
+
+                    if base_value:
+                        base_value.extend(value)
+                        set_dict_value(res, ["selector", key], base_value)
+                    else:
+                        set_dict_value(res, ["selector", key], value)
+
+        if eval_names:
+            for eval_name in eval_names:
+                eval_dict = overrides[eval_name]
+                if len(eval_dict) != 1 or next(iter(eval_dict)) != "eval":
+                    raise ValueError("Root key but be 'eval' for the eval tag.")
+
+                value = eval_dict["eval"]
+
+                if not isinstance(value, str):
+                    raise ValueError("the eval field must be a list")
+
+                path = ["executor", "config", "shell_options", "eval"]
+                base_value = get_dict_value(res, path)
+
+                if base_value:
+                    set_dict_value(res, path, base_value + "; " + value)
+                else:
+                    set_dict_value(res, path, value)
 
         return res
 
@@ -265,7 +320,7 @@ class MatrixSuiteConfig(SuiteConfigInterface):
         all_matrix_suites = cls.get_all_mappings(suites_dir)
 
         if suite_name in all_matrix_suites.keys():
-            return all_matrix_suites[suite_name]  # pylint: disable=unsubscriptable-object
+            return all_matrix_suites[suite_name]
         return None
 
     @classmethod

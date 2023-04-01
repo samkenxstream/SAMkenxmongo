@@ -26,11 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/unittest/unittest.h"
 
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/commands.h"
@@ -39,7 +34,12 @@
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/shard_version_factory.h"
 #include "mongo/s/sharding_router_test_fixture.h"
+#include "mongo/unittest/unittest.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace {
@@ -49,8 +49,6 @@ const HostAndPort kTestConfigShardHost("FakeConfigHost", 12345);
 const Status kShardNotFoundStatus{ErrorCodes::ShardNotFound, "dummy"};
 const Status kError1Status{ErrorCodes::HostUnreachable, "dummy"};
 const Status kError2Status{ErrorCodes::HostUnreachable, "dummy"};
-
-const Status kStaleConfigErrorStatus{ErrorCodes::StaleShardVersion, "dummy"};
 
 const Status kWriteConcernError1Status{ErrorCodes::WriteConcernFailed, "dummy"};
 const Status kWriteConcernError2Status{ErrorCodes::UnsatisfiableWriteConcern, "dummy"};
@@ -194,6 +192,19 @@ protected:
     const ShardId kShard5{"s5"};
 
     const std::vector<ShardId> kShardIdList{kShard1, kShard2, kShard3, kShard4, kShard5};
+
+    const Status kStaleConfigErrorStatus{
+        [] {
+            OID epoch{OID::gen()};
+            Timestamp timestamp{1, 0};
+            return StaleConfigInfo(
+                NamespaceString::createNamespaceString_forTest("Foo.Bar"),
+                ShardVersionFactory::make(ChunkVersion({epoch, timestamp}, {1, 0}),
+                                          boost::optional<CollectionIndexes>(boost::none)),
+                boost::none,
+                ShardId{"dummy"});
+        }(),
+        "dummy"};
 
 private:
     static void _assertShardIdsMatch(const std::set<ShardId>& expectedShardIds,

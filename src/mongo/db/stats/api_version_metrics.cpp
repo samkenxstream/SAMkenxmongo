@@ -27,10 +27,8 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/commands/server_status.h"
 #include "mongo/db/stats/api_version_metrics.h"
+#include "mongo/db/commands/server_status.h"
 #include "mongo/util/duration.h"
 
 namespace mongo {
@@ -42,7 +40,7 @@ APIVersionMetrics& APIVersionMetrics::get(ServiceContext* svc) {
     return handle(svc);
 }
 
-void APIVersionMetrics::update(std::string appName, const APIParameters& apiParams) {
+void APIVersionMetrics::update(const std::string& appName, const APIParameters& apiParams) {
     Date_t now = getGlobalServiceContext()->getFastClockSource()->now();
     stdx::lock_guard<Latch> lk(_mutex);
     if (apiParams.getAPIVersion()) {
@@ -122,6 +120,9 @@ public:
             .appendAPIVersionMetricsInfo(&apiVersionBob);
         apiVersionBob.done();
     }
-} apiVersionMetricsSSM;
+};
+
+auto& apiVersionMetricsSSM =
+    addMetricToTree(std::make_unique<APIVersionMetrics::APIVersionMetricsSSM>());
 
 }  // namespace mongo

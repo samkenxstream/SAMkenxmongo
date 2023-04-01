@@ -1,6 +1,10 @@
 /**
  * Tests that when certain planning-related server parameters are changed at runtime, the SBE plan
  * cache is cleared.
+ * @tags: [
+ *   # TODO SERVER-67607: Test plan cache with CQF enabled.
+ *   cqf_incompatible,
+ * ]
  */
 (function() {
 "use strict";
@@ -35,6 +39,15 @@ const paramList = [
     {name: "internalQueryCollectionMaxDataSizeBytesToChooseHashJoin", value: 100},
     {name: "internalQueryCollectionMaxStorageSizeBytesToChooseHashJoin", value: 100},
     {name: "internalQueryDisableLookupExecutionUsingHashJoin", value: true},
+    {name: "internalQuerySlotBasedExecutionDisableLookupPushdown", value: true},
+    {name: "internalQuerySlotBasedExecutionDisableGroupPushdown", value: true},
+    {name: "allowDiskUseByDefault", value: false},
+    {name: "internalQueryMaxNumberOfFieldsToChooseUnfilteredColumnScan", value: 100},
+    {name: "internalQueryMaxNumberOfFieldsToChooseFilteredColumnScan", value: 100},
+    {name: "internalCostModelCoefficients", value: '{"filterIncrementalCost": 1.0}'},
+    {name: "internalQueryColumnScanMinAvgDocSizeBytes", value: 2048},
+    {name: "internalQueryColumnScanMinCollectionSizeBytes", value: 2048},
+    {name: "internalQueryColumnScanMinNumColumnFilters", value: 5},
 ];
 
 const conn = MongoRunner.runMongod();
@@ -43,10 +56,9 @@ assert.neq(conn, null, "mongod failed to start up");
 const dbName = jsTestName();
 const db = conn.getDB(dbName);
 
-// This test is specifically verifying the behavior of the SBE plan cache. So if either the SBE plan
-// cache or SBE itself are disabled, bail out.
-if (!checkSBEEnabled(db, ["featureFlagSbePlanCache"])) {
-    jsTestLog("Skipping test because either SBE engine or SBE plan cache are disabled");
+// This test is specifically verifying the behavior of the SBE plan cache.
+if (!checkSBEEnabled(db)) {
+    jsTestLog("Skipping test because SBE is not enabled");
     MongoRunner.stopMongod(conn);
     return;
 }
@@ -54,7 +66,7 @@ if (!checkSBEEnabled(db, ["featureFlagSbePlanCache"])) {
 assert.commandWorked(db.dropDatabase());
 
 const coll = db.coll;
-assert.commandWorked(coll.createIndexes([{a: 1}, {a: 1, b: 1}]));
+assert.commandWorked(coll.createIndex({a: 1}));
 
 const filter = {
     a: 1,
@@ -63,16 +75,17 @@ const filter = {
 const cacheKey = getPlanCacheKeyFromShape({query: filter, collection: coll, db: db});
 
 function createCacheEntry() {
-    // Run the query twice so that the cache entry gets activated.
-    [...Array(2)].forEach(() => assert.eq(0, coll.find(filter).itcount()));
+    assert.eq(0, coll.find(filter).itcount());
     const cacheContents =
         coll.aggregate([{$planCacheStats: {}}, {$match: {planCacheKey: cacheKey}}]).toArray();
     // We expect to see a single SBE cache entry.
     assert.eq(cacheContents.length, 1, cacheContents);
     const cacheEntry = cacheContents[0];
+    // Since there is just a single indexed plan available, we expect the cache entry to be pinned
+    // and active after running the query just once.
     assert.eq(cacheEntry.version, "2", cacheContents);
     assert.eq(cacheEntry.isActive, true, cacheContents);
-    assert.eq(cacheEntry.isPinned, false, cacheContents);
+    assert.eq(cacheEntry.isPinned, true, cacheContents);
 }
 
 function assertCacheCleared() {

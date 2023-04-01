@@ -28,8 +28,6 @@
  */
 #include "mongo/client/sdam/topology_state_machine.h"
 
-#include <boost/optional/optional_io.hpp>
-
 #include "mongo/client/sdam/sdam_test_base.h"
 #include "mongo/client/sdam/server_description.h"
 #include "mongo/client/sdam/server_description_builder.h"
@@ -90,7 +88,7 @@ protected:
 
         // update the known hosts in the ServerDescription
         if (testCase.initialConfig.getSeedList()) {
-            for (auto address : *testCase.initialConfig.getSeedList()) {
+            for (const auto& address : *testCase.initialConfig.getSeedList()) {
                 serverDescriptionBuilder.withHost(address);
             }
         }
@@ -463,7 +461,7 @@ TEST_F(TopologyStateMachineTestFixture, ShouldNotUpdateToplogyType) {
     }
 
     int count = 0;
-    for (auto testCase : testCases) {
+    for (const auto& testCase : testCases) {
         std::cout << "case " << ++count << " starting TopologyType: " << toString(testCase.starting)
                   << "; incoming ServerType: " << toString(testCase.incoming)
                   << "; expect ending TopologyType: " << toString(testCase.ending) << std::endl;
@@ -532,7 +530,7 @@ TEST_F(TopologyStateMachineTestFixture, ShouldUpdateToCorrectToplogyType) {
           TopologyType::kReplicaSetNoPrimary}};
 
     int count = 0;
-    for (auto testCase : testCases) {
+    for (const auto& testCase : testCases) {
         std::cout << "case " << ++count << " starting TopologyType: " << toString(testCase.starting)
                   << "; incoming ServerType: " << toString(testCase.incoming)
                   << "; expect ending TopologyType: " << toString(testCase.ending) << std::endl;

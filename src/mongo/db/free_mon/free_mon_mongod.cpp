@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -66,6 +65,9 @@
 #include "mongo/util/future.h"
 #include "mongo/util/net/http_client.h"
 #include "mongo/util/testing_proctor.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 
@@ -112,8 +114,7 @@ public:
             ConstDataRange cdr(blobData.get(), blobSize);
             BSONObj respObj = cdr.read<Validated<BSONObj>>();
 
-            auto resp =
-                FreeMonRegistrationResponse::parse(IDLParserErrorContext("response"), respObj);
+            auto resp = FreeMonRegistrationResponse::parse(IDLParserContext("response"), respObj);
 
             return resp;
         });
@@ -135,7 +136,7 @@ public:
 
             BSONObj respObj = cdr.read<Validated<BSONObj>>();
 
-            auto resp = FreeMonMetricsResponse::parse(IDLParserErrorContext("response"), respObj);
+            auto resp = FreeMonMetricsResponse::parse(IDLParserContext("response"), respObj);
 
             return resp;
         });
@@ -247,7 +248,7 @@ private:
 
 }  // namespace
 
-Status onValidateFreeMonEndpointURL(StringData str) {
+Status onValidateFreeMonEndpointURL(StringData str, const boost::optional<TenantId>&) {
     // Check for http, not https here because testEnabled may not be set yet
     if (!str.startsWith("http"_sd) != 0) {
         return Status(ErrorCodes::BadValue,
@@ -292,7 +293,7 @@ void registerCollectors(FreeMonController* controller) {
             "replSetGetConfig", "replSetGetConfig", "", BSON("replSetGetConfig" << 1)));
 
         // Collect UUID for certain collections.
-        std::set<NamespaceString> namespaces({NamespaceString("local.oplog.rs")});
+        std::set<NamespaceString> namespaces({NamespaceString::kRsOplogNamespace});
         controller->addRegistrationCollector(
             std::make_unique<FreeMonNamespaceUUIDCollector>(namespaces));
         controller->addMetricsCollector(

@@ -358,11 +358,12 @@ TEST_F(FaultManagerTest, HealthCheckWithOffFacetCreatesNoFaultInOk) {
     configPtr->setIntensityForType(faultFacetType, HealthObserverIntensityEnum::kOff);
     manager().acceptTest(HealthCheckStatus(faultFacetType, Severity::kFailure, "error"));
     ASSERT_EQ(manager().getFaultState(), FaultState::kOk);
+    resetManager();
 }
 
 TEST_F(FaultManagerTest, DNSHealthCheckWithBadHostNameFailsAndGoodHostNameSuccess) {
     RAIIServerParameterControllerForTest _controller{"featureFlagHealthMonitoring", true};
-    RAIIServerParameterControllerForTest serverParamController{"activeFaultDurationSecs", 10};
+    RAIIServerParameterControllerForTest serverParamController{"activeFaultDurationSecs", 30};
     const auto faultFacetType = FaultFacetType::kDns;
     auto config = std::make_unique<FaultManagerConfig>();
     config->setIntensityForType(faultFacetType, HealthObserverIntensityEnum::kCritical);
@@ -376,7 +377,7 @@ TEST_F(FaultManagerTest, DNSHealthCheckWithBadHostNameFailsAndGoodHostNameSucces
                                                     << "interval" << 1000)));
     const BSONObj newParameterObj = BSON("key" << bsonOBj);
     auto element = newParameterObj.getField("key");
-    uassertStatusOK(serverParam->set(element));
+    uassertStatusOK(serverParam->set(element, boost::none));
 
     registerHealthObserver<DnsHealthObserver>();
     globalFailPointRegistry()

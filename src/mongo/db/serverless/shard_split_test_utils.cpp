@@ -37,7 +37,7 @@ namespace mongo {
 namespace test {
 namespace shard_split {
 
-ScopedTenantAccessBlocker::ScopedTenantAccessBlocker(const std::vector<std::string>& tenants,
+ScopedTenantAccessBlocker::ScopedTenantAccessBlocker(const std::vector<TenantId>& tenants,
                                                      OperationContext* opCtx)
     : _tenants(tenants), _opCtx(opCtx) {}
 
@@ -58,19 +58,20 @@ void reconfigToAddRecipientNodes(ServiceContext* serviceContext,
                                  const std::vector<HostAndPort>& recipientNodes) {
     BSONArrayBuilder members;
     int idx = 0;
-    for (auto node : donorNodes) {
+    for (const auto& node : donorNodes) {
         members.append(BSON("_id" << idx++ << "host" << node.toString()));
     }
-    for (auto node : recipientNodes) {
+    for (const auto& node : recipientNodes) {
         members.append(BSON("_id" << idx++ << "host" << node.toString() << "priority" << 0
-                                  << "votes" << 0 << "tags"
+                                  << "hidden" << 1 << "votes" << 0 << "tags"
                                   << BSON(recipientTagName << UUID::gen().toString())));
     }
 
     auto newConfig = repl::ReplSetConfig::parse(BSON("_id"
                                                      << "donor"
                                                      << "version" << 1 << "protocolVersion" << 1
-                                                     << "members" << members.arr()));
+                                                     << "members" << members.arr() << "settings"
+                                                     << BSON("replicaSetId" << OID::gen())));
 
     auto replCoord = repl::ReplicationCoordinator::get(serviceContext);
     dynamic_cast<repl::ReplicationCoordinatorMock*>(replCoord)->setGetConfigReturnValue(newConfig);

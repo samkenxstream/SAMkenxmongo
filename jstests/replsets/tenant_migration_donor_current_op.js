@@ -1,37 +1,24 @@
 /**
  * Tests currentOp command during a tenant migration.
  *
- * Tenant migrations are not expected to be run on servers with ephemeralForTest.
- *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
  *   requires_persistence,
+ *   # The currentOp output field 'lastDurableState' was changed from an enum to a string.
+ *   requires_fcv_70,
  *   serverless,
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {isShardMergeEnabled} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
-// An object that mirrors the donor migration states.
-const migrationStates = {
-    kUninitialized: 0,
-    kAbortingIndexBuilds: 1,
-    kDataSync: 2,
-    kBlocking: 3,
-    kCommitted: 4,
-    kAborted: 5
-};
-
-const kTenantId = 'testTenantId';
+const kTenantId = ObjectId().str;
 const kReadPreference = {
     mode: "primary"
 };
@@ -40,19 +27,18 @@ function checkStandardFieldsOK(ops, {
     migrationId,
     lastDurableState,
     tenantMigrationTest,
-    migrationCompleted = false,
+    garbageCollectable = false,
 }) {
     assert.eq(ops.length, 1);
     const [op] = ops;
     assert.eq(bsonWoCompare(op.instanceID, migrationId), 0);
     assert.eq(bsonWoCompare(op.readPreference, kReadPreference), 0);
     assert.eq(op.lastDurableState, lastDurableState);
-    assert.eq(op.migrationCompleted, migrationCompleted);
+    assert.eq(op.garbageCollectable, garbageCollectable);
     assert(op.migrationStart instanceof Date);
     assert.eq(op.recipientConnectionString, tenantMigrationTest.getRecipientRst().getURL());
 
-    if (TenantMigrationUtil.isShardMergeEnabled(
-            tenantMigrationTest.getDonorPrimary().getDB("admin"))) {
+    if (isShardMergeEnabled(tenantMigrationTest.getDonorPrimary().getDB("admin"))) {
         assert.eq(op.tenantId, undefined);
     } else {
         assert.eq(bsonWoCompare(op.tenantId, kTenantId), 0);
@@ -81,7 +67,7 @@ function checkStandardFieldsOK(ops, {
 
     checkStandardFieldsOK(res.inprog, {
         migrationId,
-        lastDurableState: migrationStates.kAbortingIndexBuilds,
+        lastDurableState: TenantMigrationTest.DonorState.kAbortingIndexBuilds,
         tenantMigrationTest,
     });
 
@@ -112,7 +98,7 @@ function checkStandardFieldsOK(ops, {
 
     checkStandardFieldsOK(res.inprog, {
         migrationId,
-        lastDurableState: migrationStates.kDataSync,
+        lastDurableState: TenantMigrationTest.DonorState.kDataSync,
         tenantMigrationTest,
     });
     assert(res.inprog[0].startMigrationDonorTimestamp instanceof Timestamp);
@@ -144,7 +130,7 @@ function checkStandardFieldsOK(ops, {
 
     checkStandardFieldsOK(res.inprog, {
         migrationId,
-        lastDurableState: migrationStates.kBlocking,
+        lastDurableState: TenantMigrationTest.DonorState.kBlocking,
         tenantMigrationTest,
     });
     assert(res.inprog[0].blockTimestamp instanceof Timestamp);
@@ -176,7 +162,7 @@ function checkStandardFieldsOK(ops, {
 
     checkStandardFieldsOK(res.inprog, {
         migrationId,
-        lastDurableState: migrationStates.kAborted,
+        lastDurableState: TenantMigrationTest.DonorState.kAborted,
         tenantMigrationTest,
     });
     assert(res.inprog[0].startMigrationDonorTimestamp instanceof Timestamp);
@@ -210,7 +196,7 @@ function checkStandardFieldsOK(ops, {
 
     checkStandardFieldsOK(res.inprog, {
         migrationId,
-        lastDurableState: migrationStates.kCommitted,
+        lastDurableState: TenantMigrationTest.DonorState.kCommitted,
         tenantMigrationTest,
     });
     assert(res.inprog[0].startMigrationDonorTimestamp instanceof Timestamp);
@@ -226,9 +212,9 @@ function checkStandardFieldsOK(ops, {
 
     checkStandardFieldsOK(res.inprog, {
         migrationId,
-        lastDurableState: migrationStates.kCommitted,
+        lastDurableState: TenantMigrationTest.DonorState.kCommitted,
         tenantMigrationTest,
-        migrationCompleted: true,
+        garbageCollectable: true,
     });
     assert(res.inprog[0].startMigrationDonorTimestamp instanceof Timestamp);
     assert(res.inprog[0].blockTimestamp instanceof Timestamp);
@@ -237,5 +223,4 @@ function checkStandardFieldsOK(ops, {
     assert(res.inprog[0].expireAt instanceof Date);
 
     tenantMigrationTest.stop();
-})();
 })();

@@ -2,31 +2,34 @@
  * Tests that tenant migration donor's in memory state is recovered correctly on startup. This test
  * randomly selects a point during the migration to shutdown the donor.
  *
- * Tenant migrations are not expected to be run on servers with ephemeralForTest.
  * Incompatible with shard merge, which can't handle restart.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
+ *   requires_fcv_62,
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {makeX509OptionsForTest} from "jstests/replsets/libs/tenant_migration_util.js";
+import {
+    getServerlessOperationLock,
+    ServerlessLockType
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
 
 const donorRst = new ReplSetTest({
     nodes: 1,
     name: 'donor',
-    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor, {
+    serverless: true,
+    nodeOptions: Object.assign(makeX509OptionsForTest().donor, {
         setParameter:
             // In order to deterministically validate that in-memory state is preserved during
             // recovery, this failpoint prevents active migrations from continuing on process
@@ -41,7 +44,7 @@ donorRst.initiate();
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName(), donorRst});
 
 const kMaxSleepTimeMS = 1000;
-const kTenantId = 'testTenantId';
+const kTenantId = ObjectId().str;
 
 let donorPrimary = tenantMigrationTest.getDonorPrimary();
 
@@ -72,7 +75,8 @@ donorRst.startSet({
 
 donorPrimary = donorRst.getPrimary();
 const configDonorsColl = donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS);
-const donorDoc = configDonorsColl.findOne({tenantId: kTenantId});
+assert.lte(configDonorsColl.count(), 1);
+const donorDoc = configDonorsColl.findOne();
 if (donorDoc) {
     switch (donorDoc.state) {
         case TenantMigrationTest.DonorState.kAbortingIndexBuilds:
@@ -135,6 +139,12 @@ if (donorDoc) {
     }
 }
 
+const activeServerlessLock = getServerlessOperationLock(donorPrimary);
+if (donorDoc && !donorDoc.expireAt) {
+    assert.eq(activeServerlessLock, ServerlessLockType.TenantMigrationDonor);
+} else {
+    assert.eq(activeServerlessLock, ServerlessLockType.None);
+}
+
 tenantMigrationTest.stop();
 donorRst.stopSet();
-})();

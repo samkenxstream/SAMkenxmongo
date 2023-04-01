@@ -29,9 +29,12 @@
 
 #pragma once
 
+#include "mongo/db/curop.h"
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/query/multiple_collection_accessor.h"
+#include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/plan_cache_debug_info.h"
 #include "mongo/db/query/plan_cache_key_factory.h"
 #include "mongo/db/query/plan_explainer_factory.h"
@@ -98,7 +101,7 @@ plan_cache_debug_info::DebugInfoSBE buildDebugInfo(const QuerySolution* solution
 template <typename PlanStageType, typename ResultType, typename Data>
 void updatePlanCache(
     OperationContext* opCtx,
-    const CollectionPtr& collection,
+    const MultipleCollectionAccessor& collections,
     PlanCachingMode cachingMode,
     const CanonicalQuery& query,
     std::unique_ptr<plan_ranker::PlanRankingDecision> ranking,
@@ -106,13 +109,6 @@ void updatePlanCache(
     auto winnerIdx = ranking->candidateOrder[0];
     invariant(winnerIdx >= 0 && winnerIdx < candidates.size());
     auto& winningPlan = candidates[winnerIdx];
-
-    // TODO SERVER-61507: Integration between lowering parts of aggregation pipeline into the find
-    // subsystem and the new SBE cache isn't implemented yet.
-    if (!query.pipeline().empty() &&
-        feature_flags::gFeatureFlagSbePlanCache.isEnabledAndIgnoreFCV()) {
-        return;
-    }
 
     // Even if the query is of a cacheable shape, the caller might have indicated that we shouldn't
     // write to the plan cache.
@@ -137,10 +133,11 @@ void updatePlanCache(
             auto&& [winnerExplainer, runnerUpExplainer] = [&]() {
                 if constexpr (std::is_same_v<PlanStageType, std::unique_ptr<sbe::PlanStage>>) {
                     return std::make_pair(
-                        plan_explainer_factory::make(
-                            winningPlan.root.get(), &winningPlan.data, winningPlan.solution.get()),
+                        plan_explainer_factory::make(winningPlan.root.get(),
+                                                     &winningPlan.data.stageData,
+                                                     winningPlan.solution.get()),
                         plan_explainer_factory::make(candidates[runnerUpIdx].root.get(),
-                                                     &candidates[runnerUpIdx].data,
+                                                     &candidates[runnerUpIdx].data.stageData,
                                                      candidates[runnerUpIdx].solution.get()));
                 } else {
                     static_assert(std::is_same_v<PlanStageType, PlanStage*>);
@@ -163,8 +160,9 @@ void updatePlanCache(
             canCache = false;
             auto winnerExplainer = [&]() {
                 if constexpr (std::is_same_v<PlanStageType, std::unique_ptr<sbe::PlanStage>>) {
-                    return plan_explainer_factory::make(
-                        winningPlan.root.get(), &winningPlan.data, winningPlan.solution.get());
+                    return plan_explainer_factory::make(winningPlan.root.get(),
+                                                        &winningPlan.data.stageData,
+                                                        winningPlan.solution.get());
                 } else {
                     static_assert(std::is_same_v<PlanStageType, PlanStage*>);
                     return plan_explainer_factory::make(winningPlan.root);
@@ -188,6 +186,10 @@ void updatePlanCache(
                                    SolutionCacheData,
                                    plan_cache_debug_info::DebugInfo>
                 callbacks{query, buildDebugInfoFn};
+            winningPlan.solution->cacheData->indexFilterApplied =
+                winningPlan.solution->indexFilterApplied;
+            auto& collection = collections.getMainCollection();
+            auto isSensitive = CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation;
             uassertStatusOK(CollectionQueryInfo::get(collection)
                                 .getPlanCache()
                                 ->set(plan_cache_key_factory::make<PlanCacheKey>(query, collection),
@@ -195,37 +197,41 @@ void updatePlanCache(
                                       *rankingDecision,
                                       opCtx->getServiceContext()->getPreciseClockSource()->now(),
                                       &callbacks,
+                                      isSensitive ? PlanSecurityLevel::kSensitive
+                                                  : PlanSecurityLevel::kNotSensitive,
                                       boost::none /* worksGrowthCoefficient */));
         };
 
         if (winningPlan.solution->cacheData != nullptr) {
             if constexpr (std::is_same_v<PlanStageType, std::unique_ptr<sbe::PlanStage>>) {
-                if (feature_flags::gFeatureFlagSbePlanCache.isEnabledAndIgnoreFCV()) {
-                    tassert(6142201,
-                            "The winning CandidatePlan should contain the original plan",
-                            winningPlan.clonedPlan);
-                    // Clone the winning SBE plan and its auxiliary data.
-                    auto cachedPlan = std::make_unique<sbe::CachedSbePlan>(
-                        std::move(winningPlan.clonedPlan->first),
-                        std::move(winningPlan.clonedPlan->second));
-                    auto buildDebugInfoFn = [soln = winningPlan.solution.get()]()
-                        -> plan_cache_debug_info::DebugInfoSBE { return buildDebugInfo(soln); };
-                    PlanCacheCallbacksImpl<sbe::PlanCacheKey,
-                                           sbe::CachedSbePlan,
-                                           plan_cache_debug_info::DebugInfoSBE>
-                        callbacks{query, buildDebugInfoFn};
-                    uassertStatusOK(sbe::getPlanCache(opCtx).set(
-                        plan_cache_key_factory::make<sbe::PlanCacheKey>(query, collection),
-                        std::move(cachedPlan),
-                        *rankingDecision,
-                        opCtx->getServiceContext()->getPreciseClockSource()->now(),
-                        &callbacks,
-                        boost::none /* worksGrowthCoefficient */));
-                } else {
-                    // Fall back to use the classic plan cache. Remove this branch after
-                    // "gFeatureFlagSbePlanCache" is removed.
-                    cacheClassicPlan();
-                }
+                tassert(6142201,
+                        "The winning CandidatePlan should contain the original plan",
+                        winningPlan.clonedPlan);
+
+                // Clone the winning SBE plan and its auxiliary data.
+                auto cachedPlan = std::make_unique<sbe::CachedSbePlan>(
+                    std::move(winningPlan.clonedPlan->first),
+                    std::move(winningPlan.clonedPlan->second.stageData));
+                cachedPlan->indexFilterApplied = winningPlan.solution->indexFilterApplied;
+
+                auto buildDebugInfoFn =
+                    [soln = winningPlan.solution.get()]() -> plan_cache_debug_info::DebugInfoSBE {
+                    return buildDebugInfo(soln);
+                };
+                PlanCacheCallbacksImpl<sbe::PlanCacheKey,
+                                       sbe::CachedSbePlan,
+                                       plan_cache_debug_info::DebugInfoSBE>
+                    callbacks{query, buildDebugInfoFn};
+
+                auto isSensitive = CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation;
+                uassertStatusOK(sbe::getPlanCache(opCtx).set(
+                    plan_cache_key_factory::make(query, collections),
+                    std::move(cachedPlan),
+                    *rankingDecision,
+                    opCtx->getServiceContext()->getPreciseClockSource()->now(),
+                    &callbacks,
+                    isSensitive ? PlanSecurityLevel::kSensitive : PlanSecurityLevel::kNotSensitive,
+                    boost::none /* worksGrowthCoefficient */));
             } else {
                 static_assert(std::is_same_v<PlanStageType, PlanStage*>);
                 cacheClassicPlan();
@@ -244,7 +250,7 @@ void updatePlanCache(
  * the cache, the plan immediately becomes "active".
  */
 void updatePlanCache(OperationContext* opCtx,
-                     const CollectionPtr& collection,
+                     const MultipleCollectionAccessor& collections,
                      const CanonicalQuery& query,
                      const QuerySolution& solution,
                      const sbe::PlanStage& root,

@@ -100,23 +100,23 @@ ExecutorFuture<void> cancelWhenAnyErrorThenQuiesce(
 template <typename BodyCallable>
 class [[nodiscard]] WithAutomaticRetry {
 public:
-    explicit WithAutomaticRetry(BodyCallable && body) : _body{std::move(body)} {}
+    explicit WithAutomaticRetry(BodyCallable&& body) : _body{std::move(body)} {}
 
-    decltype(auto) onTransientError(unique_function<void(const Status&)> onTransientError)&& {
+    decltype(auto) onTransientError(unique_function<void(const Status&)> onTransientError) && {
         invariant(!_onTransientError, "Cannot call onTransientError() twice");
         _onTransientError = std::move(onTransientError);
         return std::move(*this);
     }
 
     decltype(auto) onUnrecoverableError(
-        unique_function<void(const Status&)> onUnrecoverableError)&& {
+        unique_function<void(const Status&)> onUnrecoverableError) && {
         invariant(!_onUnrecoverableError, "Cannot call onUnrecoverableError() twice");
         _onUnrecoverableError = std::move(onUnrecoverableError);
         return std::move(*this);
     }
 
     template <typename StatusType>
-    auto until(unique_function<bool(const StatusType&)> condition)&& {
+    auto until(unique_function<bool(const StatusType&)> condition) && {
         invariant(_onTransientError, "Must call onTransientError() first");
         invariant(_onUnrecoverableError, "Must call onUnrecoverableError() first");
 
@@ -170,19 +170,20 @@ private:
 };
 
 /**
- * Wrapper class around CancelableOperationContextFactory which uses resharding::WithAutomaticRetry
- * to ensure all cancelable operations will be retried if able upon failure.
+ * Wrapper class around CancelableOperationContextFactory which by default uses
+ * resharding::WithAutomaticRetry to ensure all cancelable operations will be retried if able upon
+ * failure.
  */
 class RetryingCancelableOperationContextFactory {
 public:
     RetryingCancelableOperationContextFactory(CancellationToken cancelToken, ExecutorPtr executor)
         : _factory{std::move(cancelToken), std::move(executor)} {}
 
-    template <typename BodyCallable>
+    template <typename BodyCallable,
+              template <typename> typename RetryProvider = resharding::WithAutomaticRetry>
     decltype(auto) withAutomaticRetry(BodyCallable&& body) const {
-        return resharding::WithAutomaticRetry([this, body]() { return body(_factory); });
+        return RetryProvider([this, body]() { return body(_factory); });
     }
-
 
 private:
     const CancelableOperationContextFactory _factory;

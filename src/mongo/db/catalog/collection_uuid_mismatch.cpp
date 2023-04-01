@@ -34,24 +34,41 @@
 #include "mongo/db/storage/storage_parameters_gen.h"
 
 namespace mongo {
+
+void checkCollectionUUIDMismatch(OperationContext* opCtx,
+                                 const NamespaceString& ns,
+                                 const Collection* coll,
+                                 const boost::optional<UUID>& uuid) {
+    checkCollectionUUIDMismatch(opCtx, CollectionCatalog::get(opCtx), ns, coll, uuid);
+}
+
 void checkCollectionUUIDMismatch(OperationContext* opCtx,
                                  const NamespaceString& ns,
                                  const CollectionPtr& coll,
-                                 const boost::optional<UUID>& uuid,
-                                 bool checkFeatureFlag) {
+                                 const boost::optional<UUID>& uuid) {
+    checkCollectionUUIDMismatch(opCtx, CollectionCatalog::get(opCtx), ns, coll.get(), uuid);
+}
+
+void checkCollectionUUIDMismatch(OperationContext* opCtx,
+                                 const std::shared_ptr<const CollectionCatalog>& catalog,
+                                 const NamespaceString& ns,
+                                 const CollectionPtr& coll,
+                                 const boost::optional<UUID>& uuid) {
+    checkCollectionUUIDMismatch(opCtx, catalog, ns, coll.get(), uuid);
+}
+
+void checkCollectionUUIDMismatch(OperationContext* opCtx,
+                                 const std::shared_ptr<const CollectionCatalog>& catalog,
+                                 const NamespaceString& ns,
+                                 const Collection* coll,
+                                 const boost::optional<UUID>& uuid) {
     if (!uuid) {
         return;
     }
 
-    uassert(ErrorCodes::InvalidOptions,
-            "The collectionUUID parameter is not enabled",
-            !checkFeatureFlag ||
-                feature_flags::gCommandsAcceptCollectionUUID.isEnabled(
-                    serverGlobalParams.featureCompatibility));
-
-    auto actualNamespace = CollectionCatalog::get(opCtx)->lookupNSSByUUID(opCtx, *uuid);
+    auto actualNamespace = catalog->lookupNSSByUUID(opCtx, *uuid);
     uassert(
-        (CollectionUUIDMismatchInfo{ns.db().toString(),
+        (CollectionUUIDMismatchInfo{ns.dbName(),
                                     *uuid,
                                     ns.coll().toString(),
                                     actualNamespace && actualNamespace->db() == ns.db()
@@ -60,4 +77,5 @@ void checkCollectionUUIDMismatch(OperationContext* opCtx,
         "Collection UUID does not match that specified",
         coll && coll->uuid() == *uuid);
 }
+
 }  // namespace mongo

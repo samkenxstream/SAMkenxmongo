@@ -1,7 +1,9 @@
 /**
  * A speculative snapshot must not include any writes ordered after any uncommitted writes.
  *
+ * The test runs commands that are not allowed with security token: endSession.
  * @tags: [
+ *   not_allowed_with_security_token,
  *  uses_transactions,
  *  requires_majority_read_concern,
  *  uses_parallel_shell,
@@ -12,7 +14,7 @@
 (function() {
 "use strict";
 
-load("jstests/libs/logv2_helpers.js");
+load("jstests/libs/fail_point_util.js");
 
 const dbName = "test";
 const collName = "speculative_snapshot_includes_all_writes_1";
@@ -46,10 +48,8 @@ let checkReads = (session, collExpected, coll2Expected) => {
     assert.sameMembers(coll2Expected, coll2.find().toArray());
 };
 
-// Clear ramlog so checkLog can't find log messages from previous times this fail point was
-// enabled.
-assert.commandWorked(testDB.adminCommand({clearLog: 'global'}));
-
+const failPoint = configureFailPoint(
+    db, "hangAfterCollectionInserts", {collectionNS: testColl2.getFullName(), first_id: "b"});
 try {
     // The default WC is majority and this test can't satisfy majority writes.
     assert.commandWorked(testDB.adminCommand(
@@ -60,26 +60,13 @@ try {
     assert.commandWorked(testColl2.insert([{_id: "a"}], {writeConcern: {w: "majority"}}));
 
     jsTest.log("Create the uncommitted write.");
-
-    assert.commandWorked(db.adminCommand({
-        configureFailPoint: "hangAfterCollectionInserts",
-        mode: "alwaysOn",
-        data: {collectionNS: testColl2.getFullName()}
-    }));
-
     const joinHungWrite = startParallelShell(() => {
         assert.commandWorked(
             db.getSiblingDB("test").speculative_snapshot_includes_all_writes_2.insert(
                 {_id: "b"}, {writeConcern: {w: "majority"}}));
     });
 
-    if (isJsonLog(db.getMongo())) {
-        checkLog.containsJson(db.getMongo(), 20289);
-    } else {
-        checkLog.contains(
-            db.getMongo(),
-            "hangAfterCollectionInserts fail point enabled for " + testColl2.getFullName());
-    }
+    failPoint.wait();
 
     jsTest.log("Create a write following the uncommitted write.");
     // Note this write must use local write concern; it cannot be majority committed until
@@ -99,11 +86,7 @@ try {
     checkReads(defaultSession, [{_id: 0}, {_id: 1}], [{_id: "a"}]);
 
     jsTestLog("Allow the uncommitted write to finish.");
-    assert.commandWorked(db.adminCommand({
-        configureFailPoint: "hangAfterCollectionInserts",
-        mode: "off",
-    }));
-
+    failPoint.off();
     joinHungWrite();
 
     jsTestLog("Double-checking that writes not committed at start of snapshot cannot appear.");
@@ -129,6 +112,7 @@ try {
     localSession.endSession();
     defaultSession.endSession();
 } finally {
+    failPoint.off();
     // Unsetting CWWC is not allowed, so explicitly restore the default write concern to be majority
     // by setting CWWC to {w: majority}.
     assert.commandWorked(testDB.adminCommand({

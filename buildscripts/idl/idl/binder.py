@@ -25,7 +25,6 @@
 # exception statement from all source files in the program, then also delete
 # it in the license file.
 #
-# pylint: disable=too-many-lines
 """Transform idl.syntax trees from the parser into well-defined idl.ast trees."""
 
 import collections
@@ -177,7 +176,6 @@ def _validate_chain_type_properties(ctxt, idl_type, syntax_type):
 
 def _validate_type_properties(ctxt, idl_type, syntax_type):
     # type: (errors.ParserContext, Union[syntax.Type, ast.Type], str) -> None
-    # pylint: disable=too-many-branches
     """Validate each type is correct."""
     # Validate bson type restrictions
     if not _validate_bson_types_list(ctxt, idl_type, syntax_type):
@@ -188,8 +186,9 @@ def _validate_type_properties(ctxt, idl_type, syntax_type):
 
         if bson_type == "any":
             # For 'any', a deserializer is required but the user can try to get away with the default
-            # serialization for their C++ type.
-            if idl_type.deserializer is None:
+            # serialization for their C++ type.  An internal_only type is not associated with BSON
+            # and thus should not have a deserializer defined.
+            if idl_type.deserializer is None and not idl_type.internal_only:
                 ctxt.add_missing_ast_required_field_error(idl_type, syntax_type, idl_type.name,
                                                           "deserializer")
         elif bson_type == "chain":
@@ -258,7 +257,8 @@ def _get_struct_qualified_cpp_name(struct):
 
 def _bind_struct_common(ctxt, parsed_spec, struct, ast_struct):
     # type: (errors.ParserContext, syntax.IDLSpec, syntax.Struct, ast.Struct) -> None
-    # pylint: disable=too-many-branches
+
+    _inject_hidden_fields(struct)
 
     ast_struct.name = struct.name
     ast_struct.description = struct.description
@@ -271,6 +271,13 @@ def _bind_struct_common(ctxt, parsed_spec, struct, ast_struct):
     ast_struct.qualified_cpp_name = _get_struct_qualified_cpp_name(struct)
     ast_struct.allow_global_collection_name = struct.allow_global_collection_name
     ast_struct.non_const_getter = struct.non_const_getter
+    ast_struct.is_command_reply = struct.is_command_reply
+    if struct.is_generic_cmd_list:
+        if struct.is_generic_cmd_list == "arg":
+            ast_struct.generic_list_type = ast.GenericListType.ARG
+        else:
+            assert struct.is_generic_cmd_list == "reply"
+            ast_struct.generic_list_type = ast.GenericListType.REPLY
 
     # Validate naming restrictions
     if ast_struct.name.startswith("array<"):
@@ -295,6 +302,16 @@ def _bind_struct_common(ctxt, parsed_spec, struct, ast_struct):
     for field in struct.fields or []:
         ast_field = _bind_field(ctxt, parsed_spec, field)
         if ast_field:
+            if ast_struct.generic_list_type:
+                gen_field_info = ast.GenericFieldInfo(struct.file_name, struct.line, struct.column)
+                if ast_struct.generic_list_type == ast.GenericListType.ARG:
+                    gen_field_info.forward_to_shards = field.forward_to_shards
+                elif ast_struct.generic_list_type == ast.GenericListType.REPLY:
+                    gen_field_info.forward_from_shards = field.forward_from_shards
+                    gen_field_info.arg = False
+                else:
+                    assert False
+                ast_field.generic_field_info = gen_field_info
             if ast_field.supports_doc_sequence and not isinstance(ast_struct, ast.Command):
                 # Doc sequences are only supported in commands at the moment
                 ctxt.add_bad_struct_field_as_doc_sequence_error(ast_struct, ast_struct.name,
@@ -330,6 +347,26 @@ def _bind_struct_common(ctxt, parsed_spec, struct, ast_struct):
                 pos += 1
 
 
+def _inject_hidden_fields(struct):
+    # type: (syntax.Struct) -> None
+    """Inject hidden fields to aid deserialization/serialization for structs."""
+
+    # Don't generate if no fields exist or it's already included in this struct
+    if struct.fields is None:
+        struct.fields = []
+
+    serialization_context_field = syntax.Field(struct.file_name, struct.line, struct.column)
+    serialization_context_field.name = "serialization_context"  # This comes from basic_types.idl
+    serialization_context_field.type = syntax.FieldTypeSingle(struct.file_name, struct.line,
+                                                              struct.column)
+    serialization_context_field.type.type_name = "serialization_context"
+    serialization_context_field.cpp_name = "serializationContext"
+    serialization_context_field.optional = False
+    serialization_context_field.default = "SerializationContext()"
+
+    struct.fields.append(serialization_context_field)
+
+
 def _bind_struct(ctxt, parsed_spec, struct):
     # type: (errors.ParserContext, syntax.IDLSpec, syntax.Struct) -> ast.Struct
     """
@@ -346,52 +383,6 @@ def _bind_struct(ctxt, parsed_spec, struct):
     return ast_struct
 
 
-def _bind_field_list_entry(field_list_entry):
-    # type: (syntax.FieldListEntry) -> ast.FieldListEntry
-    """Bind a generic argument or reply field list entry."""
-    ast_entry = ast.FieldListEntry(field_list_entry.file_name, field_list_entry.line,
-                                   field_list_entry.column)
-    ast_entry.name = field_list_entry.name
-    ast_entry.forward_to_shards = field_list_entry.forward_to_shards
-    ast_entry.forward_from_shards = field_list_entry.forward_from_shards
-    return ast_entry
-
-
-ASTFieldListBaseClass = TypeVar("ASTFieldListBaseClass", bound=ast.FieldListBase, covariant=True)
-
-
-def _bind_field_list(field_list, ast_class):
-    # type: (syntax.FieldListBase, Type[ASTFieldListBaseClass]) -> ASTFieldListBaseClass
-    """Bind a generic argument or reply field list (helper method).
-
-    The ast_class param must be a subclass of ast.FieldListBase. The returned value is an
-    instance of ast_class.
-    """
-    ast_field_list = ast_class(field_list.file_name, field_list.line, field_list.column)
-    ast_field_list.description = field_list.description
-    ast_field_list.cpp_name = field_list.name
-    if field_list.cpp_name:
-        ast_field_list.cpp_name = field_list.cpp_name
-
-    return ast_field_list
-
-
-def _bind_generic_argument_list(field_list):
-    # type: (syntax.GenericArgumentList) -> ast.GenericArgumentList
-    """Bind a generic argument list."""
-    ast_field_list = _bind_field_list(field_list, ast.GenericArgumentList)
-    ast_field_list.fields = [_bind_field_list_entry(f) for f in field_list.fields]
-    return ast_field_list
-
-
-def _bind_generic_reply_field_list(field_list):
-    # type: (syntax.GenericReplyFieldList) -> ast.GenericReplyFieldList
-    """Bind a generic reply field list."""
-    ast_field_list = _bind_field_list(field_list, ast.GenericReplyFieldList)
-    ast_field_list.fields = [_bind_field_list_entry(f) for f in field_list.fields]
-    return ast_field_list
-
-
 def _inject_hidden_command_fields(command):
     # type: (syntax.Command) -> None
     """Inject hidden fields to aid deserialization/serialization for OpMsg parsing of commands."""
@@ -400,7 +391,7 @@ def _inject_hidden_command_fields(command):
     db_field = syntax.Field(command.file_name, command.line, command.column)
     db_field.name = "$db"
     db_field.type = syntax.FieldTypeSingle(command.file_name, command.line, command.column)
-    db_field.type.type_name = "string"  # This comes from basic_types.idl
+    db_field.type.type_name = "database_name"  # This comes from basic_types.idl
     db_field.cpp_name = "dbName"
     db_field.serialize_op_msg_request_only = True
 
@@ -409,6 +400,19 @@ def _inject_hidden_command_fields(command):
         db_field.constructed = True
 
     command.fields.append(db_field)
+
+    # Inject "$tenant" for use by cluster administrators overriding tenant in multitenancy.
+    tenant_field = syntax.Field(command.file_name, command.line, command.column)
+    tenant_field.name = "$tenant"
+    tenant_field.type = syntax.FieldTypeSingle(command.file_name, command.line, command.column)
+    tenant_field.type.type_name = "tenant_id"  # This comes from basic_types.idl
+    tenant_field.cpp_name = "dollarTenant"
+    tenant_field.optional = True
+    # The $tenant field should be injected when serializing to OpMsgRequest and to
+    # BSONObjBuilder if it exists.
+    tenant_field.serialize_op_msg_request_only = False
+
+    command.fields.append(tenant_field)
 
 
 def _bind_struct_type(struct):
@@ -420,6 +424,7 @@ def _bind_struct_type(struct):
     ast_type.name = struct.name
     ast_type.cpp_type = _get_struct_qualified_cpp_name(struct)
     ast_type.bson_serialization_type = ["object"]
+    ast_type.first_element_field_name = struct.fields[0].name if struct.fields else None
     return ast_type
 
 
@@ -438,13 +443,17 @@ def _bind_struct_field(ctxt, ast_field, idl_type):
     ast_field.type = _bind_struct_type(struct)
     ast_field.type.is_array = isinstance(idl_type, syntax.ArrayType)
 
-    _validate_field_of_type_struct(ctxt, ast_field)
+    _validate_default_of_type_struct(ctxt, ast_field)
 
 
 def _bind_variant_field(ctxt, ast_field, idl_type):
-    # type: (errors.ParserContext, ast.Field, syntax.VariantType) -> None
+    # type: (errors.ParserContext, ast.Field, Union[syntax.VariantType, syntax.ArrayType]) -> None
     ast_field.type = _bind_type(idl_type)
     ast_field.type.is_variant = True
+
+    if isinstance(idl_type, syntax.ArrayType):
+        assert isinstance(idl_type.element_type, syntax.VariantType)
+        idl_type = idl_type.element_type
 
     _validate_bson_types_list(ctxt, idl_type, "field")
 
@@ -452,8 +461,11 @@ def _bind_variant_field(ctxt, ast_field, idl_type):
         ast_alternative = _bind_type(alternative)
         ast_field.type.variant_types.append(ast_alternative)
 
-    if idl_type.variant_struct_type:
-        ast_field.type.variant_struct_type = _bind_struct_type(idl_type.variant_struct_type)
+    if idl_type.variant_struct_types:
+        ast_field.type.variant_struct_types = []
+
+    for struct_type in idl_type.variant_struct_types:
+        ast_field.type.variant_struct_types.append(_bind_struct_type(struct_type))
 
     def gen_cpp_types():
         for alternative in ast_field.type.variant_types:
@@ -462,8 +474,9 @@ def _bind_variant_field(ctxt, ast_field, idl_type):
             else:
                 yield alternative.cpp_type
 
-        if ast_field.type.variant_struct_type:
-            yield ast_field.type.variant_struct_type.cpp_type
+        if ast_field.type.variant_struct_types:
+            for variant_type in ast_field.type.variant_struct_types:
+                yield variant_type.cpp_type
 
     ast_field.type.cpp_type = f'stdx::variant<{", ".join(gen_cpp_types())}>'
 
@@ -474,7 +487,6 @@ def _bind_variant_field(ctxt, ast_field, idl_type):
 def _bind_command_type(ctxt, parsed_spec, command):
     # type: (errors.ParserContext, syntax.IDLSpec, syntax.Command) -> ast.Field
     """Bind the type field in a command as the first field."""
-    # pylint: disable=too-many-branches,too-many-statements
     ast_field = ast.Field(command.file_name, command.line, command.column)
     ast_field.name = command.name
     ast_field.description = command.description
@@ -508,7 +520,6 @@ def _bind_command_type(ctxt, parsed_spec, command):
     if isinstance(base_type, syntax.Struct):
         _bind_struct_field(ctxt, ast_field, syntax_symbol)
     elif isinstance(base_type, syntax.VariantType):
-        # Arrays of variants aren't supported for now.
         assert isinstance(syntax_symbol, syntax.VariantType)
         _bind_variant_field(ctxt, ast_field, cast(syntax.VariantType, syntax_symbol))
     else:
@@ -667,7 +678,6 @@ def _validate_check_uniqueness(ctxt, access_checks):
 def _bind_access_check(ctxt, parsed_spec, command):
     # type: (errors.ParserContext, syntax.IDLSpec, syntax.Command) -> Optional[List[ast.AccessCheck]]
     """Bind the access_check field in a command."""
-    # pylint: disable=too-many-return-statements
 
     if not command.access_check:
         return None
@@ -747,16 +757,15 @@ def _validate_ignored_field(ctxt, field):
         ctxt.add_ignored_field_must_be_empty_error(field, field.name, "default")
 
 
-def _validate_field_of_type_struct(ctxt, field):
+def _validate_default_of_type_struct(ctxt, field):
     # type: (errors.ParserContext, Union[syntax.Field, ast.Field]) -> None
-    """Validate that for fields with a type of struct, no other properties are set."""
-    if field.default is not None:
-        ctxt.add_struct_field_must_be_empty_error(field, field.name, "default")
+    """Validate that for fields with a type of struct, the only default permitted is true, which causes it to be default-constructed."""
+    if (field.default is not None) and (field.default != "true"):
+        ctxt.add_struct_default_must_be_true_or_empty_error(field, field.name)
 
 
 def _validate_variant_type(ctxt, syntax_symbol, field):
     # type: (errors.ParserContext, syntax.VariantType, syntax.Field) -> None
-    # pylint: disable=unused-argument
     """Validate that this field is a proper variant type."""
 
     # Check for duplicate BSON serialization types.
@@ -781,7 +790,7 @@ def _validate_variant_type(ctxt, syntax_symbol, field):
         else:
             add_to_count(type_count, alternative.bson_serialization_type)
 
-    if syntax_symbol.variant_struct_type:
+    if syntax_symbol.variant_struct_types:
         type_count["object"] += 1
 
     for type_name, count in type_count.items():
@@ -792,7 +801,7 @@ def _validate_variant_type(ctxt, syntax_symbol, field):
         if count > 1:
             ctxt.add_variant_duplicate_types_error(syntax_symbol, field.name, f'array<{type_name}>')
 
-    types = len(syntax_symbol.variant_types) + (1 if syntax_symbol.variant_struct_type else 0)
+    types = len(syntax_symbol.variant_types) + len(syntax_symbol.variant_struct_types)
     if types < 2:
         ctxt.add_useless_variant_error(syntax_symbol)
 
@@ -833,8 +842,9 @@ def _validate_doc_sequence_field(ctxt, ast_field):
     assert ast_field.type.is_array
 
     # The only allowed BSON type for a doc_sequence field is "object"
-    if ast_field.type.bson_serialization_type != ['object']:
-        ctxt.add_bad_non_object_as_doc_sequence_error(ast_field, ast_field.name)
+    for serialization_type in ast_field.type.bson_serialization_type:
+        if serialization_type != 'object':
+            ctxt.add_bad_non_object_as_doc_sequence_error(ast_field, ast_field.name)
 
 
 def _normalize_method_name(cpp_type_name, cpp_method_name):
@@ -934,8 +944,8 @@ def _bind_validator(ctxt, validator):
     return ast_validator
 
 
-def _bind_condition(condition):
-    # type: (syntax.Condition) -> ast.Condition
+def _bind_condition(condition, condition_for):
+    # type: (syntax.Condition, str) -> ast.Condition
     """Bind a condition from the idl.syntax tree."""
 
     if not condition:
@@ -945,6 +955,14 @@ def _bind_condition(condition):
     ast_condition.expr = condition.expr
     ast_condition.constexpr = condition.constexpr
     ast_condition.preprocessor = condition.preprocessor
+
+    if condition.feature_flag:
+        assert condition_for == 'server_parameter'
+        ast_condition.feature_flag = condition.feature_flag
+
+    if condition.min_fcv:
+        assert condition_for == 'server_parameter'
+        ast_condition.min_fcv = condition.min_fcv
 
     return ast_condition
 
@@ -969,6 +987,8 @@ def _bind_type(idltype):
     ast_type.bindata_subtype = idltype.bindata_subtype
     ast_type.serializer = _normalize_method_name(idltype.cpp_type, idltype.serializer)
     ast_type.deserializer = _normalize_method_name(idltype.cpp_type, idltype.deserializer)
+    ast_type.deserialize_with_tenant = idltype.deserialize_with_tenant
+    ast_type.internal_only = idltype.internal_only
     return ast_type
 
 
@@ -980,7 +1000,6 @@ def _bind_field(ctxt, parsed_spec, field):
     - Create the idl.ast version from the idl.syntax tree.
     - Validate the resulting type is correct.
     """
-    # pylint: disable=too-many-branches,too-many-statements
     ast_field = ast.Field(field.file_name, field.line, field.column)
     ast_field.name = field.name
     ast_field.description = field.description
@@ -990,7 +1009,9 @@ def _bind_field(ctxt, parsed_spec, field):
     ast_field.constructed = field.constructed
     ast_field.comparison_order = field.comparison_order
     ast_field.non_const_getter = field.non_const_getter
-    ast_field.unstable = field.unstable
+    # Ignore the 'unstable' field since it's deprecated by the 'stability' field and only there at parsing level
+    # to provide compatibility support.
+    ast_field.stability = field.stability
     ast_field.always_serialize = field.always_serialize
 
     ast_field.cpp_name = field.name
@@ -1045,9 +1066,9 @@ def _bind_field(ctxt, parsed_spec, field):
         ast_field.type.serializer = enum_type_info.get_enum_serializer_name()
         ast_field.type.deserializer = enum_type_info.get_enum_deserializer_name()
     elif isinstance(base_type, syntax.VariantType):
-        # Arrays of variants aren't supported for now.
-        assert isinstance(syntax_symbol, syntax.VariantType)
-        _bind_variant_field(ctxt, ast_field, cast(syntax.VariantType, syntax_symbol))
+        # syntax_symbol is an Array for arrays of variant.
+        assert isinstance(syntax_symbol, (syntax.ArrayType, syntax.VariantType))
+        _bind_variant_field(ctxt, ast_field, syntax_symbol)
     else:
         assert isinstance(base_type, syntax.Type)
 
@@ -1145,6 +1166,9 @@ def _bind_chained_struct(ctxt, parsed_spec, ast_struct, chained_struct):
     # Merge all the fields from resolved struct into this ast struct.
     for field in struct.fields or []:
         ast_field = _bind_field(ctxt, parsed_spec, field)
+        # Don't use internal fields in chained types, stick to local access only
+        if ast_field.type.internal_only:
+            continue
         if ast_field and not _is_duplicate_field(ctxt, chained_struct.name, ast_struct.fields,
                                                  ast_field):
 
@@ -1301,7 +1325,10 @@ def _bind_server_parameter_with_storage(ctxt, ast_param, param):
             ctxt.add_server_parameter_invalid_attr(param, field, 'bound')
             return None
 
-    ast_param.cpp_vartype = param.cpp_vartype
+    if param.set_at == ['cluster']:
+        ast_param.cpp_vartype = f'TenantIdMap<{param.cpp_vartype}>'
+    else:
+        ast_param.cpp_vartype = param.cpp_vartype
     ast_param.cpp_varname = param.cpp_varname
     ast_param.on_update = param.on_update
 
@@ -1361,7 +1388,7 @@ def _bind_server_parameter(ctxt, param):
     ast_param = ast.ServerParameter(param.file_name, param.line, param.column)
     ast_param.name = param.name
     ast_param.description = param.description
-    ast_param.condition = _bind_condition(param.condition)
+    ast_param.condition = _bind_condition(param.condition, condition_for='server_parameter')
     ast_param.redact = param.redact
     ast_param.test_only = param.test_only
     ast_param.deprecated_name = param.deprecated_name
@@ -1450,7 +1477,6 @@ def _bind_config_option(ctxt, globals_spec, option):
     # type: (errors.ParserContext, syntax.Global, syntax.ConfigOption) -> ast.ConfigOption
     """Bind a config setting."""
 
-    # pylint: disable=too-many-branches,too-many-statements,too-many-return-statements
     node = ast.ConfigOption(option.file_name, option.line, option.column)
 
     if _is_invalid_config_short_name(option.short_name or ''):
@@ -1488,7 +1514,7 @@ def _bind_config_option(ctxt, globals_spec, option):
     node.arg_vartype = option.arg_vartype
     node.cpp_vartype = option.cpp_vartype
     node.cpp_varname = option.cpp_varname
-    node.condition = _bind_condition(option.condition)
+    node.condition = _bind_condition(option.condition, condition_for='config')
 
     node.requires = option.requires
     node.conflicts = option.conflicts
@@ -1573,12 +1599,6 @@ def bind(parsed_spec):
     for struct in parsed_spec.symbols.structs:
         if not struct.imported:
             bound_spec.structs.append(_bind_struct(ctxt, parsed_spec, struct))
-
-    for arg_list in parsed_spec.symbols.generic_argument_lists:
-        bound_spec.generic_argument_lists.append(_bind_generic_argument_list(arg_list))
-
-    for field_list in parsed_spec.symbols.generic_reply_field_lists:
-        bound_spec.generic_reply_field_lists.append(_bind_generic_reply_field_list(field_list))
 
     for feature_flag in parsed_spec.feature_flags:
         bound_spec.server_parameters.append(_bind_feature_flags(ctxt, feature_flag))

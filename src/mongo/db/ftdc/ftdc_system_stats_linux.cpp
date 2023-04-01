@@ -33,6 +33,7 @@
 
 #include <memory>
 #include <string>
+#include <sys/resource.h>
 #include <vector>
 
 #include "mongo/base/status.h"
@@ -40,6 +41,8 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/ftdc/collector.h"
 #include "mongo/db/ftdc/controller.h"
+#include "mongo/util/errno_util.h"
+#include "mongo/util/functional.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/procparser.h"
 
@@ -155,6 +158,16 @@ public:
                 &subObjBuilder);
             subObjBuilder.doneFast();
         }
+
+        {
+            BSONObjBuilder subObjBuilder(builder.subobjStart("files"_sd));
+            processStatusErrors(
+                procparser::parseProcSysFsFileNrFile("/proc/sys/fs/file-nr"_sd,
+                                                     procparser::FileNrKey::kFileHandlesInUse,
+                                                     &subObjBuilder),
+                &subObjBuilder);
+            subObjBuilder.doneFast();
+        }
     }
 
 private:
@@ -165,10 +178,77 @@ private:
     std::vector<StringData> _disksStringData;
 };
 
+class SimpleFunctionCollector final : public FTDCCollectorInterface {
+public:
+    SimpleFunctionCollector(StringData name,
+                            unique_function<void(OperationContext*, BSONObjBuilder&)> collectFn)
+        : _name(name.toString()), _collectFn(std::move(collectFn)) {}
+
+    void collect(OperationContext* opCtx, BSONObjBuilder& builder) override {
+        _collectFn(opCtx, builder);
+    }
+
+    std::string name() const override {
+        return _name;
+    }
+
+private:
+    std::string _name;
+    unique_function<void(OperationContext*, BSONObjBuilder&)> _collectFn;
+};
+
+
+void collectUlimit(int resource, StringData resourceName, BSONObjBuilder& builder) {
+
+    struct rlimit rlim;
+
+    BSONObjBuilder subObjBuilder(builder.subobjStart(resourceName));
+
+    if (!getrlimit(resource, &rlim)) {
+        subObjBuilder.append("soft", static_cast<int64_t>(rlim.rlim_cur));
+        subObjBuilder.append("hard", static_cast<int64_t>(rlim.rlim_max));
+    } else {
+        auto ec = lastSystemError();
+
+        subObjBuilder.append("error", errorMessage(ec));
+    }
+}
+
+void collectUlimits(OperationContext*, BSONObjBuilder& builder) {
+    collectUlimit(RLIMIT_CPU, "cpuTime_secs"_sd, builder);
+    collectUlimit(RLIMIT_FSIZE, "fileSize_blocks"_sd, builder);
+    collectUlimit(RLIMIT_DATA, "dataSegSize_kb"_sd, builder);
+    collectUlimit(RLIMIT_STACK, "stackSize_kb"_sd, builder);
+    collectUlimit(RLIMIT_CORE, "coreFileSize_blocks"_sd, builder);
+    collectUlimit(RLIMIT_RSS, "residentSize_kb"_sd, builder);
+    collectUlimit(RLIMIT_NOFILE, "fileDescriptors"_sd, builder);
+    collectUlimit(RLIMIT_AS, "addressSpace_kb"_sd, builder);
+    collectUlimit(RLIMIT_NPROC, "processes"_sd, builder);
+    collectUlimit(RLIMIT_MEMLOCK, "memLock_kb"_sd, builder);
+    collectUlimit(RLIMIT_LOCKS, "fileLocks"_sd, builder);
+    collectUlimit(RLIMIT_SIGPENDING, "pendingSignals"_sd, builder);
+}
+
 }  // namespace
+
 
 void installSystemMetricsCollector(FTDCController* controller) {
     controller->addPeriodicCollector(std::make_unique<LinuxSystemMetricsCollector>());
+
+    // Total max open files is only collected on rotate, since it changes infrequently
+    controller->addOnRotateCollector(std::make_unique<SimpleFunctionCollector>(
+        "sysMaxOpenFiles", [](OperationContext* ctx, BSONObjBuilder& builder) {
+            auto status = procparser::parseProcSysFsFileNrFile(
+                "/proc/sys/fs/file-nr", procparser::FileNrKey::kMaxFileHandles, &builder);
+            // Handle errors here similarly to system stats.
+            if (!status.isOK()) {
+                builder.append("error", status.toString());
+            }
+        }));
+
+    // Collect ULimits settings on rotation.
+    controller->addOnRotateCollector(
+        std::make_unique<SimpleFunctionCollector>("ulimits", collectUlimits));
 }
 
 }  // namespace mongo

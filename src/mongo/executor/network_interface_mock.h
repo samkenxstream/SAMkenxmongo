@@ -41,6 +41,7 @@
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/transport/mock_session.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/time_support.h"
@@ -105,7 +106,7 @@ public:
     std::string getDiagnosticString() override;
 
     Counters getCounters() const override {
-        return Counters();
+        return _counters;
     }
 
     void startup() override;
@@ -147,6 +148,19 @@ public:
     void dropConnections(const HostAndPort&) override {}
 
     void testEgress(const HostAndPort&, transport::ConnectSSLMode, Milliseconds, Status) override {}
+
+    using LeasedStreamMaker =
+        std::function<std::unique_ptr<NetworkInterface::LeasedStream>(HostAndPort)>;
+    void setLeasedStreamMaker(LeasedStreamMaker lsm) {
+        _leasedStreamMaker = std::move(lsm);
+    }
+
+    SemiFuture<std::unique_ptr<NetworkInterface::LeasedStream>> leaseStream(
+        const HostAndPort& hp, transport::ConnectSSLMode, Milliseconds) override {
+        invariant(_leasedStreamMaker,
+                  "Tried to lease a stream from NetworkInterfaceMock without providing one");
+        return (*_leasedStreamMaker)(hp);
+    }
 
     ////////////////////////////////////////////////////////////////////////////////
     //
@@ -446,6 +460,14 @@ private:
 
     // The handshake replies set for each host.
     stdx::unordered_map<HostAndPort, RemoteCommandResponse> _handshakeReplies;  // (M)
+
+    // Track statistics about processed responses. Right now, the mock tracks the total responses
+    // processed with sent, the number of OK responses with succeeded, non-OK responses with failed,
+    // and cancellation errors with canceled. It does not track the timedOut or failedRemotely
+    // statistics.
+    Counters _counters;
+
+    boost::optional<LeasedStreamMaker> _leasedStreamMaker;
 };
 
 /**
@@ -516,6 +538,10 @@ public:
      */
     bool hasReadyRequest() const {
         return !_isProcessing && !_isFinished;
+    }
+
+    bool isFinished() const {
+        return _isFinished;
     }
 
     /**

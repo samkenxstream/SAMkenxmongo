@@ -69,12 +69,14 @@ bool InternalSchemaXorMatchExpression::matchesSingleElement(const BSONElement& e
 void InternalSchemaXorMatchExpression::debugString(StringBuilder& debug,
                                                    int indentationLevel) const {
     _debugAddSpace(debug, indentationLevel);
-    debug << kName + "\n";
+    debug << kName;
+    _debugStringAttachTagInfo(&debug);
     _debugList(debug, indentationLevel);
 }
 
-void InternalSchemaXorMatchExpression::serialize(BSONObjBuilder* out, bool includePath) const {
+void InternalSchemaXorMatchExpression::serialize(BSONObjBuilder* out,
+                                                 SerializationOptions opts) const {
     BSONArrayBuilder arrBob(out->subarrayStart(kName));
-    _listToBSON(&arrBob, includePath);
+    _listToBSON(&arrBob, opts);
 }
 }  //  namespace mongo

@@ -56,23 +56,26 @@ public:
         ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
         boost::optional<BSONObj> readConcern = boost::none) override;
 
+    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+        const AggregateCommandRequest& aggRequest,
+        Pipeline* pipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        boost::optional<BSONObj> shardCursorsSortSpec = boost::none,
+        ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
+        boost::optional<BSONObj> readConcern = boost::none) override;
+
     BSONObj preparePipelineAndExplain(Pipeline* ownedPipeline, ExplainOptions::Verbosity verbosity);
 
-    std::unique_ptr<ShardFilterer> getShardFilterer(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx) const override {
-        // We'll never do shard filtering on a standalone.
-        return nullptr;
-    }
-
-    boost::optional<ChunkVersion> refreshAndGetCollectionVersion(
+    boost::optional<ShardVersion> refreshAndGetCollectionVersion(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const NamespaceString& nss) const final {
         return boost::none;  // Nothing is sharded here.
     }
 
-    virtual void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                              const NamespaceString& nss,
-                                              ChunkVersion targetCollectionVersion) const override {
+    virtual void checkRoutingInfoEpochOrThrow(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const NamespaceString& nss,
+        ChunkVersion targetCollectionPlacementVersion) const override {
         uasserted(51020, "unexpected request to consult sharding catalog on non-shardsvr");
     }
 
@@ -102,13 +105,15 @@ public:
 
     void renameIfOptionsAndIndexesHaveNotChanged(
         OperationContext* opCtx,
-        const BSONObj& renameCommandObj,
+        const NamespaceString& sourceNs,
         const NamespaceString& targetNs,
+        bool dropTarget,
+        bool stayTemp,
         const BSONObj& originalCollectionOptions,
         const std::list<BSONObj>& originalIndexes) override;
 
     void createCollection(OperationContext* opCtx,
-                          const std::string& dbName,
+                          const DatabaseName& dbName,
                           const BSONObj& cmdObj) override;
 
     void dropCollection(OperationContext* opCtx, const NamespaceString& collection) override;

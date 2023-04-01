@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -39,22 +38,26 @@
 #include "mongo/base/init.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/multi_key_path_tracker.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
+
 
 namespace mongo {
 MONGO_FAIL_POINT_DEFINE(skipUpdateIndexMultikey);
@@ -69,9 +72,9 @@ IndexCatalogEntryImpl::IndexCatalogEntryImpl(OperationContext* const opCtx,
     : _ident(ident),
       _descriptor(std::move(descriptor)),
       _catalogId(collection->getCatalogId()),
-      _ordering(Ordering::make(_descriptor->keyPattern())),
       _isReady(false),
       _isFrozen(isFrozen),
+      _shouldValidateDocument(false),
       _isDropped(false),
       _indexOffset(invariantStatusOK(
           collection->checkMetaDataForIndex(_descriptor->indexName(), _descriptor->infoObj()))) {
@@ -79,7 +82,13 @@ IndexCatalogEntryImpl::IndexCatalogEntryImpl(OperationContext* const opCtx,
     _descriptor->_entry = this;
     _isReady = collection->isIndexReady(_descriptor->indexName());
 
-    auto nss = DurableCatalog::get(opCtx)->getEntry(_catalogId).tenantNs.getNss();
+    // For time-series collections, we need to check that the indexed metric fields do not have
+    // expanded array values.
+    _shouldValidateDocument =
+        collection->getTimeseriesOptions() &&
+        timeseries::doesBucketsIndexIncludeMeasurement(
+            opCtx, collection->ns(), *collection->getTimeseriesOptions(), _descriptor->infoObj());
+
     const BSONObj& collation = _descriptor->collation();
     if (!collation.isEmpty()) {
         auto statusWithCollator =
@@ -95,7 +104,7 @@ IndexCatalogEntryImpl::IndexCatalogEntryImpl(OperationContext* const opCtx,
         const BSONObj& filter = _descriptor->partialFilterExpression();
 
         _expCtxForFilter = make_intrusive<ExpressionContext>(
-            opCtx, CollatorInterface::cloneCollator(_collator.get()), nss);
+            opCtx, CollatorInterface::cloneCollator(_collator.get()), collection->ns());
 
         // Parsing the partial filter expression is not expected to fail here since the
         // expression would have been successfully parsed upstream during index creation.
@@ -107,23 +116,26 @@ IndexCatalogEntryImpl::IndexCatalogEntryImpl(OperationContext* const opCtx,
         LOGV2_DEBUG(20350,
                     2,
                     "have filter expression for {namespace} {indexName} {filter}",
-                    "namespace"_attr = nss,
+                    logAttrs(collection->ns()),
                     "indexName"_attr = _descriptor->indexName(),
                     "filter"_attr = redact(filter));
     }
 }
 
-void IndexCatalogEntryImpl::init(std::unique_ptr<IndexAccessMethod> accessMethod) {
+void IndexCatalogEntryImpl::setAccessMethod(std::unique_ptr<IndexAccessMethod> accessMethod) {
     invariant(!_accessMethod);
     _accessMethod = std::move(accessMethod);
+    CollectionQueryInfo::computeUpdateIndexData(this, _accessMethod.get(), &_indexedPaths);
 }
 
 bool IndexCatalogEntryImpl::isReady(OperationContext* opCtx) const {
     // For multi-document transactions, we can open a snapshot prior to checking the
     // minimumSnapshotVersion on a collection.  This means we are unprotected from reading
     // out-of-sync index catalog entries.  To fix this, we uassert if we detect that the
-    // in-memory catalog is out-of-sync with the on-disk catalog.
-    if (opCtx->inMultiDocumentTransaction()) {
+    // in-memory catalog is out-of-sync with the on-disk catalog. This check is not necessary when
+    // point-in-time catalog lookups are enabled as the snapshot is always in sync.
+    if (opCtx->inMultiDocumentTransaction() &&
+        !feature_flags::gPointInTimeCatalogLookups.isEnabledAndIgnoreFCV()) {
         if (!isPresentInMySnapshot(opCtx) || isReadyInMySnapshot(opCtx) != _isReady) {
             uasserted(ErrorCodes::SnapshotUnavailable,
                       str::stream() << "Unable to read from a snapshot due to pending collection"
@@ -139,6 +151,10 @@ bool IndexCatalogEntryImpl::isReady(OperationContext* opCtx) const {
 bool IndexCatalogEntryImpl::isFrozen() const {
     invariant(!_isFrozen || !_isReady);
     return _isFrozen;
+}
+
+bool IndexCatalogEntryImpl::shouldValidateDocument() const {
+    return _shouldValidateDocument;
 }
 
 bool IndexCatalogEntryImpl::isMultikey(OperationContext* const opCtx,
@@ -157,13 +173,17 @@ MultikeyPaths IndexCatalogEntryImpl::getMultikeyPaths(OperationContext* opCtx,
 // ---
 
 void IndexCatalogEntryImpl::setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) {
-    if (!_minVisibleSnapshot || (newMinimumVisibleSnapshot > _minVisibleSnapshot.get())) {
+    if (!_minVisibleSnapshot || (newMinimumVisibleSnapshot > _minVisibleSnapshot.value())) {
         _minVisibleSnapshot = newMinimumVisibleSnapshot;
     }
 }
 
 void IndexCatalogEntryImpl::setIsReady(bool newIsReady) {
     _isReady = newIsReady;
+}
+
+void IndexCatalogEntryImpl::setIsFrozen(bool newIsFrozen) {
+    _isFrozen = newIsFrozen;
 }
 
 void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
@@ -317,12 +337,24 @@ Status IndexCatalogEntryImpl::_setMultikeyInMultiDocumentTransaction(
                 // may not have a stable timestamp. Therefore, we need to round up
                 // the multi-key write timestamp to the max of the three so that we don't write
                 // behind the oldest/stable timestamp. This code path is only hit during initial
-                // sync/recovery when reconstructing prepared transactions and so we don't expect
+                // sync/recovery when reconstructing prepared transactions, and so we don't expect
                 // the oldest/stable timestamp to advance concurrently.
+                //
+                // WiredTiger disallows committing at the stable timestamp to avoid confusion during
+                // checkpoints, to overcome that we allow setting the timestamp slightly after the
+                // prepared timestamp of the original transaction. This is currently not an issue as
+                // the index metadata state is read from in-memory cache and this is modifying the
+                // state on-disk from the _mdb_catalog document. To put in other words, multikey
+                // doesn't go backwards. This would be a problem if we move to a versioned catalog
+                // world as a different transaction could choose an earlier timestamp (i.e. the
+                // original transaction timestamp) and encounter an invalid system state where the
+                // document that enables multikey hasn't enabled it yet but is present in the
+                // collection. In other words, the index is not set for multikey but there is
+                // already data present that relies on it.
                 auto status = opCtx->recoveryUnit()->setTimestamp(std::max(
                     {recoveryPrepareOpTime.getTimestamp(),
                      opCtx->getServiceContext()->getStorageEngine()->getOldestTimestamp(),
-                     opCtx->getServiceContext()->getStorageEngine()->getStableTimestamp()}));
+                     opCtx->getServiceContext()->getStorageEngine()->getStableTimestamp() + 1}));
                 fassert(31164, status);
             } else {
                 // If there is no recovery prepare OpTime, then this node must be a primary. We
@@ -345,13 +377,23 @@ Status IndexCatalogEntryImpl::_setMultikeyInMultiDocumentTransaction(
 }
 
 std::shared_ptr<Ident> IndexCatalogEntryImpl::getSharedIdent() const {
-    return {shared_from_this(), _accessMethod->getIdentPtr()};  // aliasing constructor
+    return _accessMethod ? _accessMethod->getSharedIdent() : nullptr;
+}
+
+const Ordering& IndexCatalogEntryImpl::ordering() const {
+    return _descriptor->ordering();
+}
+
+void IndexCatalogEntryImpl::setIdent(std::shared_ptr<Ident> newIdent) {
+    if (!_accessMethod)
+        return;
+    _accessMethod->setIdent(std::move(newIdent));
 }
 
 // ----
 
 NamespaceString IndexCatalogEntryImpl::getNSSFromCatalog(OperationContext* opCtx) const {
-    return DurableCatalog::get(opCtx)->getEntry(_catalogId).tenantNs.getNss();
+    return DurableCatalog::get(opCtx)->getEntry(_catalogId).nss;
 }
 
 bool IndexCatalogEntryImpl::isReadyInMySnapshot(OperationContext* opCtx) const {
@@ -384,7 +426,7 @@ void IndexCatalogEntryImpl::_catalogSetMultikey(OperationContext* opCtx,
         LOGV2_DEBUG(4718705,
                     1,
                     "Index set to multi key, clearing query plan cache",
-                    "namespace"_attr = collection->ns(),
+                    logAttrs(collection->ns()),
                     "keyPattern"_attr = _descriptor->keyPattern());
         CollectionQueryInfo::get(collection).clearQueryCacheForSetMultikey(collection);
     }

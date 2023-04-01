@@ -29,9 +29,11 @@
 
 #include "mongo/db/catalog/index_repair.h"
 #include "mongo/base/status_with.h"
+#include "mongo/db/catalog/collection_write_path.h"
+#include "mongo/db/catalog/collection_yield_restore.h"
 #include "mongo/db/catalog/validate_state.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/logv2/log_debug.h"
 
@@ -41,11 +43,11 @@ namespace index_repair {
 StatusWith<int> moveRecordToLostAndFound(OperationContext* opCtx,
                                          const NamespaceString& nss,
                                          const NamespaceString& lostAndFoundNss,
-                                         RecordId dupRecord) {
+                                         const RecordId& dupRecord) {
     AutoGetCollection autoColl(opCtx, lostAndFoundNss, MODE_IX);
     auto catalog = CollectionCatalog::get(opCtx);
     auto originalCollection = catalog->lookupCollectionByNamespace(opCtx, nss);
-    CollectionPtr localCollection = catalog->lookupCollectionByNamespace(opCtx, lostAndFoundNss);
+    CollectionPtr localCollection(catalog->lookupCollectionByNamespace(opCtx, lostAndFoundNss));
 
     // Creates the collection if it doesn't exist.
     if (!localCollection) {
@@ -62,7 +64,8 @@ StatusWith<int> moveRecordToLostAndFound(OperationContext* opCtx,
                 // duplicate key errors on the _id value.
                 CollectionOptions collOptions;
                 collOptions.setNoIdIndex();
-                localCollection = db->createCollection(opCtx, lostAndFoundNss, collOptions);
+                localCollection =
+                    CollectionPtr(db->createCollection(opCtx, lostAndFoundNss, collOptions));
 
                 // Ensure the collection exists.
                 invariant(localCollection, lostAndFoundNss.ns());
@@ -74,6 +77,8 @@ StatusWith<int> moveRecordToLostAndFound(OperationContext* opCtx,
             return status;
         }
     }
+
+    localCollection.makeYieldable(opCtx, LockedCollectionYieldRestore(opCtx, localCollection));
 
     return writeConflictRetry(
         opCtx, "writeDupDocToLostAndFoundCollection", nss.ns(), [&]() -> StatusWith<int> {
@@ -88,8 +93,8 @@ StatusWith<int> moveRecordToLostAndFound(OperationContext* opCtx,
             }
 
             // Write document to lost_and_found collection and delete from original collection.
-            Status status =
-                localCollection->insertDocument(opCtx, InsertStatement(doc.value()), nullptr);
+            Status status = collection_internal::insertDocument(
+                opCtx, localCollection, InsertStatement(doc.value()), nullptr);
             if (!status.isOK()) {
                 return status;
             }
@@ -97,14 +102,15 @@ StatusWith<int> moveRecordToLostAndFound(OperationContext* opCtx,
             // CheckRecordId set to 'On' because we need _unindexKeys to confirm the record id of
             // this document matches the record id of the element it tries to unindex. This avoids
             // wrongly unindexing a document with the same _id.
-            originalCollection->deleteDocument(opCtx,
-                                               kUninitializedStmtId,
-                                               dupRecord,
-                                               nullptr /* opDebug */,
-                                               false /* fromMigrate */,
-                                               false /* noWarn */,
-                                               Collection::StoreDeletedDoc::Off,
-                                               CheckRecordId::On);
+            collection_internal::deleteDocument(opCtx,
+                                                CollectionPtr(originalCollection),
+                                                kUninitializedStmtId,
+                                                dupRecord,
+                                                nullptr /* opDebug */,
+                                                false /* fromMigrate */,
+                                                false /* noWarn */,
+                                                collection_internal::StoreDeletedDoc::Off,
+                                                CheckRecordId::On);
 
             wuow.commit();
             return docSize;
@@ -123,13 +129,19 @@ int repairMissingIndexEntry(OperationContext* opCtx,
     options.dupsAllowed = !index->descriptor()->unique();
     int64_t numInserted = 0;
 
+    Status insertStatus = Status::OK();
     writeConflictRetry(opCtx, "insertingMissingIndexEntries", nss.ns(), [&] {
         WriteUnitOfWork wunit(opCtx);
-        // Ignore return status because we will use numInserted to verify success.
-        accessMethod
-            ->insertKeysAndUpdateMultikeyPaths(
-                opCtx, coll, {ks}, {}, {}, options, nullptr, &numInserted)
-            .ignore();
+        insertStatus =
+            accessMethod->insertKeysAndUpdateMultikeyPaths(opCtx,
+                                                           coll,
+                                                           {ks},
+                                                           {},
+                                                           {},
+                                                           options,
+                                                           nullptr,
+                                                           &numInserted,
+                                                           IncludeDuplicateRecordId::kOn);
         wunit.commit();
     });
 
@@ -138,11 +150,14 @@ int repairMissingIndexEntry(OperationContext* opCtx,
     // The insertKeysAndUpdateMultikeyPaths() may fail when there are missing index entries for
     // duplicate documents.
     if (numInserted > 0) {
+        invariant(numInserted == 1);
         auto& indexResults = results->indexResultsMap[indexName];
         indexResults.keysTraversed += numInserted;
         results->numInsertedMissingIndexEntries += numInserted;
         results->repaired = true;
     } else {
+        invariant(insertStatus.code() == ErrorCodes::DuplicateKey);
+
         RecordId rid;
         if (keyFormat == KeyFormat::Long) {
             rid = KeyString::decodeRecordIdLongAtEnd(ks.getBuffer(), ks.getSize());
@@ -151,19 +166,46 @@ int repairMissingIndexEntry(OperationContext* opCtx,
             rid = KeyString::decodeRecordIdStrAtEnd(ks.getBuffer(), ks.getSize());
         }
 
+        auto dupKeyInfo = insertStatus.extraInfo<DuplicateKeyErrorInfo>();
+        auto dupKeyRid = dupKeyInfo->getDuplicateRid();
+
+        // Determine which document to remove, based on which rid is older.
+        RecordId& ridToMove = rid;
+        if (dupKeyRid && *dupKeyRid < rid) {
+            ridToMove = *dupKeyRid;
+        }
+
         // Move the duplicate document of the missing index entry from the record store to the lost
         // and found.
         Snapshotted<BSONObj> doc;
-        if (coll->findDoc(opCtx, rid, &doc)) {
-            const NamespaceString lostAndFoundNss = NamespaceString(
-                NamespaceString::kLocalDb, "lost_and_found." + coll->uuid().toString());
+        if (coll->findDoc(opCtx, ridToMove, &doc)) {
 
-            auto moveStatus = moveRecordToLostAndFound(opCtx, nss, lostAndFoundNss, rid);
+            const NamespaceString lostAndFoundNss =
+                NamespaceString::makeLocalCollection("lost_and_found." + coll->uuid().toString());
+
+            auto moveStatus = moveRecordToLostAndFound(opCtx, nss, lostAndFoundNss, ridToMove);
+
             if (moveStatus.isOK() && (moveStatus.getValue() > 0)) {
                 auto& indexResults = results->indexResultsMap[indexName];
                 indexResults.keysRemovedFromRecordStore++;
                 results->numDocumentsMovedToLostAndFound++;
                 results->repaired = true;
+
+                // If we moved the record that was already in the index, now neither of the
+                // duplicate records is in the index, so we need to add the newer record to the
+                // index.
+                if (dupKeyRid && ridToMove == *dupKeyRid) {
+                    writeConflictRetry(opCtx, "insertingMissingIndexEntries", nss.ns(), [&] {
+                        WriteUnitOfWork wunit(opCtx);
+                        insertStatus = accessMethod->insertKeysAndUpdateMultikeyPaths(
+                            opCtx, coll, {ks}, {}, {}, options, nullptr, nullptr);
+                        wunit.commit();
+                    });
+                    if (!insertStatus.isOK()) {
+                        results->errors.push_back(str::stream() << "unable to insert record " << rid
+                                                                << " to " << indexName);
+                    }
+                }
             } else {
                 results->errors.push_back(str::stream() << "unable to move record " << rid << " to "
                                                         << lostAndFoundNss.ns());

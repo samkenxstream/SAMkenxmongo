@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/repl/insert_group.h"
+#include "mongo/stdx/unordered_map.h"
 
 namespace mongo {
 class CollatorInterface;
@@ -50,13 +51,10 @@ public:
     };
 
     CollectionProperties getCollectionProperties(OperationContext* opCtx,
-                                                 const StringMapHashedKey& ns);
+                                                 const NamespaceString& nss);
 
 private:
-    CollectionProperties getCollectionPropertiesImpl(OperationContext* opCtx,
-                                                     const NamespaceString& nss);
-
-    StringMap<CollectionProperties> _cache;
+    stdx::unordered_map<NamespaceString, CollectionProperties> _cache;
 };
 
 /**
@@ -66,48 +64,142 @@ private:
 class OplogApplierUtils {
 public:
     /**
-     * Specially sort collections that are $cmd first, before everything else.  This will
-     * move commands with the special $cmd collection name to the beginning, rather than sorting
-     * them potentially in the middle of the sorted vector of insert/update/delete ops.
-     * This special sort behavior is required because DDL operations need to run before
-     * create/update/delete operations in a multi-doc transaction.
+     * Sort operations by their namespaces. There are some special rules for sorting:
+     *
+     * 1. Prepared transaction commands (prepare/commit/abort) act as delimiters, which
+     *    creates partitions in the ops vector so that any reordering can only happen
+     *    within each partition but not across partitions.
+     * 2. Within each partition, DDL ops (with the '$cmd' collection name) are ordered
+     *    before all other CRUD ops since DDL ops need to be run before CRUD ops.
+     *
+     * As an example, the right side below is a possible output after calling this:
+     * [                                         [
+     *     insert(ns2, docA),                        create(ns1),          -
+     *     create(ns1),                              insert(ns1, docB),    |
+     *     insert(ns1, docB),          sort          insert(ns1, docC),    |- sorted
+     *     update(ns2, docA),       ==========>      insert(ns2, docA),    |
+     *     insert(ns1, docC),                        update(ns2, docA),    -
+     *     prepare(sess1, txn1),                     prepare(sess1, txn1),
+     *     insert(ns1, docD),                        insert(ns1, docD),    -
+     *     delete(ns2, docA),                        update(ns1, docB),    |- sorted
+     *     update(ns1, docB),                        delete(ns2, docA),    -
+     * ]                                         ]
      */
-    static void stableSortByNamespace(std::vector<const OplogEntry*>* oplogEntryPointers);
+    static void stableSortByNamespace(std::vector<ApplierOperation>* ops);
 
     /**
-     * Updates a CRUD op's hash and isForCappedCollection field if necessary.
-     */
-    static void processCrudOp(OperationContext* opCtx,
-                              OplogEntry* op,
-                              uint32_t* hash,
-                              StringMapHashedKey* hashedNs,
-                              CachedCollectionProperties* collPropertiesCache);
-
-
-    /**
-     * Adds a single oplog entry to the appropriate writer vector.  Returns the index of the
+     * Adds a single oplog entry to the appropriate writer vector. Returns the index of the
      * writer vector the entry was written to.
      */
     static uint32_t addToWriterVector(OperationContext* opCtx,
                                       OplogEntry* op,
-                                      std::vector<std::vector<const OplogEntry*>>* writerVectors,
+                                      std::vector<std::vector<ApplierOperation>>* writerVectors,
                                       CachedCollectionProperties* collPropertiesCache,
                                       boost::optional<uint32_t> forceWriterId = boost::none);
+
     /**
-     * Adds a set of derivedOps to writerVectors.
+     * Adds a set of derivedOps to writerVectors. For ops derived from prepared transactions, the
+     * addDerivedPrepares() variant should be used.
+     *
      * If `serial` is true, assign all derived operations to the writer vector corresponding to the
      * hash of the first operation in `derivedOps`.
      */
     static void addDerivedOps(OperationContext* opCtx,
                               std::vector<OplogEntry>* derivedOps,
-                              std::vector<std::vector<const OplogEntry*>>* writerVectors,
+                              std::vector<std::vector<ApplierOperation>>* writerVectors,
                               CachedCollectionProperties* collPropertiesCache,
                               bool serial);
 
     /**
+     * Adds a set of derived prepared transaction operations to writerVectors.
+     *
+     * The prepareOp and derivedOps are inputs that we use to generate ApplierOperation's to be
+     * added to the writerVectors. The derivedOps contains all the CRUD ops inside the applyOps
+     * part of the prepareOp. When this function finishes the writerVectors may look like this:
+     *
+     * ========================== for non-empty prepared transaction ==========================
+     * writer vector 1: [ ]
+     * writer vector 2: [
+     *     ApplierOperation{
+     *         op: prepareOp,
+     *         instruction: applySplitPreparedTxnOp,
+     *         subSession: <split_session_id_1>,
+     *         splitPrepareOps: [ crud_op_1, crud_op_3 ],
+     *     },
+     * ]
+     * writer vector 3: [
+     *     // This op should already exist in the writerVector prior to this function call.
+     *     ApplierOperation{ op: <config.transaction_update_op>, instruction: applyOplogEntry },
+     * ]
+     * writer vector 4: [
+     *     ApplierOperation{
+     *         op: prepareOp,
+     *         instruction: applySplitPreparedTxnOp,
+     *         subSession: <split_session_id_2>,
+     *         splitPrepareOps: [ crud_op_2, crud_op_4 ],
+     *     },
+     * ]
+     * ============================ for empty prepared transaction ============================
+     * writer vector 1: [ ]
+     * writer vector 2: [
+     *     // This op should already exist in the writerVector prior to this function call.
+     *     ApplierOperation{ op: <config.transaction_update_op>, instruction: applyOplogEntry },
+     * ]
+     * writer vector 3: [ ]
+     * writer vector 4: [
+     *     // The splitPrepareOps list is made empty, which we can still correctly apply.
+     *     ApplierOperation{
+     *         op: <original_prepare_op>,
+     *         instruction: applySplitPreparedTxnOp,
+     *         subSession: <split_session_id_1>,
+     *         splitPrepareOps: [ ],
+     *     },
+     * ]
+     */
+    static void addDerivedPrepares(OperationContext* opCtx,
+                                   OplogEntry* prepareOp,
+                                   std::vector<OplogEntry>* derivedOps,
+                                   std::vector<std::vector<ApplierOperation>>* writerVectors,
+                                   CachedCollectionProperties* collPropertiesCache);
+
+    /**
+     * Adds commit or abort transaction operations to the writerVectors.
+     *
+     * The commitOrAbortOp is the input that we use to generate ApplierOperation's to be added
+     * to those writerVectors that previously got assigned the prepare ops. When this function
+     * finishes the writerVectors may look like this:
+     *
+     * writer vector 1: [ ]
+     * writer vector 2: [
+     *     ApplierOperation{
+     *         op: commitOrAbortOp,
+     *         instruction: applySplitPreparedTxnOp,
+     *         subSession: <split_session_id_1>,
+     *         splitPrepareOps: [ ],
+     *     },
+     * ]
+     * writer vector 3: [
+     *     // This op should already exist in the writerVector prior to this function call.
+     *     ApplierOperation{ op: <config.transaction_update_op>, instruction: applyOplogEntry },
+     * ]
+     * writer vector 4: [
+     *     ApplierOperation{
+     *         op: commitOrAbortOp,
+     *         instruction: applySplitPreparedTxnOp,
+     *         subSession: <split_session_id_2>,
+     *         splitPrepareOps: [ ],
+     *     },
+     * ]
+     */
+    static void addDerivedCommitsOrAborts(OperationContext* opCtx,
+                                          OplogEntry* commitOrAbortOp,
+                                          std::vector<std::vector<ApplierOperation>>* writerVectors,
+                                          CachedCollectionProperties* collPropertiesCache);
+
+    /**
      * Returns the namespace string for this oplogEntry; if it has a UUID it looks up the
-     * corresponding namespace and returns it, otherwise it returns the oplog entry 'nss'.  If there
-     * is a UUID and no namespace with that ID is found, throws NamespaceNotFound.
+     * corresponding namespace and returns it, otherwise it returns the oplog entry 'nss'.  If
+     * there is a UUID and no namespace with that ID is found, throws NamespaceNotFound.
      */
     static NamespaceString parseUUIDOrNs(OperationContext* opCtx, const OplogEntry& oplogEntry);
 
@@ -135,7 +227,7 @@ public:
      */
     static Status applyOplogBatchCommon(
         OperationContext* opCtx,
-        std::vector<const OplogEntry*>* ops,
+        std::vector<ApplierOperation>* ops,
         OplogApplication::Mode oplogApplicationMode,
         bool allowNamespaceNotFoundErrorsOnCrudOps,
         bool isDataConsistent,

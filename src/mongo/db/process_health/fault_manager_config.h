@@ -68,7 +68,7 @@ static const StringData FaultFacetTypeStrings[] = {
 FaultFacetType toFaultFacetType(HealthObserverTypeEnum type);
 
 
-static const StringData FaultFacetType_serializer(const FaultFacetType value) {
+static StringData FaultFacetType_serializer(const FaultFacetType value) {
     return FaultFacetTypeStrings[static_cast<int>(value)];
 }
 
@@ -117,7 +117,7 @@ public:
 
                 auto x = intensities->_data->getValues();
                 if (x) {
-                    for (auto setting : *x) {
+                    for (const auto& setting : *x) {
                         if (setting.getType() == observerType) {
                             return setting.getIntensity();
                         }

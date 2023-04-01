@@ -77,6 +77,9 @@
         # Exclude last-continuous specific tests
         - jstests/multiVersion/targetedTestsLastContinuousFeatures/*.js
 
+        # Exclude last-lts specific tests
+        - jstests/multiVersion/targetedTestsLastLtsFeatures/*.js
+
         # TODO: SERVER-21578
         - jstests/multiVersion/genericSetFCVUsage/balancer_multiVersion_detect.js
 
@@ -109,6 +112,7 @@
 
         # Skip any tests that run with auth explicitly.
         - jstests/multiVersion/genericBinVersion/load_keys_on_upgrade.js
+      exclude_with_any_tags:
 
 - name: multiversion_sanity_check_selector
   value:
@@ -125,7 +129,6 @@
         - multiversion_incompatible
         - backport_required_multiversion
         - replica_sets_multiversion_backport_required_multiversion
-        - disabled_due_to_server_60490
       exclude_files:
         - jstests/replsets/initial_sync_rename_collection.js
         - jstests/replsets/initial_sync_drop_collection.js
@@ -194,7 +197,6 @@
         - multiversion_incompatible
         - backport_required_multiversion
         - replica_sets_multiversion_backport_required_multiversion
-        - disabled_due_to_server_60490
       exclude_files:
         - jstests/sharding/**/libs/**/*.js
         # Enable when 4.6 becomes last stable
@@ -203,9 +205,6 @@
         # TODO SERVER-46040: Enable when SERVER-46040 is backported
         - jstests/sharding/drop_indexes_with_stale_config_error.js
         - jstests/sharding/query/merge_write_concern.js
-        # TODO (SERVER-64908): Enable lookup_graph_lookup_foreign_becomes_sharded.js in the
-        # sharding_multiversion suite
-        - jstests/sharding/query/lookup_graph_lookup_foreign_becomes_sharded.js
 
 - name: sharding_multiversion_testdata_last_lts
   value:

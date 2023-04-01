@@ -4,6 +4,8 @@ import os
 import os.path
 import time
 import shutil
+import uuid
+
 import yaml
 
 import pymongo
@@ -15,13 +17,15 @@ import buildscripts.resmokelib.testing.fixtures.interface as interface
 class MongoDFixture(interface.Fixture):
     """Fixture which provides JSTests with a standalone mongod to run against."""
 
-    def __init__(  # pylint: disable=too-many-arguments
-            self, logger, job_num, fixturelib, mongod_executable=None, mongod_options=None,
-            add_feature_flags=False, dbpath_prefix=None, preserve_dbpath=False, port=None):
+    def __init__(self, logger, job_num, fixturelib, mongod_executable=None, mongod_options=None,
+                 add_feature_flags=False, dbpath_prefix=None, preserve_dbpath=False, port=None):
         """Initialize MongoDFixture with different options for the mongod process."""
         interface.Fixture.__init__(self, logger, job_num, fixturelib, dbpath_prefix=dbpath_prefix)
         self.mongod_options = self.fixturelib.make_historic(
             self.fixturelib.default_if_none(mongod_options, {}))
+
+        if "set_parameters" not in self.mongod_options:
+            self.mongod_options["set_parameters"] = {}
 
         if add_feature_flags:
             for ff in self.config.ENABLED_FEATURE_FLAGS:
@@ -52,6 +56,11 @@ class MongoDFixture(interface.Fixture):
         self.port = port or fixturelib.get_next_port(job_num)
         self.mongod_options["port"] = self.port
 
+        # Always log backtraces to a file in the dbpath in our testing.
+        backtrace_log_file_name = os.path.join(self.get_dbpath_prefix(),
+                                               uuid.uuid4().hex + ".stacktrace")
+        self.mongod_options["set_parameters"]["backtraceLogFile"] = backtrace_log_file_name
+
     def setup(self):
         """Set up the mongod."""
         if not self.preserve_dbpath and os.path.lexists(self._dbpath):
@@ -61,7 +70,8 @@ class MongoDFixture(interface.Fixture):
 
         launcher = MongodLauncher(self.fixturelib)
         # Second return val is the port, which we ignore because we explicitly created the port above.
-        # The port is used to set other mongod_option's here: https://github.com/mongodb/mongo/blob/532a6a8ae7b8e7ab5939e900759c00794862963d/buildscripts/resmokelib/testing/fixtures/replicaset.py#L136
+        # The port is used to set other mongod_option's here:
+        # https://github.com/mongodb/mongo/blob/532a6a8ae7b8e7ab5939e900759c00794862963d/buildscripts/resmokelib/testing/fixtures/replicaset.py#L136
         mongod, _ = launcher.launch_mongod_program(self.logger, self.job_num,
                                                    executable=self.mongod_executable,
                                                    mongod_options=self.mongod_options)
@@ -138,7 +148,6 @@ class MongoDFixture(interface.Fixture):
         exit_code = self.mongod.wait()
 
         # Python's subprocess module returns negative versions of system calls.
-        # pylint: disable=invalid-unary-operand-type
         if exit_code == 0 or (mode is not None and exit_code == -(mode.value)):
             self.logger.info("Successfully stopped the mongod on port {:d}.".format(self.port))
         else:
@@ -158,6 +167,10 @@ class MongoDFixture(interface.Fixture):
 
     def get_node_info(self):
         """Return a list of NodeInfo objects."""
+        if self.mongod is None:
+            self.logger.warning("The mongod fixture has not been set up yet.")
+            return []
+
         info = interface.NodeInfo(full_name=self.logger.full_name, name=self.logger.name,
                                   port=self.port, pid=self.mongod.pid)
         return [info]
@@ -168,7 +181,7 @@ class MongoDFixture(interface.Fixture):
 
     def get_driver_connection_url(self):
         """Return the driver connection URL."""
-        return "mongodb://" + self.get_internal_connection_string()
+        return "mongodb://" + self.get_internal_connection_string() + "/?directConnection=true"
 
 
 # The below parameters define the default 'logComponentVerbosity' object passed to mongod processes
@@ -180,15 +193,16 @@ class MongoDFixture(interface.Fixture):
 # The default verbosity setting for any tests that are not started with an Evergreen task id. This
 # will apply to any tests run locally.
 DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY = {
-    "replication": {"rollback": 2}, "sharding": {"migration": 2}, "transaction": 4,
-    "tenantMigration": 4
+    "replication": {"rollback": 2}, "sharding": {"migration": 2, "rangeDeleter": 2},
+    "transaction": 4, "tenantMigration": 4
 }
 
 # The default verbosity setting for any mongod processes running in Evergreen i.e. started with an
 # Evergreen task id.
 DEFAULT_EVERGREEN_MONGOD_LOG_COMPONENT_VERBOSITY = {
-    "replication": {"election": 4, "heartbeats": 2, "initialSync": 2, "rollback": 2},
-    "sharding": {"migration": 2}, "storage": {"recovery": 2}, "transaction": 4, "tenantMigration": 4
+    "replication": {"election": 4, "heartbeats": 2, "initialSync": 2,
+                    "rollback": 2}, "sharding": {"migration": 2, "rangeDeleter": 2},
+    "storage": {"recovery": 2}, "transaction": 4, "tenantMigration": 4
 }
 
 
@@ -200,8 +214,8 @@ class MongodLauncher(object):
         self.fixturelib = fixturelib
         self.config = fixturelib.get_config()
 
-    def launch_mongod_program(  # pylint: disable=too-many-branches,too-many-statements,too-many-arguments
-            self, logger, job_num, executable=None, process_kwargs=None, mongod_options=None):
+    def launch_mongod_program(self, logger, job_num, executable=None, process_kwargs=None,
+                              mongod_options=None):
         """
         Return a Process instance that starts mongod arguments constructed from 'mongod_options'.
 
@@ -239,7 +253,8 @@ class MongodLauncher(object):
         # that has migrated off of a shard, meant to allow most dependent queries on secondaries to
         # complete first. It defaults to 900, or 15 minutes, which is prohibitively long for tests.
         # Setting it in the .yml file overrides this.
-        if "shardsvr" in mongod_options and "orphanCleanupDelaySecs" not in suite_set_parameters:
+        if (("shardsvr" in mongod_options or "configsvr" in mongod_options)
+                and "orphanCleanupDelaySecs" not in suite_set_parameters):
             suite_set_parameters["orphanCleanupDelaySecs"] = 1
 
         # The LogicalSessionCache does automatic background refreshes in the server. This is
@@ -296,7 +311,6 @@ class MongodLauncher(object):
 
         shortcut_opts = {
             "enableMajorityReadConcern": self.config.MAJORITY_READ_CONCERN,
-            "nojournal": self.config.NO_JOURNAL,
             "storageEngine": self.config.STORAGE_ENGINE,
             "transportLayer": self.config.TRANSPORT_LAYER,
             "wiredTigerCollectionConfigString": self.config.WT_COLL_CONFIG,
@@ -312,16 +326,10 @@ class MongodLauncher(object):
             shortcut_opts["wiredTigerCacheSizeGB"] = self.config.STORAGE_ENGINE_CACHE_SIZE
 
         # These options are just flags, so they should not take a value.
-        opts_without_vals = ("nojournal", "logappend")
-
-        # Have the --nojournal command line argument to resmoke.py unset the journal option.
-        if shortcut_opts["nojournal"] and "journal" in mongod_options:
-            del mongod_options["journal"]
+        opts_without_vals = ("logappend")
 
         # Ensure that config servers run with journaling enabled.
         if "configsvr" in mongod_options:
-            shortcut_opts["nojournal"] = False
-            mongod_options["journal"] = ""
             suite_set_parameters.setdefault("reshardingMinimumOperationDurationMillis", 5000)
             suite_set_parameters.setdefault("reshardingCriticalSectionTimeoutMillis",
                                             24 * 60 * 60)  # 24 hours
@@ -345,11 +353,6 @@ class MongodLauncher(object):
         if "replSet" in mongod_options and "configsvr" in mongod_options:
             mongod_options["storageEngine"] = "wiredTiger"
 
-        # TODO (SERVER-63044): Remove the block below.
-        if executable.endswith("mongod"):
-            if "internalBatchUserMultiDeletesForTest" not in suite_set_parameters:
-                suite_set_parameters["internalBatchUserMultiDeletesForTest"] = 1
-
         return self.fixturelib.mongod_program(logger, job_num, executable, process_kwargs,
                                               mongod_options)
 
@@ -368,3 +371,9 @@ def _add_testing_set_parameters(suite_set_parameters):
     """
     suite_set_parameters.setdefault("testingDiagnosticsEnabled", True)
     suite_set_parameters.setdefault("enableTestCommands", True)
+    suite_set_parameters.setdefault("requireConfirmInSetFcv", False)
+    # The exact file location is on a per-process basis, so it'll have to be determined when the process gets spun up.
+    # Set it to true for now as a placeholder that will error if no further processing is done.
+    # The placeholder is needed so older versions don't have this option won't have this value set.
+    suite_set_parameters.setdefault("backtraceLogFile", True)
+    suite_set_parameters.setdefault("disableTransitionFromLatestToLastContinuous", False)

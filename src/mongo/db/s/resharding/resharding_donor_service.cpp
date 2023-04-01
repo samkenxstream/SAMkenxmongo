@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
 #include "mongo/db/s/resharding/resharding_donor_service.h"
 
@@ -37,33 +36,40 @@
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
-#include "mongo/db/s/recoverable_critical_section_service.h"
 #include "mongo/db/s/resharding/resharding_change_event_o2_field_gen.h"
 #include "mongo/db/s/resharding/resharding_data_copy_util.h"
 #include "mongo/db/s/resharding/resharding_donor_recipient_common.h"
 #include "mongo/db/s/resharding/resharding_future_util.h"
-#include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
 #include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/db/s/sharding_index_catalog_ddl_util.h"
+#include "mongo/db/s/sharding_recovery_service.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/write_block_bypass.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
 #include "mongo/util/future_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
+
 
 namespace mongo {
 
+MONGO_FAIL_POINT_DEFINE(reshardingPauseDonorBeforeCatalogCacheRefresh);
+MONGO_FAIL_POINT_DEFINE(reshardingPauseDonorAfterBlockingReads);
 MONGO_FAIL_POINT_DEFINE(reshardingDonorFailsAfterTransitionToDonatingOplogEntries);
 MONGO_FAIL_POINT_DEFINE(removeDonorDocFailpoint);
 
@@ -84,7 +90,7 @@ Timestamp generateMinFetchTimestamp(OperationContext* opCtx, const NamespaceStri
     // Do a no-op write and use the OpTime as the minFetchTimestamp
     writeConflictRetry(
         opCtx, "resharding donor minFetchTimestamp", NamespaceString::kRsOplogNamespace.ns(), [&] {
-            AutoGetDb db(opCtx, sourceNss.db(), MODE_IX);
+            AutoGetDb db(opCtx, sourceNss.dbName(), MODE_IX);
             Lock::CollectionLock collLock(opCtx, sourceNss, MODE_S);
 
             AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
@@ -145,7 +151,8 @@ public:
 
     void refreshCatalogCache(OperationContext* opCtx, const NamespaceString& nss) override {
         auto catalogCache = Grid::get(opCtx)->catalogCache();
-        uassertStatusOK(catalogCache->getShardedCollectionRoutingInfoWithRefresh(opCtx, nss));
+        uassertStatusOK(
+            catalogCache->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx, nss));
     }
 
     void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) override {
@@ -176,8 +183,12 @@ public:
         }
     }
 
-    void clearFilteringMetadata(OperationContext* opCtx) {
-        resharding::clearFilteringMetadata(opCtx, true /* scheduleAsyncRefresh */);
+    void clearFilteringMetadata(OperationContext* opCtx,
+                                const NamespaceString& sourceNss,
+                                const NamespaceString& tempReshardingNss) {
+        stdx::unordered_set<NamespaceString> namespacesToRefresh{sourceNss, tempReshardingNss};
+        resharding::clearFilteringMetadata(
+            opCtx, namespacesToRefresh, true /* scheduleAsyncRefresh */);
     }
 };
 
@@ -193,20 +204,24 @@ std::shared_ptr<repl::PrimaryOnlyService::Instance> ReshardingDonorService::cons
     BSONObj initialState) {
     return std::make_shared<DonorStateMachine>(
         this,
-        ReshardingDonorDocument::parse({"DonorStateMachine"}, initialState),
-        std::make_unique<ExternalStateImpl>());
+        ReshardingDonorDocument::parse(IDLParserContext{"DonorStateMachine"}, initialState),
+        std::make_unique<ExternalStateImpl>(),
+        _serviceContext);
 }
 
 ReshardingDonorService::DonorStateMachine::DonorStateMachine(
     const ReshardingDonorService* donorService,
     const ReshardingDonorDocument& donorDoc,
-    std::unique_ptr<DonorStateMachineExternalState> externalState)
+    std::unique_ptr<DonorStateMachineExternalState> externalState,
+    ServiceContext* serviceContext)
     : repl::PrimaryOnlyService::TypedInstance<DonorStateMachine>(),
       _donorService(donorService),
+      _serviceContext(serviceContext),
+      _metrics{ReshardingMetrics::initializeFrom(donorDoc, _serviceContext)},
       _metadata{donorDoc.getCommonReshardingMetadata()},
       _recipientShardIds{donorDoc.getRecipientShards()},
       _donorCtx{donorDoc.getMutableState()},
-      _donorMetricsToRestore{donorDoc.getMetrics() ? donorDoc.getMetrics().get()
+      _donorMetricsToRestore{donorDoc.getMetrics() ? donorDoc.getMetrics().value()
                                                    : ReshardingDonorMetrics()},
       _externalState{std::move(externalState)},
       _markKilledExecutor(std::make_shared<ThreadPool>([] {
@@ -220,11 +235,13 @@ ReshardingDonorService::DonorStateMachine::DonorStateMachine(
                           << "resharding_donor"
                           << "collection" << _metadata.getSourceNss().toString())),
       _isAlsoRecipient([&] {
-          auto myShardId = _externalState->myShardId(getGlobalServiceContext());
+          auto myShardId = _externalState->myShardId(_serviceContext);
           return std::find(_recipientShardIds.begin(), _recipientShardIds.end(), myShardId) !=
               _recipientShardIds.end();
       }()) {
     invariant(_externalState);
+
+    _metrics->onStateTransition(boost::none, _donorCtx.getState());
 }
 
 ExecutorFuture<void> ReshardingDonorService::DonorStateMachine::_runUntilBlockingWritesOrErrored(
@@ -260,7 +277,7 @@ ExecutorFuture<void> ReshardingDonorService::DonorStateMachine::_runUntilBlockin
 
             LOGV2(4956400,
                   "Resharding operation donor state machine failed",
-                  "namespace"_attr = _metadata.getSourceNss(),
+                  logAttrs(_metadata.getSourceNss()),
                   "reshardingUUID"_attr = _metadata.getReshardingUUID(),
                   "error"_attr = status);
 
@@ -366,17 +383,18 @@ ExecutorFuture<void> ReshardingDonorService::DonorStateMachine::_finishReshardin
 
                {
                    auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
+                   _externalState->clearFilteringMetadata(
+                       opCtx.get(), _metadata.getSourceNss(), _metadata.getTempReshardingNss());
 
-                   _externalState->clearFilteringMetadata(opCtx.get());
-
-                   RecoverableCriticalSectionService::get(opCtx.get())
+                   ShardingRecoveryService::get(opCtx.get())
                        ->releaseRecoverableCriticalSection(
                            opCtx.get(),
                            _metadata.getSourceNss(),
                            _critSecReason,
                            ShardingCatalogClient::kLocalWriteConcern);
 
-                   _metrics()->leaveCriticalSection(getCurrentTime());
+                   _metrics->setEndFor(ReshardingMetrics::TimedPhase::kCriticalSection,
+                                       getCurrentTime());
                }
 
                auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
@@ -401,17 +419,29 @@ ExecutorFuture<void> ReshardingDonorService::DonorStateMachine::_finishReshardin
 
 Status ReshardingDonorService::DonorStateMachine::_runMandatoryCleanup(
     Status status, const CancellationToken& stepdownToken) {
+    _metrics->onStateTransition(_donorCtx.getState(), boost::none);
+
+    // Destroy metrics early so it's lifetime will not be tied to the lifetime of this state
+    // machine. This is because we have future callbacks copy shared pointers to this state machine
+    // that causes it to live longer than expected and potentially overlap with a newer instance
+    // when stepping up.
+    _metrics.reset();
+
     if (!status.isOK()) {
+        // If the stepdownToken was triggered, it takes priority in order to make sure that
+        // the promise is set with an error that can be retried with. If it ran into an
+        // unrecoverable error, it would have fasserted earlier.
+        auto statusForPromise = stepdownToken.isCanceled()
+            ? Status{ErrorCodes::InterruptedDueToReplStateChange,
+                     "Resharding operation donor state machine interrupted due to replica set "
+                     "stepdown"}
+            : status;
+
         stdx::lock_guard<Latch> lk(_mutex);
 
-        ensureFulfilledPromise(lk, _critSecWasAcquired, status);
-        ensureFulfilledPromise(lk, _critSecWasPromoted, status);
-
-        ensureFulfilledPromise(lk, _completionPromise, status);
-    }
-
-    if (stepdownToken.isCanceled()) {
-        _metrics()->onStepDown(ReshardingMetrics::Role::kDonor);
+        ensureFulfilledPromise(lk, _critSecWasAcquired, statusForPromise);
+        ensureFulfilledPromise(lk, _critSecWasPromoted, statusForPromise);
+        ensureFulfilledPromise(lk, _completionPromise, statusForPromise);
     }
 
     return status;
@@ -425,7 +455,6 @@ SemiFuture<void> ReshardingDonorService::DonorStateMachine::run(
     _cancelableOpCtxFactory.emplace(abortToken, _markKilledExecutor);
 
     return ExecutorFuture(**executor)
-        .then([this] { _startMetrics(); })
         .then([this, executor, abortToken] {
             return _runUntilBlockingWritesOrErrored(executor, abortToken);
         })
@@ -479,18 +508,13 @@ void ReshardingDonorService::DonorStateMachine::interrupt(Status status) {}
 boost::optional<BSONObj> ReshardingDonorService::DonorStateMachine::reportForCurrentOp(
     MongoProcessInterface::CurrentOpConnectionsMode connMode,
     MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept {
-    ReshardingMetrics::ReporterOptions options(ReshardingMetrics::Role::kDonor,
-                                               _metadata.getReshardingUUID(),
-                                               _metadata.getSourceNss(),
-                                               _metadata.getReshardingKey().toBSON(),
-                                               false);
-    return _metrics()->reportForCurrentOp(options);
+    return _metrics->reportForCurrentOp();
 }
 
 void ReshardingDonorService::DonorStateMachine::onReshardingFieldsChanges(
     OperationContext* opCtx, const TypeCollectionReshardingFields& reshardingFields) {
     if (reshardingFields.getState() == CoordinatorStateEnum::kAborting) {
-        abort(reshardingFields.getUserCanceled().get());
+        abort(reshardingFields.getUserCanceled().value());
         return;
     }
 
@@ -509,6 +533,14 @@ void ReshardingDonorService::DonorStateMachine::onReshardingFieldsChanges(
             ensureFulfilledPromise(lk, _coordinatorHasDecisionPersisted);
         }
     }
+}
+
+void ReshardingDonorService::DonorStateMachine::onWriteDuringCriticalSection() {
+    _metrics->onWriteDuringCriticalSection();
+}
+
+void ReshardingDonorService::DonorStateMachine::onReadDuringCriticalSection() {
+    _metrics->onReadDuringCriticalSection();
 }
 
 SharedSemiFuture<void> ReshardingDonorService::DonorStateMachine::awaitCriticalSectionAcquired() {
@@ -558,6 +590,8 @@ void ReshardingDonorService::DonorStateMachine::
     // with a SnapshotUnavailable error response.
     {
         auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
+        reshardingPauseDonorBeforeCatalogCacheRefresh.pauseWhileSet(opCtx.get());
+
         _externalState->refreshCatalogCache(opCtx.get(), _metadata.getTempReshardingNss());
         _externalState->waitForCollectionFlush(opCtx.get(), _metadata.getTempReshardingNss());
     }
@@ -572,8 +606,10 @@ void ReshardingDonorService::DonorStateMachine::
         auto rawOpCtx = opCtx.get();
 
         auto generateOplogEntry = [&]() {
-            ReshardingChangeEventO2Field changeEvent{_metadata.getReshardingUUID(),
-                                                     ReshardingChangeEventEnum::kReshardBegin};
+            ReshardBeginChangeEventO2Field changeEvent{
+                _metadata.getSourceNss(),
+                _metadata.getReshardingUUID(),
+            };
 
             repl::MutableOplogEntry oplog;
             oplog.setNss(_metadata.getSourceNss());
@@ -606,7 +642,7 @@ void ReshardingDonorService::DonorStateMachine::
     LOGV2_DEBUG(5390702,
                 2,
                 "Collection being resharded now ready for recipients to begin cloning",
-                "namespace"_attr = _metadata.getSourceNss(),
+                logAttrs(_metadata.getSourceNss()),
                 "minFetchTimestamp"_attr = minFetchTimestamp,
                 "bytesToClone"_attr = bytesToClone,
                 "documentsToClone"_attr = documentsToClone,
@@ -664,14 +700,14 @@ void ReshardingDonorService::DonorStateMachine::
 
     {
         auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
-        RecoverableCriticalSectionService::get(opCtx.get())
+        ShardingRecoveryService::get(opCtx.get())
             ->acquireRecoverableCriticalSectionBlockWrites(
                 opCtx.get(),
                 _metadata.getSourceNss(),
                 _critSecReason,
                 ShardingCatalogClient::kLocalWriteConcern);
 
-        _metrics()->enterCriticalSection(getCurrentTime());
+        _metrics->setStartFor(ReshardingMetrics::TimedPhase::kCriticalSection, getCurrentTime());
     }
 
     {
@@ -692,7 +728,7 @@ void ReshardingDonorService::DonorStateMachine::
             oplog.setObject(
                 BSON("msg" << fmt::format("Writes to {} are temporarily blocked for resharding.",
                                           _metadata.getSourceNss().toString())));
-            oplog.setObject2(BSON("type" << kReshardFinalOpLogType << "reshardingUUID"
+            oplog.setObject2(BSON("type" << resharding::kReshardFinalOpLogType << "reshardingUUID"
                                          << _metadata.getReshardingUUID()));
             oplog.setOpTime(OplogSlot());
             oplog.setWallClockTime(opCtx->getServiceContext()->getFastClockSource()->now());
@@ -727,7 +763,7 @@ void ReshardingDonorService::DonorStateMachine::
                 LOGV2_DEBUG(5279504,
                             0,
                             "Committed oplog entries to temporarily block writes for resharding",
-                            "namespace"_attr = _metadata.getSourceNss(),
+                            logAttrs(_metadata.getSourceNss()),
                             "reshardingUUID"_attr = _metadata.getReshardingUUID(),
                             "numRecipients"_attr = _recipientShardIds.size(),
                             "duration"_attr = duration_cast<Milliseconds>(latency.elapsed()));
@@ -762,12 +798,13 @@ void ReshardingDonorService::DonorStateMachine::_dropOriginalCollectionThenTrans
     }
     {
         auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
-        RecoverableCriticalSectionService::get(opCtx.get())
+        ShardingRecoveryService::get(opCtx.get())
             ->promoteRecoverableCriticalSectionToBlockAlsoReads(
                 opCtx.get(),
                 _metadata.getSourceNss(),
                 _critSecReason,
                 ShardingCatalogClient::kLocalWriteConcern);
+        reshardingPauseDonorAfterBlockingReads.pauseWhileSet(opCtx.get());
     }
 
     {
@@ -777,9 +814,20 @@ void ReshardingDonorService::DonorStateMachine::_dropOriginalCollectionThenTrans
 
     if (_isAlsoRecipient) {
         auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
+        // Allow bypassing user write blocking. The check has already been performed on the
+        // db-primary shard's ReshardCollectionCoordinator.
+        WriteBlockBypass::get(opCtx.get()).set(true);
         resharding::data_copy::ensureTemporaryReshardingCollectionRenamed(opCtx.get(), _metadata);
     } else {
         auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
+        // Allow bypassing user write blocking. The check has already been performed on the
+        // db-primary shard's ReshardCollectionCoordinator.
+        WriteBlockBypass::get(opCtx.get()).set(true);
+
+        if (feature_flags::gGlobalIndexesShardingCatalog.isEnabled(
+                serverGlobalParams.featureCompatibility)) {
+            dropCollectionShardingIndexCatalog(opCtx.get(), _metadata.getSourceNss());
+        }
         resharding::data_copy::ensureCollectionDropped(
             opCtx.get(), _metadata.getSourceNss(), _metadata.getSourceUUID());
     }
@@ -802,13 +850,14 @@ void ReshardingDonorService::DonorStateMachine::_transitionState(DonorShardConte
     auto newState = newDonorCtx.getState();
 
     _updateDonorDocument(std::move(newDonorCtx));
-    _metrics()->setDonorState(newState);
+
+    _metrics->onStateTransition(oldState, newState);
 
     LOGV2_INFO(5279505,
                "Transitioned resharding donor state",
                "newState"_attr = DonorState_serializer(newState),
                "oldState"_attr = DonorState_serializer(oldState),
-               "namespace"_attr = _metadata.getSourceNss(),
+               logAttrs(_metadata.getSourceNss()),
                "collectionUUID"_attr = _metadata.getSourceUUID(),
                "reshardingUUID"_attr = _metadata.getReshardingUUID());
 }
@@ -826,7 +875,7 @@ void ReshardingDonorService::DonorStateMachine::_transitionToDonatingInitialData
 void ReshardingDonorService::DonorStateMachine::_transitionToError(Status abortReason) {
     auto newDonorCtx = _donorCtx;
     newDonorCtx.setState(DonorStateEnum::kError);
-    emplaceTruncatedAbortReasonIfExists(newDonorCtx, abortReason);
+    resharding::emplaceTruncatedAbortReasonIfExists(newDonorCtx, abortReason);
     _transitionState(std::move(newDonorCtx));
 }
 
@@ -955,7 +1004,7 @@ void ReshardingDonorService::DonorStateMachine::_updateDonorDocument(
 
         WriteUnitOfWork wuow(opCtx.get());
         Helpers::update(opCtx.get(),
-                        nss.toString(),
+                        nss,
                         BSON(ReshardingDonorDocument::kReshardingUUIDFieldName
                              << _metadata.getReshardingUUID()),
                         BSON("$set" << BSON(ReshardingDonorDocument::kMutableStateFieldName
@@ -981,18 +1030,11 @@ void ReshardingDonorService::DonorStateMachine::_removeDonorDocument(
 
         WriteUnitOfWork wuow(opCtx.get());
 
-        opCtx->recoveryUnit()->onCommit([this, stepdownToken, aborted](boost::optional<Timestamp>) {
-            stdx::lock_guard<Latch> lk(_mutex);
-
-            if (!stepdownToken.isCanceled()) {
-                _metrics()->onCompletion(ReshardingMetrics::Role::kDonor,
-                                         aborted ? ReshardingOperationStatusEnum::kFailure
-                                                 : ReshardingOperationStatusEnum::kSuccess,
-                                         getCurrentTime());
-            }
-
-            _completionPromise.emplaceValue();
-        });
+        opCtx->recoveryUnit()->onCommit(
+            [this, stepdownToken, aborted](OperationContext*, boost::optional<Timestamp>) {
+                stdx::lock_guard<Latch> lk(_mutex);
+                _completionPromise.emplaceValue();
+            });
 
         deleteObjects(opCtx.get(),
                       *coll,
@@ -1003,19 +1045,6 @@ void ReshardingDonorService::DonorStateMachine::_removeDonorDocument(
 
         wuow.commit();
     });
-}
-
-ReshardingMetrics* ReshardingDonorService::DonorStateMachine::_metrics() const {
-    return ReshardingMetrics::get(cc().getServiceContext());
-}
-
-void ReshardingDonorService::DonorStateMachine::_startMetrics() {
-    auto donorState = _donorCtx.getState();
-    if (donorState > DonorStateEnum::kPreparingToDonate) {
-        _metrics()->onStepUp(donorState, _donorMetricsToRestore);
-    } else {
-        _metrics()->onStart(ReshardingMetrics::Role::kDonor, getCurrentTime());
-    }
 }
 
 CancellationToken ReshardingDonorService::DonorStateMachine::_initAbortSource(

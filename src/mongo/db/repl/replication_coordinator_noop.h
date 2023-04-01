@@ -212,6 +212,8 @@ public:
 
     Status setMaintenanceMode(OperationContext*, bool) final;
 
+    bool shouldDropSyncSourceAfterShardSplit(OID replicaSetId) const final;
+
     Status processReplSetSyncFrom(OperationContext*, const HostAndPort&, BSONObjBuilder*) final;
 
     Status processReplSetFreeze(int, BSONObjBuilder*) final;
@@ -226,7 +228,9 @@ public:
 
     Status doOptimizedReconfig(OperationContext* opCtx, GetNewConfigFn) final;
 
-    Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment) final;
+    Status awaitConfigCommitment(OperationContext* opCtx,
+                                 bool waitForOplogCommitment,
+                                 long long term) final;
 
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) final;
 
@@ -331,6 +335,25 @@ public:
     virtual void restartScheduledHeartbeats_forTest() final;
 
     virtual void recordIfCWWCIsSetOnConfigServerOnStartup(OperationContext* opCtx) final;
+
+    class WriteConcernTagChangesNoOp : public WriteConcernTagChanges {
+        virtual ~WriteConcernTagChangesNoOp() = default;
+        virtual bool reserveDefaultWriteConcernChange() {
+            return false;
+        };
+        virtual void releaseDefaultWriteConcernChange() {}
+
+        virtual bool reserveConfigWriteConcernTagChange() {
+            return false;
+        };
+        virtual void releaseConfigWriteConcernTagChange() {}
+    };
+
+    virtual WriteConcernTagChanges* getWriteConcernTagChanges() override;
+
+    virtual SplitPrepareSessionManager* getSplitPrepareSessionManager() override;
+
+    virtual bool isRetryableWrite(OperationContext* opCtx) const override;
 
 private:
     ServiceContext* const _service;

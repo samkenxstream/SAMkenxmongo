@@ -27,30 +27,27 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/commands/internal_rename_if_options_and_indexes_match_gen.h"
-
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/internal_rename_if_options_and_indexes_match_gen.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/database_sharding_state.h"
-#include "mongo/db/s/dist_lock_manager.h"
+#include "mongo/db/s/ddl_lock_manager.h"
 
 namespace mongo {
-MONGO_FAIL_POINT_DEFINE(blockBeforeInternalRenameIfOptionsAndIndexesMatch);
-
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(blockBeforeInternalRenameIfOptionsAndIndexesMatch);
 
 bool isCollectionSharded(OperationContext* opCtx, const NamespaceString& nss) {
     AutoGetCollectionForRead lock(opCtx, nss);
     return opCtx->writesAreReplicated() &&
-        CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx).isSharded();
+        CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, nss)
+            ->getCollectionDescription(opCtx)
+            .isSharded();
 }
-
-}  // namespace
 
 /**
  * Rename a collection while checking collection option and indexes.
@@ -73,24 +70,26 @@ public:
                 std::list<BSONObj>(originalIndexes.begin(), originalIndexes.end());
             const auto& collectionOptions = thisRequest.getCollectionOptions();
 
-            if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
+            if (serverGlobalParams.clusterRole.has(ClusterRole::None) ||
+                serverGlobalParams.clusterRole.exclusivelyHasConfigRole()) {
                 // No need to acquire additional locks in a non-sharded environment
                 _internalRun(opCtx, fromNss, toNss, indexList, collectionOptions);
                 return;
             }
 
             // Check if the receiving shard is still the primary for the database
-            DatabaseShardingState::checkIsPrimaryShardForDb(opCtx, fromNss.db());
+            DatabaseShardingState::assertIsPrimaryShardForDb(opCtx, fromNss.db());
 
             // Acquiring the local part of the distributed locks for involved namespaces allows:
             // - Serialize with sharded DDLs, ensuring no concurrent modifications of the
             // collections.
             // - Check safely if the target collection is sharded or not.
-            auto distLockManager = DistLockManager::get(opCtx);
-            auto fromLocalDistlock = distLockManager->lockDirectLocally(
-                opCtx, fromNss.ns(), DistLockManager::kDefaultLockTimeout);
-            auto toLocalDistLock = distLockManager->lockDirectLocally(
-                opCtx, toNss.ns(), DistLockManager::kDefaultLockTimeout);
+            static constexpr StringData lockReason{"internalRenameCollection"_sd};
+            auto ddlLockManager = DDLLockManager::get(opCtx);
+            auto fromCollDDLLock = ddlLockManager->lock(
+                opCtx, fromNss.ns(), lockReason, DDLLockManager::kDefaultLockTimeout);
+            auto toCollDDLLock = ddlLockManager->lock(
+                opCtx, toNss.ns(), lockReason, DDLLockManager::kDefaultLockTimeout);
 
             uassert(ErrorCodes::IllegalOperation,
                     str::stream() << "cannot rename to sharded collection '" << toNss << "'",
@@ -163,4 +162,6 @@ public:
     }
 
 } internalRenameIfOptionsAndIndexesMatchCmd;
+
+}  // namespace
 }  // namespace mongo

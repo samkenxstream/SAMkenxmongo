@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/client/sdam/topology_state_machine.h"
 
@@ -36,6 +35,9 @@
 #include "mongo/client/sdam/sdam_test_base.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo::sdam {
 namespace {
@@ -58,7 +60,11 @@ inline int idx(T enumType) {
  * https://github.com/mongodb/specifications/blob/master/source/server-discovery-and-monitoring/server-discovery-and-monitoring.rst#topologytype-table
  */
 void mongo::sdam::TopologyStateMachine::initTransitionTable() {
-    auto bindThis = [&](auto&& pmf) { return [=](auto&&... a) { (this->*pmf)(a...); }; };
+    auto bindThis = [&](auto&& pmf) {
+        return [=](auto&&... a) {
+            (this->*pmf)(a...);
+        };
+    };
 
     // init the table to No-ops
     _stt.resize(allTopologyTypes().size() + 1);

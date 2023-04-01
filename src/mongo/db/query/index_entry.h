@@ -43,7 +43,8 @@
 namespace mongo {
 class CollatorInterface;
 class MatchExpression;
-class WildcardProjection;
+class IndexPathProjection;
+using WildcardProjection = IndexPathProjection;
 
 /**
  * A CoreIndexInfo is a representation of an index in the catalog with parsed information which is
@@ -60,16 +61,17 @@ struct CoreIndexInfo {
                   Identifier ident,
                   const MatchExpression* fe = nullptr,
                   const CollatorInterface* ci = nullptr,
-                  const WildcardProjection* wildcardProj = nullptr)
+                  const IndexPathProjection* indexPathProj = nullptr)
         : identifier(std::move(ident)),
           keyPattern(kp),
           filterExpr(fe),
           type(type),
           sparse(sp),
           collator(ci),
-          wildcardProjection(wildcardProj) {
-        // We always expect a projection executor for $** indexes, and none otherwise.
-        invariant((type == IndexType::INDEX_WILDCARD) == (wildcardProjection != nullptr));
+          indexPathProjection(indexPathProj) {
+        // If a projection executor exists, we always expect a $** index
+        if (indexPathProjection != nullptr)
+            invariant(type == IndexType::INDEX_WILDCARD || type == IndexType::INDEX_COLUMN);
     }
 
     virtual ~CoreIndexInfo() = default;
@@ -136,8 +138,9 @@ struct CoreIndexInfo {
     const CollatorInterface* collator = nullptr;
 
     // For $** indexes, a pointer to the projection executor owned by the index access method. Null
-    // unless this IndexEntry represents a wildcard index, in which case this is always non-null.
-    const WildcardProjection* wildcardProjection = nullptr;
+    // unless this IndexEntry represents a wildcard or column storeindex, in which case this is
+    // always non-null.
+    const IndexPathProjection* indexPathProjection = nullptr;
 };
 
 /**
@@ -152,7 +155,7 @@ struct IndexEntry : CoreIndexInfo {
                IndexType type,
                IndexDescriptor::IndexVersion version,
                bool mk,
-               const MultikeyPaths& mkp,
+               MultikeyPaths mkp,
                std::set<FieldRef> multikeyPathSet,
                bool sp,
                bool unq,
@@ -160,16 +163,18 @@ struct IndexEntry : CoreIndexInfo {
                const MatchExpression* fe,
                const BSONObj& io,
                const CollatorInterface* ci,
-               const WildcardProjection* wildcardProjection)
+               const WildcardProjection* wildcardProjection,
+               size_t wildcardPos = 0)
         : CoreIndexInfo(kp, type, sp, std::move(ident), fe, ci, wildcardProjection),
           version(version),
           multikey(mk),
-          multikeyPaths(mkp),
-          multikeyPathSet(std::move(multikeyPathSet)),
           unique(unq),
-          infoObj(io) {
+          multikeyPaths(std::move(mkp)),
+          multikeyPathSet(std::move(multikeyPathSet)),
+          infoObj(io),
+          wildcardFieldPos(wildcardPos) {
         // The caller must not supply multikey metadata in two different formats.
-        invariant(multikeyPaths.empty() || multikeyPathSet.empty());
+        invariant(this->multikeyPaths.empty() || this->multikeyPathSet.empty());
     }
 
     IndexEntry(const IndexEntry&) = default;
@@ -229,6 +234,7 @@ struct IndexEntry : CoreIndexInfo {
 
     IndexDescriptor::IndexVersion version;
     bool multikey;
+    bool unique;
 
     // If non-empty, 'multikeyPaths' is a vector with size equal to the number of elements in the
     // index key pattern. Each element in the vector is an ordered set of positions (starting at 0)
@@ -248,21 +254,45 @@ struct IndexEntry : CoreIndexInfo {
     // 'multikeyPathSet' must be empty.
     std::set<FieldRef> multikeyPathSet;
 
-    bool unique;
-
     // Geo indices have extra parameters.  We need those available to plan correctly.
     BSONObj infoObj;
+
+    // Position of the replaced wildcard index field in the keyPattern, applied to Wildcard Indexes
+    // only.
+    size_t wildcardFieldPos;
 };
 
 /**
  * Represents a columnar index.
  */
-struct ColumnIndexEntry {
-    ColumnIndexEntry(std::string catalogName) : catalogName(std::move(catalogName)) {}
+struct ColumnIndexEntry : CoreIndexInfo {
+    ColumnIndexEntry(const BSONObj& keyPattern,
+                     IndexType type,
+                     IndexDescriptor::IndexVersion version,
+                     bool sparse,
+                     bool unique,
+                     Identifier ident,
+                     const MatchExpression* filterExpression,
+                     const CollatorInterface* ci,
+                     const IndexPathProjection* columnstoreProjection)
+        : CoreIndexInfo(keyPattern,
+                        type,
+                        sparse,
+                        std::move(ident),
+                        filterExpression,
+                        ci,
+                        columnstoreProjection),
+          version(version),
+          unique(unique) {}
 
-    std::string catalogName;
+    ColumnIndexEntry(const ColumnIndexEntry&) = default;
+    ColumnIndexEntry(ColumnIndexEntry&&) = default;
+    ColumnIndexEntry& operator=(const ColumnIndexEntry&) = default;
+    ColumnIndexEntry& operator=(ColumnIndexEntry&&) = default;
+    ~ColumnIndexEntry() = default;
 
-    // TODO SERVER-63123: Projection, probably need some kind of disambiguator.
+    IndexDescriptor::IndexVersion version;
+    bool unique;
 };
 
 std::ostream& operator<<(std::ostream& stream, const IndexEntry::Identifier& ident);

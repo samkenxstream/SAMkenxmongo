@@ -32,12 +32,13 @@
 #include "mongo/base/status.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/op_observer_noop.h"
+#include "mongo/db/op_observer/op_observer_noop.h"
 #include "mongo/db/repl/oplog_applier_impl.h"
 #include "mongo/db/repl/replication_consistency_markers.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/db/session_txn_record_gen.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/idl/server_parameter_test_util.h"
 
 namespace mongo {
 
@@ -74,18 +75,17 @@ public:
      * This function is called whenever OplogApplierImpl inserts documents into a collection.
      */
     void onInserts(OperationContext* opCtx,
-                   const NamespaceString& nss,
-                   const UUID& uuid,
+                   const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
-                   bool fromMigrate) override;
+                   std::vector<bool> fromMigrate,
+                   bool defaultFromMigrate) override;
 
     /**
      * This function is called whenever OplogApplierImpl deletes a document from a collection.
      */
     void onDelete(OperationContext* opCtx,
-                  const NamespaceString& nss,
-                  const UUID& uuid,
+                  const CollectionPtr& coll,
                   StmtId stmtId,
                   const OplogDeleteEntryArgs& args) override;
 
@@ -102,7 +102,8 @@ public:
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
                             const BSONObj& idIndex,
-                            const OplogSlot& createOpTime) override;
+                            const OplogSlot& createOpTime,
+                            bool fromMigrate) override;
 
     /**
      * Called when OplogApplierImpl renames a collection.
@@ -144,16 +145,23 @@ public:
                    const CollectionOptions& oldCollOptions,
                    boost::optional<IndexCollModInfo> indexInfo) override;
 
+    /**
+     * Called when OplogApplierImpl prepares a multi-doc transaction using the
+     * TransactionParticipant.
+     */
+    std::unique_ptr<ApplyOpsOplogSlotAndOperationAssignment> preTransactionPrepare(
+        OperationContext* opCtx,
+        const std::vector<OplogSlot>& reservedSlots,
+        const TransactionOperations& transactionOperations,
+        Date_t wallClockTime) override;
+
     // Hooks for OpObserver functions. Defaults to a no-op function but may be overridden to
     // check actual documents mutated.
     std::function<void(OperationContext*, const NamespaceString&, const std::vector<BSONObj>&)>
         onInsertsFn;
 
-    std::function<void(OperationContext*,
-                       const NamespaceString&,
-                       boost::optional<UUID>,
-                       StmtId,
-                       const OplogDeleteEntryArgs&)>
+    std::function<void(
+        OperationContext*, const CollectionPtr&, StmtId, const OplogDeleteEntryArgs&)>
         onDeleteFn;
 
     std::function<void(OperationContext*, const OplogUpdateEntryArgs&)> onUpdateFn;
@@ -194,14 +202,13 @@ public:
 };
 
 class OplogApplierImplTest : public ServiceContextMongoDTest {
-public:
-    OplogApplierImplTest(){};
-    OplogApplierImplTest(std::string storageEngine)
-        : ServiceContextMongoDTest(std::move(storageEngine)){};
-
 protected:
+    explicit OplogApplierImplTest(Options options = {})
+        : ServiceContextMongoDTest(options.useReplSettings(true)) {}
+
     void _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::Error expectedError,
                                                            const OplogEntry& op,
+                                                           const NamespaceString& targetNss,
                                                            bool expectedApplyOpCalled);
 
     Status _applyOplogEntryOrGroupedInsertsWrapper(OperationContext* opCtx,
@@ -212,6 +219,11 @@ protected:
     std::unique_ptr<ReplicationConsistencyMarkers> _consistencyMarkers;
     ServiceContext* serviceContext;
     OplogApplierImplOpObserver* _opObserver = nullptr;
+
+    template <typename T>
+    inline void setServerParameter(const std::string& name, T value) {
+        _serverParamControllers.push_back(ServerParameterControllerForTest(name, value));
+    }
 
     OpTime nextOpTime() {
         static long long lastSecond = 1;
@@ -232,6 +244,22 @@ protected:
     Status runOpsInitialSync(std::vector<OplogEntry> ops);
 
     UUID kUuid{UUID::gen()};
+
+    std::vector<ServerParameterControllerForTest> _serverParamControllers;
+};
+
+class OplogApplierImplWithFastAutoAdvancingClockTest : public OplogApplierImplTest {
+protected:
+    OplogApplierImplWithFastAutoAdvancingClockTest()
+        : OplogApplierImplTest(
+              Options{}.useMockClock(true, Milliseconds{serverGlobalParams.slowMS.load() * 10})) {}
+};
+
+class OplogApplierImplWithSlowAutoAdvancingClockTest : public OplogApplierImplTest {
+protected:
+    OplogApplierImplWithSlowAutoAdvancingClockTest()
+        : OplogApplierImplTest(
+              Options{}.useMockClock(true, Milliseconds{serverGlobalParams.slowMS.load() / 10})) {}
 };
 
 // Utility class to allow easily scanning a collection.  Scans in forward order, returns
@@ -271,6 +299,14 @@ OplogEntry makeOplogEntry(OpTypeEnum opType,
                           boost::optional<BSONObj> o2 = boost::none,
                           boost::optional<bool> fromMigrate = boost::none);
 
+OplogEntry makeOplogEntry(OpTime opTime,
+                          OpTypeEnum opType,
+                          NamespaceString nss,
+                          const boost::optional<UUID>& uuid,
+                          BSONObj o,
+                          boost::optional<BSONObj> o2 = boost::none,
+                          boost::optional<bool> fromMigrate = boost::none);
+
 OplogEntry makeOplogEntry(OpTypeEnum opType, NamespaceString nss, boost::optional<UUID> uuid);
 
 /**
@@ -278,10 +314,10 @@ OplogEntry makeOplogEntry(OpTypeEnum opType, NamespaceString nss, boost::optiona
  */
 CollectionOptions createOplogCollectionOptions();
 
-/*
- * Creates collection options for recording pre-images for testing deletes.
+/**
+ * Creates collection options for recording change stream pre-images for testing deletes.
  */
-CollectionOptions createRecordPreImageCollectionOptions();
+CollectionOptions createRecordChangeStreamPreAndPostImagesCollectionOptions();
 
 /**
  * Create test collection.

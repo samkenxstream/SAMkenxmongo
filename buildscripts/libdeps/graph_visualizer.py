@@ -24,9 +24,9 @@
 """
 Libdeps Graph Visualization Tool.
 
-Starts a web service which creates a UI for interacting and examing the libdeps graph.
-The web service front end consist of React+Redux for the framework, SocketIO for backend
-communication, and Material UI for the GUI. The web service back end use flask and socketio.
+Starts a web service which creates a UI for interacting and examining the libdeps graph.
+The web service front end consist of React+Redux for the framework, flask API for backend
+communication, and Material UI for the GUI. The web service back end uses flask.
 
 This script will automatically install the npm modules, and build and run the production
 web service if not debug.
@@ -72,6 +72,9 @@ def get_args():
     parser.add_argument('--backend-port', type=str, action='store',
                         help="Port where the back end will run.", default="5000")
 
+    parser.add_argument('--memory-limit', type=float, action='store',
+                        help="Limit in GB for backend memory usage.", default=8.0)
+
     parser.add_argument('--launch', choices=['frontend', 'backend', 'both'], default='both',
                         help="Specifies which part of the web service to launch.")
 
@@ -116,9 +119,8 @@ def check_node(node_check, cwd):
 def start_backend(web_service_info, debug):
     """Start the backend in debug mode."""
 
-    web_service_info['socketio'].run(app=web_service_info['app'],
-                                     host=web_service_info['backend_host'],
-                                     port=web_service_info['backend_port'], debug=debug)
+    web_service_info['app'].run(host=web_service_info['backend_host'],
+                                port=web_service_info['backend_port'], debug=debug)
 
 
 def start_frontend_thread(web_service_info, npm_command, debug):
@@ -158,14 +160,14 @@ def main():
 
     # TODO: add https command line option and support
     server = BackendServer(graphml_dir=args.graphml_dir,
-                           frontend_url=f"http://{args.frontend_host}:{args.frontend_port}")
+                           frontend_url=f"http://{args.frontend_host}:{args.frontend_port}",
+                           memory_limit=args.memory_limit)
 
-    app, socketio = server.get_app()
+    app = server.get_app()
     cwd = Path(__file__).parent / 'graph_visualizer_web_stack'
 
     web_service_info = {
         'app': app,
-        'socketio': socketio,
         'cwd': cwd,
         'frontend_host': args.frontend_host,
         'frontend_port': args.frontend_port,

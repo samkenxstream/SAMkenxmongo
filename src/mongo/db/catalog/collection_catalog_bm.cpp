@@ -35,7 +35,6 @@
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/tenant_namespace.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -52,7 +51,7 @@ public:
     void onDestroyClient(Client* client) final {}
 
     void onCreateOperationContext(OperationContext* opCtx) override {
-        opCtx->setLockState(std::make_unique<LockerImpl>());
+        opCtx->setLockState(std::make_unique<LockerImpl>(opCtx->getServiceContext()));
     }
 
     void onDestroyOperationContext(OperationContext* opCtx) final {}
@@ -63,7 +62,8 @@ const ServiceContext::ConstructorActionRegisterer clientObserverRegisterer{
     [](ServiceContext* service) {
         service->registerClientObserver(std::make_unique<LockerImplClientObserver>());
     },
-    [](ServiceContext* serviceContext) {}};
+    [](ServiceContext* serviceContext) {
+    }};
 
 ServiceContext* setupServiceContext() {
     auto serviceContext = ServiceContext::make();
@@ -77,11 +77,12 @@ void createCollections(OperationContext* opCtx, int numCollections) {
     BatchedCollectionCatalogWriter batched(opCtx);
 
     for (auto i = 0; i < numCollections; i++) {
-        const TenantNamespace tenantNs(boost::none,
-                                       NamespaceString("collection_catalog_bm", std::to_string(i)));
+        const NamespaceString nss("collection_catalog_bm", std::to_string(i));
         CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
-            catalog.registerCollection(
-                opCtx, UUID::gen(), std::make_shared<CollectionMock>(tenantNs));
+            catalog.registerCollection(opCtx,
+                                       UUID::gen(),
+                                       std::make_shared<CollectionMock>(nss),
+                                       /*ts=*/boost::none);
         });
     }
 }

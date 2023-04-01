@@ -36,10 +36,11 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/s/migration_session_id.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/platform/mutex.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/concurrency/with_lock.h"
 
 namespace mongo {
@@ -67,9 +68,18 @@ public:
         Done,
     };
 
+    struct ProcessOplogResult {
+        LogicalSessionId sessionId;
+        TxnNumber txnNum{kUninitializedTxnNumber};
+
+        repl::OpTime oplogTime;
+        bool isPrePostImage = false;
+    };
+
     SessionCatalogMigrationDestination(NamespaceString nss,
                                        ShardId fromShard,
-                                       MigrationSessionId migrationSessionId);
+                                       MigrationSessionId migrationSessionId,
+                                       CancellationToken cancellationToken);
     ~SessionCatalogMigrationDestination();
 
     /**
@@ -105,14 +115,25 @@ public:
      */
     std::string getErrMsg();
 
+    /**
+     * Returns the number of session oplog entries processed by the _processSessionOplog() method
+     */
+    long long getSessionOplogEntriesMigrated();
+
 private:
     void _retrieveSessionStateFromSource(ServiceContext* service);
+
+    ProcessOplogResult _processSessionOplog(const BSONObj& oplogBSON,
+                                            const ProcessOplogResult& lastResult,
+                                            ServiceContext* serviceContext,
+                                            CancellationToken cancellationToken);
 
     void _errorOccurred(StringData errMsg);
 
     const NamespaceString _nss;
     const ShardId _fromShard;
     const MigrationSessionId _migrationSessionId;
+    const CancellationToken _cancellationToken;
 
     stdx::thread _thread;
 
@@ -120,6 +141,10 @@ private:
     Mutex _mutex = MONGO_MAKE_LATCH("SessionCatalogMigrationDestination::_mutex");
     State _state = State::NotStarted;
     std::string _errMsg;  // valid only if _state == ErrorOccurred.
+
+    // The number of session oplog entries processed. This is not always equal to the number of
+    // session oplog entries comitted because entries may have been processed but not committed
+    AtomicWord<long long> _sessionOplogEntriesMigrated{0};
 };
 
 }  // namespace mongo

@@ -37,9 +37,7 @@
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/query/async_results_merger_params_gen.h"
 #include "mongo/s/query/establish_cursors.h"
 #include "mongo/util/fail_point.h"
 
@@ -58,8 +56,14 @@ bool isShardConfigEvent(const Document& eventDoc) {
 
     auto opType = eventDoc[DocumentSourceChangeStream::kOperationTypeField];
 
-    if (!opType.missing() &&
-        opType.getStringData() == DocumentSourceChangeStream::kNewShardDetectedOpType) {
+    // If opType isn't a string, then this document has been manipulated. This means it cannot have
+    // been produced by the internal shard-monitoring cursor that we opened on the config servers,
+    // or by the kNewShardDetectedOpType mechanism, which bypasses filtering and projection stages.
+    if (opType.getType() != BSONType::String) {
+        return false;
+    }
+
+    if (opType.getStringData() == DocumentSourceChangeStream::kNewShardDetectedOpType) {
         // If the failpoint is enabled, throw the 'ChangeStreamToplogyChange' exception to the
         // client. This is used in testing to confirm that the swallowed 'kNewShardDetected' event
         // has reached the mongoS.
@@ -73,10 +77,33 @@ bool isShardConfigEvent(const Document& eventDoc) {
         return true;
     }
 
+    // Check whether this event occurred on the config.shards collection.
     auto nsObj = eventDoc[DocumentSourceChangeStream::kNamespaceField];
-    return nsObj.getType() == BSONType::Object &&
-        nsObj["db"_sd].getStringData() == ShardType::ConfigNS.db() &&
-        nsObj["coll"_sd].getStringData() == ShardType::ConfigNS.coll();
+    const bool isConfigDotShardsEvent = nsObj["db"_sd].getType() == BSONType::String &&
+        nsObj["db"_sd].getStringData() == NamespaceString::kConfigsvrShardsNamespace.db() &&
+        nsObj["coll"_sd].getType() == BSONType::String &&
+        nsObj["coll"_sd].getStringData() == NamespaceString::kConfigsvrShardsNamespace.coll();
+
+    // If it isn't from config.shards, treat it as a normal user event.
+    if (!isConfigDotShardsEvent) {
+        return false;
+    }
+
+    // We need to validate that this event hasn't been faked by a user projection in a way that
+    // would cause us to tassert. Check the clusterTime field, which is needed to determine the
+    // point from which the new shard should start reporting change events.
+    if (eventDoc["clusterTime"].getType() != BSONType::bsonTimestamp) {
+        return false;
+    }
+    // Check the fullDocument field, which should contain details of the new shard's name and hosts.
+    auto fullDocument = eventDoc[DocumentSourceChangeStream::kFullDocumentField];
+    if (opType.getStringData() == "insert"_sd && fullDocument.getType() != BSONType::Object) {
+        return false;
+    }
+
+    // The event is on config.shards and is well-formed. It is still possible that it is a forgery,
+    // but all the user can do is cause their own stream to uassert.
+    return true;
 }
 }  // namespace
 
@@ -174,8 +201,8 @@ BSONObj DocumentSourceChangeStreamHandleTopologyChange::createUpdatedCommandForN
     Timestamp shardAddedTime) {
     // We must start the new cursor from the moment at which the shard became visible.
     const auto newShardAddedTime = LogicalTime{shardAddedTime};
-    auto resumeTokenForNewShard =
-        ResumeToken::makeHighWaterMarkToken(newShardAddedTime.addTicks(1).asTimestamp());
+    auto resumeTokenForNewShard = ResumeToken::makeHighWaterMarkToken(
+        newShardAddedTime.addTicks(1).asTimestamp(), pExpCtx->changeStreamTokenVersion);
 
     // Create a new shard command object containing the new resume token.
     auto shardCommand = replaceResumeTokenInCommand(resumeTokenForNewShard.toDocument());
@@ -185,7 +212,7 @@ BSONObj DocumentSourceChangeStreamHandleTopologyChange::createUpdatedCommandForN
 
     // Create the 'AggregateCommandRequest' object which will help in creating the parsed pipeline.
     auto aggCmdRequest = aggregation_request_helper::parseFromBSON(
-        pExpCtx->ns, shardCommand, boost::none, apiStrict);
+        opCtx, pExpCtx->ns, shardCommand, boost::none, apiStrict);
 
     // Parse and optimize the pipeline.
     auto pipeline = Pipeline::parse(aggCmdRequest.getPipeline(), pExpCtx);
@@ -199,7 +226,8 @@ BSONObj DocumentSourceChangeStreamHandleTopologyChange::createUpdatedCommandForN
                                                                Document{shardCommand},
                                                                splitPipelines,
                                                                boost::none, /* exhangeSpec */
-                                                               true /* needsMerge */);
+                                                               true /* needsMerge */,
+                                                               boost::none /* explain */);
 }
 
 BSONObj DocumentSourceChangeStreamHandleTopologyChange::replaceResumeTokenInCommand(
@@ -227,9 +255,8 @@ BSONObj DocumentSourceChangeStreamHandleTopologyChange::replaceResumeTokenInComm
     return newCmd.freeze().toBson();
 }
 
-Value DocumentSourceChangeStreamHandleTopologyChange::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    if (explain) {
+Value DocumentSourceChangeStreamHandleTopologyChange::serialize(SerializationOptions opts) const {
+    if (opts.verbosity) {
         return Value(DOC(DocumentSourceChangeStream::kStageName
                          << DOC("stage"
                                 << "internalHandleTopologyChange"_sd)));

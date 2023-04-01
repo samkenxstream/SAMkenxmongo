@@ -27,22 +27,18 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
-
-#include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/bgsync.h"
 
 #include <memory>
 
-#include "mongo/base/counter.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connection_pool.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/repl/data_replicator_external_state_impl.h"
@@ -65,6 +61,9 @@
 #include "mongo/util/testing_proctor.h"
 #include "mongo/util/time_support.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
+
 namespace mongo {
 
 using std::string;
@@ -79,27 +78,19 @@ const Milliseconds kRollbackOplogSocketTimeout(10 * 60 * 1000);
 // The number of times a node attempted to choose a node to sync from among the available sync
 // source options. This occurs if we re-evaluate our sync source, receive an error from the source,
 // or step down.
-Counter64 numSyncSourceSelections;
-ServerStatusMetricField<Counter64> displayNumSyncSourceSelections("repl.syncSource.numSelections",
-                                                                  &numSyncSourceSelections);
+CounterMetric numSyncSourceSelections("repl.syncSource.numSelections");
 
 // The number of times a node kept it's original sync source after re-evaluating if its current sync
 // source was optimal.
-Counter64 numTimesChoseSameSyncSource;
-ServerStatusMetricField<Counter64> displayNumTimesChoseSameSyncSource(
-    "repl.syncSource.numTimesChoseSame", &numTimesChoseSameSyncSource);
+CounterMetric numTimesChoseSameSyncSource("repl.syncSource.numTimesChoseSame");
 
 // The number of times a node chose a new sync source after re-evaluating if its current sync source
 // was optimal.
-Counter64 numTimesChoseDifferentSyncSource;
-ServerStatusMetricField<Counter64> displayNumTimesChoseDifferentSyncSource(
-    "repl.syncSource.numTimesChoseDifferent", &numTimesChoseDifferentSyncSource);
+CounterMetric numTimesChoseDifferentSyncSource("repl.syncSource.numTimesChoseDifferent");
 
 // The number of times a node could not find a sync source when choosing a node to sync from among
 // the available options.
-Counter64 numTimesCouldNotFindSyncSource;
-ServerStatusMetricField<Counter64> displayNumTimesCouldNotFindSyncSource(
-    "repl.syncSource.numTimesCouldNotFind", &numTimesCouldNotFindSyncSource);
+CounterMetric numTimesCouldNotFindSyncSource("repl.syncSource.numTimesCouldNotFind");
 
 /**
  * Extends DataReplicatorExternalStateImpl to be member state aware.
@@ -136,6 +127,15 @@ ChangeSyncSourceAction DataReplicatorExternalStateBackgroundSync::shouldStopFetc
     const rpc::OplogQueryMetadata& oqMetadata,
     const OpTime& previousOpTimeFetched,
     const OpTime& lastOpTimeFetched) const {
+    if (getReplicationCoordinator()->shouldDropSyncSourceAfterShardSplit(
+            replMetadata.getReplicaSetId())) {
+        // Drop the last batch of message following a change of replica set due to a shard split.
+        LOGV2(6493902,
+              "Choosing new sync source because we have joined a new replica set following a shard "
+              "split.");
+        return ChangeSyncSourceAction::kStopSyncingAndDropLastBatchIfPresent;
+    }
+
     if (_bgsync->shouldStopFetching()) {
         return ChangeSyncSourceAction::kStopSyncingAndEnqueueLastBatch;
     }
@@ -187,6 +187,8 @@ void BackgroundSync::shutdown(OperationContext* opCtx) {
     stdx::lock_guard<Latch> lock(_mutex);
 
     setState(lock, ProducerState::Stopped);
+    // If we happen to be waiting for sync source data, stop.
+    _notifySyncSourceSelectionDataChanged(lock);
 
     if (_syncSourceResolver) {
         _syncSourceResolver->shutdown();
@@ -327,6 +329,11 @@ void BackgroundSync::_produce() {
             lastOpTimeFetched,
             OpTime(),
             [&syncSourceResp](const SyncSourceResolverResponse& resp) { syncSourceResp = resp; });
+        // It is possible for _syncSourceSelectionDataChanged to become true between when we release
+        // the lock at the end of this block and when the syncSourceResolver retrieves the relevant
+        // heartbeat data, which means if we don't get a sync source we won't sleep even though we
+        // used the relevant data.  But that's OK because we'll only spin once.
+        _syncSourceSelectionDataChanged = false;
     }
     // This may deadlock if called inside the mutex because SyncSourceResolver::startup() calls
     // ReplicationCoordinator::chooseNewSyncSource(). ReplicationCoordinatorImpl's mutex has to
@@ -413,20 +420,18 @@ void BackgroundSync::_produce() {
             source = _syncSourceHost;
         }
         // If our sync source has not changed, it is likely caused by our heartbeat data map being
-        // out of date. In that case we sleep for 1 second to reduce the amount we spin waiting
-        // for our map to update.
+        // out of date. In that case we sleep for up to 1 second to reduce the amount we spin
+        // waiting for our map to update.  If we are notified of heartbeat data change, we will
+        // interrupt the wait early.
         if (oldSource == source) {
             long long sleepMS = _getRetrySleepMS();
             LOGV2(21087,
-                  "Chose same sync source candidate as last time, {syncSource}. Sleeping for "
-                  "{sleepDurationMillis}ms to avoid immediately choosing a new sync source for the "
-                  "same reason as last time.",
                   "Chose same sync source candidate as last time. Sleeping to avoid immediately "
                   "choosing a new sync source for the same reason as last time",
                   "syncSource"_attr = source,
                   "sleepDurationMillis"_attr = sleepMS);
             numTimesChoseSameSyncSource.increment(1);
-            mongo::sleepmillis(sleepMS);
+            _waitForNewSyncSourceSelectionData(sleepMS);
         } else {
             LOGV2(21088,
                   "Changed sync source from {oldSyncSource} to {newSyncSource}",
@@ -449,12 +454,10 @@ void BackgroundSync::_produce() {
         // No sync source found.
         LOGV2_DEBUG(21090,
                     1,
-                    "Could not find a sync source. Sleeping for {sleepDurationMillis}ms before "
-                    "trying again.",
                     "Could not find a sync source. Sleeping before trying again",
                     "sleepDurationMillis"_attr = sleepMS);
         numTimesCouldNotFindSyncSource.increment(1);
-        mongo::sleepmillis(sleepMS);
+        _waitForNewSyncSourceSelectionData(sleepMS);
         return;
     }
 
@@ -486,26 +489,6 @@ void BackgroundSync::_produce() {
 
     if (!_replCoord->getMemberState().primary()) {
         _replCoord->signalUpstreamUpdater();
-    }
-
-    // Set the applied point if unset. This is most likely the first time we've established a sync
-    // source since stepping down or otherwise clearing the applied point. We need to set this here,
-    // before the OplogWriter gets a chance to append to the oplog.
-    {
-        auto opCtx = cc().makeOperationContext();
-
-        // Check if the producer has been stopped so that we can prevent setting the applied point
-        // after step up has already cleared it. We need to acquire the collection lock before the
-        // mutex to preserve proper lock ordering.
-        AutoGetCollection autoColl(
-            opCtx.get(),
-            NamespaceString(ReplicationConsistencyMarkersImpl::kDefaultMinValidNamespace),
-            MODE_IX);
-        stdx::lock_guard<Latch> lock(_mutex);
-
-        if (_state != ProducerState::Running) {
-            return;
-        }
     }
 
     // "lastFetched" not used. Already set in _enqueueDocuments.
@@ -863,6 +846,33 @@ void BackgroundSync::_fallBackOnRollbackViaRefetch(
     rollback(opCtx, *localOplog, rollbackSource, requiredRBID, _replCoord, _replicationProcess);
 }
 
+void BackgroundSync::notifySyncSourceSelectionDataChanged() {
+    stdx::lock_guard lock(_mutex);
+    _notifySyncSourceSelectionDataChanged(lock);
+}
+
+void BackgroundSync::_notifySyncSourceSelectionDataChanged(WithLock) {
+    if (!_syncSourceSelectionDataChanged) {
+        _syncSourceSelectionDataChanged = true;
+        _syncSourceSelectionDataCv.notify_one();
+    }
+}
+
+void BackgroundSync::_waitForNewSyncSourceSelectionData(long long waitTimeMillis) {
+    stdx::unique_lock<Latch> lock(_mutex);
+    if (_syncSourceSelectionDataCv.wait_for(
+            lock, stdx::chrono::milliseconds(waitTimeMillis), [this] {
+                return _syncSourceSelectionDataChanged || _inShutdown;
+            })) {
+        LOGV2_DEBUG(6795401,
+                    1,
+                    "Sync source wait interrupted early",
+                    "syncSourceSelectionDataChanged"_attr = _syncSourceSelectionDataChanged,
+                    "inShutdown"_attr = _inShutdown,
+                    "waitTimeMillis"_attr = waitTimeMillis);
+    }
+}
+
 HostAndPort BackgroundSync::getSyncTarget() const {
     stdx::unique_lock<Latch> lock(_mutex);
     return _syncSourceHost;
@@ -875,11 +885,15 @@ void BackgroundSync::clearSyncTarget() {
           "Resetting sync source to empty",
           "previousSyncSource"_attr = _syncSourceHost);
     _syncSourceHost = HostAndPort();
+    _notifySyncSourceSelectionDataChanged(lock);
 }
 
 void BackgroundSync::_stop(WithLock lock, bool resetLastFetchedOptime) {
     setState(lock, ProducerState::Stopped);
     LOGV2(21107, "Stopping replication producer");
+
+    // If we happen to be waiting for sync source data, stop.
+    _notifySyncSourceSelectionDataChanged(lock);
 
     _syncSourceHost = HostAndPort();
     if (resetLastFetchedOptime) {
@@ -951,8 +965,7 @@ OpTime BackgroundSync::_readLastAppliedOpTime(OperationContext* opCtx) {
     try {
         bool success = writeConflictRetry(
             opCtx, "readLastAppliedOpTime", NamespaceString::kRsOplogNamespace.ns(), [&] {
-                return Helpers::getLast(
-                    opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntry);
+                return Helpers::getLast(opCtx, NamespaceString::kRsOplogNamespace, oplogEntry);
             });
 
         if (!success) {
@@ -965,7 +978,7 @@ OpTime BackgroundSync::_readLastAppliedOpTime(OperationContext* opCtx) {
         LOGV2_FATAL(18904,
                     "Problem reading {namespace}: {error}",
                     "Problem reading from namespace",
-                    "namespace"_attr = NamespaceString::kRsOplogNamespace.ns(),
+                    logAttrs(NamespaceString::kRsOplogNamespace),
                     "error"_attr = redact(ex));
     }
 

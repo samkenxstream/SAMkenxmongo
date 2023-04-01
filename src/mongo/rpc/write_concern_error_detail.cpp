@@ -27,13 +27,10 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/rpc/write_concern_error_detail.h"
-#include "mongo/rpc/write_concern_error_gen.h"
 
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/field_parser.h"
+#include "mongo/rpc/write_concern_error_gen.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -82,9 +79,9 @@ bool WriteConcernErrorDetail::parseBSON(const BSONObj& source, string* errMsg) {
         errMsg = &dummy;
 
     try {
-        auto wce = WriteConcernError::parse({"writeConcernError"}, source);
+        auto wce = WriteConcernError::parse(IDLParserContext{"writeConcernError"}, source);
         _status = Status(ErrorCodes::Error(wce.getCode()), wce.getErrmsg(), source);
-        if ((_isErrInfoSet = wce.getErrInfo().is_initialized())) {
+        if ((_isErrInfoSet = wce.getErrInfo().has_value())) {
             _errInfo = wce.getErrInfo().value().getOwned();
         }
     } catch (DBException& ex) {

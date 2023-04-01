@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/pipeline/document_source_set_variable_from_subpipeline.h"
 #include "mongo/platform/basic.h"
@@ -40,50 +39,42 @@
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/logv2/log.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+
 namespace mongo {
 
 using boost::intrusive_ptr;
 
 constexpr StringData DocumentSourceSetVariableFromSubPipeline::kStageName;
 
-Value DocumentSourceSetVariableFromSubPipeline::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+REGISTER_INTERNAL_DOCUMENT_SOURCE(setVariableFromSubPipeline,
+                                  LiteParsedDocumentSourceDefault::parse,
+                                  DocumentSourceSetVariableFromSubPipeline::createFromBson,
+                                  true);
+
+Value DocumentSourceSetVariableFromSubPipeline::serialize(SerializationOptions opts) const {
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484314);
+    }
+
     const auto var = "$$" + Variables::getBuiltinVariableName(_variableID);
+    SetVariableFromSubPipelineSpec spec;
     tassert(625298, "SubPipeline cannot be null during serialization", _subPipeline);
-    return Value(DOC(getSourceName()
-                     << DOC("setVariable" << var << "pipeline" << _subPipeline->serialize())));
+    spec.setSetVariable(var);
+    spec.setPipeline(_subPipeline->serializeToBson(opts.verbosity));
+    return Value(DOC(getSourceName() << spec.toBSON()));
 }
 
 DepsTracker::State DocumentSourceSetVariableFromSubPipeline::getDependencies(
     DepsTracker* deps) const {
-    // TODO SERVER-63845: change to NOT_SUPPORTED.
-    return DepsTracker::State::SEE_NEXT;
+    return DepsTracker::State::NOT_SUPPORTED;
 }
 
-Pipeline::SourceContainer::iterator DocumentSourceSetVariableFromSubPipeline::doOptimizeAt(
-    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
-    tassert(625295, "Iterator mismatch during optimization", *itr == this);
-    auto nextStage = std::next(itr);
-    if (nextStage == container->end()) {
-        return container->end();
-    }
-    // SetVariableFromSubPipeline can be moved after any shard-only stage that does not
-    // reference the $$SEARCH_META variable.
-
-    // Confirm it is a shards only stage.
-    if (nextStage->get()->distributedPlanLogic()->shardsStage &&
-        !nextStage->get()->distributedPlanLogic()->mergingStage) {
-
-        DepsTracker depsTracker;
-        nextStage->get()->getDependencies(&depsTracker);
-        // Check if next stage uses $$SEARCH_META.
-        if (!depsTracker.hasVariableReferenceTo(std::set<Variables::Id>{_variableID})) {
-            std::swap(*itr, *nextStage);
-            return itr == container->begin() ? itr : std::prev(itr);
-        }
-    }
-
-    return nextStage;
+void DocumentSourceSetVariableFromSubPipeline::addVariableRefs(
+    std::set<Variables::Id>* refs) const {
+    refs->insert(_variableID);
+    _subPipeline->addVariableRefs(refs);
 }
 
 boost::intrusive_ptr<DocumentSource> DocumentSourceSetVariableFromSubPipeline::createFromBson(
@@ -95,8 +86,8 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceSetVariableFromSubPipeline::c
             << typeName(elem.type()),
         elem.type() == BSONType::Object);
 
-    auto spec = SetVariableFromSubPipelineSpec::parse(IDLParserErrorContext(kStageName),
-                                                      elem.embeddedObject());
+    auto spec =
+        SetVariableFromSubPipelineSpec::parse(IDLParserContext(kStageName), elem.embeddedObject());
     const auto searchMetaStr = "$$" + Variables::getBuiltinVariableName(Variables::kSearchMetaId);
     uassert(
         625291,
@@ -105,7 +96,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceSetVariableFromSubPipeline::c
         spec.getSetVariable().toString() == searchMetaStr);
 
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline =
-        Pipeline::parse(spec.getPipeline(), expCtx);
+        Pipeline::parse(spec.getPipeline(), expCtx->copyForSubPipeline(expCtx->ns));
 
     return DocumentSourceSetVariableFromSubPipeline::create(
         expCtx, std::move(pipeline), Variables::kSearchMetaId);
@@ -127,11 +118,14 @@ DocumentSourceSetVariableFromSubPipeline::create(
 
 DocumentSource::GetNextResult DocumentSourceSetVariableFromSubPipeline::doGetNext() {
     if (_firstCallForInput) {
+        tassert(6448002,
+                "Expected to have already attached a cursor source to the pipeline",
+                !_subPipeline->peekFront()->constraints().requiresInputDocSource);
         auto nextSubPipelineInput = _subPipeline->getNext();
-        tassert(625296,
-                "No document returned from $SetVariableFromSubPipeline subpipeline ",
+        uassert(625296,
+                "No document returned from $SetVariableFromSubPipeline subpipeline",
                 nextSubPipelineInput);
-        tassert(625297,
+        uassert(625297,
                 "Multiple documents returned from $SetVariableFromSubPipeline subpipeline when "
                 "only one expected",
                 !_subPipeline->getNext());
@@ -139,6 +133,24 @@ DocumentSource::GetNextResult DocumentSourceSetVariableFromSubPipeline::doGetNex
     }
     _firstCallForInput = false;
     return pSource->getNext();
+}
+
+void DocumentSourceSetVariableFromSubPipeline::addSubPipelineInitialSource(
+    boost::intrusive_ptr<DocumentSource> source) {
+    _subPipeline->addInitialSource(std::move(source));
+}
+
+void DocumentSourceSetVariableFromSubPipeline::detachFromOperationContext() {
+    _subPipeline->detachFromOperationContext();
+}
+
+void DocumentSourceSetVariableFromSubPipeline::reattachToOperationContext(OperationContext* opCtx) {
+    _subPipeline->reattachToOperationContext(opCtx);
+}
+
+bool DocumentSourceSetVariableFromSubPipeline::validateOperationContext(
+    const OperationContext* opCtx) const {
+    return getContext()->opCtx == opCtx && _subPipeline->validateOperationContext(opCtx);
 }
 
 }  // namespace mongo

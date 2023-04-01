@@ -15,7 +15,6 @@
 
 load('jstests/concurrency/fsm_libs/extend_workload.js');
 load('jstests/concurrency/fsm_workloads/random_DDL_operations.js');
-load("jstests/libs/override_methods/mongos_manual_intervention_actions.js");
 
 var $config = extendWorkload($config, function($config, $super) {
     $config.states.setFCV = function(db, collName, connCache) {
@@ -31,32 +30,22 @@ var $config = extendWorkload($config, function($config, $super) {
                 jsTestLog('setFCV: Invalid transition');
                 return;
             }
-            throw e;
-        }
-
-        // TODO SERVER-63983: remove the following if block once 6.0 becomes lastLTS
-        if (targetFCV == lastLTSFCV || targetFCV == lastContinuousFCV) {
-            for (var i = 0; i < dbCount; i++) {
-                const dbName = dbPrefix + i;
-                assertAlways.commandWorked(
-                    db.getSiblingDB(dbName).adminCommand({enablesharding: dbName}));
+            if (e.code === 7428200) {
+                // Cannot upgrade FCV if a previous FCV downgrade stopped in the middle of cleaning
+                // up internal server metadata.
+                assertAlways.eq(latestFCV, targetFCV);
+                jsTestLog(
+                    'setFCV: Cannot upgrade FCV if a previous FCV downgrade stopped in the middle \
+                    of cleaning up internal server metadata');
+                return;
             }
+            throw e;
         }
 
         jsTestLog('setFCV state finished');
     };
 
-    // TODO SERVER-63983: remove the following state override once 6.0 becomes lastLTS
-    $config.states.create = function(db, collName, connCache) {
-        db = getRandomDb(db);
-        const coll = getRandomCollection(db);
-        const fullNs = coll.getFullName();
-        jsTestLog('Executing create state: ' + fullNs);
-        assertAlways.commandWorkedOrFailedWithCode(
-            db.adminCommand({shardCollection: fullNs, key: {_id: 1}, unique: false}),
-            [ErrorCodes.IllegalOperation]);
-    };
-
+    // TODO (SERVER-73875): Include `movePrimary` state once 7.0 becomes last LTS.
     $config.transitions = {
         create: {create: 0.225, drop: 0.225, rename: 0.225, collMod: 0.225, setFCV: 0.10},
         drop: {create: 0.225, drop: 0.225, rename: 0.225, collMod: 0.225, setFCV: 0.10},

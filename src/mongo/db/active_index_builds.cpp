@@ -26,13 +26,17 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+#include <fmt/format.h>
 
 #include "mongo/db/active_index_builds.h"
 #include "mongo/db/catalog/index_builds_manager.h"
 #include "mongo/logv2/log.h"
 
 #include <boost/iterator/transform_iterator.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
@@ -49,7 +53,9 @@ void ActiveIndexBuilds::waitForAllIndexBuildsToStopForShutdown(OperationContext*
         return;
     }
 
-    auto indexBuildToUUID = [](const auto& indexBuild) { return indexBuild.first; };
+    auto indexBuildToUUID = [](const auto& indexBuild) {
+        return indexBuild.first;
+    };
     auto begin = boost::make_transform_iterator(_allIndexBuilds.begin(), indexBuildToUUID);
     auto end = boost::make_transform_iterator(_allIndexBuilds.end(), indexBuildToUUID);
     LOGV2(4725201,
@@ -57,16 +63,22 @@ void ActiveIndexBuilds::waitForAllIndexBuildsToStopForShutdown(OperationContext*
           "indexBuilds"_attr = logv2::seqLog(begin, end));
 
     // Wait for all the index builds to stop.
-    auto pred = [this]() { return _allIndexBuilds.empty(); };
+    auto pred = [this]() {
+        return _allIndexBuilds.empty();
+    };
     _indexBuildsCondVar.wait(lk, pred);
 }
 
 void ActiveIndexBuilds::assertNoIndexBuildInProgress() const {
     stdx::unique_lock<Latch> lk(_mutex);
-    uassert(ErrorCodes::BackgroundOperationInProgressForDatabase,
-            str::stream() << "cannot perform operation: there are currently "
-                          << _allIndexBuilds.size() << " index builds running.",
-            _allIndexBuilds.size() == 0);
+    if (!_allIndexBuilds.empty()) {
+        auto firstIndexBuild = _allIndexBuilds.cbegin()->second;
+        uasserted(ErrorCodes::BackgroundOperationInProgressForDatabase,
+                  fmt::format("cannot perform operation: there are currently {} index builds "
+                              "running. Found index build: {}",
+                              _allIndexBuilds.size(),
+                              firstIndexBuild->buildUUID.toString()));
+    }
 }
 
 void ActiveIndexBuilds::waitUntilAnIndexBuildFinishes(OperationContext* opCtx) {
@@ -137,7 +149,7 @@ void ActiveIndexBuilds::unregisterIndexBuild(
                 "buildUUID"_attr = replIndexBuildState->buildUUID,
                 "collectionUUID"_attr = replIndexBuildState->collectionUUID);
 
-    indexBuildsManager->unregisterIndexBuild(replIndexBuildState->buildUUID);
+    indexBuildsManager->tearDownAndUnregisterIndexBuild(replIndexBuildState->buildUUID);
     _indexBuildsCompletedGen++;
     _indexBuildsCondVar.notify_all();
 }
@@ -153,7 +165,7 @@ std::vector<std::shared_ptr<ReplIndexBuildState>> ActiveIndexBuilds::_filterInde
     WithLock lk, IndexBuildFilterFn indexBuildFilter) const {
 
     std::vector<std::shared_ptr<ReplIndexBuildState>> indexBuilds;
-    for (auto pair : _allIndexBuilds) {
+    for (const auto& pair : _allIndexBuilds) {
         auto replState = pair.second;
         if (!indexBuildFilter(*replState)) {
             continue;
@@ -163,9 +175,12 @@ std::vector<std::shared_ptr<ReplIndexBuildState>> ActiveIndexBuilds::_filterInde
     return indexBuilds;
 }
 
-void ActiveIndexBuilds::awaitNoBgOpInProgForDb(OperationContext* opCtx, StringData db) {
+void ActiveIndexBuilds::awaitNoBgOpInProgForDb(OperationContext* opCtx,
+                                               const DatabaseName& dbName) {
     stdx::unique_lock<Latch> lk(_mutex);
-    auto indexBuildFilter = [db](const auto& replState) { return db == replState.dbName; };
+    auto indexBuildFilter = [dbName](const auto& replState) {
+        return dbName == replState.dbName;
+    };
     auto pred = [&, this]() {
         auto dbIndexBuilds = _filterIndexBuilds_inlock(lk, indexBuildFilter);
         return dbIndexBuilds.empty();
@@ -183,7 +198,7 @@ Status ActiveIndexBuilds::registerIndexBuild(
         return replIndexBuildState->collectionUUID == replState.collectionUUID;
     };
     auto collIndexBuilds = _filterIndexBuilds_inlock(lk, pred);
-    for (auto existingIndexBuild : collIndexBuilds) {
+    for (const auto& existingIndexBuild : collIndexBuilds) {
         for (const auto& name : replIndexBuildState->indexNames) {
             if (existingIndexBuild->indexNames.end() !=
                 std::find(existingIndexBuild->indexNames.begin(),
@@ -204,6 +219,15 @@ Status ActiveIndexBuilds::registerIndexBuild(
 size_t ActiveIndexBuilds::getActiveIndexBuilds() const {
     stdx::unique_lock<Latch> lk(_mutex);
     return _allIndexBuilds.size();
+}
+
+void ActiveIndexBuilds::appendBuildInfo(const UUID& buildUUID, BSONObjBuilder* builder) const {
+    stdx::unique_lock<Latch> lk(_mutex);
+    auto it = _allIndexBuilds.find(buildUUID);
+    if (it == _allIndexBuilds.end()) {
+        return;
+    }
+    it->second->appendBuildInfo(builder);
 }
 
 void ActiveIndexBuilds::sleepIfNecessary_forTestOnly() const {

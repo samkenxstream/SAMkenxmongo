@@ -132,7 +132,7 @@ public:
     }
 
     /** Lock and return a holder to the value and lock. Const or non-const. */
-    auto operator-> () const {
+    auto operator->() const {
         return synchronize();
     }
     auto operator*() const {
@@ -144,7 +144,7 @@ public:
     }
 
     /** Mutators */
-    auto operator-> () {
+    auto operator->() {
         return synchronize();
     }
     auto operator*() {
@@ -183,8 +183,8 @@ public:
     }
 
 private:
-    value_type _value;  ///< guarded by _mutex
-    mutable mutex_type _mutex = mutex_policy_type::construct();
+    value_type _value;                                           ///< guarded by _mutex
+    mutable mutex_type _mutex = mutex_policy_type::construct();  // NOLINT(mongo-mutex-check)
 };
 
 }  // namespace mongo

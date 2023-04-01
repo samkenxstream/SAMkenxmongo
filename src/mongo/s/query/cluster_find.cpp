@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -54,23 +53,30 @@
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/getmore_command_gen.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/db/query/telemetry.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/overflow_arithmetic.h"
+#include "mongo/s/analyze_shard_key_cmd_gen.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/num_hosts_targeted_metrics.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/collection_uuid_mismatch.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/async_results_merger.h"
 #include "mongo/s/query/cluster_client_cursor_impl.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/query/establish_cursors.h"
 #include "mongo/s/query/store_possible_cursor.h"
+#include "mongo/s/query_analysis_sampler_util.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -82,11 +88,6 @@ static const BSONObj kSortKeyMetaProjection = BSON("$meta"
                                                    << "sortKey");
 static const BSONObj kGeoNearDistanceMetaProjection = BSON("$meta"
                                                            << "geoNearDistance");
-// We must allow some amount of overhead per result document, since when we make a cursor response
-// the documents are elements of a BSONArray. The overhead is 1 byte/doc for the type + 1 byte/doc
-// for the field name's null terminator + 1 byte per digit in the array index. The index can be no
-// more than 8 decimal digits since the response is at most 16MB, and 16 * 1024 * 1024 < 1 * 10^8.
-static const int kPerDocumentOverheadBytesUpperBound = 10;
 
 const char kFindCmdName[] = "find";
 
@@ -149,14 +150,16 @@ StatusWith<std::unique_ptr<FindCommandRequest>> transformQueryForShards(
 
 /**
  * Constructs the find commands sent to each targeted shard to establish cursors, attaching the
- * shardVersion and txnNumber, if necessary.
+ * shardVersion, txnNumber and sampleId if necessary.
  */
 std::vector<std::pair<ShardId, BSONObj>> constructRequestsForShards(
     OperationContext* opCtx,
-    const ChunkManager& cm,
+    const CollectionRoutingInfo& cri,
     const std::set<ShardId>& shardIds,
     const CanonicalQuery& query,
+    const boost::optional<UUID> sampleId,
     bool appendGeoNearDistanceProjection) {
+    const auto& cm = cri.cm;
 
     std::unique_ptr<FindCommandRequest> findCommandToForward;
     if (shardIds.size() > 1) {
@@ -174,6 +177,11 @@ std::vector<std::pair<ShardId, BSONObj>> constructRequestsForShards(
         findCommandToForward->setReadConcern(readConcernArgs.toBSONInner());
     }
 
+    // Choose the shard to sample the query on if needed.
+    const auto sampleShardId = sampleId
+        ? boost::make_optional(analyze_shard_key::getRandomShardId(shardIds))
+        : boost::none;
+
     auto shardRegistry = Grid::get(opCtx)->shardRegistry();
     std::vector<std::pair<ShardId, BSONObj>> requests;
     for (const auto& shardId : shardIds) {
@@ -184,15 +192,17 @@ std::vector<std::pair<ShardId, BSONObj>> constructRequestsForShards(
         findCommandToForward->serialize(BSONObj(), &cmdBuilder);
 
         if (cm.isSharded()) {
-            cm.getVersion(shardId).serializeToBSON(ChunkVersion::kShardVersionField, &cmdBuilder);
+            cri.getShardVersion(shardId).serialize(ShardVersion::kShardVersionField, &cmdBuilder);
         } else if (!query.nss().isOnInternalDb()) {
-            ChunkVersion::UNSHARDED().serializeToBSON(ChunkVersion::kShardVersionField,
-                                                      &cmdBuilder);
+            ShardVersion::UNSHARDED().serialize(ShardVersion::kShardVersionField, &cmdBuilder);
             cmdBuilder.append("databaseVersion", cm.dbVersion().toBSON());
         }
 
         if (opCtx->getTxnNumber()) {
             cmdBuilder.append(OperationSessionInfo::kTxnNumberFieldName, *opCtx->getTxnNumber());
+        }
+        if (shardId == sampleShardId) {
+            analyze_shard_key::appendSampleId(&cmdBuilder, *sampleId);
         }
 
         requests.emplace_back(shardId, cmdBuilder.obj());
@@ -218,9 +228,12 @@ void updateNumHostsTargetedMetrics(OperationContext* opCtx,
 CursorId runQueryWithoutRetrying(OperationContext* opCtx,
                                  const CanonicalQuery& query,
                                  const ReadPreferenceSetting& readPref,
-                                 const ChunkManager& cm,
+                                 const boost::optional<UUID> sampleId,
+                                 const CollectionRoutingInfo& cri,
                                  std::vector<BSONObj>* results,
                                  bool* partialResultsReturned) {
+    const auto& cm = cri.cm;
+
     auto findCommand = query.getFindCommandRequest();
     // Get the set of shards on which we will run the query.
     auto shardIds = getTargetedShardsForQuery(
@@ -284,40 +297,53 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
             "tailable cursor unexpectedly has a sort",
             sortComparatorObj.isEmpty() || !findCommand.getTailable());
 
-    auto establishCursorsOnShards = [&](const std::set<ShardId>& shardIds) {
-        return establishCursors(
-            opCtx,
-            Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
-            query.nss(),
-            readPref,
-            // Construct the requests that we will use to establish cursors on the targeted shards,
-            // attaching the shardVersion and txnNumber, if necessary.
-            constructRequestsForShards(opCtx, cm, shardIds, query, appendGeoNearDistanceProjection),
-            findCommand.getAllowPartialResults());
-    };
-
     try {
         // Establish the cursors with a consistent shardVersion across shards.
-        params.remotes = establishCursorsOnShards(shardIds);
+
+        // If we have maxTimeMS and allowPartialResults, then leave some spare time in the opCtx
+        // deadline so that we have time to return partial results before the opCtx is killed.
+        auto deadline = opCtx->getDeadline();
+        if (findCommand.getAllowPartialResults() && findCommand.getMaxTimeMS()) {
+            // Reserve 25% of the time budget (up to 100,000 microseconds max) for processing
+            // buffered partial results.
+            deadline -=
+                Microseconds{std::min(1000LL * findCommand.getMaxTimeMS().get() / 4, 100'000LL)};
+            LOGV2_DEBUG(
+                5746901,
+                0,
+                "Setting an earlier artificial deadline because the find allows partial results.",
+                "deadline"_attr = deadline);
+        }
+
+        // The call to establishCursors has its own timeout mechanism that is controlled by the
+        // opCtx, so we don't expect runWithDeadline to throw a timeout at this level. We use
+        // runWithDeadline because it has the side effect of pushing a temporary (artificial)
+        // deadline onto the opCtx used by establishCursors.
+        opCtx->runWithDeadline(deadline, ErrorCodes::MaxTimeMSExpired, [&]() -> void {
+            params.remotes = establishCursors(
+                opCtx,
+                Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
+                query.nss(),
+                readPref,
+                // Construct the requests that we will use to establish cursors on the targeted
+                // shards, attaching the shardVersion and txnNumber, if necessary.
+                constructRequestsForShards(
+                    opCtx, cri, shardIds, query, sampleId, appendGeoNearDistanceProjection),
+                findCommand.getAllowPartialResults());
+        });
     } catch (const DBException& ex) {
         if (ex.code() == ErrorCodes::CollectionUUIDMismatch &&
             !ex.extraInfo<CollectionUUIDMismatchInfo>()->actualCollection() &&
             !shardIds.count(cm.dbPrimary())) {
-            // We received CollectionUUIDMismatchInfo but it does not contain the actual
-            // namespace, and we did not attempt to establish a cursor on the primary shard.
-            // Attempt to do so now in case the collection corresponding to the provided UUID is
-            // unsharded. This should throw CollectionUUIDMismatchInfo, StaleShardVersion, or
-            // StaleDbVersion.
-            establishCursorsOnShards({cm.dbPrimary()});
+            // We received CollectionUUIDMismatch but it does not contain the actual namespace, and
+            // we did not attempt to establish a cursor on the primary shard.
+            uassertStatusOK(populateCollectionUUIDMismatch(opCtx, ex.toStatus()));
             MONGO_UNREACHABLE;
         }
-
         throw;
     }
 
-
     // Determine whether the cursor we may eventually register will be single- or multi-target.
-
     const auto cursorType = params.remotes.size() > 1
         ? ClusterCursorManager::CursorType::MultiTarget
         : ClusterCursorManager::CursorType::SingleTarget;
@@ -332,7 +358,6 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
     }
 
     // Transfer the established cursors to a ClusterClientCursor.
-
     auto ccc = ClusterClientCursorImpl::make(
         opCtx, Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(), std::move(params));
 
@@ -340,15 +365,41 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
 
     FindCommon::waitInFindBeforeMakingBatch(opCtx, query);
 
-    auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
-    size_t bytesBuffered = 0;
+    if (findCommand.getAllowPartialResults() &&
+        opCtx->checkForInterruptNoAssert().code() == ErrorCodes::MaxTimeMSExpired) {
+        // MaxTimeMS is expired in the router, but some remotes may still have outsanding requests.
+        // Wait for all remotes to expire their requests.
 
-    // This loop will not result in actually calling getMore against shards, but just loading
-    // results from the initial batches (that were obtained while establishing cursors) into
-    // 'results'.
+        // Maximum number of 1ms sleeps to wait for remote cursors to be exhausted.
+        constexpr int kMaxAttempts = 10;
+        for (int remainingAttempts = kMaxAttempts; !ccc->remotesExhausted(); remainingAttempts--) {
+            if (!remainingAttempts) {
+                LOGV2_DEBUG(
+                    5746900,
+                    0,
+                    "MaxTimeMSExpired error was seen on the router, but partial results cannot be "
+                    "returned because the remotes did not give the expected MaxTimeMS error within "
+                    "kMaxAttempts.");
+                // Reveal the MaxTimeMSExpired error.
+                opCtx->checkForInterrupt();
+            }
+            stdx::this_thread::sleep_for(stdx::chrono::milliseconds(1));
+        }
+    }
+
+    auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
+    FindCommon::BSONArrayResponseSizeTracker responseSizeTracker;
+
+    // This loop will load enough results from the shards for a full first batch.  At first, these
+    // results come from the initial batches that were obtained when establishing cursors, but
+    // ClusterClientCursor::next will fetch further results if necessary.
     while (!FindCommon::enoughForFirstBatch(findCommand, results->size())) {
         auto next = uassertStatusOK(ccc->next());
-
+        if (findCommand.getAllowPartialResults()) {
+            if (ccc->remotesExhausted()) {
+                cursorState = ClusterCursorManager::CursorState::Exhausted;
+            }
+        }
         if (next.isEOF()) {
             // We reached end-of-stream. If the cursor is not tailable, then we mark it as
             // exhausted. If it is tailable, usually we keep it open (i.e. "NotExhausted") even
@@ -364,14 +415,13 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
 
         // If adding this object will cause us to exceed the message size limit, then we stash it
         // for later.
-        if (!FindCommon::haveSpaceForNext(nextObj, results->size(), bytesBuffered)) {
+        if (!responseSizeTracker.haveSpaceForNext(nextObj)) {
             ccc->queueResult(nextObj);
             break;
         }
 
-        // Add doc to the batch. Account for the space overhead associated with returning this doc
-        // inside a BSON array.
-        bytesBuffered += (nextObj.objsize() + kPerDocumentOverheadBytesUpperBound);
+        // Add doc to the batch.
+        responseSizeTracker.add(nextObj);
         results->push_back(std::move(nextObj));
     }
 
@@ -381,23 +431,26 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
         cursorState = ClusterCursorManager::CursorState::Exhausted;
     }
 
+    auto&& opDebug = CurOp::get(opCtx)->debug();
     // Fill out query exec properties.
-    CurOp::get(opCtx)->debug().nShards = ccc->getNumRemotes();
-    CurOp::get(opCtx)->debug().nreturned = results->size();
+    opDebug.nShards = ccc->getNumRemotes();
+    opDebug.additiveMetrics.nBatches = 1;
 
     // If the caller wants to know whether the cursor returned partial results, set it here.
     if (partialResultsReturned) {
+        // Missing results can come either from the first batches or from the ccc's later batches.
         *partialResultsReturned = ccc->partialResultsReturned();
     }
 
     // If the cursor is exhausted, then there are no more results to return and we don't need to
     // allocate a cursor id.
     if (cursorState == ClusterCursorManager::CursorState::Exhausted) {
-        CurOp::get(opCtx)->debug().cursorExhausted = true;
+        opDebug.cursorExhausted = true;
 
         if (shardIds.size() > 0) {
             updateNumHostsTargetedMetrics(opCtx, cm, shardIds.size());
         }
+        collectTelemetryMongos(opCtx, ccc->getOriginatingCommand(), results->size());
         return CursorId(0);
     }
 
@@ -407,14 +460,14 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
     const auto cursorLifetime = findCommand.getNoCursorTimeout()
         ? ClusterCursorManager::CursorLifetime::Immortal
         : ClusterCursorManager::CursorLifetime::Mortal;
-    auto authUsers = AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames();
-    ccc->incNBatches();
+    auto authUser = AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserName();
+    collectTelemetryMongos(opCtx, ccc, results->size());
 
     auto cursorId = uassertStatusOK(cursorManager->registerCursor(
-        opCtx, ccc.releaseCursor(), query.nss(), cursorType, cursorLifetime, authUsers));
+        opCtx, ccc.releaseCursor(), query.nss(), cursorType, cursorLifetime, authUser));
 
     // Record the cursorID in CurOp.
-    CurOp::get(opCtx)->debug().cursorid = cursorId;
+    opDebug.cursorid = cursorId;
 
     if (shardIds.size() > 0) {
         updateNumHostsTargetedMetrics(opCtx, cm, shardIds.size());
@@ -508,22 +561,33 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
             !findCommand.getRequestResumeToken() && findCommand.getResumeAfter().isEmpty());
 
     auto const catalogCache = Grid::get(opCtx)->catalogCache();
+    // Try to generate a sample id for this query here instead of inside 'runQueryWithoutRetrying()'
+    // since it is incorrect to generate multiple sample ids for a single query.
+    const auto sampleId = analyze_shard_key::tryGenerateSampleId(
+        opCtx, query.nss(), analyze_shard_key::SampledCommandNameEnum::kFind);
 
     // Re-target and re-send the initial find command to the shards until we have established the
     // shard version.
     for (size_t retries = 1; retries <= kMaxRetries; ++retries) {
-        auto swCM = getCollectionRoutingInfoForTxnCmd(opCtx, query.nss());
-        if (swCM == ErrorCodes::NamespaceNotFound) {
+        auto swCri = getCollectionRoutingInfoForTxnCmd(opCtx, query.nss());
+        if (swCri == ErrorCodes::NamespaceNotFound) {
+            uassert(CollectionUUIDMismatchInfo(query.nss().dbName(),
+                                               *findCommand.getCollectionUUID(),
+                                               query.nss().coll().toString(),
+                                               boost::none),
+                    "Database does not exist",
+                    !findCommand.getCollectionUUID());
+
             // If the database doesn't exist, we successfully return an empty result set without
             // creating a cursor.
             return CursorId(0);
         }
 
-        const auto cm = uassertStatusOK(std::move(swCM));
+        const auto cri = uassertStatusOK(std::move(swCri));
 
         try {
             return runQueryWithoutRetrying(
-                opCtx, query, readPref, cm, results, partialResultsReturned);
+                opCtx, query, readPref, sampleId, cri, results, partialResultsReturned);
         } catch (ExceptionFor<ErrorCodes::StaleDbVersion>& ex) {
             if (retries >= kMaxRetries) {
                 // Check if there are no retries remaining, so the last received error can be
@@ -601,7 +665,8 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
             if (auto txnRouter = TransactionRouter::get(opCtx)) {
                 if (!txnRouter.canContinueOnStaleShardOrDbError(kFindCmdName, ex.toStatus())) {
                     if (ex.code() == ErrorCodes::ShardInvalidatedForTargeting) {
-                        (void)catalogCache->getCollectionRoutingInfoWithRefresh(opCtx, query.nss());
+                        (void)catalogCache->getCollectionRoutingInfoWithPlacementRefresh(
+                            opCtx, query.nss());
                     }
                     throw;
                 }
@@ -697,13 +762,14 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     auto cursorManager = Grid::get(opCtx)->getCursorManager();
 
     auto authzSession = AuthorizationSession::get(opCtx->getClient());
-    auto authChecker = [&authzSession](UserNameIterator userNames) -> Status {
-        return authzSession->isCoauthorizedWith(userNames)
+    auto authChecker = [&authzSession](const boost::optional<UserName>& userName) -> Status {
+        return authzSession->isCoauthorizedWith(userName)
             ? Status::OK()
             : Status(ErrorCodes::Unauthorized, "User not authorized to access cursor");
     };
 
-    NamespaceString nss(cmd.getDbName(), cmd.getCollection());
+    NamespaceString nss(
+        NamespaceStringUtil::parseNamespaceFromRequest(cmd.getDbName(), cmd.getCollection()));
     int64_t cursorId = cmd.getCommandParameter();
 
     auto pinnedCursor = cursorManager->checkOutCursor(cursorId, opCtx, authChecker);
@@ -763,7 +829,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     }
 
     std::vector<BSONObj> batch;
-    size_t bytesBuffered = 0;
+    FindCommon::BSONArrayResponseSizeTracker responseSizeTracker;
     long long batchSize = cmd.getBatchSize().value_or(0);
     auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
     BSONObj postBatchResumeToken;
@@ -801,6 +867,16 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         }
 
         if (!next.isOK()) {
+            if (next.getStatus() == ErrorCodes::MaxTimeMSExpired &&
+                pinnedCursor.getValue()->partialResultsReturned()) {
+                // Break to return partial results rather than return a MaxTimeMSExpired error
+                cursorState = ClusterCursorManager::CursorState::Exhausted;
+                LOGV2_DEBUG(5746903,
+                            0,
+                            "Attempting to return partial results because MaxTimeMS expired and "
+                            "the query set AllowPartialResults.");
+                break;
+            }
             return next.getStatus();
         }
 
@@ -816,8 +892,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
             break;
         }
 
-        if (!FindCommon::haveSpaceForNext(
-                *next.getValue().getResult(), batch.size(), bytesBuffered)) {
+        if (!responseSizeTracker.haveSpaceForNext(*next.getValue().getResult())) {
             pinnedCursor.getValue()->queueResult(*next.getValue().getResult());
             stashedResult = true;
             break;
@@ -826,10 +901,8 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         // As soon as we get a result, this operation no longer waits.
         awaitDataState(opCtx).shouldWaitForInserts = false;
 
-        // Add doc to the batch. Account for the space overhead associated with returning this doc
-        // inside a BSON array.
-        bytesBuffered +=
-            (next.getValue().getResult()->objsize() + kPerDocumentOverheadBytesUpperBound);
+        // Add doc to the batch.
+        responseSizeTracker.add(*next.getValue().getResult());
         batch.push_back(std::move(*next.getValue().getResult()));
 
         // Update the postBatchResumeToken. For non-$changeStream aggregations, this will be empty.
@@ -846,16 +919,18 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         postBatchResumeToken = pinnedCursor.getValue()->getPostBatchResumeToken();
     }
 
+    auto&& opDebug = CurOp::get(opCtx)->debug();
+    // Set nReturned and whether the cursor has been exhausted.
+    opDebug.cursorExhausted = (idToReturn == 0);
+    opDebug.additiveMetrics.nBatches = 1;
+
     const bool partialResultsReturned = pinnedCursor.getValue()->partialResultsReturned();
     pinnedCursor.getValue()->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
-    pinnedCursor.getValue()->incNBatches();
+    collectTelemetryMongos(opCtx, pinnedCursor.getValue(), batch.size());
+
     // Upon successful completion, transfer ownership of the cursor back to the cursor manager. If
     // the cursor has been exhausted, the cursor manager will clean it up for us.
     pinnedCursor.getValue().returnCursor(cursorState);
-
-    // Set nReturned and whether the cursor has been exhausted.
-    CurOp::get(opCtx)->debug().cursorExhausted = (idToReturn == 0);
-    CurOp::get(opCtx)->debug().nreturned = batch.size();
 
     if (MONGO_unlikely(waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch.shouldFail())) {
         CurOpFailpointHelpers::waitWhileFailPointEnabled(

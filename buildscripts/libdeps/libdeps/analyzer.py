@@ -38,6 +38,7 @@ import functools
 from pathlib import Path
 
 import networkx
+import cxxfilt
 
 from libdeps.graph import CountTypes, DependsReportTypes, LinterTypes, EdgeProps, NodeProps
 
@@ -114,7 +115,6 @@ def schema_check(func, schema_version):
 class Analyzer:
     """Base class for different types of analyzers."""
 
-    # pylint: disable=too-many-instance-attributes
     def __init__(self, dependency_graph, progress=True):
         """Store the graph and extract the build_dir from the graph."""
 
@@ -367,14 +367,19 @@ def counter_factory(dependency_graph, counters, progressbar=True):
         counters = [counters]
 
     counter_objs = []
-    for counter in counters:
-        if counter in counter_map:
+    if CountTypes.ALL.name in counters:
+        for counter in counter_map:
             counter_obj = counter_map[counter](dependency_graph)
             counter_obj.set_progress(progressbar)
             counter_objs.append(counter_obj)
-
-        else:
-            print(f"Skipping unknown counter: {counter}")
+    else:
+        for counter in counters:
+            if counter in counter_map:
+                counter_obj = counter_map[counter](dependency_graph)
+                counter_obj.set_progress(progressbar)
+                counter_objs.append(counter_obj)
+            else:
+                print(f"Skipping unknown counter: {counter}")
 
     return counter_objs
 
@@ -476,7 +481,7 @@ class InDegreeOne(Analyzer):
         in_degree_one_nodes = []
         for node, data in self._dependency_graph.nodes(data=True):
             if (len(self._dependents_graph[node]) < 2
-                    and data[NodeProps.bin_type.name] == 'SharedLibrary'):
+                    and data.get(NodeProps.bin_type.name) == 'SharedLibrary'):
 
                 if len(self._dependents_graph[node]) == 1:
                     depender = list(self._dependents_graph[node].items())[0][0]
@@ -529,6 +534,132 @@ class GraphPaths(Analyzer):
                                                            self._to_node])] = self.run()
 
 
+class SymbolDependents(Analyzer):
+    """Find all symbol dependents between the two nodes in the graph."""
+
+    def __init__(self, dependency_graph, from_node, to_node):
+        """Store graph and strip the nodes."""
+
+        super().__init__(dependency_graph)
+        self._from_node, self._to_node = from_node, to_node
+
+    @schema_check(schema_version=1)
+    def run(self):
+        """Find all symbol dependents between the two nodes in the graph."""
+
+        edge = self._dependents_graph.get_edge_data(u=self._from_node, v=self._to_node)
+        if 'symbols' in edge:
+            return edge['symbols'].split()
+        return []
+
+    def report(self, report):
+        """Add the symbol dependents list to the report."""
+
+        if DependsReportTypes.SYMBOL_DEPENDS.name not in report:
+            report[DependsReportTypes.SYMBOL_DEPENDS.name] = {}
+        report[DependsReportTypes.SYMBOL_DEPENDS.name][tuple([self._from_node,
+                                                              self._to_node])] = self.run()
+
+
+class Efficiency(Analyzer):
+    """Find efficiency of each public dependency originating from each node in a given set."""
+
+    def __init__(self, dependency_graph, from_nodes):
+        """Store graph and strip the nodes."""
+
+        super().__init__(dependency_graph)
+        self._from_nodes = from_nodes
+
+    @schema_check(schema_version=1)
+    def run(self):
+        """Find efficiency of each public dependency originating from a node."""
+
+        efficiencies_data = {}
+
+        for node_a in self._from_nodes:
+            efficiency_data = {}
+
+            for node_b in self._dependency_graph[node_a]:
+                edge = self._dependency_graph.get_edge_data(u=node_a, v=node_b)
+
+                if edge['direct'] and edge['visibility'] == 1:
+                    needed, not_needed = [], []
+
+                    for node_x in self._dependency_graph[node_b]:
+                        edge = self._dependency_graph.get_edge_data(u=node_b, v=node_x)
+
+                        if not edge['direct'] and 'symbols' in edge:
+                            needed.append(node_x)
+                        elif not edge['direct']:
+                            not_needed.append(node_x)
+
+                    total_count = len(needed) + len(not_needed)
+
+                    efficiency_data[node_b] = {
+                        "needed": needed, "not_needed": not_needed, "count_needed": len(needed),
+                        "count_not_needed": len(not_needed), "count_total": total_count,
+                        "efficiency": len(needed) / (total_count or 1)
+                    }
+            efficiencies_data[node_a] = efficiency_data
+
+        return efficiencies_data
+
+    def report(self, report):
+        """Add the public libdeps efficiency of each input node to the report."""
+
+        if DependsReportTypes.EFFICIENCY.name not in report:
+            report[DependsReportTypes.EFFICIENCY.name] = {}
+        report[DependsReportTypes.EFFICIENCY.name] = self.run()
+
+
+class EfficiencyLinter(Analyzer):
+    """Analyze efficiency of all public dependencies. List those with efficiencies under a given threshold."""
+
+    def __init__(self, dependency_graph, threshold=2):
+        """Store graph and strip the nodes."""
+
+        super().__init__(dependency_graph)
+        self._threshold = threshold
+
+    @schema_check(schema_version=1)
+    def run(self):
+        """Find efficiency of all public dependencies in graph."""
+
+        data = {}
+        result = Efficiency(self._dependency_graph, self._dependency_graph.nodes).run()
+        for node_a in result:
+            for node_b in result[node_a]:
+                data[tuple([node_a, node_b])] = result[node_a][node_b]
+
+        efficiencies = list(x['efficiency'] for x in data.values())
+
+        efficiencies_product = 1
+        for efficiency in efficiencies:
+            efficiencies_product *= efficiency + 1
+        efficiencies_geo_mean = (efficiencies_product**(1 / len(efficiencies))) - 1
+
+        edges_zero = list(filter(lambda x: data[x]['efficiency'] == 0, data))
+        edges_lt_threshold = list(
+            filter(
+                lambda x: data[x]['efficiency'] < (self._threshold / 100) and data[x]['efficiency']
+                > 0, data))
+        edges_lt_threshold = sorted(edges_lt_threshold, key=lambda x: data[x]['efficiency'])
+
+        return {
+            "threshold": self._threshold, "edge_data": data,
+            "edges_lt_threshold": edges_lt_threshold, "count_lt_threshold": len(edges_lt_threshold),
+            "edges_zero": edges_zero, "count_zero": len(edges_zero), "mean": round(
+                efficiencies_geo_mean, 3)
+        }
+
+    def report(self, report):
+        """Add efficiency lint result to report."""
+
+        if LinterTypes.EFFICIENCY_LINT.name not in report:
+            report[LinterTypes.EFFICIENCY_LINT.name] = {}
+        report[LinterTypes.EFFICIENCY_LINT.name] = self.run()
+
+
 class CriticalEdges(Analyzer):
     """Finds all edges between two nodes, where removing those edges disconnects the two nodes."""
 
@@ -548,10 +679,12 @@ class CriticalEdges(Analyzer):
         # of the direction of the graph, so we we use the reverse graph
         # so that we get a cut nearest our from_node, or the first cut we
         # would encounter on a given path from the from_node to the to_node.
-        min_cut_edges = list(
-            minimum_st_edge_cut(
-                G=self._dependents_graph.get_direct_nonprivate_graph().get_node_tree(self._to_node),
-                s=self._to_node, t=self._from_node))
+        subgraph = self._dependents_graph.get_direct_nonprivate_graph().get_node_tree(self._to_node)
+        if subgraph.has_node(self._from_node):
+            min_cut_edges = list(
+                minimum_st_edge_cut(G=subgraph, s=self._to_node, t=self._from_node))
+        else:
+            min_cut_edges = []
         return [(edge[1], edge[0]) for edge in min_cut_edges]
 
     def report(self, report):
@@ -776,7 +909,6 @@ class GaPrettyPrinter(GaPrinter):
     def _print_depends_reports(self, results):
         """Print the depends reports result data."""
 
-        # pylint: disable=too-many-branches
         if DependsReportTypes.DIRECT_DEPENDS.name in results:
             print("\nNodes that directly depend on:")
             for node in results[DependsReportTypes.DIRECT_DEPENDS.name]:
@@ -816,6 +948,42 @@ class GaPrettyPrinter(GaPrinter):
             print("\nLibrary nodes with 1 or 0 dependers:")
             for count, nodes in enumerate(results[DependsReportTypes.IN_DEGREE_ONE.name], start=1):
                 print(f"    {count}: '{nodes[0]}' <- '{nodes[1]}'")
+
+        if DependsReportTypes.SYMBOL_DEPENDS.name in results:
+            print("\nSymbol dependents:")
+            for nodes in results[DependsReportTypes.SYMBOL_DEPENDS.name]:
+                symbols = results[DependsReportTypes.SYMBOL_DEPENDS.name][nodes]
+                print(
+                    f"{len(symbols)} symbols defined in '{nodes[0]}' which are used in '{nodes[1]}'"
+                )
+                for symbol in symbols:
+                    print(f"\t{cxxfilt.demangle(symbol)}")
+
+        if DependsReportTypes.EFFICIENCY.name in results:
+            for from_node in results[DependsReportTypes.EFFICIENCY.name]:
+                print("\nEfficiency of all public direct edges on " + from_node + ":")
+                data = results[DependsReportTypes.EFFICIENCY.name][from_node]
+                for to_node in data:
+                    print('[ ' + str(round(data[to_node]['efficiency'] * 100, 1)) + '% ] ' +
+                          from_node + ' -> ' + to_node)
+
+        if LinterTypes.EFFICIENCY_LINT.name in results:
+            data = results[LinterTypes.EFFICIENCY_LINT.name]
+            print("\nLibdepsLinter: Efficiency of Direct Public Edges")
+
+            print(f"  Geometric Mean: {round(data['mean'] * 100, 1)}%")
+
+            print(f"  0%: {data['count_zero']} edges")
+            for edge in data['edges_zero']:
+                print(
+                    f"    [ {str(round(data['edge_data'][edge]['efficiency'] * 100, 2))}% ] {edge[0]} -> {edge[1]}"
+                )
+
+            print(f"  0-{data['threshold']}%: {data['count_lt_threshold']} edges")
+            for edge in data['edges_lt_threshold']:
+                print(
+                    f"    [ {str(round(data['edge_data'][edge]['efficiency'] * 100, 2))}% ] {edge[0]} -> {edge[1]}"
+                )
 
     def print(self):
         """Print the result data."""

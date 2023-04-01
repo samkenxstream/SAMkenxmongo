@@ -4,7 +4,6 @@
  *
  * @tags: [
  *   requires_fcv_51,
- *   requires_find_command
  * ]
  */
 
@@ -12,6 +11,7 @@
 "use strict";
 
 load("jstests/core/timeseries/libs/timeseries.js");  // For 'TimeseriesTest' helpers.
+load('jstests/sharding/libs/shard_versioning_util.js');
 
 Random.setRandomSeed();
 
@@ -59,6 +59,7 @@ function runTest({shardKey, cmdObj, numProfilerEntries}) {
     const isDelete = cmdObj["delete"] !== undefined;
     const isUpdate = cmdObj["update"] !== undefined;
     const isCollMod = cmdObj["collMod"] !== undefined;
+    const isDropIndex = cmdObj["dropIndexes"] !== undefined;
     const cmdCollName = cmdObj[Object.keys(cmdObj)[0]];
     const shardKeyHasMetaField = shardKey[metaField] !== undefined;
 
@@ -106,7 +107,29 @@ function runTest({shardKey, cmdObj, numProfilerEntries}) {
         }
 
         const queryField = `command.${Object.keys(cmdObj)[0]}`;
-        let filter = {[queryField]: cmdCollName, "command.shardVersion.0": {$ne: Timestamp(0, 0)}};
+        let filter = {
+            [queryField]: cmdCollName,
+            "$or": [
+                {
+                    "$and": [
+                        {"command.shardVersion.0": {"$exists": true}},
+                        {
+                            "command.shardVersion.0":
+                                {$ne: ShardVersioningUtil.kIgnoredShardVersion.v}
+                        },
+                    ]
+                },
+                {
+                    "$and": [
+                        {"command.shardVersion.v": {"$exists": true}},
+                        {
+                            "command.shardVersion.v":
+                                {$ne: ShardVersioningUtil.kIgnoredShardVersion.v}
+                        },
+                    ]
+                },
+            ]
+        };
 
         // We currently do not log 'shardVersion' for updates. See SERVER-60354 for details.
         if (isUpdate) {
@@ -117,7 +140,13 @@ function runTest({shardKey, cmdObj, numProfilerEntries}) {
             const command = unVersioned ? "_shardsvrCollMod" : "_shardsvrCollModParticipant";
             filter = {[`command.${command}`]: cmdCollName, "ok": {$ne: 0}};
         } else if (unVersioned && !isCollMod) {
-            filter["command.shardVersion.0"] = Timestamp(0, 0);
+            filter = {
+                [queryField]: cmdCollName,
+                "$or": [
+                    {"command.shardVersion.0": ShardVersioningUtil.kIgnoredShardVersion.v},
+                    {"command.shardVersion.v": ShardVersioningUtil.kIgnoredShardVersion.v},
+                ]
+            };
         }
 
         // Filter out the profiler entries with $indexStats pipeline stage, as the
@@ -145,8 +174,10 @@ function runTest({shardKey, cmdObj, numProfilerEntries}) {
     assert.commandWorked(mongos0.createCollection(
         collName, {timeseries: {timeField: timeField, metaField: metaField}}));
 
-    // When unsharded, the command should be run against the user requested namespace.
-    validateCommand(cmdCollName, numProfilerEntries.unsharded, true);
+    // When unsharded, the command should be run against the user requested namespace, except for
+    // dropIndex.
+    validateCommand(
+        isDropIndex ? bucketsCollName : cmdCollName, numProfilerEntries.unsharded, true);
 }
 
 /**
@@ -258,8 +289,7 @@ runTest({
     numProfilerEntries: {sharded: 1, unsharded: 1},
 });
 
-if (TimeseriesTest.timeseriesUpdatesAndDeletesEnabled(st.shard0) &&
-    TimeseriesTest.shardedTimeseriesUpdatesAndDeletesEnabled(st.shard0)) {
+if (TimeseriesTest.shardedTimeseriesUpdatesAndDeletesEnabled(st.shard0)) {
     // Tests for updates.
     runTest({
         shardKey: {[metaField + ".a"]: 1},

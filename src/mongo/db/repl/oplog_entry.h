@@ -32,11 +32,11 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/apply_ops_gen.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/util/visit_helper.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/util/overloaded_visitor.h"
 
 namespace mongo {
 namespace repl {
@@ -47,8 +47,10 @@ std::vector<T> toVector(boost::optional<stdx::variant<T, std::vector<T>>> optVal
     if (!optVals) {
         return {};
     }
-    return stdx::visit(visit_helper::Overloaded{[](T val) { return std::vector<T>{val}; },
-                                                [](const std::vector<T>& vals) { return vals; }},
+    return stdx::visit(OverloadedVisitor{[](T val) { return std::vector<T>{val}; },
+                                         [](const std::vector<T>& vals) {
+                                             return vals;
+                                         }},
                        *optVals);
 }
 }  // namespace variant_util
@@ -77,21 +79,31 @@ public:
 
         // The pre-image is recorded in the change stream pre-images collection.
         kPreImagesCollection,
-
-        // The pre-image is recorded in the oplog as a separate entry.
-        kOplog,
     };
 
-    static ReplOperation parse(const IDLParserErrorContext& ctxt, const BSONObj& bsonObject) {
+    static ReplOperation parse(const IDLParserContext& ctxt, const BSONObj& bsonObject) {
         ReplOperation o;
         o.parseProtected(ctxt, bsonObject);
         return o;
     }
-    const BSONObj& getPreImageDocumentKey() const {
-        return _preImageDocumentKey;
+
+    static ReplOperation parseOwned(const IDLParserContext& ctxt, const BSONObj&& bsonObject) {
+        ReplOperation o;
+        o.parseProtected(ctxt, bsonObject);
+        o.setAnchor(std::move(bsonObject));
+        return o;
     }
-    void setPreImageDocumentKey(BSONObj value) {
-        _preImageDocumentKey = std::move(value);
+
+    ReplOperation() = default;
+    explicit ReplOperation(DurableReplOperation durableReplOp)
+        : DurableReplOperation(std::move(durableReplOp)) {}
+
+    const BSONObj& getPostImageDocumentKey() const {
+        return _postImageDocumentKey;
+    }
+
+    void setPostImageDocumentKey(BSONObj value) {
+        _postImageDocumentKey = std::move(value);
     }
 
     const BSONObj& getPreImage() const {
@@ -134,15 +146,6 @@ public:
      */
     void setChangeStreamPreImageRecordingMode(ChangeStreamPreImageRecordingMode value) {
         _preImageRecordingMode = value;
-    }
-
-    /**
-     * Returns true if the change stream pre-image is recorded in a dedicated oplog entry for this
-     * operation.
-     */
-    bool isChangeStreamPreImageRecordedInOplog() const {
-        return ReplOperation::ChangeStreamPreImageRecordingMode::kOplog ==
-            getChangeStreamPreImageRecordingMode();
     }
 
     /**
@@ -189,8 +192,41 @@ public:
         return variant_util::toVector<StmtId>(DurableReplOperation::getStatementIds());
     }
 
+    void setFromMigrateIfTrue(bool value) & {
+        if (value)
+            setFromMigrate(value);
+    }
+
+    /**
+     * This function overrides the base class setTid() function for the sole purpose of satisfying
+     * the FCV checks.  Once these are deprecated, we should remove this overridden function
+     * entirely.
+     */
+    void setTid(boost::optional<mongo::TenantId> value) &;
+
+    /**
+     * Exports pre/post image information, if present, for writing to the image collection.
+     *
+     * Exported information includes both the image document and a flag to indicate if this
+     * is for a pre or post image.
+     * Does not fill in 'timestamp' - this will be filled in by OpObserverImpl after we have
+     * written the corresponding applyOps oplog entry.
+     *
+     * Accepts an output parameter that for the image information that we expect
+     * to be an uninitialized optional value. This output parameter may be set by a previous
+     * call to this function. In this case, if this ReplOperation has an image, this will
+     * result in an exception thrown.
+     */
+    using ImageBundle = struct {
+        repl::RetryImageEnum imageKind;
+        BSONObj imageDoc;
+        Timestamp timestamp;
+    };
+    void extractPrePostImageForTransaction(boost::optional<ImageBundle>* image) const;
+
 private:
-    BSONObj _preImageDocumentKey;
+    // Stores the post image _id + shard key values.
+    BSONObj _postImageDocumentKey;
 
     // Used for storing the pre-image and post-image for the operation in-memory regardless of where
     // the images should be persisted.
@@ -226,6 +262,18 @@ public:
     static ReplOperation makeDeleteOperation(const NamespaceString& nss,
                                              UUID uuid,
                                              const BSONObj& docToDelete);
+
+    // Returns a MutableOplogEntry that is intended to be equivalent to a ReplOperation.
+    // Importantly, this MutableOplogEntry is not serializable to BSON because
+    // it does not include a WallClockTime. This MutableOplogEntry is intended for
+    // construction before logOperation() which will insert a WallClockTime.
+    // Test code that needs a BSONObj can convert this using something like
+    // MutableOplogEntry::toReplOperation().
+    static MutableOplogEntry makeGlobalIndexCrudOperation(const OpTypeEnum& opType,
+                                                          const NamespaceString& indexNss,
+                                                          const UUID& indexUuid,
+                                                          const BSONObj& key,
+                                                          const BSONObj& docKey);
 
     static ReplOperation makeCreateCommand(NamespaceString nss,
                                            const mongo::CollectionOptions& options,
@@ -269,9 +317,7 @@ public:
         getDurableReplOperation().setOpType(std::move(value));
     }
 
-    void setTid(boost::optional<mongo::TenantId> value) & {
-        getDurableReplOperation().setTid(std::move(value));
-    }
+    void setTid(boost::optional<mongo::TenantId> value) &;
 
     void setNss(NamespaceString value) & {
         getDurableReplOperation().setNss(std::move(value));
@@ -339,6 +385,10 @@ public:
      */
     OpTime getOpTime() const;
 
+    void setFromMigrate(bool value) & {
+        getDurableReplOperation().setFromMigrate(value);
+    }
+
     /**
      * Same as setFromMigrate but only set when it is true.
      */
@@ -346,6 +396,28 @@ public:
         if (value)
             setFromMigrate(value);
     }
+
+    /**
+     * ReplOperation and MutableOplogEntry mostly hold the same data,
+     * but lack a common ancestor in C++. Due to the details of IDL,
+     * there is no generated C++ link between the two hierarchies.
+     *
+     * The primary difference between the two types is the OpTime
+     * stored in OplogEntryBase that is absent in DurableReplOperation.
+     *
+     * This type conversion is useful in contexts when the two type
+     * hierarchies should be interchangeable, like with internal tx's.
+     * See: logMutableOplogEntry() in op_observer_impl.cpp.
+     *
+     * OplogEntryBase<>-------DurableReplOperation
+     *        ^                       ^
+     *        |                       |
+     * MutableOplogEntry       ReplOperation
+     *        ^
+     *        |
+     * DurableOplogEntry
+     */
+    ReplOperation toReplOperation() const noexcept;
 };
 
 /**
@@ -414,6 +486,7 @@ public:
     using MutableOplogEntry::makeCreateCommand;
     using MutableOplogEntry::makeCreateIndexesCommand;
     using MutableOplogEntry::makeDeleteOperation;
+    using MutableOplogEntry::makeGlobalIndexCrudOperation;
     using MutableOplogEntry::makeInsertOperation;
     using MutableOplogEntry::makeUpdateOperation;
 
@@ -435,6 +508,9 @@ public:
         kCommitTransaction,
         kAbortTransaction,
         kImportCollection,
+        kModifyCollectionShardingIndexCatalog,
+        kCreateGlobalIndex,
+        kDropGlobalIndex,
     };
 
     // Get the in-memory size in bytes of a ReplOperation.
@@ -443,9 +519,7 @@ public:
     static StatusWith<DurableOplogEntry> parse(const BSONObj& object);
 
     DurableOplogEntry(OpTime opTime,
-                      boost::optional<int64_t> hash,
                       OpTypeEnum opType,
-                      const boost::optional<TenantId>& tid,
                       const NamespaceString& nss,
                       const boost::optional<UUID>& uuid,
                       const boost::optional<bool>& fromMigrate,
@@ -498,13 +572,28 @@ public:
     }
 
     /**
+     * Returns if this is a prepared 'abortTransaction' oplog entry.
+     */
+    bool isPreparedAbort() const {
+        return getCommandType() == DurableOplogEntry::CommandType::kAbortTransaction;
+    }
+
+    /**
+     * Returns if this is a prepared transaction command oplog entry, i.e. prepareTransaction,
+     * commitTransaction or abortTransaction.
+     */
+    bool isPreparedTransactionCommand() const {
+        return isCommand() && (isPreparedCommit() || isPreparedAbort() || shouldPrepare());
+    }
+
+    /**
      * Returns whether the oplog entry represents an applyOps which is a self-contained atomic
      * operation, or the last applyOps of an unprepared transaction, as opposed to part of a
      * prepared transaction or a non-final applyOps in a transaction.
      */
     bool isTerminalApplyOps() const {
         return getCommandType() == DurableOplogEntry::CommandType::kApplyOps && !shouldPrepare() &&
-            !isPartialTransaction() && !getObject().getBoolField("prepare");
+            !isPartialTransaction();
     }
 
     /**
@@ -523,6 +612,12 @@ public:
      */
     static bool isCrudOpType(OpTypeEnum opType);
     bool isCrudOpType() const;
+
+    /**
+     * Returns true if the oplog entry is for a global index CRUD operation.
+     */
+    static bool isGlobalIndexCrudOpType(OpTypeEnum opType);
+    bool isGlobalIndexCrudOpType() const;
 
     /**
      * Returns true if the oplog entry is for an Update or Delete operation.
@@ -662,7 +757,7 @@ public:
     std::vector<StmtId> getStatementIds() const&;
     const OperationSessionInfo& getOperationSessionInfo() const;
     const boost::optional<mongo::LogicalSessionId>& getSessionId() const;
-    const boost::optional<std::int64_t> getTxnNumber() const;
+    boost::optional<std::int64_t> getTxnNumber() const;
     const DurableReplOperation& getDurableReplOperation() const;
     mongo::repl::OpTypeEnum getOpType() const;
     const boost::optional<mongo::TenantId>& getTid() const;
@@ -670,27 +765,35 @@ public:
     const boost::optional<mongo::UUID>& getUuid() const;
     const mongo::BSONObj& getObject() const;
     const boost::optional<mongo::BSONObj>& getObject2() const;
-    const boost::optional<bool> getUpsert() const;
+    boost::optional<bool> getUpsert() const;
     const boost::optional<mongo::repl::OpTime>& getPreImageOpTime() const;
     const boost::optional<mongo::ShardId>& getDestinedRecipient() const;
     const mongo::Timestamp& getTimestamp() const;
-    const boost::optional<std::int64_t> getTerm() const;
+    boost::optional<std::int64_t> getTerm() const;
     const mongo::Date_t& getWallClockTime() const;
-    const boost::optional<std::int64_t> getHash() const&;
+    boost::optional<std::int64_t> getHash() const&;
     std::int64_t getVersion() const;
-    const boost::optional<bool> getFromMigrate() const&;
+    boost::optional<bool> getFromMigrate() const&;
     const boost::optional<mongo::UUID>& getFromTenantMigration() const&;
     const boost::optional<mongo::repl::OpTime>& getPrevWriteOpTimeInTransaction() const&;
     const boost::optional<mongo::repl::OpTime>& getPostImageOpTime() const&;
-    const boost::optional<RetryImageEnum> getNeedsRetryImage() const;
+    boost::optional<RetryImageEnum> getNeedsRetryImage() const;
     OpTime getOpTime() const;
     bool isCommand() const;
     bool isPartialTransaction() const;
     bool isEndOfLargeTransaction() const;
     bool isPreparedCommit() const;
+    bool isPreparedAbort() const;
+    bool isPreparedTransactionCommand() const;
     bool isTerminalApplyOps() const;
     bool isSingleOplogEntryTransaction() const;
     bool isSingleOplogEntryTransactionWithCommand() const;
+
+    /**
+     * Returns whether this oplog entry contains a DDL operation. Used to determine whether to
+     * log the entry.
+     */
+    bool shouldLogAsDDLOperation() const;
 
     /**
      * Returns an index of this operation in the "applyOps" entry, if the operation is packed in the
@@ -732,6 +835,7 @@ public:
     mongo::Date_t getWallClockTimeForPreImage() const;
 
     bool isCrudOpType() const;
+    bool isGlobalIndexCrudOpType() const;
     bool isUpdateOrDelete() const;
     bool isIndexCommandType() const;
     bool shouldPrepare() const;

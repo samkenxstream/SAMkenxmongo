@@ -25,7 +25,6 @@
 # exception statement from all source files in the program, then also delete
 # it in the license file.
 #
-# pylint: disable=too-many-lines
 """
 Common error handling code for IDL compatibility checker.
 
@@ -118,12 +117,18 @@ ERROR_ID_REPLY_FIELD_SERIALIZER_NOT_EQUAL = "ID0073"
 ERROR_ID_COMMAND_DESERIALIZER_NOT_EQUAL = "ID0074"
 ERROR_ID_COMMAND_PARAMETER_DESERIALIZER_NOT_EQUAL = "ID0075"
 ERROR_ID_REPLY_FIELD_DESERIALIZER_NOT_EQUAL = "ID0076"
-ERROR_ID_NEW_REPLY_FIELD_REQUIRES_UNSTABLE = "ID0077"
-ERROR_ID_NEW_PARAMETER_REQUIRES_UNSTABLE = "ID0078"
-ERROR_ID_NEW_COMMAND_TYPE_FIELD_REQUIRES_UNSTABLE = "ID0079"
+ERROR_ID_NEW_REPLY_FIELD_REQUIRES_STABILITY = "ID0077"
+ERROR_ID_NEW_PARAMETER_REQUIRES_STABILITY = "ID0078"
+ERROR_ID_NEW_COMMAND_TYPE_FIELD_REQUIRES_STABILITY = "ID0079"
 ERROR_ID_NEW_REPLY_CHAINED_TYPE_NOT_SUBSET = "ID0080"
 ERROR_ID_NEW_COMMAND_PARAMETER_CHAINED_TYPE_NOT_SUPERSET = "ID0081"
 ERROR_ID_NEW_COMMAND_CHAINED_TYPE_NOT_SUPERSET = "ID0082"
+ERROR_ID_UNSTABLE_REPLY_FIELD_CHANGED_TO_STABLE = "ID0083"
+ERROR_ID_UNSTABLE_COMMAND_PARAM_FIELD_CHANGED_TO_STABLE = "ID0084"
+ERROR_ID_UNSTABLE_COMMAND_TYPE_FIELD_CHANGED_TO_STABLE = "ID0085"
+ERROR_ID_NEW_REPLY_FIELD_ADDED_AS_STABLE = "ID0086"
+ERROR_ID_NEW_COMMAND_PARAM_FIELD_ADDED_AS_STABLE = "ID0087"
+ERROR_ID_NEW_COMMAND_TYPE_FIELD_ADDED_AS_STABLE = "ID0088"
 
 
 class IDLCompatibilityCheckerError(Exception):
@@ -145,7 +150,6 @@ class IDLCompatibilityError(object):
     - file - a string, the path to the IDL file where the error occurred.
     """
 
-    #pylint: disable=too-many-arguments
     def __init__(self, error_id: str, command_name: str, msg: str, old_idl_dir: str,
                  new_idl_dir: str, file: str) -> None:
         """Construct an IDLCompatibility error."""
@@ -176,7 +180,6 @@ class IDLCompatibilityErrorCollection(object):
         """Initialize IDLCompatibilityErrorCollection."""
         self._errors: List[IDLCompatibilityError] = []
 
-    #pylint: disable=too-many-arguments
     def add(self, error_id: str, command_name: str, msg: str, old_idl_dir: str, new_idl_dir: str,
             file: str) -> None:
         """Add an error message with directory information."""
@@ -248,8 +251,6 @@ class IDLCompatibilityContext(object):
     - single class responsible for producing actual error messages.
     """
 
-    # pylint:disable=too-many-public-methods
-
     def __init__(self, old_idl_dir: str, new_idl_dir: str,
                  errors: IDLCompatibilityErrorCollection) -> None:
         """Construct a new IDLCompatibilityContext."""
@@ -313,7 +314,6 @@ class IDLCompatibilityContext(object):
     def add_command_or_param_type_not_superset_error(self, command_name: str, type_name: str,
                                                      file: str, field_name: Optional[str],
                                                      is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments
         """Add an error about the command or parameter type not being a superset."""
         if is_command_parameter:
             self._add_error(
@@ -333,7 +333,6 @@ class IDLCompatibilityContext(object):
     def add_command_or_param_type_contains_validator_error(self, command_name: str, field_name: str,
                                                            file: str, type_name: Optional[str],
                                                            is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments
         """
         Add an error about a type containing a validator.
 
@@ -355,7 +354,7 @@ class IDLCompatibilityContext(object):
     def add_command_or_param_type_validators_not_equal_error(
             self, command_name: str, field_name: str, file: str, type_name: Optional[str],
             is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments,invalid-name
+        # pylint: disable=invalid-name
         """Add an error about the new and old command or parameter type validators not being equal."""
         if is_command_parameter:
             self._add_error(
@@ -378,7 +377,6 @@ class IDLCompatibilityContext(object):
     def add_new_command_or_param_type_bson_any_error(
             self, command_name: str, old_type: str, new_type: str, file: str,
             field_name: Optional[str], is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments
         """
         Add an error about BSON serialization type.
 
@@ -404,7 +402,6 @@ class IDLCompatibilityContext(object):
     def add_new_command_or_param_type_enum_or_struct_error(
             self, command_name: str, new_type: str, old_type: str, file: str,
             field_name: Optional[str], is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments
         """
         Add an error about a type that is an enum or struct.
 
@@ -428,7 +425,7 @@ class IDLCompatibilityContext(object):
     def add_new_param_or_command_type_field_added_required_error(
             self, command_name: str, field_name: str, file: str, type_name: str,
             is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments,invalid-name
+        # pylint: disable=invalid-name
         """
         Add a new added required parameter or command type field error.
 
@@ -452,7 +449,6 @@ class IDLCompatibilityContext(object):
     def add_new_param_or_command_type_field_missing_error(self, command_name: str, field_name: str,
                                                           file: str, type_name: str,
                                                           is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments
         """Add an error about a parameter or command type field that is missing in the new command."""
         if is_command_parameter:
             self._add_error(
@@ -469,7 +465,6 @@ class IDLCompatibilityContext(object):
     def add_new_param_or_command_type_field_required_error(self, command_name: str, field_name: str,
                                                            file: str, type_name: Optional[str],
                                                            is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments
         """
         Add a required parameter or command type field error.
 
@@ -491,7 +486,7 @@ class IDLCompatibilityContext(object):
     def add_new_param_or_command_type_field_stable_required_no_default_error(
             self, struct_name: str, field_name: str, file: str, type_name: Optional[str],
             is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments,invalid-name
+        # pylint: disable=invalid-name
         """
         Add a stable required parameter or command type field error.
 
@@ -517,7 +512,6 @@ class IDLCompatibilityContext(object):
     def add_new_param_or_command_type_field_unstable_error(self, command_name: str, field_name: str,
                                                            file: str, type_name: Optional[str],
                                                            is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments
         """
         Add an unstable parameter or command type field error.
 
@@ -539,7 +533,6 @@ class IDLCompatibilityContext(object):
     def add_new_command_or_param_type_not_enum_error(
             self, command_name: str, new_type: str, old_type: str, file: str,
             field_name: Optional[str], is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments
         """
         Add an not enum parameter or command type field error.
 
@@ -561,7 +554,6 @@ class IDLCompatibilityContext(object):
     def add_new_command_or_param_type_not_struct_error(
             self, command_name: str, new_type: str, old_type: str, file: str,
             field_name: Optional[str], is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments
         """Add an error about the new command or parameter type not being a struct when the old one is."""
         if is_command_parameter:
             self._add_error(
@@ -580,7 +572,7 @@ class IDLCompatibilityContext(object):
     def add_new_command_or_param_type_not_variant_type_error(self, command_name: str, new_type: str,
                                                              file: str, field_name: Optional[str],
                                                              is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments,invalid-name
+        # pylint: disable=invalid-name
         """
         Add an error about the new command or parameter type not being a variant type.
 
@@ -603,7 +595,7 @@ class IDLCompatibilityContext(object):
     def add_new_command_or_param_variant_type_not_superset_error(
             self, command_name: str, variant_type_name: str, file: str, field_name: Optional[str],
             is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments,invalid-name
+        # pylint: disable=invalid-name
         """
         Add an error about the new variant types not being a superset.
 
@@ -629,7 +621,7 @@ class IDLCompatibilityContext(object):
     def add_new_command_or_param_chained_type_not_superset_error(
             self, command_name: str, chained_type_name: str, file: str, field_name: Optional[str],
             is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments,invalid-name
+        # pylint: disable=invalid-name
         """
         Add an error about the new chained types not being a superset.
 
@@ -751,7 +743,6 @@ class IDLCompatibilityContext(object):
     def add_new_reply_field_type_not_enum_error(self, command_name: str, field_name: str,
                                                 new_field_type: str, old_field_type: str,
                                                 file: str) -> None:
-        # pylint: disable=too-many-arguments
         """Add an error about the new reply field type not being an enum when the old one is."""
         self._add_error(ERROR_ID_NEW_REPLY_FIELD_TYPE_NOT_ENUM, command_name,
                         ("'%s' has a reply field or sub-field '%s' of type '%s' "
@@ -762,7 +753,6 @@ class IDLCompatibilityContext(object):
     def add_new_reply_field_type_not_struct_error(self, command_name: str, field_name: str,
                                                   new_field_type: str, old_field_type: str,
                                                   file: str) -> None:
-        # pylint: disable=too-many-arguments
         """Add an error about the new reply field type not being a struct when the old one is."""
         self._add_error(ERROR_ID_NEW_REPLY_FIELD_TYPE_NOT_STRUCT, command_name,
                         ("'%s' has a reply field or sub-field '%s' of type '%s' "
@@ -773,7 +763,6 @@ class IDLCompatibilityContext(object):
     def add_new_reply_field_type_enum_or_struct_error(self, command_name: str, field_name: str,
                                                       new_field_type: str, old_field_type: str,
                                                       file: str) -> None:
-        # pylint: disable=too-many-arguments
         """
         Add an error about a reply field type being incompatible with the old field type.
 
@@ -797,7 +786,6 @@ class IDLCompatibilityContext(object):
 
     def add_new_reply_field_variant_type_error(self, command_name: str, field_name: str,
                                                old_field_type: str, file: str) -> None:
-        # pylint: disable=too-many-arguments
         """Add an error about the new reply field type being variant when the old one is not."""
         self._add_error(ERROR_ID_NEW_REPLY_FIELD_VARIANT_TYPE, command_name,
                         ("'%s' has a reply field or sub-field '%s' that has a variant "
@@ -807,7 +795,6 @@ class IDLCompatibilityContext(object):
 
     def add_new_reply_field_variant_type_not_subset_error(
             self, command_name: str, field_name: str, variant_type_name: str, file: str) -> None:
-        # pylint: disable=too-many-arguments
         """
         Add an error about the reply field variant types not being a subset.
 
@@ -823,7 +810,6 @@ class IDLCompatibilityContext(object):
 
     def add_new_reply_chained_type_not_subset_error(self, command_name: str, reply_name: str,
                                                     chained_type_name: str, file: str) -> None:
-        # pylint: disable=too-many-arguments
         """
         Add an error about the reply chained types not being a subset.
 
@@ -841,7 +827,6 @@ class IDLCompatibilityContext(object):
     def add_old_command_or_param_type_bson_any_error(
             self, command_name: str, old_type: str, new_type: str, file: str,
             field_name: Optional[str], is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments
         """
         Add an error about BSON serialization type.
 
@@ -866,7 +851,7 @@ class IDLCompatibilityContext(object):
     def add_old_command_or_param_type_bson_any_not_allowed_error(
             self, command_name: str, type_name: str, file: str, field_name: Optional[str],
             is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments,invalid-name
+        # pylint: disable=invalid-name
         """
         Add an error about the old command or param type bson serialization type being 'any'.
 
@@ -890,7 +875,7 @@ class IDLCompatibilityContext(object):
     def add_new_command_or_param_type_bson_any_not_allowed_error(
             self, command_name: str, type_name: str, file: str, field_name: Optional[str],
             is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments,invalid-name
+        # pylint: disable=invalid-name
         """
         Add an error about the new command or param type bson serialization type being 'any'.
 
@@ -914,7 +899,6 @@ class IDLCompatibilityContext(object):
     def add_command_or_param_cpp_type_not_equal_error(self, command_name: str, type_name: str,
                                                       file: str, field_name: Optional[str],
                                                       is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments,invalid-name
         """Add an error about the old and new command or param cpp_type not being equal."""
         if is_command_parameter:
             self._add_error(ERROR_ID_COMMAND_PARAMETER_CPP_TYPE_NOT_EQUAL, command_name,
@@ -931,7 +915,6 @@ class IDLCompatibilityContext(object):
     def add_command_or_param_serializer_not_equal_error(self, command_name: str, type_name: str,
                                                         file: str, field_name: Optional[str],
                                                         is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments,invalid-name
         """Add an error about the old and new command or param serializer not being equal."""
         if is_command_parameter:
             self._add_error(ERROR_ID_COMMAND_PARAMETER_SERIALIZER_NOT_EQUAL, command_name,
@@ -948,7 +931,6 @@ class IDLCompatibilityContext(object):
     def add_command_or_param_deserializer_not_equal_error(self, command_name: str, type_name: str,
                                                           file: str, field_name: Optional[str],
                                                           is_command_parameter: bool) -> None:
-        # pylint: disable=too-many-arguments,invalid-name
         """Add an error about the old and new command or param deserializer not being equal."""
         if is_command_parameter:
             self._add_error(ERROR_ID_COMMAND_PARAMETER_DESERIALIZER_NOT_EQUAL, command_name,
@@ -1028,7 +1010,6 @@ class IDLCompatibilityContext(object):
 
     def add_type_not_array_error(self, symbol: str, command_name: str, symbol_name: str,
                                  new_type: str, old_type: str, file: str) -> None:
-        # pylint: disable=too-many-arguments
         """
         Add an error about type not being an ArrayType when it should be.
 
@@ -1095,29 +1076,76 @@ class IDLCompatibilityContext(object):
                         ("The generic reply field '%s' was removed from the new definition of the "
                          "generic_argument.idl file") % (field_name), file)
 
-    def add_new_reply_field_requires_unstable_error(self, command_name: str, field_name: str,
-                                                    file: str) -> None:
-        """Add an error that a new reply field requires the 'unstable' field."""
+    def add_new_reply_field_requires_stability_error(self, command_name: str, field_name: str,
+                                                     file: str) -> None:
+        """Add an error that a new reply field requires the 'stability' field."""
         self._add_error(
-            ERROR_ID_NEW_REPLY_FIELD_REQUIRES_UNSTABLE, command_name,
+            ERROR_ID_NEW_REPLY_FIELD_REQUIRES_STABILITY, command_name,
             ("The new definition of '%s' has reply field '%s' that requires specifying a value "
-             "for the 'unstable' field") % (command_name, field_name), file)
+             "for the 'stability' field") % (command_name, field_name), file)
 
-    def add_new_param_or_command_type_field_requires_unstable_error(
+    def add_new_param_or_command_type_field_requires_stability_error(
             self, command_name: str, field_name: str, file: str,
             is_command_parameter: bool) -> None:
         # pylint: disable=invalid-name
-        """Add an error that a new param or command type field requires the 'unstable' field."""
+        """Add an error that a new param or command type field requires the 'stability' field."""
         if is_command_parameter:
             self._add_error(
-                ERROR_ID_NEW_PARAMETER_REQUIRES_UNSTABLE, command_name,
+                ERROR_ID_NEW_PARAMETER_REQUIRES_STABILITY, command_name,
                 ("The new definition of '%s' has parameter '%s' that requires specifying a value "
-                 "for the 'unstable' field") % (command_name, field_name), file)
+                 "for the 'stability' field") % (command_name, field_name), file)
         else:
             self._add_error(
-                ERROR_ID_NEW_COMMAND_TYPE_FIELD_REQUIRES_UNSTABLE, command_name,
+                ERROR_ID_NEW_COMMAND_TYPE_FIELD_REQUIRES_STABILITY, command_name,
                 ("The new definition of '%s' has command type field '%s' that requires specifying "
-                 "a value for the 'unstable' field") % (command_name, field_name), file)
+                 "a value for the 'stability' field") % (command_name, field_name), file)
+
+    def add_unstable_reply_field_changed_to_stable_error(self, command_name: str, field_name: str,
+                                                         file: str) -> None:
+        """Add an error that a reply field may not change from unstable to stable."""
+        self._add_error(ERROR_ID_UNSTABLE_REPLY_FIELD_CHANGED_TO_STABLE, command_name, (
+            "The command '%s' has reply field '%s' which is unstable and may not be changed to stable in "
+            "the new definition unless explicitly allowed.") % (command_name, field_name), file)
+
+    def add_unstable_param_or_type_field_to_stable_error(self, command_name: str, field_name: str,
+                                                         file: str,
+                                                         is_command_parameter: bool) -> None:
+        """Add an error that a command parameter or type field may not change from unstable to stable."""
+        if is_command_parameter:
+            self._add_error(
+                ERROR_ID_UNSTABLE_COMMAND_PARAM_FIELD_CHANGED_TO_STABLE, command_name,
+                ("The command '%s' has command parameter field '%s' which is unstable and may "
+                 "not be changed to stable in the new definition unless explicitly allowed.") %
+                (command_name, field_name), file)
+        else:
+            self._add_error(
+                ERROR_ID_UNSTABLE_COMMAND_TYPE_FIELD_CHANGED_TO_STABLE, command_name,
+                ("The command '%s' has command type field '%s' which is unstable and may "
+                 "not be changed to stable in the new definition unless explicitly allowed.") %
+                (command_name, field_name), file)
+
+    def add_new_reply_field_added_as_stable_error(self, command_name: str, field_name: str,
+                                                  file: str) -> None:
+        """Add an error that a new reply field may not be added as stable unless explicitly allowed."""
+        self._add_error(
+            ERROR_ID_NEW_REPLY_FIELD_ADDED_AS_STABLE, command_name,
+            ("The command '%s' has newly-added reply field '%s' which may not be defined as stable "
+             "unless that addition is explicitly allowed.") % (command_name, field_name), file)
+
+    def add_new_param_or_type_field_added_as_stable_error(self, command_name: str, field_name: str,
+                                                          file: str,
+                                                          is_command_parameter: bool) -> None:
+        """Add an error that a new command param or type field may not be added as stable unless explicitly allowed."""
+        if is_command_parameter:
+            self._add_error(
+                ERROR_ID_NEW_COMMAND_PARAM_FIELD_ADDED_AS_STABLE, command_name,
+                ("The command '%s' has newly-added param '%s' which may not be defined as stable "
+                 "unless that addition is explicitly allowed.") % (command_name, field_name), file)
+        else:
+            self._add_error(
+                ERROR_ID_NEW_COMMAND_TYPE_FIELD_ADDED_AS_STABLE, command_name,
+                ("The command '%s' has newly-added type '%s' which may not be defined as stable "
+                 "unless that addition is explicitly allowed.") % (command_name, field_name), file)
 
 
 def _assert_unique_error_messages() -> None:

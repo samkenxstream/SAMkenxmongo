@@ -1,4 +1,9 @@
-// @tags: [requires_getmore]
+// @tags: [
+//   requires_getmore,
+//   # This test uses exhaust which does not use runCommand (required by the inject_tenant_prefix.js
+//   # override).
+//   tenant_migration_incompatible,
+// ]
 
 (function() {
 'use strict';
@@ -54,5 +59,27 @@ for (let i = 0; i < numDocs; ++i) {
 assert.commandWorked(bulk.execute());
 
 assert.eq(numDocs, coll.find().addOption(DBQuery.Option.exhaust).itcount());
+
+// Test that exhaust query with a limit is allowed.
+assert.eq(numDocs, coll.find().addOption(DBQuery.Option.exhaust).limit(numDocs + 1).itcount());
+assert.eq(numDocs - 1, coll.find().addOption(DBQuery.Option.exhaust).limit(numDocs - 1).itcount());
+
+// Test that exhaust with batchSize and limit is allowed.
+assert.eq(
+    numDocs,
+    coll.find().addOption(DBQuery.Option.exhaust).limit(numDocs + 1).batchSize(100).itcount());
+assert.eq(
+    numDocs - 1,
+    coll.find().addOption(DBQuery.Option.exhaust).limit(numDocs - 1).batchSize(100).itcount());
+
+// Test that exhaust with negative limit is allowed. A negative limit means "single batch": the
+// server will return just a single batch and then close the cursor, even if the limit has not yet
+// been reached. When the batchSize is not specified explicitly, we expect the default initial batch
+// size of 101 to be used.
+assert.eq(Math.min(101, TestData.batchSize || Infinity),
+          coll.find().addOption(DBQuery.Option.exhaust).limit(-numDocs).itcount());
+assert.eq(50,
+          coll.find().addOption(DBQuery.Option.exhaust).limit(-numDocs).batchSize(50).itcount());
+assert.eq(1, coll.find().addOption(DBQuery.Option.exhaust).limit(-1).itcount());
 }());
 }());

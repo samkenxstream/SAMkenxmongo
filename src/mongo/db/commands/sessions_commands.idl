@@ -31,8 +31,8 @@ global:
 
 imports:
   - "mongo/db/auth/access_checks.idl"
-  - "mongo/db/logical_session_id.idl"
-  - "mongo/idl/basic_types.idl"
+  - "mongo/db/session/logical_session_id.idl"
+  - "mongo/db/basic_types.idl"
 
 commands:
     endSessionsFromClient:
@@ -46,7 +46,7 @@ commands:
         reply_type: OkReply
         access_check:
             complex:
-              - check: get_single_user
+              - check: get_authenticated_user
               - check: lookup_user
 
     refreshSessionsFromClient:
@@ -60,5 +60,5 @@ commands:
         reply_type: OkReply
         access_check:
             complex:
-              - check: get_single_user
+              - check: get_authenticated_user
               - check: lookup_user

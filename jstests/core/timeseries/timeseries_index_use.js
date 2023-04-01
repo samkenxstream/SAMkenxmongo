@@ -2,13 +2,15 @@
  * Tests index usage on meta and time fields for timeseries collections.
  *
  * @tags: [
- *   does_not_support_stepdowns,
- *   does_not_support_transactions,
- *   requires_fcv_51,
- *   requires_getmore,
- *   requires_pipeline_optimization,
  *   # Explain of a resolved view must be executed by mongos.
  *   directly_against_shardsvrs_incompatible,
+ *   # Refusing to run a test that issues an aggregation command with explain because it may return
+ *   # incomplete results if interrupted by a stepdown.
+ *   does_not_support_stepdowns,
+ *   # Tests that optimization produces expected query plans.
+ *   requires_pipeline_optimization,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 (function() {
@@ -40,6 +42,12 @@ const generateTest = (useHint) => {
                 coll.getName(),
                 Object.assign({timeseries: {timeField: timeFieldName, metaField: metaFieldName}},
                               collOpts)));
+            if (TimeseriesTest.timeseriesScalabilityImprovementsEnabled(db)) {
+                // When enabled, the {meta: 1, time: 1} index gets built by default on the
+                // time-series bucket collection. When this index is present, the query planner will
+                // use it, changing the expected behaviour of this test. Drop the index.
+                assert.commandWorked(coll.dropIndex({[metaFieldName]: 1, [timeFieldName]: 1}));
+            }
 
             const dbCollNames = testDB.getCollectionNames();
             assert.contains(bucketsColl.getName(),
@@ -50,8 +58,9 @@ const generateTest = (useHint) => {
 
         /**
          * Creates the index specified by the spec and options, then explains the query to ensure
-         * that the created index is used. Runs the query and verifies that the expected number of
-         * documents are matched. Finally, deletes the created index.
+         * that the created index is used or was considered by multi-planner.
+         * Runs the query and verifies that the expected number of documents are matched.
+         * Finally, deletes the created index.
          */
         const testQueryUsesIndex = function(
             filter, numMatches, indexSpec, indexOpts = {}, queryOpts = {}) {
@@ -67,9 +76,23 @@ const generateTest = (useHint) => {
             assert.eq(numMatches, query.itcount());
 
             const explain = query.explain();
-            const ixscan = getAggPlanStage(explain, "IXSCAN");
-            assert.neq(null, ixscan, tojson(explain));
-            assert.eq("testIndexName", ixscan.indexName, tojson(ixscan));
+            if (useHint) {
+                const ixscan = getAggPlanStage(explain, "IXSCAN");
+                assert.neq(null, ixscan, tojson(explain));
+                assert.eq("testIndexName", ixscan.indexName, tojson(ixscan));
+            } else {
+                let ixscan = getAggPlanStage(explain, "IXSCAN");
+                // If ixscan is not present, check rejected plans
+                if (ixscan === null) {
+                    const rejectedPlans =
+                        getRejectedPlans(getAggPlanStage(explain, "$cursor")["$cursor"]);
+                    assert.eq(1, rejectedPlans.length);
+                    const ixscans = getPlanStages(getRejectedPlan(rejectedPlans[0]), "IXSCAN");
+                    assert.eq(1, ixscans.length);
+                    ixscan = ixscans[0];
+                }
+                assert.eq("testIndexName", ixscan.indexName, tojson(ixscan));
+            }
             assert.commandWorked(coll.dropIndex("testIndexName"));
         };
 

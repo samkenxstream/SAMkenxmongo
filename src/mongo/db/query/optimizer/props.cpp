@@ -34,13 +34,13 @@
 namespace mongo::optimizer::properties {
 
 CollationRequirement::CollationRequirement(ProjectionCollationSpec spec) : _spec(std::move(spec)) {
+    uassert(6624302, "Empty collation spec", !_spec.empty());
+
     ProjectionNameSet projections;
     for (const auto& entry : _spec) {
         uassert(6624021, "Repeated projection name", projections.insert(entry.first).second);
     }
 }
-
-CollationRequirement CollationRequirement::Empty = CollationRequirement();
 
 bool CollationRequirement::operator==(const CollationRequirement& other) const {
     return _spec == other._spec;
@@ -208,11 +208,11 @@ void IndexingRequirement::setDedupRID(const bool value) {
     _dedupRID = value;
 }
 
-const GroupIdType IndexingRequirement::getSatisfiedPartialIndexesGroupId() const {
+GroupIdType IndexingRequirement::getSatisfiedPartialIndexesGroupId() const {
     return _satisfiedPartialIndexesGroupId;
 }
 
-RepetitionEstimate::RepetitionEstimate(const CEType estimate) : _estimate(estimate) {}
+RepetitionEstimate::RepetitionEstimate(const double estimate) : _estimate(estimate) {}
 
 bool RepetitionEstimate::operator==(const RepetitionEstimate& other) const {
     return _estimate == other._estimate;
@@ -222,7 +222,7 @@ ProjectionNameSet RepetitionEstimate::getAffectedProjectionNames() const {
     return {};
 }
 
-CEType RepetitionEstimate::getEstimate() const {
+double RepetitionEstimate::getEstimate() const {
     return _estimate;
 }
 
@@ -256,10 +256,10 @@ const ProjectionNameSet& ProjectionAvailability::getProjections() const {
 }
 
 CardinalityEstimate::CardinalityEstimate(const CEType estimate)
-    : _estimate(estimate), _partialSchemaKeyCEMap() {}
+    : _estimate(estimate), _partialSchemaKeyCE() {}
 
 bool CardinalityEstimate::operator==(const CardinalityEstimate& other) const {
-    return _estimate == other._estimate && _partialSchemaKeyCEMap == other._partialSchemaKeyCEMap;
+    return _estimate == other._estimate && _partialSchemaKeyCE == other._partialSchemaKeyCE;
 }
 
 CEType CardinalityEstimate::getEstimate() const {
@@ -270,33 +270,40 @@ CEType& CardinalityEstimate::getEstimate() {
     return _estimate;
 }
 
-const PartialSchemaKeyCE& CardinalityEstimate::getPartialSchemaKeyCEMap() const {
-    return _partialSchemaKeyCEMap;
+const PartialSchemaKeyCE& CardinalityEstimate::getPartialSchemaKeyCE() const {
+    return _partialSchemaKeyCE;
 }
 
-PartialSchemaKeyCE& CardinalityEstimate::getPartialSchemaKeyCEMap() {
-    return _partialSchemaKeyCEMap;
+PartialSchemaKeyCE& CardinalityEstimate::getPartialSchemaKeyCE() {
+    return _partialSchemaKeyCE;
 }
 
 IndexingAvailability::IndexingAvailability(GroupIdType scanGroupId,
                                            ProjectionName scanProjection,
                                            std::string scanDefName,
-                                           const bool possiblyEqPredsOnly,
+                                           const bool eqPredsOnly,
+                                           const bool hasProperInterval,
                                            opt::unordered_set<std::string> satisfiedPartialIndexes)
     : _scanGroupId(scanGroupId),
       _scanProjection(std::move(scanProjection)),
       _scanDefName(std::move(scanDefName)),
-      _possiblyEqPredsOnly(possiblyEqPredsOnly),
-      _satisfiedPartialIndexes(std::move(satisfiedPartialIndexes)) {}
+      _eqPredsOnly(eqPredsOnly),
+      _satisfiedPartialIndexes(std::move(satisfiedPartialIndexes)),
+      _hasProperInterval(hasProperInterval) {}
 
 bool IndexingAvailability::operator==(const IndexingAvailability& other) const {
     return _scanGroupId == other._scanGroupId && _scanProjection == other._scanProjection &&
-        _scanDefName == other._scanDefName && _possiblyEqPredsOnly == other._possiblyEqPredsOnly &&
-        _satisfiedPartialIndexes == other._satisfiedPartialIndexes;
+        _scanDefName == other._scanDefName && _eqPredsOnly == other._eqPredsOnly &&
+        _satisfiedPartialIndexes == other._satisfiedPartialIndexes &&
+        _hasProperInterval == other._hasProperInterval;
 }
 
 GroupIdType IndexingAvailability::getScanGroupId() const {
     return _scanGroupId;
+}
+
+void IndexingAvailability::setScanGroupId(const GroupIdType scanGroupId) {
+    _scanGroupId = scanGroupId;
 }
 
 const ProjectionName& IndexingAvailability::getScanProjection() const {
@@ -315,12 +322,20 @@ opt::unordered_set<std::string>& IndexingAvailability::getSatisfiedPartialIndexe
     return _satisfiedPartialIndexes;
 }
 
-bool IndexingAvailability::getPossiblyEqPredsOnly() const {
-    return _possiblyEqPredsOnly;
+bool IndexingAvailability::getEqPredsOnly() const {
+    return _eqPredsOnly;
 }
 
-void IndexingAvailability::setPossiblyEqPredsOnly(const bool value) {
-    _possiblyEqPredsOnly = value;
+void IndexingAvailability::setEqPredsOnly(const bool value) {
+    _eqPredsOnly = value;
+}
+
+bool IndexingAvailability::hasProperInterval() const {
+    return _hasProperInterval;
+}
+
+void IndexingAvailability::setHasProperInterval(const bool hasProperInterval) {
+    _hasProperInterval = hasProperInterval;
 }
 
 CollectionAvailability::CollectionAvailability(opt::unordered_set<std::string> scanDefSet)
@@ -343,7 +358,7 @@ size_t DistributionHash::operator()(
     size_t result = 0;
     updateHash(result, std::hash<DistributionType>()(distributionAndProjections._type));
     for (const ProjectionName& projectionName : distributionAndProjections._projectionNames) {
-        updateHash(result, std::hash<ProjectionName>()(projectionName));
+        updateHash(result, ProjectionName::Hasher()(projectionName));
     }
     return result;
 }

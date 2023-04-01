@@ -197,11 +197,13 @@ private:
 
     const SelectionFilter shardedFilter = [this](const ReadPreferenceSetting& readPref,
                                                  const std::vector<HostAndPort>& excludedHosts) {
-        return [&](const ServerDescriptionPtr& s) { return s->getType() == ServerType::kMongos; };
+        return [&](const ServerDescriptionPtr& s) {
+            return s->getType() == ServerType::kMongos;
+        };
     };
 
     SdamConfiguration _config;
-    mutable PseudoRandom _random;
+    static thread_local PseudoRandom _random;
 };
 
 // This is used to filter out servers based on their current latency measurements.

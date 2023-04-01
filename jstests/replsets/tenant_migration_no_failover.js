@@ -1,9 +1,9 @@
 /**
- * Tests a full tenant migration, assuming no failover.
+ * Tests a full tenant migration using multitenant migration protocol, assuming no failover.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
+ *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
  *   requires_persistence,
@@ -11,19 +11,16 @@
  * ]
  */
 
-(function() {
-"use strict";
-
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
 
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
-const tenantId = "testTenantId";
+const tenantId = ObjectId().str;
 
 const dbNames = ["db0", "db1", "db2"];
 const tenantDBs = dbNames.map(dbName => tenantMigrationTest.tenantDB(tenantId, dbName));
-const nonTenantDBs = dbNames.map(dbName => tenantMigrationTest.nonTenantDB(tenantId, dbName));
+const nonTenantDBs = dbNames.map(dbName => tenantMigrationTest.tenantDB(ObjectId().str, dbName));
 const collNames = ["coll0", "coll1"];
 
 for (const db of [...tenantDBs, ...nonTenantDBs]) {
@@ -38,7 +35,8 @@ const migrationOpts = {
     tenantId,
 };
 
-TenantMigrationTest.assertCommitted(tenantMigrationTest.runMigration(migrationOpts));
+TenantMigrationTest.assertCommitted(
+    tenantMigrationTest.runMigration(migrationOpts, {enableDonorStartMigrationFsync: true}));
 
 for (const db of [...tenantDBs, ...nonTenantDBs]) {
     for (const coll of collNames) {
@@ -47,4 +45,3 @@ for (const db of [...tenantDBs, ...nonTenantDBs]) {
 }
 
 tenantMigrationTest.stop();
-})();

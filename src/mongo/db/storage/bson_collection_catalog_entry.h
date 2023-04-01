@@ -34,7 +34,6 @@
 
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/index/multikey_paths.h"
-#include "mongo/db/tenant_namespace.h"
 
 namespace mongo {
 
@@ -121,6 +120,7 @@ public:
         mutable Mutex multikeyMutex;
         mutable bool multikey = false;
         mutable MultikeyPaths multikeyPaths;
+        mutable AtomicWord<int32_t> concurrentWriters;
     };
 
     struct MetaData {
@@ -150,8 +150,9 @@ public:
          */
         bool eraseIndex(StringData name);
 
-        TenantNamespace tenantNs;
+        NamespaceString nss;
         CollectionOptions options;
+        // May include empty instances which represent indexes already dropped.
         std::vector<IndexMetaData> indexes;
 
         // Time-series collections created in versions 5.1 and earlier are allowed to contain

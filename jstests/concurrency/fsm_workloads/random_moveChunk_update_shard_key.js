@@ -40,7 +40,7 @@ var $config = extendWorkload($config, function($config, $super) {
              // So, if the range deleter has not yet cleaned up that document when the chunk is
              // moved back to the original shard, the moveChunk may fail as a result of a duplicate
              // key error on the recipient.
-             err.message.includes("Location51008"));
+             err.message.includes("Location51008") || err.message.includes("Location6718402"));
     };
 
     $config.data.runningWithStepdowns =
@@ -141,7 +141,7 @@ var $config = extendWorkload($config, function($config, $super) {
         const replacementStyle = (Math.floor(Math.random() * 2) == 0);
 
         if (replacementStyle) {
-            return {_id: currentId, skey: newShardKey, counter: counterForId + 1};
+            return {_id: currentId, skey: newShardKey, tid: this.tid, counter: counterForId + 1};
         } else {
             // Op style
             return {$set: {skey: newShardKey}, $inc: {counter: 1}};
@@ -191,10 +191,11 @@ var $config = extendWorkload($config, function($config, $super) {
         jsTestLog(logString);
     };
 
-    function assertDocWasUpdated(collection, idToUpdate, currentShardKey, newShardKey, newCounter) {
+    function assertDocWasUpdated(
+        collection, idToUpdate, currentShardKey, newShardKey, newCounter, tid) {
         assertWhenOwnColl.isnull(collection.findOne({_id: idToUpdate, skey: currentShardKey}));
         assertWhenOwnColl.eq(collection.findOne({_id: idToUpdate, skey: newShardKey}),
-                             {_id: idToUpdate, skey: newShardKey, counter: newCounter});
+                             {_id: idToUpdate, skey: newShardKey, tid: tid, counter: newCounter});
     }
 
     function wasDocUpdated(collection, idToUpdate, currentShardKey) {
@@ -242,10 +243,14 @@ var $config = extendWorkload($config, function($config, $super) {
 
                     // With internal transactions enabled, IncompleteTransactionHistory means the
                     // write succeeded, so we can treat this error as success.
-                    if (this.internalTransactionsEnabled) {
+                    if (this.updateDocumentShardKeyUsingTransactionApiEnabled) {
                         print("Internal transactions are on so assuming the operation succeeded");
-                        assertDocWasUpdated(
-                            collection, idToUpdate, currentShardKey, newShardKey, counterForId + 1);
+                        assertDocWasUpdated(collection,
+                                            idToUpdate,
+                                            currentShardKey,
+                                            newShardKey,
+                                            counterForId + 1,
+                                            this.tid);
                         this.expectedCounters[idToUpdate] = counterForId + 1;
                         return;
                     }
@@ -320,10 +325,14 @@ var $config = extendWorkload($config, function($config, $super) {
 
                     // With internal transactions enabled, IncompleteTransactionHistory means the
                     // write succeeded, so we can treat this error as success.
-                    if (this.internalTransactionsEnabled) {
+                    if (this.updateDocumentShardKeyUsingTransactionApiEnabled) {
                         print("Internal transactions are on so assuming the operation succeeded");
-                        assertDocWasUpdated(
-                            collection, idToUpdate, currentShardKey, newShardKey, counterForId + 1);
+                        assertDocWasUpdated(collection,
+                                            idToUpdate,
+                                            currentShardKey,
+                                            newShardKey,
+                                            counterForId + 1,
+                                            this.tid);
                         this.expectedCounters[idToUpdate] = counterForId + 1;
                         return;
                     }
@@ -437,7 +446,7 @@ var $config = extendWorkload($config, function($config, $super) {
         // consistency, so use a non causally consistent session with internal transactions.
         const shouldUseCausalConsistency =
             (this.runningWithStepdowns || this.retryOnKilledSession) &&
-            !this.internalTransactionsEnabled;
+            !this.updateDocumentShardKeyUsingTransactionApiEnabled;
         this.session = db.getMongo().startSession(
             {causalConsistency: shouldUseCausalConsistency, retryWrites: true});
 
@@ -479,15 +488,18 @@ var $config = extendWorkload($config, function($config, $super) {
         }
         db.printShardingStatus();
 
-        const parameterRes = db.adminCommand({getParameter: 1, featureFlagInternalTransactions: 1});
+        const parameterRes = db.adminCommand(
+            {getParameter: 1, featureFlagUpdateDocumentShardKeyUsingTransactionApi: 1});
         if (!parameterRes.ok) {
             assert.eq(parameterRes.errmsg, "no option found to get", parameterRes);
-            this.internalTransactionsEnabled = false;
+            this.updateDocumentShardKeyUsingTransactionApiEnabled = false;
         } else {
             assert.commandWorked(parameterRes);
-            this.internalTransactionsEnabled = parameterRes.featureFlagInternalTransactions.value;
+            this.updateDocumentShardKeyUsingTransactionApiEnabled =
+                parameterRes.featureFlagUpdateDocumentShardKeyUsingTransactionApi.value;
         }
-        print("Internal transactions enabled: " + this.internalTransactionsEnabled);
+        print("Updating document shard key using transaction api enabled: " +
+              this.updateDocumentShardKeyUsingTransactionApiEnabled);
     };
 
     /**

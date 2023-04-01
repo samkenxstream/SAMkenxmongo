@@ -6,9 +6,12 @@
  * recipient's majority read on 'config.transactions' can miss committed retryable writes at that
  * majority commit point.
  *
+ * TODO SERVER-61231: Adapt for shard merge.
+ *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
+ *   # Shard merge only supports 'primary' read preference.
+ *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
  *   requires_persistence,
@@ -16,9 +19,12 @@
  * ]
  */
 
-(function() {
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    isShardMergeEnabled,
+    makeX509OptionsForTest
+} from "jstests/replsets/libs/tenant_migration_util.js";
+
 load("jstests/libs/fail_point_util.js");  // For configureFailPoint().
 load("jstests/libs/uuid_util.js");        // For extractUUIDFromObject().
 load("jstests/libs/write_concern_util.js");
@@ -57,11 +63,12 @@ const donorRst = new ReplSetTest({
         n3: {rsConfig: {priority: 0, hidden: true}, setParameter: {bgSyncOplogFetcherBatchSize: 1}},
         n4: {rsConfig: {priority: 0, hidden: true}, setParameter: {bgSyncOplogFetcherBatchSize: 1}},
     },
+    serverless: true,
     // Force secondaries to sync from the primary to guarantee replication progress with the
     // stopReplProducerOnDocument failpoint. Also disable primary catchup because some replicated
     // retryable write statements are intentionally not being made majority committed.
     settings: {chainingAllowed: false, catchUpTimeoutMillis: 0},
-    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor, {
+    nodeOptions: Object.assign(makeX509OptionsForTest().donor, {
         setParameter: {
             tenantMigrationExcludeDonorHostTimeoutMS: 30 * 1000,
             // Allow non-timestamped reads on donor after migration completes for testing.
@@ -76,7 +83,7 @@ const donorPrimary = donorRst.getPrimary();
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName(), donorRst: donorRst});
 
 const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
-const kTenantId = "testTenantId";
+const kTenantId = ObjectId().str;
 const migrationId = UUID();
 const kDbName = tenantMigrationTest.tenantDB(kTenantId, "testDB");
 const kCollName = "retryable_write_secondary_oplog_application";
@@ -197,7 +204,7 @@ assert.eq(startFetchingDonorOpTime.ts, stmtMajorityCommitted.ts);
 
 // At this point, the recipient should have fetched retryable writes and put them into the
 // oplog buffer.
-const kOplogBufferNS = "config.repl.migration.oplog_" + migrationOpts.migrationIdString;
+const kOplogBufferNS = `config.repl.migration.oplog_${migrationOpts.migrationIdString}`;
 const recipientOplogBuffer = recipientPrimary.getCollection(kOplogBufferNS);
 jsTestLog(`oplog buffer ns: ${kOplogBufferNS}`);
 
@@ -236,4 +243,3 @@ assert.eq(docAfterMigration.counter, counterTotal);
 
 donorRst.stopSet();
 tenantMigrationTest.stop();
-})();

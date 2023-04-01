@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -38,6 +37,9 @@
 #include "mongo/db/storage/key_string.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/util/bufreader.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 namespace {
@@ -125,7 +127,7 @@ void BM_BSONToKeyString(benchmark::State& state,
     const BsonsAndKeyStrings bsonsAndKeyStrings = generateBsonsAndKeyStrings(bsonType, version);
     for (auto _ : state) {
         benchmark::ClobberMemory();
-        for (auto bson : bsonsAndKeyStrings.bsons) {
+        for (const auto& bson : bsonsAndKeyStrings.bsons) {
             benchmark::DoNotOptimize(KeyString::Builder(version, bson, ALL_ASCENDING));
         }
     }

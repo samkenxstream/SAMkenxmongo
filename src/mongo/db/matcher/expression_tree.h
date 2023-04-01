@@ -61,6 +61,7 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const final {
+        tassert(6400201, "Out-of-bounds access to child of MatchExpression.", i < numChildren());
         return _expressions[i].get();
     }
 
@@ -98,7 +99,7 @@ public:
 protected:
     void _debugList(StringBuilder& debug, int indentationLevel) const;
 
-    void _listToBSON(BSONArrayBuilder* out, bool includePath) const;
+    void _listToBSON(BSONArrayBuilder* out, SerializationOptions opts) const;
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final;
@@ -123,11 +124,11 @@ public:
 
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
-    virtual std::unique_ptr<MatchExpression> shallowClone() const {
+    virtual std::unique_ptr<MatchExpression> clone() const {
         std::unique_ptr<AndMatchExpression> self =
             std::make_unique<AndMatchExpression>(_errorAnnotation);
         for (size_t i = 0; i < numChildren(); ++i) {
-            self->add(getChild(i)->shallowClone());
+            self->add(getChild(i)->clone());
         }
         if (getTag()) {
             self->setTag(getTag()->clone());
@@ -137,7 +138,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
-    virtual void serialize(BSONObjBuilder* out, bool includePath) const;
+    virtual void serialize(BSONObjBuilder* out, SerializationOptions opts) const;
 
     bool isTriviallyTrue() const final;
 
@@ -167,11 +168,11 @@ public:
 
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
-    virtual std::unique_ptr<MatchExpression> shallowClone() const {
+    virtual std::unique_ptr<MatchExpression> clone() const {
         std::unique_ptr<OrMatchExpression> self =
             std::make_unique<OrMatchExpression>(_errorAnnotation);
         for (size_t i = 0; i < numChildren(); ++i) {
-            self->add(getChild(i)->shallowClone());
+            self->add(getChild(i)->clone());
         }
         if (getTag()) {
             self->setTag(getTag()->clone());
@@ -181,7 +182,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
-    virtual void serialize(BSONObjBuilder* out, bool includePath) const;
+    virtual void serialize(BSONObjBuilder* out, SerializationOptions opts) const;
 
     bool isTriviallyFalse() const final;
 
@@ -211,11 +212,11 @@ public:
 
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
-    virtual std::unique_ptr<MatchExpression> shallowClone() const {
+    virtual std::unique_ptr<MatchExpression> clone() const {
         std::unique_ptr<NorMatchExpression> self =
             std::make_unique<NorMatchExpression>(_errorAnnotation);
         for (size_t i = 0; i < numChildren(); ++i) {
-            self->add(getChild(i)->shallowClone());
+            self->add(getChild(i)->clone());
         }
         if (getTag()) {
             self->setTag(getTag()->clone());
@@ -225,7 +226,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
-    virtual void serialize(BSONObjBuilder* out, bool includePath) const;
+    virtual void serialize(BSONObjBuilder* out, SerializationOptions opts) const;
 
     void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
         visitor->visit(this);
@@ -238,6 +239,7 @@ public:
 
 class NotMatchExpression final : public MatchExpression {
 public:
+    static constexpr int kNumChildren = 1;
     explicit NotMatchExpression(MatchExpression* e,
                                 clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : MatchExpression(NOT, std::move(annotation)), _exp(e) {}
@@ -246,9 +248,9 @@ public:
                                 clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : MatchExpression(NOT, std::move(annotation)), _exp(std::move(expr)) {}
 
-    virtual std::unique_ptr<MatchExpression> shallowClone() const {
+    virtual std::unique_ptr<MatchExpression> clone() const {
         std::unique_ptr<NotMatchExpression> self =
-            std::make_unique<NotMatchExpression>(_exp->shallowClone(), _errorAnnotation);
+            std::make_unique<NotMatchExpression>(_exp->clone(), _errorAnnotation);
         if (getTag()) {
             self->setTag(getTag()->clone());
         }
@@ -265,15 +267,16 @@ public:
 
     virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
-    virtual void serialize(BSONObjBuilder* out, bool includePath) const;
+    virtual void serialize(BSONObjBuilder* out, SerializationOptions opts) const;
 
     bool equivalent(const MatchExpression* other) const final;
 
     size_t numChildren() const final {
-        return 1;
+        return kNumChildren;
     }
 
     MatchExpression* getChild(size_t i) const final {
+        tassert(6400210, "Out-of-bounds access to child of MatchExpression.", i < kNumChildren);
         return _exp.get();
     }
 
@@ -306,7 +309,7 @@ public:
 private:
     static void serializeNotExpressionToNor(MatchExpression* exp,
                                             BSONObjBuilder* out,
-                                            bool includePath);
+                                            SerializationOptions opts);
 
     ExpressionOptimizerFunc getOptimizer() const final;
 

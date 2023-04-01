@@ -30,7 +30,7 @@ global:
   cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 commands:
     distinct:
@@ -45,11 +45,18 @@ commands:
                 description: "The field path for which to return distinct values."
                 type: string
             query:
-                description: "Optional query that filters the documents from which to retrieve the 
+                description: "Optional query that filters the documents from which to retrieve the
                               distinct values."
                 type: object
                 optional: true
             collation:
                 description: "Optional collation for the command."
                 type: object
+                optional: true
+            mirrored:
+                description: "Indicates whether the operation is a mirrored read"
+                type: optionalBool
+            sampleId:
+                description: "The unique sample id for the operation if it has been chosen for sampling."
+                type: uuid
                 optional: true

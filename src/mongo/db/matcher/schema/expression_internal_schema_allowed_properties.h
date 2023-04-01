@@ -31,12 +31,12 @@
 
 #include <boost/optional.hpp>
 #include <memory>
-#include <pcrecpp.h>
 #include <utility>
 #include <vector>
 
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_with_placeholder.h"
+#include "mongo/util/pcre.h"
 
 namespace mongo {
 
@@ -90,15 +90,15 @@ namespace mongo {
 class InternalSchemaAllowedPropertiesMatchExpression final : public MatchExpression {
 public:
     /**
-     * A container for regular expression data. Holds a pcrecpp::RE object, as well as the original
+     * A container for regular expression data. Holds a regex object, as well as the original
      * string pattern, which is used for comparisons and serialization.
      */
     struct Pattern {
         explicit Pattern(StringData pattern)
-            : rawRegex(pattern), regex(std::make_unique<pcrecpp::RE>(pattern.toString())) {}
+            : rawRegex(pattern), regex(std::make_unique<pcre::Regex>(std::string{rawRegex})) {}
 
         StringData rawRegex;
-        std::unique_ptr<pcrecpp::RE> regex;
+        std::unique_ptr<pcre::Regex> regex;
     };
 
     /**
@@ -136,9 +136,9 @@ public:
     bool matches(const MatchableDocument* doc, MatchDetails* details) const final;
     bool matchesSingleElement(const BSONElement& element, MatchDetails* details) const final;
 
-    void serialize(BSONObjBuilder* builder, bool includePath) const final;
+    void serialize(BSONObjBuilder* builder, SerializationOptions opts) const final;
 
-    std::unique_ptr<MatchExpression> shallowClone() const final;
+    std::unique_ptr<MatchExpression> clone() const final;
 
     std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
@@ -149,7 +149,7 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const final {
-        invariant(i < numChildren());
+        tassert(6400212, "Out-of-bounds access to child of MatchExpression.", i < numChildren());
 
         if (i == 0) {
             return _otherwise->getFilter();
@@ -191,10 +191,6 @@ private:
      * Helper function for matches() and matchesSingleElement().
      */
     bool _matchesBSONObj(const BSONObj& obj) const;
-
-    void _doAddDependencies(DepsTracker* deps) const final {
-        deps->needWholeDocument = true;
-    }
 
     // The names of the properties are owned by the BSONObj used to create this match expression.
     // Since that BSONObj must outlive this object, we can safely store StringData.

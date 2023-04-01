@@ -35,6 +35,7 @@
 
 #include "mongo/db/json.h"
 #include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/platform/decimal128.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -99,9 +100,27 @@ TEST(CollectionOptions, ErrorBadMax) {
         CollectionOptions::parse(BSON("capped" << true << "max" << (1LL << 31))).getStatus());
 }
 
+TEST(CollectionOptions, CappedSizeNotRoundUpForAlignment) {
+    serverGlobalParams.mutableFeatureCompatibility.setVersion(
+        multiversion::FeatureCompatibilityVersion::kVersion_6_2);
+    const long long kUnalignedCappedSize = 1000;
+    const long long kAlignedCappedSize = 1000;
+
+    // Check size rounds up to multiple of alignment.
+    auto options = assertGet(
+        CollectionOptions::parse((BSON("capped" << true << "size" << kUnalignedCappedSize))));
+
+    ASSERT_EQUALS(options.capped, true);
+    ASSERT_EQUALS(options.cappedSize, kAlignedCappedSize);
+    ASSERT_EQUALS(options.cappedMaxDocs, 0);
+}
+
 TEST(CollectionOptions, CappedSizeRoundsUpForAlignment) {
+    serverGlobalParams.mutableFeatureCompatibility.setVersion(
+        multiversion::FeatureCompatibilityVersion::kVersion_6_0);
     const long long kUnalignedCappedSize = 1000;
     const long long kAlignedCappedSize = 1024;
+
     // Check size rounds up to multiple of alignment.
     auto options = assertGet(
         CollectionOptions::parse((BSON("capped" << true << "size" << kUnalignedCappedSize))));
@@ -313,7 +332,7 @@ TEST(CollectionOptions, ParseUUID) {
     // Check successful parse and roundtrip.
     options =
         assertGet(CollectionOptions::parse(uuid.toBSON(), CollectionOptions::parseForStorage));
-    ASSERT(options.uuid.get() == uuid);
+    ASSERT(options.uuid.value() == uuid);
 
     // Check that a collection options containing a UUID passes validation.
     ASSERT_OK(options.validateForStorage());
@@ -357,10 +376,8 @@ TEST(CollectionOptions, NExtentsNoError) {
 
 #define ASSERT_STATUS_CODE(CODE, EXPRESSION) ASSERT_EQUALS(CODE, (EXPRESSION).getStatus().code())
 
-// Duplicate fields is not allowed
+// Duplicate fields are not allowed
 TEST(FLECollectionOptions, MultipleFields) {
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2", true);
-
     ASSERT_STATUS_CODE(6338402, CollectionOptions::parse(fromjson(R"({
     encryptedFields: {
         "fields": [
@@ -382,8 +399,6 @@ TEST(FLECollectionOptions, MultipleFields) {
 
 // Duplicate key ids are bad, it breaks the design
 TEST(FLECollectionOptions, DuplicateKeyIds) {
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2", true);
-
     ASSERT_STATUS_CODE(6338401, CollectionOptions::parse(fromjson(R"({
     encryptedFields: {
         "fields": [
@@ -403,9 +418,47 @@ TEST(FLECollectionOptions, DuplicateKeyIds) {
     }})")));
 }
 
-TEST(FLECollectionOptions, ConflictingPrefixes) {
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2", true);
+TEST(FLECollectionOptions, NonConflictingPrefixes) {
+    ASSERT_OK(CollectionOptions::parse(fromjson(R"({
+    encryptedFields: {
+        "fields": [
+            {
+                "path": "name",
+                "keyId": { '$uuid': '11d58b8a-0c6c-4d69-a0bd-70c6d9befae9' },
+                "bsonType": "string",
+                "queries": {"queryType": "equality"}
+            },
+            {
+                "path": "nameOther",
+                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                "bsonType": "string",
+                "queries": [{"queryType": "equality"}]
+            }
+        ]
+    }})"))
+                  .getStatus());
 
+    ASSERT_OK(CollectionOptions::parse(fromjson(R"({
+    encryptedFields: {
+        "fields": [
+            {
+                "path": "a.b.c",
+                "keyId": { '$uuid': '11d58b8a-0c6c-4d69-a0bd-70c6d9befae9' },
+                "bsonType": "string",
+                "queries": {"queryType": "equality"}
+            },
+            {
+                "path": "a.b.cde",
+                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                "bsonType": "string",
+                "queries": [{"queryType": "equality"}]
+            }
+        ]
+    }})"))
+                  .getStatus());
+}
+
+TEST(FLECollectionOptions, ConflictingPrefixes) {
     ASSERT_STATUS_CODE(6338403, CollectionOptions::parse(fromjson(R"({
     encryptedFields: {
         "fields": [
@@ -462,10 +515,6 @@ TEST(FLECollectionOptions, ConflictingPrefixes) {
 }
 
 TEST(FLECollectionOptions, DuplicateQueryTypes) {
-
-
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2", true);
-
     ASSERT_STATUS_CODE(6338404, CollectionOptions::parse(fromjson(R"({
     encryptedFields: {
         "fields": [
@@ -479,10 +528,8 @@ TEST(FLECollectionOptions, DuplicateQueryTypes) {
     }})")));
 }
 
-TEST(FLECollectionOptions, AllowedTypes) {
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2", true);
-
-    std::vector<std::string> types({
+TEST(FLECollectionOptions, Equality_AllowedTypes) {
+    std::vector<std::string> typesAllowedIndexed({
         "string",
         "binData",
         "objectId",
@@ -493,21 +540,31 @@ TEST(FLECollectionOptions, AllowedTypes) {
         "int",
         "timestamp",
         "long",
+        "dbPointer",
+        "symbol",
     });
 
-    for (const auto& type : types) {
-        ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
-    encryptedFields: {
-        "fields": [
-            {
-                "path": "name.first",
-                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
-                "bsonType": ")" << type << R"("
-            }
-        ]
-    }})"))
-                      .getStatus());
+    std::vector<std::string> typesAllowedUnindexed({
+        "string",
+        "binData",
+        "objectId",
+        "bool",
+        "date",
+        "regex",
+        "javascript",
+        "int",
+        "timestamp",
+        "long",
+        "double",
+        "object",
+        "array",
+        "decimal",
+        "dbPointer",
+        "symbol",
+        "javascriptWithScope",
+    });
 
+    for (const auto& type : typesAllowedIndexed) {
         ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
         encryptedFields: {
             "fields": [
@@ -519,44 +576,48 @@ TEST(FLECollectionOptions, AllowedTypes) {
                 }
             ]
         }
+    }})"))
+                      .getStatus());
+    }
+
+    for (const auto& type : typesAllowedUnindexed) {
+        ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
+    encryptedFields: {
+        "fields": [
+            {
+                "path": "name.first",
+                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                "bsonType": ")" << type << R"("
+            }
+        ]
     }})"))
                       .getStatus());
     }
 }
 
 
-TEST(FLECollectionOptions, DisAllowedTypes) {
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2", true);
-
-    std::vector<std::string> types({
+TEST(FLECollectionOptions, Equality_DisAllowedTypes) {
+    std::vector<std::string> typesDisallowedIndexed({
         "minKey",
-        "missing",
         "double",
         "object",
         "array",
         "null",
         "undefined",
-        "dbPointer",
-        "symbol",
         "javascriptWithScope",
         "decimal",
         "maxKey",
     });
 
-    for (const auto& type : types) {
-        ASSERT_NOT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
-    encryptedFields: {
-        "fields": [
-            {
-                "path": "name.first",
-                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
-                "bsonType": ")" << type << R"("
-            }
-        ]
-    }})"))
-                          .getStatus());
+    std::vector<std::string> typesDisallowedUnindexed({
+        "minKey",
+        "null",
+        "undefined",
+        "maxKey",
+    });
 
-        ASSERT_NOT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
+    for (const auto& type : typesDisallowedIndexed) {
+        ASSERT_STATUS_CODE(6338405, CollectionOptions::parse(fromjson(str::stream() << R"({
         encryptedFields: {
             "fields": [
                 {
@@ -567,9 +628,432 @@ TEST(FLECollectionOptions, DisAllowedTypes) {
                 }
             ]
         }
-    }})"))
-                          .getStatus());
+    }})")));
     }
+
+    for (const auto& type : typesDisallowedUnindexed) {
+        ASSERT_STATUS_CODE(6338406, CollectionOptions::parse(fromjson(str::stream() << R"({
+    encryptedFields: {
+        "fields": [
+            {
+                "path": "name.first",
+                "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                "bsonType": ")" << type << R"("
+            }
+        ]
+    }})")));
+    }
+}
+
+
+TEST(FLECollectionOptions, Range_AllowedTypes) {
+    // TODO: SERVER-67760 remove feature flag
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2Range", true);
+
+    ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "rangePreview", "sparsity" : 1, min : 1, max : 2}
+                }
+            ]
+        }
+    }})"))
+                  .getStatus());
+
+    ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "long",
+                    "queries": {"queryType": "rangePreview", "sparsity" : 1, min : {$numberLong: "1"}, max : {$numberLong: "2"}}
+                }
+            ]
+        }
+    }})"))
+                  .getStatus());
+
+    for (const auto& type : std::vector<std::string>{"double", "decimal"}) {
+        ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": ")" << type << R"(",
+                    "queries": {"queryType": "rangePreview", "sparsity" : 1}
+                }
+            ]
+        }
+    }})"))
+                      .getStatus());
+    }
+
+    ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": ")"
+                                                              << "double"
+                                                              << R"(",
+                    "queries": {"queryType": "rangePreview", "sparsity" : 1, min: 0.000, max: 1.000, precision: 3}
+                }
+            ]
+        }
+    }})"))
+                  .getStatus());
+
+    ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": ")"
+                                                              << "decimal"
+                                                              << R"(",
+                    "queries": {"queryType": "rangePreview", "sparsity" : 1, min: NumberDecimal("0.000"), max: NumberDecimal("1.000"), precision: 3}
+                }
+            ]
+        }
+    }})"))
+                  .getStatus());
+
+    // Validate date works
+    ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "date",
+                    "queries": {"queryType": "rangePreview", "sparsity" : 1, min : {"$date": {"$numberLong": "12344"}}, max : {"$date": {"$numberLong": "12345"}}}
+                }
+            ]
+        }
+    }})"))
+                  .getStatus());
+}
+
+
+TEST(FLECollectionOptions, Range_DisAllowedTypes) {
+    // TODO: SERVER-67760 remove feature flag
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2Range", true);
+
+    std::vector<std::string> typesDisallowedIndexed({
+        "array",
+        "binData",
+        "bool",
+        "dbPointer",
+        "javascript",
+        "javascriptWithScope",
+        "maxKey",
+        "minKey",
+        "null",
+        "object",
+        "objectId",
+        "regex",
+        "string",
+        "symbol",
+        "timestamp",
+    });
+
+    for (const auto& type : typesDisallowedIndexed) {
+        ASSERT_STATUS_CODE(6775201, CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": ")" << type << R"(",
+                    "queries": {"queryType": "rangePreview"}
+                }
+            ]
+        }
+    }})")));
+    }
+}
+
+TEST(FLECollectionOptions, Range_MissingFields) {
+    // TODO: SERVER-67760 remove feature flag
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2Range", true);
+
+    ASSERT_STATUS_CODE(6775202, CollectionOptions::parse(fromjson(R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "rangePreview"}
+                }
+            ]
+        }
+    }})")));
+
+    ASSERT_STATUS_CODE(6775203, CollectionOptions::parse(fromjson(R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "rangePreview", sparsity: 1}
+                }
+            ]
+        }
+    }})")));
+
+    ASSERT_STATUS_CODE(6775204, CollectionOptions::parse(fromjson(R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "rangePreview", sparsity: 1, min : 1}
+                }
+            ]
+        }
+    }})")));
+}
+
+TEST(FLECollectionOptions, Equality_ExtraFields) {
+    // TODO: SERVER-67760 remove feature flag
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2Range", true);
+
+    ASSERT_STATUS_CODE(6775205, CollectionOptions::parse(fromjson(R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "equality", sparsity:1}
+                }
+            ]
+        }
+    }})")));
+
+    ASSERT_STATUS_CODE(6775206, CollectionOptions::parse(fromjson(R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "equality", min:1}
+                }
+            ]
+        }
+    }})")));
+
+    ASSERT_STATUS_CODE(6775207, CollectionOptions::parse(fromjson(R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "equality", max:1}
+                }
+            ]
+        }
+    }})")));
+}
+
+
+TEST(FLECollectionOptions, Range_MinMax) {
+    // TODO: SERVER-67760 remove feature flag
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2Range", true);
+
+
+    {
+        auto doc = BSON("encryptedFields"
+                        << BSON("fields" << BSON_ARRAY(BSON("path"
+                                                            << "firstName"
+                                                            << "keyId" << UUID::gen() << "bsonType"
+                                                            << "int"
+                                                            << "queries"
+                                                            << BSON("queryType"
+                                                                    << "rangePreview"
+                                                                    << "sparsity" << 1 << "min" << 2
+                                                                    << "max" << 1)))));
+
+        ASSERT_STATUS_CODE(6720005, CollectionOptions::parse(doc));
+    }
+
+    {
+        auto doc = BSON("encryptedFields"
+                        << BSON("fields" << BSON_ARRAY(BSON("path"
+                                                            << "firstName"
+                                                            << "keyId" << UUID::gen() << "bsonType"
+                                                            << "long"
+                                                            << "queries"
+                                                            << BSON("queryType"
+                                                                    << "rangePreview"
+                                                                    << "sparsity" << 1 << "min"
+                                                                    << 2LL << "max" << 1LL)))));
+
+        ASSERT_STATUS_CODE(6720005, CollectionOptions::parse(doc));
+    }
+
+    {
+        auto doc =
+            BSON("encryptedFields" << BSON(
+                     "fields" << BSON_ARRAY(BSON("path"
+                                                 << "firstName"
+                                                 << "keyId" << UUID::gen() << "bsonType"
+                                                 << "double"
+                                                 << "queries"
+                                                 << BSON("queryType"
+                                                         << "rangePreview"
+                                                         << "sparsity" << 1 << "min" << 2.0)))));
+
+        ASSERT_STATUS_CODE(6967100, CollectionOptions::parse(doc));
+
+        doc = BSON("encryptedFields" << BSON(
+                       "fields" << BSON_ARRAY(BSON("path"
+                                                   << "firstName"
+                                                   << "keyId" << UUID::gen() << "bsonType"
+                                                   << "double"
+                                                   << "queries"
+                                                   << BSON("queryType"
+                                                           << "rangePreview"
+                                                           << "sparsity" << 1 << "max" << 2.0)))));
+
+        ASSERT_STATUS_CODE(6967100, CollectionOptions::parse(doc));
+
+        doc = BSON("encryptedFields"
+                   << BSON("fields"
+                           << BSON_ARRAY(BSON("path"
+                                              << "firstName"
+                                              << "keyId" << UUID::gen() << "bsonType"
+                                              << "double"
+                                              << "queries"
+                                              << BSON("queryType"
+                                                      << "rangePreview"
+                                                      << "sparsity" << 1 << "precision" << 2)))));
+
+        ASSERT_STATUS_CODE(6967100, CollectionOptions::parse(doc));
+
+        doc = BSON("encryptedFields"
+                   << BSON("fields" << BSON_ARRAY(
+                               BSON("path"
+                                    << "firstName"
+                                    << "keyId" << UUID::gen() << "bsonType"
+                                    << "decimal"
+                                    << "queries"
+                                    << BSON("queryType"
+                                            << "rangePreview"
+                                            << "sparsity" << 1 << "min" << Decimal128(2.0))))));
+
+        ASSERT_STATUS_CODE(6967100, CollectionOptions::parse(doc));
+
+        doc = BSON("encryptedFields"
+                   << BSON("fields" << BSON_ARRAY(
+                               BSON("path"
+                                    << "firstName"
+                                    << "keyId" << UUID::gen() << "bsonType"
+                                    << "decimal"
+                                    << "queries"
+                                    << BSON("queryType"
+                                            << "rangePreview"
+                                            << "sparsity" << 1 << "max" << Decimal128(2.0))))));
+
+        ASSERT_STATUS_CODE(6967100, CollectionOptions::parse(doc));
+
+        doc = BSON("encryptedFields"
+                   << BSON("fields"
+                           << BSON_ARRAY(BSON("path"
+                                              << "firstName"
+                                              << "keyId" << UUID::gen() << "bsonType"
+                                              << "decimal"
+                                              << "queries"
+                                              << BSON("queryType"
+                                                      << "rangePreview"
+                                                      << "sparsity" << 1 << "precision" << 2)))));
+
+        ASSERT_STATUS_CODE(6967100, CollectionOptions::parse(doc));
+    }
+
+
+    Date_t start = Date_t::now();
+    Date_t end = start;
+    end += Hours(1);
+    auto doc = BSON("encryptedFields"
+                    << BSON("fields" << BSON_ARRAY(BSON("path"
+                                                        << "firstName"
+                                                        << "keyId" << UUID::gen() << "bsonType"
+                                                        << "date"
+                                                        << "queries"
+                                                        << BSON("queryType"
+                                                                << "rangePreview"
+                                                                << "sparsity" << 1 << "min" << end
+                                                                << "max" << start)))));
+
+    ASSERT_STATUS_CODE(6720005, CollectionOptions::parse(doc));
+}
+
+TEST(FLECollectionOptions, Range_BoundTypeMismatch) {
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2Range", true);
+    ASSERT_STATUS_CODE(7018200, CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "rangePreview", "sparsity" : 1, min: {"$numberLong": "12344"}, max: {"$numberLong": "123440"}}
+                }
+            ]
+        }
+    }})")));
+
+    ASSERT_STATUS_CODE(7018200, CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "long",
+                    "queries": {"queryType": "rangePreview", "sparsity" : 1, min: 1, max: 2}
+                }
+            ]
+        }
+    }})")));
+
+    ASSERT_STATUS_CODE(7018201, CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "long",
+                    "queries": {"queryType": "rangePreview", "sparsity" : 1, min: {$numberLong: "1"}, max: 2}
+                }
+            ]
+        }
+    }})")));
+    ASSERT_STATUS_CODE(7018201, CollectionOptions::parse(fromjson(str::stream() << R"({
+        encryptedFields: {
+            "fields": [
+                {
+                    "path": "firstName",
+                    "keyId": { '$uuid': '5f34e99a-b214-451f-b6f6-d3d28e933d15' },
+                    "bsonType": "int",
+                    "queries": {"queryType": "rangePreview", "sparsity" : 1, min: 1, max: {"$numberLong": "123440"}}
+                }
+            ]
+        }
+    }})")));
 }
 
 }  // namespace mongo

@@ -2,10 +2,8 @@
  * Tests that tenant migration recipient's in memory state is recovered correctly on startup. This
  * test randomly selects a point during the migration to shutdown the recipient.
  *
- * Tenant migrations are not expected to be run on servers with ephemeralForTest.
- *
+ *  TODO SERVER-72209 Remove incompatible_with_shard_merge once recipient is resistent to restarts
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
@@ -15,17 +13,17 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {makeX509OptionsForTest} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
 
 const recipientRst = new ReplSetTest({
     nodes: 1,
     name: 'recipient',
-    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().recipient, {
+    serverless: true,
+    nodeOptions: Object.assign(makeX509OptionsForTest().recipient, {
         setParameter:
             {"failpoint.PrimaryOnlyServiceSkipRebuildingInstances": tojson({mode: "alwaysOn"})}
     })
@@ -37,14 +35,14 @@ recipientRst.initiate();
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName(), recipientRst});
 
 const kMaxSleepTimeMS = 7500;
-const kTenantId = 'testTenantId';
+const kTenantId = ObjectId().str;
 
 let recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 
 // Force the migration to pause after entering a randomly selected state.
 Random.setRandomSeed();
 const kMigrationFpNames = [
-    "fpAfterCollectionClonerDone",
+    "fpBeforeFetchingCommittedTransactions",
     "fpAfterWaitForRejectReadsBeforeTimestamp",
 ];
 const index = Random.randInt(kMigrationFpNames.length + 1);
@@ -52,8 +50,9 @@ if (index < kMigrationFpNames.length) {
     configureFailPoint(recipientPrimary, kMigrationFpNames[index], {action: "hang"});
 }
 
+const migrationId = UUID();
 const migrationOpts = {
-    migrationIdString: extractUUIDFromObject(UUID()),
+    migrationIdString: extractUUIDFromObject(migrationId),
     tenantId: kTenantId,
 };
 assert.commandWorked(tenantMigrationTest.startMigration(migrationOpts));
@@ -68,7 +67,7 @@ recipientRst.startSet({
 recipientPrimary = recipientRst.getPrimary();
 const configRecipientsColl =
     recipientPrimary.getCollection(TenantMigrationTest.kConfigRecipientsNS);
-const recipientDoc = configRecipientsColl.findOne({tenantId: kTenantId});
+const recipientDoc = configRecipientsColl.findOne({_id: migrationId});
 if (recipientDoc) {
     switch (recipientDoc.state) {
         case TenantMigrationTest.RecipientState.kStarted:
@@ -109,4 +108,3 @@ if (recipientDoc) {
 
 tenantMigrationTest.stop();
 recipientRst.stopSet();
-})();

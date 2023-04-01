@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include <memory>
 
@@ -44,16 +43,20 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/request_execution_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/session_catalog.h"
+#include "mongo/db/session/session_catalog.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/stats/top.h"
 #include "mongo/logv2/log.h"
+#include "mongo/rpc/check_allowed_op_query_cmd.h"
 #include "mongo/rpc/message.h"
-#include "mongo/rpc/warn_deprecated_wire_ops.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/load_balancer_support.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/transaction_router.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo {
 
@@ -70,7 +73,7 @@ BSONObj buildErrReply(const DBException& ex) {
 
 // Allows for decomposing `handleRequest` into parts and simplifies composing the future-chain.
 struct HandleRequest : public std::enable_shared_from_this<HandleRequest> {
-    struct OpRunnerBase;
+    struct CommandOpRunner;
 
     HandleRequest(OperationContext* opCtx, const Message& message)
         : rec(std::make_shared<RequestExecutionContext>(opCtx, message)),
@@ -124,56 +127,36 @@ void HandleRequest::setupEnvironment() {
     CurOp::get(opCtx)->ensureStarted();
 }
 
-// The base for various operation runners that handle the request, and often generate a DbResponse.
-struct HandleRequest::OpRunnerBase {
-    explicit OpRunnerBase(std::shared_ptr<HandleRequest> hr) : hr(std::move(hr)) {}
-    virtual ~OpRunnerBase() = default;
-    virtual Future<DbResponse> run() = 0;
-    const std::shared_ptr<HandleRequest> hr;
-};
-
-struct CommandOpRunner final : public HandleRequest::OpRunnerBase {
-    using HandleRequest::OpRunnerBase::OpRunnerBase;
-    Future<DbResponse> run() override {
+struct HandleRequest::CommandOpRunner {
+    explicit CommandOpRunner(std::shared_ptr<HandleRequest> hr) : hr(std::move(hr)) {}
+    Future<DbResponse> run() {
         return Strategy::clientCommand(hr->rec);
     }
+    const std::shared_ptr<HandleRequest> hr;
 };
 
 Future<DbResponse> HandleRequest::handleRequest() {
     switch (op) {
         case dbQuery:
             if (!nsString.isCommand()) {
-                globalOpCounters.gotQueryDeprecated();
-                warnDeprecation(*(rec->getOpCtx()->getClient()), networkOpToString(dbQuery));
                 return Future<DbResponse>::makeReady(
-                    makeErrorResponseToDeprecatedOpQuery("OP_QUERY is no longer supported"));
+                    makeErrorResponseToUnsupportedOpQuery("OP_QUERY is no longer supported"));
             }
-        // FALLTHROUGH: it's a query containing a command
+            [[fallthrough]];  // It's a query containing a command
         case dbMsg:
             return std::make_unique<CommandOpRunner>(shared_from_this())->run();
         case dbGetMore: {
-            globalOpCounters.gotGetMoreDeprecated();
-            warnDeprecation(*(rec->getOpCtx()->getClient()), networkOpToString(dbGetMore));
             return Future<DbResponse>::makeReady(
-                makeErrorResponseToDeprecatedOpQuery("OP_GET_MORE is no longer supported"));
+                makeErrorResponseToUnsupportedOpQuery("OP_GET_MORE is no longer supported"));
         }
         case dbKillCursors:
-            globalOpCounters.gotKillCursorsDeprecated();
-            warnDeprecation(*(rec->getOpCtx()->getClient()), networkOpToString(op));
             uasserted(5745707, "OP_KILL_CURSORS is no longer supported");
         case dbInsert: {
-            auto opInsert = InsertOp::parseLegacy(rec->getMessage());
-            globalOpCounters.gotInsertsDeprecated(opInsert.getDocuments().size());
-            warnDeprecation(*(rec->getOpCtx()->getClient()), networkOpToString(op));
             uasserted(5745706, "OP_INSERT is no longer supported");
         }
         case dbUpdate:
-            globalOpCounters.gotUpdateDeprecated();
-            warnDeprecation(*(rec->getOpCtx()->getClient()), networkOpToString(op));
             uasserted(5745705, "OP_UPDATE is no longer supported");
         case dbDelete:
-            globalOpCounters.gotDeleteDeprecated();
-            warnDeprecation(*(rec->getOpCtx()->getClient()), networkOpToString(op));
             uasserted(5745704, "OP_DELETE is no longer supported");
         default:
             MONGO_UNREACHABLE;
@@ -182,9 +165,23 @@ Future<DbResponse> HandleRequest::handleRequest() {
 
 void HandleRequest::onSuccess(const DbResponse& dbResponse) {
     auto opCtx = rec->getOpCtx();
+    const auto currentOp = CurOp::get(opCtx);
+
     // Mark the op as complete, populate the response length, and log it if appropriate.
-    CurOp::get(opCtx)->completeAndLogOperation(
-        opCtx, logv2::LogComponent::kCommand, dbResponse.response.size(), slowMsOverride);
+    currentOp->completeAndLogOperation(
+        logv2::LogComponent::kCommand,
+        CollectionCatalog::get(opCtx)
+            ->getDatabaseProfileSettings(currentOp->getNSS().dbName())
+            .filter,
+        dbResponse.response.size(),
+        slowMsOverride);
+
+    // Update the source of stats shown in the db.serverStatus().opLatencies section.
+    Top::get(opCtx->getServiceContext())
+        .incrementGlobalLatencyStats(
+            opCtx,
+            durationCount<Microseconds>(currentOp->elapsedTimeExcludingPauses()),
+            currentOp->getReadWriteType());
 }
 
 Future<DbResponse> HandleRequest::run() {
@@ -202,10 +199,15 @@ Future<DbResponse> HandleRequest::run() {
     return future;
 }
 
-Future<DbResponse> ServiceEntryPointMongos::handleRequest(OperationContext* opCtx,
-                                                          const Message& message) noexcept {
+Future<DbResponse> ServiceEntryPointMongos::handleRequestImpl(OperationContext* opCtx,
+                                                              const Message& message) noexcept {
     auto hr = std::make_shared<HandleRequest>(opCtx, message);
     return hr->run();
+}
+
+Future<DbResponse> ServiceEntryPointMongos::handleRequest(OperationContext* opCtx,
+                                                          const Message& message) noexcept {
+    return handleRequestImpl(opCtx, message);
 }
 
 void ServiceEntryPointMongos::onClientConnect(Client* client) {
@@ -214,7 +216,7 @@ void ServiceEntryPointMongos::onClientConnect(Client* client) {
     }
 }
 
-void ServiceEntryPointMongos::onClientDisconnect(Client* client) {
+void ServiceEntryPointMongos::derivedOnClientDisconnect(Client* client) {
     if (load_balancer_support::isFromLoadBalancer(client)) {
         _loadBalancedConnections.decrement();
 

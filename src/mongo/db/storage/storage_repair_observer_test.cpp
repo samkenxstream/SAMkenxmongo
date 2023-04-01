@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -37,27 +36,34 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/logv2/log.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+
 namespace mongo {
 namespace {
 
-static const NamespaceString kConfigNss("local.system.replset");
+static const NamespaceString kConfigNss =
+    NamespaceString::createNamespaceString_forTest("local.system.replset");
 static const std::string kRepairIncompleteFileName = "_repair_incomplete";
 
 using boost::filesystem::path;
 
 class StorageRepairObserverTest : public ServiceContextMongoDTest {
 public:
-    StorageRepairObserverTest() : ServiceContextMongoDTest("ephemeralForTest") {
-
+    StorageRepairObserverTest() {
         repl::ReplicationCoordinator::set(
             getServiceContext(),
             std::make_unique<repl::ReplicationCoordinatorMock>(getServiceContext()));
+        repl::StorageInterface::set(getServiceContext(),
+                                    std::make_unique<repl::StorageInterfaceImpl>());
     }
 
     void assertRepairIncompleteOnTearDown() {
@@ -66,13 +72,19 @@ public:
 
     void createMockReplConfig(OperationContext* opCtx) {
         BSONObj replConfig;
-        Lock::DBLock dbLock(opCtx, "local", MODE_X);
-        Helpers::putSingleton(opCtx, "local.system.replset", replConfig);
+        Lock::DBLock dbLock(opCtx, DatabaseName(boost::none, "local"), MODE_X);
+        Helpers::putSingleton(
+            opCtx,
+            NamespaceString::createNamespaceString_forTest(boost::none, "local.system.replset"),
+            replConfig);
     }
 
     void assertReplConfigValid(OperationContext* opCtx, bool valid) {
         BSONObj replConfig;
-        ASSERT(Helpers::getSingleton(opCtx, "local.system.replset", replConfig));
+        ASSERT(Helpers::getSingleton(
+            opCtx,
+            NamespaceString::createNamespaceString_forTest(boost::none, "local.system.replset"),
+            replConfig));
         if (valid) {
             ASSERT(!replConfig.hasField("repaired"));
         } else {
@@ -82,8 +94,11 @@ public:
 
     bool hasReplConfig(OperationContext* opCtx) {
         BSONObj replConfig;
-        Lock::DBLock dbLock(opCtx, "local", MODE_IS);
-        return Helpers::getSingleton(opCtx, "local.system.replset", replConfig);
+        Lock::DBLock dbLock(opCtx, DatabaseName(boost::none, "local"), MODE_IS);
+        return Helpers::getSingleton(
+            opCtx,
+            NamespaceString::createNamespaceString_forTest(boost::none, "local.system.replset"),
+            replConfig);
     }
 
     path repairFilePath() {

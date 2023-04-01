@@ -27,6 +27,7 @@
  *    it in the license file.
  */
 
+#include "mongo/db/exec/sbe/values/util.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/sbe_stage_builder_test_fixture.h"
@@ -301,4 +302,85 @@ TEST_F(SbeValueTest, CompareTwoValueMapTypes) {
     valueMapTypeInequalityComparisonTestGenFn(addMultipleDecimalKeyFn, addObjectKeyFn);
 }
 
+TEST_F(SbeValueTest, ArrayMoveIsDestructive) {
+    // Test that moving one SBE Array into another destroys the contents
+    // of the first one.
+    value::Array arr1;
+    auto pushStr = [](value::Array* arr, StringData str) {
+        auto [t, v] = value::makeBigString(str);
+        arr->push_back(t, v);
+    };
+
+    pushStr(&arr1, "foo");
+    pushStr(&arr1, "bar");
+
+    value::Array arr2 = std::move(arr1);
+
+    // arr1 should not hold dangling pointers to the values now owned by arr2.
+    ASSERT_EQ(arr1.size(), 0);  // NOLINT(bugprone-use-after-move)
+}
+
+TEST_F(SbeValueTest, ArrayForEachMoveIsDestructive) {
+    auto [tag, val] = value::makeNewArray();
+    value::ValueGuard guard{tag, val};
+
+    value::Array& arr1 = *value::getArrayView(val);
+
+    auto pushStr = [](value::Array* arr, StringData str) {
+        auto [t, v] = value::makeBigString(str);
+        arr->push_back(t, v);
+    };
+
+    pushStr(&arr1, "foo");
+    pushStr(&arr1, "bar");
+
+    {
+        auto [elTag, elVal] = arr1.getAt(0);
+        ASSERT_TRUE(value::isString(elTag));
+    }
+    {
+        auto [elTag, elVal] = arr1.getAt(1);
+        ASSERT_TRUE(value::isString(elTag));
+    }
+
+    value::Array arr2;
+    // Move elements from arr1 into arr2.
+    value::arrayForEach<true>(
+        tag, val, [&](value::TypeTags elTag, value::Value elVal) { arr2.push_back(elTag, elVal); });
+
+    ASSERT_EQ(arr1.size(), 0);
+    {
+        auto [elTag, elVal] = arr2.getAt(0);
+        ASSERT_TRUE(value::isString(elTag));
+    }
+    {
+        auto [elTag, elVal] = arr2.getAt(1);
+        ASSERT_TRUE(value::isString(elTag));
+    }
+}
+
+TEST_F(SbeValueTest, ArraySetForEachMoveIsDestructive) {
+    auto [tag, val] = value::makeNewArraySet();
+    value::ValueGuard guard{tag, val};
+
+    value::ArraySet& arr1 = *value::getArraySetView(val);
+
+    auto pushStr = [](value::ArraySet* arr, StringData str) {
+        auto [t, v] = value::makeBigString(str);
+        arr->push_back(t, v);
+    };
+
+    pushStr(&arr1, "foo");
+    pushStr(&arr1, "bar");
+
+    ASSERT_EQ(arr1.size(), 2);
+
+    value::ArraySet arr2;
+    // Move elements from arr1 into arr2.
+    value::arrayForEach<true>(
+        tag, val, [&](value::TypeTags elTag, value::Value elVal) { arr2.push_back(elTag, elVal); });
+
+    ASSERT_EQ(arr1.size(), 0);
+    ASSERT_EQ(arr2.size(), 2);
+}
 }  // namespace mongo::sbe

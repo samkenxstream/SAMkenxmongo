@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
@@ -42,6 +41,9 @@
 #include "mongo/util/cancellation.h"
 #include "mongo/util/fail_point.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
+
+
 namespace mongo {
 namespace {
 
@@ -53,10 +55,13 @@ using TransactionCoordinatorDocument = txn::TransactionCoordinatorDocument;
 MONGO_FAIL_POINT_DEFINE(hangBeforeWaitingForParticipantListWriteConcern);
 MONGO_FAIL_POINT_DEFINE(hangBeforeWaitingForDecisionWriteConcern);
 
-ExecutorFuture<void> waitForMajorityWithHangFailpoint(ServiceContext* service,
-                                                      FailPoint& failpoint,
-                                                      const std::string& failPointName,
-                                                      repl::OpTime opTime) {
+ExecutorFuture<void> waitForMajorityWithHangFailpoint(
+    ServiceContext* service,
+    FailPoint& failpoint,
+    const std::string& failPointName,
+    repl::OpTime opTime,
+    const LogicalSessionId& lsid,
+    const TxnNumberAndRetryCounter& txnNumberAndRetryCounter) {
     auto executor = Grid::get(service)->getExecutorPool()->getFixedExecutor();
     auto waitForWC = [service, executor](repl::OpTime opTime) {
         return WaitForMajorityService::get(service)
@@ -66,7 +71,11 @@ ExecutorFuture<void> waitForMajorityWithHangFailpoint(ServiceContext* service,
 
     if (auto sfp = failpoint.scoped(); MONGO_unlikely(sfp.isActive())) {
         const BSONObj& data = sfp.getData();
-        LOGV2(22445, "Hit {failPointName} failpoint", "failPointName"_attr = failPointName);
+        LOGV2(22445,
+              "Hit {failPointName} failpoint",
+              "failPointName"_attr = failPointName,
+              "lsid"_attr = lsid,
+              "txnNumberAndRetryCounter"_attr = txnNumberAndRetryCounter);
 
         // Run the hang failpoint asynchronously on a different thread to avoid self deadlocks.
         return ExecutorFuture<void>(executor).then(
@@ -117,7 +126,7 @@ TransactionCoordinator::TransactionCoordinator(
                                  LOGV2_DEBUG(5047000,
                                              1,
                                              "TransactionCoordinator deadline reached",
-                                             "sessionId"_attr = _lsid.getId(),
+                                             "sessionId"_attr = _lsid,
                                              "txnNumberAndRetryCounter"_attr =
                                                  _txnNumberAndRetryCounter);
                                  cancelIfCommitNotYetStarted();
@@ -147,7 +156,7 @@ TransactionCoordinator::TransactionCoordinator(
         .then([this] {
             return VectorClockMutable::get(_serviceContext)->waitForDurableTopologyTime();
         })
-        .thenRunOn(Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor())
+        .thenRunOn(_scheduler->getExecutor())
         .then([this] {
             // Persist the participants, unless they have been made durable already (which would
             // only be the case if this coordinator was created as part of step-up recovery).
@@ -177,9 +186,11 @@ TransactionCoordinator::TransactionCoordinator(
                 _serviceContext,
                 hangBeforeWaitingForParticipantListWriteConcern,
                 "hangBeforeWaitingForParticipantListWriteConcern",
-                std::move(opTime));
+                std::move(opTime),
+                _lsid,
+                _txnNumberAndRetryCounter);
         })
-        .thenRunOn(Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor())
+        .thenRunOn(_scheduler->getExecutor())
         .then([this, apiParams] {
             {
                 stdx::lock_guard<Latch> lg(_mutex);
@@ -226,7 +237,7 @@ TransactionCoordinator::TransactionCoordinator(
                             "{sessionId}:{_txnNumberAndRetryCounter} Advancing cluster time to "
                             "the commit timestamp {commitTimestamp}",
                             "Advancing cluster time to the commit timestamp",
-                            "sessionId"_attr = _lsid.getId(),
+                            "sessionId"_attr = _lsid,
                             "txnNumberAndRetryCounter"_attr = _txnNumberAndRetryCounter,
                             "commitTimestamp"_attr = *_decision->getCommitTimestamp());
 
@@ -241,7 +252,7 @@ TransactionCoordinator::TransactionCoordinator(
                 // and convert the internal error code to the public one.
                 LOGV2(5047001,
                       "Transaction coordinator made abort decision",
-                      "sessionId"_attr = lsid.getId(),
+                      "sessionId"_attr = lsid,
                       "txnNumberAndRetryCounter"_attr = txnNumberAndRetryCounter,
                       "status"_attr = redact(status));
                 stdx::lock_guard<Latch> lg(_mutex);
@@ -290,7 +301,9 @@ TransactionCoordinator::TransactionCoordinator(
             return waitForMajorityWithHangFailpoint(_serviceContext,
                                                     hangBeforeWaitingForDecisionWriteConcern,
                                                     "hangBeforeWaitingForDecisionWriteConcern",
-                                                    std::move(opTime));
+                                                    std::move(opTime),
+                                                    _lsid,
+                                                    _txnNumberAndRetryCounter);
         })
         .then([this, apiParams] {
             {
@@ -349,11 +362,7 @@ TransactionCoordinator::TransactionCoordinator(
                     _serviceContext->getPreciseClockSource()->now());
             }
 
-            return txn::deleteCoordinatorDoc(*_scheduler, _lsid, _txnNumberAndRetryCounter)
-                .then([this] {
-                    invariant(!_coordinatorDocRemovalPromise.getFuture().isReady());
-                    _coordinatorDocRemovalPromise.emplaceValue();
-                });
+            return txn::deleteCoordinatorDoc(*_scheduler, _lsid, _txnNumberAndRetryCounter);
         })
         .getAsync([this, deadlineFuture = std::move(deadlineFuture)](Status s) mutable {
             // Interrupt this coordinator's scheduler hierarchy and join the deadline task's future
@@ -431,15 +440,15 @@ void TransactionCoordinator::_done(Status status) {
     // *receiving* node was stepping down.
     if (status == ErrorCodes::TransactionCoordinatorSteppingDown)
         status = Status(ErrorCodes::InterruptedDueToReplStateChange,
-                        str::stream() << "Coordinator " << _lsid.getId() << ':'
-                                      << _txnNumberAndRetryCounter.toBSON()
-                                      << " stopped due to: " << status.reason());
+                        str::stream()
+                            << "Coordinator " << _lsid << ':' << _txnNumberAndRetryCounter.toBSON()
+                            << " stopped due to: " << status.reason());
 
     LOGV2_DEBUG(22447,
                 3,
                 "{sessionId}:{_txnNumberAndRetryCounter} Two-phase commit completed with {status}",
                 "Two-phase commit completed",
-                "sessionId"_attr = _lsid.getId(),
+                "sessionId"_attr = _lsid,
                 "txnNumberAndRetryCounter"_attr = _txnNumberAndRetryCounter,
                 "status"_attr = redact(status));
 
@@ -458,7 +467,7 @@ void TransactionCoordinator::_done(Status status) {
         (shouldLog(logv2::LogComponent::kTransaction, logv2::LogSeverity::Debug(1)) ||
          _transactionCoordinatorMetricsObserver->getSingleTransactionCoordinatorStats()
                  .getTwoPhaseCommitDuration(tickSource, tickSource->getTicks()) >
-             Milliseconds(serverGlobalParams.slowMS))) {
+             Milliseconds(serverGlobalParams.slowMS.load()))) {
         _logSlowTwoPhaseCommit(*_decision);
     }
 
@@ -466,10 +475,6 @@ void TransactionCoordinator::_done(Status status) {
 
     if (!_decisionPromise.getFuture().isReady()) {
         _decisionPromise.setError(status);
-    }
-
-    if (!_coordinatorDocRemovalPromise.getFuture().isReady()) {
-        _coordinatorDocRemovalPromise.setError(status);
     }
 
     if (!status.isOK()) {

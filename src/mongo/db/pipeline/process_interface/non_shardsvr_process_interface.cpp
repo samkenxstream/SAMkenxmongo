@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/pipeline/process_interface/non_shardsvr_process_interface.h"
 
 #include "mongo/db/catalog/create_collection.h"
@@ -36,9 +34,10 @@
 #include "mongo/db/catalog/list_indexes.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_builds_coordinator.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
 
@@ -50,6 +49,17 @@ NonShardServerProcessInterface::attachCursorSourceToPipeline(
     ShardTargetingPolicy shardTargetingPolicy,
     boost::optional<BSONObj> readConcern) {
     return attachCursorSourceToPipelineForLocalRead(ownedPipeline);
+}
+
+std::unique_ptr<Pipeline, PipelineDeleter>
+NonShardServerProcessInterface::attachCursorSourceToPipeline(
+    const AggregateCommandRequest& aggRequest,
+    Pipeline* pipeline,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    boost::optional<BSONObj> shardCursorsSortSpec,
+    ShardTargetingPolicy shardTargetingPolicy,
+    boost::optional<BSONObj> readConcern) {
+    return attachCursorSourceToPipelineForLocalRead(pipeline, aggRequest);
 }
 
 std::list<BSONObj> NonShardServerProcessInterface::getIndexSpecs(OperationContext* opCtx,
@@ -176,21 +186,22 @@ void NonShardServerProcessInterface::createIndexesOnEmptyCollection(
 }
 void NonShardServerProcessInterface::renameIfOptionsAndIndexesHaveNotChanged(
     OperationContext* opCtx,
-    const BSONObj& renameCommandObj,
+    const NamespaceString& sourceNs,
     const NamespaceString& targetNs,
+    bool dropTarget,
+    bool stayTemp,
     const BSONObj& originalCollectionOptions,
     const std::list<BSONObj>& originalIndexes) {
-    NamespaceString sourceNs = NamespaceString(renameCommandObj["renameCollection"].String());
     RenameCollectionOptions options;
-    options.dropTarget = renameCommandObj["dropTarget"].trueValue();
-    options.stayTemp = renameCommandObj["stayTemp"].trueValue();
+    options.dropTarget = dropTarget;
+    options.stayTemp = stayTemp;
     // skip sharding validation on non sharded servers
     doLocalRenameIfOptionsAndIndexesHaveNotChanged(
         opCtx, sourceNs, targetNs, options, originalIndexes, originalCollectionOptions);
 }
 
 void NonShardServerProcessInterface::createCollection(OperationContext* opCtx,
-                                                      const std::string& dbName,
+                                                      const DatabaseName& dbName,
                                                       const BSONObj& cmdObj) {
     uassertStatusOK(mongo::createCollection(opCtx, dbName, cmdObj));
 }

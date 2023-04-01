@@ -53,7 +53,7 @@ public:
     }
 
     virtual Status createRecordStore(OperationContext* opCtx,
-                                     StringData ns,
+                                     const NamespaceString& nss,
                                      StringData ident,
                                      const CollectionOptions& options,
                                      KeyFormat keyFormat = KeyFormat::Long) {
@@ -61,7 +61,7 @@ public:
     }
 
     virtual std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
-                                                        StringData ns,
+                                                        const NamespaceString& nss,
                                                         StringData ident,
                                                         const CollectionOptions& options);
 
@@ -70,6 +70,7 @@ public:
                                                                   KeyFormat keyFormat) override;
 
     virtual Status createSortedDataInterface(OperationContext* opCtx,
+                                             const NamespaceString& nss,
                                              const CollectionOptions& collOptions,
                                              StringData ident,
                                              const IndexDescriptor* desc) {
@@ -82,26 +83,36 @@ public:
 
     virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
         OperationContext* opCtx,
+        const NamespaceString& nss,
         const CollectionOptions& collOptions,
         StringData ident,
         const IndexDescriptor* desc);
 
+    Status createColumnStore(OperationContext* opCtx,
+                             const NamespaceString& ns,
+                             const CollectionOptions& collOptions,
+                             StringData ident,
+                             const IndexDescriptor* desc) override {
+        return Status(ErrorCodes::NotImplemented, "createColumnStore()");
+    }
+
+    std::unique_ptr<ColumnStore> getColumnStore(OperationContext* opCtx,
+                                                const NamespaceString& nss,
+                                                const CollectionOptions& collOptions,
+                                                StringData ident,
+                                                const IndexDescriptor*) override {
+        uasserted(ErrorCodes::NotImplemented, "getColumnStore()");
+    }
+
     virtual Status dropIdent(RecoveryUnit* ru,
                              StringData ident,
-                             StorageEngine::DropIdentCallback&& onDrop) {
+                             const StorageEngine::DropIdentCallback& onDrop) {
         return Status::OK();
     }
 
     virtual void dropIdentForImport(OperationContext* opCtx, StringData ident) {}
 
     virtual bool supportsDirectoryPerDB() const {
-        return false;
-    }
-
-    /**
-     * devnull does no journaling, so don't report the engine as durable.
-     */
-    virtual bool isDurable() const {
         return false;
     }
 

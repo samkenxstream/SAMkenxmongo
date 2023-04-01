@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -37,10 +36,13 @@
 #include "mongo/db/timeseries/timeseries_commands_conversion_helper.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/chunk_manager_targeter.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/cluster_ddl.h"
+#include "mongo/s/collection_routing_info_targeter.h"
 #include "mongo/s/grid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -66,18 +68,28 @@ public:
         return false;
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const final {
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), ActionType::createIndex));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::createIndex)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const final {
         return true;
     }
 
+    bool allowedInTransactions() const final {
+        return true;
+    }
+
     bool runWithRequestParser(OperationContext* opCtx,
-                              const std::string& dbName,
+                              const DatabaseName& dbName,
                               const BSONObj& cmdObj,
                               const RequestParser&,
                               BSONObjBuilder& output) final {
@@ -86,12 +98,13 @@ public:
                     1,
                     "createIndexes: {namespace} cmd: {command}",
                     "CMD: createIndexes",
-                    "namespace"_attr = nss,
+                    logAttrs(nss),
                     "command"_attr = redact(cmdObj));
 
-        cluster::createDatabase(opCtx, dbName);
+        // TODO SERVER-67798 Change cluster::createDatabase to use DatabaseName
+        cluster::createDatabase(opCtx, dbName.toStringWithTenantId());
 
-        auto targeter = ChunkManagerTargeter(opCtx, nss);
+        auto targeter = CollectionRoutingInfoTargeter(opCtx, nss);
         auto routingInfo = targeter.getRoutingInfo();
         auto cmdToBeSent = cmdObj;
         if (targeter.timeseriesNamespaceNeedsRewrite(nss)) {
@@ -117,7 +130,7 @@ public:
         CommandHelpers::appendSimpleCommandStatus(output, ok, errmsg);
 
         if (ok) {
-            LOGV2(5706400, "Indexes created", "namespace"_attr = nss);
+            LOGV2(5706400, "Indexes created", logAttrs(nss));
         }
 
         return ok;
@@ -130,7 +143,7 @@ public:
      * 'code' & 'codeName' are permitted in either scenario, but non-zero 'code' indicates "not ok".
      */
     void validateResult(const BSONObj& result) final {
-        auto ctx = IDLParserErrorContext("createIndexesReply");
+        auto ctx = IDLParserContext("createIndexesReply");
         if (checkIsErrorStatus(result, ctx)) {
             return;
         }
@@ -149,7 +162,7 @@ public:
             return;
         }
 
-        auto rawCtx = IDLParserErrorContext(kRawFieldName, &ctx);
+        auto rawCtx = IDLParserContext(kRawFieldName, &ctx);
         for (const auto& element : rawData.Obj()) {
             if (!rawCtx.checkAndAssertType(element, Object)) {
                 return;

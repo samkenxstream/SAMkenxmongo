@@ -72,7 +72,7 @@ public:
         void doCheckAuthorization(OperationContext*) const final {}
 
         NamespaceString ns() const final {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
 
         ListDatabasesReply typedRun(OperationContext* opCtx) final {
@@ -90,8 +90,8 @@ public:
                 if (authDB) {
                     uassert(ErrorCodes::Unauthorized,
                             "Insufficient permissions to list all databases",
-                            authDB.get() || mayListAllDatabases);
-                    return authDB.get();
+                            authDB.value() || mayListAllDatabases);
+                    return authDB.value();
                 }
 
                 // By default, list all databases if we can, otherwise
@@ -104,19 +104,23 @@ public:
             std::map<std::string, long long> sizes;
             std::map<std::string, std::unique_ptr<BSONObjBuilder>> dbShardInfo;
 
-            auto shardIds = shardRegistry->getAllShardIdsNoReload();
-            shardIds.emplace_back(ShardId::kConfigServerId);
+            auto shardIds = shardRegistry->getAllShardIds(opCtx);
+            if (std::find(shardIds.begin(), shardIds.end(), ShardId::kConfigServerId) ==
+                shardIds.end()) {
+                // The config server may be a shard, so only add if it isn't already in shardIds.
+                shardIds.emplace_back(ShardId::kConfigServerId);
+            }
 
             // { filter: matchExpression }.
             auto filteredCmd = applyReadWriteConcern(
                 opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmd.toBSON({})));
 
             for (const ShardId& shardId : shardIds) {
-                const auto shardStatus = shardRegistry->getShard(opCtx, shardId);
+                auto shardStatus = shardRegistry->getShard(opCtx, shardId);
                 if (!shardStatus.isOK()) {
                     continue;
                 }
-                const auto s = shardStatus.getValue();
+                const auto s = std::move(shardStatus.getValue());
 
                 auto response = uassertStatusOK(
                     s->runCommandWithFixedRetryAttempts(opCtx,
@@ -135,11 +139,6 @@ public:
 
                     // If this is the admin db, only collect its stats from the config servers.
                     if (name == "admin" && !s->isConfig()) {
-                        continue;
-                    }
-
-                    // We don't collect config server info for dbs other than "admin" and "config".
-                    if (s->isConfig() && name != "config" && name != "admin") {
                         continue;
                     }
 
@@ -172,7 +171,7 @@ public:
                 const long long size = sizeEntry.second;
 
                 // Skip the local database, since all shards have their own independent local
-                if (name == NamespaceString::kLocalDb)
+                if (name == DatabaseName::kLocal.db())
                     continue;
 
                 if (authorizedDatabases && !as->isAuthorizedForAnyActionOnAnyResourceInDB(name)) {

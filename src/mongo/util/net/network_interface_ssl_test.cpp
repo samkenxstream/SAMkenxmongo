@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -40,6 +39,9 @@
 #include "mongo/unittest/integration_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/ssl_options.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace executor {
@@ -58,7 +60,8 @@ public:
         NetworkInterfaceIntegrationFixture::setUp();
 
         // Setup an internal user so that we can use it for external auth
-        auto user = std::make_shared<UserHandle>(User(UserName("__system", "local")));
+        UserRequest systemLocal(UserName("__system"_sd, "local"_sd), boost::none);
+        auto user = std::make_shared<UserHandle>(User(systemLocal));
 
         internalSecurity.setUser(user);
 

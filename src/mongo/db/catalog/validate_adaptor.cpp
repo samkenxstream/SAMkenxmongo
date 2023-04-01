@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -36,13 +35,17 @@
 #include <fmt/format.h>
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/util/bson_extract.h"
+#include "mongo/bson/util/bsoncolumn.h"
 #include "mongo/db/catalog/clustered_collection_util.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/column_index_consistency.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_consistency.h"
 #include "mongo/db/catalog/throttle_cursor.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/index/columns_access_method.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/wildcard_access_method.h"
@@ -50,24 +53,39 @@
 #include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id_helpers.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/storage/execution_context.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/timeseries/bucket_catalog/flat_bson.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
+#include "mongo/db/timeseries/timeseries_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/object_check.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/testing_proctor.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+
 namespace mongo {
 
 namespace {
 
-MONGO_FAIL_POINT_DEFINE(crashOnMultikeyValidateFailure);
-
 // Set limit for size of corrupted records that will be reported.
 const long long kMaxErrorSizeBytes = 1 * 1024 * 1024;
-const long long kInterruptIntervalNumRecords = 4096;
 const long long kInterruptIntervalNumBytes = 50 * 1024 * 1024;  // 50MB.
+
+static constexpr const char* kSchemaValidationFailedReason =
+    "Detected one or more documents not compliant with the collection's schema. Check logs for log "
+    "id 5363500.";
+static constexpr const char* kTimeseriesValidationInconsistencyReason =
+    "Detected one or more documents in this collection incompatible with time-series "
+    "specifications. For more info, see logs with log id 6698300.";
+static constexpr const char* kBSONValidationNonConformantReason =
+    "Detected one or more documents in this collection not conformant to BSON specifications. For "
+    "more info, see logs with log id 6825900";
 
 /**
  * Validate that for each record in a clustered RecordStore the record key (RecordId) matches the
@@ -102,21 +120,447 @@ void _validateClusteredCollectionRecordId(OperationContext* opCtx,
     }
 }
 
+void schemaValidationFailed(CollectionValidation::ValidateState* state,
+                            Collection::SchemaValidationResult result,
+                            ValidateResults* results) {
+    invariant(Collection::SchemaValidationResult::kPass != result);
+
+    if (state->isCollectionSchemaViolated()) {
+        // Only report the message once.
+        return;
+    }
+
+    state->setCollectionSchemaViolated();
+
+    // When testing is enabled, only warn about non-compliant documents to prevent test failures.
+    if (TestingProctor::instance().isEnabled() ||
+        Collection::SchemaValidationResult::kWarn == result) {
+        results->warnings.push_back(kSchemaValidationFailedReason);
+    } else if (Collection::SchemaValidationResult::kError == result) {
+        results->errors.push_back(kSchemaValidationFailedReason);
+        results->valid = false;
+    }
+}
+
+// Checks that 'control.count' matches the actual number of measurements in a closed bucket.
+Status _validateTimeseriesCount(const BSONObj& control, int bucketCount, int version) {
+    if (version == 1) {
+        return Status::OK();
+    }
+    long long controlCount;
+    if (Status status = bsonExtractIntegerField(
+            control, timeseries::kBucketControlCountFieldName, &controlCount);
+        !status.isOK()) {
+        return status;
+    }
+    if (controlCount != bucketCount) {
+        return Status(ErrorCodes::BadValue,
+                      fmt::format("The 'control.count' field ({}) does not match the actual number "
+                                  "of measurements in the document ({}).",
+                                  controlCount,
+                                  bucketCount));
+    }
+    return Status::OK();
+}
+
+// Checks if the embedded timestamp in the bucket id field matches that in the 'control.min' field.
+Status _validateTimeSeriesIdTimestamp(const CollectionPtr& collection, const BSONObj& recordBson) {
+    // Compares both timestamps measured in seconds.
+    int64_t minTimestamp = recordBson.getField(timeseries::kBucketControlFieldName)
+                               .Obj()
+                               .getField(timeseries::kBucketControlMinFieldName)
+                               .Obj()
+                               .getField(collection->getTimeseriesOptions()->getTimeField())
+                               .timestamp()
+                               .asInt64() /
+        1000;
+    int64_t oidEmbeddedTimestamp =
+        recordBson.getField(timeseries::kBucketIdFieldName).OID().getTimestamp();
+    if (minTimestamp != oidEmbeddedTimestamp) {
+        return Status(
+            ErrorCodes::InvalidIdField,
+            fmt::format("Mismatch between the embedded timestamp {} in the time-series "
+                        "bucket '_id' field and the timestamp {} in 'control.min' field.",
+                        Date_t::fromMillisSinceEpoch(oidEmbeddedTimestamp * 1000).toString(),
+                        Date_t::fromMillisSinceEpoch(minTimestamp * 1000).toString()));
+    }
+    return Status::OK();
+}
+
+/**
+ * Checks the value of the bucket's version.
+ */
+Status _validateTimeseriesControlVersion(const BSONObj& recordBson, int bucketVersion) {
+    if (bucketVersion != 1 && bucketVersion != 2) {
+        return Status(
+            ErrorCodes::BadValue,
+            fmt::format("Invalid value for 'control.version'. Expected 1 or 2, but got {}.",
+                        bucketVersion));
+    }
+    return Status::OK();
+}
+
+/**
+ * Checks if the bucket's version matches the types of 'data' fields.
+ */
+Status _validateTimeseriesDataFieldTypes(const BSONElement& dataField, int bucketVersion) {
+    auto dataType = bucketVersion == 1 ? BSONType::Object : BSONType::BinData;
+    // Checks that open buckets have 'Object' type and closed buckets have 'BinData Column' type.
+    auto isCorrectType = [&](BSONElement el) {
+        if (bucketVersion == 1) {
+            return el.type() == BSONType::Object;
+        } else {
+            return el.type() == BSONType::BinData && el.binDataType() == BinDataType::Column;
+        }
+    };
+
+    if (!isCorrectType(dataField)) {
+        return Status(ErrorCodes::TypeMismatch,
+                      fmt::format("Mismatch between time-series schema version and data field "
+                                  "type. Expected type {}, but got {}.",
+                                  mongo::typeName(dataType),
+                                  mongo::typeName(dataField.type())));
+    }
+    return Status::OK();
+}
+
+/**
+ * Checks whether the min and max values between 'control' and 'data' match, taking timestamp
+ * granularity into account.
+ */
+Status _validateTimeSeriesMinMax(const CollectionPtr& coll,
+                                 timeseries::bucket_catalog::MinMax& minmax,
+                                 const BSONElement& controlMin,
+                                 const BSONElement& controlMax,
+                                 StringData fieldName) {
+    auto min = minmax.min();
+    auto max = minmax.max();
+    auto checkMinAndMaxMatch = [&]() {
+        const auto options = coll->getTimeseriesOptions().value();
+        if (fieldName == options.getTimeField()) {
+            return controlMin.Date() ==
+                timeseries::roundTimestampToGranularity(min.getField(fieldName).Date(), options) &&
+                controlMax.Date() == max.getField(fieldName).Date();
+        } else {
+            return controlMin.wrap().woCompare(min) == 0 && controlMax.wrap().woCompare(max) == 0;
+        }
+    };
+
+    if (!checkMinAndMaxMatch()) {
+        return Status(
+            ErrorCodes::BadValue,
+            fmt::format(
+                "Mismatch between time-series control and observed min or max for field {}. "
+                "Control had min {} and max {}, but observed data had min {} and max {}.",
+                fieldName,
+                controlMin.toString(),
+                controlMax.toString(),
+                min.toString(),
+                max.toString()));
+    }
+
+    return Status::OK();
+}
+
+/**
+ * Attempts to parse the field name to integer.
+ */
+int _idxInt(StringData idx) {
+    try {
+        auto idxInt = std::stoi(idx.toString());
+        return idxInt;
+    } catch (const std::invalid_argument&) {
+        return INT_MIN;
+    }
+}
+
+/**
+ * Validates the indexes of the time field in the data field of a bucket. Checks the min and max
+ * values match the ones in 'control' field. Counts the number of measurements.
+ */
+Status _validateTimeSeriesDataTimeField(const CollectionPtr& coll,
+                                        const BSONElement& timeField,
+                                        const BSONElement& controlMin,
+                                        const BSONElement& controlMax,
+                                        StringData fieldName,
+                                        int version,
+                                        int* bucketCount) {
+    timeseries::bucket_catalog::MinMax minmax;
+    if (version == 1) {
+        for (const auto& metric : timeField.Obj()) {
+            if (metric.type() != BSONType::Date) {
+                return Status(ErrorCodes::BadValue,
+                              fmt::format("Time-series bucket {} field is not a Date", fieldName));
+            }
+            // Checks that indices are consecutively increasing numbers starting from 0.
+            if (auto idx = _idxInt(metric.fieldNameStringData()); idx != *bucketCount) {
+                return Status(ErrorCodes::BadValue,
+                              fmt::format("The index '{}' in time-series bucket data field '{}' is "
+                                          "not consecutively increasing from '0'",
+                                          metric.fieldNameStringData(),
+                                          fieldName));
+            }
+            minmax.update(metric.wrap(fieldName), boost::none, coll->getDefaultCollator());
+            ++(*bucketCount);
+        }
+    } else {
+        BSONColumn col{timeField};
+        Date_t prevTimestamp = Date_t::min();
+        for (const auto& metric : col) {
+            if (!metric.eoo()) {
+                if (metric.type() != BSONType::Date) {
+                    return Status(
+                        ErrorCodes::BadValue,
+                        fmt::format("Time-series bucket '{}' field is not a Date", fieldName));
+                }
+                // Checks the time values are sorted in increasing order for compressed buckets.
+                Date_t curTimestamp = metric.Date();
+                if (curTimestamp >= prevTimestamp) {
+                    prevTimestamp = curTimestamp;
+                } else {
+                    return Status(
+                        ErrorCodes::BadValue,
+                        fmt::format("Time-series bucket '{}' field is not in ascending order",
+                                    fieldName));
+                }
+                minmax.update(metric.wrap(fieldName), boost::none, coll->getDefaultCollator());
+                ++(*bucketCount);
+            } else {
+                return Status(ErrorCodes::BadValue, "Time-series bucket has missing time fields");
+            }
+        }
+    }
+
+    if (Status status = _validateTimeSeriesMinMax(coll, minmax, controlMin, controlMax, fieldName);
+        !status.isOK()) {
+        return status;
+    }
+
+    return Status::OK();
+}
+
+/**
+ * Validates the indexes of the data measurement fields of a bucket. Checks the min and max values
+ * match the ones in 'control' field.
+ */
+Status _validateTimeSeriesDataField(const CollectionPtr& coll,
+                                    const BSONElement& dataField,
+                                    const BSONElement& controlMin,
+                                    const BSONElement& controlMax,
+                                    StringData fieldName,
+                                    int version,
+                                    int bucketCount) {
+    timeseries::bucket_catalog::MinMax minmax;
+    if (version == 1) {
+        // Checks that indices are in increasing order and within the correct range.
+        int prevIdx = INT_MIN;
+        for (const auto& metric : dataField.Obj()) {
+            auto idx = _idxInt(metric.fieldNameStringData());
+            if (idx <= prevIdx) {
+                return Status(ErrorCodes::BadValue,
+                              fmt::format("The index '{}' in time-series bucket data field '{}' is "
+                                          "not in increasing order",
+                                          metric.fieldNameStringData(),
+                                          fieldName));
+            }
+            if (idx > bucketCount) {
+                return Status(ErrorCodes::BadValue,
+                              fmt::format("The index '{}' in time-series bucket data field '{}' is "
+                                          "out of range",
+                                          metric.fieldNameStringData(),
+                                          fieldName));
+            }
+            if (idx < 0) {
+                return Status(ErrorCodes::BadValue,
+                              fmt::format("The index '{}' in time-series bucket data field '{}' is "
+                                          "negative or non-numerical",
+                                          metric.fieldNameStringData(),
+                                          fieldName));
+            }
+            minmax.update(metric.wrap(fieldName), boost::none, coll->getDefaultCollator());
+            prevIdx = idx;
+        }
+    } else {
+        BSONColumn col{dataField};
+        for (const auto& metric : col) {
+            if (!metric.eoo()) {
+                minmax.update(metric.wrap(fieldName), boost::none, coll->getDefaultCollator());
+            }
+        }
+    }
+
+    if (Status status = _validateTimeSeriesMinMax(coll, minmax, controlMin, controlMax, fieldName);
+        !status.isOK()) {
+        return status;
+    }
+
+    return Status::OK();
+}
+
+Status _validateTimeSeriesDataFields(const CollectionPtr& coll,
+                                     const BSONObj& recordBson,
+                                     int bucketVersion) {
+    BSONObj data = recordBson.getField(timeseries::kBucketDataFieldName).Obj();
+    BSONObj control = recordBson.getField(timeseries::kBucketControlFieldName).Obj();
+    BSONObj controlMin = control.getField(timeseries::kBucketControlMinFieldName).Obj();
+    BSONObj controlMax = control.getField(timeseries::kBucketControlMaxFieldName).Obj();
+
+    // Builds a hash map for the fields to avoid repeated traversals.
+    auto buildFieldTable = [&](StringMap<BSONElement>* table, const BSONObj& fields) {
+        for (const auto& field : fields) {
+            table->insert({field.fieldNameStringData().toString(), field});
+        }
+    };
+
+    StringMap<BSONElement> dataFields;
+    StringMap<BSONElement> controlMinFields;
+    StringMap<BSONElement> controlMaxFields;
+    buildFieldTable(&dataFields, data);
+    buildFieldTable(&controlMinFields, controlMin);
+    buildFieldTable(&controlMaxFields, controlMax);
+
+    // Checks that the number of 'control.min' and 'control.max' fields agrees with number of 'data'
+    // fields.
+    if (dataFields.size() != controlMinFields.size() ||
+        controlMinFields.size() != controlMaxFields.size()) {
+        return Status(
+            ErrorCodes::BadValue,
+            fmt::format("Mismatch between the number of time-series control fields and the number "
+                        "of data fields. Control had {} min fields and {} max fields, but observed "
+                        "data had {} fields.",
+                        controlMinFields.size(),
+                        controlMaxFields.size(),
+                        dataFields.size()));
+    };
+
+    // Validates the time field.
+    int bucketCount = 0;
+    auto timeFieldName = coll->getTimeseriesOptions().value().getTimeField().toString();
+    if (Status status = _validateTimeseriesDataFieldTypes(dataFields[timeFieldName], bucketVersion);
+        !status.isOK()) {
+        return status;
+    }
+
+    if (Status status = _validateTimeSeriesDataTimeField(coll,
+                                                         dataFields[timeFieldName],
+                                                         controlMinFields[timeFieldName],
+                                                         controlMaxFields[timeFieldName],
+                                                         timeFieldName,
+                                                         bucketVersion,
+                                                         &bucketCount);
+        !status.isOK()) {
+        return status;
+    }
+
+    if (Status status = _validateTimeseriesCount(control, bucketCount, bucketVersion);
+        !status.isOK()) {
+        return status;
+    }
+
+    // Validates the other fields.
+    for (const auto& [fieldName, dataField] : dataFields) {
+        if (fieldName != timeFieldName) {
+            if (Status status =
+                    _validateTimeseriesDataFieldTypes(dataFields[fieldName], bucketVersion);
+                !status.isOK()) {
+                return status;
+            }
+
+            if (Status status = _validateTimeSeriesDataField(coll,
+                                                             dataFields[fieldName],
+                                                             controlMinFields[fieldName],
+                                                             controlMaxFields[fieldName],
+                                                             fieldName,
+                                                             bucketVersion,
+                                                             bucketCount);
+                !status.isOK()) {
+                return status;
+            }
+        }
+    }
+
+    return Status::OK();
+}
+
+/**
+ * Validates the consistency of a time-series bucket.
+ */
+Status _validateTimeSeriesBucketRecord(const CollectionPtr& collection,
+                                       const BSONObj& recordBson,
+                                       ValidateResults* results) {
+    int bucketVersion = recordBson.getField(timeseries::kBucketControlFieldName)
+                            .Obj()
+                            .getIntField(timeseries::kBucketControlVersionFieldName);
+
+    if (Status status = _validateTimeSeriesIdTimestamp(collection, recordBson); !status.isOK()) {
+        return status;
+    }
+
+    if (Status status = _validateTimeseriesControlVersion(recordBson, bucketVersion);
+        !status.isOK()) {
+        return status;
+    }
+
+    if (Status status = _validateTimeSeriesDataFields(collection, recordBson, bucketVersion);
+        !status.isOK()) {
+        return status;
+    }
+
+    return Status::OK();
+}
+
+
+void _timeseriesValidationFailed(CollectionValidation::ValidateState* state,
+                                 ValidateResults* results) {
+    if (state->isTimeseriesDataInconsistent()) {
+        // Only report the warning message once.
+        return;
+    }
+    state->setTimeseriesDataInconsistent();
+
+    results->warnings.push_back(kTimeseriesValidationInconsistencyReason);
+}
+
+void _BSONSpecValidationFailed(CollectionValidation::ValidateState* state,
+                               ValidateResults* results) {
+    if (state->isBSONDataNonConformant()) {
+        // Only report the warning message once.
+        return;
+    }
+    state->setBSONDataNonConformant();
+
+    results->warnings.push_back(kBSONValidationNonConformantReason);
+}
 }  // namespace
 
 Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
                                        const RecordId& recordId,
                                        const RecordData& record,
+                                       long long* nNonCompliantDocuments,
                                        size_t* dataSize,
                                        ValidateResults* results) {
-    const Status status = validateBSON(record.data(), record.size());
-    if (!status.isOK())
-        return status;
+    auto validateBSONMode = BSONValidateMode::kDefault;
+    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        feature_flags::gExtendValidateCommand.isEnabled(serverGlobalParams.featureCompatibility)) {
+        validateBSONMode = _validateState->getBSONValidateMode();
+    }
+    const Status status = validateBSON(record.data(), record.size(), validateBSONMode);
+    if (!status.isOK()) {
+        if (status.code() != ErrorCodes::NonConformantBSON) {
+            return status;
+        }
+        LOGV2_WARNING(6825900,
+                      "Document is not conformant to BSON specifications",
+                      "recordId"_attr = recordId,
+                      "reason"_attr = status);
+        (*nNonCompliantDocuments)++;
+        _BSONSpecValidationFailed(_validateState, results);
+    }
 
     BSONObj recordBson = record.toBson();
     *dataSize = recordBson.objsize();
 
-    if (MONGO_unlikely(_validateState->extraLoggingForTest())) {
+    if (MONGO_unlikely(_validateState->logDiagnostics())) {
         LOGV2(4666601, "[validate]", "recordId"_attr = recordId, "recordData"_attr = recordBson);
     }
 
@@ -130,363 +574,17 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
                                              results);
     }
 
-    auto& executionCtx = StorageExecutionContext::get(opCtx);
     SharedBufferFragmentBuilder pool(KeyString::HeapBuilder::kHeapAllocatorDefaultBytes);
 
     for (const auto& index : _validateState->getIndexes()) {
         const IndexDescriptor* descriptor = index->descriptor();
-        auto iam = index->accessMethod()->asSortedData();
-
         if (descriptor->isPartial() && !index->getFilterExpression()->matchesBSON(recordBson))
             continue;
 
-        auto documentKeySet = executionCtx.keys();
-        auto multikeyMetadataKeys = executionCtx.multikeyMetadataKeys();
-        auto documentMultikeyPaths = executionCtx.multikeyPaths();
 
-        iam->getKeys(opCtx,
-                     coll,
-                     pool,
-                     recordBson,
-                     InsertDeleteOptions::ConstraintEnforcementMode::kEnforceConstraints,
-                     SortedDataIndexAccessMethod::GetKeysContext::kAddingKeys,
-                     documentKeySet.get(),
-                     multikeyMetadataKeys.get(),
-                     documentMultikeyPaths.get(),
-                     recordId);
-
-        bool shouldBeMultikey = iam->shouldMarkIndexAsMultikey(
-            documentKeySet->size(),
-            {multikeyMetadataKeys->begin(), multikeyMetadataKeys->end()},
-            *documentMultikeyPaths);
-
-        if (!index->isMultikey(opCtx, coll) && shouldBeMultikey) {
-            if (_validateState->fixErrors()) {
-                writeConflictRetry(opCtx, "setIndexAsMultikey", coll->ns().ns(), [&] {
-                    WriteUnitOfWork wuow(opCtx);
-                    coll->getIndexCatalog()->setMultikeyPaths(
-                        opCtx, coll, descriptor, *multikeyMetadataKeys, *documentMultikeyPaths);
-                    wuow.commit();
-                });
-
-                LOGV2(4614700,
-                      "Index set to multikey",
-                      "indexName"_attr = descriptor->indexName(),
-                      "collection"_attr = coll->ns().ns());
-                results->warnings.push_back(str::stream() << "Index " << descriptor->indexName()
-                                                          << " set to multikey.");
-                results->repaired = true;
-            } else {
-                auto& curRecordResults = (results->indexResultsMap)[descriptor->indexName()];
-                std::string msg = str::stream() << "Index " << descriptor->indexName()
-                                                << " is not multikey but has more than one"
-                                                << " key in document " << recordId;
-                curRecordResults.errors.push_back(msg);
-                curRecordResults.valid = false;
-                if (crashOnMultikeyValidateFailure.shouldFail()) {
-                    invariant(false, msg);
-                }
-            }
-        }
-
-        if (index->isMultikey(opCtx, coll)) {
-            const MultikeyPaths& indexPaths = index->getMultikeyPaths(opCtx, coll);
-            if (!MultikeyPathTracker::covers(indexPaths, *documentMultikeyPaths.get())) {
-                if (_validateState->fixErrors()) {
-                    writeConflictRetry(opCtx, "increaseMultikeyPathCoverage", coll->ns().ns(), [&] {
-                        WriteUnitOfWork wuow(opCtx);
-                        coll->getIndexCatalog()->setMultikeyPaths(
-                            opCtx, coll, descriptor, *multikeyMetadataKeys, *documentMultikeyPaths);
-                        wuow.commit();
-                    });
-
-                    LOGV2(4614701,
-                          "Multikey paths updated to cover multikey document",
-                          "indexName"_attr = descriptor->indexName(),
-                          "collection"_attr = coll->ns().ns());
-                    results->warnings.push_back(str::stream() << "Index " << descriptor->indexName()
-                                                              << " multikey paths updated.");
-                    results->repaired = true;
-                } else {
-                    std::string msg = str::stream()
-                        << "Index " << descriptor->indexName()
-                        << " multikey paths do not cover a document. RecordId: " << recordId;
-                    auto& curRecordResults = (results->indexResultsMap)[descriptor->indexName()];
-                    curRecordResults.errors.push_back(msg);
-                    curRecordResults.valid = false;
-                }
-            }
-        }
-
-        IndexInfo& indexInfo = _indexConsistency->getIndexInfo(descriptor->indexName());
-        if (shouldBeMultikey) {
-            indexInfo.multikeyDocs = true;
-        }
-
-        // An empty set of multikey paths indicates that this index does not track path-level
-        // multikey information and we should do no tracking.
-        if (shouldBeMultikey && documentMultikeyPaths->size()) {
-            _indexConsistency->addDocumentMultikeyPaths(&indexInfo, *documentMultikeyPaths);
-        }
-
-        for (const auto& keyString : *multikeyMetadataKeys) {
-            try {
-                _indexConsistency->addMultikeyMetadataPath(keyString, &indexInfo);
-            } catch (...) {
-                return exceptionToStatus();
-            }
-        }
-
-        for (const auto& keyString : *documentKeySet) {
-            try {
-                _totalIndexKeys++;
-                _indexConsistency->addDocKey(opCtx, keyString, &indexInfo, recordId);
-            } catch (...) {
-                return exceptionToStatus();
-            }
-        }
+        this->traverseRecord(opCtx, coll, index.get(), recordId, recordBson, results);
     }
-    return status;
-}
-
-namespace {
-// Ensures that index entries are in increasing or decreasing order.
-void _validateKeyOrder(OperationContext* opCtx,
-                       const IndexCatalogEntry* index,
-                       const KeyString::Value& currKey,
-                       const KeyString::Value& prevKey,
-                       IndexValidateResults* results) {
-    auto descriptor = index->descriptor();
-    bool unique = descriptor->unique();
-
-    // KeyStrings will be in strictly increasing order because all keys are sorted and they are in
-    // the format (Key, RID), and all RecordIDs are unique.
-    if (currKey.compare(prevKey) <= 0) {
-        if (results && results->valid) {
-            results->errors.push_back(str::stream()
-                                      << "index '" << descriptor->indexName()
-                                      << "' is not in strictly ascending or descending order");
-        }
-        if (results) {
-            results->valid = false;
-        }
-        return;
-    }
-
-    if (unique) {
-        // Unique indexes must not have duplicate keys.
-        int cmp = currKey.compareWithoutRecordIdLong(prevKey);
-        if (cmp != 0) {
-            return;
-        }
-
-        if (results && results->valid) {
-            auto bsonKey = KeyString::toBson(currKey, Ordering::make(descriptor->keyPattern()));
-            auto firstRecordId =
-                KeyString::decodeRecordIdLongAtEnd(prevKey.getBuffer(), prevKey.getSize());
-            auto secondRecordId =
-                KeyString::decodeRecordIdLongAtEnd(currKey.getBuffer(), currKey.getSize());
-            results->errors.push_back(str::stream() << "Unique index '" << descriptor->indexName()
-                                                    << "' has duplicate key: " << bsonKey
-                                                    << ", first record: " << firstRecordId
-                                                    << ", second record: " << secondRecordId);
-        }
-        if (results) {
-            results->valid = false;
-        }
-    }
-}
-}  // namespace
-
-void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
-                                    const IndexCatalogEntry* index,
-                                    int64_t* numTraversedKeys,
-                                    ValidateResults* results) {
-    const IndexDescriptor* descriptor = index->descriptor();
-    auto indexName = descriptor->indexName();
-    auto& indexResults = results->indexResultsMap[indexName];
-    IndexInfo& indexInfo = _indexConsistency->getIndexInfo(indexName);
-    int64_t numKeys = 0;
-
-    bool isFirstEntry = true;
-
-    // The progress meter will be inactive after traversing the record store to allow the message
-    // and the total to be set to different values.
-    if (!_progress->isActive()) {
-        const char* curopMessage = "Validate: scanning index entries";
-        stdx::unique_lock<Client> lk(*opCtx->getClient());
-        _progress.set(CurOp::get(opCtx)->setProgress_inlock(curopMessage, _totalIndexKeys));
-    }
-
-    const KeyString::Version version =
-        index->accessMethod()->asSortedData()->getSortedDataInterface()->getKeyStringVersion();
-
-    KeyString::Builder firstKeyStringBuilder(
-        version, BSONObj(), indexInfo.ord, KeyString::Discriminator::kExclusiveBefore);
-    KeyString::Value firstKeyString = firstKeyStringBuilder.getValueCopy();
-    KeyString::Value prevIndexKeyStringValue;
-
-    // Ensure that this index has an open index cursor.
-    const auto indexCursorIt = _validateState->getIndexCursors().find(indexName);
-    invariant(indexCursorIt != _validateState->getIndexCursors().end());
-
-    const std::unique_ptr<SortedDataInterfaceThrottleCursor>& indexCursor = indexCursorIt->second;
-
-    boost::optional<KeyStringEntry> indexEntry;
-    try {
-        indexEntry = indexCursor->seekForKeyString(opCtx, firstKeyString);
-    } catch (const DBException& ex) {
-        if (TestingProctor::instance().isEnabled() && ex.code() != ErrorCodes::WriteConflict) {
-            LOGV2_FATAL(5318400,
-                        "Error seeking to first key",
-                        "error"_attr = ex.toString(),
-                        "index"_attr = indexName,
-                        "key"_attr = firstKeyString.toString());
-        }
-        throw;
-    }
-
-    const auto keyFormat =
-        index->accessMethod()->asSortedData()->getSortedDataInterface()->rsKeyFormat();
-    const RecordId kWildcardMultikeyMetadataRecordId = record_id_helpers::reservedIdFor(
-        record_id_helpers::ReservationId::kWildcardMultikeyMetadataId, keyFormat);
-
-    // Warn about unique indexes with keys in old format (without record id).
-    bool foundOldUniqueIndexKeys = false;
-
-    while (indexEntry) {
-        if (!isFirstEntry) {
-            _validateKeyOrder(
-                opCtx, index, indexEntry->keyString, prevIndexKeyStringValue, &indexResults);
-        }
-
-        if (!foundOldUniqueIndexKeys && !descriptor->isIdIndex() && descriptor->unique() &&
-            !indexCursor->isRecordIdAtEndOfKeyString()) {
-            results->warnings.push_back(
-                fmt::format("Unique index {} has one or more keys in the old format (without "
-                            "embedded record id). First record: {}",
-                            indexInfo.indexName,
-                            indexEntry->loc.toString()));
-            foundOldUniqueIndexKeys = true;
-        }
-
-        bool isMetadataKey = indexEntry->loc == kWildcardMultikeyMetadataRecordId;
-        if (descriptor->getIndexType() == IndexType::INDEX_WILDCARD && isMetadataKey) {
-            _indexConsistency->removeMultikeyMetadataPath(indexEntry->keyString, &indexInfo);
-        } else {
-            try {
-                _indexConsistency->addIndexKey(
-                    opCtx, indexEntry->keyString, &indexInfo, indexEntry->loc, results);
-            } catch (const DBException& e) {
-                StringBuilder ss;
-                ss << "Parsing index key for " << indexInfo.indexName << " recId "
-                   << indexEntry->loc << " threw exception " << e.toString();
-                results->errors.push_back(ss.str());
-                results->valid = false;
-            }
-        }
-
-        _progress->hit();
-        numKeys++;
-        isFirstEntry = false;
-        prevIndexKeyStringValue = indexEntry->keyString;
-
-        if (numKeys % kInterruptIntervalNumRecords == 0) {
-            // Periodically checks for interrupts and yields.
-            opCtx->checkForInterrupt();
-            _validateState->yield(opCtx);
-        }
-
-        try {
-            indexEntry = indexCursor->nextKeyString(opCtx);
-        } catch (const DBException& ex) {
-            if (TestingProctor::instance().isEnabled() && ex.code() != ErrorCodes::WriteConflict) {
-                LOGV2_FATAL(5318401,
-                            "Error advancing index cursor",
-                            "error"_attr = ex.toString(),
-                            "index"_attr = indexName,
-                            "prevKey"_attr = prevIndexKeyStringValue.toString());
-            }
-            throw;
-        }
-    }
-
-    if (results && _indexConsistency->getMultikeyMetadataPathCount(&indexInfo) > 0) {
-        results->errors.push_back(str::stream()
-                                  << "Index '" << descriptor->indexName()
-                                  << "' has one or more missing multikey metadata index keys");
-        results->valid = false;
-    }
-
-    // Adjust multikey metadata when allowed. These states are all allowed by the design of
-    // multikey. A collection should still be valid without these adjustments.
-    if (_validateState->adjustMultikey()) {
-
-        // If this collection has documents that make this index multikey, then check whether those
-        // multikey paths match the index's metadata.
-        auto indexPaths = index->getMultikeyPaths(opCtx, _validateState->getCollection());
-        auto& documentPaths = indexInfo.docMultikeyPaths;
-        if (indexInfo.multikeyDocs && documentPaths != indexPaths) {
-            LOGV2(5367500,
-                  "Index's multikey paths do not match those of its documents",
-                  "index"_attr = descriptor->indexName(),
-                  "indexPaths"_attr = MultikeyPathTracker::dumpMultikeyPaths(indexPaths),
-                  "documentPaths"_attr = MultikeyPathTracker::dumpMultikeyPaths(documentPaths));
-
-            // Since we have the correct multikey path information for this index, we can tighten up
-            // its metadata to improve query performance. This may apply in two distinct scenarios:
-            // 1. Collection data has changed such that the current multikey paths on the index
-            // are too permissive and certain document paths are no longer multikey.
-            // 2. This index was built before 3.4, and there is no multikey path information for
-            // the index. We can effectively 'upgrade' the index so that it does not need to be
-            // rebuilt to update this information.
-            writeConflictRetry(opCtx, "updateMultikeyPaths", _validateState->nss().ns(), [&]() {
-                WriteUnitOfWork wuow(opCtx);
-                auto writeableIndex = const_cast<IndexCatalogEntry*>(index);
-                const bool isMultikey = true;
-                writeableIndex->forceSetMultikey(
-                    opCtx, _validateState->getCollection(), isMultikey, documentPaths);
-                wuow.commit();
-            });
-
-            if (results) {
-                results->warnings.push_back(str::stream() << "Updated index multikey metadata"
-                                                          << ": " << descriptor->indexName());
-                results->repaired = true;
-            }
-        }
-
-        // If this index does not need to be multikey, then unset the flag.
-        if (index->isMultikey(opCtx, _validateState->getCollection()) && !indexInfo.multikeyDocs) {
-            invariant(!indexInfo.docMultikeyPaths.size());
-
-            LOGV2(5367501,
-                  "Index is multikey but there are no multikey documents",
-                  "index"_attr = descriptor->indexName());
-
-            // This makes an improvement in the case that no documents make the index multikey and
-            // the flag can be unset entirely. This may be due to a change in the data or historical
-            // multikey bugs that have persisted incorrect multikey infomation.
-            writeConflictRetry(opCtx, "unsetMultikeyPaths", _validateState->nss().ns(), [&]() {
-                WriteUnitOfWork wuow(opCtx);
-                auto writeableIndex = const_cast<IndexCatalogEntry*>(index);
-                const bool isMultikey = false;
-                writeableIndex->forceSetMultikey(
-                    opCtx, _validateState->getCollection(), isMultikey, {});
-                wuow.commit();
-            });
-
-            if (results) {
-                results->warnings.push_back(str::stream() << "Unset index multikey metadata"
-                                                          << ": " << descriptor->indexName());
-                results->repaired = true;
-            }
-        }
-    }
-
-    if (numTraversedKeys) {
-        *numTraversedKeys = numKeys;
-    }
+    return Status::OK();
 }
 
 void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
@@ -496,29 +594,37 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
     long long dataSizeTotal = 0;
     long long interruptIntervalNumBytes = 0;
     long long nInvalid = 0;
+    long long nNonCompliantDocuments = 0;
     long long numCorruptRecordsSizeBytes = 0;
 
     ON_BLOCK_EXIT([&]() {
         output->appendNumber("nInvalidDocuments", nInvalid);
+        output->appendNumber("nNonCompliantDocuments", nNonCompliantDocuments);
         output->appendNumber("nrecords", _numRecords);
-        _progress->finished();
+        {
+            stdx::unique_lock<Client> lk(*opCtx->getClient());
+            _progress.get(lk)->finished();
+        }
     });
 
     RecordId prevRecordId;
 
     // In case validation occurs twice and the progress meter persists after index traversal
-    if (_progress.get() && _progress->isActive()) {
-        _progress->finished();
+    if (_progress.get(WithLock::withoutLock()) &&
+        _progress.get(WithLock::withoutLock())->isActive()) {
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        _progress.get(lk)->finished();
     }
 
     // Because the progress meter is intended as an approximation, it's sufficient to get the number
     // of records when we begin traversing, even if this number may deviate from the final number.
+    const auto& coll = _validateState->getCollection();
     const char* curopMessage = "Validate: scanning documents";
-    const auto totalRecords = _validateState->getCollection()->getRecordStore()->numRecords(opCtx);
-    const auto rs = _validateState->getCollection()->getRecordStore();
+    const auto totalRecords = coll->getRecordStore()->numRecords(opCtx);
+    const auto rs = coll->getRecordStore();
     {
         stdx::unique_lock<Client> lk(*opCtx->getClient());
-        _progress.set(CurOp::get(opCtx)->setProgress_inlock(curopMessage, totalRecords));
+        _progress.set(lk, CurOp::get(opCtx)->setProgress_inlock(curopMessage, totalRecords), opCtx);
     }
 
     if (_validateState->getFirstRecordId().isNull()) {
@@ -533,18 +639,17 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
              traverseRecordStoreCursor->seekExact(opCtx, _validateState->getFirstRecordId());
          record;
          record = traverseRecordStoreCursor->next(opCtx)) {
-        _progress->hit();
+        {
+            stdx::unique_lock<Client> lk(*opCtx->getClient());
+            _progress.get(lk)->hit();
+        }
         ++_numRecords;
         auto dataSize = record->data.size();
         interruptIntervalNumBytes += dataSize;
         dataSizeTotal += dataSize;
         size_t validatedSize = 0;
-        Status status = validateRecord(opCtx, record->id, record->data, &validatedSize, results);
-
-        // RecordStores are required to return records in RecordId order.
-        if (prevRecordId.isValid()) {
-            invariant(prevRecordId < record->id);
-        }
+        Status status = validateRecord(
+            opCtx, record->id, record->data, &nNonCompliantDocuments, &validatedSize, results);
 
         // validatedSize = dataSize is not a general requirement as some storage engines may use
         // padding, but we still require that they return the unpadded record data.
@@ -594,26 +699,41 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
             // If the document is not corrupted, validate the document against this collection's
             // schema validator. Don't treat invalid documents as errors since documents can bypass
             // document validation when being inserted or updated.
-            status = _validateState->getCollection()->checkValidation(opCtx, record->data.toBson());
-            if (!status.isOK()) {
+            auto result = coll->checkValidation(opCtx, record->data.toBson());
+
+            if (result.first != Collection::SchemaValidationResult::kPass) {
                 LOGV2_WARNING(5363500,
                               "Document is not compliant with the collection's schema",
-                              logAttrs(_validateState->getCollection()->ns()),
+                              logAttrs(coll->ns()),
                               "recordId"_attr = record->id,
-                              "reason"_attr = status);
+                              "reason"_attr = result.second);
 
-                if (!_validateState->isCollectionSchemaViolated()) {
-                    _validateState->setCollectionSchemaViolated();
-                    results->warnings.push_back(
-                        "Detected one or more documents not compliant with the collection's "
-                        "schema. See logs.");
+                nNonCompliantDocuments++;
+                schemaValidationFailed(_validateState, result.first, results);
+            } else if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+                       feature_flags::gExtendValidateCommand.isEnabled(
+                           serverGlobalParams.featureCompatibility) &&
+                       coll->getTimeseriesOptions()) {
+                // Checks for time-series collection consistency.
+                Status bucketStatus =
+                    _validateTimeSeriesBucketRecord(coll, record->data.toBson(), results);
+                // This log id should be kept in sync with the associated warning messages that are
+                // returned to the client.
+                if (!bucketStatus.isOK()) {
+                    LOGV2_WARNING(6698300,
+                                  "Document is not compliant with time-series specifications",
+                                  logAttrs(coll->ns()),
+                                  "recordId"_attr = record->id,
+                                  "reason"_attr = bucketStatus);
+                    nNonCompliantDocuments++;
+                    _timeseriesValidationFailed(_validateState, results);
                 }
             }
         }
 
         prevRecordId = record->id;
 
-        if (_numRecords % kInterruptIntervalNumRecords == 0 ||
+        if (_numRecords % IndexConsistency::kInterruptIntervalNumRecords == 0 ||
             interruptIntervalNumBytes >= kInterruptIntervalNumBytes) {
             // Periodically checks for interrupts and yields.
             opCtx->checkForInterrupt();
@@ -630,95 +750,105 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
                                                   << " invalid documents.");
     }
 
-    const auto fastCount = _validateState->getCollection()->numRecords(opCtx);
+    const auto fastCount = coll->numRecords(opCtx);
     if (_validateState->shouldEnforceFastCount() && fastCount != _numRecords) {
-        results->errors.push_back(str::stream() << "fast count (" << fastCount
-                                                << ") does not match number of records ("
-                                                << _numRecords << ") for collection '"
-                                                << _validateState->getCollection()->ns() << "'");
+        results->errors.push_back(
+            str::stream() << "fast count (" << fastCount << ") does not match number of records ("
+                          << _numRecords << ") for collection '" << coll->ns() << "'");
         results->valid = false;
     }
 
     // Do not update the record store stats if we're in the background as we've validated a
     // checkpoint and it may not have the most up-to-date changes.
     if (results->valid && !_validateState->isBackground()) {
-        _validateState->getCollection()->getRecordStore()->updateStatsAfterRepair(
-            opCtx, _numRecords, dataSizeTotal);
+        coll->getRecordStore()->updateStatsAfterRepair(opCtx, _numRecords, dataSizeTotal);
     }
+}
+
+bool isColumnStoreIndex(const IndexCatalogEntry* index) {
+    return index->descriptor()->getAccessMethodName() == IndexNames::COLUMN;
 }
 
 void ValidateAdaptor::validateIndexKeyCount(OperationContext* opCtx,
                                             const IndexCatalogEntry* index,
                                             IndexValidateResults& results) {
-    // Fetch the total number of index entries we previously found traversing the index.
-    const IndexDescriptor* desc = index->descriptor();
-    const std::string indexName = desc->indexName();
-    IndexInfo* indexInfo = &_indexConsistency->getIndexInfo(indexName);
-    auto numTotalKeys = indexInfo->numKeys;
-
-    // Update numRecords by subtracting number of records removed from record store in repair mode
-    // when validating index consistency
-    _numRecords -= results.keysRemovedFromRecordStore;
-
-    // Do not fail on finding too few index entries compared to collection entries when full:false.
-    bool hasTooFewKeys = false;
-    bool noErrorOnTooFewKeys = !_validateState->isFullIndexValidation();
-
-    if (desc->isIdIndex() && numTotalKeys != _numRecords) {
-        hasTooFewKeys = (numTotalKeys < _numRecords);
-        std::string msg = str::stream()
-            << "number of _id index entries (" << numTotalKeys
-            << ") does not match the number of documents in the index (" << _numRecords << ")";
-        if (noErrorOnTooFewKeys && (numTotalKeys < _numRecords)) {
-            results.warnings.push_back(msg);
-        } else {
-            results.errors.push_back(msg);
-            results.valid = false;
-        }
-    }
-
-    // Hashed indexes may never be multikey.
-    if (desc->getAccessMethodName() == IndexNames::HASHED &&
-        index->isMultikey(opCtx, _validateState->getCollection())) {
-        results.errors.push_back(str::stream() << "Hashed index is incorrectly marked multikey: "
-                                               << desc->indexName());
-        results.valid = false;
-    }
-
-    // Confirm that the number of index entries is not greater than the number of documents in the
-    // collection. This check is only valid for indexes that are not multikey (indexed arrays
-    // produce an index key per array entry) and not $** indexes which can produce index keys for
-    // multiple paths within a single document.
-    if (results.valid && !index->isMultikey(opCtx, _validateState->getCollection()) &&
-        desc->getIndexType() != IndexType::INDEX_WILDCARD && numTotalKeys > _numRecords) {
-        std::string err = str::stream()
-            << "index " << desc->indexName() << " is not multi-key, but has more entries ("
-            << numTotalKeys << ") than documents in the index (" << _numRecords << ")";
-        results.errors.push_back(err);
-        results.valid = false;
-    }
-
-    // Ignore any indexes with a special access method. If an access method name is given, the
-    // index may be a full text, geo or special index plugin with different semantics.
-    if (results.valid && !desc->isSparse() && !desc->isPartial() && !desc->isIdIndex() &&
-        desc->getAccessMethodName() == "" && numTotalKeys < _numRecords) {
-        hasTooFewKeys = true;
-        std::string msg = str::stream()
-            << "index " << desc->indexName() << " is not sparse or partial, but has fewer entries ("
-            << numTotalKeys << ") than documents in the index (" << _numRecords << ")";
-        if (noErrorOnTooFewKeys) {
-            results.warnings.push_back(msg);
-        } else {
-            results.errors.push_back(msg);
-            results.valid = false;
-        }
-    }
-
-    if (!_validateState->isFullIndexValidation() && hasTooFewKeys) {
-        std::string warning = str::stream()
-            << "index " << desc->indexName() << " has fewer keys than records."
-            << " Please re-run the validate command with {full: true}";
-        results.warnings.push_back(warning);
+    if (isColumnStoreIndex(index)) {
+        _columnIndexConsistency.validateIndexKeyCount(opCtx, index, &_numRecords, results);
+    } else {
+        _keyBasedIndexConsistency.validateIndexKeyCount(opCtx, index, &_numRecords, results);
     }
 }
+
+void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
+                                    const IndexCatalogEntry* index,
+                                    int64_t* numTraversedKeys,
+                                    ValidateResults* results) {
+    // The progress meter will be inactive after traversing the record store to allow the message
+    // and the total to be set to different values.
+    if (!_progress.get(WithLock::withoutLock())->isActive()) {
+        const char* curopMessage = "Validate: scanning index entries";
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        _progress.set(lk,
+                      CurOp::get(opCtx)->setProgress_inlock(
+                          curopMessage,
+                          isColumnStoreIndex(index)
+                              ? _columnIndexConsistency.getTotalIndexKeys()
+                              : _keyBasedIndexConsistency.getTotalIndexKeys()),
+                      opCtx);
+    }
+
+    int64_t numKeys = 0;
+    if (isColumnStoreIndex(index)) {
+        numKeys += _columnIndexConsistency.traverseIndex(opCtx, index, _progress, results);
+    } else {
+        numKeys += _keyBasedIndexConsistency.traverseIndex(opCtx, index, _progress, results);
+    }
+
+    if (numTraversedKeys) {
+        *numTraversedKeys = numKeys;
+    }
+}
+
+void ValidateAdaptor::traverseRecord(OperationContext* opCtx,
+                                     const CollectionPtr& coll,
+                                     const IndexCatalogEntry* index,
+                                     const RecordId& recordId,
+                                     const BSONObj& record,
+                                     ValidateResults* results) {
+    if (isColumnStoreIndex(index)) {
+        _columnIndexConsistency.traverseRecord(opCtx, coll, index, recordId, record, results);
+    } else {
+        _keyBasedIndexConsistency.traverseRecord(opCtx, coll, index, recordId, record, results);
+    }
+}
+
+void ValidateAdaptor::setSecondPhase() {
+    _columnIndexConsistency.setSecondPhase();
+    _keyBasedIndexConsistency.setSecondPhase();
+}
+
+bool ValidateAdaptor::limitMemoryUsageForSecondPhase(ValidateResults* result) {
+    bool retVal = true;
+    retVal &= _columnIndexConsistency.limitMemoryUsageForSecondPhase(result);
+    retVal &= _keyBasedIndexConsistency.limitMemoryUsageForSecondPhase(result);
+    return retVal;
+}
+
+bool ValidateAdaptor::haveEntryMismatch() const {
+    bool retVal = false;
+    retVal |= _columnIndexConsistency.haveEntryMismatch();
+    retVal |= _keyBasedIndexConsistency.haveEntryMismatch();
+    return retVal;
+}
+
+void ValidateAdaptor::repairIndexEntries(OperationContext* opCtx, ValidateResults* results) {
+    _columnIndexConsistency.repairIndexEntries(opCtx, results);
+    _keyBasedIndexConsistency.repairIndexEntries(opCtx, results);
+}
+
+void ValidateAdaptor::addIndexEntryErrors(OperationContext* opCtx, ValidateResults* results) {
+    _columnIndexConsistency.addIndexEntryErrors(opCtx, results);
+    _keyBasedIndexConsistency.addIndexEntryErrors(opCtx, results);
+}
+
 }  // namespace mongo

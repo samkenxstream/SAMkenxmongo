@@ -51,7 +51,7 @@ class TaskExecutor;
 class ShardingCatalogClientImpl final : public ShardingCatalogClient {
 
 public:
-    ShardingCatalogClientImpl();
+    ShardingCatalogClientImpl(std::shared_ptr<Shard> overrideConfigShard);
     virtual ~ShardingCatalogClientImpl();
 
     /*
@@ -59,10 +59,16 @@ public:
      * writing a document to the "config.collections" collection with the catalog information
      * described by "coll."
      */
-    static Status updateShardingCatalogEntryForCollection(OperationContext* opCtx,
-                                                          const NamespaceString& nss,
-                                                          const CollectionType& coll,
-                                                          bool upsert);
+    Status updateShardingCatalogEntryForCollection(OperationContext* opCtx,
+                                                   const NamespaceString& nss,
+                                                   const CollectionType& coll,
+                                                   bool upsert);
+
+    std::vector<BSONObj> runCatalogAggregation(
+        OperationContext* opCtx,
+        AggregateCommandRequest& aggRequest,
+        const repl::ReadConcernArgs& readConcern,
+        const Milliseconds& maxTimeout = Shard::kDefaultConfigCommandTimeout) override;
 
     DatabaseType getDatabase(OperationContext* opCtx,
                              StringData db,
@@ -82,10 +88,13 @@ public:
 
     std::vector<CollectionType> getCollections(OperationContext* opCtx,
                                                StringData db,
-                                               repl::ReadConcernLevel readConcernLevel) override;
+                                               repl::ReadConcernLevel readConcernLevel,
+                                               const BSONObj& sort) override;
 
-    std::vector<NamespaceString> getAllShardedCollectionsForDb(
-        OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) override;
+    std::vector<NamespaceString> getAllShardedCollectionsForDb(OperationContext* opCtx,
+                                                               StringData dbName,
+                                                               repl::ReadConcernLevel readConcern,
+                                                               const BSONObj& sort) override;
 
     StatusWith<std::vector<std::string>> getDatabasesForShard(OperationContext* opCtx,
                                                               const ShardId& shardName) override;
@@ -107,8 +116,16 @@ public:
         const ChunkVersion& sinceVersion,
         const repl::ReadConcernArgs& readConcern) override;
 
+    std::pair<CollectionType, std::vector<IndexCatalogType>>
+    getCollectionAndShardingIndexCatalogEntries(OperationContext* opCtx,
+                                                const NamespaceString& nss,
+                                                const repl::ReadConcernArgs& readConcern) override;
+
     StatusWith<std::vector<TagsType>> getTagsForCollection(OperationContext* opCtx,
                                                            const NamespaceString& nss) override;
+
+    std::vector<NamespaceString> getAllNssThatHaveZonesForDatabase(
+        OperationContext* opCtx, const StringData& dbName) override;
 
     StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
         OperationContext* opCtx, repl::ReadConcernLevel readConcern) override;
@@ -124,15 +141,6 @@ public:
                                       const BSONObj& cmdObj,
                                       BSONObjBuilder* result) override;
 
-    Status applyChunkOpsDeprecated(OperationContext* opCtx,
-                                   const BSONArray& updateOps,
-                                   const BSONArray& preCondition,
-                                   const UUID& uuid,
-                                   const NamespaceString& nss,
-                                   const ChunkVersion& lastChunkVersion,
-                                   const WriteConcernOptions& writeConcern,
-                                   repl::ReadConcernLevel readConcern) override;
-
     StatusWith<BSONObj> getGlobalSettings(OperationContext* opCtx, StringData key) override;
 
     StatusWith<VersionType> getConfigVersion(OperationContext* opCtx,
@@ -142,11 +150,6 @@ public:
                                 const NamespaceString& nss,
                                 const BSONObj& doc,
                                 const WriteConcernOptions& writeConcern) override;
-
-    void insertConfigDocumentsAsRetryableWrite(OperationContext* opCtx,
-                                               const NamespaceString& nss,
-                                               std::vector<BSONObj> docs,
-                                               const WriteConcernOptions& writeConcern) override;
 
     StatusWith<bool> updateConfigDocument(OperationContext* opCtx,
                                           const NamespaceString& nss,
@@ -175,6 +178,45 @@ public:
         const LogicalTime& newerThanThis,
         repl::ReadConcernLevel readConcernLevel) override;
 
+
+    /*
+        * Return all shards that used to own data for the collection at the given clusterTime.
+        * The result should be either:
+            1. The list of shards if the collection was sharded
+            2. A list 1 element containing only the primary shard if the collection was unsharded,
+        dropped or renamed.
+            3. An empty array if the collection and the database are not found
+        * In case at least one of the shard is no longer active, a SnapshotTooOld error is thrown.
+    */
+    HistoricalPlacement getShardsThatOwnDataForCollAtClusterTime(
+        OperationContext* opCtx,
+        const NamespaceString& collName,
+        const Timestamp& clusterTime) override;
+
+    /*
+        * Return all shards that used to own data for the database at the given clusterTime.
+        * The result is
+            1. a vector of unique shardids
+            2. An empty array if the collection and the database are not found
+        * In case at least one of the shard is no longer active, a SnapshotTooOld error is thrown.
+    */
+    HistoricalPlacement getShardsThatOwnDataForDbAtClusterTime(
+        OperationContext* opCtx,
+        const NamespaceString& dbName,
+        const Timestamp& clusterTime) override;
+
+    /**
+     * Returns the list of active shards that still contains data or that used to contain data
+     * at clusterTime >= input clusterTime based on placementHistory
+     */
+    HistoricalPlacement getShardsThatOwnDataAtClusterTime(OperationContext* opCtx,
+                                                          const Timestamp& clusterTime) override;
+
+    HistoricalPlacement getHistoricalPlacement(
+        OperationContext* opCtx,
+        const Timestamp& atClusterTime,
+        const boost::optional<NamespaceString>& nss) override;
+
 private:
     /**
      * Updates a single document (if useMultiUpdate is false) or multiple documents (if
@@ -189,13 +231,13 @@ private:
      * was upserted or it existed and any of the fields changed) and false otherwise (basically
      * returns whether the update command's response update.n value is > 0).
      */
-    static StatusWith<bool> _updateConfigDocument(OperationContext* opCtx,
-                                                  const NamespaceString& nss,
-                                                  const BSONObj& query,
-                                                  const BSONObj& update,
-                                                  bool upsert,
-                                                  const WriteConcernOptions& writeConcern,
-                                                  Milliseconds maxTimeMs);
+    StatusWith<bool> _updateConfigDocument(OperationContext* opCtx,
+                                           const NamespaceString& nss,
+                                           const BSONObj& query,
+                                           const BSONObj& update,
+                                           bool upsert,
+                                           const WriteConcernOptions& writeConcern,
+                                           Milliseconds maxTimeMs);
 
     StatusWith<repl::OpTimeWith<std::vector<BSONObj>>> _exhaustiveFindOnConfig(
         OperationContext* opCtx,
@@ -216,6 +258,26 @@ private:
         const std::string& dbName,
         const ReadPreferenceSetting& readPref,
         repl::ReadConcernLevel readConcernLevel);
+
+    /**
+     * Queries the config server to retrieve placement data based on the Request object.
+     * TODO (SERVER-73029): Remove the method - and replace its invocations with
+     * runPlacementHistoryAggregation()
+     */
+    HistoricalPlacement _fetchPlacementMetadata(OperationContext* opCtx,
+                                                ConfigsvrGetHistoricalPlacement&& request);
+
+
+    /**
+     * Returns the Shard type that should be used to access the config server. Unless an instance
+     * was provided at construction, which may be done e.g. to force using local operations, falls
+     * back to using the config shard from the ShardRegistry.
+     */
+    std::shared_ptr<Shard> _getConfigShard(OperationContext* opCtx);
+
+    // If set, this is used as the config shard by all methods. Be careful to only use an instance
+    // that is always valid, like a ShardLocal.
+    std::shared_ptr<Shard> _overrideConfigShard;
 };
 
 }  // namespace mongo

@@ -32,10 +32,12 @@
 #include "mongo/db/keys_collection_client_direct.h"
 #include "mongo/db/keys_collection_manager.h"
 #include "mongo/db/logical_time_validator.h"
-#include "mongo/db/op_observer_impl.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/op_observer/oplog_writer_mock.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/s/sharding_mongod_test_fixture.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/util/clock_source_mock.h"
@@ -50,13 +52,14 @@ namespace {
  */
 class VectorClockMongoDTest : public ShardingMongodTestFixture {
 protected:
+    VectorClockMongoDTest()
+        : ShardingMongodTestFixture(Options{}.useMockClock(true), false /* setUpMajorityReads */) {}
+
     void setUp() override {
         ShardingMongodTestFixture::setUp();
 
-        auto clockSource = std::make_unique<ClockSourceMock>();
-        getServiceContext()->setFastClockSource(std::move(clockSource));
-
-        auto keysCollectionClient = std::make_unique<KeysCollectionClientDirect>();
+        auto keysCollectionClient = std::make_unique<KeysCollectionClientDirect>(
+            !getServiceContext()->getStorageEngine()->supportsReadConcernMajority());
 
         VectorClockMutable::get(getServiceContext())
             ->tickClusterTimeTo(LogicalTime(Timestamp(1, 0)));
@@ -66,6 +69,9 @@ protected:
         auto validator = std::make_unique<LogicalTimeValidator>(_keyManager);
         validator->init(getServiceContext());
         LogicalTimeValidator::set(getServiceContext(), std::move(validator));
+
+        // Ensure that this node is neither "config server" nor "shard server".
+        serverGlobalParams.clusterRole = ClusterRole::None;
     }
 
     void tearDown() override {
@@ -84,7 +90,8 @@ protected:
     void setupOpObservers() override {
         auto opObserverRegistry =
             checked_cast<OpObserverRegistry*>(getServiceContext()->getOpObserver());
-        opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
+        opObserverRegistry->addObserver(
+            std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterMock>()));
     }
 
 private:

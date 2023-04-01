@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/db/server_options_server_helpers.h"
 
@@ -37,6 +36,7 @@
 #include <boost/algorithm/string/trim.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/operations.hpp>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <ios>
 #include <iostream>
@@ -59,6 +59,9 @@
 #include "mongo/util/options_parser/options_parser.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 using std::endl;
 using std::string;
@@ -110,6 +113,34 @@ Status setParsedOpts(const moe::Environment& params) {
     serverGlobalParams.parsedOpts = params.toBSON();
     cmdline_utils::censorBSONObj(&serverGlobalParams.parsedOpts);
     return Status::OK();
+}
+
+bool shouldFork(const moe::Environment& params) {
+    auto paramYes = [](const moe::Environment& params, const std::string& key) {
+        return params.count(key) && params[key].as<bool>();
+    };
+
+    auto envVarYes = [](const std::string& envKey) {
+        auto envVal = getenv(envKey.c_str());
+        return envVal && std::string{envVal} == "1";
+    };
+
+    if (paramYes(params, "shutdown")) {
+        return false;
+    }
+
+    if (envVarYes("MONGODB_CONFIG_OVERRIDE_NOFORK")) {
+        LOGV2(7484500,
+              "Environment variable MONGODB_CONFIG_OVERRIDE_NOFORK == 1, "
+              "overriding \"processManagement.fork\" to false");
+        return false;
+    }
+
+    if (paramYes(params, "processManagement.fork")) {
+        return true;
+    }
+
+    return false;
 }
 }  // namespace
 
@@ -358,10 +389,11 @@ Status storeServerOptions(const moe::Environment& params) {
                 serverGlobalParams.bind_ips.emplace_back("::");
             }
         } else {
-            boost::split(serverGlobalParams.bind_ips,
-                         bind_ip,
-                         [](char c) { return c == ','; },
-                         boost::token_compress_on);
+            boost::split(
+                serverGlobalParams.bind_ips,
+                bind_ip,
+                [](char c) { return c == ','; },
+                boost::token_compress_on);
         }
     }
 
@@ -381,10 +413,7 @@ Status storeServerOptions(const moe::Environment& params) {
         serverGlobalParams.unixSocketPermissions =
             params["net.unixDomainSocket.filePermissions"].as<int>();
     }
-
-    if ((params.count("processManagement.fork") &&
-         params["processManagement.fork"].as<bool>() == true) &&
-        (!params.count("shutdown") || params["shutdown"].as<bool>() == false)) {
+    if (shouldFork(params)) {
         serverGlobalParams.doFork = true;
     }
 #endif  // _WIN32

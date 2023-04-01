@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -36,13 +35,17 @@
 #include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+
 namespace mongo {
 namespace {
 
 class ImplicitCollectionCreationTest : public ShardServerTestFixture {};
 
 TEST_F(ImplicitCollectionCreationTest, ImplicitCreateDisallowedByDefault) {
-    NamespaceString nss("ImplicitCreateDisallowedByDefaultDB.TestColl");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(
+        "ImplicitCreateDisallowedByDefaultDB.TestColl");
     AutoGetCollection autoColl(operationContext(), nss, MODE_IX);
     auto db = autoColl.ensureDbExists(operationContext());
     WriteUnitOfWork wuow(operationContext());
@@ -54,7 +57,8 @@ TEST_F(ImplicitCollectionCreationTest, ImplicitCreateDisallowedByDefault) {
 }
 
 TEST_F(ImplicitCollectionCreationTest, AllowImplicitCollectionCreate) {
-    NamespaceString nss("AllowImplicitCollectionCreateDB.TestColl");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest("AllowImplicitCollectionCreateDB.TestColl");
     OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
         operationContext());
     AutoGetCollection autoColl(operationContext(), nss, MODE_IX);

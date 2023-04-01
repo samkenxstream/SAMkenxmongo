@@ -98,11 +98,11 @@ struct CollectionScanParams {
     bool tailable = false;
 
     // Assert that the specified timestamp has not fallen off the oplog on a forward scan.
-    boost::optional<Timestamp> assertTsHasNotFallenOffOplog = boost::none;
+    boost::optional<Timestamp> assertTsHasNotFallenOff = boost::none;
 
-    // Should we keep track of the timestamp of the latest oplog entry we've seen? This information
-    // is needed to merge cursors from the oplog in order of operation time when reading the oplog
-    // across a sharded cluster.
+    // Should we keep track of the timestamp of the latest oplog or change collection entry we've
+    // seen? This information is needed to merge cursors from the oplog in order of operation time
+    // when reading the oplog across a sharded cluster.
     bool shouldTrackLatestOplogTimestamp = false;
 
     // Once the first matching document is found, assume that all documents after it must match.
@@ -111,6 +111,13 @@ struct CollectionScanParams {
 
     // Whether or not to wait for oplog visibility on oplog collection scans.
     bool shouldWaitForOplogVisibility = false;
+
+    // Whether or not to return EOF and stop further scanning once MatchExpression evaluates to
+    // false. Can only be set to true if the MatchExpression is present.
+    bool shouldReturnEofOnFilterMismatch = false;
+
+    // Whether the collection scan should have low storage admission priority.
+    bool lowPriority = false;
 };
 
 }  // namespace mongo

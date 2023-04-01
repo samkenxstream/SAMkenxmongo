@@ -1,7 +1,9 @@
 /**
  * Tests parallel transactions with createCollections.
  *
+ * The test runs commands that are not allowed with security token: endSession.
  * @tags: [
+ *   not_allowed_with_security_token,
  *   uses_transactions,
  * ]
  */
@@ -10,6 +12,7 @@
 
 load("jstests/libs/create_collection_txn_helpers.js");
 load("jstests/libs/auto_retry_transaction_in_sharding.js");
+load("jstests/libs/feature_flag_util.js");
 
 const dbName = 'test_txns_create_collection_parallel';
 
@@ -63,11 +66,23 @@ function runParallelCollectionCreateTest(command, explicitCreate) {
     session.commitTransaction();
     assert.eq(sessionColl.find({}).itcount(), 1);
 
-    assert.commandFailedWithCode(secondSessionDB.runCommand({create: collName}),
-                                 ErrorCodes.NamespaceExists);
+    // TODO SERVER-67289: Remove feature flag check.
+    if (FeatureFlagUtil.isPresentAndEnabled(db, "PointInTimeCatalogLookups")) {
+        // create cannot observe the collection created in the other transaction so the command
+        // will succeed and we will instead throw WCE when trying to commit the transaction.
+        retryOnceOnTransientAndRestartTxnOnMongos(secondSession, () => {
+            assert.commandWorked(secondSessionDB.runCommand({create: collName}));
+        }, {writeConcern: {w: "majority"}});
 
-    assert.commandFailedWithCode(secondSession.abortTransaction_forTesting(),
-                                 ErrorCodes.NoSuchTransaction);
+        assert.commandFailedWithCode(secondSession.commitTransaction_forTesting(),
+                                     ErrorCodes.WriteConflict);
+    } else {
+        assert.commandFailedWithCode(secondSessionDB.runCommand({create: collName}),
+                                     ErrorCodes.NamespaceExists);
+
+        assert.commandFailedWithCode(secondSession.abortTransaction_forTesting(),
+                                     ErrorCodes.NoSuchTransaction);
+    }
 
     assert.eq(distinctSessionColl.find({}).itcount(), 0);
     sessionColl.drop({writeConcern: {w: "majority"}});

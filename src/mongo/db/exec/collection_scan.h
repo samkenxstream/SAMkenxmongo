@@ -58,13 +58,6 @@ public:
                    WorkingSet* workingSet,
                    const MatchExpression* filter);
 
-    CollectionScan(ExpressionContext* expCtx,
-                   const CollectionPtr& collection,
-                   const CollectionScanParams& params,
-                   WorkingSet* workingSet,
-                   const MatchExpression* filter,
-                   bool relaxCappedConstraints);
-
     StageState doWork(WorkingSetID* out) final;
     bool isEOF() final;
 
@@ -98,6 +91,10 @@ public:
 
     const SpecificStats* getSpecificStats() const final;
 
+    CollectionScanParams::Direction getDirection() const {
+        return _params.direction;
+    }
+
 protected:
     void doSaveStateRequiresCollection() final;
 
@@ -111,6 +108,12 @@ private:
     StageState returnIfMatches(WorkingSetMember* member, WorkingSetID memberID, WorkingSetID* out);
 
     /**
+     * Sets '_latestOplogEntryTimestamp' to the current read timestamp, if available. This is
+     * equivalent to the latest visible timestamp in the oplog.
+     */
+    void setLatestOplogEntryTimestampToReadTimestamp();
+
+    /**
      * Extracts the timestamp from the 'ts' field of 'record', and sets '_latestOplogEntryTimestamp'
      * to that time if it isn't already greater. Throws an exception if the 'ts' field cannot be
      * extracted.
@@ -120,7 +123,7 @@ private:
     /**
      * Asserts that the minimum timestamp in the query filter has not already fallen off the oplog.
      */
-    void assertTsHasNotFallenOffOplog(const Record& record);
+    void assertTsHasNotFallenOff(const Record& record);
 
     // WorkingSet is not owned by us.
     WorkingSet* _workingSet;
@@ -134,9 +137,12 @@ private:
 
     RecordId _lastSeenId;  // Null if nothing has been returned from _cursor yet.
 
-    // If _params.shouldTrackLatestOplogTimestamp is set and the collection is the oplog, the latest
-    // timestamp seen in the collection.  Otherwise, this is a null timestamp.
+    // If _params.shouldTrackLatestOplogTimestamp is set and the collection is the oplog or a change
+    // collection, this is the latest timestamp seen by the collection scan. For change collections,
+    // on EOF we advance this timestamp to the latest timestamp in the global oplog.
     Timestamp _latestOplogEntryTimestamp;
+
+    boost::optional<ScopedAdmissionPriorityForLock> _priority;
 
     // Stats
     CollectionScanStats _specificStats;

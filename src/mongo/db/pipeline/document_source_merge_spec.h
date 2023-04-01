@@ -54,8 +54,11 @@ struct MergeWhenMatchedPolicy {
  */
 void mergeTargetNssSerializeToBSON(const NamespaceString& targetNss,
                                    StringData fieldName,
-                                   BSONObjBuilder* bob);
-NamespaceString mergeTargetNssParseFromBSON(const BSONElement& elem);
+                                   BSONObjBuilder* bob,
+                                   const SerializationContext& serializationContext);
+NamespaceString mergeTargetNssParseFromBSON(boost::optional<TenantId> tenantId,
+                                            const BSONElement& elem,
+                                            const SerializationContext& serializationContext);
 
 /**
  * Serialize and deserialize functions for the $merge stage 'on' field which can be a single string

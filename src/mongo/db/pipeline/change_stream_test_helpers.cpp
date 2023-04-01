@@ -58,16 +58,30 @@ LogicalSessionFromClient testLsid() {
 
 Document makeResumeToken(Timestamp ts,
                          ImplicitValue uuid,
-                         ImplicitValue docKey,
+                         ImplicitValue docKeyOrOpDesc,
+                         StringData operationType,
                          ResumeTokenData::FromInvalidate fromInvalidate,
                          size_t txnOpIndex) {
-    ResumeTokenData tokenData;
-    tokenData.clusterTime = ts;
-    tokenData.eventIdentifier = docKey;
-    tokenData.fromInvalidate = fromInvalidate;
-    tokenData.txnOpIndex = txnOpIndex;
-    if (!uuid.missing())
-        tokenData.uuid = uuid.getUuid();
+    static const std::set<StringData> kCrudOps = {
+        "insert"_sd, "update"_sd, "replace"_sd, "delete"_sd};
+    auto eventId = Value(Document{
+        {"operationType", operationType},
+        {kCrudOps.count(operationType) ? "documentKey" : "operationDescription", docKeyOrOpDesc}});
+    return makeResumeTokenWithEventId(ts, uuid, eventId, fromInvalidate, txnOpIndex);
+}
+
+Document makeResumeTokenWithEventId(Timestamp ts,
+                                    ImplicitValue uuid,
+                                    ImplicitValue eventIdentifier,
+                                    ResumeTokenData::FromInvalidate fromInvalidate,
+                                    size_t txnOpIndex) {
+    auto optionalUuid = uuid.missing() ? boost::none : boost::make_optional(uuid.getUuid());
+    ResumeTokenData tokenData{ts,
+                              ResumeTokenData::kDefaultTokenVersion,
+                              txnOpIndex,
+                              optionalUuid,
+                              eventIdentifier,
+                              fromInvalidate};
     return ResumeToken(tokenData).toDocument();
 }
 
@@ -84,11 +98,8 @@ repl::OplogEntry makeOplogEntry(repl::OpTypeEnum opType,
                                 OperationSessionInfo sessionInfo,
                                 boost::optional<repl::OpTime> prevOpTime,
                                 boost::optional<repl::OpTime> preImageOpTime) {
-    long long hash = 1LL;
     return {repl::DurableOplogEntry(opTime ? *opTime : kDefaultOpTime,  // optime
-                                    hash,                               // hash
                                     opType,                             // opType
-                                    boost::none,                        // tenant id
                                     nss,                                // namespace
                                     uuid,                               // uuid
                                     fromMigrate,                        // fromMigrate

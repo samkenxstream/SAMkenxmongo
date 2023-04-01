@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -39,14 +38,14 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/stacktrace.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+
 namespace mongo {
 
 namespace {
 std::once_flag logPrepareWithTimestampOnce;
 }
-
-// When set, simulates WT_PREPARE_CONFLICT returned from WiredTiger API calls.
-MONGO_FAIL_POINT_DEFINE(WTPrepareConflictForReads);
 
 MONGO_FAIL_POINT_DEFINE(WTSkipPrepareConflictRetries);
 

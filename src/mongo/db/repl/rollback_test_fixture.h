@@ -48,16 +48,9 @@
 namespace mongo {
 namespace repl {
 
-/**
- * Test fixture for both 3.4 and 3.6 rollback unit tests.
- * The fixture makes available to tests:
- * - an "ephemeralForTest" storage engine for checking results of the rollback algorithm at the
- *   storage layer. The storage engine is initialized as part of the ServiceContextForMongoD test
- *   fixture.
- */
 class RollbackTest : public ServiceContextMongoDTest {
 public:
-    RollbackTest() = default;
+    explicit RollbackTest(Options options = {}) : ServiceContextMongoDTest(std::move(options)) {}
 
     /**
      * Initializes the service context and task executor.
@@ -104,7 +97,8 @@ public:
                                                       StringData nss,
                                                       BSONObj cmdObj,
                                                       int recordId,
-                                                      boost::optional<BSONObj> o2 = boost::none);
+                                                      boost::optional<BSONObj> o2 = boost::none,
+                                                      boost::optional<TenantId> tid = boost::none);
 
     /**
      * Creates an oplog entry with a recordId for a command operation. The oplog entry will not have
@@ -285,50 +279,13 @@ public:
                                                       UUID uuid,
                                                       const BSONObj& filter) const override;
 
-    StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
+    StatusWith<BSONObj> getCollectionInfoByUUID(const DatabaseName& dbName,
                                                 const UUID& uuid) const override;
     StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const override;
 
 private:
     std::unique_ptr<OplogInterface> _oplog;
     HostAndPort _source;
-};
-
-/**
- * Test fixture to ensure that rollback re-syncs collection options from a sync source and updates
- * the local collection options correctly. A test operates on a single test collection, and is
- * parameterized on two arguments:
- *
- * 'localCollOptions': the collection options that the local test collection is initially created
- * with.
- *
- * 'remoteCollOptionsObj': the collection options object that the sync source will respond with to
- * the rollback node when it fetches collection metadata.
- *
- * If no command is provided, a collMod operation with a 'validationLevel' argument is used to
- * trigger a collection metadata resync, since the rollback of collMod operations does not take into
- * account the actual command object. It simply re-syncs all the collection options.
- */
-class RollbackResyncsCollectionOptionsTest : public RollbackTest {
-
-    class RollbackSourceWithCollectionOptions : public RollbackSourceMock {
-    public:
-        RollbackSourceWithCollectionOptions(std::unique_ptr<OplogInterface> oplog,
-                                            BSONObj collOptionsObj);
-
-        StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
-                                                    const UUID& uuid) const override;
-
-        BSONObj collOptionsObj;
-    };
-
-public:
-    void resyncCollectionOptionsTest(CollectionOptions localCollOptions,
-                                     BSONObj remoteCollOptionsObj,
-                                     BSONObj collModCmd,
-                                     std::string collName);
-    void resyncCollectionOptionsTest(CollectionOptions localCollOptions,
-                                     BSONObj remoteCollOptionsObj);
 };
 
 }  // namespace repl

@@ -295,11 +295,11 @@ public:
 /**
  * A ValueBuilder that supports reading of sbe tag/values into a MaterializedRow.
  */
-class MaterializedRowValueBuilder : public ValueBuilder {
+template <typename RowType>
+class RowValueBuilder : public ValueBuilder {
 public:
-    MaterializedRowValueBuilder(BufBuilder* valueBufferBuilder)
-        : ValueBuilder(valueBufferBuilder) {}
-    MaterializedRowValueBuilder(MaterializedRowValueBuilder& other) = delete;
+    RowValueBuilder(BufBuilder* valueBufferBuilder) : ValueBuilder(valueBufferBuilder) {}
+    RowValueBuilder(RowValueBuilder<RowType>& other) = delete;
 
     size_t numValues() const override {
         size_t nVals = 0;
@@ -319,11 +319,14 @@ public:
         return nVals;
     }
 
-    void readValues(MaterializedRow& row) {
+    void readValues(RowType& row) {
         auto bufferLen = _valueBufferBuilder->len();
         size_t bufIdx = 0;
         size_t rowIdx = 0;
-        while (bufIdx < _numValues) {
+        // The 'row' output parameter might be smaller than the number of values owned by this
+        // builder. Be careful to only read as many values into 'row' as this output 'row' has space
+        // for.
+        while (rowIdx < row.size()) {
             invariant(rowIdx < row.size());
             auto [_, tagNothing, valNothing] = getValue(bufIdx++, bufferLen);
             tassert(6136200, "sbe tag must be 'Boolean'", tagNothing == TypeTags::Boolean);

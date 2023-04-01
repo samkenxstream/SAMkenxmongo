@@ -15,8 +15,6 @@ from buildscripts.resmokelib.testing.fixtures import _builder
 class FixtureLib:
     """Class that exposes the resmokelib API that fixtures can use."""
 
-    # pylint: disable=no-self-use
-
     #################
     # Logger tools #
     #################
@@ -45,7 +43,7 @@ class FixtureLib:
         """Build fixtures by calling builder API."""
         return _builder.make_fixture(class_name, logger, job_num, *args, **kwargs)
 
-    def mongod_program(self, logger, job_num, executable, process_kwargs, mongod_options):  # pylint: disable=too-many-arguments
+    def mongod_program(self, logger, job_num, executable, process_kwargs, mongod_options):
         """
         Return a Process instance that starts mongod arguments constructed from 'mongod_options'.
 
@@ -57,22 +55,20 @@ class FixtureLib:
         return core.programs.mongod_program(logger, job_num, executable, process_kwargs,
                                             mongod_options)
 
-    def mongos_program(  # pylint: disable=too-many-arguments
-            self, logger, job_num, test_id=None, executable=None, process_kwargs=None,
-            mongos_options=None):
+    def mongos_program(self, logger, job_num, executable=None, process_kwargs=None,
+                       mongos_options=None):
         """Return a Process instance that starts a mongos with arguments constructed from 'kwargs'."""
-        return core.programs.mongos_program(logger, job_num, test_id, executable, process_kwargs,
+        return core.programs.mongos_program(logger, job_num, executable, process_kwargs,
                                             mongos_options)
 
-    def generic_program(self, logger, args, job_num, test_id=None, process_kwargs=None, **kwargs):  # pylint: disable=too-many-arguments
+    def generic_program(self, logger, args, process_kwargs=None, **kwargs):
         """Return a Process instance that starts an arbitrary executable.
 
         The executable arguments are constructed from 'kwargs'.
 
         The args parameter is an array of strings containing the command to execute.
         """
-        return core.programs.generic_program(logger, args, job_num, test_id, process_kwargs,
-                                             **kwargs)
+        return core.programs.generic_program(logger, args, process_kwargs, **kwargs)
 
     #########
     # Utils #
@@ -114,7 +110,7 @@ class FixtureLib:
         return original
 
 
-class _FixtureConfig(object):  # pylint: disable=too-many-instance-attributes
+class _FixtureConfig(object):
     """Class that stores fixture configuration info."""
 
     def __init__(self):
@@ -126,6 +122,7 @@ class _FixtureConfig(object):  # pylint: disable=too-many-instance-attributes
         self.DEFAULT_MONGOD_EXECUTABLE = config.DEFAULT_MONGOD_EXECUTABLE
         self.MONGOD_SET_PARAMETERS = config.MONGOD_SET_PARAMETERS
         self.FIXTURE_SUBDIR = config.FIXTURE_SUBDIR
+        self.AUTO_KILL = config.AUTO_KILL
         self.ALWAYS_USE_LOG_FILES = config.ALWAYS_USE_LOG_FILES
         self.LAST_LTS_MONGOD_BINARY = LAST_LTS_MONGOD_BINARY
         self.LAST_LTS_MONGOS_BINARY = LAST_LTS_MONGOS_BINARY

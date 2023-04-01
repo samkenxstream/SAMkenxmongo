@@ -33,6 +33,7 @@
 #include "mongo/s/concurrency/locker_mongos_client_observer.h"
 #include "mongo/s/mock_ns_targeter.h"
 #include "mongo/s/session_catalog_router.h"
+#include "mongo/s/shard_version_factory.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/s/write_ops/write_op.h"
 #include "mongo/unittest/unittest.h"
@@ -40,15 +41,7 @@
 namespace mongo {
 namespace {
 
-const NamespaceString kNss("foo.bar");
-
-WriteErrorDetail buildError(int code, const BSONObj& info, const std::string& message) {
-    WriteErrorDetail error;
-    error.setStatus({ErrorCodes::Error(code), message});
-    error.setErrInfo(info);
-
-    return error;
-}
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("foo.bar");
 
 write_ops::DeleteOpEntry buildDelete(const BSONObj& query, bool multi) {
     write_ops::DeleteOpEntry entry;
@@ -67,8 +60,87 @@ void sortByEndpoint(std::vector<std::unique_ptr<TargetedWrite>>* writes) {
     std::sort(writes->begin(), writes->end(), EndpointComp());
 }
 
+// This shard version is used as the received version in StaleConfigInfo since we do not have
+// information about the received version of the operation.
+ShardVersion ShardVersionPlacementIgnoredNoIndexes() {
+    return ShardVersionFactory::make(ChunkVersion::IGNORED(),
+                                     boost::optional<CollectionIndexes>(boost::none));
+}
+
 class WriteOpTest : public ServiceContextTest {
 protected:
+    static Status getMockRetriableError(CollectionGeneration& gen) {
+        return {StaleConfigInfo(
+                    kNss,
+                    ShardVersionFactory::make(ChunkVersion(gen, {10, 0}),
+                                              boost::optional<CollectionIndexes>(boost::none)),
+                    ShardVersionFactory::make(ChunkVersion(gen, {11, 0}),
+                                              boost::optional<CollectionIndexes>(boost::none)),
+                    ShardId("shardA")),
+                "simulate ssv error for test"};
+    }
+
+    static Status getMockNonRetriableError(CollectionGeneration& gen) {
+        return {DuplicateKeyErrorInfo(
+                    BSON("mock" << 1), BSON("" << 1), BSONObj{}, stdx::monostate{}, boost::none),
+                "Mock duplicate key error"};
+    }
+
+    WriteOp setupTwoShardTest(CollectionGeneration& gen,
+                              std::vector<std::unique_ptr<TargetedWrite>>& targeted,
+                              bool isTransactional) const {
+        ShardEndpoint endpointA(
+            ShardId("shardA"),
+            ShardVersionFactory::make(ChunkVersion(gen, {10, 0}),
+                                      boost::optional<CollectionIndexes>(boost::none)),
+            boost::none);
+        ShardEndpoint endpointB(
+            ShardId("shardB"),
+            ShardVersionFactory::make(ChunkVersion(gen, {20, 0}),
+                                      boost::optional<CollectionIndexes>(boost::none)),
+            boost::none);
+
+        BatchedCommandRequest request([&] {
+            write_ops::DeleteCommandRequest deleteOp(kNss);
+            deleteOp.setDeletes({buildDelete(BSON("x" << GTE << -1 << LT << 1), false)});
+            return deleteOp;
+        }());
+
+        if (isTransactional) {
+            const TxnNumber kTxnNumber = 1;
+            _opCtx->setTxnNumber(kTxnNumber);
+
+            auto txnRouter = TransactionRouter::get(_opCtx);
+            txnRouter.beginOrContinueTxn(
+                _opCtx, kTxnNumber, TransactionRouter::TransactionActions::kStart);
+        }
+
+        // Do multi-target write op
+        WriteOp writeOp(BatchItemRef(&request, 0), isTransactional);
+        ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
+
+        MockNSTargeter targeter(kNss,
+                                {MockRange(endpointA, BSON("x" << MINKEY), BSON("x" << 0)),
+                                 MockRange(endpointB, BSON("x" << 0), BSON("x" << MAXKEY))});
+
+        writeOp.targetWrites(_opCtx, targeter, &targeted);
+        ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Pending);
+        ASSERT_EQUALS(targeted.size(), 2u);
+        sortByEndpoint(&targeted);
+        ASSERT_EQUALS(targeted[0]->endpoint.shardName, endpointA.shardName);
+        if (!isTransactional) {
+            ASSERT(ShardVersion::ShardVersion::isPlacementVersionIgnored(
+                *targeted[0]->endpoint.shardVersion));
+        }
+        ASSERT_EQUALS(targeted[1]->endpoint.shardName, endpointB.shardName);
+        if (!isTransactional) {
+            ASSERT(ShardVersion::ShardVersion::isPlacementVersionIgnored(
+                *targeted[1]->endpoint.shardVersion));
+        }
+
+        return writeOp;
+    }
+
     WriteOpTest() {
         auto service = getServiceContext();
         service->registerClientObserver(std::make_unique<LockerMongosClientObserver>());
@@ -91,18 +163,17 @@ TEST_F(WriteOpTest, BasicError) {
     WriteOp writeOp(BatchItemRef(&request, 0), false);
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
 
-    const auto error(buildError(ErrorCodes::UnknownError, BSON("data" << 12345), "some message"));
-
+    write_ops::WriteError error(0, {ErrorCodes::UnknownError, "some message"});
     writeOp.setOpError(error);
+
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Error);
-    ASSERT_EQUALS(writeOp.getOpError().toStatus().code(), error.toStatus().code());
-    ASSERT_EQUALS(writeOp.getOpError().getErrInfo()["data"].Int(),
-                  error.getErrInfo()["data"].Int());
-    ASSERT_EQUALS(writeOp.getOpError().toStatus().reason(), error.toStatus().reason());
+    ASSERT_EQUALS(writeOp.getOpError().getStatus(), error.getStatus());
 }
 
 TEST_F(WriteOpTest, TargetSingle) {
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpoint(ShardId("shard"),
+                           ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none),
+                           boost::none);
 
     BatchedCommandRequest request([&] {
         write_ops::InsertCommandRequest insertOp(kNss);
@@ -129,12 +200,22 @@ TEST_F(WriteOpTest, TargetSingle) {
 
 // Multi-write targeting test where our query goes to one shard
 TEST_F(WriteOpTest, TargetMultiOneShard) {
+    CollectionGeneration gen(OID(), Timestamp(1, 1));
     ShardEndpoint endpointA(
-        ShardId("shardA"), ChunkVersion(10, 0, OID(), Timestamp(1, 1)), boost::none);
+        ShardId("shardA"),
+        ShardVersionFactory::make(ChunkVersion(gen, {10, 0}),
+                                  boost::optional<CollectionIndexes>(boost::none)),
+        boost::none);
     ShardEndpoint endpointB(
-        ShardId("shardB"), ChunkVersion(20, 0, OID(), Timestamp(1, 1)), boost::none);
+        ShardId("shardB"),
+        ShardVersionFactory::make(ChunkVersion(gen, {20, 0}),
+                                  boost::optional<CollectionIndexes>(boost::none)),
+        boost::none);
     ShardEndpoint endpointC(
-        ShardId("shardB"), ChunkVersion(20, 0, OID(), Timestamp(1, 1)), boost::none);
+        ShardId("shardB"),
+        ShardVersionFactory::make(ChunkVersion(gen, {20, 0}),
+                                  boost::optional<CollectionIndexes>(boost::none)),
+        boost::none);
 
     BatchedCommandRequest request([&] {
         write_ops::DeleteCommandRequest deleteOp(kNss);
@@ -164,12 +245,22 @@ TEST_F(WriteOpTest, TargetMultiOneShard) {
 
 // Multi-write targeting test where our write goes to more than one shard
 TEST_F(WriteOpTest, TargetMultiAllShards) {
+    CollectionGeneration gen(OID(), Timestamp(1, 1));
     ShardEndpoint endpointA(
-        ShardId("shardA"), ChunkVersion(10, 0, OID(), Timestamp(1, 1)), boost::none);
+        ShardId("shardA"),
+        ShardVersionFactory::make(ChunkVersion(gen, {10, 0}),
+                                  boost::optional<CollectionIndexes>(boost::none)),
+        boost::none);
     ShardEndpoint endpointB(
-        ShardId("shardB"), ChunkVersion(20, 0, OID(), Timestamp(1, 1)), boost::none);
+        ShardId("shardB"),
+        ShardVersionFactory::make(ChunkVersion(gen, {20, 0}),
+                                  boost::optional<CollectionIndexes>(boost::none)),
+        boost::none);
     ShardEndpoint endpointC(
-        ShardId("shardB"), ChunkVersion(20, 0, OID(), Timestamp(1, 1)), boost::none);
+        ShardId("shardB"),
+        ShardVersionFactory::make(ChunkVersion(gen, {20, 0}),
+                                  boost::optional<CollectionIndexes>(boost::none)),
+        boost::none);
 
     BatchedCommandRequest request([&] {
         write_ops::DeleteCommandRequest deleteOp(kNss);
@@ -192,11 +283,14 @@ TEST_F(WriteOpTest, TargetMultiAllShards) {
     ASSERT_EQUALS(targeted.size(), 3u);
     sortByEndpoint(&targeted);
     ASSERT_EQUALS(targeted[0]->endpoint.shardName, endpointA.shardName);
-    ASSERT(ChunkVersion::isIgnoredVersion(*targeted[0]->endpoint.shardVersion));
+    ASSERT(
+        ShardVersion::ShardVersion::isPlacementVersionIgnored(*targeted[0]->endpoint.shardVersion));
     ASSERT_EQUALS(targeted[1]->endpoint.shardName, endpointB.shardName);
-    ASSERT(ChunkVersion::isIgnoredVersion(*targeted[1]->endpoint.shardVersion));
+    ASSERT(
+        ShardVersion::ShardVersion::isPlacementVersionIgnored(*targeted[1]->endpoint.shardVersion));
     ASSERT_EQUALS(targeted[2]->endpoint.shardName, endpointC.shardName);
-    ASSERT(ChunkVersion::isIgnoredVersion(*targeted[2]->endpoint.shardVersion));
+    ASSERT(
+        ShardVersion::ShardVersion::isPlacementVersionIgnored(*targeted[2]->endpoint.shardVersion));
 
     writeOp.noteWriteComplete(*targeted[0]);
     writeOp.noteWriteComplete(*targeted[1]);
@@ -205,40 +299,13 @@ TEST_F(WriteOpTest, TargetMultiAllShards) {
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Completed);
 }
 
-TEST_F(WriteOpTest, TargetMultiAllShardsAndErrorSingleChildOp) {
-    ShardEndpoint endpointA(
-        ShardId("shardA"), ChunkVersion(10, 0, OID(), Timestamp(1, 1)), boost::none);
-    ShardEndpoint endpointB(
-        ShardId("shardB"), ChunkVersion(20, 0, OID(), Timestamp(1, 1)), boost::none);
-
-    BatchedCommandRequest request([&] {
-        write_ops::DeleteCommandRequest deleteOp(kNss);
-        deleteOp.setDeletes({buildDelete(BSON("x" << GTE << -1 << LT << 1), false)});
-        return deleteOp;
-    }());
-
-    // Do multi-target write op
-    WriteOp writeOp(BatchItemRef(&request, 0), false);
-    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
-
-    MockNSTargeter targeter(kNss,
-                            {MockRange(endpointA, BSON("x" << MINKEY), BSON("x" << 0)),
-                             MockRange(endpointB, BSON("x" << 0), BSON("x" << MAXKEY))});
-
+TEST_F(WriteOpTest, TargetMultiAllShardsAndErrorSingleChildOp1) {
+    CollectionGeneration gen(OID(), Timestamp(1, 1));
     std::vector<std::unique_ptr<TargetedWrite>> targeted;
-    writeOp.targetWrites(_opCtx, targeter, &targeted);
-    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Pending);
-    ASSERT_EQUALS(targeted.size(), 2u);
-    sortByEndpoint(&targeted);
-    ASSERT_EQUALS(targeted[0]->endpoint.shardName, endpointA.shardName);
-    ASSERT(ChunkVersion::isIgnoredVersion(*targeted[0]->endpoint.shardVersion));
-    ASSERT_EQUALS(targeted[1]->endpoint.shardName, endpointB.shardName);
-    ASSERT(ChunkVersion::isIgnoredVersion(*targeted[1]->endpoint.shardVersion));
+    auto writeOp = setupTwoShardTest(gen, targeted, false);
 
     // Simulate retryable error.
-    WriteErrorDetail retryableError;
-    retryableError.setIndex(0);
-    retryableError.setStatus({ErrorCodes::StaleShardVersion, "simulate ssv error for test"});
+    write_ops::WriteError retryableError(0, getMockRetriableError(gen));
     writeOp.noteWriteError(*targeted[0], retryableError);
 
     // State should not change until we have result from all nodes.
@@ -250,9 +317,57 @@ TEST_F(WriteOpTest, TargetMultiAllShardsAndErrorSingleChildOp) {
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
 }
 
+TEST_F(WriteOpTest, TargetMultiAllShardsAndErrorMultipleChildOp2) {
+    CollectionGeneration gen(OID(), Timestamp(1, 1));
+    std::vector<std::unique_ptr<TargetedWrite>> targeted;
+    auto writeOp = setupTwoShardTest(gen, targeted, false);
+
+    // Simulate two errors: one retryable error and another non-retryable error.
+    write_ops::WriteError retryableError(0, getMockRetriableError(gen));
+    write_ops::WriteError nonRetryableError(1, getMockNonRetriableError(gen));
+
+    // First, the retryable error is issued.
+    writeOp.noteWriteError(*targeted[0], retryableError);
+
+    // State should not change until we have result from all nodes.
+    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Pending);
+
+    // Then, the non-retyrable error is issued.
+    writeOp.noteWriteError(*targeted[1], nonRetryableError);
+
+    // State remains in error, because of non-retryable error.
+    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Error);
+    ASSERT_EQUALS(writeOp.getOpError().getStatus(), nonRetryableError.getStatus());
+}
+
+TEST_F(WriteOpTest, TargetMultiAllShardsAndErrorMultipleChildOp3) {
+    CollectionGeneration gen(OID(), Timestamp(1, 1));
+    std::vector<std::unique_ptr<TargetedWrite>> targeted;
+    auto writeOp = setupTwoShardTest(gen, targeted, false);
+
+    // Simulate two errors: one non-retryable error and another retryable error.
+    write_ops::WriteError retryableError(0, getMockRetriableError(gen));
+    write_ops::WriteError nonRetryableError(1, getMockNonRetriableError(gen));
+
+    // First, the non-retryable error is issued.
+    writeOp.noteWriteError(*targeted[1], nonRetryableError);
+
+    // State should not change until we have result from all nodes.
+    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Pending);
+
+    // Then, the retyrable error is issued.
+    writeOp.noteWriteError(*targeted[0], retryableError);
+
+    // State remains in error, because of non-retryable error.
+    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Error);
+    ASSERT_EQUALS(writeOp.getOpError().getStatus(), nonRetryableError.getStatus());
+}
+
 // Single error after targeting test
 TEST_F(WriteOpTest, ErrorSingle) {
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpoint(ShardId("shard"),
+                           ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none),
+                           boost::none);
 
     BatchedCommandRequest request([&] {
         write_ops::InsertCommandRequest insertOp(kNss);
@@ -272,20 +387,18 @@ TEST_F(WriteOpTest, ErrorSingle) {
     ASSERT_EQUALS(targeted.size(), 1u);
     assertEndpointsEqual(targeted.front()->endpoint, endpoint);
 
-    const auto error(buildError(ErrorCodes::UnknownError, BSON("data" << 12345), "some message"));
-
+    write_ops::WriteError error(0, {ErrorCodes::UnknownError, "some message"});
     writeOp.noteWriteError(*targeted.front(), error);
 
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Error);
-    ASSERT_EQUALS(writeOp.getOpError().toStatus().code(), error.toStatus().code());
-    ASSERT_EQUALS(writeOp.getOpError().getErrInfo()["data"].Int(),
-                  error.getErrInfo()["data"].Int());
-    ASSERT_EQUALS(writeOp.getOpError().toStatus().reason(), error.toStatus().reason());
+    ASSERT_EQUALS(writeOp.getOpError().getStatus(), error.getStatus());
 }
 
 // Cancel single targeting test
 TEST_F(WriteOpTest, CancelSingle) {
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpoint(ShardId("shard"),
+                           ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none),
+                           boost::none);
 
     BatchedCommandRequest request([&] {
         write_ops::InsertCommandRequest insertOp(kNss);
@@ -316,7 +429,9 @@ TEST_F(WriteOpTest, CancelSingle) {
 
 // Retry single targeting test
 TEST_F(WriteOpTest, RetrySingleOp) {
-    ShardEndpoint endpoint(ShardId("shard"), ChunkVersion::IGNORED(), boost::none);
+    ShardEndpoint endpoint(ShardId("shard"),
+                           ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none),
+                           boost::none);
 
     BatchedCommandRequest request([&] {
         write_ops::InsertCommandRequest insertOp(kNss);
@@ -338,8 +453,11 @@ TEST_F(WriteOpTest, RetrySingleOp) {
     assertEndpointsEqual(targeted.front()->endpoint, endpoint);
 
     // Stale exception
-    const auto error(
-        buildError(ErrorCodes::StaleShardVersion, BSON("data" << 12345), "some message"));
+    write_ops::WriteError error(
+        0,
+        {StaleConfigInfo(
+             kNss, ShardVersionPlacementIgnoredNoIndexes(), boost::none, ShardId("shard")),
+         "some message"});
     writeOp.noteWriteError(*targeted.front(), error);
 
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
@@ -354,12 +472,22 @@ private:
 };
 
 TEST_F(WriteOpTransactionTest, TargetMultiDoesNotTargetAllShards) {
+    CollectionGeneration gen(OID(), Timestamp(1, 1));
     ShardEndpoint endpointA(
-        ShardId("shardA"), ChunkVersion(10, 0, OID(), Timestamp(1, 1)), boost::none);
+        ShardId("shardA"),
+        ShardVersionFactory::make(ChunkVersion(gen, {10, 0}),
+                                  boost::optional<CollectionIndexes>(boost::none)),
+        boost::none);
     ShardEndpoint endpointB(
-        ShardId("shardB"), ChunkVersion(20, 0, OID(), Timestamp(1, 1)), boost::none);
+        ShardId("shardB"),
+        ShardVersionFactory::make(ChunkVersion(gen, {20, 0}),
+                                  boost::optional<CollectionIndexes>(boost::none)),
+        boost::none);
     ShardEndpoint endpointC(
-        ShardId("shardB"), ChunkVersion(20, 0, OID(), Timestamp(1, 1)), boost::none);
+        ShardId("shardC"),
+        ShardVersionFactory::make(ChunkVersion(gen, {20, 0}),
+                                  boost::optional<CollectionIndexes>(boost::none)),
+        boost::none);
 
     BatchedCommandRequest request([&] {
         write_ops::DeleteCommandRequest deleteOp(kNss);
@@ -393,48 +521,32 @@ TEST_F(WriteOpTransactionTest, TargetMultiDoesNotTargetAllShards) {
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Completed);
 }
 
-TEST_F(WriteOpTransactionTest, TargetMultiAllShardsAndErrorSingleChildOp) {
-    ShardEndpoint endpointA(
-        ShardId("shardA"), ChunkVersion(10, 0, OID(), Timestamp(1, 1)), boost::none);
-    ShardEndpoint endpointB(
-        ShardId("shardB"), ChunkVersion(20, 0, OID(), Timestamp(1, 1)), boost::none);
-
-    BatchedCommandRequest request([&] {
-        write_ops::DeleteCommandRequest deleteOp(kNss);
-        deleteOp.setDeletes({buildDelete(BSON("x" << GTE << -1 << LT << 1), false)});
-        return deleteOp;
-    }());
-
-    const TxnNumber kTxnNumber = 1;
-    _opCtx->setTxnNumber(kTxnNumber);
-
-    auto txnRouter = TransactionRouter::get(_opCtx);
-    txnRouter.beginOrContinueTxn(_opCtx, kTxnNumber, TransactionRouter::TransactionActions::kStart);
-
-    // Do multi-target write op
-    WriteOp writeOp(BatchItemRef(&request, 0), true);
-    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Ready);
-
-    MockNSTargeter targeter(kNss,
-                            {MockRange(endpointA, BSON("x" << MINKEY), BSON("x" << 0)),
-                             MockRange(endpointB, BSON("x" << 0), BSON("x" << MAXKEY))});
-
+TEST_F(WriteOpTransactionTest, TargetMultiAllShardsAndErrorSingleChildOp1) {
+    CollectionGeneration gen(OID(), Timestamp(1, 1));
     std::vector<std::unique_ptr<TargetedWrite>> targeted;
-    writeOp.targetWrites(_opCtx, targeter, &targeted);
-    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Pending);
-    ASSERT_EQUALS(targeted.size(), 2u);
-    sortByEndpoint(&targeted);
-    ASSERT_EQUALS(targeted[0]->endpoint.shardName, endpointA.shardName);
-    ASSERT_EQUALS(targeted[1]->endpoint.shardName, endpointB.shardName);
+    auto writeOp = setupTwoShardTest(gen, targeted, true);
 
     // Simulate retryable error.
-    WriteErrorDetail retryableError;
-    retryableError.setIndex(0);
-    retryableError.setStatus({ErrorCodes::StaleShardVersion, "simulate ssv error for test"});
+    write_ops::WriteError retryableError(0, getMockRetriableError(gen));
     writeOp.noteWriteError(*targeted[0], retryableError);
 
     // State should change to error right away even with retryable error when in a transaction.
     ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Error);
+    ASSERT_EQUALS(writeOp.getOpError().getStatus(), retryableError.getStatus());
+}
+
+TEST_F(WriteOpTransactionTest, TargetMultiAllShardsAndErrorSingleChildOp2) {
+    CollectionGeneration gen(OID(), Timestamp(1, 1));
+    std::vector<std::unique_ptr<TargetedWrite>> targeted;
+    auto writeOp = setupTwoShardTest(gen, targeted, true);
+
+    // Simulate non-retryable error.
+    write_ops::WriteError nonRetryableError(0, getMockRetriableError(gen));
+    writeOp.noteWriteError(*targeted[0], nonRetryableError);
+
+    // State should change to error right away even with non-retryable error when in a transaction.
+    ASSERT_EQUALS(writeOp.getWriteState(), WriteOpState_Error);
+    ASSERT_EQUALS(writeOp.getOpError().getStatus(), nonRetryableError.getStatus());
 }
 
 }  // namespace

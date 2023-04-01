@@ -27,61 +27,29 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 
-#include <iomanip>
 #include <set>
 
-#include "mongo/base/status_with.h"
-#include "mongo/bson/bsonmisc.h"
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/client/connection_string.h"
 #include "mongo/client/read_preference.h"
-#include "mongo/client/remote_command_targeter.h"
-#include "mongo/client/replica_set_monitor.h"
-#include "mongo/db/api_parameters.h"
-#include "mongo/db/auth/authorization_session_impl.h"
-#include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/client.h"
-#include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
-#include "mongo/db/internal_transactions_feature_flag_gen.h"
-#include "mongo/db/logical_session_cache.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/db/operation_context.h"
-#include "mongo/db/query/collation/collator_factory_interface.h"
-#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/balancer/balancer.h"
 #include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_util.h"
 #include "mongo/db/timeseries/timeseries_options.h"
-#include "mongo/db/transaction_api.h"
 #include "mongo/db/vector_clock.h"
-#include "mongo/executor/network_interface.h"
-#include "mongo/executor/task_executor.h"
 #include "mongo/logv2/log.h"
-#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/sharding_catalog_client_impl.h"
-#include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_tags.h"
-#include "mongo/s/client/shard.h"
-#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/chunk_constraints.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/request_types/flush_routing_table_cache_updates_gen.h"
-#include "mongo/s/shard_key_pattern.h"
-#include "mongo/s/shard_util.h"
-#include "mongo/s/write_ops/batched_command_request.h"
-#include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/transport/service_entry_point.h"
-#include "mongo/util/fail_point.h"
-#include "mongo/util/scopeguard.h"
-#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -89,64 +57,19 @@ namespace {
 MONGO_FAIL_POINT_DEFINE(hangRefineCollectionShardKeyBeforeUpdatingChunks);
 MONGO_FAIL_POINT_DEFINE(hangRefineCollectionShardKeyBeforeCommit);
 
-const ReadPreferenceSetting kConfigReadSelector(ReadPreference::Nearest, TagSet{});
-const WriteConcernOptions kNoWaitWriteConcern(1, WriteConcernOptions::SyncMode::UNSET, Seconds(0));
-const char kWriteConcernField[] = "writeConcern";
-
-const KeyPattern kUnshardedCollectionShardKey(BSON("_id" << 1));
-
-boost::optional<UUID> checkCollectionOptions(OperationContext* opCtx,
-                                             Shard* shard,
-                                             const NamespaceString& ns,
-                                             const CollectionOptions options) {
-    BSONObjBuilder listCollCmd;
-    listCollCmd.append("listCollections", 1);
-    listCollCmd.append("filter", BSON("name" << ns.coll()));
-
-    auto response = uassertStatusOK(
-        shard->runCommandWithFixedRetryAttempts(opCtx,
-                                                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                                ns.db().toString(),
-                                                listCollCmd.obj(),
-                                                Shard::RetryPolicy::kIdempotent));
-
-    auto cursorObj = response.response["cursor"].Obj();
-    auto collections = cursorObj["firstBatch"].Obj();
-    BSONObjIterator collIter(collections);
-    uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "cannot find ns: " << ns.ns(),
-            collIter.more());
-
-    auto collectionDetails = collIter.next();
-    CollectionOptions actualOptions =
-        uassertStatusOK(CollectionOptions::parse(collectionDetails["options"].Obj()));
-    // TODO: SERVER-33048 check idIndex field
-
-    uassert(ErrorCodes::NamespaceExists,
-            str::stream() << "ns: " << ns.ns()
-                          << " already exists with different options: " << actualOptions.toBSON(),
-            options.matchesStorageOptions(
-                actualOptions, CollatorFactoryInterface::get(opCtx->getServiceContext())));
-
-    if (actualOptions.isView()) {
-        // Views don't have UUID.
-        return boost::none;
-    }
-
-    auto collectionInfo = collectionDetails["info"].Obj();
-    return uassertStatusOK(UUID::parse(collectionInfo["uuid"]));
-}
-
-void triggerFireAndForgetShardRefreshes(OperationContext* opCtx, const CollectionType& coll) {
+void triggerFireAndForgetShardRefreshes(OperationContext* opCtx,
+                                        Shard* configShard,
+                                        ShardingCatalogClient* catalogClient,
+                                        const CollectionType& coll) {
     const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
-    const auto allShards = uassertStatusOK(Grid::get(opCtx)->catalogClient()->getAllShards(
+    const auto allShards = uassertStatusOK(catalogClient->getAllShards(
                                                opCtx, repl::ReadConcernLevel::kLocalReadConcern))
                                .value;
     for (const auto& shardEntry : allShards) {
         const auto query = BSON(ChunkType::collectionUUID
                                 << coll.getUuid() << ChunkType::shard(shardEntry.getName()));
 
-        const auto chunk = uassertStatusOK(shardRegistry->getConfigShard()->exhaustiveFindOnConfig(
+        const auto chunk = uassertStatusOK(configShard->exhaustiveFindOnConfig(
                                                opCtx,
                                                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                                                repl::ReadConcernLevel::kLocalReadConcern,
@@ -167,7 +90,7 @@ void triggerFireAndForgetShardRefreshes(OperationContext* opCtx, const Collectio
             shard->runFireAndForgetCommand(
                 opCtx,
                 ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                NamespaceString::kAdminDb.toString(),
+                DatabaseName::kAdmin.toString(),
                 BSON("_flushRoutingTableCacheUpdates" << coll.getNss().ns()));
         }
     }
@@ -288,19 +211,24 @@ std::pair<std::vector<BSONObj>, std::vector<BSONObj>> makeChunkAndTagUpdatesForR
 void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
                                                       const NamespaceString& nss,
                                                       const ShardKeyPattern& newShardKeyPattern) {
+    // Mark opCtx as interruptible to ensure that all reads and writes to the metadata collections
+    // under the exclusive _kChunkOpLock happen on the same term.
+    opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+
     // Take _kChunkOpLock in exclusive mode to prevent concurrent chunk modifications and generate
-    // strictly monotonously increasing collection versions
-    Lock::ExclusiveLock chunkLk(opCtx, opCtx->lockState(), _kChunkOpLock);
-    Lock::ExclusiveLock zoneLk(opCtx, opCtx->lockState(), _kZoneOpLock);
+    // strictly monotonously increasing collection placement versions
+    Lock::ExclusiveLock chunkLk(opCtx, _kChunkOpLock);
+    Lock::ExclusiveLock zoneLk(opCtx, _kZoneOpLock);
 
     struct RefineTimers {
         Timer executionTimer;
         Timer totalTimer;
-    } timers;
+    };
+    auto timers = std::make_shared<RefineTimers>();
 
     const auto newEpoch = OID::gen();
 
-    auto collType = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, nss);
+    auto collType = _localCatalogClient->getCollection(opCtx, nss);
     const auto oldShardKeyPattern = ShardKeyPattern(collType.getKeyPattern());
 
     uassertStatusOK(ShardingLogging::get(opCtx)->logChangeChecked(
@@ -309,7 +237,9 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
         nss.ns(),
         BSON("oldKey" << oldShardKeyPattern.toBSON() << "newKey" << newShardKeyPattern.toBSON()
                       << "oldEpoch" << collType.getEpoch() << "newEpoch" << newEpoch),
-        ShardingCatalogClient::kLocalWriteConcern));
+        ShardingCatalogClient::kLocalWriteConcern,
+        _localConfigShard,
+        _localCatalogClient.get()));
 
     const auto oldFields = oldShardKeyPattern.toBSON();
     const auto newFields =
@@ -322,83 +252,9 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
     Timestamp newTimestamp = now.clusterTime().asTimestamp();
     collType.setTimestamp(newTimestamp);
 
-    auto updateCollectionAndChunksFn = [&](OperationContext* opCtx, TxnNumber txnNumber) {
-        // Update the config.collections entry for the given namespace.
-        updateShardingCatalogEntryForCollectionInTxn(
-            opCtx, nss, collType, false /* upsert */, txnNumber);
-
-        LOGV2(21933,
-              "refineCollectionShardKey updated collection entry for {namespace}: took "
-              "{durationMillis} ms. Total time taken: {totalTimeMillis} ms.",
-              "refineCollectionShardKey updated collection entry",
-              "namespace"_attr = nss.ns(),
-              "durationMillis"_attr = timers.executionTimer.millis(),
-              "totalTimeMillis"_attr = timers.totalTimer.millis());
-        timers.executionTimer.reset();
-
-        if (MONGO_unlikely(hangRefineCollectionShardKeyBeforeUpdatingChunks.shouldFail())) {
-            LOGV2(21934, "Hit hangRefineCollectionShardKeyBeforeUpdatingChunks failpoint");
-            hangRefineCollectionShardKeyBeforeUpdatingChunks.pauseWhileSet(opCtx);
-        }
-
-        auto [chunkUpdates, tagUpdates] = makeChunkAndTagUpdatesForRefine(newFields);
-
-        // Update all config.chunks entries for the given namespace by setting (i) their bounds for
-        // each new field in the refined key to MinKey (except for the global max chunk where the
-        // max bounds are set to MaxKey), and unsetting (ii) their jumbo field.
-        const auto chunksQuery = BSON(ChunkType::collectionUUID << collType.getUuid());
-        writeToConfigDocumentInTxn(
-            opCtx,
-            ChunkType::ConfigNS,
-            BatchedCommandRequest::buildPipelineUpdateOp(ChunkType::ConfigNS,
-                                                         chunksQuery,
-                                                         chunkUpdates,
-                                                         false,  // upsert
-                                                         true    // useMultiUpdate
-                                                         ),
-            txnNumber);
-
-        LOGV2(21935,
-              "refineCollectionShardKey: updated chunk entries for {namespace}: took "
-              "{durationMillis} ms. Total time taken: {totalTimeMillis} ms.",
-              "refineCollectionShardKey: updated chunk entries",
-              "namespace"_attr = nss.ns(),
-              "durationMillis"_attr = timers.executionTimer.millis(),
-              "totalTimeMillis"_attr = timers.totalTimer.millis());
-        timers.executionTimer.reset();
-
-        // Update all config.tags entries for the given namespace by setting their bounds for
-        // each new field in the refined key to MinKey (except for the global max tag where the
-        // max bounds are set to MaxKey).
-        writeToConfigDocumentInTxn(
-            opCtx,
-            TagsType::ConfigNS,
-            BatchedCommandRequest::buildPipelineUpdateOp(TagsType::ConfigNS,
-                                                         BSON("ns" << nss.ns()),
-                                                         tagUpdates,
-                                                         false,  // upsert
-                                                         true    // useMultiUpdate
-                                                         ),
-            txnNumber);
-
-
-        LOGV2(21936,
-              "refineCollectionShardKey: updated zone entries for {namespace}: took "
-              "{durationMillis} ms. Total time taken: {totalTimeMillis} ms.",
-              "refineCollectionShardKey: updated zone entries",
-              "namespace"_attr = nss.ns(),
-              "durationMillis"_attr = timers.executionTimer.millis(),
-              "totalTimeMillis"_attr = timers.totalTimer.millis());
-
-        if (MONGO_unlikely(hangRefineCollectionShardKeyBeforeCommit.shouldFail())) {
-            LOGV2(21937, "Hit hangRefineCollectionShardKeyBeforeCommit failpoint");
-            hangRefineCollectionShardKeyBeforeCommit.pauseWhileSet(opCtx);
-        }
-    };
-
     auto updateCollectionAndChunksWithAPIFn =
-        [collType, newFields, nss, &timers](const txn_api::TransactionClient& txnClient,
-                                            ExecutorPtr txnExec) -> SemiFuture<void> {
+        [collType, newFields, nss, timers](const txn_api::TransactionClient& txnClient,
+                                           ExecutorPtr txnExec) -> SemiFuture<void> {
         auto [chunkUpdates, tagUpdates] = makeChunkAndTagUpdatesForRefine(newFields);
 
         // Update the config.collections entry for the given namespace.
@@ -410,7 +266,7 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
                                                  false /* multi */);
         return txnClient.runCRUDOp(catalogUpdateRequest, {})
             .thenRunOn(txnExec)
-            .then([&txnClient, &timers, collType, nss, chunkUpdates = std::move(chunkUpdates)](
+            .then([&txnClient, timers, collType, nss, chunkUpdates = std::move(chunkUpdates)](
                       auto catalogResponse) {
                 uassertStatusOK(catalogResponse.toStatus());
 
@@ -418,10 +274,10 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
                       "refineCollectionShardKey updated collection entry for {namespace}: took "
                       "{durationMillis} ms. Total time taken: {totalTimeMillis} ms.",
                       "refineCollectionShardKey updated collection entry",
-                      "namespace"_attr = nss.ns(),
-                      "durationMillis"_attr = timers.executionTimer.millis(),
-                      "totalTimeMillis"_attr = timers.totalTimer.millis());
-                timers.executionTimer.reset();
+                      logAttrs(nss),
+                      "durationMillis"_attr = timers->executionTimer.millis(),
+                      "totalTimeMillis"_attr = timers->totalTimer.millis());
+                timers->executionTimer.reset();
 
                 if (MONGO_unlikely(hangRefineCollectionShardKeyBeforeUpdatingChunks.shouldFail())) {
                     LOGV2(5875907,
@@ -444,41 +300,41 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
                 return txnClient.runCRUDOp(chunkUpdateRequest, {});
             })
             .thenRunOn(txnExec)
-            .then([&txnClient, &timers, nss, tagUpdates = std::move(tagUpdates)](
-                      auto chunksResponse) {
-                uassertStatusOK(chunksResponse.toStatus());
+            .then(
+                [&txnClient, timers, nss, tagUpdates = std::move(tagUpdates)](auto chunksResponse) {
+                    uassertStatusOK(chunksResponse.toStatus());
 
-                LOGV2(5875908,
-                      "refineCollectionShardKey: updated chunk entries for {namespace}: took "
-                      "{durationMillis} ms. Total time taken: {totalTimeMillis} ms.",
-                      "refineCollectionShardKey: updated chunk entries",
-                      "namespace"_attr = nss.ns(),
-                      "durationMillis"_attr = timers.executionTimer.millis(),
-                      "totalTimeMillis"_attr = timers.totalTimer.millis());
-                timers.executionTimer.reset();
+                    LOGV2(5875908,
+                          "refineCollectionShardKey: updated chunk entries for {namespace}: took "
+                          "{durationMillis} ms. Total time taken: {totalTimeMillis} ms.",
+                          "refineCollectionShardKey: updated chunk entries",
+                          logAttrs(nss),
+                          "durationMillis"_attr = timers->executionTimer.millis(),
+                          "totalTimeMillis"_attr = timers->totalTimer.millis());
+                    timers->executionTimer.reset();
 
-                // Update all config.tags entries for the given namespace by setting their bounds
-                // for each new field in the refined key to MinKey (except for the global max tag
-                // where the max bounds are set to MaxKey).
-                auto tagUpdateRequest =
-                    BatchedCommandRequest::buildPipelineUpdateOp(TagsType::ConfigNS,
-                                                                 BSON("ns" << nss.ns()),
-                                                                 tagUpdates,
-                                                                 false /* upsert */,
-                                                                 true /* useMultiUpdate */);
-                return txnClient.runCRUDOp(tagUpdateRequest, {});
-            })
+                    // Update all config.tags entries for the given namespace by setting their
+                    // bounds for each new field in the refined key to MinKey (except for the global
+                    // max tag where the max bounds are set to MaxKey).
+                    auto tagUpdateRequest =
+                        BatchedCommandRequest::buildPipelineUpdateOp(TagsType::ConfigNS,
+                                                                     BSON("ns" << nss.ns()),
+                                                                     tagUpdates,
+                                                                     false /* upsert */,
+                                                                     true /* useMultiUpdate */);
+                    return txnClient.runCRUDOp(tagUpdateRequest, {});
+                })
             .thenRunOn(txnExec)
-            .then([&txnClient, &timers, nss](auto tagsResponse) {
+            .then([&txnClient, timers, nss](auto tagsResponse) {
                 uassertStatusOK(tagsResponse.toStatus());
 
                 LOGV2(5875909,
                       "refineCollectionShardKey: updated zone entries for {namespace}: took "
                       "{durationMillis} ms. Total time taken: {totalTimeMillis} ms.",
                       "refineCollectionShardKey: updated zone entries",
-                      "namespace"_attr = nss.ns(),
-                      "durationMillis"_attr = timers.executionTimer.millis(),
-                      "totalTimeMillis"_attr = timers.totalTimer.millis());
+                      logAttrs(nss),
+                      "durationMillis"_attr = timers->executionTimer.millis(),
+                      "totalTimeMillis"_attr = timers->totalTimer.millis());
 
                 if (MONGO_unlikely(hangRefineCollectionShardKeyBeforeCommit.shouldFail())) {
                     LOGV2(5875910, "Hit hangRefineCollectionShardKeyBeforeCommit failpoint");
@@ -488,33 +344,31 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
             .semi();
     };
 
-    if (feature_flags::gFeatureFlagInternalTransactions.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
-        // The transaction API will use the write concern on the opCtx, which will have the default
-        // sharding wTimeout of 60 seconds. Refining a shard key may involve writing many more
-        // documents than a normal operation, so we override the write concern to not use a
-        // wTimeout, matching the behavior before the API was introduced.
-        WriteConcernOptions originalWC = opCtx->getWriteConcern();
-        opCtx->setWriteConcern(WriteConcernOptions{WriteConcernOptions::kMajority,
-                                                   WriteConcernOptions::SyncMode::UNSET,
-                                                   WriteConcernOptions::kNoTimeout});
-        ON_BLOCK_EXIT([opCtx, originalWC] { opCtx->setWriteConcern(originalWC); });
+    // The transaction API will use the write concern on the opCtx, which will have the default
+    // sharding wTimeout of 60 seconds. Refining a shard key may involve writing many more
+    // documents than a normal operation, so we override the write concern to not use a
+    // wTimeout, matching the behavior before the API was introduced.
+    WriteConcernOptions originalWC = opCtx->getWriteConcern();
+    opCtx->setWriteConcern(WriteConcernOptions{WriteConcernOptions::kMajority,
+                                               WriteConcernOptions::SyncMode::UNSET,
+                                               WriteConcernOptions::kNoTimeout});
+    ON_BLOCK_EXIT([opCtx, originalWC] { opCtx->setWriteConcern(originalWC); });
 
-        withTransactionAPI(opCtx, nss, std::move(updateCollectionAndChunksWithAPIFn));
-    } else {
-        withTransaction(opCtx, nss, std::move(updateCollectionAndChunksFn));
-    }
+    withTransactionAPI(opCtx, nss, std::move(updateCollectionAndChunksWithAPIFn));
 
     ShardingLogging::get(opCtx)->logChange(opCtx,
                                            "refineCollectionShardKey.end",
                                            nss.ns(),
                                            BSONObj(),
-                                           ShardingCatalogClient::kLocalWriteConcern);
+                                           ShardingCatalogClient::kLocalWriteConcern,
+                                           _localConfigShard,
+                                           _localCatalogClient.get());
 
     // Trigger refreshes on each shard containing chunks in the namespace 'nss'. Since this isn't
     // necessary for correctness, all refreshes are best-effort.
     try {
-        triggerFireAndForgetShardRefreshes(opCtx, collType);
+        triggerFireAndForgetShardRefreshes(
+            opCtx, _localConfigShard.get(), _localCatalogClient.get(), collType);
     } catch (const DBException& ex) {
         LOGV2(
             51798,
@@ -522,126 +376,135 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
             "in {namespace}",
             "refineCollectionShardKey: failed to best-effort refresh all shards containing chunks",
             "error"_attr = ex.toStatus(),
-            "namespace"_attr = nss.ns());
+            logAttrs(nss));
     }
 }
-
-void ShardingCatalogManager::updateShardingCatalogEntryForCollectionInTxn(
-    OperationContext* opCtx,
-    const NamespaceString& nss,
-    const CollectionType& coll,
-    const bool upsert,
-    TxnNumber txnNumber) {
-    try {
-        writeToConfigDocumentInTxn(
-            opCtx,
-            CollectionType::ConfigNS,
-            BatchedCommandRequest::buildUpdateOp(CollectionType::ConfigNS,
-                                                 BSON(CollectionType::kNssFieldName << nss.ns()),
-                                                 coll.toBSON(),
-                                                 upsert,
-                                                 false /* multi */
-                                                 ),
-            txnNumber);
-    } catch (DBException& e) {
-        e.addContext("Collection metadata write failed");
-        throw;
-    }
-}
-
 
 void ShardingCatalogManager::configureCollectionBalancing(
     OperationContext* opCtx,
     const NamespaceString& nss,
     boost::optional<int32_t> chunkSizeMB,
     boost::optional<bool> defragmentCollection,
-    boost::optional<bool> enableAutoSplitter) {
-
-    // Hold the FCV region to serialize with the setFeatureCompatibilityVersion command
-    FixedFCVRegion fcvRegion(opCtx);
-    uassert(ErrorCodes::IllegalOperation,
-            "_configsvrConfigureCollectionBalancing can only be run when the cluster is in feature "
-            "compatibility versions greater or equal than 5.3.",
-            serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
-                multiversion::FeatureCompatibilityVersion::kVersion_5_3));
+    boost::optional<bool> enableAutoSplitter,
+    boost::optional<bool> enableAutoMerger) {
 
     uassert(ErrorCodes::InvalidOptions,
             "invalid configure collection balancing update",
             chunkSizeMB || defragmentCollection || enableAutoSplitter);
 
+    // utility lambda to log the change
+    auto logConfigureCollectionBalancing = [&]() {
+        BSONObjBuilder logChangeDetail;
+        if (chunkSizeMB) {
+            logChangeDetail.append("chunkSizeMB", chunkSizeMB.get());
+        }
+
+        if (defragmentCollection) {
+            logChangeDetail.append("defragmentCollection", defragmentCollection.get());
+        }
+
+        if (enableAutoSplitter) {
+            logChangeDetail.append("enableAutoSplitter", enableAutoSplitter.get());
+        }
+
+        ShardingLogging::get(opCtx)->logChange(opCtx,
+                                               "configureCollectionBalancing",
+                                               nss.ns(),
+                                               logChangeDetail.obj(),
+                                               ShardingCatalogClient::kMajorityWriteConcern,
+                                               _localConfigShard,
+                                               _localCatalogClient.get());
+    };
+
     short updatedFields = 0;
     BSONObjBuilder updateCmd;
+    BSONObjBuilder setClauseBuilder;
     {
-        BSONObjBuilder setBuilder(updateCmd.subobjStart("$set"));
         if (chunkSizeMB && *chunkSizeMB != 0) {
-            // verify we got a positive integer in range [1MB, 1GB]
+            auto chunkSizeBytes = static_cast<int64_t>(*chunkSizeMB) * 1024 * 1024;
+            bool withinRange = nss == NamespaceString::kLogicalSessionsNamespace
+                ? (chunkSizeBytes > 0 && chunkSizeBytes <= 1024 * 1024 * 1024)
+                : ChunkSizeSettingsType::checkMaxChunkSizeValid(chunkSizeBytes);
             uassert(ErrorCodes::InvalidOptions,
                     str::stream() << "Chunk size '" << *chunkSizeMB << "' out of range [1MB, 1GB]",
-                    *chunkSizeMB > 0 &&
-                        *chunkSizeMB < std::numeric_limits<int32_t>::max() / (1024 * 1024) &&
-                        ChunkSizeSettingsType::checkMaxChunkSizeValid(*chunkSizeMB * 1024 * 1024));
-            setBuilder.append(CollectionType::kMaxChunkSizeBytesFieldName,
-                              *chunkSizeMB * 1024 * 1024);
+                    withinRange);
+            setClauseBuilder.append(CollectionType::kMaxChunkSizeBytesFieldName, chunkSizeBytes);
             updatedFields++;
         }
         if (defragmentCollection) {
-            bool doDefragmentation = defragmentCollection.get();
+            bool doDefragmentation = defragmentCollection.value();
             if (doDefragmentation) {
-                setBuilder.append(CollectionType::kDefragmentCollectionFieldName,
-                                  doDefragmentation);
+                setClauseBuilder.append(CollectionType::kDefragmentCollectionFieldName,
+                                        doDefragmentation);
                 updatedFields++;
             } else {
                 Balancer::get(opCtx)->abortCollectionDefragmentation(opCtx, nss);
             }
         }
         if (enableAutoSplitter) {
-            bool doSplit = enableAutoSplitter.get();
-            setBuilder.append(CollectionType::kNoAutoSplitFieldName, !doSplit);
+            bool doSplit = enableAutoSplitter.value();
+            setClauseBuilder.append(CollectionType::kNoAutoSplitFieldName, !doSplit);
+            updatedFields++;
+        }
+        if (enableAutoMerger) {
+            setClauseBuilder.append(CollectionType::kEnableAutoMergeFieldName,
+                                    enableAutoMerger.value());
             updatedFields++;
         }
     }
     if (chunkSizeMB && *chunkSizeMB == 0) {
-        BSONObjBuilder unsetBuilder(updateCmd.subobjStart("$unset"));
-        unsetBuilder.append(CollectionType::kMaxChunkSizeBytesFieldName, 0);
+        // Logic to reset the 'maxChunkSizeBytes' field to its default value
+        if (nss == NamespaceString::kLogicalSessionsNamespace) {
+            setClauseBuilder.append(CollectionType::kMaxChunkSizeBytesFieldName,
+                                    logical_sessions::kMaxChunkSizeBytes);
+        } else {
+            BSONObjBuilder unsetClauseBuilder;
+            unsetClauseBuilder.append(CollectionType::kMaxChunkSizeBytesFieldName, 0);
+            updateCmd.append("$unset", unsetClauseBuilder.obj());
+        }
         updatedFields++;
     }
 
     if (updatedFields == 0) {
+        logConfigureCollectionBalancing();
         return;
     }
 
+    updateCmd.append("$set", setClauseBuilder.obj());
     const auto update = updateCmd.obj();
     {
         // Take _kChunkOpLock in exclusive mode to prevent concurrent chunk splits, merges, and
         // migrations
-        Lock::ExclusiveLock lk(opCtx, opCtx->lockState(), _kChunkOpLock);
+        Lock::ExclusiveLock lk(opCtx, _kChunkOpLock);
 
-        withTransaction(
-            opCtx, CollectionType::ConfigNS, [&](OperationContext* opCtx, TxnNumber txnNumber) {
-                const auto query = BSON(CollectionType::kNssFieldName << nss.ns());
-                const auto res = writeToConfigDocumentInTxn(
-                    opCtx,
-                    CollectionType::ConfigNS,
-                    BatchedCommandRequest::buildUpdateOp(CollectionType::ConfigNS,
-                                                         query,
-                                                         update /* update */,
-                                                         false /* upsert */,
-                                                         false /* multi */),
-                    txnNumber);
-                const auto numDocsModified = UpdateOp::parseResponse(res).getN();
-                uassert(ErrorCodes::ConflictingOperationInProgress,
-                        str::stream() << "Expected to match one doc for query " << query
-                                      << " but matched " << numDocsModified,
-                        numDocsModified == 1);
+        withTransaction(opCtx,
+                        CollectionType::ConfigNS,
+                        [this, &nss, &update](OperationContext* opCtx, TxnNumber txnNumber) {
+                            const auto query = BSON(CollectionType::kNssFieldName << nss.ns());
+                            const auto res = writeToConfigDocumentInTxn(
+                                opCtx,
+                                CollectionType::ConfigNS,
+                                BatchedCommandRequest::buildUpdateOp(CollectionType::ConfigNS,
+                                                                     query,
+                                                                     update /* update */,
+                                                                     false /* upsert */,
+                                                                     false /* multi */),
+                                txnNumber);
+                            const auto numDocsModified = UpdateOp::parseResponse(res).getN();
+                            uassert(ErrorCodes::NamespaceNotSharded,
+                                    str::stream() << "Expected to match one doc for query " << query
+                                                  << " but matched " << numDocsModified,
+                                    numDocsModified == 1);
 
-                bumpCollectionMinorVersionInTxn(opCtx, nss, txnNumber);
-            });
+                            bumpCollectionMinorVersionInTxn(opCtx, nss, txnNumber);
+                        });
         // Now any migrations that change the list of shards will see the results of the transaction
         // during refresh, so it is safe to release the chunk lock.
     }
 
-    const auto cm = uassertStatusOK(
-        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx, nss));
+    const auto [cm, _] = uassertStatusOK(
+        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx,
+                                                                                              nss));
     std::set<ShardId> shardsIds;
     cm.getAllShardIds(&shardsIds);
 
@@ -652,7 +515,9 @@ void ShardingCatalogManager::configureCollectionBalancing(
         nss,
         executor);
 
-    Balancer::get(opCtx)->notifyPersistedBalancerSettingsChanged();
+    Balancer::get(opCtx)->notifyPersistedBalancerSettingsChanged(opCtx);
+
+    logConfigureCollectionBalancing();
 }
 
 void ShardingCatalogManager::renameShardedMetadata(
@@ -662,73 +527,108 @@ void ShardingCatalogManager::renameShardedMetadata(
     const WriteConcernOptions& writeConcern,
     boost::optional<CollectionType> optFromCollType) {
     // Take _kChunkOpLock in exclusive mode to prevent concurrent chunk modifications and generate
-    // strictly monotonously increasing collection versions
-    Lock::ExclusiveLock chunkLk(opCtx, opCtx->lockState(), _kChunkOpLock);
-    Lock::ExclusiveLock zoneLk(opCtx, opCtx->lockState(), _kZoneOpLock);
+    // strictly monotonously increasing collection placement versions
+    Lock::ExclusiveLock chunkLk(opCtx, _kChunkOpLock);
+    Lock::ExclusiveLock zoneLk(opCtx, _kZoneOpLock);
 
     std::string logMsg = str::stream() << from << " to " << to;
     if (optFromCollType) {
         // Rename CSRS metadata in case the source collection is sharded
         auto collType = *optFromCollType;
-        sharding_ddl_util::shardedRenameMetadata(opCtx, collType, to, writeConcern);
+        sharding_ddl_util::shardedRenameMetadata(
+            opCtx, _localConfigShard.get(), _localCatalogClient.get(), collType, to, writeConcern);
         ShardingLogging::get(opCtx)->logChange(
             opCtx,
             "renameCollection.metadata",
             str::stream() << logMsg << ": dropped target collection and renamed source collection",
             BSON("newCollMetadata" << collType.toBSON()),
-            ShardingCatalogClient::kLocalWriteConcern);
+            ShardingCatalogClient::kLocalWriteConcern,
+            _localConfigShard,
+            _localCatalogClient.get());
     } else {
         // Remove stale CSRS metadata in case the source collection is unsharded and the
         // target collection was sharded
         // throws if the provided UUID does not match
         sharding_ddl_util::removeCollAndChunksMetadataFromConfig_notIdempotent(
-            opCtx, to, writeConcern);
-        sharding_ddl_util::removeTagsMetadataFromConfig_notIdempotent(opCtx, to, writeConcern);
+            opCtx, _localCatalogClient.get(), to, writeConcern);
+        sharding_ddl_util::removeTagsMetadataFromConfig_notIdempotent(
+            opCtx, _localConfigShard.get(), to, writeConcern);
         ShardingLogging::get(opCtx)->logChange(opCtx,
                                                "renameCollection.metadata",
                                                str::stream()
                                                    << logMsg << " : dropped target collection.",
                                                BSONObj(),
-                                               ShardingCatalogClient::kLocalWriteConcern);
+                                               ShardingCatalogClient::kLocalWriteConcern,
+                                               _localConfigShard,
+                                               _localCatalogClient.get());
     }
 }
 
-void ShardingCatalogManager::updateTimeSeriesGranularity(OperationContext* opCtx,
-                                                         const NamespaceString& nss,
-                                                         BucketGranularityEnum granularity) {
-    const auto cm = uassertStatusOK(
-        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx, nss));
+void ShardingCatalogManager::updateTimeSeriesBucketingParameters(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const CollModTimeseries& timeseriesParameters) {
+    // Take _kChunkOpLock in exclusive mode to prevent concurrent updates of the collection
+    // placement version.
+    Lock::ExclusiveLock lk(opCtx, _kChunkOpLock);
+
+    const auto [cm, _] = uassertStatusOK(
+        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx,
+                                                                                              nss));
     std::set<ShardId> shardIds;
     cm.getAllShardIds(&shardIds);
 
-    withTransaction(
-        opCtx, CollectionType::ConfigNS, [&](OperationContext* opCtx, TxnNumber txnNumber) {
-            // Update granularity value in config.collections.
-            auto granularityFieldName = CollectionType::kTimeseriesFieldsFieldName + "." +
-                TypeCollectionTimeseriesFields::kGranularityFieldName;
-            auto bucketSpanFieldName = CollectionType::kTimeseriesFieldsFieldName + "." +
-                TypeCollectionTimeseriesFields::kBucketMaxSpanSecondsFieldName;
-            auto bucketSpan = timeseries::getMaxSpanSecondsFromGranularity(granularity);
-            writeToConfigDocumentInTxn(
-                opCtx,
-                CollectionType::ConfigNS,
-                BatchedCommandRequest::buildUpdateOp(
+    withTransaction(opCtx,
                     CollectionType::ConfigNS,
-                    BSON(CollectionType::kNssFieldName << nss.ns()) /* query */,
-                    BSON("$set" << BSON(granularityFieldName
-                                        << BucketGranularity_serializer(granularity)
-                                        << bucketSpanFieldName << bucketSpan)) /* update */,
-                    false /* upsert */,
-                    false /* multi */),
-                txnNumber);
+                    [this, &nss, &timeseriesParameters, &shardIds](OperationContext* opCtx,
+                                                                   TxnNumber txnNumber) {
+                        auto granularityFieldName = CollectionType::kTimeseriesFieldsFieldName +
+                            "." + TypeCollectionTimeseriesFields::kGranularityFieldName;
+                        auto bucketSpanFieldName = CollectionType::kTimeseriesFieldsFieldName +
+                            "." + TypeCollectionTimeseriesFields::kBucketMaxSpanSecondsFieldName;
+                        auto bucketRoundingFieldName = CollectionType::kTimeseriesFieldsFieldName +
+                            "." + TypeCollectionTimeseriesFields::kBucketRoundingSecondsFieldName;
 
-            // Bump the chunk version for shards.
-            bumpMajorVersionOneChunkPerShard(opCtx,
-                                             nss,
-                                             txnNumber,
-                                             {std::make_move_iterator(shardIds.begin()),
-                                              std::make_move_iterator(shardIds.end())});
-        });
+                        BSONObjBuilder updateCmd;
+                        BSONObj bucketUp;
+                        if (timeseriesParameters.getGranularity().has_value()) {
+                            auto bucketSpan = timeseries::getMaxSpanSecondsFromGranularity(
+                                timeseriesParameters.getGranularity().get());
+                            updateCmd.append("$unset", BSON(bucketRoundingFieldName << ""));
+                            bucketUp = BSON(granularityFieldName
+                                            << BucketGranularity_serializer(
+                                                   timeseriesParameters.getGranularity().get())
+                                            << bucketSpanFieldName << bucketSpan);
+                        } else {
+                            invariant(timeseriesParameters.getBucketMaxSpanSeconds().has_value() &&
+                                      timeseriesParameters.getBucketRoundingSeconds().has_value());
+                            updateCmd.append("$unset", BSON(granularityFieldName << ""));
+                            bucketUp =
+                                BSON(bucketSpanFieldName
+                                     << timeseriesParameters.getBucketMaxSpanSeconds().get()
+                                     << bucketRoundingFieldName
+                                     << timeseriesParameters.getBucketRoundingSeconds().get());
+                        }
+                        updateCmd.append("$set", bucketUp);
+
+                        writeToConfigDocumentInTxn(
+                            opCtx,
+                            CollectionType::ConfigNS,
+                            BatchedCommandRequest::buildUpdateOp(
+                                CollectionType::ConfigNS,
+                                BSON(CollectionType::kNssFieldName << nss.ns()) /* query */,
+                                updateCmd.obj() /* update */,
+                                false /* upsert */,
+                                false /* multi */),
+                            txnNumber);
+
+                        // Bump the chunk version for shards.
+                        bumpMajorVersionOneChunkPerShard(opCtx,
+                                                         nss,
+                                                         txnNumber,
+                                                         {std::make_move_iterator(shardIds.begin()),
+                                                          std::make_move_iterator(shardIds.end())});
+                    });
 }
 
 }  // namespace mongo

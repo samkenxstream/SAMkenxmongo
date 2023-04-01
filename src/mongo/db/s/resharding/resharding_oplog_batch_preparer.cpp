@@ -31,14 +31,14 @@
 
 #include "mongo/db/s/resharding/resharding_oplog_batch_preparer.h"
 
-#include <third_party/murmurhash3/MurmurHash3.h>
+#include <MurmurHash3.h>
 
 #include "mongo/bson/bsonelement_comparator.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/ops/write_ops_retryability.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/logv2/redaction.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
@@ -140,7 +140,9 @@ WriterVectors ReshardingOplogBatchPreparer::makeCrudOpWriterVectors(
 
             for (const auto& innerOp : applyOpsInfo.getOperations()) {
                 unrolledOp.setDurableReplOperation(repl::DurableReplOperation::parse(
-                    {"ReshardingOplogBatchPreparer::makeCrudOpWriterVectors innerOp"}, innerOp));
+                    IDLParserContext{
+                        "ReshardingOplogBatchPreparer::makeCrudOpWriterVectors innerOp"},
+                    innerOp));
 
                 if (isWouldChangeOwningShardSentinelOplogEntry(unrolledOp)) {
                     continue;
@@ -230,7 +232,8 @@ WriterVectors ReshardingOplogBatchPreparer::makeSessionOpWriterVectors(
 
                 for (const auto& innerOp : applyOpsInfo.getOperations()) {
                     auto replOp = repl::ReplOperation::parse(
-                        {"ReshardingOplogBatchPreparer::makeSessionOpWriterVectors innerOp"},
+                        IDLParserContext{
+                            "ReshardingOplogBatchPreparer::makeSessionOpWriterVectors innerOp"},
                         innerOp);
                     if (replOp.getStatementIds().empty()) {
                         // Skip this operation since it is not retryable.

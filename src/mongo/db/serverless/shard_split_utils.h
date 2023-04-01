@@ -30,9 +30,9 @@
 #pragma once
 
 #include "mongo/client/sdam/topology_listener.h"
+#include "mongo/db/repl/optime_with.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/serverless/shard_split_state_machine_gen.h"
-
 
 namespace mongo {
 namespace serverless {
@@ -64,7 +64,7 @@ repl::ReplSetConfig makeSplitConfig(const repl::ReplSetConfig& config,
 
 /**
  * Inserts the shard split state document 'stateDoc' into
- * 'config.tenantSplitDonors' collection. Also, creates the collection if not present
+ * 'config.shardSplitDonors' collection. Also, creates the collection if not present
  * before inserting the document.
  *
  * NOTE: A state doc might get inserted based on a decision made out of a stale read within a
@@ -97,19 +97,6 @@ Status updateStateDoc(OperationContext* opCtx, const ShardSplitDonorDocument& st
 StatusWith<bool> deleteStateDoc(OperationContext* opCtx, const UUID& shardSplitId);
 
 /**
- * Returns the state doc matching the document with shardSplitId from the disk if it
- * exists. Reads at "no" timestamp i.e, reading with the "latest" snapshot reflecting up to date
- * data.
- *
- * If the stored state doc on disk contains invalid BSON, the 'InvalidBSON' error code is
- * returned.
- *
- * Returns 'NoMatchingDocument' error code if no document with 'shardSplitId' is found.
- */
-StatusWith<ShardSplitDonorDocument> getStateDocument(OperationContext* opCtx,
-                                                     const UUID& shardSplitId);
-
-/**
  * Returns true if the state document should be removed for a shard split recipient which is based
  * on having a local state doc in kBlocking state and having matching recipientSetName matching the
  * config.replSetName.
@@ -134,7 +121,7 @@ public:
     void onServerHeartbeatSucceededEvent(const HostAndPort& hostAndPort, BSONObj reply) final;
 
     // Fulfilled when all nodes have accepted the split.
-    SharedSemiFuture<void> getFuture() const;
+    SharedSemiFuture<HostAndPort> getSplitAcceptedFuture() const;
 
 private:
     mutable Mutex _mutex =
@@ -143,9 +130,8 @@ private:
     bool _fulfilled{false};
     const size_t _numberOfRecipient;
     std::string _recipientSetName;
-    std::map<HostAndPort, std::string> _reportedSetNames;
-    bool _hasPrimary{false};
-    SharedPromise<void> _promise;
+    stdx::unordered_map<HostAndPort, repl::OpTimeWith<std::string>> _reportedSetNames;
+    SharedPromise<HostAndPort> _promise;
 };
 
 }  // namespace serverless

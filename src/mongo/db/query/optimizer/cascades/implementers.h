@@ -39,12 +39,16 @@ namespace mongo::optimizer::cascades {
  *  Adds operator implementation rules for particular group and physical properties. Only add
  * rewrites for newly added logical nodes
  */
-void addImplementers(const Memo& memo,
+void addImplementers(const Metadata& metadata,
+                     const Memo& memo,
                      const QueryHints& hints,
                      const RIDProjectionsMap& ridProjections,
                      PrefixId& prefixId,
-                     PhysOptimizationResult& bestResult,
+                     SpoolIdGenerator& spoolId,
+                     const properties::PhysProps& physProps,
+                     PhysQueueAndImplPos& queue,
                      const properties::LogicalProps& logicalProps,
-                     const OrderPreservingABTSet& logicalNodes);
+                     const OrderPreservingABTSet& logicalNodes,
+                     const PathToIntervalFn& pathToInterval);
 
 }  // namespace mongo::optimizer::cascades

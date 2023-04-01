@@ -2,9 +2,11 @@
  * Test the input/output behavior of some predicates on time-series collections.
  *
  * @tags: [
+ *   # This test depends on certain writes ending up in the same bucket. Stepdowns may result in
+ *   # writes splitting between two primaries, and thus different buckets.
  *   does_not_support_stepdowns,
- *   does_not_support_transactions,
- *   requires_fcv_52,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 (function() {
@@ -17,7 +19,7 @@ const tsColl = db.timeseries_predicates_timeseries;
 coll.drop();
 tsColl.drop();
 assert.commandWorked(
-    db.createCollection(tsColl.getName(), {timeseries: {timeField: 'time', metaField: 'meta'}}));
+    db.createCollection(tsColl.getName(), {timeseries: {timeField: 'time', metaField: 'mt'}}));
 const bucketsColl = db.getCollection('system.buckets.' + tsColl.getName());
 
 // Test that 'predicate' behaves correctly on the example documents,
@@ -39,7 +41,7 @@ function checkPredicateResult(predicate, documents) {
 function checkAllBucketings(predicate, documents) {
     for (const doc of documents) {
         doc._id = ObjectId();
-        doc.time = ISODate();
+        doc.time = doc.time || ISODate();
     }
 
     // For N documents, there are 2^N ways to assign them to buckets A and B.
@@ -86,18 +88,18 @@ checkAllBucketings({x: {$exists: true}}, [
 
 // Test $or...
 {
-    // ... on metric + meta.
+    // ... on metric + mt.
     checkAllBucketings({
         $or: [
             {x: {$lt: 0}},
-            {'meta.y': {$gt: 0}},
+            {'mt.y': {$gt: 0}},
         ]
     },
                        [
-                           {x: +1, meta: {y: -1}},
-                           {x: +1, meta: {y: +1}},
-                           {x: -1, meta: {y: -1}},
-                           {x: -1, meta: {y: +1}},
+                           {x: +1, mt: {y: -1}},
+                           {x: +1, mt: {y: +1}},
+                           {x: -1, mt: {y: -1}},
+                           {x: -1, mt: {y: +1}},
                        ]);
 
     // ... when one argument can't be pushed down.
@@ -131,18 +133,18 @@ checkAllBucketings({x: {$exists: true}}, [
 
 // Test $and...
 {
-    // ... on metric + meta.
+    // ... on metric + mt.
     checkAllBucketings({
         $and: [
             {x: {$lt: 0}},
-            {'meta.y': {$gt: 0}},
+            {'mt.y': {$gt: 0}},
         ]
     },
                        [
-                           {x: +1, meta: {y: -1}},
-                           {x: +1, meta: {y: +1}},
-                           {x: -1, meta: {y: -1}},
-                           {x: -1, meta: {y: +1}},
+                           {x: +1, mt: {y: -1}},
+                           {x: +1, mt: {y: +1}},
+                           {x: -1, mt: {y: -1}},
+                           {x: -1, mt: {y: +1}},
                        ]);
 
     // ... when one argument can't be pushed down.
@@ -180,28 +182,28 @@ checkAllBucketings({
     $or: [
         {
             $and: [
-                {'meta.a': {$gt: 0}},
+                {'mt.a': {$gt: 0}},
                 {'x': {$lt: 0}},
             ]
         },
         {
             $and: [
-                {'meta.b': {$gte: 0}},
+                {'mt.b': {$gte: 0}},
                 {time: {$gt: ISODate('2020-01-01')}},
             ]
         },
     ]
 },
                    [
-                       {meta: {a: -1, b: -1}, x: -1, time: ISODate('2020-02-01')},
-                       {meta: {a: -1, b: -1}, x: -1, time: ISODate('2019-12-31')},
-                       {meta: {a: -1, b: -1}, x: +1, time: ISODate('2020-02-01')},
-                       {meta: {a: -1, b: -1}, x: +1, time: ISODate('2019-12-31')},
+                       {mt: {a: -1, b: -1}, x: -1, time: ISODate('2020-02-01')},
+                       {mt: {a: -1, b: -1}, x: -1, time: ISODate('2019-12-31')},
+                       {mt: {a: -1, b: -1}, x: +1, time: ISODate('2020-02-01')},
+                       {mt: {a: -1, b: -1}, x: +1, time: ISODate('2019-12-31')},
 
-                       {meta: {a: +1, b: -1}, x: -1, time: ISODate('2020-02-01')},
-                       {meta: {a: +1, b: -1}, x: -1, time: ISODate('2019-12-31')},
-                       {meta: {a: +1, b: -1}, x: +1, time: ISODate('2020-02-01')},
-                       {meta: {a: +1, b: -1}, x: +1, time: ISODate('2019-12-31')},
+                       {mt: {a: +1, b: -1}, x: -1, time: ISODate('2020-02-01')},
+                       {mt: {a: +1, b: -1}, x: -1, time: ISODate('2019-12-31')},
+                       {mt: {a: +1, b: -1}, x: +1, time: ISODate('2020-02-01')},
+                       {mt: {a: +1, b: -1}, x: +1, time: ISODate('2019-12-31')},
                    ]);
 
 // Test nested $and / $or where some leaf predicates cannot be pushed down.
@@ -209,27 +211,174 @@ checkAllBucketings({
     $or: [
         {
             $and: [
-                {'meta.a': {$gt: 0}},
+                {'mt.a': {$gt: 0}},
                 {'x': {$exists: false}},
             ]
         },
         {
             $and: [
-                {'meta.b': {$gte: 0}},
+                {'mt.b': {$gte: 0}},
                 {time: {$gt: ISODate('2020-01-01')}},
             ]
         },
     ]
 },
                    [
-                       {meta: {a: -1, b: -1}, time: ISODate('2020-02-01')},
-                       {meta: {a: -1, b: -1}, time: ISODate('2019-12-31')},
-                       {meta: {a: -1, b: -1}, x: 'asdf', time: ISODate('2020-02-01')},
-                       {meta: {a: -1, b: -1}, x: 'asdf', time: ISODate('2019-12-31')},
+                       {mt: {a: -1, b: -1}, time: ISODate('2020-02-01')},
+                       {mt: {a: -1, b: -1}, time: ISODate('2019-12-31')},
+                       {mt: {a: -1, b: -1}, x: 'asdf', time: ISODate('2020-02-01')},
+                       {mt: {a: -1, b: -1}, x: 'asdf', time: ISODate('2019-12-31')},
 
-                       {meta: {a: +1, b: -1}, time: ISODate('2020-02-01')},
-                       {meta: {a: +1, b: -1}, time: ISODate('2019-12-31')},
-                       {meta: {a: +1, b: -1}, x: 'asdf', time: ISODate('2020-02-01')},
-                       {meta: {a: +1, b: -1}, x: 'asdf', time: ISODate('2019-12-31')},
+                       {mt: {a: +1, b: -1}, time: ISODate('2020-02-01')},
+                       {mt: {a: +1, b: -1}, time: ISODate('2019-12-31')},
+                       {mt: {a: +1, b: -1}, x: 'asdf', time: ISODate('2020-02-01')},
+                       {mt: {a: +1, b: -1}, x: 'asdf', time: ISODate('2019-12-31')},
                    ]);
+
+// Test $exists on mt, inside $or.
+checkAllBucketings({
+    $or: [
+        {"mt.a": {$exists: true}},
+        {"x": {$gt: 2}},
+    ]
+},
+                   [
+                       {mt: {a: 1}, x: 1},
+                       {mt: {a: 2}, x: 2},
+                       {mt: {a: 3}, x: 3},
+                       {mt: {a: 4}, x: 4},
+                       {mt: {}, x: 1},
+                       {mt: {}, x: 2},
+                       {mt: {}, x: 3},
+                       {mt: {}, x: 4},
+                   ]);
+
+// Test $in on mt, inside $or.
+checkAllBucketings({
+    $or: [
+        {"mt.a": {$in: [1, 3]}},
+        {"x": {$gt: 2}},
+    ]
+},
+                   [
+                       {mt: {a: 1}, x: 1},
+                       {mt: {a: 2}, x: 2},
+                       {mt: {a: 3}, x: 3},
+                       {mt: {a: 4}, x: 4},
+                       {mt: {}, x: 1},
+                       {mt: {}, x: 2},
+                       {mt: {}, x: 3},
+                       {mt: {}, x: 4},
+                   ]);
+
+// Test geo predicates on mt, inside $or.
+for (const pred of ['$geoWithin', '$geoIntersects']) {
+    checkAllBucketings({
+        $or: [
+            {
+                "mt.location": {
+                    [pred]: {
+                        $geometry: {
+                            type: "Polygon",
+                            coordinates: [[
+                                [0, 0],
+                                [0, 3],
+                                [3, 3],
+                                [3, 0],
+                                [0, 0],
+                            ]]
+                        }
+                    }
+                }
+            },
+            {x: {$gt: 2}},
+        ]
+    },
+                       [
+                           {mt: {location: [1, 1]}, x: 1},
+                           {mt: {location: [1, 1]}, x: 2},
+                           {mt: {location: [1, 1]}, x: 3},
+                           {mt: {location: [1, 1]}, x: 4},
+                           {mt: {location: [5, 5]}, x: 1},
+                           {mt: {location: [5, 5]}, x: 2},
+                           {mt: {location: [5, 5]}, x: 3},
+                           {mt: {location: [5, 5]}, x: 4},
+                       ]);
+}
+
+// Test $mod on mt, inside $or.
+// $mod is an example of a predicate that we don't handle specially in time-series optimizations:
+// it can be pushed down if and only if it's on a metadata field.
+checkAllBucketings({
+    $or: [
+        {"mt.a": {$mod: [2, 0]}},
+        {"x": {$gt: 4}},
+    ]
+},
+                   [
+                       {mt: {a: 1}, x: 1},
+                       {mt: {a: 2}, x: 2},
+                       {mt: {a: 3}, x: 3},
+                       {mt: {a: 4}, x: 4},
+                       {mt: {a: 5}, x: 5},
+                       {mt: {a: 6}, x: 6},
+                       {mt: {a: 7}, x: 7},
+                       {mt: {a: 8}, x: 8},
+                   ]);
+
+// Test $elemMatch on mt, inside $or.
+checkAllBucketings({
+    $or: [
+        {"mt.a": {$elemMatch: {b: 3}}},
+        {"x": {$gt: 4}},
+    ]
+},
+                   [
+                       {x: 1, mt: {a: []}},
+                       {x: 2, mt: {a: [{b: 2}]}},
+                       {x: 3, mt: {a: [{b: 3}]}},
+                       {x: 4, mt: {a: [{b: 2}, {b: 3}]}},
+                       {x: 5, mt: {a: []}},
+                       {x: 6, mt: {a: [{b: 2}]}},
+                       {x: 7, mt: {a: [{b: 3}]}},
+                       {x: 8, mt: {a: [{b: 2}, {b: 3}]}},
+                   ]);
+checkAllBucketings({
+    $or: [
+        {"mt.a": {$elemMatch: {b: 2, c: 3}}},
+        {"x": {$gt: 3}},
+    ]
+},
+                   [
+                       {x: 1, mt: {a: []}},
+                       {x: 2, mt: {a: [{b: 2, c: 3}]}},
+                       {x: 3, mt: {a: [{b: 2}, {c: 3}]}},
+                       {x: 4, mt: {a: []}},
+                       {x: 5, mt: {a: [{b: 2, c: 3}]}},
+                       {x: 6, mt: {a: [{b: 2}, {c: 3}]}},
+                   ]);
+
+// Test a standalone $elemMatch on mt.
+checkAllBucketings({"mt.a": {$elemMatch: {b: 3}}}, [
+    {mt: {a: []}},
+    {mt: {a: [{b: 2}]}},
+    {mt: {a: [{b: 3}]}},
+    {mt: {a: [{b: 2}, {b: 3}]}},
+    {mt: {a: []}},
+    {mt: {a: [{b: 2}]}},
+    {mt: {a: [{b: 3}]}},
+    {mt: {a: [{b: 2}, {b: 3}]}},
+]);
+
+// Test a standalone $size on mt.
+checkAllBucketings({"mt.a": {$size: 1}}, [
+    {mt: {a: []}},
+    {mt: {a: [{b: 2}]}},
+    {mt: {a: [{b: 3}]}},
+    {mt: {a: [{b: 2}, {b: 3}]}},
+    {mt: {a: []}},
+    {mt: {a: [{b: 2}]}},
+    {mt: {a: [{b: 3}]}},
+    {mt: {a: [{b: 2}, {b: 3}]}},
+]);
 })();

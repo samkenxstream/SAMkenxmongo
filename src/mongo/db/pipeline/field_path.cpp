@@ -54,7 +54,12 @@ const StringDataSet kAllowedDollarPrefixedFields = {
     "$sortKey",
 
     // This is necessary for the "showRecordId" feature.
-    "$recordId"};
+    "$recordId",
+
+    // This is necessary for $search queries with a specified sort.
+    "$searchSortValues"_sd,
+    "$searchScore"_sd,
+};
 
 }  // namespace
 
@@ -69,10 +74,8 @@ string FieldPath::getFullyQualifiedPath(StringData prefix, StringData suffix) {
     return str::stream() << prefix << "." << suffix;
 }
 
-FieldPath::FieldPath(std::string inputPath)
-    : _fieldPath(std::move(inputPath)),
-      _fieldPathDotPosition{string::npos},
-      _fieldHash{kHashUninitialized} {
+FieldPath::FieldPath(std::string inputPath, bool precomputeHashes)
+    : _fieldPath(std::move(inputPath)), _fieldPathDotPosition{string::npos} {
     uassert(40352, "FieldPath cannot be constructed with empty string", !_fieldPath.empty());
     uassert(40353, "FieldPath must not end with a '.'.", _fieldPath[_fieldPath.size() - 1] != '.');
 
@@ -81,31 +84,28 @@ FieldPath::FieldPath(std::string inputPath)
     size_t startPos = 0;
     while (string::npos != (dotPos = _fieldPath.find('.', startPos))) {
         _fieldPathDotPosition.push_back(dotPos);
-        _fieldHash.push_back(kHashUninitialized);
         startPos = dotPos + 1;
     }
 
     _fieldPathDotPosition.push_back(_fieldPath.size());
 
-    // Validate the path length and the fields.
+    // Validate the path length and the fields, and precompute their hashes if requested.
     const auto pathLength = getPathLength();
     uassert(ErrorCodes::Overflow,
             "FieldPath is too long",
             pathLength <= BSONDepth::getMaxAllowableDepth());
+    _fieldHash.reserve(pathLength);
     for (size_t i = 0; i < pathLength; ++i) {
-        uassertValidFieldName(getFieldName(i));
+        const auto& fieldName = getFieldName(i);
+        uassertValidFieldName(fieldName);
+        _fieldHash.push_back(precomputeHashes ? FieldNameHasher()(fieldName) : kHashUninitialized);
     }
 }
 
 void FieldPath::uassertValidFieldName(StringData fieldName) {
     uassert(15998, "FieldPath field names may not be empty strings.", !fieldName.empty());
 
-    const auto dotsAndDollarsHint =
-        serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-            serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
-                multiversion::FeatureCompatibilityVersion::kFullyDowngradedTo_5_0)
-        ? " Consider using $getField or $setField."
-        : "";
+    const auto dotsAndDollarsHint = " Consider using $getField or $setField.";
 
     if (fieldName[0] == '$' && !kAllowedDollarPrefixedFields.count(fieldName)) {
         uasserted(16410,
@@ -163,5 +163,19 @@ FieldPath FieldPath::concat(const FieldPath& tail) const {
     invariant(newHashes.size() == expectedDotSize - 1);
 
     return FieldPath(std::move(concat), std::move(newDots), std::move(newHashes));
+}
+
+std::string FieldPath::redactedFullPath(SerializationOptions opts) const {
+    if (!opts.redactFieldNames) {
+        return fullPath();
+    }
+    std::stringstream redacted;
+    for (size_t i = 0; i < getPathLength(); ++i) {
+        if (i > 0) {
+            redacted << ".";
+        }
+        redacted << opts.redactFieldNamesStrategy(getFieldName(i));
+    }
+    return redacted.str();
 }
 }  // namespace mongo

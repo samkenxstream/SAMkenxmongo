@@ -1,9 +1,8 @@
 /**
  * Verifies that the validate hook is able to upgrade the feature compatibility version of the
- * server regardless of what state any previous upgrades or downgrades have left it in.
+ * server regardless of what state any previous upgrades or downgrades have left it in (besides
+ * the isCleaningServerMetadata state, where we must complete the downgrade before upgrading).
  */
-
-load("jstests/libs/logv2_helpers.js");
 
 // The global 'db' variable is used by the data consistency hooks.
 var db;
@@ -16,41 +15,22 @@ var db;
 TestData.skipCollectionAndIndexValidation = true;
 
 function makePatternForValidate(dbName, collName) {
-    if (isJsonLogNoConn()) {
-        return new RegExp(
-            `Slow query.*"ns":"${
-                dbName}\\.\\$cmd","appName":"MongoDB Shell","command":{"validate":"${collName}"`,
-            "g");
-    }
-
-    return new RegExp("COMMAND.*command " + dbName +
-                          "\\.\\$cmd appName: \"MongoDB Shell\" command: validate { validate: \"" +
-                          collName + "\"",
-                      "g");
+    return new RegExp(
+        `Slow query.*"ns":"${dbName}\\.\\$cmd","appName":"MongoDB Shell","command":{"validate":"${
+            collName}"`,
+        "g");
 }
 
 function makePatternForSetFCV(targetVersion) {
-    if (isJsonLogNoConn()) {
-        return new RegExp(
-            `Slow query.*"appName":"MongoDB Shell","command":{"setFeatureCompatibilityVersion":"${
-                targetVersion}"`,
-            "g");
-    }
     return new RegExp(
-        "COMMAND.*command.*appName: \"MongoDB Shell\" command: setFeatureCompatibilityVersion" +
-            " { setFeatureCompatibilityVersion: \"" + targetVersion + "\"",
+        `Slow query.*"appName":"MongoDB Shell","command":{"setFeatureCompatibilityVersion":"${
+            targetVersion}"`,
         "g");
 }
 
 function makePatternForSetParameter(paramName) {
-    if (isJsonLogNoConn()) {
-        return new RegExp(
-            `Slow query.*"appName":"MongoDB Shell","command":{"setParameter":1,"${paramName}":`,
-            "g");
-    }
-    return new RegExp("COMMAND.*command.*appName: \"MongoDB Shell\" command: setParameter" +
-                          " { setParameter: 1\\.0, " + paramName + ":",
-                      "g");
+    return new RegExp(
+        `Slow query.*"appName":"MongoDB Shell","command":{"setParameter":1,"${paramName}":`, "g");
 }
 
 function countMatches(pattern, output) {
@@ -163,9 +143,26 @@ function forceInterruptedUpgradeOrDowngrade(conn, targetVersion) {
                 conn.adminCommand({getParameter: 1, featureCompatibilityVersion: 1}));
 
             if (res.featureCompatibilityVersion.hasOwnProperty("targetVersion")) {
-                checkFCV(conn.getDB("admin"), lastLTSFCV, targetVersion);
-                jsTest.log(`Reached partially downgraded state after ${attempts} attempts`);
-                return true;
+                const fcvDoc = conn.getDB("admin")
+                                   .system.version.find({_id: "featureCompatibilityVersion"})
+                                   .limit(1)
+                                   .readConcern("local")
+                                   .next();
+                if (fcvDoc.isCleaningServerMetadata) {
+                    checkFCV(conn.getDB("admin"),
+                             lastLTSFCV,
+                             targetVersion,
+                             true /*isCleaningServerMetadata*/);
+                    // If the setFCV command was interrupted while in the isCleaningServerMetadata
+                    // state, we must complete the FCV downgrade successfully.
+                    assert.commandWorked(
+                        conn.adminCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
+
+                } else {
+                    checkFCV(conn.getDB("admin"), lastLTSFCV, targetVersion);
+                    jsTest.log(`Reached partially downgraded state after ${attempts} attempts`);
+                    return true;
+                }
             }
 
             // Either upgrade the feature compatibility version so we can try downgrading again,

@@ -3,6 +3,4 @@ set -o errexit
 BASEDIR=$(dirname "$0")
 cd "$BASEDIR/../"
 
-find buildscripts etc jstests -name '*.y*ml' -exec yamllint -c etc/yamllint_config.yml {} +
-# TODO: Uncomment this line.
-#python -m evergreen_lint -c ./etc/evergreen_lint.yml lint
+yamllint -c etc/yamllint_config.yml buildscripts etc jstests

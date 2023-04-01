@@ -9,23 +9,21 @@
  * because the recipient will invalidate its in-memory understanding and refetch the on-disk
  * transaction state instead.
  *
- * Note: this test is designed to emulate a back-and-forth migration from donor to recipient,
- * recipient to donor, then donor to recipient again.
+ * Note: incompatible_with_shard_merge because (1) this test runs back-to-back migrations, and
+ * (2) because of the two-phase nature of the database drop between migrations, wt files will
+ * still be present on the recipient during the second migration, leading to errors.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
+ *   incompatible_with_shard_merge,
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/replsets/libs/tenant_migration_test.js");
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/replsets/rslib.js");
 load("jstests/libs/uuid_util.js");
 
@@ -35,7 +33,7 @@ const setParameterOpts = {
 const tenantMigrationTest =
     new TenantMigrationTest({name: jsTestName(), sharedOptions: {setParameter: setParameterOpts}});
 
-const tenantId = "testTenantId";
+const tenantId = ObjectId().str;
 const tenantDB = tenantMigrationTest.tenantDB(tenantId, "testDB");
 const collName = "testColl";
 const transactionsNS = "config.transactions";
@@ -113,4 +111,3 @@ const migrationOpts2 = {
 TenantMigrationTest.assertCommitted(tenantMigrationTest.runMigration(migrationOpts2));
 
 tenantMigrationTest.stop();
-})();

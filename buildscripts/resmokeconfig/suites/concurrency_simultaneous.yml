@@ -39,7 +39,8 @@ selector:
   - uses_transactions
   - requires_replication
   - requires_sharding
-  - disabled_due_to_server_61671
+  - incompatible_with_concurrency_simultaneous
+
   group_size: 10
   group_count_multiplier: 2.5
 
@@ -68,5 +69,6 @@ executor:
         # system running out of WiredTiger write tickets. We intentionally lower the number of
         # WiredTiger write tickets available to below the maximum number of database clients to
         # trigger this situation at least some of the time.
+        storageEngineConcurrencyAdjustmentAlgorithm: ""
         wiredTigerConcurrentWriteTransactions: 64
         roleGraphInvalidationIsFatal: 1

@@ -3,6 +3,13 @@
 set -o errexit
 set -o xtrace
 
+mongo="$(pwd)/dist-test/bin/mongo"
+export PATH="$(dirname "$mongo"):$PATH"
+if [ ! -f "$mongo" ]; then
+  echo "Mongo shell at $mongo is missing"
+  exit 1
+fi
+
 function print() {
   echo "$@" >&2
 }
@@ -19,7 +26,7 @@ if [ ! -f "$TEST_PATH" ]; then
 fi
 
 # test file is even good before going on
-if ! mongo --nodb --norc --quiet "$TEST_PATH"; then
+if ! "$mongo" --nodb --norc --quiet "$TEST_PATH"; then
   print "File $TEST_PATH has syntax errors"
   exit 1
 fi
@@ -36,20 +43,19 @@ sudo --non-interactive bash -c '
 
     rm -rf /etc/sysconfig/mongod /etc/mongod
 
-    setsebool mongod_can_connect_snmp off
     setsebool mongod_can_connect_ldap off
     setsebool mongod_can_use_kerberos off
 '
 
 # create mongo config
-mongo --nodb --norc --quiet --eval='
+"$mongo" --nodb --norc --quiet --eval='
     assert(load("'"$TEST_PATH"'"));
     const test = new TestDefinition();
     print(typeof(test.config) === "string" ? test.config : JSON.stringify(test.config, null, 2));
 ' | sudo --non-interactive tee /etc/mongod.conf
 
 # setup
-mongo --nodb --norc --quiet --eval='
+"$mongo" --nodb --norc --quiet --eval='
     assert(load("'"$TEST_PATH"'"));
     const test = new TestDefinition();
     jsTest.log("Running setup()");
@@ -67,18 +73,18 @@ tsj="$(date --utc --date='1 seconds ago' +'%Y-%m-%d %H:%M:%S')"
 sudo --non-interactive systemctl start mongod \
   && sudo --non-interactive systemctl status mongod || (
   set +o errexit
-  echo "=== SELinux errors:"
+  echo "================== SELinux errors: =================="
   sudo --non-interactive ausearch -m AVC,USER_AVC,SELINUX_ERR,USER_SELINUX_ERR -ts $ts
-  echo "=== journalctl --unit=mongod:"
-  sudo --non-interactive journalctl --no-pager --since="$tsj" --unit=mongod --unit=systemd --catalog
-  echo "=== /var/log/mongodb/mongod.log:"
+  echo "================== journalctl =================="
+  sudo --non-interactive journalctl --no-pager --catalog --since="$tsj" | grep -i mongo
+  echo "================== /var/log/mongodb/mongod.log =================="
   sudo --non-interactive cat /var/log/mongodb/mongod.log
   echo "==== FAIL: mongod service was not started successfully"
   exit 1
 )
 
 # run test and teardown
-mongo --norc --gssapiServiceName=mockservice --eval='
+"$mongo" --norc --gssapiServiceName=mockservice --eval='
     assert(load("'"$TEST_PATH"'"));
     // name is such to prevent collisions
     const test_812de7ce = new TestDefinition();

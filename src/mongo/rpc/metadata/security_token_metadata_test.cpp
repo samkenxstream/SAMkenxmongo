@@ -31,12 +31,13 @@
 
 #include "mongo/bson/oid.h"
 #include "mongo/crypto/sha256_block.h"
-#include "mongo/db/auth/security_token.h"
 #include "mongo/db/auth/security_token_gen.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/locker_noop_service_context_test_fixture.h"
 #include "mongo/db/multitenancy_gen.h"
 #include "mongo/db/tenant_id.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/rpc/op_msg_test.h"
 #include "mongo/unittest/unittest.h"
 
@@ -51,46 +52,63 @@ BSONObj makeSecurityToken(const UserName& userName) {
     constexpr auto authUserFieldName = auth::SecurityToken::kAuthenticatedUserFieldName;
     auto authUser = userName.toBSON(true /* serialize token */);
     ASSERT_EQ(authUser["tenant"_sd].type(), jstOID);
-    return auth::signSecurityToken(BSON(authUserFieldName << authUser));
+    using VTS = auth::ValidatedTenancyScope;
+    return VTS(BSON(authUserFieldName << authUser), VTS::TokenForTestingTag{})
+        .getOriginalToken()
+        .getOwned();
 }
 
-class SecurityTokenMetadataTest : public LockerNoopServiceContextTest {};
+class SecurityTokenMetadataTest : public LockerNoopServiceContextTest {
+protected:
+    void setUp() final {
+        client = getServiceContext()->makeClient("test");
+    }
+
+    ServiceContext::UniqueClient client;
+};
 
 TEST_F(SecurityTokenMetadataTest, SecurityTokenNotAccepted) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest securityTokenController("featureFlagSecurityToken", false);
+
     const auto kPingBody = BSON(kPingFieldName << 1);
     const auto kTokenBody = makeSecurityToken(UserName("user", "admin", TenantId(OID::gen())));
 
-    gMultitenancySupport = false;
     auto msgBytes = OpMsgBytes{0, kBodySection, kPingBody, kSecurityTokenSection, kTokenBody};
     ASSERT_THROWS_CODE_AND_WHAT(msgBytes.parse(),
                                 DBException,
-                                ErrorCodes::Unauthorized,
-                                "Unsupported Security Token provided");
+                                ErrorCodes::InvalidOptions,
+                                "Multitenancy not enabled, refusing to accept securityToken");
 }
 
 TEST_F(SecurityTokenMetadataTest, BasicSuccess) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest securityTokenController("featureFlagSecurityToken", true);
+
     const auto kTenantId = TenantId(OID::gen());
     const auto kPingBody = BSON(kPingFieldName << 1);
     const auto kTokenBody = makeSecurityToken(UserName("user", "admin", kTenantId));
 
-    gMultitenancySupport = true;
     auto msg = OpMsgBytes{0, kBodySection, kPingBody, kSecurityTokenSection, kTokenBody}.parse();
     ASSERT_BSONOBJ_EQ(msg.body, kPingBody);
     ASSERT_EQ(msg.sequences.size(), 0u);
-    ASSERT_BSONOBJ_EQ(msg.securityToken, kTokenBody);
+    ASSERT_TRUE(msg.validatedTenancyScope != boost::none);
+    ASSERT_BSONOBJ_EQ(msg.validatedTenancyScope->getOriginalToken(), kTokenBody);
+    ASSERT_EQ(msg.validatedTenancyScope->tenantId(), kTenantId);
 
     auto opCtx = makeOperationContext();
-    ASSERT(auth::getSecurityToken(opCtx.get()) == boost::none);
+    ASSERT(auth::ValidatedTenancyScope::get(opCtx.get()) == boost::none);
 
-    auth::readSecurityTokenMetadata(opCtx.get(), msg.securityToken);
-    auto token = auth::getSecurityToken(opCtx.get());
+    auth::ValidatedTenancyScope::set(opCtx.get(), msg.validatedTenancyScope);
+    auto token = auth::ValidatedTenancyScope::get(opCtx.get());
     ASSERT(token != boost::none);
 
-    auto authedUser = token->getAuthenticatedUser();
+    ASSERT_TRUE(token->hasAuthenticatedUser());
+    auto authedUser = token->authenticatedUser();
     ASSERT_EQ(authedUser.getUser(), "user");
     ASSERT_EQ(authedUser.getDB(), "admin");
     ASSERT_TRUE(authedUser.getTenant() != boost::none);
-    ASSERT_EQ(authedUser.getTenant().get(), kTenantId);
+    ASSERT_EQ(authedUser.getTenant().value(), kTenantId);
 }
 
 }  // namespace

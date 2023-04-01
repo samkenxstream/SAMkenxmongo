@@ -2,17 +2,13 @@
 
 /**
  * @tags: [
- *  featureFlagFLE2,
+ * assumes_unsharded_collection
  * ]
  */
 load("jstests/fle2/libs/encrypted_client_util.js");
 
 (function() {
 'use strict';
-
-if (!isFLE2Enabled()) {
-    return;
-}
 
 let dbTest = db.getSiblingDB('create_encrypted_collection_db');
 
@@ -46,12 +42,52 @@ assert.commandFailedWithCode(
     6367301,
     "Create with encryptedFields and capped passed");
 
+assert.commandFailedWithCode(
+    dbTest.createCollection("basic",
+                            {validationAction: "warn", encryptedFields: sampleEncryptedFields}),
+    ErrorCodes.BadValue);
+
+assert.commandFailedWithCode(
+    dbTest.createCollection("basic",
+                            {encryptedFields: sampleEncryptedFields, validationLevel: "off"}),
+    ErrorCodes.BadValue);
+
+assert.commandFailedWithCode(
+    dbTest.createCollection("basic",
+                            {encryptedFields: sampleEncryptedFields, validationLevel: "moderate"}),
+    ErrorCodes.BadValue);
+
 assert.commandWorked(dbTest.createCollection("basic", {encryptedFields: sampleEncryptedFields}));
 
 const result = dbTest.getCollectionInfos({name: "basic"});
-print("result" + tojson(result));
 const ef = result[0].options.encryptedFields;
-assert.eq(ef.escCollection, "fle2.basic.esc");
-assert.eq(ef.eccCollection, "fle2.basic.ecc");
-assert.eq(ef.ecocCollection, "fle2.basic.ecoc");
+assert.eq(ef.escCollection, "enxcol_.basic.esc");
+
+// TODO SERVER-73303 remove when V2 is enabled
+if (!isFLE2ProtocolVersion2Enabled()) {
+    assert.eq(ef.eccCollection, "enxcol_.basic.ecc");
+}
+assert.eq(ef.ecocCollection, "enxcol_.basic.ecoc");
+
+assert.commandWorked(dbTest.createCollection("basic_int64_cf", {
+    encryptedFields: {
+        "fields": [{
+            "path": "firstName",
+            "keyId": UUID("11d58b8a-0c6c-4d69-a0bd-70c6d9befae9"),
+            "bsonType": "string",
+            "queries": {"queryType": "equality", contention: NumberLong(123)}
+        }]
+    }
+}));
+
+assert.commandWorked(dbTest.createCollection("basic_int32_cf", {
+    encryptedFields: {
+        "fields": [{
+            "path": "firstName",
+            "keyId": UUID("11d58b8a-0c6c-4d69-a0bd-70c6d9befae9"),
+            "bsonType": "string",
+            "queries": {"queryType": "equality", contention: NumberInt(123)}
+        }]
+    }
+}));
 }());

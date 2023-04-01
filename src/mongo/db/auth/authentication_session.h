@@ -42,6 +42,17 @@ namespace mongo {
 
 class Client;
 
+class AuthMetricsRecorder {
+public:
+    void restart();
+    BSONObj capture();
+    void appendMetric(const BSONObj& metric);
+
+private:
+    Timer _timer;
+    BSONArrayBuilder _appendedMetrics;
+};
+
 /**
  * Type representing an ongoing authentication session.
  */
@@ -133,6 +144,13 @@ public:
     }
 
     /**
+     * This returns the last processed step of this session.
+     */
+    boost::optional<StepType> getLastStep() const {
+        return _lastStep;
+    }
+
+    /**
      * Set the mechanism name for this session.
      *
      * If the mechanism name is not recognized, this will throw.
@@ -145,7 +163,7 @@ public:
      * The database will be validated against the current database for this session.
      */
     void updateDatabase(StringData database) {
-        updateUserName(UserName("", database.toString()));
+        updateUserName(UserName("", database.toString()), false /* isMechX509 */);
     }
 
     /**
@@ -153,7 +171,7 @@ public:
      *
      * The user name will be validated against the current user name for this session.
      */
-    void updateUserName(UserName userName);
+    void updateUserName(UserName userName, bool isMechX509);
 
     /**
      * Set the last user name used with `saslSupportedMechs` for this session.
@@ -188,6 +206,14 @@ public:
     void markFailed(const Status& status);
 
     /**
+     * Returns the metrics recorder for this Authentication Session.
+     * The session retains ownership of this pointer.
+     */
+    AuthMetricsRecorder* metrics() {
+        return &_metricsRecorder;
+    }
+
+    /**
      * This function invokes a functor with a StepGuard on the stack and observes any exceptions
      * emitted.
      */
@@ -199,10 +225,17 @@ public:
         try {
             return std::forward<F>(f)(session);
         } catch (const DBException& ex) {
-            session->markFailed(ex.toStatus());
+            bool specAuthFailed = ex.toStatus().code() == ErrorCodes::Error::AuthenticationFailed &&
+                (state == StepType::kSpeculativeAuthenticate ||
+                 state == StepType::kSpeculativeSaslStart);
+            // If speculative authentication failed, then we do not want to mark the session as
+            // failed in order to allow the session to persist into another authentication
+            // attempt. If we ran into an exception for another reason, mark the session as failed.
+            if (!specAuthFailed) {
+                session->markFailed(ex.toStatus());
+            }
             throw;
         } catch (...) {
-            // Swallow other errors.
             session->markFailed(
                 Status(ErrorCodes::InternalError, "Encountered an unhandleable error"));
             throw;
@@ -235,7 +268,7 @@ private:
     static boost::optional<AuthenticationSession>& _get(Client* client);
 
     void _finish();
-    void _verifyUserNameFromSaslSupportedMechanisms(const UserName& user);
+    void _verifyUserNameFromSaslSupportedMechanisms(const UserName& user, bool isMechX509);
 
     Client* const _client;
 
@@ -255,6 +288,7 @@ private:
     // certificate. If we have a authN mechanism, we use its principal name instead.
     UserName _userName;
     std::unique_ptr<ServerMechanismBase> _mech;
+    AuthMetricsRecorder _metricsRecorder;
 };
 
 }  // namespace mongo

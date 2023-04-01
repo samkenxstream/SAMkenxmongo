@@ -27,17 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <memory>
-
+#include "mongo/db/repl/mock_repl_coord_server_fixture.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
-#include "mongo/db/repl/mock_repl_coord_server_fixture.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
@@ -47,6 +44,7 @@
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/storage/snapshot_manager.h"
 
 namespace mongo {
 
@@ -82,14 +80,21 @@ void MockReplCoordServerFixture::setUp() {
 
     // Note: internal code does not allow implicit creation of non-capped oplog collection.
     DBDirectClient client(opCtx());
-    ASSERT_TRUE(
-        client.createCollection(NamespaceString::kRsOplogNamespace.ns(), 1024 * 1024, true));
+    ASSERT_TRUE(client.createCollection(NamespaceString::kRsOplogNamespace, 1024 * 1024, true));
 
     repl::acquireOplogCollectionForLogging(opCtx());
 
     repl::DropPendingCollectionReaper::set(
         service,
         std::make_unique<repl::DropPendingCollectionReaper>(repl::StorageInterface::get(service)));
+
+    // Set a committed snapshot so that we can perform majority reads.
+    WriteUnitOfWork wuow{_opCtx.get()};
+    if (auto snapshotManager =
+            _opCtx->getServiceContext()->getStorageEngine()->getSnapshotManager()) {
+        snapshotManager->setCommittedSnapshot(repl::getNextOpTime(_opCtx.get()).getTimestamp());
+    }
+    wuow.commit();
 }
 
 void MockReplCoordServerFixture::insertOplogEntry(const repl::OplogEntry& entry) {
@@ -97,10 +102,11 @@ void MockReplCoordServerFixture::insertOplogEntry(const repl::OplogEntry& entry)
     ASSERT_TRUE(coll);
 
     WriteUnitOfWork wuow(opCtx());
-    auto status = coll->insertDocument(opCtx(),
-                                       InsertStatement(entry.getEntry().toBSON()),
-                                       &CurOp::get(opCtx())->debug(),
-                                       /* fromMigrate */ false);
+    auto status = collection_internal::insertDocument(opCtx(),
+                                                      *coll,
+                                                      InsertStatement(entry.getEntry().toBSON()),
+                                                      &CurOp::get(opCtx())->debug(),
+                                                      /* fromMigrate */ false);
     ASSERT_OK(status);
     wuow.commit();
 }

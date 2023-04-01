@@ -28,8 +28,6 @@
  */
 #include "mongo/client/sdam/server_selector.h"
 
-#include <boost/optional/optional_io.hpp>
-
 #include "mongo/client/sdam/sdam_test_base.h"
 #include "mongo/client/sdam/server_description_builder.h"
 #include "mongo/client/sdam/topology_description.h"
@@ -656,7 +654,9 @@ TEST_F(ServerSelectorTestFixture, ShouldFilterByTags) {
     tags = TagSets::eastOrWestProductionSet;
     servers = makeServerDescriptionList();
     selector.filterTags(&servers, tags);
-    ASSERT_EQ(2, servers.size());
+    ASSERT_EQ(1, servers.size());
+    ASSERT_EQ((std::map<std::string, std::string>{{"dc", "east"}, {"usage", "production"}}),
+              servers[0]->getTags());
 
     tags = TagSets::testSet;
     servers = makeServerDescriptionList();

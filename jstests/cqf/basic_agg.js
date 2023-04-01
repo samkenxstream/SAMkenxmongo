@@ -10,33 +10,39 @@ if (!checkCascadesOptimizerEnabled(db)) {
 const coll = db.cqf_basic_index;
 coll.drop();
 
-assert.commandWorked(
-    coll.insert([{a: {b: 1}}, {a: {b: 2}}, {a: {b: 3}}, {a: {b: 4}}, {a: {b: 5}}]));
+const documents = [{a: {b: 1}}, {a: {b: 2}}, {a: {b: 3}}, {a: {b: 4}}, {a: {b: 5}}];
 
-const extraDocCount = 50;
+const extraDocCount = 500;
 // Add extra docs to make sure indexes can be picked.
 for (let i = 0; i < extraDocCount; i++) {
-    assert.commandWorked(coll.insert({a: {b: i + 10}}));
+    documents.push({a: {b: i + 10}});
 }
+
+assert.commandWorked(coll.insertMany(documents));
+
 assert.commandWorked(coll.createIndex({'a.b': 1}));
 
 let res = coll.explain("executionStats").aggregate([{$match: {'a.b': 2}}]);
 assert.eq(1, res.executionStats.nReturned);
-assert.eq("IndexScan", res.queryPlanner.winningPlan.optimizerPlan.child.leftChild.nodeType);
+assertValueOnPlanPath("IndexScan", res, "child.leftChild.nodeType");
 
 res = coll.explain("executionStats").aggregate([{$match: {'a.b': {$gt: 2}}}]);
 assert.eq(3 + extraDocCount, res.executionStats.nReturned);
-assert.eq("PhysicalScan", res.queryPlanner.winningPlan.optimizerPlan.child.child.nodeType);
+assertValueOnPlanPath("PhysicalScan", res, "child.child.nodeType");
 
 res = coll.explain("executionStats").aggregate([{$match: {'a.b': {$gte: 2}}}]);
 assert.eq(4 + extraDocCount, res.executionStats.nReturned);
-assert.eq("PhysicalScan", res.queryPlanner.winningPlan.optimizerPlan.child.child.nodeType);
+assertValueOnPlanPath("PhysicalScan", res, "child.child.nodeType");
 
 res = coll.explain("executionStats").aggregate([{$match: {'a.b': {$lt: 2}}}]);
 assert.eq(1, res.executionStats.nReturned);
-assert.eq("IndexScan", res.queryPlanner.winningPlan.optimizerPlan.child.leftChild.nodeType);
+assertValueOnPlanPath("IndexScan", res, "child.leftChild.nodeType");
 
 res = coll.explain("executionStats").aggregate([{$match: {'a.b': {$lte: 2}}}]);
 assert.eq(2, res.executionStats.nReturned);
-assert.eq("IndexScan", res.queryPlanner.winningPlan.optimizerPlan.child.leftChild.nodeType);
+assertValueOnPlanPath("IndexScan", res, "child.leftChild.nodeType");
+
+res = coll.explain("executionStats").aggregate([{$match: {$and: [{'a.b': 2}]}}]);
+assert.eq(1, res.executionStats.nReturned);
+assertValueOnPlanPath("IndexScan", res, "child.leftChild.nodeType");
 }());

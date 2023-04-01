@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/platform/basic.h"
 
@@ -52,6 +51,7 @@
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/auth/user_document_parser.h"
 #include "mongo/db/auth/user_management_commands_parser.h"
+#include "mongo/db/commands/authentication_commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/mongod_options.h"
@@ -62,11 +62,15 @@
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/str.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
+
+
 namespace mongo {
 namespace {
 
 std::shared_ptr<UserHandle> createSystemUserHandle() {
-    auto user = std::make_shared<UserHandle>(User(UserName("__system", "local")));
+    UserRequest request(UserName("__system", "local"), boost::none);
+    auto user = std::make_shared<UserHandle>(User(std::move(request)));
 
     ActionSet allActions;
     allActions.addAllActions();
@@ -124,116 +128,20 @@ ServiceContext::ConstructorActionRegisterer setClusterNetworkRestrictionManager{
         ClusterNetworkRestrictionManager::set(service, std::move(manager));
     }};
 
-class PinnedUserSetParameter {
-public:
-    void append(BSONObjBuilder& b, const std::string& name) const {
-        BSONArrayBuilder sub(b.subarrayStart(name));
-        stdx::lock_guard<Latch> lk(_mutex);
-        for (const auto& username : _pinnedUsersList) {
-            BSONObjBuilder nameObj(sub.subobjStart());
-            nameObj << AuthorizationManager::USER_NAME_FIELD_NAME << username.getUser()
-                    << AuthorizationManager::USER_DB_FIELD_NAME << username.getDB();
-        }
-    }
-
-    Status set(const BSONElement& newValueElement) {
-        if (newValueElement.type() == String) {
-            return setFromString(newValueElement.str());
-        } else if (newValueElement.type() == Array) {
-            auto array = static_cast<BSONArray>(newValueElement.embeddedObject());
-            std::vector<UserName> out;
-            auto status = auth::parseUserNamesFromBSONArray(array, "", &out);
-            if (!status.isOK())
-                return status;
-
-            status = _checkForSystemUser(out);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            stdx::lock_guard<Latch> lk(_mutex);
-            _pinnedUsersList = out;
-            auto authzManager = _authzManager;
-            if (!authzManager) {
-                return Status::OK();
-            }
-
-            authzManager->updatePinnedUsersList(std::move(out));
-            return Status::OK();
-        } else {
-            return {ErrorCodes::BadValue,
-                    "authorizationManagerPinnedUsers must be either a string or a BSON array"};
-        }
-    }
-
-    Status setFromString(const std::string& str) {
-        std::vector<std::string> strList;
-        str::splitStringDelim(str, &strList, ',');
-
-        std::vector<UserName> out;
-        for (const auto& nameStr : strList) {
-            auto swUserName = UserName::parse(nameStr);
-            if (!swUserName.isOK()) {
-                return swUserName.getStatus();
-            }
-            out.push_back(std::move(swUserName.getValue()));
-        }
-
-        auto status = _checkForSystemUser(out);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        stdx::lock_guard<Latch> lk(_mutex);
-        _pinnedUsersList = out;
-        auto authzManager = _authzManager;
-        if (!authzManager) {
-            return Status::OK();
-        }
-
-        authzManager->updatePinnedUsersList(std::move(out));
-        return Status::OK();
-    }
-
-    void setAuthzManager(AuthorizationManager* authzManager) {
-        stdx::lock_guard<Latch> lk(_mutex);
-        _authzManager = authzManager;
-        _authzManager->updatePinnedUsersList(std::move(_pinnedUsersList));
-    }
-
-private:
-    Status _checkForSystemUser(const std::vector<UserName>& names) {
-        if (std::any_of(names.begin(), names.end(), [&](const UserName& userName) {
-                return (userName == (*internalSecurity.getUser())->getName());
-            })) {
-            return {ErrorCodes::BadValue,
-                    "Cannot set __system as a pinned user, it is always pinned"};
-        }
-        return Status::OK();
-    }
-
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("PinnedUserSetParameter::_mutex");
-
-    AuthorizationManager* _authzManager = nullptr;
-
-    std::vector<UserName> _pinnedUsersList;
-
-} authorizationManagerPinnedUsers;
-
 bool isAuthzNamespace(const NamespaceString& nss) {
-    return (nss == AuthorizationManager::rolesCollectionNamespace ||
-            nss == AuthorizationManager::usersCollectionNamespace ||
-            nss == AuthorizationManager::versionCollectionNamespace);
+    return (nss == NamespaceString::kAdminRolesNamespace ||
+            nss == NamespaceString::kAdminUsersNamespace ||
+            nss == NamespaceString::kServerConfigurationNamespace);
 }
 
 bool isAuthzCollection(StringData coll) {
-    return (coll == AuthorizationManager::rolesCollectionNamespace.coll() ||
-            coll == AuthorizationManager::usersCollectionNamespace.coll() ||
-            coll == AuthorizationManager::versionCollectionNamespace.coll());
+    return (coll == NamespaceString::kAdminRolesNamespace.coll() ||
+            coll == NamespaceString::kAdminUsersNamespace.coll() ||
+            coll == NamespaceString::kServerConfigurationNamespace.coll());
 }
 
 bool loggedCommandOperatesOnAuthzData(const NamespaceString& nss, const BSONObj& cmdObj) {
-    if (nss != AuthorizationManager::adminCommandNamespace)
+    if (nss != NamespaceString::kAdminCommandNamespace)
         return false;
 
     const StringData cmdName(cmdObj.firstElement().fieldNameStringData());
@@ -282,29 +190,6 @@ bool appliesToAuthzData(StringData op, const NamespaceString& nss, const BSONObj
     }
 }
 
-/**
- * Returns true if roles for this user were provided by the client, and can be obtained from
- * the connection.
- */
-bool shouldUseRolesFromConnection(OperationContext* opCtx, const UserName& userName) {
-#ifdef MONGO_CONFIG_SSL
-    if (!opCtx || !opCtx->getClient() || !opCtx->getClient()->session()) {
-        return false;
-    }
-
-    if (!allowRolesFromX509Certificates) {
-        return false;
-    }
-
-    auto& sslPeerInfo = SSLPeerInfo::forSession(opCtx->getClient()->session());
-    return sslPeerInfo.subjectName.toString() == userName.getUser() &&
-        userName.getDB() == "$external"_sd && !sslPeerInfo.roles.empty();
-#else
-    return false;
-#endif
-}
-
-
 std::unique_ptr<AuthorizationManager> authorizationManagerCreateImpl(
     ServiceContext* serviceContext) {
     return std::make_unique<AuthorizationManagerImpl>(serviceContext,
@@ -317,7 +202,7 @@ auto authorizationManagerCreateRegistration =
 MONGO_FAIL_POINT_DEFINE(waitForUserCacheInvalidation);
 void handleWaitForUserCacheInvalidation(OperationContext* opCtx, const UserHandle& user) {
     auto fp = waitForUserCacheInvalidation.scopedIf([&](const auto& bsonData) {
-        IDLParserErrorContext ctx("waitForUserCacheInvalidation");
+        IDLParserContext ctx("waitForUserCacheInvalidation");
         auto data = WaitForUserCacheInvalidationFailPoint::parse(ctx, bsonData);
 
         const auto& blockedUserName = data.getUserName();
@@ -336,7 +221,9 @@ void handleWaitForUserCacheInvalidation(OperationContext* opCtx, const UserHandl
     constexpr auto kCheckPeriod = Milliseconds{1};
     auto m = MONGO_MAKE_LATCH();
     auto cv = stdx::condition_variable{};
-    auto pred = [&] { return !fp.isStillEnabled() || !user.isValid(); };
+    auto pred = [&] {
+        return !fp.isStillEnabled() || !user.isValid();
+    };
     auto waitOneCycle = [&] {
         auto lk = stdx::unique_lock(m);
         return !opCtx->waitForConditionOrInterruptFor(cv, lk, kCheckPeriod, pred);
@@ -351,20 +238,6 @@ void handleWaitForUserCacheInvalidation(OperationContext* opCtx, const UserHandl
 }  // namespace
 
 int authorizationManagerCacheSize;
-
-void AuthorizationManagerPinnedUsersServerParameter::append(OperationContext* opCtx,
-                                                            BSONObjBuilder& out,
-                                                            const std::string& name) {
-    return authorizationManagerPinnedUsers.append(out, name);
-}
-
-Status AuthorizationManagerPinnedUsersServerParameter::set(const BSONElement& newValue) {
-    return authorizationManagerPinnedUsers.set(newValue);
-}
-
-Status AuthorizationManagerPinnedUsersServerParameter::setFromString(const std::string& str) {
-    return authorizationManagerPinnedUsers.setFromString(str);
-}
 
 AuthorizationManagerImpl::AuthorizationManagerImpl(
     ServiceContext* service, std::unique_ptr<AuthzManagerExternalState> externalState)
@@ -444,6 +317,39 @@ Status AuthorizationManagerImpl::getUserDescription(OperationContext* opCtx,
     return _externalState->getUserDescription(opCtx, UserRequest(userName, boost::none), result);
 }
 
+Status AuthorizationManagerImpl::hasValidAuthSchemaVersionDocumentForInitialSync(
+    OperationContext* opCtx) {
+    BSONObj foundDoc;
+    auto status = _externalState->hasValidStoredAuthorizationVersion(opCtx, &foundDoc);
+
+    if (status == ErrorCodes::NoSuchKey || status == ErrorCodes::TypeMismatch) {
+        std::string msg = str::stream()
+            << "During initial sync, found malformed auth schema version document: "
+            << status.toString() << "; document: " << foundDoc;
+        return Status(ErrorCodes::AuthSchemaIncompatible, msg);
+    }
+
+    if (status.isOK()) {
+        auto version = foundDoc.getIntField(AuthorizationManager::schemaVersionFieldName);
+        if ((version != AuthorizationManager::schemaVersion26Final) &&
+            (version != AuthorizationManager::schemaVersion28SCRAM)) {
+            std::string msg = str::stream()
+                << "During initial sync, found auth schema version " << version
+                << ", but this version of MongoDB only supports schema versions "
+                << AuthorizationManager::schemaVersion26Final << " and "
+                << AuthorizationManager::schemaVersion28SCRAM;
+            return {ErrorCodes::AuthSchemaIncompatible, msg};
+        }
+    }
+
+    return status;
+}
+
+bool AuthorizationManagerImpl::hasUser(OperationContext* opCtx,
+                                       const boost::optional<TenantId>& tenantId) {
+    return _externalState->hasAnyUserDocuments(opCtx, tenantId).isOK();
+}
+
 Status AuthorizationManagerImpl::rolesExist(OperationContext* opCtx,
                                             const std::vector<RoleName>& roleNames) {
     return _externalState->rolesExist(opCtx, roleNames);
@@ -474,7 +380,7 @@ Status AuthorizationManagerImpl::getRolesAsUserFragment(
 
 Status AuthorizationManagerImpl::getRoleDescriptionsForDB(
     OperationContext* opCtx,
-    StringData dbname,
+    const DatabaseName& dbname,
     PrivilegeFormat privileges,
     AuthenticationRestrictionsFormat restrictions,
     bool showBuiltinRoles,
@@ -489,26 +395,24 @@ MONGO_FAIL_POINT_DEFINE(authUserCacheSleep);
 }  // namespace
 
 StatusWith<UserHandle> AuthorizationManagerImpl::acquireUser(OperationContext* opCtx,
-                                                             const UserName& userName) try {
+                                                             const UserRequest& request) try {
+    const auto& userName = request.name;
+
     auto systemUser = internalSecurity.getUser();
     if (userName == (*systemUser)->getName()) {
+        uassert(ErrorCodes::OperationFailed,
+                "Attempted to acquire system user with predefined roles",
+                request.roles == boost::none);
         return *systemUser;
     }
 
-    UserRequest request(userName, boost::none);
-
+    UserRequest userRequest(request);
 #ifdef MONGO_CONFIG_SSL
-    // Clients connected via TLS may present an X.509 certificate which contains an authorization
-    // grant. If this is the case, the roles must be provided to the external state, for expansion
-    // into privileges.
-    if (shouldUseRolesFromConnection(opCtx, userName)) {
-        auto& sslPeerInfo = SSLPeerInfo::forSession(opCtx->getClient()->session());
-        request.roles = std::set<RoleName>();
-
-        // In order to be hashable, the role names must be converted from unordered_set to a set.
-        std::copy(sslPeerInfo.roles.begin(),
-                  sslPeerInfo.roles.end(),
-                  std::inserter(*request.roles, request.roles->begin()));
+    // X.509 will give us our roles for initial acquire, but we have to lose them during
+    // reacquire (for now) so reparse those roles into the request if not already present.
+    if ((request.roles == boost::none) && request.mechanismData.empty() &&
+        (userName.getDB() == "$external"_sd)) {
+        userRequest = getX509UserRequest(opCtx, std::move(userRequest));
     }
 #endif
 
@@ -533,7 +437,7 @@ StatusWith<UserHandle> AuthorizationManagerImpl::acquireUser(OperationContext* o
         sleepsecs(1);
     }
 
-    auto cachedUser = _userCache.acquire(opCtx, request);
+    auto cachedUser = _userCache.acquire(opCtx, userRequest);
 
     userAcquisitionStatsHandle.recordTimerEnd();
     invariant(cachedUser);
@@ -554,7 +458,13 @@ StatusWith<UserHandle> AuthorizationManagerImpl::reacquireUser(OperationContext*
 
     // Make a good faith effort to acquire an up-to-date user object, since the one
     // we've cached is marked "out-of-date."
-    auto swUserHandle = acquireUser(opCtx, userName);
+    // TODO SERVER-72678 avoid this edge case hack when rearchitecting user acquisition. This is
+    // necessary now to preserve the mechanismData from the original UserRequest while eliminating
+    // the roles. If the roles aren't reset to none, it will cause LDAP acquisition to be bypassed
+    // in favor of reusing the ones from before.
+    UserRequest requestWithoutRoles(user->getUserRequest());
+    requestWithoutRoles.roles = boost::none;
+    auto swUserHandle = acquireUser(opCtx, requestWithoutRoles);
     if (!swUserHandle.isOK()) {
         return swUserHandle.getStatus();
     }
@@ -569,107 +479,9 @@ StatusWith<UserHandle> AuthorizationManagerImpl::reacquireUser(OperationContext*
     return ret;
 }
 
-void AuthorizationManagerImpl::updatePinnedUsersList(std::vector<UserName> names) {
-    stdx::unique_lock<Latch> lk(_pinnedUsersMutex);
-    _usersToPin = std::move(names);
-    bool noUsersToPin = _usersToPin->empty();
-    _pinnedUsersCond.notify_one();
-    if (noUsersToPin) {
-        LOGV2_DEBUG(20227, 1, "There were no users to pin, not starting tracker thread");
-        return;
-    }
-
-    std::call_once(_pinnedThreadTrackerStarted, [this] {
-        stdx::thread thread(&AuthorizationManagerImpl::_pinnedUsersThreadRoutine, this);
-        thread.detach();
-    });
-}
-
 void AuthorizationManagerImpl::_updateCacheGeneration() {
     stdx::lock_guard lg(_cacheGenerationMutex);
     _cacheGeneration = OID::gen();
-}
-
-void AuthorizationManagerImpl::_pinnedUsersThreadRoutine() noexcept try {
-    Client::initThread("PinnedUsersTracker");
-    std::list<UserHandle> pinnedUsers;
-    std::vector<UserName> usersToPin;
-    LOGV2_DEBUG(20228, 1, "Starting pinned users tracking thread");
-    while (true) {
-        auto opCtx = cc().makeOperationContext();
-
-        stdx::unique_lock<Latch> lk(_pinnedUsersMutex);
-        const Milliseconds timeout(authorizationManagerPinnedUsersRefreshIntervalMillis.load());
-        auto waitRes = opCtx->waitForConditionOrInterruptFor(
-            _pinnedUsersCond, lk, timeout, [&] { return _usersToPin.has_value(); });
-
-        if (waitRes) {
-            usersToPin = std::move(_usersToPin.get());
-            _usersToPin = boost::none;
-        }
-        lk.unlock();
-        if (usersToPin.empty()) {
-            pinnedUsers.clear();
-            continue;
-        }
-
-        // Remove any users that shouldn't be pinned anymore or that are invalid.
-        for (auto it = pinnedUsers.begin(); it != pinnedUsers.end();) {
-            const auto& user = *it;
-            const auto shouldPin =
-                std::any_of(usersToPin.begin(), usersToPin.end(), [&](const UserName& userName) {
-                    return (user->getName() == userName);
-                });
-
-            if (!user.isValid() || !shouldPin) {
-                if (!shouldPin) {
-                    LOGV2_DEBUG(20229, 2, "Unpinning user", "user"_attr = user->getName());
-                } else {
-                    LOGV2_DEBUG(20230,
-                                2,
-                                "Pinned user no longer valid, will re-pin",
-                                "user"_attr = user->getName());
-                }
-                it = pinnedUsers.erase(it);
-            } else {
-                LOGV2_DEBUG(20231,
-                            3,
-                            "Pinned user is still valid and pinned",
-                            "user"_attr = user->getName());
-                ++it;
-            }
-        }
-
-        for (const auto& userName : usersToPin) {
-            if (std::any_of(pinnedUsers.begin(), pinnedUsers.end(), [&](const auto& user) {
-                    return user->getName() == userName;
-                })) {
-                continue;
-            }
-
-            auto swUser = acquireUser(opCtx.get(), userName);
-
-            if (swUser.isOK()) {
-                LOGV2_DEBUG(20232, 2, "Pinned user", "user"_attr = userName);
-                pinnedUsers.emplace_back(std::move(swUser.getValue()));
-            } else {
-                const auto& status = swUser.getStatus();
-                // If the user is not found, then it might just not exist yet. Skip this user for
-                // now.
-                if (status != ErrorCodes::UserNotFound) {
-                    LOGV2_WARNING(20239,
-                                  "Unable to fetch pinned user",
-                                  "user"_attr = userName,
-                                  "error"_attr = status);
-                } else {
-                    LOGV2_DEBUG(20233, 2, "Pinned user not found", "user"_attr = userName);
-                }
-            }
-        }
-    }
-} catch (const ExceptionFor<ErrorCodes::InterruptedAtShutdown>&) {
-    LOGV2_DEBUG(20234, 1, "Ending pinned users tracking thread");
-    return;
 }
 
 void AuthorizationManagerImpl::invalidateUserByName(OperationContext* opCtx,
@@ -682,16 +494,23 @@ void AuthorizationManagerImpl::invalidateUserByName(OperationContext* opCtx,
     _userCache.invalidateKey(UserRequest(userName, boost::none));
 }
 
-void AuthorizationManagerImpl::invalidateUsersFromDB(OperationContext* opCtx, StringData dbname) {
+void AuthorizationManagerImpl::invalidateUsersFromDB(OperationContext* opCtx,
+                                                     const DatabaseName& dbname) {
     LOGV2_DEBUG(20236, 2, "Invalidating all users from database", "database"_attr = dbname);
     _updateCacheGeneration();
     _authSchemaVersionCache.invalidateAll();
-    _userCache.invalidateKeyIf(
-        [&](const UserRequest& userRequest) { return userRequest.name.getDB() == dbname; });
+    _userCache.invalidateKeyIf([&](const UserRequest& userRequest) {
+        return userRequest.name.getDatabaseName() == dbname;
+    });
 }
 
 void AuthorizationManagerImpl::invalidateUsersByTenant(OperationContext* opCtx,
-                                                       const TenantId& tenant) {
+                                                       const boost::optional<TenantId>& tenant) {
+    if (!tenant) {
+        invalidateUserCache(opCtx);
+        return;
+    }
+
     LOGV2_DEBUG(6323600, 2, "Invalidating tenant users", "tenant"_attr = tenant);
     _updateCacheGeneration();
     _authSchemaVersionCache.invalidateAll();
@@ -748,11 +567,10 @@ Status AuthorizationManagerImpl::refreshExternalUsers(OperationContext* opCtx) {
 }
 
 Status AuthorizationManagerImpl::initialize(OperationContext* opCtx) {
-    Status status = _externalState->initialize(opCtx);
-    if (!status.isOK())
+    if (auto status = _externalState->initialize(opCtx); !status.isOK()) {
         return status;
+    }
 
-    authorizationManagerPinnedUsers.setAuthzManager(this);
     invalidateUserCache(opCtx);
     return Status::OK();
 }
@@ -784,13 +602,14 @@ AuthorizationManagerImpl::AuthSchemaVersionCache::AuthSchemaVersionCache(
     ServiceContext* service,
     ThreadPoolInterface& threadPool,
     AuthzManagerExternalState* externalState)
-    : ReadThroughCache(_mutex,
-                       service,
-                       threadPool,
-                       [this](OperationContext* opCtx, int key, const ValueHandle& cachedValue) {
-                           return _lookup(opCtx, key, cachedValue);
-                       },
-                       1 /* cacheSize */),
+    : ReadThroughCache(
+          _mutex,
+          service,
+          threadPool,
+          [this](OperationContext* opCtx, int key, const ValueHandle& cachedValue) {
+              return _lookup(opCtx, key, cachedValue);
+          },
+          1 /* cacheSize */),
       _externalState(externalState) {}
 
 AuthorizationManagerImpl::AuthSchemaVersionCache::LookupResult
@@ -811,13 +630,14 @@ AuthorizationManagerImpl::UserCacheImpl::UserCacheImpl(
     int cacheSize,
     AuthSchemaVersionCache* authSchemaVersionCache,
     AuthzManagerExternalState* externalState)
-    : UserCache(_mutex,
-                service,
-                threadPool,
-                [this](OperationContext* opCtx, const UserRequest& userReq, UserHandle cachedUser) {
-                    return _lookup(opCtx, userReq, cachedUser);
-                },
-                cacheSize),
+    : UserCache(
+          _mutex,
+          service,
+          threadPool,
+          [this](OperationContext* opCtx, const UserRequest& userReq, UserHandle cachedUser) {
+              return _lookup(opCtx, userReq, cachedUser);
+          },
+          cacheSize),
       _authSchemaVersionCache(authSchemaVersionCache),
       _externalState(externalState) {}
 

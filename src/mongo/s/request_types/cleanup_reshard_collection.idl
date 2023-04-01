@@ -32,13 +32,13 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 commands:
   cleanupReshardCollection:
     description: "The public cleanupReshardCollection command on mongos."
     command_name: cleanupReshardCollection
-    strict: false
+    strict: true
     namespace: type
     api_version: ""
     type: namespacestring

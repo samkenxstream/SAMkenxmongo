@@ -24,10 +24,13 @@ import os
 
 import SCons
 
+from SCons.Node.Alias import default_ans
+
 import auto_install_binaries
 
 _proof_scanner_cache_key = "proof_scanner_cache"
 _associated_proof = "associated_proof_key"
+
 
 def proof_generator_command_scanner_func(node, env, path):
     results = getattr(node.attributes, _proof_scanner_cache_key, None)
@@ -37,19 +40,21 @@ def proof_generator_command_scanner_func(node, env, path):
     setattr(node.attributes, _proof_scanner_cache_key, results)
     return results
 
+
 proof_generator_command_scanner = SCons.Scanner.Scanner(
     function=proof_generator_command_scanner_func,
     path_function=None,
-    recursive=True
+    recursive=True,
 )
+
 
 def auto_prove_task(env, component, role):
     entry = auto_install_binaries.get_alias_map_entry(env, component, role)
     return [
-        getattr(f.attributes, _associated_proof)
-        for f in entry.files
+        getattr(f.attributes, _associated_proof) for f in entry.files
         if hasattr(f.attributes, _associated_proof)
     ]
+
 
 def generate_test_execution_aliases(env, test):
     installed = [test]
@@ -58,7 +63,9 @@ def generate_test_execution_aliases(env, test):
 
     target_name = os.path.basename(installed[0].path)
 
-    target_command = env.Command(
+    test_env = env.Clone()
+    test_env['ENV']['TMPDIR'] = test_env.Dir('$LOCAL_TMPDIR').abspath
+    target_command = test_env.Command(
         target=f"#+{target_name}",
         source=installed[0],
         action="$( $ICERUN $) ${SOURCES[0]} $UNITTEST_FLAGS",
@@ -76,30 +83,44 @@ def generate_test_execution_aliases(env, test):
             continue
 
         source_name = source_base_name[:dot_idx]
-        if target_name == source_name:
-            continue
 
-        source_command = env.Command(
-            target=f"#+{source_name}",
+        # We currently create two types of commands: legacy and verbose
+        # ex legacy command: cancelable_operation_context_test
+        # ex verbose command: db_unittest_test_cancelable_operation_context_test
+        # i.e. Verbose incorporates the name of the unittest binary, while
+        # legacy only has the source file name.
+        # We always create the verbose command, but we only create the legacy
+        # command if there isn't a conflict between the target_name and
+        # source_name. Legacy commands must be unique
+        verbose_source_command = test_env.Command(
+            target=f"#+{target_name}-{source_name}",
             source=installed[0],
-            action="$( $ICERUN $) ${SOURCES[0]} -fileNameFilter $TEST_SOURCE_FILE_NAME $UNITTEST_FLAGS",
+            action=
+            "$( $ICERUN $) ${SOURCES[0]} -fileNameFilter $TEST_SOURCE_FILE_NAME $UNITTEST_FLAGS",
             TEST_SOURCE_FILE_NAME=source_name,
             NINJA_POOL="console",
         )
-        env.Pseudo(source_command)
-        env.Alias('test-execution-aliases', source_command)
+        env.Pseudo(verbose_source_command)
+        env.Alias('test-execution-aliases', verbose_source_command)
 
-    proof_generator_command = env.Command(
+        if target_name == source_name:
+            continue
+
+        if default_ans.lookup(f'+{source_name}') is not None:
+            raise SCons.Errors.BuildError(
+                str(verbose_source_command[0]),
+                f"There exists multiple unittests with a source file named {source_name}: {source.abspath} and {env.Alias(f'+{source_name}')[0].children()[1].abspath}"
+            )
+        env.Alias(f'+{source_name}', [verbose_source_command, source])
+
+    proof_generator_command = test_env.Command(
         target=[
             '${SOURCE}.log',
             '${SOURCE}.status',
         ],
         source=installed[0],
-        action=SCons.Action.Action(
-            "$PROOF_GENERATOR_COMMAND",
-            "$PROOF_GENERATOR_COMSTR"
-        ),
-        source_scanner=proof_generator_command_scanner
+        action=SCons.Action.Action("$PROOF_GENERATOR_COMMAND", "$PROOF_GENERATOR_COMSTR"),
+        source_scanner=proof_generator_command_scanner,
     )
 
     # We assume tests are provable by default, but some tests may not
@@ -110,13 +131,10 @@ def generate_test_execution_aliases(env, test):
         env.NoCache(proof_generator_command)
         env.AlwaysBuild(proof_generator_command)
 
-    proof_analyzer_command = env.Command(
+    proof_analyzer_command = test_env.Command(
         target='${SOURCES[1].base}.proof',
         source=proof_generator_command,
-        action=SCons.Action.Action(
-            "$PROOF_ANALYZER_COMMAND",
-            "$PROOF_ANALYZER_COMSTR"
-        )
+        action=SCons.Action.Action("$PROOF_ANALYZER_COMMAND", "$PROOF_ANALYZER_COMSTR"),
     )
 
     proof_analyzer_alias = env.Alias(
@@ -128,6 +146,7 @@ def generate_test_execution_aliases(env, test):
 
     # TODO: Should we enable proof at the file level?
 
+
 def exists(env):
     return True
 
@@ -138,14 +157,13 @@ def generate(env):
     env.AddMethod(generate_test_execution_aliases, "GenerateTestExecutionAliases")
 
     env["TEST_EXECUTION_SUFFIX_DENYLIST"] = env.get(
-        "TEST_EXECUTION_SUFFIX_DENYLIST", [".in"]
+        "TEST_EXECUTION_SUFFIX_DENYLIST",
+        [".in"],
     )
 
-    env.AppendUnique(
-        AIB_TASKS={
-            "prove": (auto_prove_task, False),
-        }
-    )
+    env.AppendUnique(AIB_TASKS={
+        "prove": (auto_prove_task, False),
+    })
 
     # TODO: Should we have some sort of prefix_xdir for the output location for these? Something like
     # $PREFIX_VARCACHE and which in our build is pre-populated to $PREFIX/var/cache/mongo or similar?

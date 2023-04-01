@@ -65,10 +65,57 @@ intrusive_ptr<DocumentSource> DocumentSourceCollStats::createFromBson(
     uassert(40166,
             str::stream() << "$collStats must take a nested object but found: " << specElem,
             specElem.type() == BSONType::Object);
-    auto spec = DocumentSourceCollStatsSpec::parse(IDLParserErrorContext(kStageName),
-                                                   specElem.embeddedObject());
+    auto spec =
+        DocumentSourceCollStatsSpec::parse(IDLParserContext(kStageName), specElem.embeddedObject());
 
     return make_intrusive<DocumentSourceCollStats>(pExpCtx, std::move(spec));
+}
+
+BSONObj DocumentSourceCollStats::makeStatsForNs(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& nss,
+    const DocumentSourceCollStatsSpec& spec,
+    const boost::optional<BSONObj>& filterObj) {
+    BSONObjBuilder builder;
+
+    builder.append("ns", NamespaceStringUtil::serialize(nss));
+
+    auto shardName = expCtx->mongoProcessInterface->getShardName(expCtx->opCtx);
+
+    if (!shardName.empty()) {
+        builder.append("shard", shardName);
+    }
+
+    builder.append("host", getHostNameCachedAndPort());
+    builder.appendDate("localTime", jsTime());
+
+    if (auto latencyStatsSpec = spec.getLatencyStats()) {
+        expCtx->mongoProcessInterface->appendLatencyStats(
+            expCtx->opCtx, nss, latencyStatsSpec->getHistograms(), &builder);
+    }
+
+    if (auto storageStats = spec.getStorageStats()) {
+        // If the storageStats field exists, it must have been validated as an object when parsing.
+        BSONObjBuilder storageBuilder(builder.subobjStart("storageStats"));
+        uassertStatusOKWithContext(
+            expCtx->mongoProcessInterface->appendStorageStats(
+                expCtx->opCtx, nss, *storageStats, &storageBuilder, filterObj),
+            "Unable to retrieve storageStats in $collStats stage");
+        storageBuilder.doneFast();
+    }
+
+    if (spec.getCount()) {
+        uassertStatusOKWithContext(
+            expCtx->mongoProcessInterface->appendRecordCount(expCtx->opCtx, nss, &builder),
+            "Unable to retrieve count in $collStats stage");
+    }
+
+    if (spec.getQueryExecStats()) {
+        uassertStatusOKWithContext(
+            expCtx->mongoProcessInterface->appendQueryExecStats(expCtx->opCtx, nss, &builder),
+            "Unable to retrieve queryExecStats in $collStats stage");
+    }
+    return builder.obj();
 }
 
 DocumentSource::GetNextResult DocumentSourceCollStats::doGetNext() {
@@ -78,49 +125,13 @@ DocumentSource::GetNextResult DocumentSourceCollStats::doGetNext() {
 
     _finished = true;
 
-    BSONObjBuilder builder;
-
-    builder.append("ns", pExpCtx->ns.ns());
-
-    auto shardName = pExpCtx->mongoProcessInterface->getShardName(pExpCtx->opCtx);
-
-    if (!shardName.empty()) {
-        builder.append("shard", shardName);
-    }
-
-    builder.append("host", getHostNameCachedAndPort());
-    builder.appendDate("localTime", jsTime());
-
-    if (auto latencyStatsSpec = _collStatsSpec.getLatencyStats()) {
-        pExpCtx->mongoProcessInterface->appendLatencyStats(
-            pExpCtx->opCtx, pExpCtx->ns, latencyStatsSpec->getHistograms(), &builder);
-    }
-
-    if (auto storageStats = _collStatsSpec.getStorageStats()) {
-        // If the storageStats field exists, it must have been validated as an object when parsing.
-        BSONObjBuilder storageBuilder(builder.subobjStart("storageStats"));
-        uassertStatusOKWithContext(pExpCtx->mongoProcessInterface->appendStorageStats(
-                                       pExpCtx->opCtx, pExpCtx->ns, *storageStats, &storageBuilder),
-                                   "Unable to retrieve storageStats in $collStats stage");
-        storageBuilder.doneFast();
-    }
-
-    if (_collStatsSpec.getCount()) {
-        uassertStatusOKWithContext(pExpCtx->mongoProcessInterface->appendRecordCount(
-                                       pExpCtx->opCtx, pExpCtx->ns, &builder),
-                                   "Unable to retrieve count in $collStats stage");
-    }
-
-    if (_collStatsSpec.getQueryExecStats()) {
-        uassertStatusOKWithContext(pExpCtx->mongoProcessInterface->appendQueryExecStats(
-                                       pExpCtx->opCtx, pExpCtx->ns, &builder),
-                                   "Unable to retrieve queryExecStats in $collStats stage");
-    }
-
-    return {Document(builder.obj())};
+    return {Document(makeStatsForNs(pExpCtx, pExpCtx->ns, _collStatsSpec))};
 }
 
-Value DocumentSourceCollStats::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceCollStats::serialize(SerializationOptions opts) const {
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484352);
+    }
     return Value(Document{{getSourceName(), _collStatsSpec.toBSON()}});
 }
 

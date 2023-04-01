@@ -3,7 +3,6 @@
  * tenant.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
@@ -12,11 +11,8 @@
  * ]
  */
 
-(function() {
-"use strict";
-
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
 
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
@@ -24,7 +20,7 @@ const donorRst = tenantMigrationTest.getDonorRst();
 const donorPrimary = tenantMigrationTest.getDonorPrimary();
 const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 
-const tenantId = "testTenantId";
+const tenantId = ObjectId().str;
 const tenantDBName = tenantMigrationTest.tenantDB(tenantId, "testDB");
 const donorTenantDB = donorPrimary.getDB(tenantDBName);
 const collName = "testColl";
@@ -60,4 +56,3 @@ assert.eq(1, findRes.length, `find result: ${tojson(findRes)}`);
 assert.eq([doc1], findRes);
 
 tenantMigrationTest.stop();
-})();

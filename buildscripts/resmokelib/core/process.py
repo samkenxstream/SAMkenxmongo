@@ -12,9 +12,11 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from shlex import quote
 
+import psutil
 from buildscripts.resmokelib import config as _config
 from buildscripts.resmokelib import errors
 from buildscripts.resmokelib import utils
@@ -74,8 +76,6 @@ class Process(object):
     """Wrapper around subprocess.Popen class."""
 
     # pylint: disable=protected-access
-    # pylint: disable=too-many-arguments
-    # pylint: disable=too-many-instance-attributes
 
     def __init__(self, logger, args, env=None, env_vars=None, cwd=None):
         """Initialize the process with the specified logger, arguments, and environment."""
@@ -87,7 +87,14 @@ class Process(object):
 
         self.logger = logger
         self.args = args
+
         self.env = utils.default_if_none(env, os.environ.copy())
+        if not self.env.get('RESMOKE_PARENT_PROCESS'):
+            self.env['RESMOKE_PARENT_PROCESS'] = os.environ.get('RESMOKE_PARENT_PROCESS',
+                                                                str(os.getpid()))
+        if not self.env.get('RESMOKE_PARENT_CTIME'):
+            self.env['RESMOKE_PARENT_CTIME'] = os.environ.get('RESMOKE_PARENT_CTIME',
+                                                              str(psutil.Process().create_time()))
         if env_vars is not None:
             self.env.update(env_vars)
 
@@ -166,7 +173,7 @@ class Process(object):
                 if return_code == win32con.STILL_ACTIVE:
                     raise
 
-    def stop(self, mode=None):  # pylint: disable=too-many-branches
+    def stop(self, mode=None):
         """Terminate the process."""
         if mode is None:
             mode = fixture_interface.TeardownMode.TERMINATE
@@ -278,8 +285,15 @@ class Process(object):
         return " ".join(sb)
 
     def pause(self):
-        """Send the SIGSTOP signal to the process."""
-        self._process.send_signal(signal.SIGSTOP)
+        """Send the SIGSTOP signal to the process and wait for it to be stopped."""
+        while True:
+            self._process.send_signal(signal.SIGSTOP)
+            mongod_process = psutil.Process(self.pid)
+            process_status = mongod_process.status()
+            if process_status == psutil.STATUS_STOPPED:
+                break
+            self.logger.info("Process status: {}".format(process_status))
+            time.sleep(1)
 
     def resume(self):
         """Send the SIGCONT signal to the process."""

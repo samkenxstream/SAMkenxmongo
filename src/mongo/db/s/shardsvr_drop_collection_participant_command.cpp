@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -38,9 +37,12 @@
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/drop_collection_coordinator.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -62,6 +64,10 @@ public:
                "directly. Participates in droping a collection.";
     }
 
+    bool supportsRetryableWrite() const final {
+        return true;
+    }
+
     using Request = ShardsvrDropCollectionParticipant;
 
     class Invocation final : public InvocationBase {
@@ -73,34 +79,25 @@ public:
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
-            opCtx->setAlwaysInterruptAtStepDownOrUp();
+            const auto txnParticipant = TransactionParticipant::get(opCtx);
+            uassert(6077301,
+                    str::stream() << Request::kCommandName << " must be run as a retryable write",
+                    txnParticipant);
 
-            try {
-                DropCollectionCoordinator::dropCollectionLocally(opCtx, ns());
-            } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-                LOGV2_DEBUG(5280920,
-                            1,
-                            "Namespace not found while trying to delete local collection",
-                            "namespace"_attr = ns());
-            }
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
-            // The txnParticipant will only be missing when the command was sent from a coordinator
-            // running an old 5.0.0 binary that didn't attach a sessionId & txnNumber.
-            // TODO SERVER-60773: Once 6.0 has branched out, txnParticipant must always exist. Add a
-            // uassert for that.
-            auto txnParticipant = TransactionParticipant::get(opCtx);
-            if (txnParticipant) {
-                // Since no write that generated a retryable write oplog entry with this sessionId
-                // and txnNumber happened, we need to make a dummy write so that the session gets
-                // durably persisted on the oplog. This must be the last operation done on this
-                // command.
-                DBDirectClient client(opCtx);
-                client.update(NamespaceString::kServerConfigurationNamespace.ns(),
-                              BSON("_id" << Request::kCommandName),
-                              BSON("$inc" << BSON("count" << 1)),
-                              true /* upsert */,
-                              false /* multi */);
-            }
+            bool fromMigrate = request().getFromMigrate().value_or(false);
+            DropCollectionCoordinator::dropCollectionLocally(opCtx, ns(), fromMigrate);
+
+            // Since no write that generated a retryable write oplog entry with this sessionId and
+            // txnNumber happened, we need to make a dummy write so that the session gets durably
+            // persisted on the oplog. This must be the last operation done on this command.
+            DBDirectClient client(opCtx);
+            client.update(NamespaceString::kServerConfigurationNamespace,
+                          BSON("_id" << Request::kCommandName),
+                          BSON("$inc" << BSON("count" << 1)),
+                          true /* upsert */,
+                          false /* multi */);
         }
 
     private:
@@ -120,7 +117,7 @@ public:
                                                            ActionType::internal));
         }
     };
-} sharsvrdDropCollectionParticipantCommand;
+} shardsvrDropCollectionParticipantCommand;
 
 }  // namespace
 }  // namespace mongo

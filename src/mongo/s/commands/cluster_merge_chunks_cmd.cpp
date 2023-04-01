@@ -27,25 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/client/connpool.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/field_parser.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 
 namespace mongo {
-
-using std::string;
-using std::vector;
-
 namespace {
 
 /**
@@ -60,19 +52,21 @@ public:
                "usage: { mergeChunks : <ns>, bounds : [ <min key>, <max key> ] }";
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
-                ActionType::splitChunk)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forExactNamespace(parseNs(dbName, cmdObj)),
+                     ActionType::splitChunk)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(cmdObj);
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return NamespaceStringUtil::parseNamespaceFromRequest(
+            dbName.tenantId(), CommandHelpers::parseNsFullyQualified(cmdObj));
     }
 
     bool adminOnly() const override {
@@ -88,22 +82,22 @@ public:
     }
 
     // Required
-    static BSONField<string> nsField;
-    static BSONField<vector<BSONObj>> boundsField;
+    static BSONField<std::string> nsField;
+    static BSONField<std::vector<BSONObj>> boundsField;
 
     // Used to send sharding state
-    static BSONField<string> shardNameField;
-    static BSONField<string> configField;
+    static BSONField<std::string> shardNameField;
+    static BSONField<std::string> configField;
 
 
     bool errmsgRun(OperationContext* opCtx,
-                   const string& dbname,
+                   const std::string& dbname,
                    const BSONObj& cmdObj,
-                   string& errmsg,
+                   std::string& errmsg,
                    BSONObjBuilder& result) override {
-        const NamespaceString nss(parseNs(dbname, cmdObj));
+        const NamespaceString nss(parseNs({boost::none, dbname}, cmdObj));
 
-        vector<BSONObj> bounds;
+        std::vector<BSONObj> bounds;
         if (!FieldParser::extract(cmdObj, boundsField, &bounds, &errmsg)) {
             return false;
         }
@@ -131,7 +125,7 @@ public:
             return false;
         }
 
-        auto const cm =
+        auto const [cm, _] =
             Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfo(opCtx, nss);
 
         if (!cm.getShardKeyPattern().isShardKey(minKey) ||
@@ -147,7 +141,7 @@ public:
         maxKey = cm.getShardKeyPattern().normalizeShardKey(maxKey);
 
         const auto firstChunk = cm.findIntersectingChunkWithSimpleCollation(minKey);
-        ChunkVersion shardVersion = cm.getVersion(firstChunk.getShardId());
+        ChunkVersion placementVersion = cm.getVersion(firstChunk.getShardId());
 
         BSONObjBuilder remoteCmdObjB;
         remoteCmdObjB.append(cmdObj[ClusterMergeChunksCommand::nsField()]);
@@ -157,8 +151,8 @@ public:
             Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString().toString());
         remoteCmdObjB.append(ClusterMergeChunksCommand::shardNameField(),
                              firstChunk.getShardId().toString());
-        remoteCmdObjB.append("epoch", shardVersion.epoch());
-        shardVersion.serializeToBSON(ChunkVersion::kShardVersionField, &remoteCmdObjB);
+        remoteCmdObjB.append("epoch", placementVersion.epoch());
+        remoteCmdObjB.append("timestamp", placementVersion.getTimestamp());
 
         BSONObj remoteResult;
 
@@ -186,11 +180,11 @@ public:
 
 } clusterMergeChunksCommand;
 
-BSONField<string> ClusterMergeChunksCommand::nsField("mergeChunks");
-BSONField<vector<BSONObj>> ClusterMergeChunksCommand::boundsField("bounds");
+BSONField<std::string> ClusterMergeChunksCommand::nsField("mergeChunks");
+BSONField<std::vector<BSONObj>> ClusterMergeChunksCommand::boundsField("bounds");
 
-BSONField<string> ClusterMergeChunksCommand::configField("config");
-BSONField<string> ClusterMergeChunksCommand::shardNameField("shardName");
+BSONField<std::string> ClusterMergeChunksCommand::configField("config");
+BSONField<std::string> ClusterMergeChunksCommand::shardNameField("shardName");
 
 }  // namespace
 }  // namespace mongo

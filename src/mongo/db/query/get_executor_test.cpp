@@ -37,9 +37,9 @@
 #include <string>
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/exec/index_path_projection.h"
 #include "mongo/db/exec/projection_executor.h"
 #include "mongo/db/exec/projection_executor_builder.h"
-#include "mongo/db/exec/wildcard_projection.h"
 #include "mongo/db/json.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/projection_parser.h"
@@ -63,7 +63,8 @@ auto createProjectionExecutor(const BSONObj& spec, const ProjectionPolicies& pol
 
 using std::unique_ptr;
 
-static const NamespaceString nss("test.collection");
+static const NamespaceString nss =
+    NamespaceString::createNamespaceString_forTest("test.collection");
 
 /**
  * Utility functions to create a CanonicalQuery
@@ -109,7 +110,7 @@ void testAllowedIndices(std::vector<IndexEntry> indexes,
 
     // getAllowedIndices should return false when query shape is not yet in query settings.
     unique_ptr<CanonicalQuery> cq(canonicalize("{a: 1}", "{}", "{}"));
-    const auto key = cq->encodeKeyForIndexFilters();
+    const auto key = cq->encodeKeyForPlanCacheCommand();
     ASSERT_FALSE(querySettings.getAllowedIndicesFilter(key));
 
     querySettings.setAllowedIndices(*cq, keyPatterns, indexNames);

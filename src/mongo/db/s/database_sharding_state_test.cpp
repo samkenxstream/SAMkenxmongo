@@ -29,7 +29,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include "boost/optional/optional_io.hpp"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
@@ -98,10 +97,10 @@ public:
             return repl::OpTimeWith<std::vector<ShardType>>(_shards);
         }
 
-        std::vector<CollectionType> getCollections(
-            OperationContext* opCtx,
-            StringData dbName,
-            repl::ReadConcernLevel readConcernLevel) override {
+        std::vector<CollectionType> getCollections(OperationContext* opCtx,
+                                                   StringData dbName,
+                                                   repl::ReadConcernLevel readConcernLevel,
+                                                   const BSONObj& sort) override {
             return _colls;
         }
 
@@ -136,10 +135,10 @@ TEST_F(DatabaseShardingStateTestWithMockedLoader, OnDbVersionMismatch) {
         auto opCtx = operationContext();
 
         auto getActiveDbVersion = [&] {
-            AutoGetDb autoDb(opCtx, kDbName, MODE_IS);
-            const auto dss = DatabaseShardingState::get(opCtx, kDbName);
-            auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
-            return dss->getDbVersion(opCtx, dssLock);
+            AutoGetDb autoDb(opCtx, DatabaseName(boost::none, kDbName), MODE_IS);
+            const auto scopedDss = DatabaseShardingState::assertDbLockedAndAcquireShared(
+                opCtx, DatabaseName(boost::none, kDbName));
+            return scopedDss->getDbVersion(opCtx);
         };
 
         _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(newDb);
@@ -168,13 +167,13 @@ TEST_F(DatabaseShardingStateTestWithMockedLoader, ForceDatabaseRefresh) {
         auto opCtx = operationContext();
 
         _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(newDb);
-        forceDatabaseRefresh(opCtx, kDbName);
+        ASSERT_OK(onDbVersionMismatchNoExcept(opCtx, kDbName, boost::none));
 
         boost::optional<DatabaseVersion> activeDbVersion = [&] {
-            AutoGetDb autoDb(opCtx, kDbName, MODE_IS);
-            const auto dss = DatabaseShardingState::get(opCtx, kDbName);
-            auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
-            return dss->getDbVersion(opCtx, dssLock);
+            AutoGetDb autoDb(opCtx, DatabaseName(boost::none, kDbName), MODE_IS);
+            const auto scopedDss = DatabaseShardingState::assertDbLockedAndAcquireShared(
+                opCtx, DatabaseName(boost::none, kDbName));
+            return scopedDss->getDbVersion(opCtx);
         }();
         ASSERT_TRUE(activeDbVersion);
         if (expectRefresh) {

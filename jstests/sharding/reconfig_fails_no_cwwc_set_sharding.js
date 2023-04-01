@@ -2,7 +2,14 @@
  * Test that a reconfig for a shard that would change the implicit default write concern to w:1
  * fails if CWWC is not set.
  *
- * @tags: [requires_majority_read_concern, requires_persistence, requires_fcv_51]
+ * Temporary catalog shard incompatible because it hits a sharding metadata hook failure on cluster
+ * shutdown.
+ * @tags: [
+ *   requires_majority_read_concern,
+ *   requires_persistence,
+ *   requires_fcv_51,
+ *   temporary_catalog_shard_incompatible,
+ * ]
  */
 
 (function() {
@@ -58,7 +65,7 @@ let logPrefix = "While the shard is not part of a sharded cluster: ";
 let shardServer = new ReplSetTest(
     {name: "shardServer", nodes: 1, nodeOptions: {shardsvr: ""}, useHostName: true});
 shardServer.startSet();
-shardServer.initiate();
+shardServer.initiateWithHighElectionTimeout();
 
 jsTestLog(logPrefix + "Adding an arbiter node that will change IDWC to (w:1) should succeed.");
 let arbiter = shardServer.add();
@@ -78,9 +85,9 @@ logPrefix = "While the shard is part of a sharded cluster: ";
 shardServer = new ReplSetTest(
     {name: "shardServer", nodes: 1, nodeOptions: {shardsvr: ""}, useHostName: true});
 shardServer.startSet();
-shardServer.initiate();
+shardServer.initiateWithHighElectionTimeout();
 
-const st = new ShardingTest({shards: 0, mongos: 1});
+const st = new ShardingTest({shards: TestData.catalogShard ? 1 : 0, mongos: 1});
 var admin = st.getDB('admin');
 
 jsTestLog("Adding the shard to the cluster should succeed.");

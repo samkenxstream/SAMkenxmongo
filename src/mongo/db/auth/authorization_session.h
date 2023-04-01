@@ -40,7 +40,6 @@
 #include "mongo/db/auth/authz_session_external_state.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/db/auth/user_set.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 
@@ -79,9 +78,9 @@ public:
     class ScopedImpersonate {
     public:
         ScopedImpersonate(AuthorizationSession* authSession,
-                          std::vector<UserName>* users,
+                          boost::optional<UserName>* user,
                           std::vector<RoleName>* roles)
-            : _authSession(*authSession), _users(*users), _roles(*roles) {
+            : _authSession(*authSession), _user(*user), _roles(*roles) {
             swap();
         }
 
@@ -93,7 +92,7 @@ public:
         void swap();
 
         AuthorizationSession& _authSession;
-        std::vector<UserName>& _users;
+        boost::optional<UserName>& _user;
         std::vector<RoleName>& _roles;
     };
 
@@ -145,7 +144,9 @@ public:
      * Adds the User identified by "UserName" to the authorization session, acquiring privileges
      * for it in the process.
      */
-    virtual Status addAndAuthorizeUser(OperationContext* opCtx, const UserName& userName) = 0;
+    virtual Status addAndAuthorizeUser(OperationContext* opCtx,
+                                       const UserRequest& userRequest,
+                                       boost::optional<Date_t> expirationTime) = 0;
 
     // Returns the authenticated user with the given name.  Returns NULL
     // if no such user is found.
@@ -153,9 +154,8 @@ public:
     // and ownership of the user stays with the AuthorizationManager
     virtual User* lookupUser(const UserName& name) = 0;
 
-    // Returns the single user on this auth session. If no user is authenticated, or if
-    // multiple users are authenticated, this method will throw an exception.
-    virtual User* getSingleUser() = 0;
+    // Get the authenticated user's object handle, if any.
+    virtual boost::optional<UserHandle> getAuthenticatedUser() = 0;
 
     // Is auth disabled? Returns true if auth is disabled.
     virtual bool shouldIgnoreAuthChecks() = 0;
@@ -163,8 +163,8 @@ public:
     // Is authenticated as at least one user.
     virtual bool isAuthenticated() = 0;
 
-    // Gets an iterator over the names of all authenticated users stored in this manager.
-    virtual UserNameIterator getAuthenticatedUserNames() = 0;
+    // Gets the name of the currently authenticated user (if any).
+    virtual boost::optional<UserName> getAuthenticatedUserName() = 0;
 
     // Gets an iterator over the roles of all authenticated users stored in this manager.
     virtual RoleNameIterator getAuthenticatedRoleNames() = 0;
@@ -184,7 +184,8 @@ public:
     // How the active session is authenticated.
     enum class AuthenticationMode {
         kNone,           // Not authenticated.
-        kConnection,     // For the duration of the connection, or until logged out.
+        kConnection,     // For the duration of the connection, or until logged out or
+                         // expiration.
         kSecurityToken,  // By operation scoped security token.
     };
     virtual AuthenticationMode getAuthenticationMode() const = 0;
@@ -258,13 +259,13 @@ public:
     // Returns true if the current session possesses a privilege which applies to the resource.
     virtual bool isAuthorizedForAnyActionOnResource(const ResourcePattern& resource) = 0;
 
-    // Replaces the data for users that a system user is impersonating with new data.
-    // The auditing system adds these users and their roles to each audit record in the log.
-    virtual void setImpersonatedUserData(const std::vector<UserName>& usernames,
+    // Replaces the data for the user that a system user is impersonating with new data.
+    // The auditing system adds this user and their roles to each audit record in the log.
+    virtual void setImpersonatedUserData(const UserName& username,
                                          const std::vector<RoleName>& roles) = 0;
 
-    // Gets an iterator over the names of all users that the system user is impersonating.
-    virtual UserNameIterator getImpersonatedUserNames() = 0;
+    // Gets the name of the user, if any, that the system user is impersonating.
+    virtual boost::optional<UserName> getImpersonatedUserName() = 0;
 
     // Gets an iterator over the roles of all users that the system user is impersonating.
     virtual RoleNameIterator getImpersonatedRoleNames() = 0;
@@ -283,10 +284,11 @@ public:
     // in common.
     virtual bool isCoauthorizedWithClient(Client* opClient, WithLock opClientLock) = 0;
 
-    // Returns true if the session and 'userNameIter' share an authenticated user, or if both have
-    // no authenticated users. Impersonated users are not considered as 'authenticated' for the
-    // purpose of this check. This always returns true if auth is not enabled.
-    virtual bool isCoauthorizedWith(UserNameIterator userNameIter) = 0;
+    // Returns true if the specified userName is the currently authenticated user,
+    // or if the session is unauthenticated and `boost::none` is specified.
+    // Impersonated users are not considered as 'authenticated' for the purpose of this check.
+    // This always returns true if auth is not enabled.
+    virtual bool isCoauthorizedWith(const boost::optional<UserName>& userName) = 0;
 
     // Tells whether impersonation is active or not.  This state is set when
     // setImpersonatedUserData is called and cleared when clearImpersonatedUserData is
@@ -307,8 +309,21 @@ public:
     // resource.
     virtual bool mayBypassWriteBlockingMode() const = 0;
 
+    // Returns true if the authorization session is expired. When this returns true,
+    // isAuthenticated() is also expected to return false.
+    virtual bool isExpired() const = 0;
+
+    // Returns the role names of the impersonated user, or if there isn't one, those of the
+    // authenticated user. Each element in the returned array is an object of the form
+    // {
+    //      _id: <concatenation of 'db' field and 'role' field>
+    //      role: <role name>
+    //      db: <database on which the user has the above role>
+    // }
+    virtual BSONArray getUserRoles() = 0;
+
 protected:
-    virtual std::tuple<std::vector<UserName>*, std::vector<RoleName>*> _getImpersonations() = 0;
+    virtual std::tuple<boost::optional<UserName>*, std::vector<RoleName>*> _getImpersonations() = 0;
 };
 
 // Returns a status encoding whether the current session in the specified `opCtx` has privilege to

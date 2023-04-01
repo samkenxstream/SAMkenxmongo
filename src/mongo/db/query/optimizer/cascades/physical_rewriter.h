@@ -52,11 +52,22 @@ public:
         CostType _cost;
     };
 
-    PhysicalRewriter(Memo& memo,
+    PhysicalRewriter(const Metadata& _metadata,
+                     Memo& memo,
+                     PrefixId& prefixId,
+                     GroupIdType rootGroupid,
+                     const DebugInfo& debugInfo,
                      const QueryHints& hints,
                      const RIDProjectionsMap& ridProjections,
-                     const CostingInterface& costDerivation,
+                     const CostEstimator& costEstimator,
+                     const PathToIntervalFn& pathToInterval,
                      std::unique_ptr<LogicalRewriter>& logicalRewriter);
+
+    // This is a transient structure. We do not allow copying or moving.
+    PhysicalRewriter(const PhysicalRewriter& /*other*/) = delete;
+    PhysicalRewriter(PhysicalRewriter&& /*other*/) = delete;
+    PhysicalRewriter& operator=(const PhysicalRewriter& /*other*/) = delete;
+    PhysicalRewriter& operator=(PhysicalRewriter&& /*other*/) = delete;
 
     /**
      * Main entry point for physical optimization.
@@ -65,27 +76,32 @@ public:
      */
     OptimizeGroupResult optimizeGroup(GroupIdType groupId,
                                       properties::PhysProps physProps,
-                                      PrefixId prefixId,
                                       CostType costLimit);
 
 private:
-    void costAndRetainBestNode(ABT node,
+    void costAndRetainBestNode(std::unique_ptr<ABT> node,
                                ChildPropsType childProps,
                                NodeCEMap nodeCEMap,
+                               PhysicalRewriteType rule,
                                GroupIdType groupId,
-                               const PrefixId& prefixId,
                                PhysOptimizationResult& bestResult);
 
-    std::pair<bool, CostType> optimizeChildren(CostType nodeCost,
+    boost::optional<CostType> optimizeChildren(CostType nodeCost,
                                                ChildPropsType childProps,
-                                               const PrefixId& prefixId,
                                                CostType costLimit);
 
+    SpoolIdGenerator _spoolId;
+
     // We don't own any of this.
+    const Metadata& _metadata;
     Memo& _memo;
-    const CostingInterface& _costDerivation;
+    PrefixId& _prefixId;
+    const GroupIdType _rootGroupId;
+    const CostEstimator& _costEstimator;
+    const DebugInfo& _debugInfo;
     const QueryHints& _hints;
     const RIDProjectionsMap& _ridProjections;
+    const PathToIntervalFn& _pathToInterval;
     // If set, we'll perform logical rewrites as part of OptimizeGroup().
     std::unique_ptr<LogicalRewriter>& _logicalRewriter;
 };

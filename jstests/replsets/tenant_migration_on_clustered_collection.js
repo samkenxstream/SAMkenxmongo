@@ -7,7 +7,6 @@
  *   assumes_against_mongod_not_mongos,
  *   assumes_unsharded_collection,
  *   # Basic tags for tenant migration tests.
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
@@ -16,18 +15,19 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    runMigrationAsync,
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/clustered_collections/clustered_collection_util.js");  // ClusteredCollectionUtil
 load("jstests/libs/parallelTester.js");                                   // Thread()
 load("jstests/libs/uuid_util.js");                                        // extractUUIDFromObject()
-load("jstests/replsets/libs/tenant_migration_test.js");                   // TenantMigrationTest
-load("jstests/replsets/libs/tenant_migration_util.js");                   // TenantMigrationUtil
+load('jstests/replsets/rslib.js');                                        // 'createRstArgs'
 
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
-const kTenantId = "testTenantId1";
+const kTenantId = ObjectId().str;
 const kDbName = tenantMigrationTest.tenantDB(kTenantId, "testDB");
 const kEmptyCollName = "testEmptyColl";
 const kNonEmptyCollName = "testNonEmptyColl";
@@ -63,9 +63,8 @@ const runTenantMigration = () => {
         recipientConnString: tenantMigrationTest.getRecipientConnString(),
         tenantId: kTenantId,
     };
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst());
-    const migrationThread =
-        new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
+    const donorRstArgs = createRstArgs(tenantMigrationTest.getDonorRst());
+    const migrationThread = new Thread(runMigrationAsync, migrationOpts, donorRstArgs);
     migrationThread.start();
 
     TenantMigrationTest.assertCommitted(migrationThread.returnData());
@@ -99,4 +98,3 @@ runTenantMigration();
 validateMigrationResults();
 
 tenantMigrationTest.stop();
-})();

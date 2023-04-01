@@ -1,11 +1,12 @@
 // Test that ongoing operations in a transaction are interrupted when the transaction expires.
-// @tags: [uses_transactions]
+// The test runs commands that are not allowed with security token: endSession, setParameter.
+// @tags: [
+//   not_allowed_with_security_token,uses_transactions]
 (function() {
 "use strict";
 
 load("jstests/libs/fail_point_util.js");
 load('jstests/libs/parallelTester.js');
-load("jstests/libs/logv2_helpers.js");
 
 const dbName = "test";
 const collName = "kill_op_on_txn_expiry";
@@ -73,15 +74,11 @@ try {
     failPoint.wait();
 
     jsTestLog("Wait for the transaction to expire");
-    if (isJsonLog(db.getMongo())) {
-        checkLog.contains(
-            db.getMongo(),
-            new RegExp(
-                "Aborting transaction because it has been running for longer than 'transactionLifetimeLimitSeconds'.*\"txnNumber\":" +
-                txnNumber));
-    } else {
-        checkLog.contains(db.getMongo(), "Aborting transaction with txnNumber " + txnNumber);
-    }
+    checkLog.contains(
+        db.getMongo(),
+        new RegExp(
+            "Aborting transaction because it has been running for longer than 'transactionLifetimeLimitSeconds'.*\"txnNumber\":" +
+            txnNumber));
 
     jsTestLog("Disabling fail point to enable insert to proceed and detect that the session " +
               "has been killed");

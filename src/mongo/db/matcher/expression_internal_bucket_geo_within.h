@@ -94,9 +94,9 @@ public:
         return false;
     }
 
-    void serialize(BSONObjBuilder* builder, bool includePath) const final;
+    void serialize(BSONObjBuilder* builder, SerializationOptions opts) const final;
 
-    std::unique_ptr<MatchExpression> shallowClone() const final;
+    std::unique_ptr<MatchExpression> clone() const final;
 
     std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
@@ -107,22 +107,22 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const final {
-        MONGO_UNREACHABLE;
+        MONGO_UNREACHABLE_TASSERT(6400208);
     }
 
     void resetChild(size_t, MatchExpression*) {
         MONGO_UNREACHABLE;
     };
 
-    const std::string getField() const {
+    std::string getField() const {
         return _field;
     }
 
-    const std::shared_ptr<GeometryContainer> getGeoContainer() const {
-        return _geoContainer;
+    const GeometryContainer& getGeoContainer() const {
+        return *_geoContainer;
     }
 
-    const StringData path() const final {
+    StringData path() const final {
         return _indexField;
     }
 
@@ -141,17 +141,15 @@ public:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     /**
      * Helper function for matches() and matchesSingleElement().
      */
     bool _matchesBSONObj(const BSONObj& obj) const;
-
-    void _doAddDependencies(DepsTracker* deps) const final {
-        deps->needWholeDocument = true;
-    }
 
     std::shared_ptr<GeometryContainer> _geoContainer;
     std::string _indexField;

@@ -39,6 +39,14 @@ public:
     explicit SASLPlainServerMechanism(std::string authenticationDatabase)
         : MakeServerMechanism<PLAINPolicy>(std::move(authenticationDatabase)) {}
 
+    boost::optional<unsigned int> currentStep() const override {
+        return (unsigned int)1;
+    }
+
+    boost::optional<unsigned int> totalSteps() const override {
+        return (unsigned int)1;
+    }
+
 private:
     StatusWith<std::tuple<bool, std::string>> stepImpl(OperationContext* opCtx,
                                                        StringData input) final;

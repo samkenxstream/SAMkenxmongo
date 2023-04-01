@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -46,6 +45,9 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/configure_collection_balancing_gen.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
+
 namespace mongo {
 namespace {
 
@@ -59,15 +61,10 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            opCtx->setAlwaysInterruptAtStepDownOrUp();
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
             uassert(ErrorCodes::IllegalOperation,
                     str::stream() << Request::kCommandName << " can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
-
-            uassert(8423309,
-                    str::stream() << Request::kCommandName << " command not supported",
-                    mongo::feature_flags::gPerCollBalancingSettings.isEnabled(
-                        serverGlobalParams.featureCompatibility));
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 
             const NamespaceString& nss = ns();
 
@@ -81,7 +78,8 @@ public:
                 nss,
                 request().getChunkSizeMB(),
                 request().getDefragmentCollection(),
-                request().getEnableAutoSplitter());
+                request().getEnableAutoSplitter(),
+                request().getEnableAutoMerger());
         }
 
     private:

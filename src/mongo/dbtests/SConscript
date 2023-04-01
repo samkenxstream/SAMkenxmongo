@@ -3,47 +3,36 @@
 Import("env")
 Import("get_option")
 Import("has_option")
-Import("usemozjs")
 Import("wiredtiger")
 
 env = env.Clone()
 
 env.Library(
-    target="framework_options",
-    source=[
-        "framework_options.cpp",
-        "framework_options.idl",
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/db/server_options_core',
-        '$BUILD_DIR/mongo/db/storage/flow_control_parameters',
-        '$BUILD_DIR/mongo/db/storage/storage_options',
-        '$BUILD_DIR/mongo/unittest/unittest',
-        '$BUILD_DIR/mongo/util/options_parser/options_parser_init',
-    ],
-)
-
-env.Library(
     target='testframework',
     source=[
-        'framework.cpp',
         'framework_options_init.cpp',
+        'framework_options.cpp',
+        'framework_options.idl',
+        'framework.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/catalog/catalog_impl',
+        '$BUILD_DIR/mongo/db/catalog/database_holder',
         '$BUILD_DIR/mongo/db/dbdirectclient',
-        '$BUILD_DIR/mongo/db/index/index_access_method_factory',
-        '$BUILD_DIR/mongo/db/index/index_access_methods',
+        '$BUILD_DIR/mongo/db/index/index_access_method',
         '$BUILD_DIR/mongo/db/index_builds_coordinator_mongod',
-        '$BUILD_DIR/mongo/db/op_observer',
+        '$BUILD_DIR/mongo/db/op_observer/op_observer',
+        '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/db/service_context_d',
+        '$BUILD_DIR/mongo/db/storage/flow_control_parameters',
         '$BUILD_DIR/mongo/db/storage/storage_control',
+        '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/scripting/scripting_common',
         '$BUILD_DIR/mongo/unittest/unittest',
-        'framework_options',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
+        '$BUILD_DIR/mongo/util/options_parser/options_parser_init',
     ],
 )
 
@@ -53,7 +42,7 @@ env.Library(
         'mock/mock_conn_registry.cpp',
         'mock/mock_dbclient_connection.cpp',
         'mock/mock_remote_db_server.cpp',
-        'mock/mock_replica_set.cpp'
+        'mock/mock_replica_set.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/clientdriver_network',
@@ -63,14 +52,14 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/exec/projection_executor',
-        '$BUILD_DIR/mongo/db/pipeline/expression_context',
         '$BUILD_DIR/mongo/db/query/projection_ast',
         '$BUILD_DIR/mongo/db/query/query_test_service_context',
+        '$BUILD_DIR/mongo/db/query_expressions',
     ],
 )
 
 env.Program(
-    target="dbtest",
+    target='dbtest',
     source=[
         'basictests.cpp',
         'catalogtests.cpp',
@@ -96,7 +85,6 @@ env.Program(
         'mock_dbclient_conn_test.cpp',
         'mock_replica_set_test.cpp',
         'multikey_paths_test.cpp',
-        'shared_buffer_test.cpp',
         'pdfiletests.cpp',
         'plan_executor_invalidation_test.cpp',
         'plan_ranking.cpp',
@@ -141,19 +129,21 @@ env.Program(
         "$BUILD_DIR/mongo/db/bson/dotted_path_support",
         "$BUILD_DIR/mongo/db/catalog/catalog_helpers",
         "$BUILD_DIR/mongo/db/catalog/clustered_collection_options",
+        "$BUILD_DIR/mongo/db/catalog/collection_crud",
         "$BUILD_DIR/mongo/db/catalog/collection_validation",
         "$BUILD_DIR/mongo/db/catalog/index_key_validate",
         "$BUILD_DIR/mongo/db/catalog/multi_index_block",
-        "$BUILD_DIR/mongo/db/catalog_raii",
         "$BUILD_DIR/mongo/db/commands/mongod",
         "$BUILD_DIR/mongo/db/commands/test_commands_enabled",
         "$BUILD_DIR/mongo/db/concurrency/deferred_writer",
         "$BUILD_DIR/mongo/db/exec/document_value/document_value_test_util",
-        "$BUILD_DIR/mongo/db/index/index_access_methods",
+        "$BUILD_DIR/mongo/db/index/index_access_method",
         "$BUILD_DIR/mongo/db/logical_time_metadata_hook",
         "$BUILD_DIR/mongo/db/mongohasher",
         "$BUILD_DIR/mongo/db/multitenancy",
-        "$BUILD_DIR/mongo/db/op_observer_impl",
+        "$BUILD_DIR/mongo/db/op_observer/op_observer_impl",
+        "$BUILD_DIR/mongo/db/op_observer/oplog_writer_impl",
+        "$BUILD_DIR/mongo/db/ops/write_ops",
         "$BUILD_DIR/mongo/db/query/collation/collator_interface_mock",
         "$BUILD_DIR/mongo/db/query/command_request_response",
         "$BUILD_DIR/mongo/db/query/query_planner_test_lib",
@@ -168,14 +158,15 @@ env.Program(
         "$BUILD_DIR/mongo/db/repl/replmocks",
         "$BUILD_DIR/mongo/db/repl/serveronly_repl",
         "$BUILD_DIR/mongo/db/repl/storage_interface_impl",
-        "$BUILD_DIR/mongo/db/server_options_core",
-        "$BUILD_DIR/mongo/db/sessions_collection_standalone",
+        "$BUILD_DIR/mongo/db/server_base",
+        "$BUILD_DIR/mongo/db/session/sessions_collection_standalone",
+        "$BUILD_DIR/mongo/db/shard_role",
         "$BUILD_DIR/mongo/db/storage/durable_catalog_impl",
-        "$BUILD_DIR/mongo/db/storage/ephemeral_for_test/storage_ephemeral_for_test",
         "$BUILD_DIR/mongo/db/storage/storage_engine_impl",
         "$BUILD_DIR/mongo/db/traffic_reader",
-        "$BUILD_DIR/mongo/db/transaction",
+        "$BUILD_DIR/mongo/db/transaction/transaction",
         "$BUILD_DIR/mongo/db/vector_clock",
+        "$BUILD_DIR/mongo/db/working_set_common",
         "$BUILD_DIR/mongo/shell/shell_utils",
         "$BUILD_DIR/mongo/transport/message_compressor_options_server",
         "$BUILD_DIR/mongo/transport/transport_layer_manager",

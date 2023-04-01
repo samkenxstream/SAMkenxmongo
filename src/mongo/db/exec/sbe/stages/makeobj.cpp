@@ -46,8 +46,11 @@ MakeObjStageBase<O>::MakeObjStageBase(std::unique_ptr<PlanStage> input,
                                       value::SlotVector projectVars,
                                       bool forceNewObject,
                                       bool returnOldObject,
-                                      PlanNodeId planNodeId)
-    : PlanStage(O == MakeObjOutputType::object ? "mkobj"_sd : "mkbson"_sd, planNodeId),
+                                      PlanNodeId planNodeId,
+                                      bool participateInTrialRunTracking)
+    : PlanStage(O == MakeObjOutputType::object ? "mkobj"_sd : "mkbson"_sd,
+                planNodeId,
+                participateInTrialRunTracking),
       _objSlot(objSlot),
       _rootSlot(rootSlot),
       _fieldBehavior(fieldBehavior),
@@ -62,6 +65,29 @@ MakeObjStageBase<O>::MakeObjStageBase(std::unique_ptr<PlanStage> input,
 }
 
 template <MakeObjOutputType O>
+MakeObjStageBase<O>::MakeObjStageBase(std::unique_ptr<PlanStage> input,
+                                      value::SlotId objSlot,
+                                      boost::optional<value::SlotId> rootSlot,
+                                      boost::optional<FieldBehavior> fieldBehavior,
+                                      OrderedPathSet fields,
+                                      OrderedPathSet projectFields,
+                                      value::SlotVector projectVars,
+                                      bool forceNewObject,
+                                      bool returnOldObject,
+                                      PlanNodeId planNodeId)
+    : MakeObjStageBase<O>::MakeObjStageBase(
+          std::move(input),
+          objSlot,
+          rootSlot,
+          fieldBehavior,
+          std::vector<std::string>(fields.begin(), fields.end()),
+          std::vector<std::string>(projectFields.begin(), projectFields.end()),
+          std::move(projectVars),
+          forceNewObject,
+          returnOldObject,
+          planNodeId) {}
+
+template <MakeObjOutputType O>
 std::unique_ptr<PlanStage> MakeObjStageBase<O>::clone() const {
     return std::make_unique<MakeObjStageBase<O>>(_children[0]->clone(),
                                                  _objSlot,
@@ -72,7 +98,8 @@ std::unique_ptr<PlanStage> MakeObjStageBase<O>::clone() const {
                                                  _projectVars,
                                                  _forceNewObject,
                                                  _returnOldObject,
-                                                 _commonStats.nodeId);
+                                                 _commonStats.nodeId,
+                                                 _participateInTrialRunTracking);
 }
 
 template <MakeObjOutputType O>
@@ -167,9 +194,9 @@ void MakeObjStageBase<MakeObjOutputType::object>::produceObject() {
                     : approximatedNumFieldsInRoot + projectedFieldsSize;
                 obj->reserve(numOutputFields);
                 // Skip document length.
-                be += 4;
-                while (*be != 0) {
-                    auto sv = bson::fieldNameView(be);
+                be += sizeof(int32_t);
+                while (be != end - 1) {
+                    auto sv = bson::fieldNameAndLength(be);
                     auto key = StringMapHasher{}.hashed_key(StringData(sv));
 
                     if (!isFieldProjectedOrRestricted(key)) {
@@ -249,10 +276,12 @@ void MakeObjStageBase<MakeObjOutputType::bsonObject>::produceObject() {
         if (tag == value::TypeTags::bsonObject) {
             if (!(nFieldsNeededIfInclusion == 0 && _fieldBehavior == FieldBehavior::keep)) {
                 auto be = value::bitcastTo<const char*>(val);
+                const auto end = be + ConstDataView(be).read<LittleEndian<uint32_t>>();
+
                 // Skip document length.
-                be += 4;
-                while (*be != 0) {
-                    auto sv = bson::fieldNameView(be);
+                be += sizeof(int32_t);
+                while (be != end - 1) {
+                    auto sv = bson::fieldNameAndLength(be);
                     auto key = StringMapHasher{}.hashed_key(StringData(sv));
 
                     auto nextBe = bson::advance(be, sv.size());
@@ -420,11 +449,11 @@ size_t MakeObjStageBase<O>::estimateCompileTimeSize() const {
 
 template <MakeObjOutputType O>
 void MakeObjStageBase<O>::doSaveState(bool relinquishCursor) {
-    if (!slotsAccessible() || !relinquishCursor) {
+    if (!relinquishCursor) {
         return;
     }
 
-    _obj.makeOwned();
+    prepareForYielding(_obj, slotsAccessible());
 }
 
 // Explicit template instantiations.

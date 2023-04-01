@@ -29,10 +29,18 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
+
+enums:
+    CriticalSectionBlockType:
+        description: "Type of block to be used in the critical section."
+        type: string
+        values:
+            kWrites: "Writes"
+            kReadsAndWrites: "ReadsAndWrites"
+            kUnblock: "Unblock"
 
 commands:
-    # TODO(SERVER-64346): Generalize this command to be reusable in other DDL context
     _shardsvrParticipantBlock:
         command_name: _shardsvrParticipantBlock
         cpp_name: ShardsvrParticipantBlock
@@ -40,3 +48,14 @@ commands:
         strict: false
         api_version: ""
         namespace: concatenate_with_db
+        fields:
+            blockType:
+                type: CriticalSectionBlockType
+                optional: true
+            reason:
+                type: object
+                optional: true
+            allowViews:
+                # WARNING: This flag can be used only by coordinators running exclusively in FCV >= 7.0
+                # TODO SERVER-68084: remove this flag
+                type: optionalBool

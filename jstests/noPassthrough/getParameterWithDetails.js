@@ -33,7 +33,7 @@
 
             assert.eq(resultsPlain[parameter["name"]], expectedValue, plainErrMsg);
             assert.docEq(
-                resultsWithDetail[parameter["name"]], expectedDetailedResultObj, detailErrMsg);
+                expectedDetailedResultObj, resultsWithDetail[parameter["name"]], detailErrMsg);
         });
     }
 
@@ -87,8 +87,8 @@
             result: {value: true, settableAtRuntime: true, settableAtStartup: true}
         },
         {
-            name: "wiredTigerMaxCacheOverflowSizeGB",
-            result: {value: 0, settableAtRuntime: true, settableAtStartup: false}
+            name: "skipShardingConfigurationChecks",
+            result: {value: false, settableAtRuntime: false, settableAtStartup: true}
         },
         {
             name: "shardedIndexConsistencyCheckIntervalMS",
@@ -97,8 +97,8 @@
     ];
     const specificParametersMongosOnly = [
         {
-            name: "taskExecutorPoolSize",
-            result: {value: 1, settableAtRuntime: true, settableAtStartup: true}
+            name: "activeFaultDurationSecs",
+            result: {value: 120, settableAtRuntime: true, settableAtStartup: true}
         },
         {
             name: "userCacheInvalidationIntervalSecs",

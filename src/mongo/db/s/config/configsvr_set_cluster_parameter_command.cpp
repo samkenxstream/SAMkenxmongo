@@ -27,18 +27,22 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/commands/set_cluster_parameter_invocation.h"
 #include "mongo/db/s/config/configsvr_coordinator_service.h"
 #include "mongo/db/s/config/set_cluster_parameter_coordinator.h"
 #include "mongo/idl/cluster_server_parameter_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -55,22 +59,43 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     str::stream() << Request::kCommandName << " can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 
-            uassert(
-                ErrorCodes::IllegalOperation,
-                "featureFlagClusterWideConfig not enabled",
-                gFeatureFlagClusterWideConfig.isEnabled(serverGlobalParams.featureCompatibility));
+            const auto coordinatorCompletionFuture = [&]() -> SharedSemiFuture<void> {
+                std::unique_ptr<ServerParameterService> sps =
+                    std::make_unique<ClusterParameterService>();
+                DBDirectClient dbClient(opCtx);
+                ClusterParameterDBClientService dbService(dbClient);
+                BSONObj cmdParamObj = request().getCommandParameter();
+                StringData parameterName = cmdParamObj.firstElement().fieldName();
+                ServerParameter* serverParameter = sps->get(parameterName);
 
-            SetClusterParameterCoordinatorDocument coordinatorDoc;
-            coordinatorDoc.setConfigsvrCoordinatorMetadata(
-                {ConfigsvrCoordinatorTypeEnum::kSetClusterParameter});
-            coordinatorDoc.setParameter(request().getCommandParameter());
+                SetClusterParameterInvocation invocation{std::move(sps), dbService};
 
-            const auto service = ConfigsvrCoordinatorService::getService(opCtx);
-            const auto instance = service->getOrCreateService(opCtx, coordinatorDoc.toBSON());
+                invocation.normalizeParameter(opCtx,
+                                              cmdParamObj,
+                                              boost::none,
+                                              serverParameter,
+                                              parameterName,
+                                              request().getDbName().tenantId(),
+                                              false /* skipValidation */);
 
-            instance->getCompletionFuture().get(opCtx);
+                auto tenantId = request().getDbName().tenantId();
+
+                SetClusterParameterCoordinatorDocument coordinatorDoc;
+                ConfigsvrCoordinatorId cid(ConfigsvrCoordinatorTypeEnum::kSetClusterParameter);
+                cid.setSubId(StringData(tenantId ? tenantId->toString() : ""));
+                coordinatorDoc.setConfigsvrCoordinatorMetadata({cid});
+                coordinatorDoc.setParameter(request().getCommandParameter());
+                coordinatorDoc.setTenantId(tenantId);
+
+                const auto service = ConfigsvrCoordinatorService::getService(opCtx);
+                const auto instance = service->getOrCreateService(opCtx, coordinatorDoc.toBSON());
+
+                return instance->getCompletionFuture();
+            }();
+
+            coordinatorCompletionFuture.get(opCtx);
         }
 
     private:

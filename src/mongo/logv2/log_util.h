@@ -32,8 +32,9 @@
 #include <functional>
 
 #include <boost/optional.hpp>
-#include <mongo/base/status.h>
-#include <mongo/base/string_data.h>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 
 namespace mongo::logv2 {
 
@@ -90,4 +91,15 @@ bool shouldRedactLogs();
  * Set the 'redact' mode of the server.
  */
 void setShouldRedactLogs(bool enabled);
+
+/**
+ * Returns true if the BinData Encrypt should be redacted. Default true.
+ */
+bool shouldRedactBinDataEncrypt();
+
+/**
+ * Sets the redact mode of the bin data encrypt field.
+ */
+void setShouldRedactBinDataEncrypt(bool enabled);
+
 }  // namespace mongo::logv2

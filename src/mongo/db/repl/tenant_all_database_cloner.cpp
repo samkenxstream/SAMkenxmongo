@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
 
 #include "mongo/platform/basic.h"
 
@@ -42,6 +41,9 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/string_map.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
+
 
 namespace mongo {
 namespace repl {
@@ -97,7 +99,8 @@ BaseCloner::AfterStageBehavior TenantAllDatabaseCloner::listDatabasesStage() {
 
     BSONObj readResult;
     BSONObj cmd = ClonerUtils::buildMajorityWaitRequest(_operationTime);
-    getClient()->runCommand("admin", cmd, readResult, QueryOption_SecondaryOk);
+    getClient()->runCommand(
+        DatabaseName(boost::none, "admin"), cmd, readResult, QueryOption_SecondaryOk);
     uassertStatusOKWithContext(
         getStatusFromCommandResult(readResult),
         "TenantAllDatabaseCloner failed to get listDatabases result majority-committed");
@@ -134,8 +137,8 @@ BaseCloner::AfterStageBehavior TenantAllDatabaseCloner::listDatabasesStage() {
 BaseCloner::AfterStageBehavior TenantAllDatabaseCloner::listExistingDatabasesStage() {
     auto opCtx = cc().makeOperationContext();
     DBDirectClient client(opCtx.get());
-    tenantMigrationRecipientInfo(opCtx.get()) =
-        boost::make_optional<TenantMigrationRecipientInfo>(getSharedData()->getMigrationId());
+    tenantMigrationInfo(opCtx.get()) =
+        boost::make_optional<TenantMigrationInfo>(getSharedData()->getMigrationId());
 
     const BSONObj filter = ClonerUtils::makeTenantDatabaseFilter(_tenantId);
     auto databasesArray = client.getDatabaseInfos(filter, true /* nameOnly */);
@@ -160,7 +163,8 @@ BaseCloner::AfterStageBehavior TenantAllDatabaseCloner::listExistingDatabasesSta
         clonedDatabases.emplace_back(dbName);
 
         BSONObj res;
-        client.runCommand(dbName, BSON("dbStats" << 1), res);
+        // TODO SERVER-72945: Use dbName which is DatabaseName object already.
+        client.runCommand(DatabaseName(boost::none, dbName), BSON("dbStats" << 1), res);
         if (auto status = getStatusFromCommandResult(res); !status.isOK()) {
             LOGV2_WARNING(5522900,
                           "Skipping recording of data size metrics for database due to failure "
@@ -175,7 +179,7 @@ BaseCloner::AfterStageBehavior TenantAllDatabaseCloner::listExistingDatabasesSta
         }
     }
 
-    if (!getSharedData()->isResuming()) {
+    if (getSharedData()->getResumePhase() == ResumePhase::kNone) {
         uassert(ErrorCodes::NamespaceExists,
                 str::stream() << "Tenant '" << _tenantId
                               << "': databases already exist prior to data sync",
@@ -230,7 +234,8 @@ BaseCloner::AfterStageBehavior TenantAllDatabaseCloner::initializeStatsStage() {
     long long approxTotalDataSizeLeftOnRemote = 0;
     for (const auto& dbName : _databases) {
         BSONObj res;
-        getClient()->runCommand(dbName, BSON("dbStats" << 1), res);
+        // TODO SERVER-72945: Use dbName which is DatabaseName object already.
+        getClient()->runCommand(DatabaseName(boost::none, dbName), BSON("dbStats" << 1), res);
         if (auto status = getStatusFromCommandResult(res); !status.isOK()) {
             LOGV2_WARNING(5426600,
                           "Skipping recording of data size metrics for database due to failure "

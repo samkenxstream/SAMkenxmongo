@@ -27,13 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/document_source_cursor.h"
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/query/collection_query_info.h"
@@ -44,6 +44,9 @@
 #include "mongo/s/resharding/resume_token_gen.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -141,11 +144,10 @@ void DocumentSourceCursor::loadBatch() {
     tassert(5565800,
             "Expected PlanExecutor to use an external lock policy",
             _exec->lockPolicy() == PlanExecutor::LockPolicy::kLockExternally);
-    autoColl.emplace(pExpCtx->opCtx,
-                     _exec->nss(),
-                     AutoGetCollectionViewMode::kViewsForbidden,
-                     Date_t::max(),
-                     _exec->getSecondaryNamespaces());
+    autoColl.emplace(
+        pExpCtx->opCtx,
+        _exec->nss(),
+        AutoGetCollection::Options{}.secondaryNssOrUUIDs(_exec->getSecondaryNamespaces()));
     uassertStatusOK(repl::ReplicationCoordinator::get(pExpCtx->opCtx)
                         ->checkCanServeReadsFor(pExpCtx->opCtx, _exec->nss(), true));
 
@@ -206,7 +208,11 @@ void DocumentSourceCursor::recordPlanSummaryStats() {
     _exec->getPlanExplainer().getSummaryStats(&_stats.planSummaryStats);
 }
 
-Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity> verbosity) const {
+Value DocumentSourceCursor::serialize(SerializationOptions opts) const {
+    auto verbosity = opts.verbosity;
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484350);
+    }
     // We never parse a DocumentSourceCursor, so we only serialize for explain.
     if (!verbosity)
         return Value();
@@ -223,16 +229,20 @@ Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity>
 
     {
         auto opCtx = pExpCtx->opCtx;
-        auto lockMode = getLockModeForQuery(opCtx, _exec->nss());
-        AutoGetDb dbLock(opCtx, _exec->nss().db(), lockMode);
-        Lock::CollectionLock collLock(opCtx, _exec->nss(), lockMode);
-        auto collection = dbLock.getDb()
-            ? CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, _exec->nss())
-            : nullptr;
+        auto secondaryNssList = _exec->getSecondaryNamespaces();
+        AutoGetCollectionForReadMaybeLockFree readLock(
+            opCtx,
+            _exec->nss(),
+            AutoGetCollection::Options{}.secondaryNssOrUUIDs(secondaryNssList));
+        MultipleCollectionAccessor collections(opCtx,
+                                               &readLock.getCollection(),
+                                               readLock.getNss(),
+                                               readLock.isAnySecondaryNamespaceAViewOrSharded(),
+                                               secondaryNssList);
 
         Explain::explainStages(_exec.get(),
-                               collection,
-                               verbosity.get(),
+                               collections,
+                               verbosity.value(),
                                _execStatus,
                                _winningPlanTrialStats,
                                BSONObj(),
@@ -244,7 +254,7 @@ Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity>
     invariant(explainStats["queryPlanner"]);
     out["queryPlanner"] = Value(explainStats["queryPlanner"]);
 
-    if (verbosity.get() >= ExplainOptions::Verbosity::kExecStats) {
+    if (verbosity.value() >= ExplainOptions::Verbosity::kExecStats) {
         invariant(explainStats["executionStats"]);
         out["executionStats"] = Value(explainStats["executionStats"]);
     }
@@ -301,7 +311,7 @@ DocumentSourceCursor::~DocumentSourceCursor() {
 }
 
 DocumentSourceCursor::DocumentSourceCursor(
-    const CollectionPtr& collection,
+    const MultipleCollectionAccessor& collections,
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
     const intrusive_ptr<ExpressionContext>& pCtx,
     CursorType cursorType,
@@ -309,7 +319,8 @@ DocumentSourceCursor::DocumentSourceCursor(
     : DocumentSource(kStageName, pCtx),
       _currentBatch(cursorType),
       _exec(std::move(exec)),
-      _trackOplogTS(trackOplogTimestamp) {
+      _trackOplogTS(trackOplogTimestamp),
+      _queryFramework(_exec->getQueryFramework()) {
     // It is illegal for both 'kEmptyDocuments' and 'trackOplogTimestamp' to be set.
     invariant(!(cursorType == CursorType::kEmptyDocuments && trackOplogTimestamp));
 
@@ -326,20 +337,27 @@ DocumentSourceCursor::DocumentSourceCursor(
         _winningPlanTrialStats = explainer.getWinningPlanTrialStats();
     }
 
-    if (collection) {
-        CollectionQueryInfo::get(collection)
-            .notifyOfQuery(pExpCtx->opCtx, collection, _stats.planSummaryStats);
+    if (collections.hasMainCollection()) {
+        const auto& coll = collections.getMainCollection();
+        CollectionQueryInfo::get(coll).notifyOfQuery(pExpCtx->opCtx, coll, _stats.planSummaryStats);
+    }
+    for (auto& [nss, coll] : collections.getSecondaryCollections()) {
+        if (coll) {
+            PlanSummaryStats stats;
+            explainer.getSecondarySummaryStats(nss.toString(), &stats);
+            CollectionQueryInfo::get(coll).notifyOfQuery(pExpCtx->opCtx, coll, stats);
+        }
     }
 }
 
 intrusive_ptr<DocumentSourceCursor> DocumentSourceCursor::create(
-    const CollectionPtr& collection,
+    const MultipleCollectionAccessor& collections,
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
     const intrusive_ptr<ExpressionContext>& pExpCtx,
     CursorType cursorType,
     bool trackOplogTimestamp) {
     intrusive_ptr<DocumentSourceCursor> source(new DocumentSourceCursor(
-        collection, std::move(exec), pExpCtx, cursorType, trackOplogTimestamp));
+        collections, std::move(exec), pExpCtx, cursorType, trackOplogTimestamp));
     return source;
 }
 }  // namespace mongo

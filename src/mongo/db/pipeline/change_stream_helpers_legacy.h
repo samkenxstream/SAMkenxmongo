@@ -27,17 +27,12 @@
  *    it in the license file.
  */
 
+#pragma once
+
 #include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/db/pipeline/document_source_change_stream_gen.h"
 
 namespace mongo::change_stream_legacy {
-
-/**
- * Transforms a given user requested change stream 'spec' into a list of executable internal
- * pipeline stages.
- */
-std::list<boost::intrusive_ptr<DocumentSource>> buildPipeline(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, DocumentSourceChangeStreamSpec spec);
 
 /**
  * Looks up and returns a pre-image document at the specified opTime in the oplog. Asserts that if
@@ -46,14 +41,6 @@ std::list<boost::intrusive_ptr<DocumentSource>> buildPipeline(
  */
 boost::optional<Document> legacyLookupPreImage(boost::intrusive_ptr<ExpressionContext> pExpCtx,
                                                const Document& preImageId);
-
-/**
- * Builds document key cache from the resume token. The cache will be used when the insert oplog
- * entry does not contain the documentKey. This can happen when reading an oplog entry written by an
- * older version of the server.
- */
-boost::optional<std::pair<UUID, std::vector<FieldPath>>> buildDocumentKeyCache(
-    const ResumeTokenData& data);
 
 /**
  * Represents the change stream operation types that are NOT guarded behind the 'showExpandedEvents'
@@ -71,5 +58,20 @@ static const std::set<StringData> kClassicOperationTypes =
                          DocumentSourceChangeStream::kReshardBeginOpType,
                          DocumentSourceChangeStream::kReshardDoneCatchUpOpType,
                          DocumentSourceChangeStream::kNewShardDetectedOpType};
+
+/**
+ * Adds filtering for legacy-format {op: 'n'} oplog messages, which used the "o2.type" field to
+ * indicate the message type.
+ */
+void populateInternalOperationFilter(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                     BSONArrayBuilder* filter);
+
+/**
+ * Converts legacy-format oplog o2 fields of type {type: <op name>, ...} to
+ * {..., <op name>: <namespace>}. Does nothing if the 'type' field is not present inside 'o2'.
+ */
+Document convertFromLegacyOplogFormat(const Document& legacyO2Entry, const NamespaceString& nss);
+
+StringData getNewShardDetectedOpName(const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
 }  // namespace mongo::change_stream_legacy

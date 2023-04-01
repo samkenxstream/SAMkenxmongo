@@ -9,7 +9,7 @@ from buildscripts.resmokelib.testing.fixtures.fixturelib import FixtureLib
 class YesFixture(interface.Fixture):  # pylint: disable=abstract-method
     """Fixture which spawns several 'yes' executables to generate lots of log messages."""
 
-    def __init__(self, logger, job_num, fixturelib, num_instances=1, message_length=100):  # pylint: disable=too-many-arguments
+    def __init__(self, logger, job_num, fixturelib, num_instances=1, message_length=100):
         """Initialize YesFixture."""
         interface.Fixture.__init__(self, logger, job_num, fixturelib)
 
@@ -34,7 +34,7 @@ class YesFixture(interface.Fixture):  # pylint: disable=abstract-method
     def _make_process(self, index):
         logger = self.fixturelib.new_fixture_node_logger(self.__class__.__name__, self.job_num,
                                                          "yes{:d}".format(index))
-        return self.fixturelib.generic_program(logger, self.job_num, ["yes", self.__message])
+        return self.fixturelib.generic_program(logger, ["yes", self.__message])
 
     def _do_teardown(self, mode=None):
         running_at_start = self.is_running()

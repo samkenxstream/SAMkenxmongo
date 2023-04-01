@@ -146,6 +146,20 @@ public:
     virtual bool isSelf(const HostAndPort& host, ServiceContext* service) = 0;
 
     /**
+     * Returns true if "host" is one of the network identities of this node, without actually
+     * going out to the network and checking.
+     */
+    virtual bool isSelfFastPath(const HostAndPort& host) = 0;
+
+    /**
+     * Returns true if "host" is one of the network identities of this node, without
+     * checking the fast path first.
+     */
+    virtual bool isSelfSlowPath(const HostAndPort& host,
+                                ServiceContext* service,
+                                Milliseconds timeout) = 0;
+
+    /**
      * Gets the replica set config document from local storage, or returns an error.
      */
     virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx) = 0;
@@ -233,6 +247,11 @@ public:
      * Start bgsync's producer if it's stopped.
      */
     virtual void startProducerIfStopped() = 0;
+
+    /**
+     * Notify interested parties that member data for other nodes has changed.
+     */
+    virtual void notifyOtherMemberDataChanged() = 0;
 
     /**
      * True if we have discovered that no sync source's oplog overlaps with ours.

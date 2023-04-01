@@ -29,7 +29,7 @@
 #include "test_util.h"
 
 static const char name[] = "lsm:test";
-#define NUM_DOCS 100000
+#define NUM_DOCS (100 * WT_THOUSAND)
 #define NUM_QUERIES (NUM_DOCS / 100)
 
 /*
@@ -120,7 +120,9 @@ main(int argc, char *argv[])
     memset(opts, 0, sizeof(*opts));
     testutil_check(testutil_parse_opts(argc, argv, opts));
     testutil_make_work_dir(opts->home);
-    testutil_check(wiredtiger_open(opts->home, NULL, "create,cache_size=200M", &opts->conn));
+    testutil_check(wiredtiger_open(opts->home, NULL,
+      "create,cache_size=200M,statistics=(all),statistics_log=(json,on_close,wait=1)",
+      &opts->conn));
 
     testutil_check(opts->conn->open_session(opts->conn, NULL, NULL, &session));
     testutil_check(opts->conn->open_session(opts->conn, NULL, NULL, &session2));
@@ -176,7 +178,7 @@ main(int argc, char *argv[])
     testutil_check(session2->open_cursor(session2, name, NULL, "next_random=true", &rcursor));
 
     /* Delete all but one document */
-    testutil_check(session->open_cursor(session, name, NULL, "overwrite", &wcursor));
+    testutil_check(session->open_cursor(session, name, NULL, NULL, &wcursor));
     for (i = 0; i < NUM_DOCS - 1; i++) {
         wcursor->set_key(wcursor, i);
         testutil_check(wcursor->remove(wcursor));
@@ -224,7 +226,7 @@ main(int argc, char *argv[])
     testutil_check(pthread_join(thread, NULL));
 
     /* Delete everything. Check for infinite loops */
-    testutil_check(session->open_cursor(session, name, NULL, "overwrite", &wcursor));
+    testutil_check(session->open_cursor(session, name, NULL, NULL, &wcursor));
     for (i = 0; i < NUM_DOCS; i++) {
         wcursor->set_key(wcursor, i);
         testutil_check(wcursor->remove(wcursor));

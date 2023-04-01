@@ -29,20 +29,27 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
 #include "mongo/db/exec/sbe/stages/spool.h"
 
 namespace mongo::sbe {
 SpoolEagerProducerStage::SpoolEagerProducerStage(std::unique_ptr<PlanStage> input,
                                                  SpoolId spoolId,
                                                  value::SlotVector vals,
-                                                 PlanNodeId planNodeId)
-    : PlanStage{"espool"_sd, planNodeId}, _spoolId{spoolId}, _vals{std::move(vals)} {
+                                                 PlanNodeId planNodeId,
+                                                 bool participateInTrialRunTracking)
+    : PlanStage{"espool"_sd, planNodeId, participateInTrialRunTracking},
+      _spoolId{spoolId},
+      _vals{std::move(vals)} {
     _children.emplace_back(std::move(input));
 }
 
 std::unique_ptr<PlanStage> SpoolEagerProducerStage::clone() const {
-    return std::make_unique<SpoolEagerProducerStage>(
-        _children[0]->clone(), _spoolId, _vals, _commonStats.nodeId);
+    return std::make_unique<SpoolEagerProducerStage>(_children[0]->clone(),
+                                                     _spoolId,
+                                                     _vals,
+                                                     _commonStats.nodeId,
+                                                     _participateInTrialRunTracking);
 }
 
 void SpoolEagerProducerStage::prepare(CompileCtx& ctx) {
@@ -171,8 +178,9 @@ SpoolLazyProducerStage::SpoolLazyProducerStage(std::unique_ptr<PlanStage> input,
                                                SpoolId spoolId,
                                                value::SlotVector vals,
                                                std::unique_ptr<EExpression> predicate,
-                                               PlanNodeId planNodeId)
-    : PlanStage{"lspool"_sd, planNodeId},
+                                               PlanNodeId planNodeId,
+                                               bool participateInTrialRunTracking)
+    : PlanStage{"lspool"_sd, planNodeId, participateInTrialRunTracking},
       _spoolId{spoolId},
       _vals{std::move(vals)},
       _predicate{std::move(predicate)} {
@@ -180,8 +188,12 @@ SpoolLazyProducerStage::SpoolLazyProducerStage(std::unique_ptr<PlanStage> input,
 }
 
 std::unique_ptr<PlanStage> SpoolLazyProducerStage::clone() const {
-    return std::make_unique<SpoolLazyProducerStage>(
-        _children[0]->clone(), _spoolId, _vals, _predicate->clone(), _commonStats.nodeId);
+    return std::make_unique<SpoolLazyProducerStage>(_children[0]->clone(),
+                                                    _spoolId,
+                                                    _vals,
+                                                    _predicate->clone(),
+                                                    _commonStats.nodeId,
+                                                    _participateInTrialRunTracking);
 }
 
 void SpoolLazyProducerStage::prepare(CompileCtx& ctx) {
@@ -274,12 +286,12 @@ PlanState SpoolLazyProducerStage::getNext() {
 }
 
 void SpoolLazyProducerStage::doSaveState(bool relinquishCursor) {
-    if (!slotsAccessible() || !relinquishCursor) {
+    if (!relinquishCursor) {
         return;
     }
 
     for (auto& [slot, accessor] : _outAccessors) {
-        accessor.makeOwned();
+        prepareForYielding(accessor, slotsAccessible());
     }
 }
 

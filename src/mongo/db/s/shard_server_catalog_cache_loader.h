@@ -75,7 +75,7 @@ public:
      * Sets any notifications waiting for this version to arrive and invalidates the catalog cache's
      * chunk metadata for collection 'nss' so that the next caller provokes a refresh.
      */
-    void notifyOfCollectionVersionUpdate(const NamespaceString& nss) override;
+    void notifyOfCollectionPlacementVersionUpdate(const NamespaceString& nss) override;
 
     SemiFuture<CollectionAndChangedChunks> getChunksSince(const NamespaceString& nss,
                                                           ChunkVersion version) override;
@@ -85,6 +85,8 @@ public:
     void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) override;
 
     void waitForDatabaseFlush(OperationContext* opCtx, StringData dbName) override;
+
+    void onFCVChanged() override;
 
 private:
     // Differentiates the server's role in the replica set so that the chunk loader knows whether to

@@ -3,7 +3,6 @@
  * state doc for the migration has been removed.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
@@ -12,22 +11,21 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {forgetMigrationAsync} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+load("jstests/replsets/rslib.js");  // 'createRstArgs'
 
 const tenantMigrationTest = new TenantMigrationTest(
     {name: jsTestName(), quickGarbageCollection: true, initiateRstWithHighElectionTimeout: false});
 
-const kTenantId = "testTenantId";
+const kTenantId = ObjectId().str;
 
 const donorRst = tenantMigrationTest.getDonorRst();
-const donorRstArgs = TenantMigrationUtil.createRstArgs(donorRst);
+const donorRstArgs = createRstArgs(donorRst);
 let donorPrimary = tenantMigrationTest.getDonorPrimary();
 
 const migrationId = UUID();
@@ -41,7 +39,7 @@ TenantMigrationTest.assertCommitted(
 
 let fp = configureFailPoint(donorPrimary,
                             "pauseTenantMigrationDonorAfterMarkingStateGarbageCollectable");
-const forgetMigrationThread = new Thread(TenantMigrationUtil.forgetMigrationAsync,
+const forgetMigrationThread = new Thread(forgetMigrationAsync,
                                          migrationOpts.migrationIdString,
                                          donorRstArgs,
                                          false /* retryOnRetryableErrors */);
@@ -60,4 +58,3 @@ assert.commandFailedWithCode(forgetMigrationThread.returnData(),
 
 donorRst.stopSet();
 tenantMigrationTest.stop();
-})();

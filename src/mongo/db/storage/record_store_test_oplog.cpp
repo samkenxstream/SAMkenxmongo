@@ -27,11 +27,8 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/db/catalog/capped_collection_maintenance.h"
 #include "mongo/db/storage/record_store_test_harness.h"
-
-#include "mongo/db/storage/record_store.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -175,7 +172,10 @@ TEST(RecordStoreTestHarness, SeekNearOplog) {
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        rs->cappedTruncateAfter(opCtx.get(), RecordId(2, 2), false);  // no-op
+        rs->cappedTruncateAfter(opCtx.get(),
+                                RecordId(2, 2),
+                                false /* inclusive */,
+                                nullptr /* aboutToDelete callback */);  // no-op
     }
 
     {
@@ -188,7 +188,10 @@ TEST(RecordStoreTestHarness, SeekNearOplog) {
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        rs->cappedTruncateAfter(opCtx.get(), RecordId(1, 2), false);  // deletes 2,2
+        rs->cappedTruncateAfter(opCtx.get(),
+                                RecordId(1, 2),
+                                false /* inclusive */,
+                                nullptr /* aboutToDelete callback */);  // deletes 2,2
     }
 
     {
@@ -201,7 +204,10 @@ TEST(RecordStoreTestHarness, SeekNearOplog) {
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        rs->cappedTruncateAfter(opCtx.get(), RecordId(1, 2), true);  // deletes 1,2
+        rs->cappedTruncateAfter(opCtx.get(),
+                                RecordId(1, 2),
+                                true /* inclusive */,
+                                nullptr /* aboutToDelete callback */);  // deletes 1,2
     }
 
     {
@@ -284,7 +290,7 @@ std::string stringifyForDebug(OperationContext* opCtx,
     auto optOplogReadTimestampInt = opCtx->recoveryUnit()->getOplogVisibilityTs();
     if (optOplogReadTimestampInt) {
         output << "Latest oplog visibility timestamp: "
-               << Timestamp(optOplogReadTimestampInt.get());
+               << Timestamp(optOplogReadTimestampInt.value());
     }
 
     if (record) {
@@ -423,7 +429,8 @@ TEST(RecordStoreTestHarness, OplogOrder) {
     {
         auto client2 = harnessHelper->serviceContext()->makeClient("c2");
         auto opCtx = harnessHelper->newOperationContext(client2.get());
-        rs->cappedTruncateAfter(opCtx.get(), id1, /*inclusive*/ false);
+        rs->cappedTruncateAfter(
+            opCtx.get(), id1, false /* inclusive */, nullptr /* aboutToDelete callback */);
     }
 
     rs->waitForAllEarlierOplogWritesToBeVisible(harnessHelper->newOperationContext().get());
@@ -507,6 +514,55 @@ TEST(RecordStoreTestHarness, OplogOrder) {
         ASSERT(nextRecord) << stringifyForDebug(opCtx.get(), nextRecord, cursor.get());
         nextRecord = cursor->next();
         ASSERT(!nextRecord) << stringifyForDebug(opCtx.get(), nextRecord, cursor.get());
+    }
+}
+
+TEST(RecordStoreTestHarness, OplogVisibilityStandalone) {
+    std::unique_ptr<RecordStoreHarnessHelper> harnessHelper(
+        newRecordStoreHarnessHelper(RecordStoreHarnessHelper::Options::Standalone));
+    std::unique_ptr<RecordStore> rs(harnessHelper->newOplogRecordStore());
+
+    RecordId id1;
+
+    // insert a document
+    {
+        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        {
+            WriteUnitOfWork uow(opCtx.get());
+            // We must have a "ts" field with a timestamp.
+            Timestamp ts(5, 1);
+            BSONObj obj = BSON("ts" << ts);
+            // However, the insert is not timestamped in standalone mode.
+            StatusWith<RecordId> res =
+                rs->insertRecord(opCtx.get(), obj.objdata(), obj.objsize(), Timestamp());
+            ASSERT_OK(res.getStatus());
+            id1 = res.getValue();
+            StatusWith<RecordId> expectedId = record_id_helpers::keyForOptime(ts, KeyFormat::Long);
+            ASSERT_OK(expectedId.getStatus());
+            // RecordId should be extracted from 'ts' field when inserting into oplog namespace
+            ASSERT(expectedId.getValue().compare(id1) == 0);
+
+            uow.commit();
+        }
+    }
+
+    // verify that we can read it
+    {
+        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto cursor = rs->getCursor(opCtx.get());
+        auto record = cursor->seekExact(id1);
+        ASSERT(record);
+        ASSERT_EQ(id1, record->id);
+        ASSERT(!cursor->next());
+    }
+
+    {
+        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto cursor = rs->getCursor(opCtx.get());
+        auto record = cursor->seekNear(RecordId(id1.getLong() + 1));
+        ASSERT(record);
+        ASSERT_EQ(id1, record->id);
+        ASSERT(!cursor->next());
     }
 }
 }  // namespace

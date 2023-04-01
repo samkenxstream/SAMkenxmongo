@@ -69,7 +69,7 @@ public:
      */
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
                                                      Pipeline::SourceContainer* container) final;
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
         return DepsTracker::State::SEE_NEXT;  // This doesn't affect needed fields
@@ -93,6 +93,8 @@ public:
     void setLimit(long long newLimit) {
         _limit = newLimit;
     }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
 private:
     DocumentSourceLimit(const boost::intrusive_ptr<ExpressionContext>& pExpCtx, long long limit);

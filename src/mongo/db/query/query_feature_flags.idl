@@ -48,101 +48,69 @@ feature_flags:
       default: true
       version: 5.1
 
-    featureFlagSBEGroupPushdown:
-      description: "Feature flag for allowing SBE $group pushdown"
-      cpp_varname: gFeatureFlagSBEGroupPushdown
+    featureFlagChangeStreamsFurtherEnrichedEvents:
+      description: "Feature flag for enabling the reshardCollection and refineCollectionShardKey events, as well as enhancements to the updateDescription field for update events"
+      cpp_varname: gFeatureFlagChangeStreamsFurtherEnrichedEvents
       default: true
-      version: 5.2
-
-    featureFlagExactTopNAccumulator:
-      description: "Feature flag for allowing use of topN family of accumulators"
-      cpp_varname: gFeatureFlagExactTopNAccumulator
-      default: true
-      version: 5.2
-
-    featureFlagShardedLookup:
-      description: "Feature flag for allowing $lookup/$graphLookup into a sharded collection"
-      cpp_varname: gFeatureFlagShardedLookup
-      default: true
-      version: 5.1
-
-    featureFlagChangeStreamPreAndPostImages:
-      description: "Feature flag for allowing usage of point-in-time pre- and post-images of documents in change streams"
-      cpp_varname: gFeatureFlagChangeStreamPreAndPostImages
-      default: false
-
-    featureFlagSearchMeta:
-      description: "Feature flag for allowing use of search collectors alongside search results"
-      cpp_varname: gFeatureFlagSearchMeta
-      default: true
-      version: 5.1
-
-    featureFlagSbePlanCache:
-      description: "Feature flag for enabling use of the SBE plan cache"
-      cpp_varname: gFeatureFlagSbePlanCache
-      default: false
-
-    featureFlagAutoParameterization:
-      description: "Feature flag for enabling auto-parameterization of match expressions. This
-      feature is used to store auto-parameterized plans in the SBE plan cache, so this flag is only
-      meaningful to turn on in combination with 'featureFlagSbePlanCache'."
-      cpp_varname: gFeatureFlagAutoParameterization
-      default: false
-
-    featureFlagSortArray:
-        description: "Feature flag for allowing use of the $sortArray aggregation expression"
-        cpp_varname: gFeatureFlagSortArray
-        default: true
-        version: 5.2
-
-    featureFlagChangeStreamsVisibility:
-      description: "Feature flag for enabling improved change streams visibility"
-      cpp_varname: gFeatureFlagChangeStreamsVisibility
-      default: false
-
-    featureFlagLocf:
-        description: "Feature flag for allowing $locf window function"
-        cpp_varname: gFeatureFlagLocf
-        default: true
-        version: 5.2
-
-    featureFlagFill:
-        description: "Feature flag for allowing $fill and $linearFill window functions"
-        cpp_varname: gFeatureFlagFill
-        default: true
-        version: 5.3
+      version: 6.1
 
     featureFlagCommonQueryFramework:
       description: "Feature flag for allowing use of Cascades-based query optimizer"
-      cpp_varname: gfeatureFlagCommonQueryFramework
-      default: false
-
-    featureFlagLastPointQuery:
-      description : "Feature flag for optimizing Last Point queries on time-series collections"
-      cpp_varname: gfeatureFlagLastPointQuery
-      default: false
-
-    featureFlagChangeStreamPreAndPostImagesTimeBasedRetentionPolicy:
-      description: "Feature flag to enable time based retention policy of point-in-time pre- and post-images of documents in change streams"
-      cpp_varname: gFeatureFlagChangeStreamPreAndPostImagesTimeBasedRetentionPolicy
-      default: false
-
-    featureFlagSBELookupPushdown:
-      description: "Feature flag for allowing SBE $lookup pushdown"
-      cpp_varname: gFeatureFlagSBELookupPushdown
-      default: false
-
-    featureFlagSBELookupPushdownIndexJoin:
-      description: "Feature flag for allowing SBE $lookup pushdown to execute query using index join strategy"
-      cpp_varname: gFeatureFlagSBELookupPushdownIndexJoin
-      default: false
-
-    featureFlagSearchShardedFacets:
-      description: "Enable use of $$SEARCH_META on sharded collections"
-      cpp_varname: gFeatureFlagSearchShardedFacets
+      cpp_varname: gFeatureFlagCommonQueryFramework
       default: false
 
     featureFlagBucketUnpackWithSort:
       description: "Enables a time-series optimization that allows for partially-blocking sort on time"
       cpp_varname: gFeatureFlagBucketUnpackWithSort
+      default: true
+      version: 6.0
+
+    featureFlagColumnstoreIndexes:
+      description: "Enables creation of a new columnstore index type"
+      cpp_varname: gFeatureFlagColumnstoreIndexes
+      default: false
+
+    featureFlagServerlessChangeStreams:
+      description: "Feature flag to enable reading change events from the change collection rather than the oplog"
+      cpp_varname: gFeatureFlagServerlessChangeStreams
+      default: false
+
+    featureFlagSbeFull:
+      description: "Feature flag for SBE behaviors, features, or extensions that are not yet enabled
+                    by default"
+      cpp_varname: gFeatureFlagSbeFull
+      default: false
+
+    featureFlagTelemetry:
+      description: "Feature flag for enabling the telemetry store."
+      cpp_varname: gFeatureFlagTelemetry
+      default: false
+
+    featureFlagBitwiseAggOperators:
+      description: "Feature flag for enabling support for bitwise operators in the aggregation language."
+      cpp_varname: gFeatureFlagBitwise
+      default: true
+      version: 6.3
+
+    featureFlagCompoundWildcardIndexes:
+      description: "Feature flag to enable compound wildcard indexes."
+      cpp_varname: gFeatureFlagCompoundWildcardIndexes
+      default: true
+      version: 7.0
+
+    featureFlagShardedSearchCustomSort:
+      description: "Feature flag to enable user specified sort for sharded $search queries."
+      cpp_varname: gFeatureFlagShardedSearchCustomSort
+      default: true
+      version: 7.0
+
+    featureFlagUserRoles:
+      description: "Feature flag to enable usage of $$USER_ROLES."
+      cpp_varname: gFeatureFlagUserRoles
+      default: true
+      version: 7.0
+
+    featureFlagApproxPercentiles:
+      description: "Feature flag to enable approximate $percentile accumulator/expression."
+      cpp_varname: gFeatureFlagApproxPercentiles
       default: false

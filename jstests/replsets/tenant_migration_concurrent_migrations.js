@@ -1,15 +1,9 @@
 /**
  * Test that multiple concurrent tenant migrations are supported.
  *
- * Tenant migrations are not expected to be run on servers with ephemeralForTest, and in particular
- * this test fails on ephemeralForTest because the donor has to wait for the write to set the
- * migration state to "committed" and "aborted" to be majority committed but it cannot do that on
- * ephemeralForTest.
- *
  * Incompatible with shard merge, which can't handle concurrent migrations.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
@@ -19,22 +13,20 @@
  * ]
  */
 
-(function() {
-'use strict';
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {makeX509Options} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
-const x509Options0 = TenantMigrationUtil.makeX509Options("jstests/libs/rs0.pem");
-const x509Options1 = TenantMigrationUtil.makeX509Options("jstests/libs/rs1.pem");
-const x509Options2 = TenantMigrationUtil.makeX509Options("jstests/libs/rs2.pem");
+const x509Options0 = makeX509Options("jstests/libs/rs0.pem");
+const x509Options1 = makeX509Options("jstests/libs/rs1.pem");
+const x509Options2 = makeX509Options("jstests/libs/rs2.pem");
 
-const rst0 = new ReplSetTest({nodes: 1, name: 'rst0', nodeOptions: x509Options0});
-const rst1 = new ReplSetTest({nodes: 1, name: 'rst1', nodeOptions: x509Options1});
-const rst2 = new ReplSetTest({nodes: 1, name: 'rst2', nodeOptions: x509Options2});
+const rst0 = new ReplSetTest({nodes: 1, name: 'rst0', serverless: true, nodeOptions: x509Options0});
+const rst1 = new ReplSetTest({nodes: 1, name: 'rst1', serverless: true, nodeOptions: x509Options1});
+const rst2 = new ReplSetTest({nodes: 1, name: 'rst2', serverless: true, nodeOptions: x509Options2});
 
 rst0.startSet();
 rst0.initiate();
@@ -45,14 +37,12 @@ rst1.initiate();
 rst2.startSet();
 rst2.initiate();
 
-const kTenantIdPrefix = "testTenantId";
-
 // Test concurrent outgoing migrations to different recipients.
 (() => {
     const tenantMigrationTest0 = new TenantMigrationTest({donorRst: rst0, recipientRst: rst1});
     const tenantMigrationTest1 = new TenantMigrationTest({donorRst: rst0, recipientRst: rst2});
-    const tenantId0 = `${kTenantIdPrefix}-ConcurrentOutgoingMigrationsToDifferentRecipient0`;
-    const tenantId1 = `${kTenantIdPrefix}-ConcurrentOutgoingMigrationsToDifferentRecipient1`;
+    const tenantId0 = ObjectId().str;
+    const tenantId1 = ObjectId().str;
     const donorPrimary = rst0.getPrimary();
     const connPoolStatsBefore = assert.commandWorked(donorPrimary.adminCommand({connPoolStats: 1}));
 
@@ -98,8 +88,8 @@ const kTenantIdPrefix = "testTenantId";
 (() => {
     const tenantMigrationTest0 = new TenantMigrationTest({donorRst: rst0, recipientRst: rst2});
     const tenantMigrationTest1 = new TenantMigrationTest({donorRst: rst1, recipientRst: rst2});
-    const tenantId0 = `${kTenantIdPrefix}-ConcurrentIncomingMigrations0`;
-    const tenantId1 = `${kTenantIdPrefix}-ConcurrentIncomingMigrations1`;
+    const tenantId0 = ObjectId().str;
+    const tenantId1 = ObjectId().str;
 
     const migrationOpts0 = {
         migrationIdString: extractUUIDFromObject(UUID()),
@@ -139,8 +129,8 @@ const kTenantIdPrefix = "testTenantId";
     const tenantMigrationTest0 = new TenantMigrationTest({donorRst: rst0, recipientRst: rst1});
     const tenantMigrationTest1 = new TenantMigrationTest({donorRst: rst0, recipientRst: rst1});
 
-    const tenantId0 = `${kTenantIdPrefix}-ConcurrentOutgoingMigrationsToSameRecipient0`;
-    const tenantId1 = `${kTenantIdPrefix}-ConcurrentOutgoingMigrationsToSameRecipient1`;
+    const tenantId0 = ObjectId().str;
+    const tenantId1 = ObjectId().str;
 
     const donorsColl = tenantMigrationTest0.getDonorRst().getPrimary().getCollection(
         TenantMigrationTest.kConfigDonorsNS);
@@ -158,7 +148,7 @@ const kTenantIdPrefix = "testTenantId";
 
     const connPoolStatsBefore = assert.commandWorked(donorPrimary.adminCommand({connPoolStats: 1}));
 
-    let blockFp = configureFailPoint(
+    const blockFp = configureFailPoint(
         donorPrimary, "pauseTenantMigrationBeforeLeavingBlockingState", {tenantId: tenantId1});
     assert.commandWorked(tenantMigrationTest0.startMigration(migrationOpts0));
     assert.commandWorked(tenantMigrationTest1.startMigration(migrationOpts1));
@@ -199,4 +189,3 @@ const kTenantIdPrefix = "testTenantId";
 rst0.stopSet();
 rst1.stopSet();
 rst2.stopSet();
-})();

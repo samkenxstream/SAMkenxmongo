@@ -27,15 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/commands/kill_sessions_remote.h"
 
 #include "mongo/db/client.h"
-#include "mongo/db/kill_sessions_common.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/session/kill_sessions_common.h"
 #include "mongo/executor/async_multicaster.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/client/shard.h"
@@ -43,6 +42,9 @@
 #include "mongo/s/commands/cluster_commands_gen.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {

@@ -27,13 +27,23 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 
 import wiredtiger, wttest
-from wiredtiger import stat
+from helper_tiered import TieredConfigMixin, gen_tiered_storage_sources
+from wtscenario import make_scenarios
 
 # test_alter05.py
 #    Check the alter command succeeds even if the file is modified.
-class test_alter05(wttest.WiredTigerTestCase):
-    conn_config = "statistics=(all)"
+class test_alter05(TieredConfigMixin, wttest.WiredTigerTestCase):
     name = "alter05"
+    tiered_storage_sources = gen_tiered_storage_sources()
+    scenarios = make_scenarios(tiered_storage_sources)
+
+    # Setup custom connection config.
+    def conn_config(self):
+        conf = self.tiered_conn_config()
+        if conf != '':
+            conf += ','
+        conf += 'statistics=(all)'
+        return conf
 
     def get_stat(self, stat):
         stat_cursor = self.session.open_cursor('statistics:')
@@ -76,13 +86,13 @@ class test_alter05(wttest.WiredTigerTestCase):
         self.session.commit_transaction('commit_timestamp=' + self.timestamp_str(2))
         c.close()
 
-        prev_alter_checkpoints = self.get_stat(stat.conn.session_table_alter_trigger_checkpoint)
+        prev_alter_checkpoints = self.get_stat(wiredtiger.stat.conn.session_table_alter_trigger_checkpoint)
 
         # Alter the table and verify.
         self.session.alter(uri, 'log=(enabled=false)')
         self.verify_metadata('log=(enabled=false)')
 
-        alter_checkpoints = self.get_stat(stat.conn.session_table_alter_trigger_checkpoint)
+        alter_checkpoints = self.get_stat(wiredtiger.stat.conn.session_table_alter_trigger_checkpoint)
         self.assertEqual(prev_alter_checkpoints + 1, alter_checkpoints)
         prev_alter_checkpoints = alter_checkpoints
 
@@ -97,7 +107,7 @@ class test_alter05(wttest.WiredTigerTestCase):
             lambda: self.session.alter(uri, 'log=(enabled=true)'))
         self.verify_metadata('log=(enabled=false)')
 
-        alter_checkpoints = self.get_stat(stat.conn.session_table_alter_trigger_checkpoint)
+        alter_checkpoints = self.get_stat(wiredtiger.stat.conn.session_table_alter_trigger_checkpoint)
         self.assertEqual(prev_alter_checkpoints + 1, alter_checkpoints)
 
 if __name__ == '__main__':

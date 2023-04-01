@@ -42,8 +42,15 @@
 #include "mongo/logv2/log_severity.h"
 #include "mongo/util/errno_util.h"
 
-namespace mongo {
-namespace logv2::detail {
+namespace mongo::logv2 {
+
+// Whether there is a doLogImpl call currently on this thread's stack.
+bool loggingInProgress();
+
+// Write message to stderr in a signal-safe manner.
+void signalSafeWriteToStderr(StringData message);
+namespace detail {
+
 using GetTenantIDFn = std::function<boost::optional<TenantId>()>;
 void setGetTenantIDCallback(GetTenantIDFn&& fn);
 
@@ -66,7 +73,7 @@ void doLogUnpacked(int32_t id,
                    LogOptions const& options,
                    const S& message,
                    const NamedArg<Args>&... args) {
-    auto attributes = makeAttributeStorage(args...);
+    auto attributes = AttributeStorage(args...);
 
     fmt::string_view msg{message};
     doLogImpl(id, severity, options, StringData(msg.data(), msg.size()), attributes);
@@ -130,6 +137,6 @@ void doLog(int32_t id,
         std::tuple_cat(toFlatAttributesTupleRef(args)...));
 }
 
-}  // namespace logv2::detail
+}  // namespace detail
 
-}  // namespace mongo
+}  // namespace mongo::logv2

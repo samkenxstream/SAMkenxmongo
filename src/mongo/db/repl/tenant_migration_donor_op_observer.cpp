@@ -31,8 +31,13 @@
 
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/repl/tenant_migration_access_blocker_util.h"
+#include "mongo/db/repl/tenant_migration_decoration.h"
 #include "mongo/db/repl/tenant_migration_donor_op_observer.h"
 #include "mongo/db/repl/tenant_migration_state_machine_gen.h"
+#include "mongo/db/serverless/serverless_operation_lock_registry.h"
+#include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 namespace mongo {
 namespace repl {
@@ -42,12 +47,6 @@ namespace {
 MONGO_FAIL_POINT_DEFINE(donorOpObserverFailAfterOnInsert);
 MONGO_FAIL_POINT_DEFINE(donorOpObserverFailAfterOnUpdate);
 
-const auto tenantIdToDeleteDecoration =
-    OperationContext::declareDecoration<boost::optional<std::string>>();
-
-const auto migrationIdToDeleteDecoration =
-    OperationContext::declareDecoration<boost::optional<UUID>>();
-
 /**
  * Initializes the TenantMigrationDonorAccessBlocker for the tenant migration denoted by the given
  * state doc.
@@ -56,50 +55,43 @@ void onTransitionToAbortingIndexBuilds(OperationContext* opCtx,
                                        const TenantMigrationDonorDocument& donorStateDoc) {
     invariant(donorStateDoc.getState() == TenantMigrationDonorStateEnum::kAbortingIndexBuilds);
 
+    ServerlessOperationLockRegistry::get(opCtx->getServiceContext())
+        .acquireLock(ServerlessOperationLockRegistry::LockType::kTenantDonor,
+                     donorStateDoc.getId());
+    opCtx->recoveryUnit()->onRollback(
+        [migrationId = donorStateDoc.getId()](OperationContext* opCtx) {
+            ServerlessOperationLockRegistry::get(opCtx->getServiceContext())
+                .releaseLock(ServerlessOperationLockRegistry::LockType::kTenantDonor, migrationId);
+        });
+
+    auto mtab = std::make_shared<TenantMigrationDonorAccessBlocker>(opCtx->getServiceContext(),
+                                                                    donorStateDoc.getId());
     if (donorStateDoc.getProtocol().value_or(MigrationProtocolEnum::kMultitenantMigrations) ==
         MigrationProtocolEnum::kMultitenantMigrations) {
-        auto mtab = std::make_shared<TenantMigrationDonorAccessBlocker>(
-            opCtx->getServiceContext(),
-            donorStateDoc.getId(),
-            donorStateDoc.getTenantId().toString(),
-            MigrationProtocolEnum::kMultitenantMigrations,
-            donorStateDoc.getRecipientConnectionString().toString());
-
-        TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
-            .add(donorStateDoc.getTenantId(), mtab);
-
-        if (opCtx->writesAreReplicated()) {
-            // onRollback is not registered on secondaries since secondaries should not fail to
-            // apply the write.
-            opCtx->recoveryUnit()->onRollback([opCtx, donorStateDoc] {
-                TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
-                    .remove(donorStateDoc.getTenantId(),
-                            TenantMigrationAccessBlocker::BlockerType::kDonor);
-            });
-        }
+        const auto tenantId = TenantId::parseFromString(donorStateDoc.getTenantId());
+        TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext()).add(tenantId, mtab);
     } else {
         tassert(6448702,
                 "Bad protocol",
                 donorStateDoc.getProtocol() == MigrationProtocolEnum::kShardMerge);
-        auto mtab = std::make_shared<TenantMigrationDonorAccessBlocker>(
-            opCtx->getServiceContext(),
-            donorStateDoc.getId(),
-            donorStateDoc.getTenantId().toString(),
-            MigrationProtocolEnum::kShardMerge,
-            donorStateDoc.getRecipientConnectionString().toString());
+        invariant(donorStateDoc.getTenantIds());
 
-        TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
-            .addShardMergeDonorAccessBlocker(mtab);
+        auto& registry = TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext());
 
-        if (opCtx->writesAreReplicated()) {
-            // onRollback is not registered on secondaries since secondaries should not fail to
-            // apply the write.
-            opCtx->recoveryUnit()->onRollback([opCtx, donorStateDoc] {
-                TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
-                    .removeShardMergeDonorAccessBlocker(donorStateDoc.getId());
-            });
+        // Add global access blocker to avoid any tenant creation during shard merge.
+        registry.addGlobalDonorAccessBlocker(mtab);
+        for (const auto& tenantId : *donorStateDoc.getTenantIds()) {
+            registry.add(tenantId,
+                         std::make_shared<TenantMigrationDonorAccessBlocker>(
+                             opCtx->getServiceContext(), donorStateDoc.getId()));
         }
     }
+
+    opCtx->recoveryUnit()->onRollback([donorStateDoc](OperationContext* opCtx) {
+        TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
+            .removeAccessBlockersForMigration(donorStateDoc.getId(),
+                                              TenantMigrationAccessBlocker::BlockerType::kDonor);
+    });
 }
 
 /**
@@ -110,21 +102,25 @@ void onTransitionToBlocking(OperationContext* opCtx,
     invariant(donorStateDoc.getState() == TenantMigrationDonorStateEnum::kBlocking);
     invariant(donorStateDoc.getBlockTimestamp());
 
-    auto mtab = tenant_migration_access_blocker::getTenantMigrationDonorAccessBlocker(
-        opCtx->getServiceContext(), donorStateDoc.getTenantId());
-    invariant(mtab);
+    auto mtabVector = TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
+                          .getDonorAccessBlockersForMigration(donorStateDoc.getId());
+    invariant(!mtabVector.empty());
 
     if (!opCtx->writesAreReplicated()) {
         // A primary calls startBlockingWrites on the TenantMigrationDonorAccessBlocker before
         // reserving the OpTime for the "start blocking" write, so only secondaries call
         // startBlockingWrites on the TenantMigrationDonorAccessBlocker in the op observer.
-        mtab->startBlockingWrites();
+        for (auto& mtab : mtabVector) {
+            mtab->startBlockingWrites();
+        }
     }
 
     // Both primaries and secondaries call startBlockingReadsAfter in the op observer, since
     // startBlockingReadsAfter just needs to be called before the "start blocking" write's oplog
     // hole is filled.
-    mtab->startBlockingReadsAfter(donorStateDoc.getBlockTimestamp().get());
+    for (auto& mtab : mtabVector) {
+        mtab->startBlockingReadsAfter(donorStateDoc.getBlockTimestamp().value());
+    }
 }
 
 /**
@@ -135,11 +131,13 @@ void onTransitionToCommitted(OperationContext* opCtx,
     invariant(donorStateDoc.getState() == TenantMigrationDonorStateEnum::kCommitted);
     invariant(donorStateDoc.getCommitOrAbortOpTime());
 
-    auto mtab = tenant_migration_access_blocker::getTenantMigrationDonorAccessBlocker(
-        opCtx->getServiceContext(), donorStateDoc.getTenantId());
-    invariant(mtab);
+    auto mtabVector = TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
+                          .getDonorAccessBlockersForMigration(donorStateDoc.getId());
+    invariant(!mtabVector.empty());
 
-    mtab->setCommitOpTime(opCtx, donorStateDoc.getCommitOrAbortOpTime().get());
+    for (auto& mtab : mtabVector) {
+        mtab->setCommitOpTime(opCtx, donorStateDoc.getCommitOrAbortOpTime().value());
+    }
 }
 
 /**
@@ -150,10 +148,13 @@ void onTransitionToAborted(OperationContext* opCtx,
     invariant(donorStateDoc.getState() == TenantMigrationDonorStateEnum::kAborted);
     invariant(donorStateDoc.getCommitOrAbortOpTime());
 
-    auto mtab = tenant_migration_access_blocker::getTenantMigrationDonorAccessBlocker(
-        opCtx->getServiceContext(), donorStateDoc.getTenantId());
-    invariant(mtab);
-    mtab->setAbortOpTime(opCtx, donorStateDoc.getCommitOrAbortOpTime().get());
+    auto mtabVector = TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
+                          .getDonorAccessBlockersForMigration(donorStateDoc.getId());
+    invariant(!mtabVector.empty());
+
+    for (auto& mtab : mtabVector) {
+        mtab->setAbortOpTime(opCtx, donorStateDoc.getCommitOrAbortOpTime().value());
+    }
 }
 
 /**
@@ -162,23 +163,26 @@ void onTransitionToAborted(OperationContext* opCtx,
  */
 class TenantMigrationDonorCommitOrAbortHandler final : public RecoveryUnit::Change {
 public:
-    TenantMigrationDonorCommitOrAbortHandler(OperationContext* opCtx,
-                                             const TenantMigrationDonorDocument donorStateDoc)
-        : _opCtx(opCtx), _donorStateDoc(std::move(donorStateDoc)) {}
+    TenantMigrationDonorCommitOrAbortHandler(const TenantMigrationDonorDocument donorStateDoc)
+        : _donorStateDoc(std::move(donorStateDoc)) {}
 
-    void commit(boost::optional<Timestamp>) override {
+    void commit(OperationContext* opCtx, boost::optional<Timestamp>) override {
         if (_donorStateDoc.getExpireAt()) {
-            auto mtab = tenant_migration_access_blocker::getTenantMigrationDonorAccessBlocker(
-                _opCtx->getServiceContext(), _donorStateDoc.getTenantId());
+            ServerlessOperationLockRegistry::get(opCtx->getServiceContext())
+                .releaseLock(ServerlessOperationLockRegistry::LockType::kTenantDonor,
+                             _donorStateDoc.getId());
 
-            if (!mtab) {
+            auto mtabVector = TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
+                                  .getDonorAccessBlockersForMigration(_donorStateDoc.getId());
+
+            if (mtabVector.empty()) {
                 // The state doc and TenantMigrationDonorAccessBlocker for this migration were
                 // removed immediately after expireAt was set. This is unlikely to occur in
                 // production where the garbage collection delay should be sufficiently large.
                 return;
             }
 
-            if (!_opCtx->writesAreReplicated()) {
+            if (!opCtx->writesAreReplicated()) {
                 // Setting expireAt implies that the TenantMigrationDonorAccessBlocker for this
                 // migration will be removed shortly after this. However, a lagged secondary
                 // might not manage to advance its majority commit point past the migration
@@ -189,26 +193,33 @@ public:
                 // here that the commit or abort opTime has been majority committed (guaranteed
                 // to be true since by design the donor never marks its state doc as garbage
                 // collectable before the migration decision is majority committed).
-                mtab->onMajorityCommitPointUpdate(_donorStateDoc.getCommitOrAbortOpTime().get());
+                for (auto& mtab : mtabVector) {
+                    mtab->onMajorityCommitPointUpdate(
+                        _donorStateDoc.getCommitOrAbortOpTime().value());
+                }
             }
 
             if (_donorStateDoc.getState() == TenantMigrationDonorStateEnum::kAborted) {
-                invariant(mtab->inStateAborted());
+                for (auto& mtab : mtabVector) {
+                    invariant(mtab->inStateAborted());
+                }
                 // The migration durably aborted and is now marked as garbage collectable,
                 // remove its TenantMigrationDonorAccessBlocker right away to allow back-to-back
                 // migration retries.
                 if (_donorStateDoc.getProtocol().value_or(
                         MigrationProtocolEnum::kMultitenantMigrations) ==
                     MigrationProtocolEnum::kMultitenantMigrations) {
-                    TenantMigrationAccessBlockerRegistry::get(_opCtx->getServiceContext())
-                        .remove(_donorStateDoc.getTenantId(),
-                                TenantMigrationAccessBlocker::BlockerType::kDonor);
+                    const auto tenantId = TenantId::parseFromString(_donorStateDoc.getTenantId());
+                    TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
+                        .remove(tenantId, TenantMigrationAccessBlocker::BlockerType::kDonor);
                 } else {
                     tassert(6448701,
                             "Bad protocol",
                             _donorStateDoc.getProtocol() == MigrationProtocolEnum::kShardMerge);
-                    TenantMigrationAccessBlockerRegistry::get(_opCtx->getServiceContext())
-                        .removeShardMergeDonorAccessBlocker(_donorStateDoc.getId());
+                    TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
+                        .removeAccessBlockersForMigration(
+                            _donorStateDoc.getId(),
+                            TenantMigrationAccessBlocker::BlockerType::kDonor);
                 }
             }
             return;
@@ -216,32 +227,31 @@ public:
 
         switch (_donorStateDoc.getState()) {
             case TenantMigrationDonorStateEnum::kCommitted:
-                onTransitionToCommitted(_opCtx, _donorStateDoc);
+                onTransitionToCommitted(opCtx, _donorStateDoc);
                 break;
             case TenantMigrationDonorStateEnum::kAborted:
-                onTransitionToAborted(_opCtx, _donorStateDoc);
+                onTransitionToAborted(opCtx, _donorStateDoc);
                 break;
             default:
                 MONGO_UNREACHABLE;
         }
     }
 
-    void rollback() override {}
+    void rollback(OperationContext* opCtx) override {}
 
 private:
-    OperationContext* _opCtx;
     const TenantMigrationDonorDocument _donorStateDoc;
 };
 
 }  // namespace
 
 void TenantMigrationDonorOpObserver::onInserts(OperationContext* opCtx,
-                                               const NamespaceString& nss,
-                                               const UUID& uuid,
+                                               const CollectionPtr& coll,
                                                std::vector<InsertStatement>::const_iterator first,
                                                std::vector<InsertStatement>::const_iterator last,
-                                               bool fromMigrate) {
-    if (nss == NamespaceString::kTenantMigrationDonorsNamespace &&
+                                               std::vector<bool> fromMigrate,
+                                               bool defaultFromMigrate) {
+    if (coll->ns() == NamespaceString::kTenantMigrationDonorsNamespace &&
         !tenant_migration_access_blocker::inRecoveryMode(opCtx)) {
         for (auto it = first; it != last; it++) {
             auto donorStateDoc = tenant_migration_access_blocker::parseDonorStateDocument(it->doc);
@@ -270,7 +280,7 @@ void TenantMigrationDonorOpObserver::onInserts(OperationContext* opCtx,
 
 void TenantMigrationDonorOpObserver::onUpdate(OperationContext* opCtx,
                                               const OplogUpdateEntryArgs& args) {
-    if (args.nss == NamespaceString::kTenantMigrationDonorsNamespace &&
+    if (args.coll->ns() == NamespaceString::kTenantMigrationDonorsNamespace &&
         !tenant_migration_access_blocker::inRecoveryMode(opCtx)) {
         auto donorStateDoc =
             tenant_migration_access_blocker::parseDonorStateDocument(args.updateArgs->updatedDoc);
@@ -283,8 +293,7 @@ void TenantMigrationDonorOpObserver::onUpdate(OperationContext* opCtx,
             case TenantMigrationDonorStateEnum::kCommitted:
             case TenantMigrationDonorStateEnum::kAborted:
                 opCtx->recoveryUnit()->registerChange(
-                    std::make_unique<TenantMigrationDonorCommitOrAbortHandler>(opCtx,
-                                                                               donorStateDoc));
+                    std::make_unique<TenantMigrationDonorCommitOrAbortHandler>(donorStateDoc));
                 break;
             default:
                 MONGO_UNREACHABLE;
@@ -297,10 +306,9 @@ void TenantMigrationDonorOpObserver::onUpdate(OperationContext* opCtx,
 }
 
 void TenantMigrationDonorOpObserver::aboutToDelete(OperationContext* opCtx,
-                                                   NamespaceString const& nss,
-                                                   const UUID& uuid,
+                                                   const CollectionPtr& coll,
                                                    BSONObj const& doc) {
-    if (nss == NamespaceString::kTenantMigrationDonorsNamespace &&
+    if (coll->ns() == NamespaceString::kTenantMigrationDonorsNamespace &&
         !tenant_migration_access_blocker::inRecoveryMode(opCtx)) {
         auto donorStateDoc = tenant_migration_access_blocker::parseDonorStateDocument(doc);
         uassert(ErrorCodes::IllegalOperation,
@@ -312,45 +320,34 @@ void TenantMigrationDonorOpObserver::aboutToDelete(OperationContext* opCtx,
         // TenantMigrationDonorAccessBlocker as soon as its donor state doc is marked as garbage
         // collectable. So onDelete should skip removing the TenantMigrationDonorAccessBlocker for
         // aborted migrations.
-        if (donorStateDoc.getProtocol().value_or(MigrationProtocolEnum::kMultitenantMigrations) ==
-            MigrationProtocolEnum::kMultitenantMigrations) {
-            tenantIdToDeleteDecoration(opCtx) =
-                donorStateDoc.getState() == TenantMigrationDonorStateEnum::kAborted
-                ? boost::none
-                : boost::make_optional(donorStateDoc.getTenantId().toString());
-        } else {
-            tassert(6448700,
-                    "Bad protocol",
-                    donorStateDoc.getProtocol() == MigrationProtocolEnum::kShardMerge);
-            migrationIdToDeleteDecoration(opCtx) =
-                donorStateDoc.getState() == TenantMigrationDonorStateEnum::kAborted
-                ? boost::none
-                : boost::make_optional(donorStateDoc.getId());
-        }
+        tenantMigrationInfo(opCtx) =
+            donorStateDoc.getState() == TenantMigrationDonorStateEnum::kAborted
+            ? boost::none
+            : boost::make_optional(TenantMigrationInfo(donorStateDoc.getId()));
     }
 }
 
 void TenantMigrationDonorOpObserver::onDelete(OperationContext* opCtx,
-                                              const NamespaceString& nss,
-                                              const UUID& uuid,
+                                              const CollectionPtr& coll,
                                               StmtId stmtId,
                                               const OplogDeleteEntryArgs& args) {
-    if (nss == NamespaceString::kTenantMigrationDonorsNamespace &&
+    if (coll->ns() == NamespaceString::kTenantMigrationDonorsNamespace &&
         !tenant_migration_access_blocker::inRecoveryMode(opCtx)) {
-        if (tenantIdToDeleteDecoration(opCtx)) {
-            opCtx->recoveryUnit()->onCommit([opCtx](boost::optional<Timestamp>) {
-                TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
-                    .remove(tenantIdToDeleteDecoration(opCtx).get(),
-                            TenantMigrationAccessBlocker::BlockerType::kDonor);
-            });
+        auto tmi = tenantMigrationInfo(opCtx);
+        if (!tmi) {
+            return;
         }
 
-        if (migrationIdToDeleteDecoration(opCtx)) {
-            opCtx->recoveryUnit()->onCommit([opCtx](boost::optional<Timestamp>) {
+        auto migrationId = tmi->uuid;
+        opCtx->recoveryUnit()->onCommit(
+            [migrationId](OperationContext* opCtx, boost::optional<Timestamp>) {
+                LOGV2_INFO(6461601,
+                           "Removing expired migration access blocker",
+                           "migrationId"_attr = migrationId);
                 TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
-                    .removeShardMergeDonorAccessBlocker(migrationIdToDeleteDecoration(opCtx).get());
+                    .removeAccessBlockersForMigration(
+                        migrationId, TenantMigrationAccessBlocker::BlockerType::kDonor);
             });
-        }
     }
 }
 
@@ -360,9 +357,12 @@ repl::OpTime TenantMigrationDonorOpObserver::onDropCollection(OperationContext* 
                                                               std::uint64_t numRecords,
                                                               const CollectionDropType dropType) {
     if (collectionName == NamespaceString::kTenantMigrationDonorsNamespace) {
-        opCtx->recoveryUnit()->onCommit([opCtx](boost::optional<Timestamp>) {
+        opCtx->recoveryUnit()->onCommit([](OperationContext* opCtx, boost::optional<Timestamp>) {
             TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
                 .removeAll(TenantMigrationAccessBlocker::BlockerType::kDonor);
+
+            ServerlessOperationLockRegistry::get(opCtx->getServiceContext())
+                .onDropStateCollection(ServerlessOperationLockRegistry::LockType::kTenantDonor);
         });
     }
     return {};

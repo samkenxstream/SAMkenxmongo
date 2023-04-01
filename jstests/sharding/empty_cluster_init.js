@@ -9,7 +9,7 @@
 //
 
 var configRS = new ReplSetTest({name: "configRS", nodes: 3, useHostName: true});
-configRS.startSet({configsvr: '', journal: "", storageEngine: 'wiredTiger'});
+configRS.startSet({configsvr: '', storageEngine: 'wiredTiger'});
 var replConfig = configRS.getReplSetConfig();
 replConfig.configsvr = true;
 configRS.initiate(replConfig);
@@ -82,10 +82,7 @@ for (var i = 0; i < mongoses.length; i++) {
 // Check version and that the version was only updated once
 //
 
-assert.eq(5, version.minCompatibleVersion);
-assert.eq(6, version.currentVersion);
-assert(version.clusterId);
-assert.eq(undefined, version.excluding);
+assert.hasFields(version, ['clusterId'], "Version document does not contain cluster ID");
 
 var oplog = configRS.getPrimary().getDB('local').oplog.rs;
 var updates = oplog.find({ns: "config.version"}).toArray();

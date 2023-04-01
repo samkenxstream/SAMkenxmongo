@@ -31,7 +31,6 @@
 #include "mongo/unittest/unittest.h"
 
 #include <boost/optional.hpp>
-#include <boost/optional/optional_io.hpp>
 #include <vector>
 
 using namespace mongo;
@@ -1340,6 +1339,17 @@ TEST(Simple8b, ValueTooLargeMaxUInt64) {
 TEST(Simple8b, ValueTooLargeMaxUInt128) {
     // Make sure we handle uint128_t max correctly.
     uint128_t value = std::numeric_limits<uint128_t>::max();
+
+    Simple8bBuilder<uint128_t> builder([](uint64_t) {
+        ASSERT(false);
+        return true;
+    });
+    ASSERT_FALSE(builder.append(value));
+}
+
+TEST(Simple8b, ValueTooLargeMaxUInt64AsUInt128) {
+    // Make sure we handle uint128_t max correctly.
+    uint128_t value = std::numeric_limits<uint64_t>::max();
 
     Simple8bBuilder<uint128_t> builder([](uint64_t) {
         ASSERT(false);

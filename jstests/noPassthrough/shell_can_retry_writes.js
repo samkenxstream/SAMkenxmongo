@@ -6,13 +6,6 @@
 (function() {
 "use strict";
 
-load("jstests/libs/retryable_writes_util.js");
-
-if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
-    jsTestLog("Retryable writes are not supported, skipping test");
-    return;
-}
-
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
 rst.initiate();
@@ -40,15 +33,6 @@ function testCommandCanBeRetried(func, expected = true) {
 
     if (cmdObjSeen === sentinel) {
         throw new Error("Mongo.prototype.runCommand() was never called: " + func.toString());
-    }
-
-    let cmdName = Object.keys(cmdObjSeen)[0];
-
-    // If the command is in a wrapped form, then we look for the actual command object inside
-    // the query/$query object.
-    if (cmdName === "query" || cmdName === "$query") {
-        cmdObjSeen = cmdObjSeen[cmdName];
-        cmdName = Object.keys(cmdObjSeen)[0];
     }
 
     assert(cmdObjSeen.hasOwnProperty("lsid"),

@@ -64,8 +64,8 @@ public:
                                 ChangeStreamRequirement::kDenylist);
     }
 
-    Value serialize(
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override;
+
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() override {
         return boost::none;
@@ -84,6 +84,8 @@ public:
         }
         return DepsTracker::State::SEE_NEXT;
     }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
 private:
     GetNextResult doGetNext() override;

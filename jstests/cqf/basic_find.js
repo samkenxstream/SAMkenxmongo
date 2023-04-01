@@ -10,33 +10,39 @@ if (!checkCascadesOptimizerEnabled(db)) {
 const coll = db.cqf_basic_find;
 coll.drop();
 
-assert.commandWorked(
-    coll.insert([{a: {b: 1}}, {a: {b: 2}}, {a: {b: 3}}, {a: {b: 4}}, {a: {b: 5}}]));
+const docs = [{a: {b: 1}}, {a: {b: 2}}, {a: {b: 3}}, {a: {b: 4}}, {a: {b: 5}}, {'': 3}];
 
-const extraDocCount = 50;
+const extraDocCount = 500;
 // Add extra docs to make sure indexes can be picked.
 for (let i = 0; i < extraDocCount; i++) {
-    assert.commandWorked(coll.insert({a: {b: i + 10}}));
+    docs.push({a: {b: i + 10}});
 }
+
+assert.commandWorked(coll.insertMany(docs));
+
 assert.commandWorked(coll.createIndex({'a.b': 1}));
 
 let res = coll.explain("executionStats").find({'a.b': 2}).finish();
 assert.eq(1, res.executionStats.nReturned);
-assert.eq("IndexScan", res.queryPlanner.winningPlan.optimizerPlan.child.leftChild.nodeType);
+assertValueOnPlanPath("IndexScan", res, "child.leftChild.nodeType");
 
 res = coll.explain("executionStats").find({'a.b': {$gt: 2}}).finish();
 assert.eq(3 + extraDocCount, res.executionStats.nReturned);
-assert.eq("PhysicalScan", res.queryPlanner.winningPlan.optimizerPlan.child.child.nodeType);
+assertValueOnPlanPath("PhysicalScan", res, "child.child.nodeType");
 
 res = coll.explain("executionStats").find({'a.b': {$gte: 2}}).finish();
 assert.eq(4 + extraDocCount, res.executionStats.nReturned);
-assert.eq("PhysicalScan", res.queryPlanner.winningPlan.optimizerPlan.child.child.nodeType);
+assertValueOnPlanPath("PhysicalScan", res, "child.child.nodeType");
 
 res = coll.explain("executionStats").find({'a.b': {$lt: 2}}).finish();
 assert.eq(1, res.executionStats.nReturned);
-assert.eq("IndexScan", res.queryPlanner.winningPlan.optimizerPlan.child.leftChild.nodeType);
+assertValueOnPlanPath("IndexScan", res, "child.leftChild.nodeType");
 
 res = coll.explain("executionStats").find({'a.b': {$lte: 2}}).finish();
 assert.eq(2, res.executionStats.nReturned);
-assert.eq("IndexScan", res.queryPlanner.winningPlan.optimizerPlan.child.leftChild.nodeType);
+assertValueOnPlanPath("IndexScan", res, "child.leftChild.nodeType");
+
+res = coll.explain("executionStats").find({'': {$gt: 2}}).finish();
+assert.eq(1, res.executionStats.nReturned);
+assertValueOnPlanPath("PhysicalScan", res, "child.child.nodeType");
 }());

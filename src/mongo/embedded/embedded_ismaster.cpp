@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -35,6 +34,9 @@
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/rpc/metadata/client_metadata.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -58,14 +60,16 @@ public:
         return false;
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {}  // No auth required
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();  // No auth required
+    }
 
     CmdIsMaster() : BasicCommand("isMaster", "ismaster") {}
 
     virtual bool run(OperationContext* opCtx,
-                     const std::string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
 
@@ -87,7 +91,7 @@ public:
         result.append("minWireVersion", wireSpec->incomingExternalClient.minWireVersion);
         result.append("maxWireVersion", wireSpec->incomingExternalClient.maxWireVersion);
 
-        result.append("readOnly", storageGlobalParams.readOnly);
+        result.append("readOnly", opCtx->readOnly());
 
         return true;
     }

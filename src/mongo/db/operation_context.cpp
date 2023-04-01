@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -45,6 +44,9 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/system_tick_source.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
@@ -78,7 +80,7 @@ OperationContext::OperationContext(Client* client, OperationIdSlot&& opIdSlot)
     : _client(client),
       _opId(std::move(opIdSlot)),
       _elapsedTime(client ? client->getServiceContext()->getTickSource()
-                          : SystemTickSource::get()) {}
+                          : globalSystemTickSource()) {}
 
 OperationContext::~OperationContext() {
     releaseOperationKey();
@@ -218,10 +220,6 @@ bool opShouldFail(Client* client, const BSONObj& failPointInfo) {
 }  // namespace
 
 Status OperationContext::checkForInterruptNoAssert() noexcept {
-    if (_noReplStateChangeWhileIgnoringOtherInterrupts()) {
-        return Status::OK();
-    }
-
     // TODO: Remove the MONGO_likely(hasClientAndServiceContext) once all operation contexts are
     // constructed with clients.
     const auto hasClientAndServiceContext = getClient() && getServiceContext();
@@ -311,34 +309,42 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
     // maxTimeNeverTimeOut is set) then we assume that the incongruity is due to a clock mismatch
     // and return _timeoutError regardless. To prevent this behaviour, only consider the op's
     // deadline in the event that the maxTimeNeverTimeOut failpoint is not set.
-    bool opHasDeadline = (hasDeadline() && !_noReplStateChangeWhileIgnoringOtherInterrupts() &&
-                          !MONGO_unlikely(maxTimeNeverTimeOut.shouldFail()));
+    bool opHasDeadline = (hasDeadline() && !MONGO_unlikely(maxTimeNeverTimeOut.shouldFail()));
 
     if (opHasDeadline) {
         deadline = std::min(deadline, getDeadline());
     }
 
-    const auto waitStatus = [&] {
-        if (Date_t::max() == deadline) {
-            Waitable::wait(_baton.get(), getServiceContext()->getPreciseClockSource(), cv, m);
-            return stdx::cv_status::no_timeout;
-        }
-        return getServiceContext()->getPreciseClockSource()->waitForConditionUntil(
-            cv, m, deadline, _baton.get());
-    }();
+    try {
+        const auto waitStatus = [&] {
+            if (Date_t::max() == deadline) {
+                Waitable::wait(_baton.get(), getServiceContext()->getPreciseClockSource(), cv, m);
+                return stdx::cv_status::no_timeout;
+            }
+            return getServiceContext()->getPreciseClockSource()->waitForConditionUntil(
+                cv, m, deadline, _baton.get());
+        }();
 
-    if (opHasDeadline && waitStatus == stdx::cv_status::timeout && deadline == getDeadline()) {
-        // It's possible that the system clock used in stdx::condition_variable::wait_until
-        // is slightly ahead of the FastClock used in checkForInterrupt. In this case,
-        // we treat the operation as though it has exceeded its time limit, just as if the
-        // FastClock and system clock had agreed.
-        if (!_hasArtificialDeadline) {
-            interruptible_detail::doWithoutLock(m, [&] { markKilled(_timeoutError); });
+        if (opHasDeadline && waitStatus == stdx::cv_status::timeout && deadline == getDeadline()) {
+            // It's possible that the system clock used in stdx::condition_variable::wait_until
+            // is slightly ahead of the FastClock used in checkForInterrupt. In this case,
+            // we treat the operation as though it has exceeded its time limit, just as if the
+            // FastClock and system clock had agreed.
+            if (!_hasArtificialDeadline) {
+                interruptible_detail::doWithoutLock(m, [&] { markKilled(_timeoutError); });
+            }
+            return Status(_timeoutError, "operation exceeded time limit");
         }
-        return Status(_timeoutError, "operation exceeded time limit");
+
+        return waitStatus;
+    } catch (const ExceptionFor<ErrorCodes::DurationOverflow>& ex) {
+        // Inside waitForConditionUntil() is a conversion from deadline's Date_t type to the system
+        // clock's time_point type. If the time_point's compiler-dependent resolution is higher
+        // than Date_t's milliseconds, it's possible for the conversion from Date_t to time_point
+        // to overflow and trigger an exception. We catch that here to maintain the noexcept
+        // contract.
+        return ex.toStatus();
     }
-
-    return waitStatus;
 }
 
 void OperationContext::markKilled(ErrorCodes::Error killCode) {
@@ -391,7 +397,10 @@ void OperationContext::setIsExecutingShutdown() {
 
     _isExecutingShutdown = true;
 
-    pushIgnoreInterrupts();
+    // The OperationContext executing shutdown is immune from interruption.
+    _hasArtificialDeadline = true;
+    setDeadlineByDate(Date_t::max(), ErrorCodes::ExceededTimeLimit);
+    _ignoreInterrupts = true;
 }
 
 void OperationContext::setLogicalSessionId(LogicalSessionId lsid) {
@@ -426,6 +435,10 @@ void OperationContext::setTxnRetryCounter(TxnRetryCounter txnRetryCounter) {
 }
 
 std::unique_ptr<RecoveryUnit> OperationContext::releaseRecoveryUnit() {
+    if (_recoveryUnit) {
+        _recoveryUnit->setOperationContext(nullptr);
+    }
+
     return std::move(_recoveryUnit);
 }
 
@@ -437,9 +450,19 @@ std::unique_ptr<RecoveryUnit> OperationContext::releaseAndReplaceRecoveryUnit() 
     return ru;
 }
 
+void OperationContext::replaceRecoveryUnit() {
+    setRecoveryUnit(
+        std::unique_ptr<RecoveryUnit>(getServiceContext()->getStorageEngine()->newRecoveryUnit()),
+        WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+}
+
 WriteUnitOfWork::RecoveryUnitState OperationContext::setRecoveryUnit(
     std::unique_ptr<RecoveryUnit> unit, WriteUnitOfWork::RecoveryUnitState state) {
     _recoveryUnit = std::move(unit);
+    if (_recoveryUnit) {
+        _recoveryUnit->setOperationContext(this);
+    }
+
     WriteUnitOfWork::RecoveryUnitState oldState = _ruState;
     _ruState = state;
     return oldState;

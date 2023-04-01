@@ -76,6 +76,8 @@ function testGetCmdLineOptsMongod(mongoRunnerConfig, expectedResult) {
         typeof expectedResult.parsed.storage.dbPath === "undefined") {
         delete getCmdLineOptsExpected.parsed.storage.dbPath;
     }
+    // Delete backtraceLogFile parameter, since we are generating unique value every time
+    delete getCmdLineOptsExpected.parsed.setParameter.backtraceLogFile;
 
     // Merge with the result that we expect
     expectedResult = mergeOptions(getCmdLineOptsExpected, expectedResult);
@@ -108,9 +110,11 @@ function testGetCmdLineOptsMongod(mongoRunnerConfig, expectedResult) {
         typeof expectedResult.parsed.storage.dbPath === "undefined") {
         delete getCmdLineOptsResult.parsed.storage.dbPath;
     }
+    // Delete backtraceLogFile parameter, since we are generating unique value every time
+    delete getCmdLineOptsResult.parsed.setParameter.backtraceLogFile;
 
     // Make sure the options are equal to what we expect
-    assert.docEq(getCmdLineOptsResult.parsed, expectedResult.parsed);
+    assert.docEq(expectedResult.parsed, getCmdLineOptsResult.parsed);
 
     // Cleanup
     mongod.getDB("admin").logout();
@@ -139,8 +143,8 @@ function testGetCmdLineOptsMongos(mongoRunnerConfig, expectedResult) {
     // options of its own, and we only want to compare against the options we care about.
     function getCmdLineOptsFromMongos(mongosOptions) {
         // Start mongod with no options
-        var baseMongod = MongoRunner.runMongod(
-            {configsvr: "", journal: "", replSet: "csrs", storageEngine: "wiredTiger"});
+        var baseMongod =
+            MongoRunner.runMongod({configsvr: "", replSet: "csrs", storageEngine: "wiredTiger"});
         assert.commandWorked(baseMongod.adminCommand({
             replSetInitiate:
                 {_id: "csrs", configsvr: true, members: [{_id: 0, host: baseMongod.host}]}
@@ -202,7 +206,7 @@ function testGetCmdLineOptsMongos(mongoRunnerConfig, expectedResult) {
     }
 
     // Make sure the options are equal to what we expect
-    assert.docEq(getCmdLineOptsResult.parsed, expectedResult.parsed);
+    assert.docEq(expectedResult.parsed, getCmdLineOptsResult.parsed);
 }
 
 // Tests that the passed configuration will not run a new mongod instances. Mainly used to test

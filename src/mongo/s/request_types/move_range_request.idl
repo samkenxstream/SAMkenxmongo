@@ -30,9 +30,11 @@ global:
     cpp_namespace: "mongo"
     cpp_includes:
         - "mongo/s/catalog/types_validators.h"
+        - "mongo/s/request_types/migration_secondary_throttle_options.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/write_concern_options.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/s/sharding_types.idl"
 
 enums:
@@ -44,8 +46,16 @@ enums:
             kForceManual: 1   # manual moveChunk command specified `forceJumbo: true`
             kForceBalancer: 2 # balancer specified `forceJumbo: true`
 
+types:
+    MigrationSecondaryThrottle:
+        bson_serialization_type: object
+        description: "Secondary throttle policy to adopt during the migration"
+        cpp_type: "mongo::MigrationSecondaryThrottleOptions"
+        serializer: mongo::MigrationSecondaryThrottleOptions::toBSON
+        deserializer: mongo::MigrationSecondaryThrottleOptions::parseFromBSON
+
 structs:
-    MoveRangeRequest:
+    MoveRangeRequestBase:
         description: "Definition of the moveRange request fields shared by several commands."
         strict: false
         fields:
@@ -53,25 +63,18 @@ structs:
                 type: shard_id
                 description: "ID of the recipient shard"
                 validator:
-                    callback: "validateShardId"
+                    callback: "ShardId::validate"
             min:
-                type: object
+                type: object_owned
                 description: "The min key of the range to move"
+                optional: true
             max:
-                type: object
+                type: object_owned
                 description: "The max key of the range to move"
                 optional: true
             waitForDelete:
                 type: bool
                 description: "If set, wait for the chunk migration to finish before returning"
-                default: false
-            forceJumbo:
-                type: ForceJumbo
-                description: "Specifies the policy to use for jumbo chunks"
-                default: kDoNotForce
-            secondaryThrottle:
-                type: bool
-                description: "Secondary throttle policy to adopt during the migration"
                 default: false
 
 commands:
@@ -84,7 +87,15 @@ commands:
         api_version: ""
         strict: false
         chained_structs:
-            MoveRangeRequest: MoveRangeRequest
+            MoveRangeRequestBase: MoveRangeRequestBase
+        fields:
+            forceJumbo:
+                type: bool
+                description: "Specifies whether or not forcing jumbo chunks move"
+                default: false
+            secondaryThrottle:
+                type: optionalBool
+                description: "Secondary throttle policy to adopt during the migration"
 
     _configsvrMoveRange:
         command_name: _configsvrMoveRange
@@ -95,11 +106,19 @@ commands:
         api_version: ""
         strict: false
         chained_structs:
-            MoveRangeRequest: MoveRangeRequest
+            MoveRangeRequestBase: MoveRangeRequestBase
+        fields:
+            forceJumbo:
+                type: ForceJumbo
+                description: "Specifies the policy to use for jumbo chunks"
+                default: kDoNotForce
+            secondaryThrottle:
+                type: MigrationSecondaryThrottle
+                description: "Secondary throttle policy to adopt during the migration"
+                optional: true
 
     _shardsvrMoveRange:
         command_name: _shardsvrMoveRange
-        command_alias: moveChunk
         cpp_name: ShardsvrMoveRange
         description: "Definition of the moveRange command called from the config server on shards."
         namespace: type
@@ -107,7 +126,7 @@ commands:
         api_version: ""
         strict: false
         chained_structs:
-            MoveRangeRequest: MoveRangeRequest
+            MoveRangeRequestBase: MoveRangeRequestBase
         fields:
             epoch:
                 type: objectid
@@ -117,8 +136,14 @@ commands:
                 type: shard_id
                 description: "ID of the donor shard"
                 validator:
-                    callback: "validateShardId"
+                    callback: "ShardId::validate"
             maxChunkSizeBytes:
                 type: safeInt64
                 description: "Max size of data to move"
-                optional: true
+            forceJumbo:
+                type: ForceJumbo
+                description: "Specifies the policy to use for jumbo chunks"
+                default: kDoNotForce
+            secondaryThrottle:
+                type: optionalBool
+                description: "Secondary throttle policy to adopt during the migration"

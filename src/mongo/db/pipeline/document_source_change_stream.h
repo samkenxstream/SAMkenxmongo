@@ -230,8 +230,9 @@ public:
     // The internal change events that are not exposed to the users.
     static constexpr StringData kReshardBeginOpType = "reshardBegin"_sd;
     static constexpr StringData kReshardDoneCatchUpOpType = "reshardDoneCatchUp"_sd;
+
     // Internal op type to signal mongos to open cursors on new shards.
-    static constexpr StringData kNewShardDetectedOpType = "kNewShardDetected"_sd;
+    static constexpr StringData kNewShardDetectedOpType = "migrateChunkToNewShard"_sd;
 
     // These events are guarded behind the 'showExpandedEvents' flag.
     static constexpr StringData kCreateOpType = "create"_sd;
@@ -239,13 +240,19 @@ public:
     static constexpr StringData kDropIndexesOpType = "dropIndexes"_sd;
     static constexpr StringData kShardCollectionOpType = "shardCollection"_sd;
     static constexpr StringData kMigrateLastChunkFromShardOpType = "migrateLastChunkFromShard"_sd;
+    static constexpr StringData kRefineCollectionShardKeyOpType = "refineCollectionShardKey"_sd;
+    static constexpr StringData kReshardCollectionOpType = "reshardCollection"_sd;
     static constexpr StringData kModifyOpType = "modify"_sd;
 
     // Default regex for collections match which prohibits system collections.
     static constexpr StringData kRegexAllCollections = R"((?!(\$|system\.)))"_sd;
-    // Regex matching all regular collections plus certain system collections.
+
+    // Regex matching all user collections plus collections exposed when 'showSystemEvents' is set.
+    // Does not match a collection named $ or a collection with 'system.' in the name.
+    // However, it will still match collection names starting with system.buckets or
+    // system.resharding, or a collection exactly named system.js
     static constexpr StringData kRegexAllCollectionsShowSystemEvents =
-        R"((?!(\$|system\.(?!(js$)))))"_sd;
+        R"((?!(\$|system\.(?!(js$|resharding\.|buckets\.)))))"_sd;
 
     static constexpr StringData kRegexAllDBs = R"(^(?!(admin|config|local)\.)[^.]+)"_sd;
     static constexpr StringData kRegexCmdColl = R"(\$cmd$)"_sd;
@@ -256,16 +263,18 @@ public:
      * Helpers for Determining which regex to match a change stream against.
      */
     static ChangeStreamType getChangeStreamType(const NamespaceString& nss);
+    static std::string regexEscapeNsForChangeStream(StringData source);
+    static StringData resolveAllCollectionsRegex(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
     static std::string getNsRegexForChangeStream(
         const boost::intrusive_ptr<ExpressionContext>& expCtx);
     static std::string getCollRegexForChangeStream(
         const boost::intrusive_ptr<ExpressionContext>& expCtx);
     static std::string getCmdNsRegexForChangeStream(
         const boost::intrusive_ptr<ExpressionContext>& expCtx);
-    static StringData resolveAllCollectionsRegex(
+    static std::string getViewNsRegexForChangeStream(
         const boost::intrusive_ptr<ExpressionContext>& expCtx);
-
-    static std::string regexEscapeNsForChangeStream(StringData source);
 
     /**
      * Parses a $changeStream stage from 'elem' and produces the $match and transformation
@@ -281,11 +290,9 @@ public:
     static void checkValueType(Value v, StringData fieldName, BSONType expectedType);
 
     /**
-     * Extracts the resume token from the given spec. If a 'startAtOperationTime' is specified,
-     * returns the equivalent high-watermark token. This method should only ever be called on a spec
-     * where one of 'resumeAfter', 'startAfter', or 'startAtOperationTime' is populated.
+     * Same as 'checkValueType', except it tolerates the field being missing.
      */
-    static ResumeTokenData resolveResumeTokenFromSpec(const DocumentSourceChangeStreamSpec& spec);
+    static void checkValueTypeOrMissing(Value v, StringData fieldName, BSONType expectedType);
 
     /**
      * For a change stream with no resume information supplied by the user, returns the clusterTime

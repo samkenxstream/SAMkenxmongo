@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include <memory>
 
@@ -45,6 +44,9 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/future.h"
 #include "mongo/util/net/ssl_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace repl {
@@ -77,6 +79,7 @@ public:
     void setUp() override {
         ServiceContextMongoDTest::setUp();
         auto serviceContext = getServiceContext();
+        TenantMigrationAccessBlockerRegistry::get(cc().getServiceContext()).startup();
 
         {
             _opCtx = cc().makeOperationContext();
@@ -111,23 +114,14 @@ public:
         return _tenantId;
     }
 
-    std::string getDonorConnectionString() const {
-        return _donorConnectionString;
-    }
-
 private:
     const UUID _migrationId = UUID::gen();
     const std::string _tenantId = "tenant123";
-    const std::string _donorConnectionString = "TestRS/HostA:12345,HostB:12345";
     ServiceContext::UniqueOperationContext _opCtx;
 };
 
 TEST_F(TenantMigrationRecipientAccessBlockerTest, NoopFunctions) {
-    TenantMigrationRecipientAccessBlocker mtab(getServiceContext(),
-                                               getMigrationId(),
-                                               getTenantId(),
-                                               MigrationProtocolEnum::kMultitenantMigrations,
-                                               getDonorConnectionString());
+    TenantMigrationRecipientAccessBlocker mtab(getServiceContext(), getMigrationId());
 
     // These functions are noop functions and should not throw even in reject state.
     ASSERT_OK(mtab.checkIfCanWrite(Timestamp()));
@@ -136,19 +130,15 @@ TEST_F(TenantMigrationRecipientAccessBlockerTest, NoopFunctions) {
 }
 
 TEST_F(TenantMigrationRecipientAccessBlockerTest, StateReject) {
-    TenantMigrationRecipientAccessBlocker mtab(getServiceContext(),
-                                               getMigrationId(),
-                                               getTenantId(),
-                                               MigrationProtocolEnum::kMultitenantMigrations,
-                                               getDonorConnectionString());
+    TenantMigrationRecipientAccessBlocker mtab(getServiceContext(), getMigrationId());
 
     {
         BSONObjBuilder builder;
         mtab.appendInfoForServerStatus(&builder);
         ASSERT_BSONOBJ_EQ(builder.obj(),
-                          BSON("state"
-                               << "reject"
-                               << "ttlIsBlocked" << true << "tenantId" << getTenantId()));
+                          BSON("migrationId" << getMigrationId() << "state"
+                                             << "reject"
+                                             << "ttlIsBlocked" << true));
     }
 
     // Default read concern.
@@ -175,21 +165,17 @@ TEST_F(TenantMigrationRecipientAccessBlockerTest, StateReject) {
 }
 
 TEST_F(TenantMigrationRecipientAccessBlockerTest, StateRejectBefore) {
-    TenantMigrationRecipientAccessBlocker mtab(getServiceContext(),
-                                               getMigrationId(),
-                                               getTenantId(),
-                                               MigrationProtocolEnum::kMultitenantMigrations,
-                                               getDonorConnectionString());
+    TenantMigrationRecipientAccessBlocker mtab(getServiceContext(), getMigrationId());
 
     mtab.startRejectingReadsBefore(Timestamp(1, 1));
     {
         BSONObjBuilder builder;
         mtab.appendInfoForServerStatus(&builder);
         ASSERT_BSONOBJ_EQ(builder.obj(),
-                          BSON("state"
-                               << "rejectBefore"
-                               << "rejectBeforeTimestamp" << Timestamp(1, 1) << "ttlIsBlocked"
-                               << true << "tenantId" << getTenantId()));
+                          BSON("migrationId" << getMigrationId() << "state"
+                                             << "rejectBefore"
+                                             << "rejectBeforeTimestamp" << Timestamp(1, 1)
+                                             << "ttlIsBlocked" << true));
     }
 
     // Advance 'rejectBeforeTimestamp'.
@@ -198,10 +184,10 @@ TEST_F(TenantMigrationRecipientAccessBlockerTest, StateRejectBefore) {
         BSONObjBuilder builder;
         mtab.appendInfoForServerStatus(&builder);
         ASSERT_BSONOBJ_EQ(builder.obj(),
-                          BSON("state"
-                               << "rejectBefore"
-                               << "rejectBeforeTimestamp" << Timestamp(2, 1) << "ttlIsBlocked"
-                               << true << "tenantId" << getTenantId()));
+                          BSON("migrationId" << getMigrationId() << "state"
+                                             << "rejectBefore"
+                                             << "rejectBeforeTimestamp" << Timestamp(2, 1)
+                                             << "ttlIsBlocked" << true));
     }
 
     // Default read concern.

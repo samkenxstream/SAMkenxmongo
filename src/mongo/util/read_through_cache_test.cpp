@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <string>
 
 #include "mongo/db/concurrency/locker_noop_service_context_test_fixture.h"
@@ -56,16 +54,16 @@ struct CachedValue {
 class Cache : public ReadThroughCache<std::string, CachedValue> {
 public:
     Cache(ServiceContext* service, ThreadPoolInterface& threadPool, size_t size, LookupFn lookupFn)
-        : ReadThroughCache(_mutex,
-                           service,
-                           threadPool,
-                           [this, lookupFn = std::move(lookupFn)](OperationContext* opCtx,
-                                                                  const std::string& key,
-                                                                  const ValueHandle& cachedValue) {
-                               ++countLookups;
-                               return lookupFn(opCtx, key, cachedValue);
-                           },
-                           size) {}
+        : ReadThroughCache(
+              _mutex,
+              service,
+              threadPool,
+              [this, lookupFn = std::move(lookupFn)](
+                  OperationContext* opCtx, const std::string& key, const ValueHandle& cachedValue) {
+                  ++countLookups;
+                  return lookupFn(opCtx, key, cachedValue);
+              },
+              size) {}
 
     int countLookups{0};
 
@@ -79,22 +77,23 @@ public:
                             ThreadPoolInterface& threadPool,
                             size_t size,
                             LookupFn lookupFn)
-        : ReadThroughCache(_mutex,
-                           service,
-                           threadPool,
-                           [this, lookupFn = std::move(lookupFn)](OperationContext* opCtx,
-                                                                  const std::string& key,
-                                                                  const ValueHandle& cachedValue,
-                                                                  Timestamp timeInStore) {
-                               ++countLookups;
-                               return lookupFn(opCtx, key, cachedValue, timeInStore);
-                           },
-                           size) {}
+        : ReadThroughCache(
+              _mutex,
+              service,
+              threadPool,
+              [this, lookupFn = std::move(lookupFn)](OperationContext* opCtx,
+                                                     const std::string& key,
+                                                     const ValueHandle& cachedValue,
+                                                     Timestamp timeInStore) {
+                  ++countLookups;
+                  return lookupFn(opCtx, key, cachedValue, timeInStore);
+              },
+              size) {}
 
     int countLookups{0};
 
 private:
-    Mutex _mutex = MONGO_MAKE_LATCH("ReadThroughCacheTest::Cache");
+    Mutex _mutex = MONGO_MAKE_LATCH("ReadThroughCacheTest::CausallyConsistentCache");
 };
 
 /**
@@ -318,7 +317,9 @@ TEST_F(ReadThroughCacheTest, InvalidateCacheSizeZeroReissuesLookup) {
 }
 
 TEST_F(ReadThroughCacheTest, KeyDoesNotExist) {
-    auto fnTest = [&](auto cache) { ASSERT(!cache.acquire(_opCtx, "TestKey")); };
+    auto fnTest = [&](auto cache) {
+        ASSERT(!cache.acquire(_opCtx, "TestKey"));
+    };
 
     fnTest(CacheWithThreadPool<Cache>(
         getServiceContext(),
@@ -516,10 +517,19 @@ TEST_F(ReadThroughCacheAsyncTest, InvalidateReissuesLookup) {
     Cache cache(getServiceContext(),
                 threadPool,
                 1,
-                [&](OperationContext*, const std::string& key, const Cache::ValueHandle&) {
+                [&](OperationContext* opCtx, const std::string&, const Cache::ValueHandle&) {
                     int idx = countLookups.fetchAndAdd(1);
                     lookupStartedBarriers[idx].countDownAndWait();
                     completeLookupBarriers[idx].countDownAndWait();
+
+                    if (idx < 2) {
+                        ASSERT_THROWS_CODE(opCtx->checkForInterrupt(),
+                                           DBException,
+                                           ErrorCodes::ReadThroughCacheLookupCanceled);
+                    } else {
+                        opCtx->checkForInterrupt();
+                    }
+
                     return Cache::LookupResult(CachedValue(idx));
                 });
 
@@ -551,7 +561,7 @@ TEST_F(ReadThroughCacheAsyncTest, InvalidateReissuesLookup) {
     ASSERT(!future.isReady());
 
     // Wait for the third lookup attempt to start, but not do not invalidate it before letting it
-    // proceed
+    // proceed (end of test)
     lookupStartedBarriers[2].countDownAndWait();
     ASSERT_EQ(3, countLookups.load());
     ASSERT(!future.isReady());

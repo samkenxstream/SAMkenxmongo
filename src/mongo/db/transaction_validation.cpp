@@ -36,49 +36,28 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/commands/txn_two_phase_commit_cmds_gen.h"
-#include "mongo/db/logical_session_id.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/db/write_concern_options.h"
 
 namespace mongo {
 
 using namespace fmt::literals;
 
-namespace {
-
-const StringMap<int> retryableWriteCommands = {{"delete", 1},
-                                               {"findandmodify", 1},
-                                               {"findAndModify", 1},
-                                               {"insert", 1},
-                                               {"update", 1},
-                                               {"_recvChunkStart", 1},
-                                               {"_configsvrRemoveChunks", 1},
-                                               {"_configsvrRemoveTags", 1},
-                                               {"_shardsvrCreateCollectionParticipant", 1},
-                                               {"_shardsvrDropCollectionParticipant", 1},
-                                               {"_shardsvrRenameCollectionParticipant", 1},
-                                               {"_shardsvrRenameCollectionParticipantUnblock", 1},
-                                               {"_configsvrRenameCollectionMetadata", 1},
-                                               {"_shardsvrParticipantBlock", 1},
-                                               {"_configsvrCollMod", 1},
-                                               {"_shardsvrCollModParticipant", 1}};
-
-// Commands that can be sent with session info but should not check out a session.
-const StringMap<int> skipSessionCheckoutList = {
-    {"coordinateCommitTransaction", 1}, {"_recvChunkStart", 1}, {"replSetStepDown", 1}};
-
-const StringMap<int> transactionCommands = {{"commitTransaction", 1},
-                                            {"coordinateCommitTransaction", 1},
-                                            {"abortTransaction", 1},
-                                            {"prepareTransaction", 1}};
-
-}  // namespace
-
 bool isRetryableWriteCommand(StringData cmdName) {
-    return retryableWriteCommands.find(cmdName) != retryableWriteCommands.cend();
+    auto command = CommandHelpers::findCommand(cmdName);
+    uassert(ErrorCodes::CommandNotFound,
+            str::stream() << "Encountered unknown command during retryability check: " << cmdName,
+            command);
+    return command->supportsRetryableWrite();
 }
 
 bool isTransactionCommand(StringData cmdName) {
-    return transactionCommands.find(cmdName) != transactionCommands.cend();
+    auto command = CommandHelpers::findCommand(cmdName);
+    uassert(ErrorCodes::CommandNotFound,
+            str::stream() << "Encountered unknown command during isTransactionCommand check: "
+                          << cmdName,
+            command);
+    return command->isTransactionCommand();
 }
 
 void validateWriteConcernForTransaction(const WriteConcernOptions& wcResult, StringData cmdName) {
@@ -91,10 +70,6 @@ bool isReadConcernLevelAllowedInTransaction(repl::ReadConcernLevel readConcernLe
     return readConcernLevel == repl::ReadConcernLevel::kSnapshotReadConcern ||
         readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern ||
         readConcernLevel == repl::ReadConcernLevel::kLocalReadConcern;
-}
-
-bool shouldCommandSkipSessionCheckout(StringData cmdName) {
-    return skipSessionCheckoutList.find(cmdName) != skipSessionCheckoutList.cend();
 }
 
 void validateSessionOptions(const OperationSessionInfoFromClient& sessionOptions,
@@ -132,4 +107,17 @@ void validateSessionOptions(const OperationSessionInfoFromClient& sessionOptions
     }
 }
 
+void doTransactionValidationForWrites(OperationContext* opCtx, const NamespaceString& ns) {
+    if (!opCtx->inMultiDocumentTransaction())
+        return;
+    uassert(50791,
+            str::stream() << "Cannot write to system collection " << ns.toString()
+                          << " within a transaction.",
+            !ns.isSystem() || ns.isPrivilegeCollection() || ns.isTimeseriesBucketsCollection());
+    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    uassert(50790,
+            str::stream() << "Cannot write to unreplicated collection " << ns.toString()
+                          << " within a transaction.",
+            !replCoord->isOplogDisabledFor(opCtx, ns));
+}
 }  // namespace mongo

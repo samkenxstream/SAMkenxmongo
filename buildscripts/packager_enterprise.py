@@ -24,7 +24,7 @@
 # * Before you run the program on a new host, these are the
 # prerequisites:
 #
-# apt-get install dpkg-dev rpm debhelper fakeroot ia32-libs createrepo git-core libsnmp15
+# apt-get install dpkg-dev rpm debhelper fakeroot ia32-libs createrepo git-core
 # echo "Now put the dist gnupg signing keys in ~root/.gnupg"
 
 import errno
@@ -44,7 +44,7 @@ import packager  # pylint: disable=wrong-import-position
 ARCH_CHOICES = ["x86_64", "ppc64le", "s390x", "arm64", "aarch64"]
 
 # Made up names for the flavors of distribution we package for.
-DISTROS = ["suse", "debian", "redhat", "ubuntu", "amazon", "amazon2"]
+DISTROS = ["suse", "debian", "redhat", "ubuntu", "amazon", "amazon2", "amazon2022"]
 
 
 class EnterpriseSpec(packager.Spec):
@@ -116,13 +116,12 @@ class EnterpriseDistro(packager.Distro):
         else:
             raise Exception("BUG: unsupported platform?")
 
-    def build_os(self, arch):  # pylint: disable=too-many-branches
+    def build_os(self, arch):
         """Return the build os label in the binary package to download.
 
-        The labels "rhel57", "rhel62", "rhel67", "rhel70", "rhel80" are for redhat,
+        The labels "rhel57", "rhel62", "rhel67", "rhel70", "rhel80", "rhel90" are for redhat,
         the others are delegated to the super class.
         """
-        # pylint: disable=too-many-return-statements
         if arch == "ppc64le":
             if self.dname == 'ubuntu':
                 return ["ubuntu1604", "ubuntu1804"]
@@ -131,7 +130,7 @@ class EnterpriseDistro(packager.Distro):
             return []
         if arch == "s390x":
             if self.dname == 'redhat':
-                return ["rhel67", "rhel72"]
+                return ["rhel67", "rhel72", "rhel83"]
             if self.dname == 'suse':
                 return ["suse11", "suse12", "suse15"]
             if self.dname == 'ubuntu':
@@ -139,18 +138,19 @@ class EnterpriseDistro(packager.Distro):
             return []
         if arch == "arm64":
             if self.dname == 'ubuntu':
-                return ["ubuntu1804", "ubuntu2004"]
+                return ["ubuntu1804", "ubuntu2004", "ubuntu2204"]
         if arch == "aarch64":
             if self.dname == 'redhat':
-                return ["rhel82"]
+                return ["rhel82", "rhel90"]
             if self.dname == 'amazon2':
                 return ["amazon2"]
+            if self.dname == 'amazon2022':
+                return ["amazon2022"]
             return []
 
         if re.search("(redhat|fedora|centos)", self.dname):
-            return ["rhel80", "rhel70", "rhel62", "rhel57"]
+            return ["rhel90", "rhel80", "rhel70", "rhel62", "rhel57"]
         return super(EnterpriseDistro, self).build_os(arch)
-        # pylint: enable=too-many-return-statements
 
 
 def main():
@@ -228,7 +228,7 @@ def unpack_binaries_into(build_os, arch, spec, where):
     try:
         packager.sysassert(["tar", "xvzf", rootdir + "/" + tarfile(build_os, arch, spec)])
         release_dir = glob('mongodb-linux-*')[0]
-        for releasefile in "bin", "snmp", "LICENSE-Enterprise.txt", "README", "THIRD-PARTY-NOTICES", "MPL-2":
+        for releasefile in "bin", "LICENSE-Enterprise.txt", "README", "THIRD-PARTY-NOTICES", "MPL-2":
             os.rename("%s/%s" % (release_dir, releasefile), releasefile)
         os.rmdir(release_dir)
     except Exception:
@@ -257,7 +257,7 @@ def make_package(distro, build_os, arch, spec, srcdir):
             "(cd \"%s\" && git archive %s %s/ ) | (cd \"%s\" && tar xvf -)" %
             (srcdir, spec.metadata_gitspec(), pkgdir, sdir)
         ])
-    # Splat the binaries and snmp files under sdir.  The "build" stages of the
+    # Splat the binaries under sdir.  The "build" stages of the
     # packaging infrastructure will move the files to wherever they
     # need to go.
     unpack_binaries_into(build_os, arch, spec, sdir)
@@ -321,7 +321,7 @@ Description: MongoDB packages
         os.chdir(oldpwd)
 
 
-def move_repos_into_place(src, dst):  # pylint: disable=too-many-branches
+def move_repos_into_place(src, dst):
     """Move the repos into place."""
     # Find all the stuff in src/*, move it to a freshly-created
     # directory beside dst, then play some games with symlinks so that

@@ -51,7 +51,7 @@ public:
 
     void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                       const NamespaceString& nss,
-                                      ChunkVersion targetCollectionVersion) const final;
+                                      ChunkVersion targetCollectionPlacementVersion) const final;
 
     std::vector<FieldPath> collectDocumentKeyFieldsActingAsRouter(
         OperationContext*, const NamespaceString&) const final {
@@ -96,21 +96,20 @@ public:
     BSONObj preparePipelineAndExplain(Pipeline* ownedPipeline,
                                       ExplainOptions::Verbosity verbosity) final;
 
-    std::unique_ptr<ShardFilterer> getShardFilterer(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx) const override final;
-
     BSONObj getCollectionOptions(OperationContext* opCtx, const NamespaceString& nss) final;
 
     std::list<BSONObj> getIndexSpecs(OperationContext* opCtx,
                                      const NamespaceString& ns,
                                      bool includeBuildUUIDs) final;
     void renameIfOptionsAndIndexesHaveNotChanged(OperationContext* opCtx,
-                                                 const BSONObj& renameCommandObj,
+                                                 const NamespaceString& sourceNs,
                                                  const NamespaceString& targetNs,
+                                                 bool dropTarget,
+                                                 bool stayTemp,
                                                  const BSONObj& originalCollectionOptions,
                                                  const std::list<BSONObj>& originalIndexes) final;
     void createCollection(OperationContext* opCtx,
-                          const std::string& dbName,
+                          const DatabaseName& dbName,
                           const BSONObj& cmdObj) final;
     void createIndexesOnEmptyCollection(OperationContext* opCtx,
                                         const NamespaceString& ns,
@@ -125,6 +124,14 @@ public:
      */
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
         Pipeline* pipeline,
+        ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
+        boost::optional<BSONObj> readConcern = boost::none) final;
+
+    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+        const AggregateCommandRequest& aggRequest,
+        Pipeline* pipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        boost::optional<BSONObj> shardCursorsSortSpec = boost::none,
         ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
         boost::optional<BSONObj> readConcern = boost::none) final;
 

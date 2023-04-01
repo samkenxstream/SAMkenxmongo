@@ -34,6 +34,7 @@
 #include <set>
 #include <string>
 
+#include "mongo/bson/ordering.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/index_names.h"
@@ -81,7 +82,8 @@ public:
     static constexpr StringData kLanguageOverrideFieldName = "language_override"_sd;
     static constexpr StringData kNamespaceFieldName = "ns"_sd;  // Removed in 4.4
     static constexpr StringData kPartialFilterExprFieldName = "partialFilterExpression"_sd;
-    static constexpr StringData kPathProjectionFieldName = "wildcardProjection"_sd;
+    static constexpr StringData kWildcardProjectionFieldName = "wildcardProjection"_sd;
+    static constexpr StringData kColumnStoreProjectionFieldName = "columnstoreProjection"_sd;
     static constexpr StringData kSparseFieldName = "sparse"_sd;
     static constexpr StringData kStorageEngineFieldName = "storageEngine"_sd;
     static constexpr StringData kTextVersionFieldName = "textIndexVersion"_sd;
@@ -89,6 +91,8 @@ public:
     static constexpr StringData kWeightsFieldName = "weights"_sd;
     static constexpr StringData kOriginalSpecFieldName = "originalSpec"_sd;
     static constexpr StringData kPrepareUniqueFieldName = "prepareUnique"_sd;
+    static constexpr StringData kClusteredFieldName = "clustered"_sd;
+    static constexpr StringData kColumnStoreCompressorFieldName = "columnstoreCompressor"_sd;
 
     /**
      * infoObj is a copy of the index-describing BSONObj contained in the catalog.
@@ -119,15 +123,40 @@ public:
     }
 
     /**
-     * Return the path projection spec, if one exists. This is only applicable for '$**' indexes.
+     * Return the path projection spec, if one exists. This is only applicable for wildcard ('$**')
+     * and columnstore indexes. It is kept as originally specified by the createIndex() call, not
+     * normalized.
+     *
+     * It contains only the projection object that was contained in one of the fields listed below
+     * from the original createIndex() parameters object, but it does NOT preserve the field name:
+     *   - "wildcardProjection"    (IndexDescriptor::kWildcardProjectionFieldName)
+     *   - "columnstoreProjection" (IndexDescriptor::kColumnStoreProjectionFieldName)
+     *
+     * This is set by the IndexDescriptor constructor and never changes after that.
+     *
+     * Example: db.a.createIndex({"$**":1}, {"name": "i1", "wildcardProjection": {"a.b": 1}})
+     *   return (unnormalized) object: {"a.b":{"$numberDouble":"1"}}
      */
     const BSONObj& pathProjection() const {
         return _projection;
     }
 
     /**
-     * Returns the normalized path projection spec, if one exists. This is only applicable for '$**'
-     * indexes.
+     * Returns the normalized path projection spec, if one exists. This is only applicable for
+     * wildcard ('$**') and columnstore indexes. It is the normalized version of the path projection
+     * and is used to determine whether a new index candidate from createIndex() duplicates an
+     * existing index.
+     *
+     * It contains the normalized projection object based on the original object that was contained
+     * in one of the fields listed below from the original createIndex() parameters object, but it
+     * does NOT preserve the field name:
+     *   - "wildcardProjection"    (IndexDescriptor::kWildcardProjectionFieldName)
+     *   - "columnstoreProjection" (IndexDescriptor::kColumnStoreProjectionFieldName)
+     *
+     * This is set by the IndexDescriptor constructor and never changes after that.
+     *
+     * Example: db.a.createIndex({"$**":1}, {"name": "i1", "wildcardProjection": {"a.b": 1}})
+     *   return (normalized) object: {"a":{"b":true},"_id":false}
      */
     const BSONObj& normalizedPathProjection() const {
         return _normalizedProjection;
@@ -171,6 +200,11 @@ public:
     // Return what version of index this is.
     IndexVersion version() const {
         return _version;
+    }
+
+    // Return the 'Ordering' of the index keys.
+    const Ordering& ordering() const {
+        return _ordering;
     }
 
     // May each key only occur once?
@@ -231,6 +265,23 @@ public:
         return _prepareUnique;
     }
 
+    boost::optional<StringData> compressor() const {
+        return _compressor ? boost::make_optional<StringData>(*_compressor) : boost::none;
+    }
+
+    /**
+     * Returns the field names from the index key pattern.
+     *
+     * Examples:
+     * For the index key pattern {a: 1, b: 1}, this method returns {"a", "b"}.
+     * For the text index key pattern {a: "text", _fts: "text", b: "text"}, this method returns
+     * {"a", "term", "weight", "b"}.
+     *
+     * Note that this method will not be able to resolve the field names for a wildcard index. So,
+     * for the wild card index {"$**": 1}, this method will return {"$**"}.
+     */
+    std::vector<const char*> getFieldNames() const;
+
     /**
      * Returns true if the key pattern is for the _id index.
      * The _id index must have form exactly {_id : 1} or {_id : -1}.
@@ -251,10 +302,19 @@ public:
     }
 
 private:
-    // This method should only ever be called by WildcardAccessMethod, to set the
-    // '_normalizedProjection' for descriptors associated with an existing IndexCatalogEntry.
-    void _setNormalizedPathProjection(BSONObj&& proj) {
-        _normalizedProjection = std::move(proj);
+    /**
+     * Returns wildcardProjection or columnstoreProjection projection
+     */
+    BSONObj createPathProjection(const BSONObj& infoObj) const {
+        if (const auto wildcardProjection =
+                infoObj[IndexDescriptor::kWildcardProjectionFieldName]) {
+            return wildcardProjection.Obj().getOwned();
+        } else if (const auto columnStoreProjection =
+                       infoObj[IndexDescriptor::kColumnStoreProjectionFieldName]) {
+            return columnStoreProjection.Obj().getOwned();
+        } else {
+            return BSONObj();
+        }
     }
 
     // What access method should we use for this index?
@@ -269,8 +329,8 @@ private:
 
     int64_t _numFields;  // How many fields are indexed?
     BSONObj _keyPattern;
-    BSONObj _projection;
-    BSONObj _normalizedProjection;
+    BSONObj _projection;            // for wildcardProjection / columnstoreProjection; never changes
+    BSONObj _normalizedProjection;  // for wildcardProjection / columnstoreProjection; never changes
     std::string _indexName;
     bool _isIdIndex;
     bool _sparse;
@@ -278,9 +338,13 @@ private:
     bool _hidden;
     bool _partial;
     IndexVersion _version;
+    // '_ordering' should be initialized after '_indexType' because different index types may
+    // require different handling of the Ordering.
+    Ordering _ordering;
     BSONObj _collation;
     BSONObj _partialFilterExpression;
     bool _prepareUnique = false;
+    boost::optional<std::string> _compressor;
 
     // Many query stages require going from an IndexDescriptor to its IndexCatalogEntry, so for
     // now we need this.
@@ -289,7 +353,6 @@ private:
     friend class IndexCatalog;
     friend class IndexCatalogEntryImpl;
     friend class IndexCatalogEntryContainer;
-    friend class WildcardAccessMethod;
 };
 
 }  // namespace mongo

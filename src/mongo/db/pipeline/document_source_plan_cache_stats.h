@@ -115,18 +115,18 @@ public:
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
                                                      Pipeline::SourceContainer* container) override;
 
-    void serializeToArray(
-        std::vector<Value>& array,
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override;
+    void serializeToArray(std::vector<Value>& array,
+                          SerializationOptions opts = SerializationOptions()) const final override;
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
 private:
     DocumentSourcePlanCacheStats(const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     GetNextResult doGetNext() final;
 
-    Value serialize(
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override {
-        MONGO_UNREACHABLE;  // Should call serializeToArray instead.
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override {
+        MONGO_UNREACHABLE_TASSERT(7484303);  // Should call serializeToArray instead.
     }
 
     // If running through mongos in a sharded cluster, stores the shard name so that it can be

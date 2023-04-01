@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/shard_util.h"
@@ -51,7 +52,8 @@ public:
     virtual void verifyUsefulNonMultiKeyIndex(const NamespaceString& nss,
                                               const BSONObj& proposedKey) const = 0;
 
-    virtual void verifyCanCreateShardKeyIndex(const NamespaceString& nss) const = 0;
+    virtual void verifyCanCreateShardKeyIndex(const NamespaceString& nss,
+                                              std::string* errMsg) const = 0;
 
     virtual void createShardKeyIndex(const NamespaceString& nss,
                                      const BSONObj& proposedKey,
@@ -72,7 +74,8 @@ public:
     void verifyUsefulNonMultiKeyIndex(const NamespaceString& nss,
                                       const BSONObj& proposedKey) const override;
 
-    void verifyCanCreateShardKeyIndex(const NamespaceString& nss) const override;
+    void verifyCanCreateShardKeyIndex(const NamespaceString& nss,
+                                      std::string* errMsg) const override;
 
     void createShardKeyIndex(const NamespaceString& nss,
                              const BSONObj& proposedKey,
@@ -95,7 +98,8 @@ public:
     void verifyUsefulNonMultiKeyIndex(const NamespaceString& nss,
                                       const BSONObj& proposedKey) const override;
 
-    void verifyCanCreateShardKeyIndex(const NamespaceString& nss) const override;
+    void verifyCanCreateShardKeyIndex(const NamespaceString& nss,
+                                      std::string* errMsg) const override;
 
     void createShardKeyIndex(const NamespaceString& nss,
                              const BSONObj& proposedKey,
@@ -105,9 +109,35 @@ public:
 private:
     OperationContext* _opCtx;
 
-    ChunkManager _cm;
+    CollectionRoutingInfo _cri;
 
     std::shared_ptr<Shard> _indexShard;
+};
+
+/**
+ * Implementation of steps for validating a shard key for refineCollectionShardKey locally.
+ */
+class ValidationBehaviorsLocalRefineShardKey final : public ShardKeyValidationBehaviors {
+public:
+    ValidationBehaviorsLocalRefineShardKey(OperationContext* opCtx, const CollectionPtr& coll);
+
+    std::vector<BSONObj> loadIndexes(const NamespaceString& nss) const override;
+
+    void verifyUsefulNonMultiKeyIndex(const NamespaceString& nss,
+                                      const BSONObj& proposedKey) const override;
+
+    void verifyCanCreateShardKeyIndex(const NamespaceString& nss,
+                                      std::string* errMsg) const override;
+
+    void createShardKeyIndex(const NamespaceString& nss,
+                             const BSONObj& proposedKey,
+                             const boost::optional<BSONObj>& defaultCollation,
+                             bool unique) const override;
+
+private:
+    OperationContext* _opCtx;
+
+    const CollectionPtr& _coll;
 };
 
 /**
@@ -165,7 +195,8 @@ bool validShardKeyIndexExists(OperationContext* opCtx,
                               const ShardKeyPattern& shardKeyPattern,
                               const boost::optional<BSONObj>& defaultCollation,
                               bool requiresUnique,
-                              const ShardKeyValidationBehaviors& behaviors);
+                              const ShardKeyValidationBehaviors& behaviors,
+                              std::string* errMsg = nullptr);
 
 void validateShardKeyIsNotEncrypted(OperationContext* opCtx,
                                     const NamespaceString& nss,

@@ -27,20 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
-
-#include "mongo/platform/basic.h"
-
-#include <boost/optional/optional_io.hpp>
 #include <memory>
 #include <vector>
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/logical_session_cache_noop.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/op_observer/oplog_writer_impl.h"
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
@@ -53,16 +47,22 @@
 #include "mongo/db/s/resharding/resharding_oplog_session_application.h"
 #include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/session/logical_session_cache_noop.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/db/vector_clock_metadata_hook.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/concurrency/thread_pool.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
 namespace {
@@ -88,7 +88,13 @@ public:
             auto storageImpl = std::make_unique<repl::StorageInterfaceImpl>();
             repl::StorageInterface::set(serviceContext, std::move(storageImpl));
 
-            MongoDSessionCatalog::onStepUp(opCtx.get());
+            MongoDSessionCatalog::set(
+                serviceContext,
+                std::make_unique<MongoDSessionCatalog>(
+                    std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
+            auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx.get());
+            mongoDSessionCatalog->onStepUp(opCtx.get());
+
             LogicalSessionCache::set(serviceContext, std::make_unique<LogicalSessionCacheNoop>());
 
             // OpObserverShardingImpl is required for timestamping the writes from
@@ -97,7 +103,8 @@ public:
                 dynamic_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
             invariant(opObserverRegistry);
 
-            opObserverRegistry->addObserver(std::make_unique<OpObserverShardingImpl>());
+            opObserverRegistry->addObserver(
+                std::make_unique<OpObserverShardingImpl>(std::make_unique<OplogWriterImpl>()));
         }
 
         {
@@ -108,22 +115,22 @@ public:
                     opCtx.get(), nss, CollectionOptions{});
             }
 
-            _metrics = std::make_unique<ReshardingMetrics>(serviceContext);
-            _metricsNew =
-                ReshardingMetricsNew::makeInstance(UUID::gen(),
-                                                   BSON("y" << 1),
-                                                   _outputNss,
-                                                   ShardingDataTransformMetrics::Role::kRecipient,
-                                                   serviceContext->getFastClockSource()->now(),
-                                                   serviceContext);
+            _metrics =
+                ReshardingMetrics::makeInstance(UUID::gen(),
+                                                BSON("y" << 1),
+                                                _outputNss,
+                                                ShardingDataTransformMetrics::Role::kRecipient,
+                                                serviceContext->getFastClockSource()->now(),
+                                                serviceContext);
+            _applierMetrics =
+                std::make_unique<ReshardingOplogApplierMetrics>(_metrics.get(), boost::none);
             _crudApplication = std::make_unique<ReshardingOplogApplicationRules>(
                 _outputNss,
                 std::vector<NamespaceString>{_myStashNss, _otherStashNss},
                 0U,
                 _myDonorId,
                 makeChunkManagerForSourceCollection(),
-                _metrics.get(),
-                _metricsNew.get());
+                _applierMetrics.get());
 
             _sessionApplication =
                 std::make_unique<ReshardingOplogSessionApplication>(_myOplogBufferNss);
@@ -187,7 +194,8 @@ public:
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
         txnParticipant.beginOrContinue(
             opCtx, {txnNumber}, false /* autocommit */, true /* startTransaction */);
@@ -196,7 +204,18 @@ public:
 
         // The transaction machinery cannot store an empty locker.
         { Lock::GlobalLock globalLock(opCtx, MODE_IX); }
-        auto opTime = repl::getNextOpTime(opCtx);
+        auto opTime = [opCtx] {
+            TransactionParticipant::SideTransactionBlock sideTxn{opCtx};
+
+            WriteUnitOfWork wuow{opCtx};
+            auto opTime = repl::getNextOpTime(opCtx);
+            wuow.release();
+
+            opCtx->recoveryUnit()->abortUnitOfWork();
+            opCtx->lockState()->endWriteUnitOfWork();
+
+            return opTime;
+        }();
         txnParticipant.prepareTransaction(opCtx, opTime);
         txnParticipant.stashTransactionResources(opCtx);
 
@@ -208,7 +227,8 @@ public:
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
         txnParticipant.beginOrContinue(
             opCtx, {txnNumber}, false /* autocommit */, boost::none /* startTransaction */);
@@ -304,7 +324,7 @@ private:
         std::vector<ChunkType> chunks = {ChunkType{
             _sourceUUID,
             ChunkRange{BSON(_currentShardKey << MINKEY), BSON(_currentShardKey << MAXKEY)},
-            ChunkVersion(100, 0, epoch, Timestamp(1, 1)),
+            ChunkVersion({epoch, Timestamp(1, 1)}, {100, 0}),
             _myDonorId}};
 
         auto rt = RoutingTableHistory::makeNew(_sourceNss,
@@ -316,7 +336,6 @@ private:
                                                Timestamp(1, 1),
                                                boost::none /* timeseriesFields */,
                                                boost::none /* reshardingFields */,
-                                               boost::none /* chunkSizeBytes */,
                                                true /* allowMigrations */,
                                                chunks);
 
@@ -342,14 +361,16 @@ private:
     const ShardId _otherDonorId{"otherDonorId"};
 
     const NamespaceString _outputNss =
-        constructTemporaryReshardingNss(_sourceNss.db(), _sourceUUID);
-    const NamespaceString _myStashNss = getLocalConflictStashNamespace(_sourceUUID, _myDonorId);
+        resharding::constructTemporaryReshardingNss(_sourceNss.db(), _sourceUUID);
+    const NamespaceString _myStashNss =
+        resharding::getLocalConflictStashNamespace(_sourceUUID, _myDonorId);
     const NamespaceString _otherStashNss =
-        getLocalConflictStashNamespace(_sourceUUID, _otherDonorId);
-    const NamespaceString _myOplogBufferNss = getLocalOplogBufferNamespace(_sourceUUID, _myDonorId);
+        resharding::getLocalConflictStashNamespace(_sourceUUID, _otherDonorId);
+    const NamespaceString _myOplogBufferNss =
+        resharding::getLocalOplogBufferNamespace(_sourceUUID, _myDonorId);
 
     std::unique_ptr<ReshardingMetrics> _metrics;
-    std::unique_ptr<ReshardingMetricsNew> _metricsNew;
+    std::unique_ptr<ReshardingOplogApplierMetrics> _applierMetrics;
 
     std::unique_ptr<ReshardingOplogApplicationRules> _crudApplication;
     std::unique_ptr<ReshardingOplogSessionApplication> _sessionApplication;

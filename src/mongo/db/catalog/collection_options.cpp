@@ -42,34 +42,54 @@
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/idl/command_generic_argument.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/overloaded_visitor.h"
 #include "mongo/util/str.h"
-#include "mongo/util/visit_helper.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 namespace mongo {
 namespace {
 long long adjustCappedSize(long long cappedSize) {
-    cappedSize += 0xff;
-    cappedSize &= 0xffffffffffffff00LL;
+    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        !feature_flags::gfeatureFlagCappedCollectionsRelaxedSize.isEnabled(
+            serverGlobalParams.featureCompatibility)) {
+        auto originalCappedSize = cappedSize;
+        cappedSize += 0xff;
+        cappedSize &= 0xffffffffffffff00LL;
+        LOGV2(7386100,
+              "Capped collection maxSize being rounded up to nearest 256-byte size.",
+              "originalSize"_attr = originalCappedSize,
+              "adjustedSize"_attr = cappedSize);
+    }
     return cappedSize;
 }
 
 long long adjustCappedMaxDocs(long long cappedMaxDocs) {
     if (cappedMaxDocs <= 0 || cappedMaxDocs == std::numeric_limits<long long>::max()) {
+        auto originalCappedMaxDocs = cappedMaxDocs;
         cappedMaxDocs = 0x7fffffff;
+        LOGV2(7386101,
+              "Capped collection maxDocs being rounded off.",
+              "originalMaxDocs"_attr = originalCappedMaxDocs,
+              "adjustedMaxDocs"_attr = cappedMaxDocs);
     }
     return cappedMaxDocs;
 }
 
 void setEncryptedDefaultEncryptedCollectionNames(const NamespaceString& ns,
                                                  EncryptedFieldConfig* config) {
-    auto prefix = std::string("fle2.") + ns.coll();
+    auto prefix = std::string("enxcol_.") + ns.coll();
 
     if (!config->getEscCollection()) {
         config->setEscCollection(StringData(prefix + ".esc"));
     }
 
-    if (!config->getEccCollection()) {
-        config->setEccCollection(StringData(prefix + ".ecc"));
+    // TODO SERVER-73303: delete when v2 is enabled.
+    if (!gFeatureFlagFLE2ProtocolVersion2.isEnabledAndIgnoreFCV()) {
+        if (!config->getEccCollection()) {
+            config->setEccCollection(StringData(prefix + ".ecc"));
+        }
     }
 
     if (!config->getEcocCollection()) {
@@ -170,10 +190,12 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
         } else if (fieldName == "flags") {
             // Ignoring this field as it is deprecated.
             continue;
+        } else if (fieldName == "recordPreImages") {
+            // Ignoring this field as it is not supported.
+            collectionOptions.recordPreImagesOptionUsed = true;
+            continue;
         } else if (fieldName == "temp") {
             collectionOptions.temp = e.trueValue();
-        } else if (fieldName == "recordPreImages") {
-            collectionOptions.recordPreImages = e.trueValue();
         } else if (fieldName == "changeStreamPreAndPostImages") {
             if (e.type() != mongo::Object) {
                 return {ErrorCodes::InvalidOptions,
@@ -183,7 +205,7 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
             try {
                 collectionOptions.changeStreamPreAndPostImagesOptions =
                     ChangeStreamPreAndPostImagesOptions::parse(
-                        {"changeStreamPreAndPostImagesOptions"}, e.Obj());
+                        IDLParserContext{"changeStreamPreAndPostImagesOptions"}, e.Obj());
             } catch (const DBException& ex) {
                 return ex.toStatus();
             }
@@ -204,8 +226,8 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
             }
 
             try {
-                collectionOptions.indexOptionDefaults =
-                    IndexOptionDefaults::parse({"CollectionOptions::parse"}, e.Obj());
+                collectionOptions.indexOptionDefaults = IndexOptionDefaults::parse(
+                    IDLParserContext{"CollectionOptions::parse"}, e.Obj());
             } catch (const DBException& ex) {
                 return ex.toStatus();
             }
@@ -222,7 +244,7 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
 
             try {
                 collectionOptions.validationAction =
-                    ValidationAction_parse({"validationAction"}, e.String());
+                    ValidationAction_parse(IDLParserContext{"validationAction"}, e.String());
             } catch (const DBException& exc) {
                 return exc.toStatus();
             }
@@ -233,7 +255,7 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
 
             try {
                 collectionOptions.validationLevel =
-                    ValidationLevel_parse({"validationLevel"}, e.String());
+                    ValidationLevel_parse(IDLParserContext{"validationLevel"}, e.String());
             } catch (const DBException& exc) {
                 return exc.toStatus();
             }
@@ -292,7 +314,7 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
 
             try {
                 collectionOptions.timeseries =
-                    TimeseriesOptions::parse({"CollectionOptions::parse"}, e.Obj());
+                    TimeseriesOptions::parse(IDLParserContext{"CollectionOptions::parse"}, e.Obj());
             } catch (const DBException& ex) {
                 return ex.toStatus();
             }
@@ -302,9 +324,8 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
             }
 
             try {
-                collectionOptions.encryptedFieldConfig =
-                    collection_options_validation::processAndValidateEncryptedFields(
-                        EncryptedFieldConfig::parse({"CollectionOptions::parse"}, e.Obj()));
+                collectionOptions.encryptedFieldConfig = EncryptedFieldConfig::parse(
+                    IDLParserContext{"CollectionOptions::parse"}, e.Obj());
             } catch (const DBException& ex) {
                 return ex.toStatus();
             }
@@ -323,8 +344,7 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
     return collectionOptions;
 }
 
-CollectionOptions CollectionOptions::fromCreateCommand(const NamespaceString& nss,
-                                                       const CreateCommand& cmd) {
+CollectionOptions CollectionOptions::fromCreateCommand(const CreateCommand& cmd) {
     CollectionOptions options;
 
     options.validationLevel = cmd.getValidationLevel();
@@ -364,9 +384,6 @@ CollectionOptions CollectionOptions::fromCreateCommand(const NamespaceString& ns
     if (auto collation = cmd.getCollation()) {
         options.collation = collation->toBSON();
     }
-    if (auto recordPreImages = cmd.getRecordPreImages()) {
-        options.recordPreImages = *recordPreImages;
-    }
     if (auto changeStreamPreAndPostImagesOptions = cmd.getChangeStreamPreAndPostImages()) {
         options.changeStreamPreAndPostImagesOptions = *changeStreamPreAndPostImagesOptions;
     }
@@ -374,21 +391,20 @@ CollectionOptions CollectionOptions::fromCreateCommand(const NamespaceString& ns
         options.timeseries = std::move(*timeseries);
     }
     if (auto clusteredIndex = cmd.getClusteredIndex()) {
-        stdx::visit(
-            visit_helper::Overloaded{
-                [&](bool isClustered) {
-                    if (isClustered) {
-                        options.clusteredIndex =
-                            clustered_util::makeCanonicalClusteredInfoForLegacyFormat();
-                    } else {
-                        options.clusteredIndex = boost::none;
-                    }
-                },
-                [&](const ClusteredIndexSpec& clusteredIndexSpec) {
-                    options.clusteredIndex =
-                        clustered_util::makeCanonicalClusteredInfo(clusteredIndexSpec);
-                }},
-            *clusteredIndex);
+        stdx::visit(OverloadedVisitor{
+                        [&](bool isClustered) {
+                            if (isClustered) {
+                                options.clusteredIndex =
+                                    clustered_util::makeCanonicalClusteredInfoForLegacyFormat();
+                            } else {
+                                options.clusteredIndex = boost::none;
+                            }
+                        },
+                        [&](const ClusteredIndexSpec& clusteredIndexSpec) {
+                            options.clusteredIndex =
+                                clustered_util::makeCanonicalClusteredInfo(clusteredIndexSpec);
+                        }},
+                    *clusteredIndex);
     }
     if (auto expireAfterSeconds = cmd.getExpireAfterSeconds()) {
         options.expireAfterSeconds = expireAfterSeconds;
@@ -398,7 +414,8 @@ CollectionOptions CollectionOptions::fromCreateCommand(const NamespaceString& ns
     }
     if (auto encryptedFieldConfig = cmd.getEncryptedFields()) {
         options.encryptedFieldConfig = std::move(*encryptedFieldConfig);
-        setEncryptedDefaultEncryptedCollectionNames(nss, options.encryptedFieldConfig.get_ptr());
+        setEncryptedDefaultEncryptedCollectionNames(cmd.getNamespace(),
+                                                    options.encryptedFieldConfig.get_ptr());
     }
 
     return options;
@@ -435,13 +452,7 @@ void CollectionOptions::appendBSON(BSONObjBuilder* builder,
     if (temp && shouldAppend(CreateCommand::kTempFieldName))
         builder->appendBool(CreateCommand::kTempFieldName, true);
 
-    if (recordPreImages && shouldAppend(CreateCommand::kRecordPreImagesFieldName)) {
-        builder->appendBool(CreateCommand::kRecordPreImagesFieldName, true);
-    }
-
-    // TODO SERVER-58584: remove the feature flag.
-    if (feature_flags::gFeatureFlagChangeStreamPreAndPostImages.isEnabledAndIgnoreFCV() &&
-        changeStreamPreAndPostImagesOptions.getEnabled() &&
+    if (changeStreamPreAndPostImagesOptions.getEnabled() &&
         shouldAppend(CreateCommand::kChangeStreamPreAndPostImagesFieldName)) {
         builder->append(CreateCommand::kChangeStreamPreAndPostImagesFieldName,
                         changeStreamPreAndPostImagesOptions.toBSON());
@@ -524,10 +535,6 @@ bool CollectionOptions::matchesStorageOptions(const CollectionOptions& other,
     }
 
     if (autoIndexId != other.autoIndexId) {
-        return false;
-    }
-
-    if (recordPreImages != other.recordPreImages) {
         return false;
     }
 

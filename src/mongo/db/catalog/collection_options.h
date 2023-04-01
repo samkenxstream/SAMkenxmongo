@@ -29,9 +29,8 @@
 
 #pragma once
 
-#include <string>
-
 #include <boost/optional.hpp>
+#include <string>
 
 #include "mongo/base/status.h"
 #include "mongo/crypto/encryption_fields_gen.h"
@@ -80,8 +79,7 @@ struct CollectionOptions {
     /**
      * Converts a client "create" command invocation.
      */
-    static CollectionOptions fromCreateCommand(const NamespaceString& nss,
-                                               const CreateCommand& cmd);
+    static CollectionOptions fromCreateCommand(const CreateCommand& cmd);
 
     static StatusWith<long long> checkAndAdjustCappedSize(long long cappedSize);
     static StatusWith<long long> checkAndAdjustCappedMaxDocs(long long cappedMaxDocs);
@@ -125,11 +123,16 @@ struct CollectionOptions {
     } autoIndexId = DEFAULT;
 
     bool temp = false;
-    bool recordPreImages = false;
+
+    // Indicates whether "recordPreImages" collection option was used in the collection definition.
+    // This needs to be remembered to make it possible to efficiently remove the option upon FCV
+    // upgrade. Otherwise, this option is not supported.
+    // TODO SERVER-74036: Remove once FCV 7.0 becomes last-LTS.
+    bool recordPreImagesOptionUsed{false};
 
     // Change stream options define whether or not to store the pre-images of the documents affected
     // by update and delete operations in a dedicated collection, that will be used for reading data
-    // via changeStreams. Can not be enabled together with 'recordPreImages' (mutually exclusive).
+    // via changeStreams.
     ChangeStreamPreAndPostImagesOptions changeStreamPreAndPostImagesOptions{false};
 
     // Storage engine collection options. Always owned or empty.

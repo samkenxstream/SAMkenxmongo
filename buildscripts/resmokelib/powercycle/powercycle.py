@@ -3,7 +3,7 @@ import atexit
 import collections
 import copy
 import datetime
-import distutils.spawn  # pylint: disable=no-name-in-module
+import distutils.spawn
 import importlib
 import json
 import logging
@@ -68,8 +68,6 @@ if _IS_WINDOWS:
     _try_import("win32security")
     _try_import("win32service")
     _try_import("win32serviceutil")
-
-# pylint: disable=too-many-lines
 
 LOGGER = logging.getLogger(__name__)
 
@@ -596,11 +594,10 @@ class Processes(object):
             cls.kill(proc)
 
 
-class MongodControl(object):  # pylint: disable=too-many-instance-attributes
+class MongodControl(object):
     """Control mongod process."""
 
-    def __init__(  # pylint: disable=too-many-arguments
-            self, bin_dir, db_path, log_path, port, options=None):
+    def __init__(self, bin_dir, db_path, log_path, port, options=None):
         """Initialize MongodControl."""
         self.process_name = "mongod{}".format(executable_extension())
 
@@ -725,9 +722,8 @@ class LocalToRemoteOperations(object):
     Return (return code, output).
     """
 
-    def __init__(  # pylint: disable=too-many-arguments
-            self, user_host, ssh_connection_options=None, ssh_options=None,
-            shell_binary="/bin/bash", use_shell=False, access_retry_count=5):
+    def __init__(self, user_host, ssh_connection_options=None, ssh_options=None,
+                 shell_binary="/bin/bash", use_shell=False, access_retry_count=5):
         """Initialize LocalToRemoteOperations."""
 
         self.remote_op = remote_operations.RemoteOperations(
@@ -760,7 +756,6 @@ class LocalToRemoteOperations(object):
         return self.remote_op.access_info()
 
 
-# pylint: disable=too-many-branches,too-many-locals,too-many-statements
 def remote_handler(options, task_config, root_dir):
     """Remote operations handler executes all remote operations on the remote host.
 
@@ -1055,8 +1050,7 @@ def internal_crash():
     return 1, "Crash did not occur"
 
 
-def crash_server_or_kill_mongod(  # pylint: disable=too-many-arguments,too-many-locals
-        task_config, crash_canary, local_ops, script_name, client_args):
+def crash_server_or_kill_mongod(task_config, crash_canary, local_ops, script_name, client_args):
     """Crash server or kill mongod and optionally write canary doc. Return tuple (ret, output)."""
 
     crash_wait_time = powercycle_constants.CRASH_WAIT_TIME + random.randint(
@@ -1106,12 +1100,13 @@ def wait_for_mongod_shutdown(mongod_control, timeout=2 * ONE_HOUR_SECS):
 
 def get_mongo_client_args(host=None, port=None, task_config=None,
                           server_selection_timeout_ms=2 * ONE_HOUR_SECS * 1000,
-                          socket_timeout_ms=2 * ONE_HOUR_SECS * 1000):
+                          socket_timeout_ms=2 * ONE_HOUR_SECS * 1000, direct_connection=True):
     """Return keyword arg dict used in PyMongo client."""
     # Set the default serverSelectionTimeoutMS & socketTimeoutMS to 10 minutes.
     mongo_args = {
         "serverSelectionTimeoutMS": server_selection_timeout_ms,
-        "socketTimeoutMS": socket_timeout_ms
+        "socketTimeoutMS": socket_timeout_ms,
+        "directConnection": direct_connection,
     }
     if host:
         mongo_args["host"] = host
@@ -1127,8 +1122,7 @@ def get_mongo_client_args(host=None, port=None, task_config=None,
     return mongo_args
 
 
-def mongo_shell(  # pylint: disable=too-many-arguments
-        mongo_path, work_dir, host_port, mongo_cmds, retries=5, retry_sleep=5):
+def mongo_shell(mongo_path, work_dir, host_port, mongo_cmds, retries=5, retry_sleep=5):
     """Start mongo_path from work_dir, connecting to host_port and executes mongo_cmds."""
     cmds = "cd {}; echo {} | {} {}".format(
         pipes.quote(work_dir), pipes.quote(mongo_cmds), pipes.quote(mongo_path), host_port)
@@ -1172,7 +1166,7 @@ def mongo_reconfig_replication(mongo, host_port, repl_set):
     database = pymongo.database.Database(mongo, "local")
     system_replset = database.get_collection("system.replset")
     # Check if replica set has already been initialized
-    if not system_replset or not system_replset.find_one():
+    if system_replset is None or not system_replset.find_one():
         rs_config = {"_id": repl_set, "members": [{"_id": 0, "host": host_port}]}
         ret = mongo.admin.command("replSetInitiate", rs_config)
         LOGGER.info("Replication initialized: %s %s", ret, rs_config)
@@ -1221,19 +1215,19 @@ def mongo_seed_docs(mongo, db_name, coll_name, num_docs):
             random.choice(string.ascii_letters) for _ in range(random.randint(1, max_length)))
 
     LOGGER.info("Seeding DB '%s' collection '%s' with %d documents, %d already exist", db_name,
-                coll_name, num_docs, mongo[db_name][coll_name].count())
+                coll_name, num_docs, mongo[db_name][coll_name].estimated_document_count())
     random.seed()
     base_num = 100000
     bulk_num = min(num_docs, 10000)
     bulk_loops = num_docs // bulk_num
     for _ in range(bulk_loops):
-        num_coll_docs = mongo[db_name][coll_name].count()
+        num_coll_docs = mongo[db_name][coll_name].estimated_document_count()
         if num_coll_docs >= num_docs:
             break
         mongo[db_name][coll_name].insert_many(
             [{"x": random.randint(0, base_num), "doc": rand_string(1024)} for _ in range(bulk_num)])
     LOGGER.info("After seeding there are %d documents in the collection",
-                mongo[db_name][coll_name].count())
+                mongo[db_name][coll_name].estimated_document_count())
     return 0
 
 
@@ -1268,9 +1262,8 @@ def new_resmoke_config(config_file, new_config_file, test_data, eval_str=""):
         yaml.safe_dump(config, yaml_stream)
 
 
-def resmoke_client(  # pylint: disable=too-many-arguments
-        work_dir, mongo_path, host_port, js_test, resmoke_suite, repeat_num=1, no_wait=False,
-        log_file=None):
+def resmoke_client(work_dir, mongo_path, host_port, js_test, resmoke_suite, repeat_num=1,
+                   no_wait=False, log_file=None):
     """Start resmoke client from work_dir, connecting to host_port and executes js_test."""
     log_output = f">> {log_file} 2>&1" if log_file else ""
     cmds = (f"cd {pipes.quote(work_dir)};"
@@ -1300,7 +1293,7 @@ def get_remote_python():
     return remote_python
 
 
-def main(parser_actions, options):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
+def main(parser_actions, options):
     """Execute Main program."""
 
     # pylint: disable=global-statement
@@ -1329,7 +1322,6 @@ def main(parser_actions, options):  # pylint: disable=too-many-branches,too-many
     # Initialize the mongod options
     # Note - We use posixpath for Windows client to Linux server scenarios.
     root_dir = f"{powercycle_constants.REMOTE_DIR}/mongodb-powercycle-test-{int(time.time())}"
-    mongod_options_map = parse_options(task_config.mongod_options)
     set_fcv_cmd = "set_fcv" if task_config.fcv is not None else ""
 
     # Error out earlier if these options are not properly specified
@@ -1411,11 +1403,6 @@ def main(parser_actions, options):  # pylint: disable=too-many-branches,too-many
     mongo_repo_root_dir = os.getcwd()
 
     # Setup the validate_canary option.
-    if "nojournal" in mongod_options_map:
-        LOGGER.error("Cannot create and validate canary documents if the mongod option"
-                     " '--nojournal' is used.")
-        local_exit(1)
-
     canary_doc = ""
 
     # Set the Pymongo connection timeout to 1 hour for canary insert & validation.

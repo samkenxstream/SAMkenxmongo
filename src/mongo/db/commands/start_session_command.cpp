@@ -38,10 +38,10 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_cache.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
 #include "mongo/db/stats/top.h"
 
 namespace mongo {
@@ -71,13 +71,17 @@ public:
     }
 
     Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
-                                 const BSONObj& cmdObj) const override {
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
         return Status::OK();
     }
 
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
     bool run(OperationContext* opCtx,
-             const std::string& db,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         const auto service = opCtx->getServiceContext();

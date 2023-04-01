@@ -31,9 +31,12 @@
 
 #include <deque>
 
+#include <boost/optional.hpp>
+
 #include "mongo/client/async_client.h"
 #include "mongo/db/service_context.h"
 #include "mongo/executor/connection_pool.h"
+#include "mongo/executor/connection_pool_tl.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/logv2/log_severity.h"
 #include "mongo/platform/mutex.h"
@@ -103,9 +106,45 @@ public:
                     Milliseconds timeout,
                     Status status) override;
 
+    /**
+     * NetworkInterfaceTL's implementation of a leased network-stream
+     * provided for manual use outside of the NITL's usual RPC API.
+     * When this type is destroyed, the destructor of the ConnectionHandle
+     * member will return the connection to this NetworkInterface's ConnectionPool.
+     */
+    class LeasedStream : public NetworkInterface::LeasedStream {
+    public:
+        AsyncDBClient* getClient() override;
+
+        LeasedStream(ConnectionPool::ConnectionHandle&& conn) : _conn{std::move(conn)} {}
+
+        // These pass-through indications of the health of the leased
+        // stream to the underlying ConnectionHandle
+        void indicateSuccess() override;
+        void indicateUsed() override;
+        void indicateFailure(Status) override;
+
+    private:
+        ConnectionPool::ConnectionHandle _conn;
+    };
+
+    SemiFuture<std::unique_ptr<NetworkInterface::LeasedStream>> leaseStream(
+        const HostAndPort& hostAndPort,
+        transport::ConnectSSLMode sslMode,
+        Milliseconds timeout) override;
+
 private:
     struct RequestState;
     struct RequestManager;
+
+    /**
+     * For each logical RPC, an instance of `CommandState` is created to capture the state of the
+     * remote command. As part of running a remote command, `NITL` sends out one or more requests
+     * to the specified targets, and `RequestState` represents the state of each request.
+     * `CommandState` owns a `RequestManager` that tracks individual requests. For each request sent
+     * over the wire, `RequestManager` creates a `Context` that holds a weak pointer to the
+     * `Request`, as well as the index of the target.
+     */
 
     struct CommandStateBase : public std::enable_shared_from_this<CommandStateBase> {
         CommandStateBase(NetworkInterfaceTL* interface_,
@@ -148,11 +187,11 @@ private:
          * Return the maximum amount of requests that can come from this command.
          */
         size_t maxConcurrentRequests() const noexcept {
-            if (!requestOnAny.hedgeOptions) {
-                return 1ull;
+            if (!requestOnAny.options.hedgeOptions.isHedgeEnabled) {
+                return 1;
             }
 
-            return requestOnAny.hedgeOptions->count + 1ull;
+            return requestOnAny.options.hedgeOptions.hedgeCount + 1;
         }
 
         /**
@@ -180,6 +219,9 @@ private:
         StrongWeakFinishLine finishLine;
 
         boost::optional<UUID> operationKey;
+
+        // Total time spent waiting for connections that eventually time out.
+        Milliseconds connTimeoutWaitTime{0};
     };
 
     struct CommandState final : public CommandStateBase {
@@ -226,6 +268,10 @@ private:
         void continueExhaustRequest(std::shared_ptr<RequestState> requestState,
                                     StatusWith<RemoteCommandResponse> swResponse);
 
+        // Protects against race between reactor thread restarting stopwatch during exhaust
+        // request and main thread reading stopwatch elapsed time during shutdown.
+        Mutex stopwatchMutex = MONGO_MAKE_LATCH("NetworkInterfaceTL::ExhaustCommandState::mutex");
+
         Promise<void> promise;
         Promise<RemoteCommandResponse> finalResponsePromise;
         RemoteCommandOnReplyFn onReplyFn;
@@ -239,7 +285,17 @@ private:
         void killOperationsForPendingRequests();
 
         CommandStateBase* cmdState;
-        std::vector<std::weak_ptr<RequestState>> requests;
+
+        /**
+         * Holds context for individual requests, and is only valid if initialized.
+         * `idx` maps the request to its target in the corresponding `cmdState`.
+         */
+        struct Context {
+            bool initialized = false;
+            size_t idx;
+            std::weak_ptr<RequestState> request;
+        };
+        std::vector<Context> requests;
 
         Mutex mutex = MONGO_MAKE_LATCH("NetworkInterfaceTL::RequestManager::mutex");
 
@@ -256,8 +312,8 @@ private:
     struct RequestState final : public std::enable_shared_from_this<RequestState> {
         using ConnectionHandle = std::shared_ptr<ConnectionPool::ConnectionHandle::element_type>;
         using WeakConnectionHandle = std::weak_ptr<ConnectionPool::ConnectionHandle::element_type>;
-        RequestState(RequestManager* mgr, std::shared_ptr<CommandStateBase> cmdState_, size_t id)
-            : cmdState{std::move(cmdState_)}, requestManager(mgr), reqId(id) {}
+        RequestState(RequestManager* mgr, std::shared_ptr<CommandStateBase> cmdState_)
+            : cmdState{std::move(cmdState_)}, requestManager(mgr) {}
 
         ~RequestState();
 
@@ -298,9 +354,6 @@ private:
         ConnectionHandle conn;
         WeakConnectionHandle weakConn;
 
-        // Internal id of this request as tracked by the RequestManager.
-        size_t reqId;
-
         // True if this request is an additional request sent to hedge the operation.
         bool isHedge{false};
 
@@ -333,7 +386,7 @@ private:
 
     void _run();
 
-    Status _killOperation(std::shared_ptr<RequestState> requestStateToKill);
+    Status _killOperation(CommandStateBase* cmdStateToKill, size_t idx);
 
     std::string _instanceName;
     ServiceContext* _svcCtx = nullptr;
@@ -353,14 +406,34 @@ private:
 
     std::unique_ptr<rpc::EgressMetadataHook> _metadataHook;
 
-    // We start in kDefault, transition to kStarted after startup() is complete and enter kStopped
-    // at the first call to shutdown()
-    enum State : int {
+    // We start in kDefault, transition to kStarted after a call to startup completes.
+    // Enter kStopping at the first call to shutdown and transition to kStopped
+    // when the call completes.
+    enum State {
         kDefault,
         kStarted,
+        kStopping,
         kStopped,
     };
-    AtomicWord<State> _state;
+
+    friend StringData toString(State s) {
+        return std::array{
+            "Default"_sd,
+            "Started"_sd,
+            "Stopping"_sd,
+            "Stopped"_sd,
+        }
+            .at(s);
+    }
+
+    // This condition variable is dedicated to block a thread calling this class
+    // destructor, strictly when another thread is performing the network
+    // interface shutdown which depends on the _ioThread termination and may
+    // take an undeterministic amount of time to return.
+    mutable stdx::mutex _stateMutex;  // NOLINT
+    stdx::condition_variable _stoppedCV;
+    State _state;
+
     stdx::thread _ioThread;
 
     Mutex _inProgressMutex =
@@ -374,6 +447,5 @@ private:
     stdx::condition_variable _workReadyCond;
     bool _isExecutorRunnable = false;
 };
-
 }  // namespace executor
 }  // namespace mongo

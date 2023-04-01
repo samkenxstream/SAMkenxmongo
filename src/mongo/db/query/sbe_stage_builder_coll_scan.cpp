@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -42,12 +41,16 @@
 #include "mongo/db/exec/sbe/stages/project.h"
 #include "mongo/db/exec/sbe/stages/scan.h"
 #include "mongo/db/exec/sbe/stages/union.h"
+#include "mongo/db/matcher/match_expression_dependencies.h"
 #include "mongo/db/query/sbe_stage_builder.h"
 #include "mongo/db/query/sbe_stage_builder_filter.h"
 #include "mongo/db/query/util/make_data_structure.h"
 #include "mongo/db/record_id_helpers.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo::stage_builder {
 namespace {
@@ -80,7 +83,7 @@ makeOplogTimestampSlotsIfNeeded(sbe::RuntimeEnvironment* env,
 
 /**
  * Checks whether a callback function should be created for a ScanStage and returns it, if so. The
- * logic in the provided callback will be executed when the ScanStage is opened or reopened.
+ * logic in the provided callback will be executed when the ScanStage is opened (but not reopened).
  */
 sbe::ScanOpenCallback makeOpenCallbackIfNeeded(const CollectionPtr& collection,
                                                const CollectionScanNode* csn) {
@@ -88,22 +91,20 @@ sbe::ScanOpenCallback makeOpenCallbackIfNeeded(const CollectionPtr& collection,
         invariant(!csn->tailable);
         invariant(collection->ns().isOplog());
 
-        return [](OperationContext* opCtx, const CollectionPtr& collection, bool reOpen) {
-            if (!reOpen) {
-                // Forward, non-tailable scans from the oplog need to wait until all oplog entries
-                // before the read begins to be visible. This isn't needed for reverse scans because
-                // we only hide oplog entries from forward scans, and it isn't necessary for tailing
-                // cursors because they ignore EOF and will eventually see all writes. Forward,
-                // non-tailable scans are the only case where a meaningful EOF will be seen that
-                // might not include writes that finished before the read started. This also must be
-                // done before we create the cursor as that is when we establish the endpoint for
-                // the cursor. Also call abandonSnapshot to make sure that we are using a fresh
-                // storage engine snapshot while waiting. Otherwise, we will end up reading from the
-                // snapshot where the oplog entries are not yet visible even after the wait.
+        return [](OperationContext* opCtx, const CollectionPtr& collection) {
+            // Forward, non-tailable scans from the oplog need to wait until all oplog entries
+            // before the read begins to be visible. This isn't needed for reverse scans because
+            // we only hide oplog entries from forward scans, and it isn't necessary for tailing
+            // cursors because they ignore EOF and will eventually see all writes. Forward,
+            // non-tailable scans are the only case where a meaningful EOF will be seen that
+            // might not include writes that finished before the read started. This also must be
+            // done before we create the cursor as that is when we establish the endpoint for
+            // the cursor. Also call abandonSnapshot to make sure that we are using a fresh
+            // storage engine snapshot while waiting. Otherwise, we will end up reading from the
+            // snapshot where the oplog entries are not yet visible even after the wait.
 
-                opCtx->recoveryUnit()->abandonSnapshot();
-                collection->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(opCtx);
-            }
+            opCtx->recoveryUnit()->abandonSnapshot();
+            collection->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(opCtx);
         };
     }
     return {};
@@ -156,7 +157,7 @@ std::unique_ptr<sbe::PlanStage> buildResumeFromRecordIdSubtree(
         std::move(seekRecordIdExpression));
 
     // Construct a 'seek' branch of the 'union'. If we're succeeded to reposition the cursor,
-    // the branch will output  the 'seekSlot' to start the real scan from, otherwise it will
+    // the branch will output the 'seekSlot' to start the real scan from, otherwise it will
     // produce EOF.
     auto seekBranch =
         sbe::makeS<sbe::LoopJoinStage>(std::move(projStage),
@@ -230,7 +231,7 @@ std::unique_ptr<sbe::PlanStage> buildResumeFromRecordIdSubtree(
  * Creates a collection scan sub-tree optimized for oplog scans. We can built an optimized scan
  * when any of the following scenarios apply:
  *
- * 1. There is a predicted on the 'ts' field of the oplog collection.
+ * 1. There is a predicate on the 'ts' field of the oplog collection.
  *    1.1 If a lower bound on 'ts' is present, the collection scan will seek directly to the
  *        RecordId of an oplog entry as close to this lower bound as possible without going higher.
  *    1.2 If the query is *only* a lower bound on 'ts' on a forward scan, every document in the
@@ -246,6 +247,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateOptimizedOplo
     StageBuilderState& state,
     const CollectionPtr& collection,
     const CollectionScanNode* csn,
+    std::vector<std::string> fields,
     PlanYieldPolicy* yieldPolicy,
     bool isTailableResumeBranch) {
     invariant(collection->ns().isOplog());
@@ -255,6 +257,8 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateOptimizedOplo
     invariant(!(csn->resumeAfterRecordId && (csn->minRecord || csn->maxRecord)));
     // Oplog scan optimizations can only be done for a forward scan.
     invariant(csn->direction == CollectionScanParams::FORWARD);
+
+    auto fieldSlots = state.slotIdGenerator->generateMultiple(fields.size());
 
     auto resultSlot = state.slotId();
     auto recordIdSlot = state.slotId();
@@ -288,8 +292,15 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateOptimizedOplo
     // of if we need to track the latest oplog timestamp.
     const auto shouldTrackLatestOplogTimestamp =
         (csn->maxRecord || csn->shouldTrackLatestOplogTimestamp);
-    auto&& [fields, slots, tsSlot] = makeOplogTimestampSlotsIfNeeded(
+    auto&& [scanFields, scanFieldSlots, tsSlot] = makeOplogTimestampSlotsIfNeeded(
         state.data->env, state.slotIdGenerator, shouldTrackLatestOplogTimestamp);
+
+    bool createScanWithAndWithoutFilter = (csn->filter && csn->stopApplyingFilterAfterFirstMatch);
+
+    if (!createScanWithAndWithoutFilter) {
+        scanFields.insert(scanFields.end(), fields.begin(), fields.end());
+        scanFieldSlots.insert(scanFieldSlots.end(), fieldSlots.begin(), fieldSlots.end());
+    }
 
     sbe::ScanCallbacks callbacks({}, {}, makeOpenCallbackIfNeeded(collection, csn));
     auto stage = sbe::makeS<sbe::ScanStage>(collection->uuid(),
@@ -300,8 +311,8 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateOptimizedOplo
                                             boost::none /* indexKeySlot */,
                                             boost::none /* keyPatternSlot */,
                                             tsSlot,
-                                            std::move(fields),
-                                            std::move(slots),
+                                            std::move(scanFields),
+                                            std::move(scanFieldSlots),
                                             seekRecordIdSlot,
                                             true /* forward */,
                                             yieldPolicy,
@@ -326,7 +337,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateOptimizedOplo
     // replica set initialization message. If this fails, then we throw
     // ErrorCodes::OplogQueryMinTsMissing. We avoid doing this check on the resumable branch of a
     // tailable scan; it only needs to be done once, when the initial branch is run.
-    if (csn->assertTsHasNotFallenOffOplog && !isTailableResumeBranch) {
+    if (csn->assertTsHasNotFallenOff && !isTailableResumeBranch) {
         invariant(csn->shouldTrackLatestOplogTimestamp);
 
         // There should always be a 'tsSlot' already allocated on the RuntimeEnvironment for the
@@ -340,7 +351,8 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateOptimizedOplo
         auto oObjSlot = state.slotId();
         auto minTsSlot = state.slotId();
         sbe::value::SlotVector minTsSlots = {minTsSlot, opTypeSlot, oObjSlot};
-        std::vector<std::string> fields = {repl::OpTime::kTimestampFieldName.toString(), "op", "o"};
+        std::vector<std::string> minTsFields = {
+            repl::OpTime::kTimestampFieldName.toString(), "op", "o"};
 
         // If the first entry we see in the oplog is the replset initialization, then it doesn't
         // matter if its timestamp is later than the specified minTs; no events earlier than the
@@ -373,7 +385,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateOptimizedOplo
                                        boost::none /* indexKeySlot */,
                                        boost::none /* keyPatternSlot */,
                                        boost::none /* oplogTsSlot*/,
-                                       std::move(fields),
+                                       std::move(minTsFields),
                                        minTsSlots, /* don't move this */
                                        boost::none,
                                        true /* forward */,
@@ -386,7 +398,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateOptimizedOplo
                     makeBinaryOp(sbe::EPrimBinary::lessEq,
                                  makeVariable(minTsSlot),
                                  makeConstant(sbe::value::TypeTags::Timestamp,
-                                              csn->assertTsHasNotFallenOffOplog->asULL())),
+                                              csn->assertTsHasNotFallenOff->asULL())),
                     makeBinaryOp(
                         sbe::EPrimBinary::logicAnd,
                         makeBinaryOp(sbe::EPrimBinary::eq,
@@ -419,6 +431,18 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateOptimizedOplo
         tsSlot = state.slotId();
         auto outputSlots = sbe::makeSV(resultSlot, recordIdSlot, *tsSlot);
 
+        if (!createScanWithAndWithoutFilter) {
+            auto unusedFieldSlots = state.slotIdGenerator->generateMultiple(fieldSlots.size());
+            minTsSlots.insert(minTsSlots.end(), unusedFieldSlots.begin(), unusedFieldSlots.end());
+
+            realSlots.insert(realSlots.end(), fieldSlots.begin(), fieldSlots.end());
+
+            size_t numFieldSlots = fieldSlots.size();
+            fieldSlots = state.slotIdGenerator->generateMultiple(numFieldSlots);
+
+            outputSlots.insert(outputSlots.end(), fieldSlots.begin(), fieldSlots.end());
+        }
+
         // Create the union stage. The left branch, which runs first, is our resumability check.
         stage = sbe::makeS<sbe::UnionStage>(
             sbe::makeSs(std::move(minTsBranch), std::move(stage)),
@@ -447,17 +471,11 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateOptimizedOplo
     invariant(!csn->stopApplyingFilterAfterFirstMatch || csn->filter);
 
     if (csn->filter) {
-        auto relevantSlots = sbe::makeSV(resultSlot, recordIdSlot);
-        if (tsSlot) {
-            relevantSlots.push_back(*tsSlot);
+        auto filterExpr = generateFilter(state, csn->filter.get(), resultSlot, nullptr);
+        if (!filterExpr.isNull()) {
+            stage = sbe::makeS<sbe::FilterStage<false>>(
+                std::move(stage), filterExpr.extractExpr(state), csn->nodeId());
         }
-
-        auto [_, outputStage] = generateFilter(state,
-                                               csn->filter.get(),
-                                               {std::move(stage), std::move(relevantSlots)},
-                                               resultSlot,
-                                               csn->nodeId());
-        stage = std::move(outputStage.stage);
 
         // We may be requested to stop applying the filter after the first match. This can happen
         // if the query is just a lower bound on 'ts' on a forward scan. In this case every document
@@ -481,7 +499,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateOptimizedOplo
         // matches. This RecordId is then used as a starting point of the collection scan in the
         // inner branch, and the execution will continue from this point further on, without
         // applying the filter.
-        if (csn->stopApplyingFilterAfterFirstMatch) {
+        if (createScanWithAndWithoutFilter) {
             invariant(!csn->maxRecord);
             invariant(csn->direction == CollectionScanParams::FORWARD);
 
@@ -489,8 +507,11 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateOptimizedOplo
             resultSlot = state.slotId();
             recordIdSlot = state.slotId();
 
-            std::tie(fields, slots, tsSlot) = makeOplogTimestampSlotsIfNeeded(
+            std::tie(scanFields, scanFieldSlots, tsSlot) = makeOplogTimestampSlotsIfNeeded(
                 state.data->env, state.slotIdGenerator, shouldTrackLatestOplogTimestamp);
+
+            scanFields.insert(scanFields.end(), fields.begin(), fields.end());
+            scanFieldSlots.insert(scanFieldSlots.end(), fieldSlots.begin(), fieldSlots.end());
 
             stage = sbe::makeS<sbe::LoopJoinStage>(
                 sbe::makeS<sbe::LimitSkipStage>(std::move(stage), 1, boost::none, csn->nodeId()),
@@ -502,8 +523,8 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateOptimizedOplo
                                            boost::none /* indexKeySlot */,
                                            boost::none /* keyPatternSlot */,
                                            tsSlot,
-                                           std::move(fields),
-                                           std::move(slots),
+                                           std::move(scanFields),
+                                           std::move(scanFieldSlots),
                                            seekRecordIdSlot,
                                            true /* forward */,
                                            yieldPolicy,
@@ -522,6 +543,9 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateOptimizedOplo
     PlanStageSlots outputs;
     outputs.set(PlanStageSlots::kResult, resultSlot);
     outputs.set(PlanStageSlots::kRecordId, recordIdSlot);
+    for (size_t i = 0; i < fields.size(); ++i) {
+        outputs.set(std::make_pair(PlanStageSlots::kField, fields[i]), fieldSlots[i]);
+    }
 
     return {std::move(stage), std::move(outputs)};
 }
@@ -538,6 +562,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateGenericCollSc
     StageBuilderState& state,
     const CollectionPtr& collection,
     const CollectionScanNode* csn,
+    std::vector<std::string> fields,
     PlanYieldPolicy* yieldPolicy,
     bool isTailableResumeBranch) {
     const auto forward = csn->direction == CollectionScanParams::FORWARD;
@@ -545,6 +570,19 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateGenericCollSc
     invariant(!csn->shouldTrackLatestOplogTimestamp || collection->ns().isOplog());
     invariant(!csn->resumeAfterRecordId || forward);
     invariant(!csn->resumeAfterRecordId || !csn->tailable);
+
+    if (csn->filter) {
+        DepsTracker deps;
+        match_expression::addDependencies(csn->filter.get(), &deps);
+        // If the filter predicate doesn't need the whole document, then we take all the top-level
+        // fields referenced by the filter predicate and we add them to 'fields'.
+        if (!deps.needWholeDocument) {
+            auto topLevelFields = getTopLevelFields(deps.fields);
+            fields = appendVectorUnique(std::move(fields), std::move(topLevelFields));
+        }
+    }
+
+    auto fieldSlots = state.slotIdGenerator->generateMultiple(fields.size());
 
     auto resultSlot = state.slotId();
     auto recordIdSlot = state.slotId();
@@ -561,8 +599,11 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateGenericCollSc
     }();
 
     // See if we need to project out an oplog latest timestamp.
-    auto&& [fields, slots, tsSlot] = makeOplogTimestampSlotsIfNeeded(
+    auto&& [scanFields, scanFieldSlots, tsSlot] = makeOplogTimestampSlotsIfNeeded(
         state.data->env, state.slotIdGenerator, csn->shouldTrackLatestOplogTimestamp);
+
+    scanFields.insert(scanFields.end(), fields.begin(), fields.end());
+    scanFieldSlots.insert(scanFieldSlots.end(), fieldSlots.begin(), fieldSlots.end());
 
     sbe::ScanCallbacks callbacks({}, {}, makeOpenCallbackIfNeeded(collection, csn));
     auto stage = sbe::makeS<sbe::ScanStage>(collection->uuid(),
@@ -573,13 +614,14 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateGenericCollSc
                                             boost::none /* indexKeySlot */,
                                             boost::none /* keyPatternSlot */,
                                             tsSlot,
-                                            std::move(fields),
-                                            std::move(slots),
+                                            std::move(scanFields),
+                                            std::move(scanFieldSlots),
                                             seekRecordIdSlot,
                                             forward,
                                             yieldPolicy,
                                             csn->nodeId(),
-                                            std::move(callbacks));
+                                            std::move(callbacks),
+                                            csn->lowPriority);
 
     if (seekRecordIdSlot) {
         stage = buildResumeFromRecordIdSubtree(state,
@@ -593,25 +635,25 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateGenericCollSc
                                                true /* resumeAfterRecordId  */);
     }
 
+    PlanStageSlots outputs;
+    outputs.set(PlanStageSlots::kResult, resultSlot);
+    outputs.set(PlanStageSlots::kRecordId, recordIdSlot);
+    for (size_t i = 0; i < fields.size(); ++i) {
+        outputs.set(std::make_pair(PlanStageSlots::kField, fields[i]), fieldSlots[i]);
+    }
+
     if (csn->filter) {
         // The 'stopApplyingFilterAfterFirstMatch' optimization is only applicable when the 'ts'
         // lower bound is also provided for an oplog scan, and is handled in
         // 'generateOptimizedOplogScan()'.
         invariant(!csn->stopApplyingFilterAfterFirstMatch);
 
-        auto relevantSlots = sbe::makeSV(resultSlot, recordIdSlot);
-
-        auto [_, outputStage] = generateFilter(state,
-                                               csn->filter.get(),
-                                               {std::move(stage), std::move(relevantSlots)},
-                                               resultSlot,
-                                               csn->nodeId());
-        stage = std::move(outputStage.stage);
+        auto filterExpr = generateFilter(state, csn->filter.get(), resultSlot, &outputs);
+        if (!filterExpr.isNull()) {
+            stage = sbe::makeS<sbe::FilterStage<false>>(
+                std::move(stage), filterExpr.extractExpr(state), csn->nodeId());
+        }
     }
-
-    PlanStageSlots outputs;
-    outputs.set(PlanStageSlots::kResult, resultSlot);
-    outputs.set(PlanStageSlots::kRecordId, recordIdSlot);
 
     return {std::move(stage), std::move(outputs)};
 }
@@ -621,13 +663,15 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateCollScan(
     StageBuilderState& state,
     const CollectionPtr& collection,
     const CollectionScanNode* csn,
+    std::vector<std::string> fields,
     PlanYieldPolicy* yieldPolicy,
     bool isTailableResumeBranch) {
     if (csn->minRecord || csn->maxRecord || csn->stopApplyingFilterAfterFirstMatch) {
         return generateOptimizedOplogScan(
-            state, collection, csn, yieldPolicy, isTailableResumeBranch);
+            state, collection, csn, std::move(fields), yieldPolicy, isTailableResumeBranch);
     } else {
-        return generateGenericCollScan(state, collection, csn, yieldPolicy, isTailableResumeBranch);
+        return generateGenericCollScan(
+            state, collection, csn, std::move(fields), yieldPolicy, isTailableResumeBranch);
     }
 }
 }  // namespace mongo::stage_builder

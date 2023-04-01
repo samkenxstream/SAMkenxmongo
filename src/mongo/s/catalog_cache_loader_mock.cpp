@@ -63,7 +63,7 @@ void CatalogCacheLoaderMock::onStepUp() {
 
 void CatalogCacheLoaderMock::shutDown() {}
 
-void CatalogCacheLoaderMock::notifyOfCollectionVersionUpdate(const NamespaceString& nss) {
+void CatalogCacheLoaderMock::notifyOfCollectionPlacementVersionUpdate(const NamespaceString& nss) {
     MONGO_UNREACHABLE;
 }
 
@@ -97,8 +97,6 @@ CollectionAndChangedChunks getCollectionRefresh(
                                       swCollectionReturnValue.getValue().getUnique(),
                                       swCollectionReturnValue.getValue().getTimeseriesFields(),
                                       reshardingFields,
-                                      swCollectionReturnValue.getValue().getMaxChunkSizeBytes(),
-                                      swCollectionReturnValue.getValue().getAllowAutoSplit(),
                                       swCollectionReturnValue.getValue().getAllowMigrations(),
                                       std::move(chunks)};
 }

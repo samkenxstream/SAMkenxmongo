@@ -31,12 +31,20 @@
 
 
 namespace mongo::optimizer {
-bool EvalPathLowering::optimize(ABT& n) {
+
+static ABT fillEmpty(ABT n, ABT emptyVal) {
+    return make<BinaryOp>(Operations::FillEmpty, std::move(n), std::move(emptyVal));
+}
+
+bool EvalPathLowering::optimize(ABT& n, bool rebuild) {
     _changed = false;
 
     algebra::transport<true>(n, *this);
 
-    if (_changed) {
+    // This is needed for cases in which EvalPathLowering is called from a context other than during
+    // PathLowering. If the ABT is modified in a way that adds variable references and definitions
+    // the environment must be updated.
+    if (_changed && rebuild) {
         _env.rebuild(n);
     }
 
@@ -49,7 +57,7 @@ void EvalPathLowering::transport(ABT& n, const PathConstant&, ABT& c) {
 }
 
 void EvalPathLowering::transport(ABT& n, const PathIdentity&) {
-    const std::string& name = _prefixId.getNextId("x");
+    const ProjectionName name{_prefixId.getNextId("x")};
 
     n = make<LambdaAbstraction>(name, make<Variable>(name));
     _changed = true;
@@ -62,7 +70,7 @@ void EvalPathLowering::transport(ABT& n, const PathLambda&, ABT& lam) {
 
 void EvalPathLowering::transport(ABT& n, const PathDefault&, ABT& c) {
     // if (exists(x), x, c)
-    const std::string& name = _prefixId.getNextId("valDefault");
+    const ProjectionName name{_prefixId.getNextId("valDefault")};
 
     n = make<LambdaAbstraction>(
         name,
@@ -73,30 +81,30 @@ void EvalPathLowering::transport(ABT& n, const PathDefault&, ABT& c) {
 }
 
 void EvalPathLowering::transport(ABT& n, const PathCompare&, ABT& c) {
-    uasserted(6624132, "cannot lower compare in projection");
+    tasserted(6624132, "cannot lower compare in projection");
 }
 
 void EvalPathLowering::transport(ABT& n, const PathGet& p, ABT& inner) {
-    const std::string& name = _prefixId.getNextId("inputGet");
+    const ProjectionName name{_prefixId.getNextId("inputGet")};
 
     n = make<LambdaAbstraction>(
         name,
         make<LambdaApplication>(
             std::exchange(inner, make<Blackhole>()),
             make<FunctionCall>("getField",
-                               makeSeq(make<Variable>(name), Constant::str(p.name())))));
+                               makeSeq(make<Variable>(name), Constant::str(p.name().value())))));
     _changed = true;
 }
 
 void EvalPathLowering::transport(ABT& n, const PathDrop& drop) {
     // if (isObject(x), dropFields(x,...) , x)
     // Alternatively, we can implement a special builtin function that does the comparison and drop.
-    const std::string& name = _prefixId.getNextId("valDrop");
+    const ProjectionName name{_prefixId.getNextId("valDrop")};
 
     std::vector<ABT> params;
     params.emplace_back(make<Variable>(name));
     for (const auto& fieldName : drop.getNames()) {
-        params.emplace_back(Constant::str(fieldName));
+        params.emplace_back(Constant::str(fieldName.value()));
     }
 
     n = make<LambdaAbstraction>(
@@ -110,12 +118,12 @@ void EvalPathLowering::transport(ABT& n, const PathDrop& drop) {
 void EvalPathLowering::transport(ABT& n, const PathKeep& keep) {
     // if (isObject(x), keepFields(x,...) , x)
     // Alternatively, we can implement a special builtin function that does the comparison and drop.
-    const std::string& name = _prefixId.getNextId("valKeep");
+    const ProjectionName name{_prefixId.getNextId("valKeep")};
 
     std::vector<ABT> params;
     params.emplace_back(make<Variable>(name));
     for (const auto& fieldName : keep.getNames()) {
-        params.emplace_back(Constant::str(fieldName));
+        params.emplace_back(Constant::str(fieldName.value()));
     }
 
     n = make<LambdaAbstraction>(
@@ -128,7 +136,7 @@ void EvalPathLowering::transport(ABT& n, const PathKeep& keep) {
 
 void EvalPathLowering::transport(ABT& n, const PathObj&) {
     // if (isObject(x), x, Nothing)
-    const std::string& name = _prefixId.getNextId("valObj");
+    const ProjectionName name{_prefixId.getNextId("valObj")};
 
     n = make<LambdaAbstraction>(
         name,
@@ -140,7 +148,7 @@ void EvalPathLowering::transport(ABT& n, const PathObj&) {
 
 void EvalPathLowering::transport(ABT& n, const PathArr&) {
     // if (isArray(x), x, Nothing)
-    const std::string& name = _prefixId.getNextId("valArr");
+    const ProjectionName name{_prefixId.getNextId("valArr")};
 
     n = make<LambdaAbstraction>(
         name,
@@ -151,19 +159,26 @@ void EvalPathLowering::transport(ABT& n, const PathArr&) {
     _changed = true;
 }
 
-void EvalPathLowering::transport(ABT& n, const PathTraverse&, ABT& inner) {
-    const std::string& name = _prefixId.getNextId("valTraverse");
+void EvalPathLowering::transport(ABT& n, const PathTraverse& p, ABT& inner) {
+    // TODO: SERVER-67306. Allow single-level traverse under EvalPath.
 
-    n = make<LambdaAbstraction>(
-        name,
-        make<FunctionCall>("traverseP",
-                           makeSeq(make<Variable>(name), std::exchange(inner, make<Blackhole>()))));
+    uassert(6624167,
+            "Currently we allow only multi-level traversal under EvalPath",
+            p.getMaxDepth() == PathTraverse::kUnlimited);
+
+    const ProjectionName name{_prefixId.getNextId("valTraverse")};
+
+    n = make<LambdaAbstraction>(name,
+                                make<FunctionCall>("traverseP",
+                                                   makeSeq(make<Variable>(name),
+                                                           std::exchange(inner, make<Blackhole>()),
+                                                           Constant::nothing())));
     _changed = true;
 }
 
 void EvalPathLowering::transport(ABT& n, const PathField& p, ABT& inner) {
-    const std::string& name = _prefixId.getNextId("inputField");
-    const std::string& val = _prefixId.getNextId("valField");
+    const ProjectionName name{_prefixId.getNextId("inputField")};
+    const ProjectionName val{_prefixId.getNextId("valField")};
 
     n = make<LambdaAbstraction>(
         name,
@@ -172,22 +187,22 @@ void EvalPathLowering::transport(ABT& n, const PathField& p, ABT& inner) {
             make<LambdaApplication>(
                 std::exchange(inner, make<Blackhole>()),
                 make<FunctionCall>("getField",
-                                   makeSeq(make<Variable>(name), Constant::str(p.name())))),
-            make<If>(
-                make<BinaryOp>(Operations::Or,
-                               make<FunctionCall>("exists", makeSeq(make<Variable>(val))),
-                               make<FunctionCall>("isObject", makeSeq(make<Variable>(name)))),
-                make<FunctionCall>(
-                    "setField",
-                    makeSeq(make<Variable>(name), Constant::str(p.name()), make<Variable>(val))),
-                make<Variable>(name))));
+                                   makeSeq(make<Variable>(name), Constant::str(p.name().value())))),
+            make<If>(make<BinaryOp>(Operations::Or,
+                                    make<FunctionCall>("exists", makeSeq(make<Variable>(val))),
+                                    make<FunctionCall>("isObject", makeSeq(make<Variable>(name)))),
+                     make<FunctionCall>("setField",
+                                        makeSeq(make<Variable>(name),
+                                                Constant::str(p.name().value()),
+                                                make<Variable>(val))),
+                     make<Variable>(name))));
 
     _changed = true;
 }
 
 void EvalPathLowering::transport(ABT& n, const PathComposeM&, ABT& p1, ABT& p2) {
     // p1 * p2 -> (p2 (p1 input))
-    const std::string& name = _prefixId.getNextId("inputComposeM");
+    const ProjectionName name{_prefixId.getNextId("inputComposeM")};
 
     n = make<LambdaAbstraction>(
         name,
@@ -199,7 +214,7 @@ void EvalPathLowering::transport(ABT& n, const PathComposeM&, ABT& p1, ABT& p2) 
 }
 
 void EvalPathLowering::transport(ABT& n, const PathComposeA&, ABT& p1, ABT& p2) {
-    uasserted(6624133, "cannot lower additive composite in projection");
+    tasserted(6624133, "cannot lower additive composite in projection");
 }
 
 void EvalPathLowering::transport(ABT& n, const EvalPath&, ABT& path, ABT& input) {
@@ -213,12 +228,15 @@ void EvalPathLowering::transport(ABT& n, const EvalPath&, ABT& path, ABT& input)
     _changed = true;
 }
 
-bool EvalFilterLowering::optimize(ABT& n) {
+bool EvalFilterLowering::optimize(ABT& n, bool rebuild) {
     _changed = false;
 
     algebra::transport<true>(n, *this);
 
-    if (_changed) {
+    // This is needed for cases in which EvalFilterLowering is called from a context other than
+    // during PathLowering. If the ABT is modified in a way that adds variable references or
+    // definitions the environment must be updated.
+    if (_changed && rebuild) {
         _env.rebuild(n);
     }
 
@@ -231,11 +249,7 @@ void EvalFilterLowering::transport(ABT& n, const PathConstant&, ABT& c) {
 }
 
 void EvalFilterLowering::transport(ABT& n, const PathIdentity&) {
-    n = make<LambdaAbstraction>(_prefixId.getNextId("_"), Constant::boolean(true));
-    _changed = true;
-
-    // TODO - do we need an identity element for the additive composition? i.e. false constant
-    // Or should Identity be left undefined and removed by the PathFuse?
+    tasserted(6893500, "PathIdentity not allowed in EvalFilter (match) context");
 }
 
 void EvalFilterLowering::transport(ABT& n, const PathLambda&, ABT& lam) {
@@ -244,17 +258,38 @@ void EvalFilterLowering::transport(ABT& n, const PathLambda&, ABT& lam) {
 }
 
 void EvalFilterLowering::transport(ABT& n, const PathDefault&, ABT& c) {
-    uasserted(6624135, "cannot lower default in filter");
+    const ProjectionName name{_prefixId.getNextId("valDefault")};
+
+    n = make<LambdaAbstraction>(
+        name,
+        make<If>(make<FunctionCall>("exists", makeSeq(make<Variable>(name))),
+                 make<UnaryOp>(Operations::Not, c),
+                 c));
+
+    _changed = true;
 }
 
 void EvalFilterLowering::transport(ABT& n, const PathCompare& cmp, ABT& c) {
-    const std::string& name = _prefixId.getNextId("valCmp");
+    const ProjectionName name{_prefixId.getNextId("valCmp")};
 
     if (cmp.op() == Operations::Eq) {
+        // ABT Eq matches the semantics of SBE eq exactly, so lower the expression directly without
+        // dealing with cross-type comparisons.
         n = make<LambdaAbstraction>(
             name,
             make<BinaryOp>(cmp.op(), make<Variable>(name), std::exchange(c, make<Blackhole>())));
+    } else if (cmp.op() == Operations::EqMember) {
+        n = make<LambdaAbstraction>(
+            name,
+            make<If>(make<FunctionCall>("isArray", makeSeq(c)),
+                     make<FunctionCall>("isMember", makeSeq(make<Variable>(name), c)),
+                     make<BinaryOp>(Operations::Eq, make<Variable>(name), c)));
     } else {
+        // ABT gt/lt/gte/lte and neq operators work across types, but SBE equivalents will return
+        // Nothing if the types do not match. We can express a type-agnostic comparison in an SBE
+        // compatible way using cmp3w (<=>), which works with any two values of any types in SBE.
+        // cmp(X, Y) is equivalent to cmp(X <=> Y, 0) in ABT, but will return a boolean rather than
+        // Nothing in SBE.
         n = make<LambdaAbstraction>(
             name,
             make<BinaryOp>(cmp.op(),
@@ -268,36 +303,36 @@ void EvalFilterLowering::transport(ABT& n, const PathCompare& cmp, ABT& c) {
 }
 
 void EvalFilterLowering::transport(ABT& n, const PathGet& p, ABT& inner) {
-    const std::string& name = _prefixId.getNextId("inputGet");
+    const ProjectionName name{_prefixId.getNextId("inputGet")};
 
     int idx;
-    bool isNumber = NumberParser{}(p.name(), &idx).isOK();
+    bool isNumber = NumberParser{}(p.name().value(), &idx).isOK();
     n = make<LambdaAbstraction>(
         name,
         make<LambdaApplication>(
             std::exchange(inner, make<Blackhole>()),
             make<FunctionCall>(isNumber ? "getFieldOrElement" : "getField",
-                               makeSeq(make<Variable>(name), Constant::str(p.name())))));
+                               makeSeq(make<Variable>(name), Constant::str(p.name().value())))));
     _changed = true;
 }
 
 void EvalFilterLowering::transport(ABT& n, const PathDrop& drop) {
-    uasserted(6624136, "cannot lower drop in filter");
+    tasserted(6624136, "cannot lower drop in filter");
 }
 
 void EvalFilterLowering::transport(ABT& n, const PathKeep& keep) {
-    uasserted(6624137, "cannot lower keep in filter");
+    tasserted(6624137, "cannot lower keep in filter");
 }
 
 void EvalFilterLowering::transport(ABT& n, const PathObj&) {
-    const std::string& name = _prefixId.getNextId("valObj");
+    const ProjectionName name{_prefixId.getNextId("valObj")};
     n = make<LambdaAbstraction>(name,
                                 make<FunctionCall>("isObject", makeSeq(make<Variable>(name))));
     _changed = true;
 }
 
 void EvalFilterLowering::transport(ABT& n, const PathArr&) {
-    const std::string& name = _prefixId.getNextId("valArr");
+    const ProjectionName name{_prefixId.getNextId("valArr")};
     n = make<LambdaAbstraction>(name, make<FunctionCall>("isArray", makeSeq(make<Variable>(name))));
     _changed = true;
 }
@@ -306,13 +341,19 @@ void EvalFilterLowering::prepare(ABT& n, const PathTraverse& t) {
     int idx;
     // This is a bad hack that detect if a child is number path element
     if (auto child = t.getPath().cast<PathGet>();
-        child && NumberParser{}(child->name(), &idx).isOK()) {
+        child && NumberParser{}(child->name().value(), &idx).isOK()) {
         _traverseStack.emplace_back(n.ref());
     }
 }
 
-void EvalFilterLowering::transport(ABT& n, const PathTraverse&, ABT& inner) {
-    const std::string& name = _prefixId.getNextId("valTraverse");
+void EvalFilterLowering::transport(ABT& n, const PathTraverse& p, ABT& inner) {
+    // TODO: SERVER-67306. Allow multi-level traverse under EvalFilter.
+
+    uassert(6624166,
+            "Currently we allow only single-level traversal under EvalFilter",
+            p.getMaxDepth() == PathTraverse::kSingleLevel);
+
+    const ProjectionName name{_prefixId.getNextId("valTraverse")};
 
     ABT numberPath = Constant::boolean(false);
     if (!_traverseStack.empty() && _traverseStack.back() == n.ref()) {
@@ -329,19 +370,18 @@ void EvalFilterLowering::transport(ABT& n, const PathTraverse&, ABT& inner) {
 }
 
 void EvalFilterLowering::transport(ABT& n, const PathField& p, ABT& inner) {
-    uasserted(6624140, "cannot lower arr in filter");
+    tasserted(6624140, "cannot lower field in filter");
 }
 
 void EvalFilterLowering::transport(ABT& n, const PathComposeM&, ABT& p1, ABT& p2) {
-    const std::string& name = _prefixId.getNextId("inputComposeM");
+    const ProjectionName name{_prefixId.getNextId("inputComposeM")};
 
     n = make<LambdaAbstraction>(
         name,
         make<If>(
-            make<FunctionCall>("fillEmpty",
-                               makeSeq(make<LambdaApplication>(std::exchange(p1, make<Blackhole>()),
-                                                               make<Variable>(name)),
-                                       Constant::boolean(false))),
+            // If p1 is Nothing, then the expression will short-circuit and Nothing will be
+            // propagated to this operator's parent, and eventually coerced to false.
+            make<LambdaApplication>(std::exchange(p1, make<Blackhole>()), make<Variable>(name)),
             make<LambdaApplication>(std::exchange(p2, make<Blackhole>()), make<Variable>(name)),
             Constant::boolean(false)));
 
@@ -349,15 +389,14 @@ void EvalFilterLowering::transport(ABT& n, const PathComposeM&, ABT& p1, ABT& p2
 }
 
 void EvalFilterLowering::transport(ABT& n, const PathComposeA&, ABT& p1, ABT& p2) {
-    const std::string& name = _prefixId.getNextId("inputComposeA");
+    const ProjectionName name{_prefixId.getNextId("inputComposeA")};
 
     n = make<LambdaAbstraction>(
         name,
         make<If>(
-            make<FunctionCall>("fillEmpty",
-                               makeSeq(make<LambdaApplication>(std::exchange(p1, make<Blackhole>()),
-                                                               make<Variable>(name)),
-                                       Constant::boolean(false))),
+            fillEmpty(
+                make<LambdaApplication>(std::exchange(p1, make<Blackhole>()), make<Variable>(name)),
+                Constant::boolean(false)),
             Constant::boolean(true),
             make<LambdaApplication>(std::exchange(p2, make<Blackhole>()), make<Variable>(name))));
 
@@ -372,15 +411,18 @@ void EvalFilterLowering::transport(ABT& n, const EvalFilter&, ABT& path, ABT& in
     n = make<LambdaApplication>(std::exchange(path, make<Blackhole>()),
                                 std::exchange(input, make<Blackhole>()));
 
+    // Wrap EvalFilter in fillEmpty to coerce it to a boolean.
+    n = fillEmpty(std::move(n), Constant::boolean(false));
+
     _changed = true;
 }
 
 void PathLowering::transport(ABT& n, const EvalPath&, ABT&, ABT&) {
-    _changed = _changed || _project.optimize(n);
+    _changed = _changed || _project.optimize(n, false /*rebuild*/);
 }
 
 void PathLowering::transport(ABT& n, const EvalFilter&, ABT&, ABT&) {
-    _changed = _changed || _filter.optimize(n);
+    _changed = _changed || _filter.optimize(n, false /*rebuild*/);
 }
 
 bool PathLowering::optimize(ABT& n) {
@@ -388,7 +430,10 @@ bool PathLowering::optimize(ABT& n) {
 
     algebra::transport<true>(n, *this);
 
-    // TODO investigate why we crash when this is removed. It should not be needed here.
+    // During PathLowering we may call EvalPathLowering or EvalFilterLowering. These each may call
+    // rebuild on a subset of the ABT, which will produce invalid references for refs that point to
+    // definitions outside of that subset. Rebuild the tree to avoid leaving those free variables
+    // for the caller.
     if (_changed) {
         _env.rebuild(n);
     }

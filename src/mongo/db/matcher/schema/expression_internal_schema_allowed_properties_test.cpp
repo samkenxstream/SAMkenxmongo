@@ -111,7 +111,7 @@ TEST(InternalSchemaAllowedPropertiesMatchExpression, EquivalentToClone) {
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     auto expr = MatchExpressionParser::parse(filter, expCtx);
     ASSERT_OK(expr.getStatus());
-    auto clone = expr.getValue()->shallowClone();
+    auto clone = expr.getValue()->clone();
     ASSERT_TRUE(expr.getValue()->equivalent(clone.get()));
 
     filter = fromjson(
@@ -119,7 +119,7 @@ TEST(InternalSchemaAllowedPropertiesMatchExpression, EquivalentToClone) {
         "patternProperties: [], otherwise: {}}}");
     expr = MatchExpressionParser::parse(filter, expCtx);
     ASSERT_OK(expr.getStatus());
-    clone = expr.getValue()->shallowClone();
+    clone = expr.getValue()->clone();
     ASSERT_TRUE(expr.getValue()->equivalent(clone.get()));
 }
 
@@ -135,9 +135,9 @@ TEST(InternalSchemaAllowedPropertiesMatchExpression, HasCorrectNumberOfChilden) 
     ASSERT(objMatch.getValue()->getChild(0));
 }
 
-DEATH_TEST(InternalSchemaAllowedPropertiesMatchExpression,
-           GetChildFailsOnIndexLargerThanChildSet,
-           "i < numChildren()") {
+DEATH_TEST_REGEX(InternalSchemaAllowedPropertiesMatchExpression,
+                 GetChildFailsOnIndexLargerThanChildSet,
+                 "Tripwire assertion.*6400212") {
     auto query = fromjson(
         "{$_internalSchemaAllowedProperties: {properties: ['a'], namePlaceholder: 'i',"
         "patternProperties: [{regex: /a/, expression: {i: 1}}], otherwise: {i: 7}}}");
@@ -146,6 +146,7 @@ DEATH_TEST(InternalSchemaAllowedPropertiesMatchExpression,
     ASSERT_OK(objMatch.getStatus());
 
     const size_t numChildren = 2;
-    objMatch.getValue()->getChild(numChildren);
+    ASSERT_EQ(objMatch.getValue()->numChildren(), numChildren);
+    ASSERT_THROWS_CODE(objMatch.getValue()->getChild(numChildren), AssertionException, 6400212);
 }
 }  // namespace mongo

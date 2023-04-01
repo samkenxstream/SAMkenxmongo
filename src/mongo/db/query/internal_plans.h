@@ -31,6 +31,7 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/exec/batched_delete_stage.h"
 #include "mongo/db/exec/delete_stage.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/plan_executor.h"
@@ -78,9 +79,12 @@ public:
         const CollectionPtr* collection,
         PlanYieldPolicy::YieldPolicy yieldPolicy,
         Direction direction = FORWARD,
-        boost::optional<RecordId> resumeAfterRecordId = boost::none,
+        const boost::optional<RecordId>& resumeAfterRecordId = boost::none,
         boost::optional<RecordIdBound> minRecord = boost::none,
-        boost::optional<RecordIdBound> maxRecord = boost::none);
+        boost::optional<RecordIdBound> maxRecord = boost::none,
+        CollectionScanParams::ScanBoundInclusion boundInclusion =
+            CollectionScanParams::ScanBoundInclusion::kIncludeBothStartAndEndRecords,
+        bool shouldReturnEofOnFilterMismatch = false);
 
     static std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> collectionScan(
         OperationContext* opCtx,
@@ -89,7 +93,8 @@ public:
         PlanYieldPolicy::YieldPolicy yieldPolicy);
 
     /**
-     * Returns a FETCH => DELETE plan.
+     * Returns a FETCH => DELETE plan, or a FETCH => BATCHED_DELETE plan if 'batchedDeleteParams' is
+     * set.
      */
     static std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> deleteWithCollectionScan(
         OperationContext* opCtx,
@@ -98,7 +103,12 @@ public:
         PlanYieldPolicy::YieldPolicy yieldPolicy,
         Direction direction = FORWARD,
         boost::optional<RecordIdBound> minRecord = boost::none,
-        boost::optional<RecordIdBound> maxRecord = boost::none);
+        boost::optional<RecordIdBound> maxRecord = boost::none,
+        CollectionScanParams::ScanBoundInclusion boundInclusion =
+            CollectionScanParams::ScanBoundInclusion::kIncludeBothStartAndEndRecords,
+        std::unique_ptr<BatchedDeleteStageParams> batchedDeleteParams = nullptr,
+        const MatchExpression* filter = nullptr,
+        bool shouldReturnEofOnFilterMismatch = false);
 
     /**
      * Returns an index scan.  Caller owns returned pointer.
@@ -115,7 +125,8 @@ public:
         int options = IXSCAN_DEFAULT);
 
     /**
-     * Returns an IXSCAN => FETCH => DELETE plan.
+     * Returns an IXSCAN => FETCH => DELETE plan, or an IXSCAN => FETCH => BATCHED_DELETE plan if
+     * 'batchedDeleteParams' is set.
      */
     static std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> deleteWithIndexScan(
         OperationContext* opCtx,
@@ -126,7 +137,8 @@ public:
         const BSONObj& endKey,
         BoundInclusion boundInclusion,
         PlanYieldPolicy::YieldPolicy yieldPolicy,
-        Direction direction = FORWARD);
+        Direction direction = FORWARD,
+        std::unique_ptr<BatchedDeleteStageParams> batchedDeleteParams = nullptr);
 
     /**
      * Returns a scan over the 'shardKeyIdx'. If the 'shardKeyIdx' is a non-clustered index, returns
@@ -183,17 +195,16 @@ private:
         WorkingSet* ws,
         const CollectionPtr* collection,
         Direction direction,
-        boost::optional<RecordId> resumeAfterRecordId = boost::none,
-        boost::optional<RecordId> minRecord = boost::none,
-        boost::optional<RecordId> maxRecord = boost::none,
-        bool relaxCappedConstraints = false);
+        const boost::optional<RecordId>& resumeAfterRecordId = boost::none,
+        const boost::optional<RecordId>& minRecord = boost::none,
+        const boost::optional<RecordId>& maxRecord = boost::none);
 
     static std::unique_ptr<PlanStage> _collectionScan(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         WorkingSet* ws,
         const CollectionPtr* collection,
         const CollectionScanParams& params,
-        bool relaxCappedConstraints = false);
+        const MatchExpression* filter = nullptr);
 
     /**
      * Returns a plan stage that is either an index scan or an index scan with a fetch stage.

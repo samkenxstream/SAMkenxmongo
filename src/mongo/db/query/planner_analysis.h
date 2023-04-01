@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_solution.h"
 
@@ -80,11 +81,15 @@ public:
 
     /**
      * Sort the results, if there is a sort required.
+     *
+     * The mandatory output parameter 'blockingSortOut' indicates if the generated sub-plan contains
+     * a blocking QSN, such as 'SortNode'.
      */
-    static QuerySolutionNode* analyzeSort(const CanonicalQuery& query,
-                                          const QueryPlannerParams& params,
-                                          QuerySolutionNode* solnRoot,
-                                          bool* blockingSortOut);
+    static std::unique_ptr<QuerySolutionNode> analyzeSort(
+        const CanonicalQuery& query,
+        const QueryPlannerParams& params,
+        std::unique_ptr<QuerySolutionNode> solnRoot,
+        bool* blockingSortOut);
 
     /**
      * Internal helper function used by analyzeSort.
@@ -111,7 +116,7 @@ public:
      */
     static bool explodeForSort(const CanonicalQuery& query,
                                const QueryPlannerParams& params,
-                               QuerySolutionNode** solnRoot);
+                               std::unique_ptr<QuerySolutionNode>* solnRoot);
 
     /**
      * Walks the QuerySolutionNode tree rooted in 'soln', and looks for a ProjectionNodeSimple that
@@ -119,22 +124,42 @@ public:
      * set of the GroupNode. If that condition is met the ProjectionNodeSimple is redundant and can
      * thus be elimiated to improve performance of the plan. Otherwise, this is a noop.
      */
-    static std::unique_ptr<QuerySolution> removeProjectSimpleBelowGroup(
+    static std::unique_ptr<QuerySolution> removeInclusionProjectionBelowGroup(
         std::unique_ptr<QuerySolution> soln);
 
     /**
-     * For the provided 'eqLookupNode', determines what join algorithm should be used to execute it
-     * and marks the node accordingly. In particular:
+     * Walks the QuerySolutionNode tree rooted in 'soln', and looks for a ColumnScan that
+     * is a child of either a Group or Projection.  If the ColumnScan's parent will ignore
+     * extra fields, then eliminate its row store expression, allowing it to return extra fields
+     * in cases when it falls back to pulling the full document from the row store.
+     * If these conditions are not met this is a noop.
+     */
+    static void removeUselessColumnScanRowStoreExpression(QuerySolutionNode& root);
+
+    /**
+     * For the provided 'foreignCollName' and 'foreignFieldName' corresponding to an EqLookupNode,
+     * returns what join algorithm should be used to execute it. In particular:
+     * - An empty array is produced for each document if the foreign collection does not exist.
      * - An indexed nested loop join is chosen if an index on the foreign collection can be used to
-     * answer the join predicate.
+     * answer the join predicate. Also returns which index on the foreign collection should be
+     * used to answer the predicate.
      * - A hash join is chosen if disk use is allowed and if the foreign collection is sufficiently
      * small.
      * - A nested loop join is chosen in all other cases.
      */
-    static void determineLookupStrategy(
-        EqLookupNode* eqLookupNode,
+    static std::pair<EqLookupNode::LookupStrategy, boost::optional<IndexEntry>>
+    determineLookupStrategy(
+        const NamespaceString& foreignCollName,
+        const std::string& foreignField,
         const std::map<NamespaceString, SecondaryCollectionInfo>& collectionsInfo,
-        bool allowDiskUse);
+        bool allowDiskUse,
+        const CollatorInterface* collator);
+
+    /**
+     * Checks if the foreign collection is eligible for the hash join algorithm. We conservatively
+     * choose the hash join algorithm for cases when the hash table is unlikely to spill to disk.
+     */
+    static bool isEligibleForHashJoin(const SecondaryCollectionInfo& foreignCollInfo);
 };
 
 }  // namespace mongo

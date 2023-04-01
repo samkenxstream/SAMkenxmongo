@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #if defined(__linux__)
 #include <sys/vfs.h>
@@ -57,6 +56,9 @@
 #if __has_feature(address_sanitizer)
 #include <sanitizer/lsan_interface.h>
 #endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
@@ -116,18 +118,16 @@ public:
                               "RAM. See http://dochub.mongodb.org/core/faq-memory-diagnostics-wt");
             }
         }
-        const bool ephemeral = false;
         auto kv =
-            std::make_unique<WiredTigerKVEngine>(getCanonicalName().toString(),
+            std::make_unique<WiredTigerKVEngine>(opCtx,
+                                                 getCanonicalName().toString(),
                                                  params.dbpath,
                                                  getGlobalServiceContext()->getFastClockSource(),
                                                  wiredTigerGlobalOptions.engineConfig,
                                                  cacheMB,
                                                  wiredTigerGlobalOptions.getMaxHistoryFileSizeMB(),
-                                                 params.dur,
-                                                 ephemeral,
-                                                 params.repair,
-                                                 params.readOnly);
+                                                 params.ephemeral,
+                                                 params.repair);
         kv->setRecordStoreExtraOptions(wiredTigerGlobalOptions.collectionConfig);
         kv->setSortedDataInterfaceExtraOptions(wiredTigerGlobalOptions.indexConfig);
 
@@ -204,7 +204,7 @@ public:
         return builder.obj();
     }
 
-    bool supportsReadOnly() const final {
+    bool supportsQueryableBackupMode() const final {
         return true;
     }
 };

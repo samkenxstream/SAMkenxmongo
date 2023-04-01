@@ -34,46 +34,38 @@
 
 namespace mongo {
 
-class DropDatabaseCoordinator final : public ShardingDDLCoordinator {
+class DropDatabaseCoordinator final
+    : public RecoverableShardingDDLCoordinator<DropDatabaseCoordinatorDocument,
+                                               DropDatabaseCoordinatorPhaseEnum> {
+
 public:
     using StateDoc = DropDatabaseCoordinatorDocument;
     using Phase = DropDatabaseCoordinatorPhaseEnum;
 
-    DropDatabaseCoordinator(ShardingDDLCoordinatorService* service, const BSONObj& initialState);
+    DropDatabaseCoordinator(ShardingDDLCoordinatorService* service, const BSONObj& initialState)
+        : RecoverableShardingDDLCoordinator(service, "DropDatabaseCoordinator", initialState),
+          _dbName(nss().db()),
+          _critSecReason(BSON("dropDatabase" << _dbName)) {}
     ~DropDatabaseCoordinator() = default;
 
-    void checkIfOptionsConflict(const BSONObj& doc) const override {}
-
-    boost::optional<BSONObj> reportForCurrentOp(
-        MongoProcessInterface::CurrentOpConnectionsMode connMode,
-        MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override;
+    void checkIfOptionsConflict(const BSONObj& doc) const final {}
 
 private:
-    ShardingDDLCoordinatorMetadata const& metadata() const override {
-        return _doc.getShardingDDLCoordinatorMetadata();
+    StringData serializePhase(const Phase& phase) const override {
+        return DropDatabaseCoordinatorPhase_serializer(phase);
+    }
+
+    bool _mustAlwaysMakeProgress() override {
+        return !_isPre70Compatible() && _doc.getPhase() > Phase::kUnset;
+    }
+
+    // TODO SERVER-73627: Remove once 7.0 becomes last LTS.
+    bool _isPre70Compatible() const {
+        return operationType() == DDLCoordinatorTypeEnum::kDropDatabasePre70Compatible;
     }
 
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                   const CancellationToken& token) noexcept override;
-
-    template <typename Func>
-    auto _executePhase(const Phase& newPhase, Func&& func) {
-        return [=] {
-            const auto& currPhase = _doc.getPhase();
-
-            if (currPhase > newPhase) {
-                // Do not execute this phase if we already reached a subsequent one.
-                return;
-            }
-            if (currPhase < newPhase) {
-                // Persist the new phase if this is the first time we are executing it.
-                _enterPhase(newPhase);
-            }
-            return func();
-        };
-    }
-
-    void _enterPhase(Phase newPhase);
 
     void _dropShardedCollection(OperationContext* opCtx,
                                 const CollectionType& coll,
@@ -83,8 +75,9 @@ private:
 
     void _clearDatabaseInfoOnSecondaries(OperationContext* opCtx);
 
-    DropDatabaseCoordinatorDocument _doc;
     StringData _dbName;
+
+    const BSONObj _critSecReason;
 };
 
 }  // namespace mongo

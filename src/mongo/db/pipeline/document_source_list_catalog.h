@@ -51,11 +51,11 @@ public:
     public:
         static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec) {
-            return std::make_unique<LiteParsed>(spec.fieldName());
+            return std::make_unique<LiteParsed>(spec.fieldName(), nss);
         }
 
-        explicit LiteParsed(std::string parseTimeName)
-            : LiteParsedDocumentSource(std::move(parseTimeName)) {}
+        explicit LiteParsed(std::string parseTimeName, NamespaceString ns)
+            : LiteParsedDocumentSource(std::move(parseTimeName)), _ns(std::move(ns)) {}
 
         stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
             return stdx::unordered_set<NamespaceString>();
@@ -68,11 +68,14 @@ public:
         bool isInitialSource() const final {
             return true;
         }
+
+    private:
+        NamespaceString _ns;
     };
 
     // virtuals from DocumentSource
     const char* getSourceName() const final;
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         StageConstraints constraints(StreamType::kStreaming,
@@ -84,7 +87,7 @@ public:
                                      LookupRequirement::kAllowed,
                                      UnionRequirement::kAllowed);
 
-        constraints.isIndependentOfAnyCollection = true;
+        constraints.isIndependentOfAnyCollection = pExpCtx->ns.isCollectionlessAggregateNS();
         constraints.requiresInputDocSource = false;
         return constraints;
     }
@@ -93,6 +96,8 @@ public:
         return boost::none;
     }
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
@@ -100,8 +105,7 @@ private:
     DocumentSourceListCatalog(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
     GetNextResult doGetNext() final;
 
-    bool _catalogDocsInitialized = false;
-    std::deque<BSONObj> _catalogDocs;
+    boost::optional<std::deque<BSONObj>> _catalogDocs;
 };
 
 }  // namespace mongo

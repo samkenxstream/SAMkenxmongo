@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -41,6 +40,9 @@
 #include "mongo/db/s/sharded_collmod_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -64,6 +66,10 @@ public:
         return Command::AllowedOnSecondary::kNever;
     }
 
+    bool supportsRetryableWrite() const final {
+        return true;
+    }
+
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
@@ -71,22 +77,23 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrCollMod can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
-            opCtx->setAlwaysInterruptAtStepDownOrUp();
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             // Set the operation context read concern level to local for reads into the config
             // database.
             repl::ReadConcernArgs::get(opCtx) =
                 repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
-            const auto& collMod = request().getCollModRequest();
-            if (collMod.getTimeseries() && collMod.getTimeseries().get().getGranularity()) {
-                auto granularity = collMod.getTimeseries().get().getGranularity().get();
-                ShardingCatalogManager::get(opCtx)->updateTimeSeriesGranularity(
-                    opCtx, ns(), granularity);
+            auto& ts = request().getCollModRequest().getTimeseries();
+            if (ts.has_value() &&
+                (ts->getGranularity().has_value() || ts->getBucketMaxSpanSeconds().has_value() ||
+                 ts->getBucketRoundingSeconds().has_value())) {
+                ShardingCatalogManager::get(opCtx)->updateTimeSeriesBucketingParameters(
+                    opCtx, ns(), ts.get());
             }
         }
 

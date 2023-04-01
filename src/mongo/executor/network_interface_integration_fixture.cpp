@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -44,6 +43,9 @@
 #include "mongo/stdx/future.h"
 #include "mongo/unittest/integration_test.h"
 #include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kASIO
+
 
 namespace mongo {
 namespace executor {
@@ -76,7 +78,9 @@ void NetworkInterfaceIntegrationFixture::tearDown() {
     _net->shutdown();
 
     auto lk = stdx::unique_lock(_mutex);
-    auto checkIdle = [&]() { return _workInProgress == 0; };
+    auto checkIdle = [&]() {
+        return _workInProgress == 0;
+    };
     _fixtureIsIdle.wait(lk, checkIdle);
 }
 
@@ -114,8 +118,7 @@ void NetworkInterfaceIntegrationFixture::startCommand(const TaskExecutor::Callba
 }
 
 Future<RemoteCommandResponse> NetworkInterfaceIntegrationFixture::runCommand(
-    const TaskExecutor::CallbackHandle& cbHandle, RemoteCommandRequest request) {
-    RemoteCommandRequestOnAny rcroa{request};
+    const TaskExecutor::CallbackHandle& cbHandle, RemoteCommandRequestOnAny rcroa) {
 
     _onSchedulingCommand();
 

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -36,23 +35,33 @@
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
 namespace mongo {
 namespace {
 
 bool nonShardedCollectionCommandPassthrough(OperationContext* opCtx,
-                                            StringData dbName,
+                                            const DatabaseName& dbName,
                                             const NamespaceString& nss,
-                                            const ChunkManager& cm,
+                                            const CollectionRoutingInfo& cri,
                                             const BSONObj& cmdObj,
                                             Shard::RetryPolicy retryPolicy,
                                             BSONObjBuilder* out) {
     const StringData cmdName(cmdObj.firstElementFieldName());
     uassert(ErrorCodes::IllegalOperation,
             str::stream() << "Can't do command: " << cmdName << " on a sharded collection",
-            !cm.isSharded());
+            !cri.cm.isSharded());
 
-    auto responses = scatterGatherVersionedTargetByRoutingTable(
-        opCtx, dbName, nss, cm, cmdObj, ReadPreferenceSetting::get(opCtx), retryPolicy, {}, {});
+    auto responses = scatterGatherVersionedTargetByRoutingTable(opCtx,
+                                                                dbName.toStringWithTenantId(),
+                                                                nss,
+                                                                cri,
+                                                                cmdObj,
+                                                                ReadPreferenceSetting::get(opCtx),
+                                                                retryPolicy,
+                                                                {},
+                                                                {});
     invariant(responses.size() == 1);
 
     const auto cmdResponse = uassertStatusOK(std::move(responses.front().swResponse));
@@ -78,28 +87,32 @@ public:
         return AllowedOnSecondary::kNever;
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsCollectionRequired(dbname, cmdObj).ns();
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return CommandHelpers::parseNsCollectionRequired(dbName, cmdObj);
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::convertToCapped);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::convertToCapped)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbName,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbName, cmdObj));
-        const auto cm =
+        const auto cri =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
         uassert(ErrorCodes::IllegalOperation,
                 "You can't convertToCapped a sharded collection",
-                !cm.isSharded());
+                !cri.cm.isSharded());
 
         // convertToCapped creates a temp collection and renames it at the end. It will require
         // special handling for create collection.
@@ -107,7 +120,7 @@ public:
             opCtx,
             dbName,
             nss,
-            cm,
+            cri,
             applyReadWriteConcern(
                 opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
             Shard::RetryPolicy::kIdempotent,

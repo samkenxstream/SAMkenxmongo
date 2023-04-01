@@ -47,8 +47,10 @@
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/scoped_timer.h"
+#include "mongo/db/exec/scoped_timer_factory.h"
 #include "mongo/db/generic_cursor.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/expression_context.h"
@@ -97,18 +99,18 @@ class Document;
                                            true)
 
 /**
- * Like REGISTER_DOCUMENT_SOURCE, except the parser will only be enabled when FCV >= minVersion.
- * We store minVersion in the parserMap, so that changing FCV at runtime correctly enables/disables
- * the parser.
+ * Like REGISTER_DOCUMENT_SOURCE, except the parser will only be registered when featureFlag is
+ * enabled. We store featureFlag in the parserMap, so that it can be checked at runtime
+ * to correctly enable/disable the parser.
  */
-#define REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION(                      \
-    key, liteParser, fullParser, allowedWithApiStrict, minVersion)      \
+#define REGISTER_DOCUMENT_SOURCE_WITH_FEATURE_FLAG(                     \
+    key, liteParser, fullParser, allowedWithApiStrict, featureFlag)     \
     REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key,                         \
                                            liteParser,                  \
                                            fullParser,                  \
                                            allowedWithApiStrict,        \
                                            AllowedWithClientType::kAny, \
-                                           minVersion,                  \
+                                           featureFlag,                 \
                                            true)
 
 /**
@@ -124,8 +126,8 @@ class Document;
                                            condition)
 
 /**
- * Like REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION, except you can also specify a condition,
- * evaluated during startup, that decides whether to register the parser.
+ * You can specify a condition, evaluated during startup,
+ * that decides whether to register the parser.
  *
  * For example, you could check a feature flag, and register the parser only when it's enabled.
  *
@@ -135,23 +137,25 @@ class Document;
  *
  * This is the most general REGISTER_DOCUMENT_SOURCE* macro, which all others should delegate to.
  */
-#define REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(                                                  \
-    key, liteParser, fullParser, allowedWithApiStrict, clientType, minVersion, ...)              \
-    MONGO_INITIALIZER_GENERAL(addToDocSourceParserMap_##key,                                     \
-                              ("BeginDocumentSourceRegistration"),                               \
-                              ("EndDocumentSourceRegistration"))                                 \
-    (InitializerContext*) {                                                                      \
-        if (!__VA_ARGS__) {                                                                      \
-            DocumentSource::registerParser("$" #key, DocumentSource::parseDisabled, minVersion); \
-            LiteParsedDocumentSource::registerParser("$" #key,                                   \
-                                                     LiteParsedDocumentSource::parseDisabled,    \
-                                                     allowedWithApiStrict,                       \
-                                                     clientType);                                \
-            return;                                                                              \
-        }                                                                                        \
-        LiteParsedDocumentSource::registerParser(                                                \
-            "$" #key, liteParser, allowedWithApiStrict, clientType);                             \
-        DocumentSource::registerParser("$" #key, fullParser, minVersion);                        \
+#define REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(                                                   \
+    key, liteParser, fullParser, allowedWithApiStrict, clientType, featureFlag, ...)              \
+    MONGO_INITIALIZER_GENERAL(addToDocSourceParserMap_##key,                                      \
+                              ("BeginDocumentSourceRegistration"),                                \
+                              ("EndDocumentSourceRegistration"))                                  \
+    (InitializerContext*) {                                                                       \
+        if (!__VA_ARGS__ ||                                                                       \
+            (boost::optional<FeatureFlag>(featureFlag) != boost::none &&                          \
+             !boost::optional<FeatureFlag>(featureFlag)->isEnabledAndIgnoreFCV())) {              \
+            DocumentSource::registerParser("$" #key, DocumentSource::parseDisabled, featureFlag); \
+            LiteParsedDocumentSource::registerParser("$" #key,                                    \
+                                                     LiteParsedDocumentSource::parseDisabled,     \
+                                                     allowedWithApiStrict,                        \
+                                                     clientType);                                 \
+            return;                                                                               \
+        }                                                                                         \
+        LiteParsedDocumentSource::registerParser(                                                 \
+            "$" #key, liteParser, allowedWithApiStrict, clientType);                              \
+        DocumentSource::registerParser("$" #key, fullParser, featureFlag);                        \
     }
 
 /**
@@ -266,13 +270,29 @@ public:
      * collection. Describes how a pipeline should be split for sharded execution.
      */
     struct DistributedPlanLogic {
+        DistributedPlanLogic() = default;
+
+        /**
+         * Convenience constructor for the common case where there is at most one merging stage. Can
+         * pass nullptr for the merging stage which means "no merging required."
+         */
+        DistributedPlanLogic(boost::intrusive_ptr<DocumentSource> shardsStageIn,
+                             boost::intrusive_ptr<DocumentSource> mergeStage,
+                             boost::optional<BSONObj> mergeSortPatternIn = boost::none)
+            : shardsStage(std::move(shardsStageIn)),
+              mergeSortPattern(std::move(mergeSortPatternIn)) {
+            if (mergeStage)
+                mergingStages.emplace_back(std::move(mergeStage));
+        }
+
+        typedef std::function<bool(const DocumentSource&)> movePastFunctionType;
         // A stage which executes on each shard in parallel, or nullptr if nothing can be done in
         // parallel. For example, a partial $group before a subsequent global $group.
         boost::intrusive_ptr<DocumentSource> shardsStage = nullptr;
 
-        // A stage which executes after merging all the results together, or nullptr if nothing is
-        // necessary after merging. For example, a $limit stage.
-        boost::intrusive_ptr<DocumentSource> mergingStage = nullptr;
+        // A stage or stages which funciton to merge all the results together, or an empty list if
+        // nothing is necessary after merging. For example, a $limit stage.
+        std::list<boost::intrusive_ptr<DocumentSource>> mergingStages = {};
 
         // If set, each document is expected to have sort key metadata which will be serialized in
         // the '$sortKey' field. 'mergeSortPattern' will then be used to describe which fields are
@@ -284,15 +304,28 @@ public:
         // into account at that split point. Should be true if a stage specifies 'shardsStage' or
         // 'mergingStage'. Does not mean anything if the sort pattern is not set.
         bool needsSplit = true;
+
+        // If needsSplit is false and this plan has anything that must run on the merging half of
+        // the pipeline, it will be deferred until the next stage that sets any non-default value on
+        // 'DistributedPlanLogic' or until a following stage causes the given validation
+        // function to return false. By default this will not allow swapping with any
+        // following stages.
+        movePastFunctionType canMovePast = [](const DocumentSource&) {
+            return false;
+        };
     };
 
     virtual ~DocumentSource() {}
 
     /**
      * Makes a deep clone of the DocumentSource by serializing and re-parsing it. DocumentSources
-     * that cannot be safely cloned this way should override this method.
+     * that cannot be safely cloned this way should override this method. Callers can optionally
+     * specify 'newExpCtx' to construct the deep clone with it instead of defaulting to the
+     * original's 'ExpressionContext'.
      */
-    virtual boost::intrusive_ptr<DocumentSource> clone() const {
+    virtual boost::intrusive_ptr<DocumentSource> clone(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx) const {
+        tassert(7406001, "expCtx passed to clone must not be null", expCtx);
         std::vector<Value> serializedDoc;
         serializeToArray(serializedDoc);
         tassert(5757900,
@@ -300,7 +333,7 @@ public:
                               << " should have serialized to exactly one document. This stage may "
                                  "need a custom clone() implementation",
                 serializedDoc.size() == 1 && serializedDoc[0].getType() == BSONType::Object);
-        auto dsList = parse(pExpCtx, Document(serializedDoc[0].getDocument()).toBson());
+        auto dsList = parse(expCtx, Document(serializedDoc[0].getDocument()).toBson());
         // Cloning should only happen once the pipeline has been fully built, after desugaring from
         // one stage to multiple stages has occurred. When cloning desugared stages we expect each
         // stage to re-parse to one stage.
@@ -330,11 +363,10 @@ public:
 
         auto serviceCtx = pExpCtx->opCtx->getServiceContext();
         invariant(serviceCtx);
-        auto fcs = serviceCtx->getFastClockSource();
-        invariant(fcs);
 
-        invariant(_commonStats.executionTimeMillis);
-        ScopedTimer timer(fcs, _commonStats.executionTimeMillis.get_ptr());
+        auto timer = scoped_timer_factory::make(
+            serviceCtx, QueryExecTimerPrecision::kMillis, _commonStats.executionTime.get_ptr());
+
         ++_commonStats.works;
 
         GetNextResult next = doGetNext();
@@ -351,6 +383,16 @@ public:
      */
     virtual StageConstraints constraints(
         Pipeline::SplitState = Pipeline::SplitState::kUnsplit) const = 0;
+
+    /**
+     * If a stage's StageConstraints::PositionRequirement is kCustom, then it should also override
+     * this method, which will be called by the validation process.
+     */
+    virtual void validatePipelinePosition(bool alreadyOptimized,
+                                          Pipeline::SourceContainer::const_iterator pos,
+                                          const Pipeline::SourceContainer& container) const {
+        MONGO_UNIMPLEMENTED_TASSERT(7183905);
+    };
 
     /**
      * Informs the stage that it is no longer needed and can release its resources. After dispose()
@@ -399,13 +441,9 @@ public:
      *
      * A subclass may choose to overwrite this, rather than serialize, if it should output multiple
      * stages (eg, $sort sometimes also outputs a $limit).
-     *
-     * The 'explain' parameter indicates the explain verbosity mode, or is equal boost::none if no
-     * explain is requested.
      */
-    virtual void serializeToArray(
-        std::vector<Value>& array,
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const;
+    virtual void serializeToArray(std::vector<Value>& array,
+                                  SerializationOptions opts = SerializationOptions()) const;
 
     /**
      * Shortcut method to get a BSONObj for debugging. Often useful in log messages, but is not
@@ -423,6 +461,14 @@ public:
     virtual void detachFromOperationContext() {}
 
     virtual void reattachToOperationContext(OperationContext* opCtx) {}
+
+    /**
+     * Validate that all operation contexts associated with this document source, including any
+     * subpipelines, match the argument.
+     */
+    virtual bool validateOperationContext(const OperationContext* opCtx) const {
+        return getContext()->opCtx == opCtx;
+    }
 
     virtual bool usedDisk() {
         return false;
@@ -453,10 +499,9 @@ public:
      * DO NOT call this method directly. Instead, use the REGISTER_DOCUMENT_SOURCE macro defined in
      * this file.
      */
-    static void registerParser(
-        std::string name,
-        Parser parser,
-        boost::optional<multiversion::FeatureCompatibilityVersion> requiredMinVersion);
+    static void registerParser(std::string name,
+                               Parser parser,
+                               boost::optional<FeatureFlag> featureFlag);
     /**
      * Convenience wrapper for the common case, when DocumentSource::Parser returns a list of one
      * DocumentSource.
@@ -464,10 +509,9 @@ public:
      * DO NOT call this method directly. Instead, use the REGISTER_DOCUMENT_SOURCE macro defined in
      * this file.
      */
-    static void registerParser(
-        std::string name,
-        SimpleParser simpleParser,
-        boost::optional<multiversion::FeatureCompatibilityVersion> requiredMinVersion);
+    static void registerParser(std::string name,
+                               SimpleParser simpleParser,
+                               boost::optional<FeatureFlag> featureFlag);
 
     /**
      * Returns true if the DocumentSource has a query.
@@ -573,9 +617,7 @@ public:
             kAllExcept,
         };
 
-        GetModPathsReturn(Type type,
-                          std::set<std::string>&& paths,
-                          StringMap<std::string>&& renames)
+        GetModPathsReturn(Type type, OrderedPathSet&& paths, StringMap<std::string>&& renames)
             : type(type), paths(std::move(paths)), renames(std::move(renames)) {}
 
         std::set<std::string> getNewNames() {
@@ -589,8 +631,43 @@ public:
             return newNames;
         }
 
+        bool canModify(const FieldPath& fieldPath) const {
+            switch (type) {
+                case Type::kAllPaths:
+                    return true;
+                case Type::kNotSupported:
+                    return true;
+                case Type::kFiniteSet:
+                    // If there's a subpath that is modified this path may be modified.
+                    for (size_t i = 0; i < fieldPath.getPathLength(); i++) {
+                        if (paths.count(fieldPath.getSubpath(i).toString()))
+                            return true;
+                    }
+
+                    for (auto&& path : paths) {
+                        // If there's a superpath that is modified this path may be modified.
+                        if (expression::isPathPrefixOf(fieldPath.fullPath(), path)) {
+                            return true;
+                        }
+                    }
+
+                    return false;
+                case Type::kAllExcept:
+                    // If one of the subpaths is unmodified return false.
+                    for (size_t i = 0; i < fieldPath.getPathLength(); i++) {
+                        if (paths.count(fieldPath.getSubpath(i).toString()))
+                            return false;
+                    }
+
+                    // Otherwise return true;
+                    return true;
+            }
+            // Cannot hit.
+            MONGO_UNREACHABLE_TASSERT(6434902);
+        }
+
         Type type;
-        std::set<std::string> paths;
+        OrderedPathSet paths;
 
         // Stages may fill out 'renames' to contain information about path renames. Each entry in
         // 'renames' maps from the new name of the path (valid in documents flowing *out* of this
@@ -613,7 +690,7 @@ public:
      * See GetModPathsReturn above for the possible return values and what they mean.
      */
     virtual GetModPathsReturn getModifiedPaths() const {
-        return {GetModPathsReturn::Type::kNotSupported, std::set<std::string>{}, {}};
+        return {GetModPathsReturn::Type::kNotSupported, OrderedPathSet{}, {}};
     }
 
     /**
@@ -635,6 +712,12 @@ public:
     }
 
     /**
+     * Populate 'refs' with the variables referred to by this stage, including user and system
+     * variables but excluding $$ROOT. Note that field path references are not considered variables.
+     */
+    virtual void addVariableRefs(std::set<Variables::Id>* refs) const = 0;
+
+    /**
      * If this stage can be run in parallel across a distributed collection, returns boost::none.
      * Otherwise, returns a struct representing what needs to be done to merge each shard's pipeline
      * into a single stream of results. Must not mutate the existing source object; if different
@@ -651,7 +734,7 @@ public:
      * parallel since it will preserve the shard key.
      */
     virtual bool canRunInParallelBeforeWriteStage(
-        const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const {
+        const OrderedPathSet& nameOfShardKeyFieldsUponEntryToStage) const {
         return false;
     }
 
@@ -715,12 +798,8 @@ private:
      * This is used by the default implementation of serializeToArray() to add this object
      * to a pipeline being serialized. Returning a missing() Value results in no entry
      * being added to the array for this stage (DocumentSource).
-     *
-     * The 'explain' parameter indicates the explain verbosity mode, or is equal boost::none if no
-     * explain is requested.
      */
-    virtual Value serialize(
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const = 0;
+    virtual Value serialize(SerializationOptions opts = SerializationOptions()) const = 0;
 };
 
 /**

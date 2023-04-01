@@ -43,9 +43,11 @@ macro(define_wiredtiger_library target type)
     #   of a 'SHARED' wiredtiger library would conflict.
     # NO_SYSTEM_FROM_IMPORTED - don't treat include interface directories consumed on an imported target as system
     #   directories.
+    # C_STANDARD - require C11 from the compiler.
     set_target_properties(${target} PROPERTIES
         OUTPUT_NAME "wiredtiger"
         NO_SYSTEM_FROM_IMPORTED TRUE
+        C_STANDARD 11
     )
 
     # Ensure we link any available library dependencies to our wiredtiger target.
@@ -67,8 +69,8 @@ macro(define_wiredtiger_library target type)
             target_include_directories(${target} PUBLIC ${HAVE_LIBDL_INCLUDES})
         endif()
     endif()
-    if(ENABLE_TCMALLOC)
-        target_link_libraries(${target} PRIVATE wt::tcmalloc)
+    if(ENABLE_MEMKIND)
+        target_link_libraries(${target} PRIVATE wt::memkind)
     endif()
 
     # We want to capture any transitive dependencies associated with the builtin library

@@ -27,24 +27,22 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
-
-#include "mongo/platform/basic.h"
-
-#include <vector>
-
 #include "mongo/db/s/resharding/resharding_oplog_fetcher.h"
 
 #include <fmt/format.h>
+#include <vector>
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/dbclient_connection.h"
 #include "mongo/client/remote_command_targeter.h"
+#include "mongo/db/catalog/clustered_collection_util.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/s/metrics/sharding_data_transform_cumulative_metrics.h"
 #include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/db/storage/write_unit_of_work.h"
@@ -52,6 +50,8 @@
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/stdx/mutex.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
 namespace mongo {
 namespace {
@@ -212,12 +212,6 @@ bool ReshardingOplogFetcher::iterate(Client* client, CancelableOperationContextF
 
     try {
         return consume(client, factory, targetShard.get());
-    } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
-        // Defer to the cancellation token for whether the Interruption exception should be retried
-        // upon or not. It is possible the error came as the response from the remote donor shard.
-        // It is also possible that the error is from a stray killOp command being run on this
-        // recipient shard.
-        return true;
     } catch (const ExceptionFor<ErrorCodes::OplogQueryMinTsMissing>&) {
         LOGV2_ERROR(
             5192103, "Fatal resharding error while fetching.", "error"_attr = exceptionToStatus());
@@ -242,17 +236,22 @@ void ReshardingOplogFetcher::_ensureCollection(Client* client,
 
     // Create the destination collection if necessary.
     writeConflictRetry(opCtx, "createReshardingLocalOplogBuffer", nss.toString(), [&] {
-        const CollectionPtr coll =
+        const Collection* coll =
             CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
         if (coll) {
             return;
         }
 
         WriteUnitOfWork wuow(opCtx);
-        AutoGetDb autoDb(opCtx, nss.db(), LockMode::MODE_IX);
+        AutoGetDb autoDb(opCtx, nss.dbName(), LockMode::MODE_IX);
         Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
         auto db = autoDb.ensureDbExists(opCtx);
-        db->createCollection(opCtx, nss);
+
+        // This oplog-like collection will benefit from clustering by _id to reduce storage overhead
+        // and improve _id query efficiency.
+        CollectionOptions options;
+        options.clusteredIndex = clustered_util::makeDefaultClusteredIdIndex();
+        db->createCollection(opCtx, nss, options);
         wuow.commit();
     });
 }
@@ -263,9 +262,9 @@ AggregateCommandRequest ReshardingOplogFetcher::_makeAggregateCommandRequest(
     auto opCtx = opCtxRaii.get();
     auto expCtx = _makeExpressionContext(opCtx);
 
-    auto serializedPipeline =
-        createOplogFetchingPipelineForResharding(expCtx, _startAt, _collUUID, _recipientShard)
-            ->serializeToBson();
+    auto serializedPipeline = resharding::createOplogFetchingPipelineForResharding(
+                                  expCtx, _startAt, _collUUID, _recipientShard)
+                                  ->serializeToBson();
 
     AggregateCommandRequest aggRequest(NamespaceString::kRsOplogNamespace,
                                        std::move(serializedPipeline));
@@ -308,14 +307,19 @@ bool ReshardingOplogFetcher::consume(Client* client,
     auto opCtxRaii = factory.makeOperationContext(client);
     int batchesProcessed = 0;
     bool moreToCome = true;
+    Timer batchFetchTimer;
     // Note that the oplog entries are *not* being copied with a tailable cursor.
     // Shard::runAggregation() will instead return upon hitting the end of the donor's oplog.
     uassertStatusOK(shard->runAggregation(
         opCtxRaii.get(),
         aggRequest,
-        [this, &batchesProcessed, &moreToCome, factory](
+        [this, &batchesProcessed, &moreToCome, &opCtxRaii, &batchFetchTimer, factory](
             const std::vector<BSONObj>& batch,
             const boost::optional<BSONObj>& postBatchResumeToken) {
+            _env->metrics()->onOplogEntriesFetched(batch.size());
+            _env->metrics()->onBatchRetrievedDuringOplogFetching(
+                Milliseconds(batchFetchTimer.millis()));
+
             ThreadClient client(fmt::format("ReshardingFetcher-{}-{}",
                                             _reshardingUUID.toString(),
                                             _donorShard.toString()),
@@ -335,13 +339,18 @@ bool ReshardingOplogFetcher::consume(Client* client,
                 WriteUnitOfWork wuow(opCtx);
                 auto nextOplog = uassertStatusOK(repl::OplogEntry::parse(doc));
 
-                auto startAt = ReshardingDonorOplogId::parse(
-                    {"OplogFetcherParsing"}, nextOplog.get_id()->getDocument().toBson());
-                uassertStatusOK(toWriteTo->insertDocument(opCtx, InsertStatement{doc}, nullptr));
+                auto startAt =
+                    ReshardingDonorOplogId::parse(IDLParserContext{"OplogFetcherParsing"},
+                                                  nextOplog.get_id()->getDocument().toBson());
+                Timer insertTimer;
+                uassertStatusOK(collection_internal::insertDocument(
+                    opCtx, *toWriteTo, InsertStatement{doc}, nullptr));
                 wuow.commit();
-                ++_numOplogEntriesCopied;
 
-                _env->metrics()->onOplogEntriesFetched(1);
+                _env->metrics()->onLocalInsertDuringOplogFetching(
+                    Milliseconds(insertTimer.millis()));
+
+                ++_numOplogEntriesCopied;
 
                 auto [p, f] = makePromiseFuture<void>();
                 {
@@ -352,7 +361,7 @@ bool ReshardingOplogFetcher::consume(Client* client,
                     _onInsertFuture = std::move(f);
                 }
 
-                if (isFinalOplog(nextOplog, _reshardingUUID)) {
+                if (resharding::isFinalOplog(nextOplog, _reshardingUUID)) {
                     moreToCome = false;
                     return false;
                 }
@@ -376,14 +385,16 @@ bool ReshardingOplogFetcher::consume(Client* client,
                     oplog.set_id(Value(startAt.toBSON()));
                     oplog.setObject(BSON("msg"
                                          << "Latest oplog ts from donor's cursor response"));
-                    oplog.setObject2(BSON("type" << kReshardProgressMark));
+                    oplog.setObject2(BSON("type" << resharding::kReshardProgressMark));
                     oplog.setOpTime(OplogSlot());
                     oplog.setWallClockTime(opCtx->getServiceContext()->getFastClockSource()->now());
 
-                    uassertStatusOK(
-                        toWriteTo->insertDocument(opCtx, InsertStatement{oplog.toBSON()}, nullptr));
+                    uassertStatusOK(collection_internal::insertDocument(
+                        opCtx, *toWriteTo, InsertStatement{oplog.toBSON()}, nullptr));
                     wuow.commit();
 
+                    // Also include synthetic oplog in the fetched count so it can match up with the
+                    // total oplog applied count in the end.
                     _env->metrics()->onOplogEntriesFetched(1);
 
                     auto [p, f] = makePromiseFuture<void>();

@@ -34,7 +34,6 @@
 
 #include "mongo/s/ns_targeter.h"
 #include "mongo/s/write_ops/batched_command_request.h"
-#include "mongo/s/write_ops/write_error_detail.h"
 
 namespace mongo {
 
@@ -107,7 +106,7 @@ public:
      *
      * Can only be used in state _Error
      */
-    const WriteErrorDetail& getOpError() const;
+    const write_ops::WriteError& getOpError() const;
 
     /**
      * Creates TargetedWrite operations for every applicable shard, which contain the
@@ -135,7 +134,7 @@ public:
      * Can only be called when state is _Pending, or is a no-op if called when the state
      * is still _Ready (and therefore no writes are pending).
      */
-    void cancelWrites(const WriteErrorDetail* why);
+    void cancelWrites(const write_ops::WriteError* why);
 
     /**
      * Marks the targeted write as finished for this write op.
@@ -151,14 +150,14 @@ public:
      * As above, one of noteWriteComplete or noteWriteError should be called exactly once for
      * every TargetedWrite.
      */
-    void noteWriteError(const TargetedWrite& targetedWrite, const WriteErrorDetail& error);
+    void noteWriteError(const TargetedWrite& targetedWrite, const write_ops::WriteError& error);
 
     /**
      * Sets the error for this write op directly, and forces the state to _Error.
      *
      * Should only be used when in state _Ready.
      */
-    void setOpError(const WriteErrorDetail& error);
+    void setOpError(const write_ops::WriteError& error);
 
 private:
     /**
@@ -176,7 +175,7 @@ private:
     std::vector<ChildWriteOp> _childOps;
 
     // filled when state == _Error
-    std::unique_ptr<WriteErrorDetail> _error;
+    boost::optional<write_ops::WriteError> _error;
 
     // Whether this write is part of a transaction.
     const bool _inTxn;
@@ -206,7 +205,7 @@ struct ChildWriteOp {
     std::unique_ptr<ShardEndpoint> endpoint;
 
     // filled when state == _Error or (optionally) when state == _Cancelled
-    std::unique_ptr<WriteErrorDetail> error;
+    boost::optional<write_ops::WriteError> error;
 };
 
 // First value is write item index in the batch, second value is child write op index
@@ -220,8 +219,10 @@ typedef std::pair<int, int> WriteOpRef;
  * operation.
  */
 struct TargetedWrite {
-    TargetedWrite(const ShardEndpoint& endpoint, WriteOpRef writeOpRef)
-        : endpoint(endpoint), writeOpRef(writeOpRef) {}
+    TargetedWrite(const ShardEndpoint& endpoint,
+                  WriteOpRef writeOpRef,
+                  boost::optional<UUID> sampleId)
+        : endpoint(endpoint), writeOpRef(writeOpRef), sampleId(sampleId) {}
 
     // Where to send the write
     ShardEndpoint endpoint;
@@ -230,6 +231,57 @@ struct TargetedWrite {
     // TODO: Could be a more complex handle, shared between write state and networking code if
     // we need to be able to cancel ops.
     WriteOpRef writeOpRef;
+
+    // The unique sample id for the write if it has been chosen for sampling.
+    boost::optional<UUID> sampleId;
+};
+
+/**
+ * Data structure representing the information needed to make a batch request, along with
+ * pointers to where the resulting responses should be placed.
+ *
+ * Internal support for storage as a doubly-linked list, to allow the TargetedWriteBatch to
+ * efficiently be registered for reporting.
+ */
+class TargetedWriteBatch {
+    TargetedWriteBatch(const TargetedWriteBatch&) = delete;
+    TargetedWriteBatch& operator=(const TargetedWriteBatch&) = delete;
+
+public:
+    TargetedWriteBatch(const ShardId& shardId) : _shardId(shardId) {}
+
+    const ShardId& getShardId() const {
+        return _shardId;
+    }
+
+    const std::vector<std::unique_ptr<TargetedWrite>>& getWrites() const {
+        return _writes;
+    };
+
+    size_t getNumOps() const {
+        return _writes.size();
+    }
+
+    int getEstimatedSizeBytes() const {
+        return _estimatedSizeBytes;
+    }
+
+    /**
+     * TargetedWrite is owned here once given to the TargetedWriteBatch.
+     */
+    void addWrite(std::unique_ptr<TargetedWrite> targetedWrite, int estWriteSize);
+
+private:
+    // Where to send the batch
+    const ShardId _shardId;
+
+    // Where the responses go
+    // TargetedWrite*s are owned by the TargetedWriteBatch
+    std::vector<std::unique_ptr<TargetedWrite>> _writes;
+
+    // Conservatively estimated size of the batch, for ensuring it doesn't grow past the maximum
+    // BSON size
+    int _estimatedSizeBytes{0};
 };
 
 }  // namespace mongo

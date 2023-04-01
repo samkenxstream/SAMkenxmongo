@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -35,6 +34,10 @@
 
 #include "mongo/bson/bsontypes.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/util/namespace_string_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -54,6 +57,7 @@ const char kBatchDocSequenceFieldInitial[] = "cursor.firstBatch";
 const char kPostBatchResumeTokenField[] = "postBatchResumeToken";
 const char kPartialResultsReturnedField[] = "partialResultsReturned";
 const char kInvalidatedField[] = "invalidated";
+const char kWasStatementExecuted[] = "$_wasStatementExecuted";
 
 }  // namespace
 
@@ -66,7 +70,7 @@ CursorResponseBuilder::CursorResponseBuilder(rpc::ReplyBuilderInterface* replyBu
                                                                            : kBatchField));
 }
 
-void CursorResponseBuilder::done(CursorId cursorId, StringData cursorNamespace) {
+void CursorResponseBuilder::done(CursorId cursorId, const NamespaceString& cursorNamespace) {
     invariant(_active);
 
     _batch.reset();
@@ -81,8 +85,12 @@ void CursorResponseBuilder::done(CursorId cursorId, StringData cursorNamespace) 
         _cursorObject->append(kInvalidatedField, _invalidated);
     }
 
+    if (_wasStatementExecuted) {
+        _cursorObject->append(kWasStatementExecuted, _wasStatementExecuted);
+    }
+
     _cursorObject->append(kIdField, cursorId);
-    _cursorObject->append(kNsField, cursorNamespace);
+    _cursorObject->append(kNsField, NamespaceStringUtil::serialize(cursorNamespace));
     if (_options.atClusterTime) {
         _cursorObject->append(kAtClusterTimeField, _options.atClusterTime->asTimestamp());
     }
@@ -103,16 +111,16 @@ void CursorResponseBuilder::abandon() {
 }
 
 void appendCursorResponseObject(long long cursorId,
-                                StringData cursorNamespace,
+                                const NamespaceString& cursorNamespace,
                                 BSONArray firstBatch,
                                 boost::optional<StringData> cursorType,
                                 BSONObjBuilder* builder) {
     BSONObjBuilder cursorObj(builder->subobjStart(kCursorField));
     cursorObj.append(kIdField, cursorId);
-    cursorObj.append(kNsField, cursorNamespace);
+    cursorObj.append(kNsField, NamespaceStringUtil::serialize(cursorNamespace));
     cursorObj.append(kBatchFieldInitial, firstBatch);
     if (cursorType) {
-        cursorObj.append(kTypeField, cursorType.get());
+        cursorObj.append(kTypeField, cursorType.value());
     }
     cursorObj.done();
 }
@@ -137,7 +145,8 @@ CursorResponse::CursorResponse(NamespaceString nss,
                                boost::optional<BSONObj> varsField,
                                boost::optional<std::string> cursorType,
                                bool partialResultsReturned,
-                               bool invalidated)
+                               bool invalidated,
+                               bool wasStatementExecuted)
     : _nss(std::move(nss)),
       _cursorId(cursorId),
       _batch(std::move(batch)),
@@ -147,7 +156,8 @@ CursorResponse::CursorResponse(NamespaceString nss,
       _varsField(std::move(varsField)),
       _cursorType(std::move(cursorType)),
       _partialResultsReturned(partialResultsReturned),
-      _invalidated(invalidated) {}
+      _invalidated(invalidated),
+      _wasStatementExecuted(wasStatementExecuted) {}
 
 std::vector<StatusWith<CursorResponse>> CursorResponse::parseFromBSONMany(
     const BSONObj& cmdResponse) {
@@ -174,8 +184,11 @@ std::vector<StatusWith<CursorResponse>> CursorResponse::parseFromBSONMany(
     return cursors;
 }
 
-StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdResponse,
-                                                         const BSONObj* ownedObj) {
+StatusWith<CursorResponse> CursorResponse::parseFromBSON(
+    const BSONObj& cmdResponse,
+    const BSONObj* ownedObj,
+    boost::optional<TenantId> tenantId,
+    const SerializationContext& serializationContext) {
     Status cmdStatus = getStatusFromCommandResult(cmdResponse);
     if (!cmdStatus.isOK()) {
         return cmdStatus;
@@ -295,6 +308,16 @@ StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdRespo
         }
     }
 
+    auto wasStatementExecuted = cursorObj[kWasStatementExecuted];
+    if (wasStatementExecuted) {
+        if (wasStatementExecuted.type() != BSONType::Bool) {
+            return {ErrorCodes::BadValue,
+                    str::stream() << kWasStatementExecuted
+                                  << " format is invalid; expected Bool, but found: "
+                                  << wasStatementExecuted.type()};
+        }
+    }
+
     auto writeConcernError = cmdResponse["writeConcernError"];
 
     if (writeConcernError && writeConcernError.type() != BSONType::Object) {
@@ -303,7 +326,7 @@ StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdRespo
                               << writeConcernError.type()};
     }
 
-    return {{NamespaceString(fullns),
+    return {{NamespaceStringUtil::deserialize(tenantId, fullns, serializationContext),
              cursorId,
              std::move(batch),
              atClusterTimeElem ? atClusterTimeElem.timestamp() : boost::optional<Timestamp>{},
@@ -313,15 +336,17 @@ StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdRespo
              varsElt ? varsElt.Obj().getOwned() : boost::optional<BSONObj>{},
              typeElt ? boost::make_optional<std::string>(typeElt.String()) : boost::none,
              partialResultsReturned.trueValue(),
-             invalidatedElem.trueValue()}};
+             invalidatedElem.trueValue(),
+             wasStatementExecuted.trueValue()}};
 }
 
 void CursorResponse::addToBSON(CursorResponse::ResponseType responseType,
-                               BSONObjBuilder* builder) const {
+                               BSONObjBuilder* builder,
+                               const SerializationContext& serializationContext) const {
     BSONObjBuilder cursorBuilder(builder->subobjStart(kCursorField));
 
     cursorBuilder.append(kIdField, _cursorId);
-    cursorBuilder.append(kNsField, _nss.ns());
+    cursorBuilder.append(kNsField, NamespaceStringUtil::serialize(_nss, serializationContext));
 
     const char* batchFieldName =
         (responseType == ResponseType::InitialResponse) ? kBatchFieldInitial : kBatchField;
@@ -347,6 +372,10 @@ void CursorResponse::addToBSON(CursorResponse::ResponseType responseType,
         cursorBuilder.append(kInvalidatedField, _invalidated);
     }
 
+    if (_wasStatementExecuted) {
+        cursorBuilder.append(kWasStatementExecuted, _wasStatementExecuted);
+    }
+
     cursorBuilder.doneFast();
 
     builder->append("ok", 1.0);
@@ -356,9 +385,10 @@ void CursorResponse::addToBSON(CursorResponse::ResponseType responseType,
     }
 }
 
-BSONObj CursorResponse::toBSON(CursorResponse::ResponseType responseType) const {
+BSONObj CursorResponse::toBSON(CursorResponse::ResponseType responseType,
+                               const SerializationContext& serializationContext) const {
     BSONObjBuilder builder;
-    addToBSON(responseType, &builder);
+    addToBSON(responseType, &builder, serializationContext);
     return builder.obj();
 }
 

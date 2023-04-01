@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -36,6 +35,9 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/move_range_request_gen.h"
 #include "mongo/s/sharding_feature_flags_gen.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -62,16 +64,12 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassert(ErrorCodes::CommandFailed,
-                    "Can't run moveRange because the feature is disabled in the current FCV mode",
-                    feature_flags::gNoMoreAutoSplitter.isEnabled(
-                        serverGlobalParams.featureCompatibility));
             uassert(ErrorCodes::IllegalOperation,
                     str::stream() << Request::kCommandName
                                   << " can only be run on the config server",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 
-            opCtx->setAlwaysInterruptAtStepDownOrUp();
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             const auto nss = ns();
             const auto& req = request();
@@ -85,8 +83,8 @@ public:
                 Grid::get(opCtx)->shardRegistry()->getShard(opCtx, req.getToShard()),
                 "Could not find destination shard");
 
-            uassertStatusOK(Balancer::get(opCtx)->moveRange(
-                opCtx, nss, req.getMoveRangeRequest(), true /* issuedByRemoteUser */));
+            uassertStatusOK(
+                Balancer::get(opCtx)->moveRange(opCtx, nss, req, true /* issuedByRemoteUser */));
         }
 
     private:

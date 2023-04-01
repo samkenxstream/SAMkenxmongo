@@ -788,7 +788,8 @@ TEST_F(QueryPlannerTest, CacheDataFromTaggedTreeFailsOnBadInput) {
     // No relevant index matching the index tag.
     relevantIndices.push_back(buildSimpleIndexEntry(BSON("a" << 1), "a_1"));
 
-    auto findCommand = std::make_unique<FindCommandRequest>(NamespaceString("test.collection"));
+    auto findCommand = std::make_unique<FindCommandRequest>(
+        NamespaceString::createNamespaceString_forTest("test.collection"));
     findCommand->setFilter(BSON("a" << 3));
     auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(findCommand));
     ASSERT_OK(statusWithCQ.getStatus());
@@ -800,7 +801,7 @@ TEST_F(QueryPlannerTest, CacheDataFromTaggedTreeFailsOnBadInput) {
 }
 
 TEST_F(QueryPlannerTest, TagAccordingToCacheFailsOnBadInput) {
-    const NamespaceString nss("test.collection");
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.collection");
 
     auto findCommand = std::make_unique<FindCommandRequest>(nss);
     findCommand->setFilter(BSON("a" << 3));
@@ -855,11 +856,11 @@ TEST_F(QueryPlannerTest, DollarResumeAfterFieldPropagatedFromQueryRequestToStage
 
     const auto* node = solns.front()->root();
     const CollectionScanNode* csn = static_cast<const CollectionScanNode*>(node);
-    ASSERT_EQUALS(RecordId(42LL), csn->resumeAfterRecordId.get());
+    ASSERT_EQUALS(RecordId(42LL), csn->resumeAfterRecordId.value());
 }
 
 TEST_F(QueryPlannerTest, PreserveRecordIdOptionPrecludesSimpleSort) {
-    params.options |= QueryPlannerParams::PRESERVE_RECORD_ID;
+    forceRecordId = true;
 
     runQueryAsCommand(fromjson("{find: 'testns', sort: {a:1}}"));
 

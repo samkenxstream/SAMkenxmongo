@@ -2,33 +2,36 @@
  * Verify that adding 'comment' field to any command shouldn't cause unexpected failures.
  * @tags: [
  *   requires_capped,
- *   requires_journaling,
  *   requires_persistence,
  *   requires_replication,
  *   requires_sharding,
- *   requires_wiredtiger,
  * ]
  */
-(function() {
 
-"use strict";
+// TODO (SERVER-74534): Enable the metadata consistency check when it will work with co-located
+// configsvr.
+TestData.skipCheckMetadataConsistency = true;
 
-load("jstests/auth/lib/commands_lib.js");  // Provides an exhaustive list of commands.
-load("jstests/libs/fail_point_util.js");   // Helper to enable/disable failpoints easily.
+import {authCommandsLib} from "jstests/auth/lib/commands_lib.js";
+
+load("jstests/libs/fail_point_util.js");  // Helper to enable/disable failpoints easily.
 
 const tests = authCommandsLib.tests;
 
 // The following commands require additional start up configuration and hence need to be skipped.
-const denylistedTests =
-    ["startRecordingTraffic", "stopRecordingTraffic", "addShardToZone", "removeShardFromZone"];
+const denylistedTests = [
+    "startRecordingTraffic",
+    "stopRecordingTraffic",
+    "addShardToZone",
+    "removeShardFromZone",
+    "oidcListKeys",
+    "oidcRefreshKeys"
+];
 
-function runTests(tests, conn, impls) {
-    const firstDb = conn.getDB(firstDbName);
-    const secondDb = conn.getDB(secondDbName);
-    const isMongos = authCommandsLib.isMongos(conn);
+function runTests(tests, conn, impls, options) {
     for (const test of tests) {
         if (!denylistedTests.includes(test.testname)) {
-            authCommandsLib.runOneTest(conn, test, impls, isMongos);
+            authCommandsLib.runOneTest(conn, test, impls, options);
         }
     }
 }
@@ -75,8 +78,6 @@ MongoRunner.stopMongod(conn);
 // Test with a sharded cluster. Some tests require the first shard's name acquired from the
 // auth commands library to be up-to-date in order to set up correctly.
 conn = new ShardingTest({shards: 1, mongos: 2});
-shard0name = conn.shard0.shardName;
-runTests(tests, conn, impls);
+runTests(tests, conn, impls, {shard0name: conn.shard0.shardName});
 
 conn.stop();
-})();

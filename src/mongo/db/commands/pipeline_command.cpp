@@ -27,17 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
 
+#include "mongo/bson/bsonelement.h"
 #include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/create_collection.h"
+#include "mongo/db/catalog/external_data_source_scope_guard.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/run_aggregate.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/aggregation_request_helper.h"
+#include "mongo/db/pipeline/external_data_source_option_gen.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
 
 namespace mongo {
 namespace {
@@ -74,7 +82,9 @@ public:
         const OpMsgRequest& opMsgRequest,
         boost::optional<ExplainOptions::Verbosity> explainVerbosity) override {
         const auto aggregationRequest = aggregation_request_helper::parseFromBSON(
-            opMsgRequest.getDatabase().toString(),
+            opCtx,
+            DatabaseNameUtil::deserialize(opMsgRequest.getValidatedTenantId(),
+                                          opMsgRequest.getDatabase()),
             opMsgRequest.body,
             explainVerbosity,
             APIParameters::get(opCtx).getAPIStrict().value_or(false));
@@ -89,6 +99,10 @@ public:
             this, opMsgRequest, std::move(aggregationRequest), std::move(privileges));
     }
 
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
     bool shouldAffectReadConcernCounter() const override {
         return true;
     }
@@ -101,14 +115,69 @@ public:
     public:
         Invocation(Command* cmd,
                    const OpMsgRequest& request,
-                   const AggregateCommandRequest aggregationRequest,
+                   AggregateCommandRequest aggregationRequest,
                    PrivilegeVector privileges)
             : CommandInvocation(cmd),
               _request(request),
-              _dbName(request.getDatabase().toString()),
+              _dbName(DatabaseNameUtil::deserialize(request.getValidatedTenantId(),
+                                                    request.getDatabase())),
               _aggregationRequest(std::move(aggregationRequest)),
               _liteParsedPipeline(_aggregationRequest),
-              _privileges(std::move(privileges)) {}
+              _privileges(std::move(privileges)) {
+            auto externalDataSources = _aggregationRequest.getExternalDataSources();
+            uassert(7039000,
+                    "Either $_externalDataSources must always be present when enableComputeMode="
+                    "true or must not when enableComputeMode=false",
+                    computeModeEnabled == externalDataSources.has_value());
+
+            if (!externalDataSources) {
+                return;
+            }
+            uassert(7039002,
+                    "Expected one or more external data source but got 0",
+                    externalDataSources->size() > 0);
+
+            for (auto&& option : *externalDataSources) {
+                uassert(7039001,
+                        "Expected one or more urls for an external data source but got 0",
+                        option.getDataSources().size() > 0);
+            }
+
+            auto findCollNameInExternalDataSourceOption = [&](const StringData& collName) {
+                return std::find_if(externalDataSources->begin(),
+                                    externalDataSources->end(),
+                                    [&](const ExternalDataSourceOption& externalDataSourceOption) {
+                                        return externalDataSourceOption.getCollName() == collName;
+                                    });
+            };
+
+            auto externalDataSourcesIter =
+                findCollNameInExternalDataSourceOption(_aggregationRequest.getNamespace().coll());
+            uassert(7039003,
+                    "Source namespace must be an external data source",
+                    externalDataSourcesIter != externalDataSources->end());
+            _usedExternalDataSources.emplace_back(_aggregationRequest.getNamespace(),
+                                                  externalDataSourcesIter->getDataSources());
+
+            for (auto&& involvedNamespace : _liteParsedPipeline.getInvolvedNamespaces()) {
+                externalDataSourcesIter =
+                    findCollNameInExternalDataSourceOption(involvedNamespace.coll());
+                uassert(7039004,
+                        "Involved namespace must be an external data source",
+                        externalDataSourcesIter != externalDataSources->end());
+                _usedExternalDataSources.emplace_back(involvedNamespace,
+                                                      externalDataSourcesIter->getDataSources());
+            }
+
+            if (auto&& pipeline = _aggregationRequest.getPipeline(); !pipeline.empty()) {
+                // An external data source does not support writes and thus cannot be used as a
+                // target for $merge / $out stages.
+                auto&& lastStage = pipeline.back();
+                uassert(7239302,
+                        "The external data source cannot be used for $merge or $out stage",
+                        !lastStage.hasField("$out"_sd) && !lastStage.hasField("$merge"_sd));
+            }
+        }
 
     private:
         bool supportsWriteConcern() const override {
@@ -141,18 +210,27 @@ public:
             CommandHelpers::handleMarkKillOnClientDisconnect(
                 opCtx, !Pipeline::aggHasWriteStage(_request.body));
 
+            // Create virtual collections and drop them when aggregate command is done. Conceptually
+            // ownership of virtual collections are moved to runAggregate() function together with
+            // 'dropVcollGuard' so that it can clean up virtual collections when it's done with
+            // them. ExternalDataSourceScopeGuard will take care of the situation when any
+            // collection could not be created.
+            ExternalDataSourceScopeGuard dropVcollGuard(opCtx, _usedExternalDataSources);
             uassertStatusOK(runAggregate(opCtx,
                                          _aggregationRequest.getNamespace(),
                                          _aggregationRequest,
                                          _liteParsedPipeline,
                                          _request.body,
                                          _privileges,
-                                         reply));
+                                         reply,
+                                         std::move(dropVcollGuard)));
 
             // The aggregate command's response is unstable when 'explain' or 'exchange' fields are
             // set.
             if (!_aggregationRequest.getExplain() && !_aggregationRequest.getExchange()) {
-                query_request_helper::validateCursorResponse(reply->getBodyBuilder().asTempObj());
+                query_request_helper::validateCursorResponse(
+                    reply->getBodyBuilder().asTempObj(),
+                    _aggregationRequest.getNamespace().tenantId());
             }
         }
 
@@ -163,14 +241,16 @@ public:
         void explain(OperationContext* opCtx,
                      ExplainOptions::Verbosity verbosity,
                      rpc::ReplyBuilderInterface* result) override {
-
+            // See run() method for details.
+            ExternalDataSourceScopeGuard dropVcollGuard(opCtx, _usedExternalDataSources);
             uassertStatusOK(runAggregate(opCtx,
                                          _aggregationRequest.getNamespace(),
                                          _aggregationRequest,
                                          _liteParsedPipeline,
                                          _request.body,
                                          _privileges,
-                                         result));
+                                         result,
+                                         std::move(dropVcollGuard)));
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
@@ -181,10 +261,12 @@ public:
         }
 
         const OpMsgRequest& _request;
-        const std::string _dbName;
-        const AggregateCommandRequest _aggregationRequest;
+        const DatabaseName _dbName;
+        AggregateCommandRequest _aggregationRequest;
         const LiteParsedPipeline _liteParsedPipeline;
         const PrivilegeVector _privileges;
+        std::vector<std::pair<NamespaceString, std::vector<ExternalDataSourceInfo>>>
+            _usedExternalDataSources;
     };
 
     std::string help() const override {
@@ -204,6 +286,10 @@ public:
 
     const AuthorizationContract* getAuthorizationContract() const final {
         return &::mongo::AggregateCommandRequest::kAuthorizationContract;
+    }
+
+    bool allowedInTransactions() const final {
+        return true;
     }
 
 } pipelineCmd;

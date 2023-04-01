@@ -44,7 +44,7 @@ import time
 ARCH_CHOICES = ["x86_64", "arm64", "aarch64", "s390x"]
 
 # Made up names for the flavors of distribution we package for.
-DISTROS = ["suse", "debian", "redhat", "ubuntu", "amazon", "amazon2"]
+DISTROS = ["suse", "debian", "redhat", "ubuntu", "amazon", "amazon2", "amazon2022"]
 
 
 class Spec(object):
@@ -192,7 +192,6 @@ class Distro(object):
         Power and x86 have different names for apt/yum (ppc64le/ppc64el
         and x86_64/amd64).
         """
-        # pylint: disable=too-many-return-statements
         if re.search("^(debian|ubuntu)", self.dname):
             if arch == "ppc64le":
                 return "ppc64el"
@@ -217,7 +216,6 @@ class Distro(object):
             return "x86_64"
         else:
             raise Exception("BUG: unsupported platform?")
-        # pylint: enable=too-many-return-statements
 
     def repodir(self, arch, build_os, spec):  # noqa: D406,D407,D412,D413
         """Return the directory where we'll place the package files for (distro, distro_version).
@@ -276,13 +274,13 @@ class Distro(object):
         else:
             raise Exception("unsupported distro: %s" % self.dname)
 
-    def repo_os_version(self, build_os):  # pylint: disable=too-many-branches
+    def repo_os_version(self, build_os):
         """Return an OS version suitable for package repo directory naming.
 
         Example, 5, 6 or 7 for redhat/centos, "precise," "wheezy," etc.
         for Ubuntu/Debian, 11 for suse, "2013.03" for amazon.
         """
-        # pylint: disable=too-many-return-statements
+
         if self.dname == 'suse':
             return re.sub(r'^suse(\d+)$', r'\1', build_os)
         if self.dname == 'redhat':
@@ -291,6 +289,8 @@ class Distro(object):
             return "2013.03"
         elif self.dname == 'amazon2':
             return "2017.12"
+        elif self.dname == 'amazon2022':
+            return "2022.0"
         elif self.dname == 'ubuntu':
             if build_os == 'ubuntu1204':
                 return "precise"
@@ -302,6 +302,8 @@ class Distro(object):
                 return "bionic"
             elif build_os == 'ubuntu2004':
                 return "focal"
+            elif build_os == 'ubuntu2204':
+                return "jammy"
             else:
                 raise Exception("unsupported build_os: %s" % build_os)
         elif self.dname == 'debian':
@@ -311,11 +313,12 @@ class Distro(object):
                 return 'stretch'
             elif build_os == 'debian10':
                 return 'buster'
+            elif build_os == 'debian11':
+                return 'bullseye'
             else:
                 raise Exception("unsupported build_os: %s" % build_os)
         else:
             raise Exception("unsupported distro: %s" % self.dname)
-        # pylint: enable=too-many-return-statements
 
     def make_pkg(self, build_os, arch, spec, srcdir):
         """Return the package."""
@@ -339,8 +342,18 @@ class Distro(object):
         if re.search("(suse)", self.dname):
             return ["suse11", "suse12", "suse15"]
         elif re.search("(redhat|fedora|centos)", self.dname):
-            return ["rhel82", "rhel80", "rhel70", "rhel71", "rhel72", "rhel62", "rhel55", "rhel67"]
-        elif self.dname in ['amazon', 'amazon2']:
+            return [
+                "rhel90",
+                "rhel82",
+                "rhel80",
+                "rhel70",
+                "rhel71",
+                "rhel72",
+                "rhel62",
+                "rhel55",
+                "rhel67",
+            ]
+        elif self.dname in ['amazon', 'amazon2', 'amazon2022']:
             return [self.dname]
         elif self.dname == 'ubuntu':
             return [
@@ -349,9 +362,10 @@ class Distro(object):
                 "ubuntu1604",
                 "ubuntu1804",
                 "ubuntu2004",
+                "ubuntu2204",
             ]
         elif self.dname == 'debian':
-            return ["debian81", "debian92", "debian10"]
+            return ["debian81", "debian92", "debian10", "debian11"]
         else:
             raise Exception("BUG: unsupported platform?")
 
@@ -367,6 +381,8 @@ class Distro(object):
             return 'amzn1'
         elif self.dname == 'amazon2':
             return 'amzn2'
+        elif self.dname == 'amazon2022':
+            return 'amzn2022'
         return re.sub(r'^rh(el\d).*$', r'\1', build_os)
 
 
@@ -663,7 +679,7 @@ Description: MongoDB packages
         os.chdir(oldpwd)
 
 
-def move_repos_into_place(src, dst):  # pylint: disable=too-many-branches
+def move_repos_into_place(src, dst):
     """Move the repos into place."""
     # Find all the stuff in src/*, move it to a freshly-created
     # directory beside dst, then play some games with symlinks so that
@@ -753,7 +769,7 @@ def write_debian_changelog(path, spec, srcdir):
         fh.write(sb)
 
 
-def make_rpm(distro, build_os, arch, spec, srcdir):  # pylint: disable=too-many-locals
+def make_rpm(distro, build_os, arch, spec, srcdir):
     """Create the RPM specfile."""
     suffix = spec.suffix()
     sdir = setupdir(distro, build_os, arch, spec)

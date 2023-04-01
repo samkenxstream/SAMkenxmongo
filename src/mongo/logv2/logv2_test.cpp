@@ -27,10 +27,10 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
+#include <csignal>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -40,7 +40,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
 #include "mongo/bson/oid.h"
-#include "mongo/db/auth/security_token.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/logv2/bson_formatter.h"
 #include "mongo/logv2/component_settings_filter.h"
@@ -60,8 +60,11 @@
 #include "mongo/logv2/uassert_sink.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/exit_code.h"
+#include "mongo/util/str_escape.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/uuid.h"
 
@@ -69,6 +72,9 @@
 #include <boost/optional.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo::logv2 {
 namespace {
@@ -180,6 +186,25 @@ BSONObj toBSON(const TypeWithNonMemberFormatting&) {
     return builder.obj();
 }
 
+struct TypeWithToStringForLogging {
+    friend std::string toStringForLogging(const TypeWithToStringForLogging& x) {
+        return "toStringForLogging";
+    }
+    std::string toString() const {
+        return "[overridden]";
+    }
+};
+
+enum EnumWithToStringForLogging { e1, e2, e3 };
+
+inline std::string toStringForLogging(EnumWithToStringForLogging x) {
+    return "[log-friendly enum]";
+}
+
+inline std::string toString(EnumWithToStringForLogging x) {
+    return "[not to be used]";
+}
+
 LogManager& mgr() {
     return LogManager::global();
 }
@@ -283,6 +308,12 @@ public:
         _attachedSinks.push_back(sink);
     }
 
+    void popSink() {
+        auto sink = _attachedSinks.back();
+        boost::log::core::get()->remove_sink(sink);
+        _attachedSinks.pop_back();
+    }
+
     template <typename Fmt>
     LineCapture makeLineCapture(Fmt&& formatter, bool stripEol = true) {
         LineCapture ret(stripEol);
@@ -351,12 +382,80 @@ TEST_F(LogV2Test, Basic) {
     // Message string is selected when using API that also take a format string
     LOGV2(20084, "fmtstr {name}", "msgstr", "name"_attr = 1);
     ASSERT_EQUALS(lines.back(), "msgstr");
+}
 
-    // Test that logging exceptions does not propagate out to user code in release builds
+TEST_F(LogV2Test, MismatchAttrInLogging) {
+    auto lines = makeLineCapture(PlainFormatter());
     if (!kDebugBuild) {
         LOGV2(4638203, "mismatch {name}", "not_name"_attr = 1);
         ASSERT(StringData(lines.back()).startsWith("Exception during log"_sd));
     }
+}
+
+TEST_F(LogV2Test, MissingAttrInLogging) {
+    auto lines = makeLineCapture(PlainFormatter());
+    if (!kDebugBuild) {
+        LOGV2(6636803, "Log missing {attr}");
+        ASSERT(StringData(lines.back()).startsWith("Exception during log"_sd));
+    }
+}
+
+namespace bl_sinks = boost::log::sinks;
+// Sink backend which will grab a mutex, then immediately segfault.
+class ConsumeSegfaultsBackend
+    : public bl_sinks::basic_formatted_sink_backend<char, bl_sinks::synchronized_feeding> {
+public:
+    static auto create() {
+        return boost::make_shared<bl_sinks::synchronous_sink<ConsumeSegfaultsBackend>>(
+            boost::make_shared<ConsumeSegfaultsBackend>());
+    }
+
+    void consume(boost::log::record_view const& rec, string_type const& formattedString) {
+        if (firstRun) {
+            firstRun = false;
+            raise(SIGSEGV);
+        } else {
+            // Reentrance of consume(), which could cause deadlock. Exit normally, causing the death
+            // test to fail.
+            exit(static_cast<int>(ExitCode::clean));
+        }
+    }
+
+private:
+    bool firstRun = true;
+};
+
+// Test that signals thrown during logging will not hang process death. Uses the
+// ConsumeSegfaultsBackend so that upon the initial log call, ConsumeSegfaultsBackend::consume will
+// be called, sending SIGSEGV. If the signal handler incorrectly invokes the logging subsystem, the
+// ConsumeSegfaultsBackend::consume function will be again invoked, failing the test since this
+// could result in deadlock.
+DEATH_TEST_F(LogV2Test, SIGSEGVDoesNotHang, "Got signal: ") {
+    auto sink = ConsumeSegfaultsBackend::create();
+    attachSink(sink);
+    LOGV2(6384304, "will SIGSEGV {str}", "str"_attr = "sigsegv");
+    // If we get here, we didn't segfault, and the test will fail.
+}
+
+class ConsumeThrowsBackend
+    : public bl_sinks::basic_formatted_sink_backend<char, bl_sinks::synchronized_feeding> {
+public:
+    struct LocalException : std::exception {};
+    static auto create() {
+        return boost::make_shared<bl_sinks::synchronous_sink<ConsumeThrowsBackend>>(
+            boost::make_shared<ConsumeThrowsBackend>());
+    }
+
+    void consume(boost::log::record_view const& rec, string_type const& formattedString) {
+        throw LocalException();
+    }
+};
+
+TEST_F(LogV2Test, ExceptInLogging) {
+    auto sink = ConsumeThrowsBackend::create();
+    attachSink(sink);
+    ASSERT_THROWS(LOGV2(6636801, "will throw exception"), ConsumeThrowsBackend::LocalException);
+    popSink();
 }
 
 class LogV2TypesTest : public LogV2Test {
@@ -758,6 +857,20 @@ TEST_F(LogV2Test, TextFormat) {
     TypeWithNonMemberFormatting t3;
     LOGV2(20079, "{name}", "name"_attr = t3);
     ASSERT(lines.back().rfind(toString(t3)) != std::string::npos);
+}
+
+TEST_F(LogV2Test, StructToStringForLogging) {
+    auto lines = makeLineCapture(JSONFormatter());
+    TypeWithToStringForLogging x;
+    LOGV2(7496800, "Msg", "x"_attr = x);
+    ASSERT_STRING_CONTAINS(lines.back(), toStringForLogging(x));
+}
+
+TEST_F(LogV2Test, EnumToStringForLogging) {
+    auto lines = makeLineCapture(JSONFormatter());
+    auto e = EnumWithToStringForLogging::e1;
+    LOGV2(7496801, "Msg", "e"_attr = e);
+    ASSERT_STRING_CONTAINS(lines.back(), toStringForLogging(e));
 }
 
 std::string hello() {
@@ -1489,6 +1602,54 @@ TEST_F(LogV2Test, JsonTruncation) {
     validateArrayTruncation(mongo::fromjson(lines.back()));
 }
 
+TEST_F(LogV2Test, StringTruncation) {
+    const AtomicWord<int32_t> maxAttributeSizeKB(1);
+    auto lines = makeLineCapture(JSONFormatter(&maxAttributeSizeKB));
+
+    std::size_t maxLength = maxAttributeSizeKB.load() << 10;
+    std::string prefix(maxLength - 3, 'a');
+
+    struct TestCase {
+        std::string input;
+        std::string suffix;
+        std::string note;
+    };
+
+    TestCase tests[] = {
+        {prefix + "LMNOPQ", "LMN", "unescaped 1-byte octet"},
+        // "\n\"NOPQ" expands to "\\n\\\"NOPQ" after escape, and the limit
+        // is reached at the 2nd '\\' octet, but since it splits the "\\\""
+        // sequence, the actual truncation happens after the 'n' octet.
+        {prefix + "\n\"NOPQ", "\n", "2-byte escape sequence"},
+        // "L\vNOPQ" expands to "L\\u000bNOPQ" after escape, and the limit
+        // is reached at the 'u' octet, so the entire sequence is truncated.
+        {prefix + "L\vNOPQ", "L", "multi-byte escape sequence"},
+        {prefix + "LM\xC3\xB1PQ", "LM", "2-byte UTF-8 sequence"},
+        {prefix + "L\xE1\x9B\x8FPQ", "L", "3-byte UTF-8 sequence"},
+        {prefix + "L\xF0\x90\x8C\xBCQ", "L", "4-byte UTF-8 sequence"},
+        {prefix + "\xE1\x9B\x8E\xE1\x9B\x8F", "\xE1\x9B\x8E", "UTF-8 codepoint boundary"},
+        // The invalid UTF-8 codepoint 0xC3 is replaced with "\\ufffd", and truncated entirely
+        {prefix + "L\xC3NOPQ", "L", "escaped invalid codepoint"},
+        {std::string(maxLength, '\\'), "\\", "escaped backslash"},
+    };
+
+    for (const auto& [input, suffix, note] : tests) {
+        LOGV2(6694001, "name", "name"_attr = input);
+        BSONObj obj = fromjson(lines.back());
+
+        auto str = obj[constants::kAttributesFieldName]["name"].checkAndGetStringData();
+        std::string context = "Failed test: " + note;
+
+        ASSERT_LTE(str.size(), maxLength) << context;
+        ASSERT(str.endsWith(suffix))
+            << context << " - string " << str << " does not end with " << suffix;
+
+        auto trunc = obj[constants::kTruncatedFieldName]["name"];
+        ASSERT_EQUALS(trunc["type"].String(), typeName(BSONType::String)) << context;
+        ASSERT_EQUALS(trunc["size"].numberLong(), str::escapeForJSON(input).size()) << context;
+    }
+}
+
 TEST_F(LogV2Test, Threads) {
     auto linesPlain = makeLineCapture(PlainFormatter());
     auto linesText = makeLineCapture(TextFormatter());
@@ -1840,7 +2001,7 @@ TEST_F(UnstructuredLoggingTest, VectorBSON) {
                                        BSON("str3"
                                             << "str4")};
     logd("{}", vectorBSON);  // NOLINT
-    validate([&vectorBSON](const BSONObj& obj) {
+    validate([](const BSONObj& obj) {
         ASSERT_EQUALS(obj.getField(kMessageFieldName).String(),
                       "({\"str1\":\"str2\"}, {\"str3\":\"str4\"})");
     });
@@ -1854,7 +2015,7 @@ TEST_F(UnstructuredLoggingTest, MapBSON) {
                                                BSON("str3"
                                                     << "str4")}};
     logd("{}", mapBSON);  // NOLINT
-    validate([&mapBSON](const BSONObj& obj) {
+    validate([](const BSONObj& obj) {
         ASSERT_EQUALS(obj.getField(kMessageFieldName).String(),
                       "(key1: {\"str1\":\"str2\"}, key2: {\"str3\":\"str4\"})");
     });

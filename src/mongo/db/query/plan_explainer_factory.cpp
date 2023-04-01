@@ -34,6 +34,8 @@
 #include "mongo/db/exec/plan_cache_util.h"
 #include "mongo/db/query/plan_explainer_impl.h"
 #include "mongo/db/query/plan_explainer_sbe.h"
+#include "mongo/util/duration.h"
+#include <ratio>
 
 namespace mongo::plan_explainer_factory {
 std::unique_ptr<PlanExplainer> make(PlanStage* root) {
@@ -57,7 +59,8 @@ std::unique_ptr<PlanExplainer> make(sbe::PlanStage* root,
                                     std::vector<sbe::plan_ranker::CandidatePlan> rejectedCandidates,
                                     bool isMultiPlan) {
     // Pre-compute Debugging info for explain use.
-    auto debugInfoSBE = std::make_unique<plan_cache_debug_info::DebugInfoSBE>(
+
+    auto debugInfoSBE = std::make_shared<const plan_cache_debug_info::DebugInfoSBE>(
         plan_cache_util::buildDebugInfo(solution));
     return std::make_unique<PlanExplainerSBE>(root,
                                               data,
@@ -65,7 +68,8 @@ std::unique_ptr<PlanExplainer> make(sbe::PlanStage* root,
                                               std::move(optimizerData),
                                               std::move(rejectedCandidates),
                                               isMultiPlan,
-                                              std::move(debugInfoSBE));
+                                              false, /* isFromPlanCache */
+                                              debugInfoSBE);
 }
 
 std::unique_ptr<PlanExplainer> make(
@@ -75,12 +79,13 @@ std::unique_ptr<PlanExplainer> make(
     std::unique_ptr<optimizer::AbstractABTPrinter> optimizerData,
     std::vector<sbe::plan_ranker::CandidatePlan> rejectedCandidates,
     bool isMultiPlan,
-    std::unique_ptr<plan_cache_debug_info::DebugInfoSBE> debugInfoSBE) {
-    // TODO SERVER-61314: Consider invariant(debugInfoSBE) as we may not need to create a
+    bool isFromPlanCache,
+    std::shared_ptr<const plan_cache_debug_info::DebugInfoSBE> debugInfoSBE) {
+    // TODO SERVER-64882: Consider invariant(debugInfoSBE) as we may not need to create a
     // DebugInfoSBE from QuerySolution after the feature flag is removed. We currently need it
     // because debugInfoSBE can be null if the plan was recovered from the classic plan cache.
     if (!debugInfoSBE) {
-        debugInfoSBE = std::make_unique<plan_cache_debug_info::DebugInfoSBE>(
+        debugInfoSBE = std::make_shared<const plan_cache_debug_info::DebugInfoSBE>(
             plan_cache_util::buildDebugInfo(solution));
     }
 
@@ -90,6 +95,7 @@ std::unique_ptr<PlanExplainer> make(
                                               std::move(optimizerData),
                                               std::move(rejectedCandidates),
                                               isMultiPlan,
-                                              std::move(debugInfoSBE));
+                                              isFromPlanCache,
+                                              debugInfoSBE);
 }
 }  // namespace mongo::plan_explainer_factory

@@ -17,7 +17,7 @@ const dbname = "foo";
 const isDirectoryPerDBSupported =
     jsTest.options().storageEngine == "wiredTiger" || !jsTest.options().storageEngine;
 
-const m = MongoRunner.runMongod({dbpath: dbpath, directoryperdb: ''});
+const m = MongoRunner.runMongod({dbpath: dbpath, directoryperdb: '', syncdelay: 1});
 
 if (!isDirectoryPerDBSupported) {
     assert.isnull(m, 'storage engine without directoryperdb support should fail to start up');
@@ -54,7 +54,7 @@ const checkDirRemoved = function(dbName, dbDirPath) {
         },
         "dbpath contained '" + dbName +
             "' directory when it should have been removed:" + tojson(listFiles(dbDirPath)),
-        10 * 1000);  // The periodic task to run data table cleanup runs once a second.
+        20 * 1000);  // The periodic task to run data table cleanup runs once a second.
 };
 
 const db = m.getDB(dbname);

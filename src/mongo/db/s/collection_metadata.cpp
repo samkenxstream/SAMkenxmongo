@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -41,6 +40,9 @@
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 
@@ -69,7 +71,7 @@ boost::optional<ShardKeyPattern> CollectionMetadata::getReshardingKeyIfShouldFor
 
     // Used a switch statement so that the compiler warns anyone who modifies the coordinator
     // states enum.
-    switch (reshardingFields.get().getState()) {
+    switch (reshardingFields.value().getState()) {
         case CoordinatorStateEnum::kUnused:
         case CoordinatorStateEnum::kInitializing:
         case CoordinatorStateEnum::kBlockingWrites:
@@ -99,7 +101,7 @@ void CollectionMetadata::throwIfReshardingInProgress(NamespaceString const& nss)
         const auto& reshardingFields = getReshardingFields();
         // Throw if the coordinator is not in states "aborting", "committing", or "done".
         if (reshardingFields && reshardingFields->getState() < CoordinatorStateEnum::kAborting) {
-            LOGV2(5277122, "reshardCollection in progress", "namespace"_attr = nss.toString());
+            LOGV2(5277122, "reshardCollection in progress", logAttrs(nss));
 
             uasserted(ErrorCodes::ReshardCollectionInProgress,
                       "reshardCollection is in progress for namespace " + nss.toString());
@@ -107,13 +109,13 @@ void CollectionMetadata::throwIfReshardingInProgress(NamespaceString const& nss)
     }
 }
 
-BSONObj CollectionMetadata::extractDocumentKey(const BSONObj& doc) const {
+BSONObj CollectionMetadata::extractDocumentKey(const ShardKeyPattern* shardKeyPattern,
+                                               const BSONObj& doc) {
     BSONObj key;
 
-    if (isSharded()) {
-        auto const& pattern = _cm->getShardKeyPattern();
-        key = dotted_path_support::extractElementsBasedOnTemplate(doc, pattern.toBSON());
-        if (pattern.hasId()) {
+    if (shardKeyPattern) {
+        key = dotted_path_support::extractElementsBasedOnTemplate(doc, shardKeyPattern->toBSON());
+        if (shardKeyPattern->hasId()) {
             return key;
         }
         // else, try to append an _id field from the document.
@@ -127,29 +129,17 @@ BSONObj CollectionMetadata::extractDocumentKey(const BSONObj& doc) const {
     return doc;
 }
 
-void CollectionMetadata::toBSONBasic(BSONObjBuilder& bb) const {
-    if (isSharded()) {
-        _cm->getVersion().appendLegacyWithField(&bb, "collVersion");
-        getShardVersionForLogging().appendLegacyWithField(&bb, "shardVersion");
-        bb.append("keyPattern", _cm->getShardKeyPattern().toBSON());
-    } else {
-        ChunkVersion::UNSHARDED().appendLegacyWithField(&bb, "collVersion");
-        ChunkVersion::UNSHARDED().appendLegacyWithField(&bb, "shardVersion");
-    }
-}
-
-BSONObj CollectionMetadata::toBSON() const {
-    BSONObjBuilder builder;
-    toBSONBasic(builder);
-    return builder.obj();
+BSONObj CollectionMetadata::extractDocumentKey(const BSONObj& doc) const {
+    return extractDocumentKey(isSharded() ? &_cm->getShardKeyPattern() : nullptr, doc);
 }
 
 std::string CollectionMetadata::toStringBasic() const {
     if (isSharded()) {
-        return str::stream() << "collection version: " << _cm->getVersion().toString()
-                             << ", shard version: " << getShardVersionForLogging().toString();
+        return str::stream() << "collection placement version: " << _cm->getVersion().toString()
+                             << ", shard placement version: "
+                             << getShardPlacementVersionForLogging().toString();
     } else {
-        return "collection version: <unsharded>";
+        return "collection placement version: <unsharded>";
     }
 }
 
@@ -179,28 +169,6 @@ bool CollectionMetadata::getNextChunk(const BSONObj& lookupKey, ChunkType* chunk
     chunk->setMax(nextChunk->getMax());
 
     return true;
-}
-
-Status CollectionMetadata::checkRangeIsValid(const BSONObj& min, const BSONObj& max) const {
-    invariant(isSharded());
-
-    ChunkType existingChunk;
-
-    if (!getNextChunk(min, &existingChunk)) {
-        return {ErrorCodes::StaleShardVersion,
-                str::stream() << "Chunk with bounds " << ChunkRange(min, max).toString()
-                              << " is not owned by this shard."};
-    }
-
-    const ChunkRange receivedRange(min, max);
-    const auto owningRange = existingChunk.getRange();
-
-    uassert(ErrorCodes::InvalidOptions,
-            str::stream() << "Rejecting moveRange because the provided range is spanning "
-                             "across more than one chunk",
-            owningRange.covers(receivedRange));
-
-    return Status::OK();
 }
 
 bool CollectionMetadata::currentShardHasAnyChunks() const {

@@ -27,21 +27,17 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/op_observer_sharding_impl.h"
 
-#include "mongo/db/catalog_raii.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/database_sharding_state.h"
-#include "mongo/db/s/migration_chunk_cloner_source_legacy.h"
+#include "mongo/db/s/migration_chunk_cloner_source.h"
 #include "mongo/db/s/migration_source_manager.h"
-#include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/db/s/sharding_write_router.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 namespace {
@@ -70,14 +66,7 @@ void assertIntersectingChunkHasNotMoved(OperationContext* opCtx,
     chunk.throwIfMoved();
 }
 
-bool isMigratingWithCSRLock(CollectionShardingRuntime* csr,
-                            CollectionShardingRuntime::CSRLock& csrLock,
-                            BSONObj const& docToDelete) {
-    auto cloner = MigrationSourceManager::getCurrentCloner(csr, csrLock);
-    return cloner && cloner->isDocumentInMigratingChunk(docToDelete);
-}
-
-void assertMovePrimaryInProgress(OperationContext* opCtx, NamespaceString const& nss) {
+void assertNoMovePrimaryInProgress(OperationContext* opCtx, const NamespaceString& nss) {
     if (!nss.isNormalCollection() && nss.coll() != "system.views" &&
         !nss.isTimeseriesBucketsCollection()) {
         return;
@@ -85,17 +74,12 @@ void assertMovePrimaryInProgress(OperationContext* opCtx, NamespaceString const&
 
     // TODO SERVER-58222: evaluate whether this is safe or whether acquiring the lock can block.
     AllowLockAcquisitionOnTimestampedUnitOfWork allowLockAcquisition(opCtx->lockState());
-    Lock::DBLock dblock(opCtx, nss.db(), MODE_IS);
-    auto dss = DatabaseShardingState::get(opCtx, nss.db().toString());
-    if (!dss) {
-        return;
-    }
+    Lock::DBLock dblock(opCtx, nss.dbName(), MODE_IS);
 
-    auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
-    auto mpsm = dss->getMovePrimarySourceManager(dssLock);
-
-    if (mpsm) {
-        LOGV2(4908600, "assertMovePrimaryInProgress", "namespace"_attr = nss.toString());
+    const auto scopedDss =
+        DatabaseShardingState::assertDbLockedAndAcquireShared(opCtx, nss.dbName());
+    if (scopedDss->isMovePrimaryInProgress()) {
+        LOGV2(4908600, "assertNoMovePrimaryInProgress", logAttrs(nss));
 
         uasserted(ErrorCodes::MovePrimaryInProgress,
                   "movePrimary is in progress for namespace " + nss.toString());
@@ -104,12 +88,17 @@ void assertMovePrimaryInProgress(OperationContext* opCtx, NamespaceString const&
 
 }  // namespace
 
+OpObserverShardingImpl::OpObserverShardingImpl(std::unique_ptr<OplogWriter> oplogWriter)
+    : OpObserverImpl(std::move(oplogWriter)) {}
+
 bool OpObserverShardingImpl::isMigrating(OperationContext* opCtx,
                                          NamespaceString const& nss,
                                          BSONObj const& docToDelete) {
-    auto csr = CollectionShardingRuntime::get(opCtx, nss);
-    auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
-    return isMigratingWithCSRLock(csr, csrLock, docToDelete);
+    const auto scopedCsr =
+        CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, nss);
+    auto cloner = MigrationSourceManager::getCurrentCloner(*scopedCsr);
+
+    return cloner && cloner->isDocumentInMigratingChunk(docToDelete);
 }
 
 void OpObserverShardingImpl::shardObserveAboutToDelete(OperationContext* opCtx,
@@ -118,42 +107,49 @@ void OpObserverShardingImpl::shardObserveAboutToDelete(OperationContext* opCtx,
     getIsMigrating(opCtx) = isMigrating(opCtx, nss, docToDelete);
 }
 
-void OpObserverShardingImpl::shardObserveInsertOp(OperationContext* opCtx,
-                                                  const NamespaceString nss,
-                                                  const BSONObj& insertedDoc,
-                                                  const repl::OpTime& opTime,
-                                                  const ShardingWriteRouter& shardingWriteRouter,
-                                                  const bool fromMigrate,
-                                                  const bool inMultiDocumentTransaction) {
+void OpObserverShardingImpl::shardObserveInsertsOp(
+    OperationContext* opCtx,
+    const NamespaceString nss,
+    std::vector<InsertStatement>::const_iterator first,
+    std::vector<InsertStatement>::const_iterator last,
+    const std::vector<repl::OpTime>& opTimeList,
+    const ShardingWriteRouter& shardingWriteRouter,
+    const bool fromMigrate,
+    const bool inMultiDocumentTransaction) {
     if (nss == NamespaceString::kSessionTransactionsTableNamespace || fromMigrate)
         return;
 
-    auto css = shardingWriteRouter.getCollectionShardingState();
-    auto* const csr = CollectionShardingRuntime::get(css);
-    csr->checkShardVersionOrThrow(opCtx);
+    auto* const css = shardingWriteRouter.getCss();
+    css->checkShardVersionOrThrow(opCtx);
+    DatabaseShardingState::assertMatchingDbVersion(opCtx, nss.db());
 
+    auto* const csr = checked_cast<CollectionShardingRuntime*>(css);
     auto metadata = csr->getCurrentMetadataIfKnown();
     if (!metadata || !metadata->isSharded()) {
-        assertMovePrimaryInProgress(opCtx, nss);
+        assertNoMovePrimaryInProgress(opCtx, nss);
         return;
     }
 
-    if (inMultiDocumentTransaction) {
-        const auto atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+    int index = 0;
+    for (auto it = first; it != last; it++, index++) {
+        auto opTime = opTimeList.empty() ? repl::OpTime() : opTimeList[index];
 
-        if (atClusterTime) {
-            const auto shardKey =
-                metadata->getShardKeyPattern().extractShardKeyFromDocThrows(insertedDoc);
-            assertIntersectingChunkHasNotMoved(opCtx, *metadata, shardKey, *atClusterTime);
+        if (inMultiDocumentTransaction) {
+            const auto atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+
+            if (atClusterTime) {
+                const auto shardKey =
+                    metadata->getShardKeyPattern().extractShardKeyFromDocThrows(it->doc);
+                assertIntersectingChunkHasNotMoved(opCtx, *metadata, shardKey, *atClusterTime);
+            }
+
+            return;
         }
 
-        return;
-    }
-
-    auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
-    auto cloner = MigrationSourceManager::getCurrentCloner(csr, csrLock);
-    if (cloner) {
-        cloner->onInsertOp(opCtx, insertedDoc, opTime);
+        auto cloner = MigrationSourceManager::getCurrentCloner(*csr);
+        if (cloner) {
+            cloner->onInsertOp(opCtx, it->doc, opTime);
+        }
     }
 }
 
@@ -165,13 +161,14 @@ void OpObserverShardingImpl::shardObserveUpdateOp(OperationContext* opCtx,
                                                   const ShardingWriteRouter& shardingWriteRouter,
                                                   const repl::OpTime& prePostImageOpTime,
                                                   const bool inMultiDocumentTransaction) {
-    auto css = shardingWriteRouter.getCollectionShardingState();
-    auto* const csr = CollectionShardingRuntime::get(css);
-    csr->checkShardVersionOrThrow(opCtx);
+    auto* const css = shardingWriteRouter.getCss();
+    css->checkShardVersionOrThrow(opCtx);
+    DatabaseShardingState::assertMatchingDbVersion(opCtx, nss.db());
 
+    auto* const csr = checked_cast<CollectionShardingRuntime*>(css);
     auto metadata = csr->getCurrentMetadataIfKnown();
     if (!metadata || !metadata->isSharded()) {
-        assertMovePrimaryInProgress(opCtx, nss);
+        assertNoMovePrimaryInProgress(opCtx, nss);
         return;
     }
 
@@ -187,8 +184,7 @@ void OpObserverShardingImpl::shardObserveUpdateOp(OperationContext* opCtx,
         return;
     }
 
-    auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
-    auto cloner = MigrationSourceManager::getCurrentCloner(csr, csrLock);
+    auto cloner = MigrationSourceManager::getCurrentCloner(*csr);
     if (cloner) {
         cloner->onUpdateOp(opCtx, preImageDoc, postImageDoc, opTime, prePostImageOpTime);
     }
@@ -201,13 +197,14 @@ void OpObserverShardingImpl::shardObserveDeleteOp(OperationContext* opCtx,
                                                   const ShardingWriteRouter& shardingWriteRouter,
                                                   const repl::OpTime& preImageOpTime,
                                                   const bool inMultiDocumentTransaction) {
-    auto css = shardingWriteRouter.getCollectionShardingState();
-    auto* const csr = CollectionShardingRuntime::get(css);
-    csr->checkShardVersionOrThrow(opCtx);
+    auto* const css = shardingWriteRouter.getCss();
+    css->checkShardVersionOrThrow(opCtx);
+    DatabaseShardingState::assertMatchingDbVersion(opCtx, nss.db());
 
+    auto* const csr = checked_cast<CollectionShardingRuntime*>(css);
     auto metadata = csr->getCurrentMetadataIfKnown();
     if (!metadata || !metadata->isSharded()) {
-        assertMovePrimaryInProgress(opCtx, nss);
+        assertNoMovePrimaryInProgress(opCtx, nss);
         return;
     }
 
@@ -223,9 +220,7 @@ void OpObserverShardingImpl::shardObserveDeleteOp(OperationContext* opCtx,
         return;
     }
 
-    auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
-    auto cloner = MigrationSourceManager::getCurrentCloner(csr, csrLock);
-
+    auto cloner = MigrationSourceManager::getCurrentCloner(*csr);
     if (cloner && getIsMigrating(opCtx)) {
         cloner->onDeleteOp(opCtx, documentKey, opTime, preImageOpTime);
     }
@@ -234,6 +229,16 @@ void OpObserverShardingImpl::shardObserveDeleteOp(OperationContext* opCtx,
 void OpObserverShardingImpl::shardObserveTransactionPrepareOrUnpreparedCommit(
     OperationContext* opCtx,
     const std::vector<repl::ReplOperation>& stmts,
+    const repl::OpTime& prepareOrCommitOptime) {
+
+    opCtx->recoveryUnit()->registerChange(
+        std::make_unique<LogTransactionOperationsForShardingHandler>(
+            *opCtx->getLogicalSessionId(), stmts, prepareOrCommitOptime));
+}
+
+void OpObserverShardingImpl::shardObserveNonPrimaryTransactionPrepare(
+    OperationContext* opCtx,
+    const std::vector<repl::OplogEntry>& stmts,
     const repl::OpTime& prepareOrCommitOptime) {
 
     opCtx->recoveryUnit()->registerChange(

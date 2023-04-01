@@ -37,6 +37,7 @@
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/tenant_oplog_batcher.h"
+#include "mongo/db/serverless/serverless_types_gen.h"
 #include "mongo/util/future.h"
 
 namespace mongo {
@@ -72,8 +73,9 @@ public:
     };
 
     TenantOplogApplier(const UUID& migrationUuid,
-                       const std::string& tenantId,
-                       OpTime applyFromOpTime,
+                       const MigrationProtocolEnum& protocol,
+                       boost::optional<std::string> tenantId,
+                       OpTime StartApplyingAfterOpTime,
                        RandomAccessOplogBuffer* oplogBuffer,
                        std::shared_ptr<executor::TaskExecutor> executor,
                        ThreadPool* writerPool,
@@ -101,30 +103,32 @@ public:
     void setCloneFinishedRecipientOpTime(OpTime cloneFinishedRecipientOpTime);
 
     /**
-     * Returns the optime the applier will start applying from. Used for testing.
+     * Returns the optime the applier will start applying from.
      */
-    OpTime getBeginApplyingOpTime_forTest() const;
+    OpTime getStartApplyingAfterOpTime() const;
 
     /**
-     * Returns the timestamp the applier will resume batching from. Used for testing.
+     * Returns the timestamp the applier will resume batching from.
      */
-    Timestamp getResumeBatchingTs_forTest() const;
+    Timestamp getResumeBatchingTs() const;
 
 private:
-    Status _doStartup_inlock() noexcept final;
+    void _doStartup_inlock() final;
     void _doShutdown_inlock() noexcept final;
     void _preJoin() noexcept final;
     void _finishShutdown(WithLock lk, Status status);
 
     void _applyLoop(TenantOplogBatch batch);
     bool _shouldStopApplying(Status status);
+    // Indicates an oplog entry should be ignored and not applied.
+    bool _shouldIgnore(const OplogEntry& entry);
 
     void _applyOplogBatch(TenantOplogBatch* batch);
-    Status _applyOplogBatchPerWorker(std::vector<const OplogEntry*>* ops);
+    Status _applyOplogBatchPerWorker(std::vector<ApplierOperation>* ops);
     void _checkNsAndUuidsBelongToTenant(OperationContext* opCtx, const TenantOplogBatch& batch);
     OpTimePair _writeNoOpEntries(OperationContext* opCtx, const TenantOplogBatch& batch);
 
-    using TenantNoOpEntry = std::pair<const OplogEntry*, std::vector<OplogSlot>::iterator>;
+    using TenantNoOpEntry = std::pair<ApplierOperation, std::vector<OplogSlot>::iterator>;
     void _writeNoOpsForRange(OpObserver* opObserver,
                              std::vector<TenantNoOpEntry>::const_iterator begin,
                              std::vector<TenantNoOpEntry>::const_iterator end);
@@ -135,8 +139,8 @@ private:
                                             const OplogEntryOrGroupedInserts& entryOrGroupedInserts,
                                             OplogApplication::Mode oplogApplicationMode,
                                             bool isDataConsistent);
-    std::vector<std::vector<const OplogEntry*>> _fillWriterVectors(OperationContext* opCtx,
-                                                                   TenantOplogBatch* batch);
+    std::vector<std::vector<ApplierOperation>> _fillWriterVectors(OperationContext* opCtx,
+                                                                  TenantOplogBatch* batch);
 
     /**
      * Sets the _finalStatus to the new status if and only if the old status is "OK".
@@ -159,8 +163,11 @@ private:
     // Handles consuming oplog entries from the OplogBuffer for oplog application.
     std::shared_ptr<TenantOplogBatcher> _oplogBatcher;  // (R)
     const UUID _migrationUuid;                          // (R)
-    const std::string _tenantId;                        // (R)
-    const OpTime _beginApplyingAfterOpTime;             // (R)
+    const MigrationProtocolEnum _protocol;              // (R)
+    // For multi-tenant migration protocol, _tenantId is set.
+    // But, for shard merge protcol, _tenantId is empty.
+    const boost::optional<std::string> _tenantId;       // (R)
+    const OpTime _startApplyingAfterOpTime;             // (R)
     RandomAccessOplogBuffer* _oplogBuffer;              // (R)
     std::shared_ptr<executor::TaskExecutor> _executor;  // (R)
     // All no-op entries written by this tenant migration should have OpTime greater than this

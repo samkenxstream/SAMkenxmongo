@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -36,10 +35,10 @@
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/catalog/list_indexes.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/cursor_manager.h"
@@ -60,8 +59,48 @@
 #include "mongo/logv2/log.h"
 #include "mongo/util/uuid.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
 namespace mongo {
 namespace {
+
+// The allowed fields have to be in sync with those defined in 'src/mongo/db/list_indexes.idl'.
+static std::set<StringData> allowedFieldNames = {
+    ListIndexesReplyItem::k2dsphereIndexVersionFieldName,
+    ListIndexesReplyItem::kBackgroundFieldName,
+    ListIndexesReplyItem::kBitsFieldName,
+    ListIndexesReplyItem::kBucketSizeFieldName,
+    ListIndexesReplyItem::kBuildUUIDFieldName,
+    ListIndexesReplyItem::kClusteredFieldName,
+    ListIndexesReplyItem::kCoarsestIndexedLevelFieldName,
+    ListIndexesReplyItem::kCollationFieldName,
+    ListIndexesReplyItem::kDefault_languageFieldName,
+    ListIndexesReplyItem::kDropDupsFieldName,
+    ListIndexesReplyItem::kExpireAfterSecondsFieldName,
+    ListIndexesReplyItem::kFinestIndexedLevelFieldName,
+    ListIndexesReplyItem::kHiddenFieldName,
+    ListIndexesReplyItem::kIndexBuildInfoFieldName,
+    ListIndexesReplyItem::kKeyFieldName,
+    ListIndexesReplyItem::kLanguage_overrideFieldName,
+    ListIndexesReplyItem::kMaxFieldName,
+    ListIndexesReplyItem::kMinFieldName,
+    ListIndexesReplyItem::kNameFieldName,
+    ListIndexesReplyItem::kNsFieldName,
+    ListIndexesReplyItem::kOriginalSpecFieldName,
+    ListIndexesReplyItem::kPartialFilterExpressionFieldName,
+    ListIndexesReplyItem::kPrepareUniqueFieldName,
+    ListIndexesReplyItem::kSparseFieldName,
+    ListIndexesReplyItem::kSpecFieldName,
+    ListIndexesReplyItem::kStorageEngineFieldName,
+    ListIndexesReplyItem::kTextIndexVersionFieldName,
+    ListIndexesReplyItem::kUniqueFieldName,
+    ListIndexesReplyItem::kVFieldName,
+    ListIndexesReplyItem::kWeightsFieldName,
+    ListIndexesReplyItem::kWildcardProjectionFieldName,
+    ListIndexesReplyItem::kColumnstoreProjectionFieldName,
+    ListIndexesReplyItem::kColumnstoreCompressorFieldName,
+};
 
 /**
  * Returns index specs, with resolved namespace, from the catalog for this listIndexes request.
@@ -74,9 +113,9 @@ IndexSpecsWithNamespaceString getIndexSpecsWithNamespaceString(OperationContext*
     bool buildUUID = cmd.getIncludeBuildUUIDs().value_or(false);
     bool indexBuildInfo = cmd.getIncludeIndexBuildInfo().value_or(false);
     invariant(!(buildUUID && indexBuildInfo));
-    ListIndexesInclude additionalInclude = buildUUID
-        ? ListIndexesInclude::BuildUUID
-        : indexBuildInfo ? ListIndexesInclude::IndexBuildInfo : ListIndexesInclude::Nothing;
+    ListIndexesInclude additionalInclude = buildUUID ? ListIndexesInclude::BuildUUID
+        : indexBuildInfo                             ? ListIndexesInclude::IndexBuildInfo
+                                                     : ListIndexesInclude::Nothing;
 
     // Since time-series collections don't have UUIDs, we skip the time-series lookup
     // if the target collection is specified as a UUID.
@@ -178,6 +217,10 @@ public:
         return "list indexes for a collection";
     }
 
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
     class Invocation final : public InvocationBaseGen {
     public:
         using InvocationBaseGen::InvocationBaseGen;
@@ -190,10 +233,10 @@ public:
             auto nss = request().getNamespaceOrUUID();
             if (nss.uuid()) {
                 // UUID requires opCtx to resolve, settle on just the dbname.
-                return NamespaceString(request().getDbName(), "");
+                return NamespaceString(request().getDbName());
             }
             invariant(nss.nss());
-            return nss.nss().get();
+            return nss.nss().value();
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const final {
@@ -271,7 +314,7 @@ public:
                                             nss));
 
             std::vector<mongo::ListIndexesReplyItem> firstBatch;
-            size_t bytesBuffered = 0;
+            FindCommon::BSONArrayResponseSizeTracker responseSizeTracker;
             for (long long objCount = 0; objCount < batchSize; objCount++) {
                 BSONObj nextDoc;
                 PlanExecutor::ExecState state = exec->getNext(&nextDoc, nullptr);
@@ -279,26 +322,30 @@ public:
                     break;
                 }
                 invariant(state == PlanExecutor::ADVANCED);
+                nextDoc = index_key_validate::repairIndexSpec(nss, nextDoc, allowedFieldNames);
 
                 // If we can't fit this result inside the current batch, then we stash it for
                 // later.
-                if (!FindCommon::haveSpaceForNext(nextDoc, objCount, bytesBuffered)) {
-                    exec->enqueue(nextDoc);
+                if (!responseSizeTracker.haveSpaceForNext(nextDoc)) {
+                    exec->stashResult(nextDoc);
                     break;
                 }
 
                 try {
                     firstBatch.push_back(ListIndexesReplyItem::parse(
-                        IDLParserErrorContext("ListIndexesReplyItem"), nextDoc));
+                        IDLParserContext("ListIndexesReplyItem"), nextDoc));
                 } catch (const DBException& exc) {
                     LOGV2_ERROR(5254500,
                                 "Could not parse catalog entry while replying to listIndexes",
                                 "entry"_attr = nextDoc,
                                 "error"_attr = exc);
                     uasserted(5254501,
-                              "Could not parse catalog entry while replying to listIndexes");
+                              fmt::format("Could not parse catalog entry while replying to "
+                                          "listIndexes. Entry: '{}'. Error: '{}'.",
+                                          nextDoc.toString(),
+                                          exc.toString()));
                 }
-                bytesBuffered += nextDoc.objsize();
+                responseSizeTracker.add(nextDoc);
             }
 
             if (exec->isEOF()) {
@@ -313,7 +360,7 @@ public:
                 opCtx,
                 {std::move(exec),
                  nss,
-                 AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                 AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserName(),
                  APIParameters::get(opCtx),
                  opCtx->getWriteConcern(),
                  repl::ReadConcernArgs::get(opCtx),

@@ -31,7 +31,7 @@ global:
         - "mongo/db/timeseries/timeseries_global_options.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 server_parameters:
     "timeseriesBucketMaxCount":
@@ -62,6 +62,27 @@ server_parameters:
         cpp_varname: "gTimeseriesIdleBucketExpiryMaxCountPerAttempt"
         default:  3
         validator: { gte: 2 }
+    "timeseriesBucketMinCount":
+        description: "Time-series buckets that need to be closed due to size
+                      (timeseriesBucketMaxSize) but haven't crossed this threshold are considered to
+                      contain large measurements, and will be kept open to improve bucketing
+                      performance. These buckets will be closed when they reach the threshold or if
+                      the bucket is close to the max BSON size limit. Setting this to 1 disables
+                      this behaviour."
+        set_at: [ startup ]
+        cpp_vartype: "std::int32_t"
+        cpp_varname: "gTimeseriesBucketMinCount"
+        default:  10
+        validator: { gte: 1 }
+    "timeseriesBucketMinSize":
+        description: "If there is high memory pressure on the system, we will lower the maximum 
+                      size (in bytes) of measurements we pack into buckets. This value represents
+                      the absolute lowest size we will limit buckets to."
+        set_at: [ startup ]
+        cpp_vartype: "std::int32_t"
+        cpp_varname: "gTimeseriesBucketMinSize"
+        default: 5120 # 5KB
+        validator: { gte: 1 }
 
 enums:
     BucketGranularity:
@@ -83,25 +104,33 @@ structs:
                               documents must have this field, and the field must be of the BSON UTC
                               datetime type (0x9)"
                 type: string
-                unstable: false
+                stability: stable
             metaField:
                 description: "The name of the top-level field describing the series. This field is
                               used to group related data and may be of any BSON type. This may not 
                               be \"_id\" or the same as 'timeField'."
                 type: string
                 optional: true
-                unstable: false
+                stability: stable
             granularity:
                 description: "Describes the expected interval between subsequent measurements"
                 type: BucketGranularity
-                default: Seconds
-                unstable: false
+                optional: true
+                stability: stable
+            bucketRoundingSeconds:
+                description: "Used to determine the minimum time boundary when opening a new bucket 
+                              by rounding the first timestamp down to the next multiple of this 
+                              value. Specified in seconds."
+                type: safeInt
+                optional: true
+                validator: { gte: 1, lte: 31536000 }
+                stability: stable
             bucketMaxSpanSeconds:
                 description: "The maximum range of time values for a bucket, in seconds"
                 type: safeInt
                 optional: true
-                validator: { gte: 1 }
-                unstable: false
+                validator: { gte: 1, lte: 31536000 }
+                stability: stable
 
     CollModTimeseries:
         description: "A type representing the adjustable options on timeseries collections"
@@ -110,4 +139,14 @@ structs:
             granularity:
                 optional: true
                 type: BucketGranularity
-                unstable: false
+                stability: stable
+            bucketRoundingSeconds:
+                optional: true
+                type: safeInt
+                stability: unstable
+                validator: { gte: 1, lte: 31536000 }
+            bucketMaxSpanSeconds:
+                optional: true
+                type: safeInt
+                stability: unstable
+                validator: { gte: 1, lte: 31536000 }

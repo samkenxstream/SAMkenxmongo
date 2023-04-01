@@ -50,12 +50,14 @@ DEFAULT_GENNY_EXECUTABLE = os.path.normpath("genny/build/src/driver/genny")
 
 # Names below correspond to how they are specified via the command line or in the options YAML file.
 DEFAULTS = {
+    "auto_kill": "on",
     "always_use_log_files": False,
     "archive_limit_mb": 5000,
     "archive_limit_tests": 10,
     "base_port": 20000,
     "backup_on_restart_dir": None,
-    "buildlogger_url": "https://logkeeper.mongodb.org",
+    "buildlogger_url": "https://logkeeper2.build.10gen.cc",
+    "catalog_shard": None,
     "continue_on_failure": False,
     "dbpath_prefix": None,
     "dbtest_executable": None,
@@ -63,7 +65,8 @@ DEFAULTS = {
     "exclude_with_any_tags": None,
     "flow_control": None,
     "flow_control_tickets": None,
-    "fuzz_mongod_configs": False,
+    "force_excluded_tests": False,
+    "fuzz_mongod_configs": None,
     "config_fuzz_seed": None,
     "genny_executable": None,
     "include_with_any_tags": None,
@@ -91,14 +94,14 @@ DEFAULTS = {
     "report_failure_status": "fail",
     "report_file": None,
     "run_all_feature_flag_tests": False,
-    "run_all_feature_flags_no_tests": False,
+    "run_no_feature_flag_tests": False,
     "additional_feature_flags": None,
+    "additional_feature_flags_file": None,
     "seed": int(time.time() * 256),  # Taken from random.py code in Python 2.7.
     "service_executor": None,
     "shell_conn_string": None,
     "shell_port": None,
     "shuffle": None,
-    "spawn_using": None,
     "stagger_jobs": None,
     "majority_read_concern": "on",
     "storage_engine": "wiredTiger",
@@ -132,10 +135,6 @@ DEFAULTS = {
     "task_doc": None,
     "variant_name": None,
     "version_id": None,
-
-    # Cedar options.
-    "cedar_url": "cedar.mongodb.com",
-    "cedar_rpc_port": "7070",
 
     # WiredTiger options.
     "wt_coll_config": None,
@@ -270,6 +269,9 @@ class MultiversionOptions(object):
 # Variables that are set by the user at the command line or with --options.
 ##
 
+# Allow resmoke permission to automatically kill existing rogue mongo processes.
+AUTO_KILL = "on"
+
 # Log to files located in the db path and don't clean dbpaths after tests.
 ALWAYS_USE_LOG_FILES = False
 
@@ -289,12 +291,6 @@ BASE_PORT = None
 # The root url of the buildlogger server.
 BUILDLOGGER_URL = None
 
-# URL to connect to the Cedar service.
-CEDAR_URL = None
-
-# Cedar gRPC service port.
-CEDAR_RPC_PORT = None
-
 # Root directory for where resmoke.py puts directories containing data files of mongod's it starts,
 # as well as those started by individual tests.
 DBPATH_PREFIX = None
@@ -305,6 +301,9 @@ DBTEST_EXECUTABLE = None
 # If set to "tests", then resmoke.py will output the tests that would be run by each suite (without
 # actually running them).
 DRY_RUN = None
+
+# If set, specifies which node is the catalog shard. Can also be set to 'any'.
+CATALOG_SHARD = None
 
 # URL to connect to the Evergreen service.
 EVERGREEN_URL = None
@@ -351,13 +350,16 @@ EVERGREEN_VERSION_ID = None
 # If set, then any jstests that have any of the specified tags will be excluded from the suite(s).
 EXCLUDE_WITH_ANY_TAGS = None
 
+# Allow test files passed as positional args to run even if they are excluded on the suite config.
+FORCE_EXCLUDED_TESTS = None
+
 # A tag which is implicited excluded. This is useful for temporarily disabling a test.
 EXCLUDED_TAG = "__TEMPORARILY_DISABLED__"
 
 # If true, then a test failure or error will cause resmoke.py to exit and not run any more tests.
 FAIL_FAST = None
 
-FUZZ_MONGOD_CONFIGS = False
+FUZZ_MONGOD_CONFIGS = None
 CONFIG_FUZZ_SEED = None
 
 # Executable file for genny, passed in as a command line arg.
@@ -386,8 +388,11 @@ INSTALL_DIR = None
 # Whether to run tests for feature flags.
 RUN_ALL_FEATURE_FLAG_TESTS = None
 
-# Whether to run the server with feature flags. Defaults to true if `RUN_ALL_FEATURE_FLAG_TESTS` is true.
-RUN_ALL_FEATURE_FLAGS = None
+# Whether to run the tests with enabled feature flags
+RUN_NO_FEATURE_FLAG_TESTS = None
+
+# the path to a file containing feature flags
+ADDITIONAL_FEATURE_FLAGS_FILE = None
 
 # List of enabled feature flags.
 ENABLED_FEATURE_FLAGS = []
@@ -460,14 +465,6 @@ SHELL_CONN_STRING = None
 # If true, then the order the tests run in is randomized. Otherwise the tests will run in
 # alphabetical (case-insensitive) order.
 SHUFFLE = None
-
-# Possible values are python and jasper. If python, resmoke uses the python built-in subprocess
-# or subprocess32 module to spawn threads. If jasper, resmoke uses the jasper module.
-SPAWN_USING = None
-
-# The connection string to the jasper service, populated when the service is
-# initialized in TestRunner.
-JASPER_CONNECTION_STR = None
 
 # If true, the launching of jobs is staggered in resmoke.py.
 STAGGER_JOBS = None
@@ -595,3 +592,12 @@ SHORTEN_LOGGER_NAME_CONFIG: dict = {}
 # that get loaded for multiversion tests can behave correctly on master and on v5.0; the latter
 # case runs 5.0 and 4.4 binaries and has this value set to True. Can be removed after 6.0.
 USE_LEGACY_MULTIVERSION = True
+
+# Expansions file location
+# in CI, the expansions file is located in the ${workdir}, one dir up
+# from src, the checkout directory
+EXPANSIONS_FILE = "../expansions.yml" if 'CI' in os.environ else None
+
+# Symbolizer secrets
+SYMBOLIZER_CLIENT_SECRET = None
+SYMBOLIZER_CLIENT_ID = None

@@ -95,10 +95,9 @@ private:
 
 class ChangeStreamOplogCollectionMock : public CollectionMock {
 public:
-    ChangeStreamOplogCollectionMock()
-        : CollectionMock(TenantNamespace(boost::none, NamespaceString::kRsOplogNamespace)) {
+    ChangeStreamOplogCollectionMock() : CollectionMock(NamespaceString::kRsOplogNamespace) {
         _recordStore =
-            _devNullEngine.getRecordStore(nullptr, NamespaceString::kRsOplogNamespace.ns(), "", {});
+            _devNullEngine.getRecordStore(nullptr, NamespaceString::kRsOplogNamespace, "", {});
     }
 
     void push_back(Document doc) {
@@ -168,7 +167,7 @@ public:
         : DocumentSourceMock({}, expCtx), _collectionPtr(&_collection) {
         _filterExpr = BSON("ns" << kTestNs);
         _filter = MatchExpressionParser::parseAndNormalize(_filterExpr, pExpCtx);
-        _params.assertTsHasNotFallenOffOplog = Timestamp(0);
+        _params.assertTsHasNotFallenOff = Timestamp(0);
         _params.shouldTrackLatestOplogTimestamp = true;
         _params.minRecord = RecordIdBound(RecordId(0));
         _params.tailable = true;
@@ -179,7 +178,7 @@ public:
         _filterExpr = BSON("ns" << kTestNs << "ts" << BSON("$gte" << resumeToken.clusterTime));
         _filter = MatchExpressionParser::parseAndNormalize(_filterExpr, pExpCtx);
         _params.minRecord = RecordIdBound(RecordId(resumeToken.clusterTime.asLL()));
-        _params.assertTsHasNotFallenOffOplog = resumeToken.clusterTime;
+        _params.assertTsHasNotFallenOff = resumeToken.clusterTime;
     }
 
     void push_back(GetNextResult&& result) {
@@ -207,10 +206,6 @@ protected:
         if (!_collScan) {
             _collScan = std::make_unique<CollectionScan>(
                 pExpCtx.get(), _collectionPtr, _params, &_ws, _filter.get());
-            // The first call to doWork will create the cursor and return NEED_TIME. But it won't
-            // actually scan any of the documents that are present in the mock cursor queue.
-            ASSERT_EQ(_collScan->doWork(nullptr), PlanStage::NEED_TIME);
-            ASSERT_EQ(_getNumDocsTested(), 0);
         }
         while (true) {
             // If the next result is a pause, return it and don't collscan.
@@ -229,6 +224,7 @@ protected:
                     // entry into the oplog. This is like a stripped-down DSCSTransform stage.
                     MutableDocument mutableDoc{_ws.get(id)->doc.value()};
                     mutableDoc["_id"] = nextResult.getDocument()["_id"];
+                    mutableDoc.metadata().setSortKey(nextResult.getDocument()["_id"], true);
                     return mutableDoc.freeze();
                 }
                 case PlanStage::NEED_TIME:
@@ -386,7 +382,9 @@ protected:
     }
     intrusive_ptr<DocumentSourceChangeStreamCheckResumability> createDSCheckResumability(
         Timestamp ts) {
-        return createDSCheckResumability(ResumeToken::makeHighWaterMarkToken(ts).getData());
+        return createDSCheckResumability(
+            ResumeToken::makeHighWaterMarkToken(ts, ResumeTokenData::kDefaultTokenVersion)
+                .getData());
     }
 };
 
@@ -482,8 +480,12 @@ TEST_F(CheckResumeTokenTest, ShouldFailIfTokenHasWrongNamespace) {
     Timestamp resumeTimestamp(100, 1);
 
     auto resumeTokenUUID = UUID::gen();
-    auto checkResumeToken = createDSEnsureResumeTokenPresent(resumeTimestamp, "1", resumeTokenUUID);
     auto otherUUID = UUID::gen();
+    ASSERT_NE(resumeTokenUUID, otherUUID);
+    if (resumeTokenUUID > otherUUID) {
+        std::swap(resumeTokenUUID, otherUUID);
+    }
+    auto checkResumeToken = createDSEnsureResumeTokenPresent(resumeTimestamp, "1", resumeTokenUUID);
     addOplogEntryOnTestNS(resumeTimestamp, "1", otherUUID);
     ASSERT_THROWS_CODE(
         checkResumeToken->getNext(), AssertionException, ErrorCodes::ChangeStreamFatalError);
@@ -650,10 +652,13 @@ TEST_F(CheckResumeTokenTest, ShouldSwallowInvalidateFromEachShardForStartAfterIn
     // Create a resume token representing an 'invalidate' event, and use it to seed the stage. A
     // resume token with {fromInvalidate:true} can only be used with startAfter, to start a new
     // stream after the old stream is invalidated.
-    ResumeTokenData invalidateToken;
-    invalidateToken.clusterTime = resumeTimestamp;
-    invalidateToken.uuid = uuids[0];
-    invalidateToken.fromInvalidate = ResumeTokenData::kFromInvalidate;
+    auto eventIdentifier = Value{Document{{"operationType", "drop"_sd}}};
+    ResumeTokenData invalidateToken{resumeTimestamp,
+                                    ResumeTokenData::kDefaultTokenVersion,
+                                    /* txnOpIndex */ 0,
+                                    uuids[0],
+                                    std::move(eventIdentifier),
+                                    ResumeTokenData::kFromInvalidate};
     auto checkResumeToken = createDSEnsureResumeTokenPresent(invalidateToken);
 
     // Add three documents which each have the invalidate resume token. We expect to see this in the
@@ -690,10 +695,13 @@ TEST_F(CheckResumeTokenTest, ShouldNotSwallowUnrelatedInvalidateForStartAfterInv
     // Create a resume token representing an 'invalidate' event, and use it to seed the stage. A
     // resume token with {fromInvalidate:true} can only be used with startAfter, to start a new
     // stream after the old stream is invalidated.
-    ResumeTokenData invalidateToken;
-    invalidateToken.clusterTime = resumeTimestamp;
-    invalidateToken.uuid = uuids[0];
-    invalidateToken.fromInvalidate = ResumeTokenData::kFromInvalidate;
+    auto eventIdentifier = Value{Document{{"operationType", "drop"_sd}}};
+    ResumeTokenData invalidateToken{resumeTimestamp,
+                                    ResumeTokenData::kDefaultTokenVersion,
+                                    /* txnOpIndex */ 0,
+                                    uuids[0],
+                                    eventIdentifier,
+                                    ResumeTokenData::kFromInvalidate};
     auto checkResumeToken = createDSEnsureResumeTokenPresent(invalidateToken);
 
     // Create a second invalidate token with the same clusterTime but a different UUID.

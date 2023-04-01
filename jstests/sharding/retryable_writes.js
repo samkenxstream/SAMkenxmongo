@@ -1,16 +1,11 @@
 /**
  * Test basic retryable write without errors by checking that the resulting collection after the
  * retry is as expected and it does not create additional oplog entries.
+ *
+ * @tags: [temporary_catalog_shard_incompatible]
  */
 (function() {
 "use strict";
-
-load("jstests/libs/retryable_writes_util.js");
-
-if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
-    jsTestLog("Retryable writes are not supported, skipping test");
-    return;
-}
 
 function checkFindAndModifyResult(expected, toCheck) {
     assert.eq(expected.ok, toCheck.ok);

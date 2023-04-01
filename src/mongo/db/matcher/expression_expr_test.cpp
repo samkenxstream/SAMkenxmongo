@@ -37,6 +37,8 @@
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/inline_auto_update.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -77,8 +79,16 @@ public:
         return _matchExpression->matchesBSON(doc);
     }
 
+    MatchExpression* getMatchExpression() {
+        return _matchExpression.get();
+    }
+
     ExprMatchExpression* getExprMatchExpression() {
         return checked_cast<ExprMatchExpression*>(_matchExpression.get());
+    }
+
+    BSONObj serialize(SerializationOptions opts) {
+        return _matchExpression->serialize(opts);
     }
 
 private:
@@ -605,9 +615,13 @@ TEST_F(ExprMatchTest, ReturnsFalseInsteadOfErrorWithFailpointSet) {
 }
 
 TEST(ExprMatchTest, IdenticalPostOptimizedExpressionsAreEquivalent) {
-    BSONObj expression = BSON("$expr" << BSON("$multiply" << BSON_ARRAY(2 << 2)));
-    BSONObj expressionEquiv = BSON("$expr" << BSON("$const" << 4));
-    BSONObj expressionNotEquiv = BSON("$expr" << BSON("$const" << 10));
+    BSONObj expression =
+        BSON("$expr" << BSON("$ifNull" << BSON_ARRAY("$NO_SUCH_FIELD"
+                                                     << BSON("$multiply" << BSON_ARRAY(2 << 2)))));
+    BSONObj expressionEquiv =
+        BSON("$expr" << BSON("$ifNull" << BSON_ARRAY("$NO_SUCH_FIELD" << BSON("$const" << 4))));
+    BSONObj expressionNotEquiv =
+        BSON("$expr" << BSON("$ifNull" << BSON_ARRAY("$NO_SUCH_FIELD" << BSON("$const" << 10))));
 
     // Create and optimize an ExprMatchExpression.
     const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
@@ -633,11 +647,12 @@ TEST(ExprMatchTest, ExpressionOptimizeRewritesVariableDereferenceAsConstant) {
     const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     auto varId = expCtx->variablesParseState.defineVariable("var");
     expCtx->variables.setConstantValue(varId, Value(4));
-
-    BSONObj expression = BSON("$expr"
-                              << "$$var");
-    BSONObj expressionEquiv = BSON("$expr" << BSON("$const" << 4));
-    BSONObj expressionNotEquiv = BSON("$expr" << BSON("$const" << 10));
+    BSONObj expression = BSON("$expr" << BSON("$ifNull" << BSON_ARRAY("$NO_SUCH_FIELD"
+                                                                      << "$$var")));
+    BSONObj expressionEquiv =
+        BSON("$expr" << BSON("$ifNull" << BSON_ARRAY("$NO_SUCH_FIELD" << BSON("$const" << 4))));
+    BSONObj expressionNotEquiv =
+        BSON("$expr" << BSON("$ifNull" << BSON_ARRAY("$NO_SUCH_FIELD" << BSON("$const" << 10))));
 
     // Create and optimize an ExprMatchExpression.
     std::unique_ptr<MatchExpression> matchExpr =
@@ -690,7 +705,7 @@ TEST(ExprMatchTest, OptimizingAnAlreadyOptimizedCloneIsANoop) {
 
     // Clone the match expression and optimize it again. We expect the twice-optimized match
     // expression to be equivalent to the once-optimized one.
-    std::unique_ptr<MatchExpression> doublyOptimized = singlyOptimized->shallowClone();
+    std::unique_ptr<MatchExpression> doublyOptimized = singlyOptimized->clone();
     doublyOptimized = MatchExpression::optimize(std::move(doublyOptimized));
     ASSERT_TRUE(doublyOptimized->equivalent(singlyOptimized.get()));
 }
@@ -700,8 +715,8 @@ TEST(ExprMatchTest, ShallowClonedExpressionIsEquivalentToOriginal) {
 
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     ExprMatchExpression pipelineExpr(expression.firstElement(), std::move(expCtx));
-    auto shallowClone = pipelineExpr.shallowClone();
-    ASSERT_TRUE(pipelineExpr.equivalent(shallowClone.get()));
+    auto clone = pipelineExpr.clone();
+    ASSERT_TRUE(pipelineExpr.equivalent(clone.get()));
 }
 
 TEST(ExprMatchTest, OptimizingExprAbsorbsAndOfAnd) {
@@ -714,26 +729,269 @@ TEST(ExprMatchTest, OptimizingExprAbsorbsAndOfAnd) {
 
     // The optimized match expression should not have and AND children of AND nodes. This should be
     // collapsed during optimization.
-    BSONObj serialized;
-    {
-        BSONObjBuilder builder;
-        optimized->serialize(&builder, true);
-        serialized = builder.obj();
-    }
-
     BSONObj expectedSerialization = fromjson(
         "{$and: [{$expr: {$and: [{$eq: ['$a', {$const: 1}]}, {$eq: ['$b', {$const: 2}]}]}},"
         "{a: {$_internalExprEq: 1}}, {b: {$_internalExprEq: 2}}]}");
-    ASSERT_BSONOBJ_EQ(serialized, expectedSerialization);
+    ASSERT_BSONOBJ_EQ(optimized->serialize(), expectedSerialization);
+}
+
+TEST(ExprMatchTest, OptimizingExprRemovesTrueConstantExpression) {
+    auto exprBson = fromjson("{$expr: true}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+
+    auto matchExpr =
+        std::make_unique<ExprMatchExpression>(exprBson.firstElement(), std::move(expCtx));
+    auto optimized = MatchExpression::optimize(std::move(matchExpr));
+
+    auto serialization = optimized->serialize();
+    auto expectedSerialization = fromjson("{}");
+    ASSERT_BSONOBJ_EQ(serialization, expectedSerialization);
+}
+
+TEST(ExprMatchTest, OptimizingExprRemovesTruthyConstantExpression) {
+    auto exprBson = fromjson("{$expr: {$concat: ['a', 'b', 'c']}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+
+    auto matchExpr =
+        std::make_unique<ExprMatchExpression>(exprBson.firstElement(), std::move(expCtx));
+    auto optimized = MatchExpression::optimize(std::move(matchExpr));
+
+    auto serialization = optimized->serialize();
+    auto expectedSerialization = fromjson("{}");
+    ASSERT_BSONOBJ_EQ(serialization, expectedSerialization);
+}
+
+TEST_F(ExprMatchTest, ExprWithTrueConstantExpressionIsTriviallyTrue) {
+    createMatcher(fromjson("{$expr: true}"));
+    ASSERT_TRUE(getMatchExpression()->isTriviallyTrue());
+}
+
+TEST_F(ExprMatchTest, ExprWithTruthyConstantExpressionIsTriviallyTrue) {
+    createMatcher(fromjson("{$expr: {$concat: ['a', 'b', 'c']}}"));
+    ASSERT_TRUE(getMatchExpression()->isTriviallyTrue());
+}
+
+TEST_F(ExprMatchTest, ExprWithNonConstantExpressionIsNotTriviallyTrue) {
+    createMatcher(fromjson("{$expr: {$concat: ['$a', '$b', '$c']}}"));
+    ASSERT_FALSE(getMatchExpression()->isTriviallyTrue());
+}
+
+TEST_F(ExprMatchTest, ExprWithFalsyConstantExpressionIsNotTriviallyTrue) {
+    createMatcher(fromjson("{$expr: {$sum: [1, -1]}}"));
+    ASSERT_FALSE(getMatchExpression()->isTriviallyTrue());
 }
 
 TEST_F(ExprMatchTest, ExpressionEvaluationReturnsResultsCorrectly) {
-    createMatcher(fromjson("{$expr: -2}"));
+    createMatcher(fromjson("{$expr: {$ifNull: ['$NO_SUCH_FIELD', -2]}}"));
     BSONMatchableDocument document{BSONObj{}};
     auto expressionResult = getExprMatchExpression()->evaluateExpression(&document);
     ASSERT_TRUE(expressionResult.integral());
     ASSERT_EQUALS(-2, expressionResult.coerceToInt());
 }
 
+DEATH_TEST_REGEX(ExprMatchTest, GetChildFailsIndexGreaterThanZero, "Tripwire assertion.*6400207") {
+    BSONObj exprBson = fromjson("{$expr: {$and: [{$eq: ['$a', 1]}, {$eq: ['$b', 2]}]}}");
+
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matchExpr =
+        std::make_unique<ExprMatchExpression>(exprBson.firstElement(), std::move(expCtx));
+
+    ASSERT_EQ(matchExpr->numChildren(), 0);
+    ASSERT_THROWS_CODE(matchExpr->getChild(0), AssertionException, 6400207);
+}
+
+/**
+ * A default redaction strategy that generates easy to check results for testing purposes.
+ */
+std::string redactFieldNameForTest(StringData s) {
+    return str::stream() << "HASH<" << s << ">";
+}
+
+TEST_F(ExprMatchTest, ExprRedactsCorrectly) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    createMatcher(fromjson("{$expr: {$sum: [\"$a\", \"$b\"]}}"));
+
+    SerializationOptions opts;
+    opts.redactFieldNamesStrategy = redactFieldNameForTest;
+    opts.redactFieldNames = true;
+    opts.replacementForLiteralArgs = "?";
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"$expr":{"$sum":["$HASH<a>","$HASH<b>"]}})",
+        serialize(opts));
+
+    createMatcher(fromjson("{$expr: {$sum: [\"$a\", \"b\"]}}"));
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"$expr":{"$sum":["$HASH<a>",{"$const":"?"}]}})",
+        serialize(opts));
+
+    createMatcher(fromjson("{$expr: {$sum: [\"$a.b\", \"$b\"]}}"));
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"$expr":{"$sum":["$HASH<a>.HASH<b>","$HASH<b>"]}})",
+        serialize(opts));
+
+    createMatcher(fromjson("{$expr: {$eq: [\"$a\", \"$$NOW\"]}}"));
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"$expr":{"$eq":["$HASH<a>","$$NOW"]}})",
+        serialize(opts));
+
+    createMatcher(fromjson("{$expr: {$eq: [\"$a\", \"$$NOW\"]}}"));
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"$expr":{"$eq":["$HASH<a>","$$NOW"]}})",
+        serialize(opts));
+
+    createMatcher(fromjson("{$expr: {$getField: {field: \"b\", input: {a: 1, b: 2}}}}"));
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"$expr":{"$getField":{"field":"HASH<b>","input":{"$const":"?"}}}})",
+        serialize(opts));
+
+    createMatcher(fromjson("{$expr: {$getField: {field: \"b\", input: \"$a\"}}}"));
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"$expr":{"$getField":{"field":"HASH<b>","input":"$HASH<a>"}}})",
+        serialize(opts));
+
+    createMatcher(fromjson("{$expr: {$getField: {field: \"b\", input: {a: 1, b: \"$c\"}}}}"));
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$expr": {
+                "$getField": {
+                    "field": "HASH<b>",
+                    "input": {
+                        "HASH<a>": {
+                            "$const": "?"
+                        },
+                        "HASH<b>": "$HASH<c>"
+                    }
+                }
+            }
+        })",
+        serialize(opts));
+
+    createMatcher(fromjson("{$expr: {$getField: {field: \"b.c\", input: {a: 1, b: \"$c\"}}}}"));
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$expr": {
+                "$getField": {
+                    "field": "HASH<b>.HASH<c>",
+                    "input": {
+                        "HASH<a>": {
+                            "$const": "?"
+                        },
+                        "HASH<b>": "$HASH<c>"
+                    }
+                }
+            }
+        })",
+        serialize(opts));
+
+    createMatcher(
+        fromjson("{$expr: {$setField: {field: \"b\", input: {a: 1, b: \"$c\"}, value: 5}}}"));
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$expr": {
+                "$setField": {
+                    "field": "HASH<b>",
+                    "input": {
+                        "HASH<a>": {
+                            "$const": "?"
+                        },
+                        "HASH<b>": "$HASH<c>"
+                    },
+                    "value": {
+                        "$const": "?"
+                    }
+                }
+            }
+        })",
+        serialize(opts));
+
+    createMatcher(fromjson(
+        "{$expr: {$setField: {field: \"b.c\", input: {a: 1, b: \"$c\"}, value: \"$d\"}}}"));
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$expr": {
+                "$setField": {
+                    "field": "HASH<b>.HASH<c>",
+                    "input": {
+                        "HASH<a>": {
+                            "$const": "?"
+                        },
+                        "HASH<b>": "$HASH<c>"
+                    },
+                    "value": "$HASH<d>"
+                }
+            }
+        })",
+        serialize(opts));
+
+    createMatcher(fromjson(
+        "{$expr: {$setField: {field: \"b.c\", input: {a: 1, b: \"$c\"}, value: \"$d.e\"}}}"));
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$expr": {
+                "$setField": {
+                    "field": "HASH<b>.HASH<c>",
+                    "input": {
+                        "HASH<a>": {
+                            "$const": "?"
+                        },
+                        "HASH<b>": "$HASH<c>"
+                    },
+                    "value": "$HASH<d>.HASH<e>"
+                }
+            }
+        })",
+        serialize(opts));
+
+    createMatcher(
+        fromjson("{$expr: {$setField: {field: \"b\", input: {a: 1, b: \"$c\"}, value: {a: 1, b: 2, "
+                 "c: 3}}}}"));
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$expr": {
+                "$setField": {
+                    "field": "HASH<b>",
+                    "input": {
+                        "HASH<a>": {
+                            "$const": "?"
+                        },
+                        "HASH<b>": "$HASH<c>"
+                    },
+                    "value": {
+                        "$const": "?"
+                    }
+                }
+            }
+        })",
+        serialize(opts));
+
+    createMatcher(
+        fromjson("{$expr: {$setField: {field: \"b\", input: {a: 1, b: \"$c\"}, value: {a: 1, b: 2, "
+                 "c: \"$d\"}}}}"));
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$expr": {
+                "$setField": {
+                    "field": "HASH<b>",
+                    "input": {
+                        "HASH<a>": {
+                            "$const": "?"
+                        },
+                        "HASH<b>": "$HASH<c>"
+                    },
+                    "value": {
+                        "HASH<a>": {
+                            "$const": "?"
+                        },
+                        "HASH<b>": {
+                            "$const": "?"
+                        },
+                        "HASH<c>": "$HASH<d>"
+                    }
+                }
+            }
+        })",
+        serialize(opts));
+}
 }  // namespace
 }  // namespace mongo

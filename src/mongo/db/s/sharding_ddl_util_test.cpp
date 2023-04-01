@@ -27,16 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/logical_session_cache_noop.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
+#include "mongo/db/session/logical_session_cache_noop.h"
+#include "mongo/db/session/session_catalog_mongod.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
@@ -45,6 +43,8 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/unittest/unittest.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 namespace mongo {
 namespace {
 
@@ -52,15 +52,23 @@ class ShardingDDLUtilTest : public ConfigServerTestFixture {
 protected:
     ShardType shard0;
 
+private:
+    ReadWriteConcernDefaultsLookupMock _lookupMock;
+
     void setUp() override {
         setUpAndInitializeConfigDb();
+
+        // Manually instantiate the ReadWriteConcernDefaults decoration on the service
+        ReadWriteConcernDefaults::create(getServiceContext(), _lookupMock.getFetchDefaultsFn());
 
         // Create config.transactions collection
         auto opCtx = operationContext();
         DBDirectClient client(opCtx);
-        client.createCollection(NamespaceString::kSessionTransactionsTableNamespace.ns());
-        client.createCollection(NamespaceString::kConfigReshardingOperationsNamespace.ns());
-        client.createCollection(CollectionType::ConfigNS.ns());
+        client.createCollection(NamespaceString::kSessionTransactionsTableNamespace);
+        client.createIndexes(NamespaceString::kSessionTransactionsTableNamespace,
+                             {MongoDSessionCatalog::getConfigTxnPartialIndexSpec()});
+        client.createCollection(NamespaceString::kConfigReshardingOperationsNamespace);
+        client.createCollection(CollectionType::ConfigNS);
 
         LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
         TransactionCoordinatorService::get(operationContext())
@@ -78,7 +86,7 @@ protected:
     }
 };
 
-const NamespaceString kToNss("test.to");
+const NamespaceString kToNss = NamespaceString::createNamespaceString_forTest("test.to");
 
 // Query 'limit' objects from the database into an array.
 void findN(DBClientBase& client,
@@ -95,13 +103,105 @@ void findN(DBClientBase& client,
     }
 }
 
+TEST_F(ShardingDDLUtilTest, SerializeDeserializeErrorStatusWithoutExtraInfo) {
+    const Status sample{ErrorCodes::ForTestingOptionalErrorExtraInfo, "Dummy reason"};
+
+    BSONObjBuilder bsonBuilder;
+    sharding_ddl_util_serializeErrorStatusToBSON(sample, "status", &bsonBuilder);
+    const auto serialized = bsonBuilder.done();
+
+    const auto deserialized =
+        sharding_ddl_util_deserializeErrorStatusFromBSON(serialized.firstElement());
+
+    ASSERT_EQ(sample.code(), deserialized.code());
+    ASSERT_EQ(sample.reason(), deserialized.reason());
+    ASSERT(!deserialized.extraInfo());
+}
+
+TEST_F(ShardingDDLUtilTest, SerializeDeserializeErrorStatusWithExtraInfo) {
+    OptionalErrorExtraInfoExample::EnableParserForTest whenInScope;
+
+    const Status sample{
+        ErrorCodes::ForTestingOptionalErrorExtraInfo, "Dummy reason", fromjson("{data: 123}")};
+
+    BSONObjBuilder bsonBuilder;
+    sharding_ddl_util_serializeErrorStatusToBSON(sample, "status", &bsonBuilder);
+    const auto serialized = bsonBuilder.done();
+
+    const auto deserialized =
+        sharding_ddl_util_deserializeErrorStatusFromBSON(serialized.firstElement());
+
+    ASSERT_EQ(sample.code(), deserialized.code());
+    ASSERT_EQ(sample.reason(), deserialized.reason());
+    ASSERT(deserialized.extraInfo());
+    ASSERT(deserialized.extraInfo<OptionalErrorExtraInfoExample>());
+    ASSERT_EQ(deserialized.extraInfo<OptionalErrorExtraInfoExample>()->data, 123);
+}
+
+TEST_F(ShardingDDLUtilTest, SerializeDeserializeErrorStatusInvalid) {
+    BSONObjBuilder bsonBuilder;
+    ASSERT_THROWS_CODE(
+        sharding_ddl_util_serializeErrorStatusToBSON(Status::OK(), "status", &bsonBuilder),
+        DBException,
+        7418500);
+
+    const auto okStatusBSON =
+        BSON("status" << BSON("code" << ErrorCodes::OK << "codeName"
+                                     << ErrorCodes::errorString(ErrorCodes::OK)));
+    ASSERT_THROWS_CODE(
+        sharding_ddl_util_deserializeErrorStatusFromBSON(okStatusBSON.firstElement()),
+        DBException,
+        7418501);
+}
+
+TEST_F(ShardingDDLUtilTest, SerializeErrorStatusTooBig) {
+    const std::string longReason(1024 * 3, 'x');
+    const Status sample{ErrorCodes::ForTestingOptionalErrorExtraInfo, longReason};
+
+    BSONObjBuilder bsonBuilder;
+    sharding_ddl_util_serializeErrorStatusToBSON(sample, "status", &bsonBuilder);
+    const auto serialized = bsonBuilder.done();
+
+    const auto deserialized =
+        sharding_ddl_util_deserializeErrorStatusFromBSON(serialized.firstElement());
+
+    ASSERT_EQ(ErrorCodes::TruncatedSerialization, deserialized.code());
+    ASSERT_EQ(
+        "ForTestingOptionalErrorExtraInfo: "
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        deserialized.reason());
+    ASSERT(!deserialized.extraInfo());
+}
+
 // Test that config.collection document and config.chunks documents are properly updated from source
 // to destination collection metadata
 TEST_F(ShardingDDLUtilTest, ShardedRenameMetadata) {
     auto opCtx = operationContext();
     DBDirectClient client(opCtx);
 
-    const NamespaceString fromNss("test.from");
+    const NamespaceString fromNss = NamespaceString::createNamespaceString_forTest("test.from");
     const auto fromCollQuery = BSON(CollectionType::kNssFieldName << fromNss.ns());
 
     const auto toCollQuery = BSON(CollectionType::kNssFieldName << kToNss.ns());
@@ -114,13 +214,14 @@ TEST_F(ShardingDDLUtilTest, ShardedRenameMetadata) {
     const int nChunks = 10;
     std::vector<ChunkType> chunks;
     for (int i = 0; i < nChunks; i++) {
-        ChunkVersion chunkVersion(1, i, fromEpoch, collTimestamp);
+        ChunkVersion chunkVersion({fromEpoch, collTimestamp}, {1, uint32_t(i)});
         ChunkType chunk;
         chunk.setName(OID::gen());
         chunk.setCollectionUUID(collUUID);
         chunk.setVersion(chunkVersion);
         chunk.setShard(shard0.getName());
-        chunk.setHistory({ChunkHistory(Timestamp(1, i), shard0.getName())});
+        chunk.setOnCurrentShardSince(Timestamp(1, i));
+        chunk.setHistory({ChunkHistory(*chunk.getOnCurrentShardSince(), shard0.getName())});
         chunk.setMin(BSON("a" << i));
         chunk.setMax(BSON("a" << i + 1));
         chunks.push_back(chunk);
@@ -133,13 +234,14 @@ TEST_F(ShardingDDLUtilTest, ShardedRenameMetadata) {
     const auto toEpoch = OID::gen();
     const auto toUUID = UUID::gen();
     for (int i = 0; i < nChunks; i++) {
-        ChunkVersion chunkVersion(1, i, toEpoch, Timestamp(2));
+        ChunkVersion chunkVersion({toEpoch, Timestamp(2)}, {1, uint32_t(i)});
         ChunkType chunk;
         chunk.setName(OID::gen());
         chunk.setCollectionUUID(toUUID);
         chunk.setVersion(chunkVersion);
         chunk.setShard(shard0.getName());
-        chunk.setHistory({ChunkHistory(Timestamp(1, i), shard0.getName())});
+        chunk.setOnCurrentShardSince(Timestamp(1, i));
+        chunk.setHistory({ChunkHistory(*chunk.getOnCurrentShardSince(), shard0.getName())});
         chunk.setMin(BSON("a" << i));
         chunk.setMax(BSON("a" << i + 1));
         originalToChunks.push_back(chunk);
@@ -157,10 +259,16 @@ TEST_F(ShardingDDLUtilTest, ShardedRenameMetadata) {
     std::vector<BSONObj> fromChunks;
     findN(client, std::move(fromChunksRequest), nChunks, fromChunks);
 
-    auto fromCollType = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, fromNss);
+    auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+    auto catalogClient = Grid::get(opCtx)->catalogClient();
+    auto fromCollType = catalogClient->getCollection(opCtx, fromNss);
     // Perform the metadata rename
-    sharding_ddl_util::shardedRenameMetadata(
-        opCtx, fromCollType, kToNss, ShardingCatalogClient::kMajorityWriteConcern);
+    sharding_ddl_util::shardedRenameMetadata(opCtx,
+                                             configShard.get(),
+                                             catalogClient,
+                                             fromCollType,
+                                             kToNss,
+                                             ShardingCatalogClient::kMajorityWriteConcern);
 
     // Check that the FROM config.collections entry has been deleted
     ASSERT(client.findOne(CollectionType::ConfigNS, fromCollQuery).isEmpty());
@@ -210,13 +318,14 @@ TEST_F(ShardingDDLUtilTest, RenamePreconditionsAreMet) {
         opCtx, false /* sourceIsSharded */, kToNss, false /* dropTarget */);
 
     // Initialize a chunk
-    ChunkVersion chunkVersion(1, 1, OID::gen(), Timestamp(2, 1));
+    ChunkVersion chunkVersion({OID::gen(), Timestamp(2, 1)}, {1, 1});
     ChunkType chunk;
     chunk.setName(OID::gen());
     chunk.setCollectionUUID(UUID::gen());
     chunk.setVersion(chunkVersion);
     chunk.setShard(shard0.getName());
-    chunk.setHistory({ChunkHistory(Timestamp(1, 1), shard0.getName())});
+    chunk.setOnCurrentShardSince(Timestamp(1, 1));
+    chunk.setHistory({ChunkHistory(*chunk.getOnCurrentShardSince(), shard0.getName())});
     chunk.setMin(kMinBSONKey);
     chunk.setMax(kMaxBSONKey);
 
@@ -233,14 +342,15 @@ TEST_F(ShardingDDLUtilTest, RenamePreconditionsTargetNamespaceIsTooLong) {
     const std::string dbName{"test"};
 
     // Check that no exception is thrown if the namespace of the target collection is long enough
-    const NamespaceString longEnoughNss{
+    const NamespaceString longEnoughNss = NamespaceString::createNamespaceString_forTest(
         dbName + "." +
-        std::string(NamespaceString::MaxNsShardedCollectionLen - dbName.length() - 1, 'x')};
+        std::string(NamespaceString::MaxNsShardedCollectionLen - dbName.length() - 1, 'x'));
     sharding_ddl_util::checkRenamePreconditions(
         opCtx, true /* sourceIsSharded */, longEnoughNss, false /* dropTarget */);
 
     // Check that an exception is thrown if the namespace of the target collection is too long
-    const NamespaceString tooLongNss{longEnoughNss.ns() + 'x'};
+    const NamespaceString tooLongNss =
+        NamespaceString::createNamespaceString_forTest(longEnoughNss.ns() + 'x');
     ASSERT_THROWS_CODE(sharding_ddl_util::checkRenamePreconditions(
                            opCtx, true /* sourceIsSharded */, tooLongNss, false /* dropTarget */),
                        AssertionException,
@@ -251,13 +361,14 @@ TEST_F(ShardingDDLUtilTest, RenamePreconditionsTargetCollectionExists) {
     auto opCtx = operationContext();
 
     // Initialize a chunk
-    ChunkVersion chunkVersion(1, 1, OID::gen(), Timestamp(2, 1));
+    ChunkVersion chunkVersion({OID::gen(), Timestamp(2, 1)}, {1, 1});
     ChunkType chunk;
     chunk.setName(OID::gen());
     chunk.setCollectionUUID(UUID::gen());
     chunk.setVersion(chunkVersion);
     chunk.setShard(shard0.getName());
-    chunk.setHistory({ChunkHistory(Timestamp(1, 1), shard0.getName())});
+    chunk.setOnCurrentShardSince(Timestamp(1, 1));
+    chunk.setHistory({ChunkHistory(*chunk.getOnCurrentShardSince(), shard0.getName())});
     chunk.setMin(kMinBSONKey);
     chunk.setMax(kMaxBSONKey);
 

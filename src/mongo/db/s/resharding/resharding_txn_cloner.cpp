@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
 #include "mongo/platform/basic.h"
 
@@ -36,13 +35,10 @@
 #include <vector>
 
 #include "mongo/bson/bsonmisc.h"
-#include "mongo/client/query.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/persistent_task_store.h"
@@ -58,11 +54,15 @@
 #include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
 #include "mongo/db/s/resharding/resharding_txn_cloner_progress_gen.h"
 #include "mongo/db/s/session_catalog_migration_destination.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/session_txn_record_gen.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
+
 
 namespace mongo {
 
@@ -161,7 +161,8 @@ boost::optional<SessionTxnRecord> ReshardingTxnCloner::_getNextRecord(OperationC
     ON_BLOCK_EXIT([curOp] { curOp->done(); });
 
     auto doc = pipeline.getNext();
-    return doc ? SessionTxnRecord::parse({"resharding config.transactions cloning"}, doc->toBson())
+    return doc ? SessionTxnRecord::parse(IDLParserContext{"resharding config.transactions cloning"},
+                                         doc->toBson())
                : boost::optional<SessionTxnRecord>{};
 }
 
@@ -253,9 +254,10 @@ SemiFuture<void> ReshardingTxnCloner::run(
 
                    {
                        auto opCtx = factory.makeOperationContext(&cc());
-                       if (auto hitPreparedTxn = doOneRecord(opCtx.get(), *chainCtx->donorRecord)) {
-                           return future_util::withCancellation(std::move(*hitPreparedTxn),
-                                                                cancelToken);
+                       if (auto conflictingTxnCompletionFuture =
+                               doOneRecord(opCtx.get(), *chainCtx->donorRecord)) {
+                           return future_util::withCancellation(
+                               std::move(*conflictingTxnCompletionFuture), cancelToken);
                        }
                    }
 

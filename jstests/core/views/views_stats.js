@@ -4,11 +4,14 @@
 // stage. The former operation must be routed to the primary in a replica set, whereas the latter
 // may be routed to a secondary.
 //
+// The test runs commands that are not allowed with security token: top.
 // @tags: [
+//     not_allowed_with_security_token,
 //     assumes_read_preference_unchanged,
 //     assumes_unsharded_collection,
-//     # top command is not available on embedded
-//     incompatible_with_embedded,
+//     # This test depends on hardcoded database name equality.
+//     tenant_migration_incompatible,
+//     does_not_support_repeated_reads,
 // ]
 
 (function() {

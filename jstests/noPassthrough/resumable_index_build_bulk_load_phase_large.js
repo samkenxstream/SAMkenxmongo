@@ -13,6 +13,8 @@
 "use strict";
 
 load("jstests/noPassthrough/libs/index_build.js");
+load("jstests/libs/sbe_util.js");          // For checkSBEEnabled.
+load("jstests/libs/columnstore_util.js");  // For setUpServerForColumnStoreIndexTest.
 
 const dbName = "test";
 
@@ -20,6 +22,10 @@ const rst = new ReplSetTest(
     {nodes: 1, nodeOptions: {setParameter: {maxIndexBuildMemoryUsageMegabytes: 50}}});
 rst.startSet();
 rst.initiate();
+
+const columnstoreEnabled =
+    checkSBEEnabled(rst.getPrimary().getDB(dbName), ["featureFlagColumnstoreIndexes"], true) &&
+    setUpServerForColumnStoreIndexTest(rst.getPrimary().getDB(dbName));
 
 // Insert enough data so that the collection scan spills to disk.
 const coll = rst.getPrimary().getDB(dbName).getCollection(jsTestName());
@@ -40,5 +46,16 @@ ResumableIndexBuildTest.run(
     ["bulk load"],
     [{skippedPhaseLogID: 20391}]);
 
+if (columnstoreEnabled) {
+    ResumableIndexBuildTest.run(
+        rst,
+        dbName,
+        coll.getName(),
+        [[{"$**": "columnstore"}]],
+        [{name: "hangIndexBuildDuringBulkLoadPhase", logIdWithIndexName: 4924400}],
+        50,
+        ["bulk load"],
+        [{skippedPhaseLogID: 20391}]);
+}
 rst.stopSet();
 })();

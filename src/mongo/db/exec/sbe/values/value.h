@@ -36,7 +36,6 @@
 #include <boost/predef/hardware/simd.h>
 #include <cstdint>
 #include <ostream>
-#include <pcre.h>
 #include <string>
 #include <utility>
 #include <vector>
@@ -44,14 +43,18 @@
 #include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_view.h"
 #include "mongo/bson/ordering.h"
+#include "mongo/config.h"
 #include "mongo/db/exec/shard_filterer.h"
 #include "mongo/db/fts/fts_matcher.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/query/bson_typemask.h"
 #include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/index_bounds.h"
 #include "mongo/platform/bits.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/platform/endian.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/pcre.h"
 #include "mongo/util/represent_as.h"
 
 namespace mongo {
@@ -66,16 +69,39 @@ class Value;
 
 class TimeZoneDatabase;
 
+class TimeZone;
+
 class JsFunction;
 
 namespace sbe {
+
+/**
+ * Trivially copyable variation on a tuple theme. This allow us to return tuples through registers.
+ */
+template <typename...>
+struct FastTuple;
+
+template <typename... Ts>
+FastTuple(Ts...) -> FastTuple<Ts...>;
+
+template <typename A, typename B, typename C>
+struct FastTuple<A, B, C> {
+    A a;
+    B b;
+    C c;
+};
+
 using FrameId = int64_t;
 using SpoolId = int64_t;
+
+static constexpr int64_t kInvalidId = LLONG_MIN;
 
 using IndexKeysInclusionSet = std::bitset<Ordering::kMaxCompoundIndexKeys>;
 
 namespace value {
 class SortSpec;
+struct MakeObjSpec;
+struct CsiCell;
 
 static constexpr size_t kNewUUIDLength = 16;
 
@@ -90,7 +116,6 @@ enum class TypeTags : uint8_t {
     NumberInt32,
     NumberInt64,
     NumberDouble,
-    NumberDecimal,
 
     // Date data types.
     Date,
@@ -99,6 +124,24 @@ enum class TypeTags : uint8_t {
     Boolean,
     Null,
     StringSmall,
+
+    MinKey,
+    MaxKey,
+
+    // Pointer to sort key component vector. This type is always owned within a SortSpec,
+    // and is never created, copied, or destroyed by SBE.
+    sortKeyComponentVector,
+
+    // Pointer to a struct with data necessary to read values from a columnstore index cell. The
+    // values of this type are fully owned by the column_scan stage and are never created, cloned or
+    // destroyed by SBE.
+    csiCell,
+
+    // Special marker
+    EndOfShallowValues = csiCell,
+
+    // Heap values
+    NumberDecimal,
     StringBig,
     Array,
     ArraySet,
@@ -106,9 +149,6 @@ enum class TypeTags : uint8_t {
 
     ObjectId,
     RecordId,
-
-    MinKey,
-    MaxKey,
 
     // Raw bson values.
     bsonObject,
@@ -151,6 +191,15 @@ enum class TypeTags : uint8_t {
 
     // Pointer to a SortSpec object.
     sortSpec,
+
+    // Pointer to a MakeObjSpec object.
+    makeObjSpec,
+
+    // Pointer to a IndexBounds object.
+    indexBounds,
+
+    // Pointer to a timezone object
+    timeZone,
 };
 
 inline constexpr bool isNumber(TypeTags tag) noexcept {
@@ -169,6 +218,10 @@ inline constexpr bool isObject(TypeTags tag) noexcept {
 
 inline constexpr bool isArray(TypeTags tag) noexcept {
     return tag == TypeTags::Array || tag == TypeTags::ArraySet || tag == TypeTags::bsonArray;
+}
+
+inline constexpr bool isNullish(TypeTags tag) noexcept {
+    return tag == TypeTags::Nothing || tag == TypeTags::Null || tag == TypeTags::bsonUndefined;
 }
 
 inline constexpr bool isObjectId(TypeTags tag) noexcept {
@@ -191,6 +244,10 @@ inline constexpr bool isBsonRegex(TypeTags tag) noexcept {
     return tag == TypeTags::bsonRegex;
 }
 
+inline constexpr bool isTimeZone(TypeTags tag) noexcept {
+    return tag == TypeTags::timeZone;
+}
+
 inline constexpr bool isStringOrSymbol(TypeTags tag) noexcept {
     return isString(tag) || tag == TypeTags::bsonSymbol;
 }
@@ -199,8 +256,11 @@ inline constexpr bool isCollatableType(TypeTags tag) noexcept {
     return isString(tag) || isArray(tag) || isObject(tag);
 }
 
+inline constexpr bool isShallowType(TypeTags tag) noexcept {
+    return tag <= TypeTags::EndOfShallowValues;
+}
+
 BSONType tagToType(TypeTags tag) noexcept;
-bool isShallowType(TypeTags tag) noexcept;
 
 /**
  * This function takes an SBE TypeTag, looks up the corresponding BSONType t, and then returns a
@@ -226,11 +286,27 @@ enum class SortDirection : uint8_t { Descending, Ascending };
 /**
  * Forward declarations.
  */
-void releaseValue(TypeTags tag, Value val) noexcept;
+
+/**
+ * Releases memory allocated for the value. If the value does not have any memory allocated for it,
+ * does nothing.
+ *
+ * NOTE: This function is intentionally marked as 'noexcept' and must not throw. It is used in the
+ *       destructors of several classes to implement RAII concept for values.
+ */
+void releaseValueDeep(TypeTags tag, Value val) noexcept;
 std::pair<TypeTags, Value> copyValue(TypeTags tag, Value val);
 std::size_t hashValue(TypeTags tag,
                       Value val,
                       const CollatorInterface* collator = nullptr) noexcept;
+
+inline void releaseValue(TypeTags tag, Value val) noexcept {
+    if (!isShallowType(tag)) {
+        releaseValueDeep(tag, val);
+    } else {
+        // No action is needed to release "shallow" values.
+    }
+}
 
 /**
  * Overloads for writing values and tags to stream.
@@ -250,9 +326,9 @@ std::pair<TypeTags, Value> compareValue(
     Value rhsValue,
     const StringData::ComparatorInterface* comparator = nullptr);
 
-bool isNaN(TypeTags tag, Value val);
+bool isNaN(TypeTags tag, Value val) noexcept;
 
-bool isInfinity(TypeTags tag, Value val);
+bool isInfinity(TypeTags tag, Value val) noexcept;
 
 /**
  * A simple hash combination.
@@ -270,13 +346,15 @@ inline std::size_t hashCombine(std::size_t state, std::size_t val) noexcept {
  */
 class ValueGuard {
 public:
-    ValueGuard(const std::pair<TypeTags, Value> typedValue)
+    MONGO_COMPILER_ALWAYS_INLINE ValueGuard(const std::pair<TypeTags, Value> typedValue)
         : ValueGuard(typedValue.first, typedValue.second) {}
-    ValueGuard(TypeTags tag, Value val) : _tag(tag), _value(val) {}
+    MONGO_COMPILER_ALWAYS_INLINE ValueGuard(TypeTags tag, Value val) : _tag(tag), _value(val) {}
+    MONGO_COMPILER_ALWAYS_INLINE ValueGuard(bool owned, TypeTags tag, Value val)
+        : ValueGuard(owned ? tag : TypeTags::Nothing, owned ? val : 0) {}
     ValueGuard() = delete;
     ValueGuard(const ValueGuard&) = delete;
     ValueGuard(ValueGuard&& other) = delete;
-    ~ValueGuard() {
+    MONGO_COMPILER_ALWAYS_INLINE ~ValueGuard() {
         releaseValue(_tag, _value);
     }
 
@@ -481,6 +559,10 @@ public:
     }
     const_iterator end() const {
         return _values.end();
+    }
+
+    void erase(const_iterator pos) {
+        _values.erase(pos);
     }
 
     template <class T1, class Hash1, class Eq1, class Allocator1>
@@ -689,6 +771,10 @@ public:
         return {TypeTags::Nothing, 0};
     }
 
+    bool contains(StringData field) const {
+        return std::find(_names.begin(), _names.end(), field) != _names.end();
+    }
+
     auto size() const noexcept {
         return _values.size();
     }
@@ -737,75 +823,66 @@ class Array {
 public:
     Array() = default;
     Array(const Array& other) {
-        // Reserve space in all vectors, they are the same size. We arbitrarily picked _typeTags
-        // to determine the size.
-        reserve(other._typeTags.size());
-        for (size_t idx = 0; idx < other._values.size(); ++idx) {
-            const auto [tag, val] = copyValue(other._typeTags[idx], other._values[idx]);
-            _values.push_back(val);
-            _typeTags.push_back(tag);
+        reserve(other._vals.size());
+        for (size_t idx = 0; idx < other._vals.size(); ++idx) {
+            auto [t, v] = other._vals[idx];
+            _vals.push_back(copyValue(t, v));
         }
     }
     Array(Array&&) = default;
     ~Array() {
-        for (size_t idx = 0; idx < _typeTags.size(); ++idx) {
-            releaseValue(_typeTags[idx], _values[idx]);
+        for (size_t idx = 0; idx < _vals.size(); ++idx) {
+            releaseValue(_vals[idx].first, _vals[idx].second);
         }
     }
 
     void push_back(TypeTags tag, Value val) {
         if (tag != TypeTags::Nothing) {
             ValueGuard guard{tag, val};
-            // Reserve space in all vectors, they are the same size. We arbitrarily picked _typeTags
-            // to determine the size.
-            if (_typeTags.capacity() == _typeTags.size()) {
-                // Reserve double capacity.
-                // Note: we are not concerned about the overflow in the operation below, as the size
-                // of 'Value' is 8 bytes. Consequently, the maximum capacity ever is 2^64/8 = 2^61.
-                // We can freely shift 2^61 << 1 without any overflow.
-                // Note: the case of '_typeTags.capacity() == 1' is handled inside 'reserve' itself.
-                reserve(_typeTags.capacity() << 1);
-            }
-            _typeTags.push_back(tag);
-            _values.push_back(val);
-
+            _vals.push_back({tag, val});
             guard.reset();
         }
     }
 
     auto size() const noexcept {
-        return _values.size();
+        return _vals.size();
     }
 
     std::pair<TypeTags, Value> getAt(std::size_t idx) const {
-        if (idx >= _values.size()) {
+        if (idx >= _vals.size()) {
             return {TypeTags::Nothing, 0};
         }
 
-        return {_typeTags[idx], _values[idx]};
+        return _vals[idx];
     }
+
+    auto& values() const noexcept {
+        return _vals;
+    }
+
+    auto& values() noexcept {
+        return _vals;
+    }
+
 
     // The in-place update of arrays is allowed only in very limited set of contexts (e.g. when
     // arrays are used in an accumulator slot). The owner of the array must guarantee that no other
     // component can observe the value being updated.
     void setAt(std::size_t idx, TypeTags tag, Value val) {
-        if (tag != TypeTags::Nothing && idx < _values.size()) {
-            releaseValue(_typeTags[idx], _values[idx]);
-            _typeTags[idx] = tag;
-            _values[idx] = val;
+        if (tag != TypeTags::Nothing && idx < _vals.size()) {
+            releaseValue(_vals[idx].first, _vals[idx].second);
+            _vals[idx] = {tag, val};
         }
     }
 
     void reserve(size_t s) {
         // Normalize to at least 1.
         s = s ? s : 1;
-        _typeTags.reserve(s);
-        _values.reserve(s);
+        _vals.reserve(s);
     }
 
 private:
-    std::vector<TypeTags> _typeTags;
-    std::vector<Value> _values;
+    std::vector<std::pair<TypeTags, Value>> _vals;
 };
 
 /**
@@ -838,9 +915,20 @@ public:
         }
     }
 
-    void push_back(TypeTags tag, Value val);
+    /**
+     * Adds the given SBE value to the set if an equal value is not already present. Assumes
+     * ownership of the given value.
+     *
+     * Returns true if the value was newly inserted, otherwise returns false to indicate that an
+     * equal value was already present in the set.
+     */
+    bool push_back(TypeTags tag, Value val);
 
     auto& values() const noexcept {
+        return _values;
+    }
+
+    auto& values() noexcept {
         return _values;
     }
 
@@ -861,70 +949,15 @@ private:
     ValueSetType _values;
 };
 
+/*
+ * A vector of values representing a sort key. The values are NOT owned by this object.
+ */
+struct SortKeyComponentVector {
+    std::vector<std::pair<value::TypeTags, value::Value>> elts;
+};
+
 bool operator==(const ArraySet& lhs, const ArraySet& rhs);
 bool operator!=(const ArraySet& lhs, const ArraySet& rhs);
-
-/**
- * Implements a wrapper of PCRE regular expression.
- * Storing the pattern and the options allows for copying of the sbe::value::PcreRegex expression,
- * which includes recompilation.
- * The compiled expression pcre* allows for direct usage of the pcre C library functionality.
- */
-class PcreRegex {
-public:
-    PcreRegex(StringData pattern, StringData options) : _pattern(pattern), _options(options) {
-        _compile();
-    }
-
-    PcreRegex(const PcreRegex& other) : PcreRegex(other._pattern, other._options) {}
-
-    PcreRegex& operator=(const PcreRegex& other) {
-        if (this != &other) {
-            (*pcre_free)(_pcrePtr);
-            _pattern = other._pattern;
-            _options = other._options;
-            _compile();
-        }
-        return *this;
-    }
-
-    ~PcreRegex() {
-        (*pcre_free)(_pcrePtr);
-    }
-
-    const std::string& pattern() const {
-        return _pattern;
-    }
-
-    const std::string& options() const {
-        return _options;
-    }
-
-    /**
-     * Wrapper function for pcre_exec().
-     * - input: The input string.
-     * - startPos: The position from where the search should start.
-     * - buf: Array populated with the found matched string and capture groups.
-     * Returns the number of matches or an error code:
-     *         < -1 error
-     *         = -1 no match
-     *         = 0  there was a match, but not enough space in the buffer
-     *         > 0  the number of matches
-     */
-    int execute(StringData input, int startPos, std::vector<int>& buf);
-
-    size_t getNumberCaptures() const;
-
-    size_t getApproximateSize() const;
-
-private:
-    void _compile();
-
-    std::string _pattern;
-    std::string _options;
-
-    pcre* _pcrePtr = nullptr;
-};
 
 constexpr size_t kSmallStringMaxLength = 7;
 using ObjectIdType = std::array<uint8_t, 12>;
@@ -1014,6 +1047,22 @@ inline size_t getStringLength(TypeTags tag, const Value& val) noexcept {
     MONGO_UNREACHABLE;
 }
 
+/*
+ * Using MONGO_COMPILER_ALWAYS_INLINE on a free function does not always play well between
+ * compilers because some require the 'inline' keyword be used while others prohibit it. To get
+ * around this, we wrap the custom strlen() function in a struct.
+ */
+struct TinyStrHelpers {
+    // Often calling the shared library strlen() function is more expensive than a small loop
+    // for small strings.
+    MONGO_COMPILER_ALWAYS_INLINE static size_t strlen(const char* s) {
+        const char* begin = s;
+        while (*s++)
+            ;
+        return s - begin - 1;
+    }
+};
+
 /**
  * getStringView() should be preferred over getRawStringView() where possible.
  */
@@ -1034,7 +1083,9 @@ inline size_t getBSONBinDataSize(TypeTags tag, Value val) {
 
 inline BinDataType getBSONBinDataSubtype(TypeTags tag, Value val) {
     invariant(tag == TypeTags::bsonBinData);
-    return static_cast<BinDataType>((getRawPointerView(val) + sizeof(uint32_t))[0]);
+    uint8_t subtype =
+        ConstDataView(getRawPointerView(val) + sizeof(uint32_t)).read<LittleEndian<uint8_t>>();
+    return static_cast<BinDataType>(subtype);
 }
 
 inline uint8_t* getBSONBinData(TypeTags tag, Value val) {
@@ -1208,10 +1259,12 @@ inline KeyString::Value* getKeyStringView(Value val) noexcept {
 
 std::pair<TypeTags, Value> makeNewPcreRegex(StringData pattern, StringData options);
 
-std::pair<TypeTags, Value> makeCopyPcreRegex(const PcreRegex& regex);
+std::pair<TypeTags, Value> makeCopyPcreRegex(const pcre::Regex& regex);
 
-inline PcreRegex* getPcreRegexView(Value val) noexcept {
-    return reinterpret_cast<PcreRegex*>(val);
+std::pair<TypeTags, Value> makeCopyTimeZone(const TimeZone& tz);
+
+inline pcre::Regex* getPcreRegexView(Value val) noexcept {
+    return reinterpret_cast<pcre::Regex*>(val);
 }
 
 inline JsFunction* getJsFunctionView(Value val) noexcept {
@@ -1236,6 +1289,26 @@ inline fts::FTSMatcher* getFtsMatcherView(Value val) noexcept {
 
 inline SortSpec* getSortSpecView(Value val) noexcept {
     return reinterpret_cast<SortSpec*>(val);
+}
+
+inline MakeObjSpec* getMakeObjSpecView(Value val) noexcept {
+    return reinterpret_cast<MakeObjSpec*>(val);
+}
+
+inline IndexBounds* getIndexBoundsView(Value val) noexcept {
+    return reinterpret_cast<IndexBounds*>(val);
+}
+
+inline SortKeyComponentVector* getSortKeyComponentVectorView(Value v) noexcept {
+    return reinterpret_cast<SortKeyComponentVector*>(v);
+}
+
+inline sbe::value::CsiCell* getCsiCellView(Value val) noexcept {
+    return reinterpret_cast<sbe::value::CsiCell*>(val);
+}
+
+inline TimeZone* getTimeZoneView(Value val) noexcept {
+    return reinterpret_cast<TimeZone*>(val);
 }
 
 /**
@@ -1356,16 +1429,25 @@ std::pair<TypeTags, Value> makeCopyFtsMatcher(const fts::FTSMatcher&);
 
 std::pair<TypeTags, Value> makeCopySortSpec(const SortSpec&);
 
+std::pair<TypeTags, Value> makeCopyMakeObjSpec(const MakeObjSpec&);
+
 std::pair<TypeTags, Value> makeCopyCollator(const CollatorInterface& collator);
 
+std::pair<TypeTags, Value> makeCopyIndexBounds(const IndexBounds& collator);
+
+#if defined(MONGO_CONFIG_DEBUG_BUILD)
 /**
- * Releases memory allocated for the value. If the value does not have any memory allocated for it,
- * does nothing.
- *
- * NOTE: This function is intentionally marked as 'noexcept' and must not throw. It is used in the
- *       destructors of several classes to implement RAII concept for values.
+ * Returns a poison value that should never be encountered in production.
+ * Used by asserts/invariants to invalidate values that should never be accessed.
  */
-void releaseValue(TypeTags tag, Value val) noexcept;
+inline std::pair<TypeTags, Value> getPoisonValue() {
+    return {TypeTags::Nothing, (uint64_t)-1};
+}
+
+inline bool isPoisonValue(TypeTags tag, Value val) {
+    return tag == TypeTags::Nothing && val == (uint64_t)-1;
+}
+#endif
 
 inline std::pair<TypeTags, Value> copyValue(TypeTags tag, Value val) {
     switch (tag) {
@@ -1433,13 +1515,56 @@ inline std::pair<TypeTags, Value> copyValue(TypeTags tag, Value val) {
             return makeCopyFtsMatcher(*getFtsMatcherView(val));
         case TypeTags::sortSpec:
             return makeCopySortSpec(*getSortSpecView(val));
+        case TypeTags::makeObjSpec:
+            return makeCopyMakeObjSpec(*getMakeObjSpecView(val));
         case TypeTags::collator:
             return makeCopyCollator(*getCollatorView(val));
+        case TypeTags::indexBounds:
+            return makeCopyIndexBounds(*getIndexBoundsView(val));
+        case TypeTags::timeZone:
+            return makeCopyTimeZone(*getTimeZoneView(val));
         default:
             break;
     }
 
     return {tag, val};
+}
+
+/**
+ * Implicit conversion from any type to a boolean value.
+ */
+inline std::pair<TypeTags, Value> coerceToBool(TypeTags tag, Value val) {
+    switch (tag) {
+        case value::TypeTags::Nothing: {
+            return {value::TypeTags::Nothing, 0};
+        }
+        case value::TypeTags::Null:
+        case value::TypeTags::bsonUndefined: {
+            return {value::TypeTags::Boolean, value::bitcastFrom<bool>(false)};
+        }
+        case value::TypeTags::Boolean: {
+            return {tag, val};
+        }
+        case value::TypeTags::NumberInt32: {
+            bool isNotZero = (value::bitcastTo<int32_t>(val) != 0);
+            return {value::TypeTags::Boolean, value::bitcastFrom<bool>(isNotZero)};
+        }
+        case value::TypeTags::NumberInt64: {
+            bool isNotZero = (value::bitcastTo<int64_t>(val) != 0);
+            return {value::TypeTags::Boolean, value::bitcastFrom<bool>(isNotZero)};
+        }
+        case value::TypeTags::NumberDouble: {
+            bool isNotZero = (value::bitcastTo<double>(val) != 0.0);
+            return {value::TypeTags::Boolean, value::bitcastFrom<bool>(isNotZero)};
+        }
+        case value::TypeTags::NumberDecimal: {
+            bool isNotZero = !value::bitcastTo<Decimal128>(val).isZero();
+            return {value::TypeTags::Boolean, value::bitcastFrom<bool>(isNotZero)};
+        }
+        default: {
+            return {value::TypeTags::Boolean, value::bitcastFrom<bool>(true)};
+        }
+    }
 }
 
 /**
@@ -1481,7 +1606,7 @@ inline T numericCast(TypeTags tag, Value val) noexcept {
  * TypeTag. In the case that a conversion is lossy, we return Nothing.
  */
 template <typename T>
-inline std::tuple<bool, value::TypeTags, value::Value> numericConvLossless(
+inline FastTuple<bool, value::TypeTags, value::Value> numericConvLossless(
     T value, value::TypeTags targetTag) {
     switch (targetTag) {
         case value::TypeTags::NumberInt32: {
@@ -1580,6 +1705,9 @@ private:
 /**
  * Holds a view of an array-like type (e.g. TypeTags::Array or TypeTags::bsonArray), and provides an
  * iterface to iterate over the values that are the elements of the array.
+ *
+ * This is a general purpose iterator. If you need to do a simple walk over the entire array in one
+ * go, not saving the place across function calls etc, prefer walkArray().
  */
 class ArrayEnumerator {
 public:
@@ -1606,6 +1734,9 @@ public:
                 auto bson = getRawPointerView(val);
                 _arrayCurrent = bson + 4;
                 _arrayEnd = bson + ConstDataView(bson).read<LittleEndian<uint32_t>>();
+                if (_arrayCurrent != _arrayEnd - 1) {
+                    _fieldNameSize = strlen(_arrayCurrent + 1);
+                }
             } else {
                 MONGO_UNREACHABLE;
             }
@@ -1624,7 +1755,7 @@ public:
         } else if (_arraySet) {
             return _iter == _arraySet->values().end();
         } else {
-            return *_arrayCurrent == 0;
+            return _arrayCurrent == _arrayEnd - 1;
         }
     }
 
@@ -1645,6 +1776,7 @@ private:
     // bsonArray
     const char* _arrayCurrent{nullptr};
     const char* _arrayEnd{nullptr};
+    size_t _fieldNameSize = 0;
 };
 
 /**

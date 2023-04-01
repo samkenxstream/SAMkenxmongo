@@ -2,8 +2,8 @@
  * Validate basic batched multi-deletion functionality.
  *
  * @tags: [
- *  # Running as a replica set requires journaling.
- *  requires_journaling,
+ *  requires_fcv_61,
+ *  requires_replication,
  * ]
  */
 
@@ -12,21 +12,18 @@
 load("jstests/libs/analyze_plan.js");
 
 function validateBatchedDeletes(conn) {
-    // '__internalBatchedDeletesTesting.Collection0' is a special, hardcoded namespace that batches
-    // multi-doc deletes if the 'internalBatchUserMultiDeletesForTest' server parameter is set.
-    // TODO (SERVER-63044): remove this special handling.
-    const db = conn.getDB("__internalBatchedDeletesTesting");
-    const coll = db.getCollection('Collection0');
+    const db = conn.getDB("test");
+    const coll = db.getCollection("c");
     const collName = coll.getName();
 
-    const docsPerBatchDefault = 100;  // BatchedDeleteStageBatchParams::targetBatchDocs
-    const collCount =
-        5017;  // Intentionally not a multiple of BatchedDeleteStageBatchParams::targetBatchDocs.
+    const docsPerBatchDefault = 100;  // batchedDeletesTargetBatchDocs.
+    const collCount = 5017;  // Intentionally not a multiple of batchedDeletesTargetBatchDocs.
 
     function validateDeletion(db, coll, docsPerBatch) {
         coll.drop();
-        assert.commandWorked(coll.insertMany(
-            [...Array(collCount).keys()].map(x => ({_id: x, a: "a".repeat(1024)}))));
+        assert.commandWorked(
+            coll.insertMany([...Array(collCount).keys()].map(x => ({_id: x, a: "a".repeat(1024)})),
+                            {ordered: false}));
 
         const serverStatusBatchesBefore = db.serverStatus()['batchedDeletes']['batches'];
         const serverStatusDocsBefore = db.serverStatus()['batchedDeletes']['docs'];
@@ -45,11 +42,12 @@ function validateBatchedDeletes(conn) {
     }
 
     coll.drop();
-    assert.commandWorked(
-        coll.insertMany([...Array(collCount).keys()].map(x => ({_id: x, a: "a".repeat(1024)}))));
+    assert.commandWorked(coll.insertMany(
+        [...Array(collCount).keys()].map(x => ({_id: x, a: "a".repeat(1024)})), {ordered: false}));
 
-    assert.commandWorked(
-        db.adminCommand({setParameter: 1, internalBatchUserMultiDeletesForTest: 1}));
+    // For consistent results, don't enforce the targetBatchTimeMS and targetStagedDocBytes.
+    assert.commandWorked(db.adminCommand({setParameter: 1, batchedDeletesTargetBatchTimeMS: 0}));
+    assert.commandWorked(db.adminCommand({setParameter: 1, batchedDeletesTargetStagedDocBytes: 0}));
 
     // Explain plan and executionStats.
     {

@@ -5,12 +5,19 @@
  * former operation may be routed to a secondary in the replica set, whereas the latter must be
  * routed to the primary.
  *
+ * The test runs commands that are not allowed with security token: top.
  * @tags: [
- *  assumes_read_preference_unchanged,
- *  requires_fastcount,
- *
- *  # top command is not available on embedded
- *  incompatible_with_embedded]
+ *   not_allowed_with_security_token,
+ *    assumes_read_preference_unchanged,
+ *    requires_fastcount,
+ *    # This test contains assertions on the number of executed operations, and tenant migrations
+ *    # passthrough suites automatically retry operations on TenantMigrationAborted errors.
+ *    tenant_migration_incompatible,
+ *    does_not_support_repeated_reads,
+ *    requires_fcv_62,
+ *    # TODO SERVER-67640: Verify 'top' and $collStats work correctly for queries in CQF.
+ *    cqf_incompatible,
+ * ]
  */
 
 (function() {
@@ -121,8 +128,18 @@ for (i = 0; i < numRecords; i++) {
 }
 lastTop = assertTopDiffEq(testColl, lastTop, "commands", numRecords);
 
+// aggregate
+assert.eq(0, testColl.aggregate([]).itcount());  // All records were just deleted.
+assertTopDiffEq(testColl, lastTop, "commands", 1);
+lastTop = assertTopDiffEq(testColl, lastTop, "readLock", 1);
+
 // getIndexes
 assert.eq(1, testColl.getIndexes().length);
+assertTopDiffEq(testColl, lastTop, "commands", 1);
+lastTop = assertTopDiffEq(testColl, lastTop, "readLock", 1);
+
+// aggregate with $indexStats
+assert.doesNotThrow(() => testColl.aggregate([{$indexStats: {}}]).itcount());
 assertTopDiffEq(testColl, lastTop, "commands", 1);
 lastTop = assertTopDiffEq(testColl, lastTop, "readLock", 1);
 

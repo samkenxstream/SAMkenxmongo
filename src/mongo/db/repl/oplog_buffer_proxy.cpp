@@ -26,12 +26,14 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/oplog_buffer_proxy.h"
 #include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
@@ -112,14 +114,24 @@ bool OplogBufferProxy::tryPop(OperationContext* opCtx, Value* value) {
     return true;
 }
 
-bool OplogBufferProxy::waitForData(Seconds waitDuration) {
+bool OplogBufferProxy::waitForDataFor(Milliseconds waitDuration, Interruptible* interruptible) {
     {
         stdx::unique_lock<Latch> lk(_lastPushedMutex);
         if (_lastPushed) {
             return true;
         }
     }
-    return _target->waitForData(waitDuration);
+    return _target->waitForDataFor(waitDuration, interruptible);
+}
+
+bool OplogBufferProxy::waitForDataUntil(Date_t deadline, Interruptible* interruptible) {
+    {
+        stdx::unique_lock<Latch> lk(_lastPushedMutex);
+        if (_lastPushed) {
+            return true;
+        }
+    }
+    return _target->waitForDataUntil(deadline, interruptible);
 }
 
 bool OplogBufferProxy::peek(OperationContext* opCtx, Value* value) {

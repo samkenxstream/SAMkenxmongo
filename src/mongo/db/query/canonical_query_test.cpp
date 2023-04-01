@@ -34,6 +34,7 @@
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/query_test_service_context.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -43,7 +44,8 @@ using std::string;
 using std::unique_ptr;
 using unittest::assertGet;
 
-static const NamespaceString nss("testdb.testcoll");
+static const NamespaceString nss =
+    NamespaceString::createNamespaceString_forTest("testdb.testcoll");
 
 /**
  * Helper function to parse the given BSON object as a MatchExpression, checks the status,
@@ -280,9 +282,7 @@ TEST(CanonicalQueryTest, CanonicalizeFromBaseQuery) {
     MatchExpression* firstClauseExpr = baseCq->root()->getChild(0);
     auto childCq = assertGet(CanonicalQuery::canonicalize(opCtx.get(), *baseCq, firstClauseExpr));
 
-    BSONObjBuilder expectedFilter;
-    firstClauseExpr->serialize(&expectedFilter);
-    ASSERT_BSONOBJ_EQ(childCq->getFindCommandRequest().getFilter(), expectedFilter.obj());
+    ASSERT_BSONOBJ_EQ(childCq->getFindCommandRequest().getFilter(), firstClauseExpr->serialize());
 
     ASSERT_BSONOBJ_EQ(childCq->getFindCommandRequest().getProjection(),
                       baseCq->getFindCommandRequest().getProjection());
@@ -454,5 +454,16 @@ TEST(CanonicalQueryTest, InvalidSortOrdersFailToCanonicalize) {
     assertInvalidSortOrder(fromjson("{'': -1}"));
 }
 
+TEST(CanonicalQueryTest, DoNotParameterizeTextExpressions) {
+    auto cq =
+        canonicalize("{$text: {$search: \"Hello World!\"}}",
+                     MatchExpressionParser::kDefaultSpecialFeatures | MatchExpressionParser::kText);
+    ASSERT_FALSE(cq->isParameterized());
+}
+
+TEST(CanonicalQueryTest, DoParameterizeRegularExpressions) {
+    auto cq = canonicalize("{a: 1, b: {$lt: 5}}");
+    ASSERT_TRUE(cq->isParameterized());
+}
 }  // namespace
 }  // namespace mongo

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -53,6 +52,9 @@
 #include "mongo/util/str.h"
 #include "mongo/util/version.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+
 namespace mongo {
 
 using std::cout;
@@ -65,12 +67,14 @@ const std::set<std::string> kSetShellParameterAllowlist = {
     "awsEC2InstanceMetadataUrl",
     "awsECSInstanceMetadataUrl",
     "disabledSecureAllocatorDomains",
-    "featureFlagFLE2",
+    "featureFlagFLE2Range",
+    "featureFlagFLE2ProtocolVersion2",
     "newLineAfterPasswordPromptForTest",
     "ocspClientHttpTimeoutSecs",
     "ocspEnabled",
     "skipShellCursorFinalize",
     "tlsOCSPSlowResponderWarningSecs",
+    "enableDetailedConnectionHealthMetricLogLines",
 };
 
 std::string getMongoShellHelp(StringData name, const moe::OptionSection& options) {
@@ -309,7 +313,7 @@ Status storeMongoShellOptions(const moe::Environment& params,
     if (params.count("setShellParameter")) {
         auto ssp = params["setShellParameter"].as<std::map<std::string, std::string>>();
         auto* paramSet = ServerParameterSet::getNodeParameterSet();
-        for (auto it : ssp) {
+        for (const auto& it : ssp) {
             const auto& name = it.first;
             auto param = paramSet->getIfExists(name);
             if (!param || !kSetShellParameterAllowlist.count(name)) {
@@ -321,7 +325,7 @@ Status storeMongoShellOptions(const moe::Environment& params,
                         str::stream()
                             << "Cannot use --setShellParameter to set '" << name << "' at startup"};
             }
-            auto status = param->setFromString(it.second);
+            auto status = param->setFromString(it.second, boost::none);
             if (!status.isOK()) {
                 return {ErrorCodes::BadValue,
                         str::stream()

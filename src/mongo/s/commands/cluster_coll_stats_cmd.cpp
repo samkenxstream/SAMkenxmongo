@@ -27,20 +27,25 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/timeseries/timeseries_commands_conversion_helper.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/chunk_manager_targeter.h"
 #include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/collection_routing_info_targeter.h"
 #include "mongo/s/grid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
+
+Rarely _sampler;
 
 auto fieldIsAnyOf = [](StringData v, std::initializer_list<StringData> il) {
     auto ei = il.end();
@@ -172,30 +177,40 @@ public:
         return false;
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsCollectionRequired(dbname, cmdObj).ns();
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return CommandHelpers::parseNsCollectionRequired(dbName, cmdObj);
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::collStats);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::collStats)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbName,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
+        if (_sampler.tick())
+            LOGV2_WARNING(7024601,
+                          "The collStats command is deprecated. For more information, see "
+                          "https://dochub.mongodb.org/core/collStats-deprecated");
+
         const NamespaceString nss(parseNs(dbName, cmdObj));
 
-        const auto targeter = ChunkManagerTargeter(opCtx, nss);
-        const auto cm = targeter.getRoutingInfo();
+        const auto targeter = CollectionRoutingInfoTargeter(opCtx, nss);
+        const auto cri = targeter.getRoutingInfo();
+        const auto& cm = cri.cm;
         if (cm.isSharded()) {
             result.appendBool("sharded", true);
         } else {
@@ -227,7 +242,7 @@ public:
             opCtx,
             nss.db(),
             targeter.getNS(),
-            cm,
+            cri,
             applyReadWriteConcern(
                 opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObjToSend)),
             ReadPreferenceSetting::get(opCtx),

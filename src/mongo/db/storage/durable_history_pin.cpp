@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #define LOGV2_FOR_RECOVERY(ID, DLEVEL, MESSAGE, ...) \
     LOGV2_DEBUG_OPTIONS(ID, DLEVEL, {logv2::LogComponent::kStorageRecovery}, MESSAGE, ##__VA_ARGS__)
@@ -41,6 +40,9 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
@@ -87,12 +89,12 @@ void DurableHistoryRegistry::reconcilePins(OperationContext* opCtx) {
                            "ts"_attr = pinTs);
         if (pinTs) {
             auto swTimestamp =
-                engine->pinOldestTimestamp(opCtx, pin->getName(), pinTs.get(), false);
+                engine->pinOldestTimestamp(opCtx, pin->getName(), pinTs.value(), false);
             if (!swTimestamp.isOK()) {
                 LOGV2_WARNING(5384105,
                               "Unable to repin oldest timestamp",
                               "service"_attr = pin->getName(),
-                              "request"_attr = pinTs.get(),
+                              "request"_attr = pinTs.value(),
                               "error"_attr = swTimestamp.getStatus());
             }
         } else {

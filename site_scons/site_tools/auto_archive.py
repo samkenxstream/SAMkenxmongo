@@ -47,7 +47,11 @@ if __name__ == "__main__":
     archive_type = sys.argv[1]
     archive_name = sys.argv[2]
     root_dir = sys.argv[3]
-    files = sys.argv[4:]
+    file_list = sys.argv[4]
+
+    files = []
+    with open(file_list) as f:
+        files = f.read().splitlines()
 
     if archive_type not in ("zip", "tar"):
         print("unsupported archive_type", archive_type)
@@ -76,9 +80,7 @@ def add_package_name_alias(env, component, role, name):
     """Add a package name mapping for the combination of component and role."""
     # Verify we didn't get a None or empty string for any argument
     if not name:
-        raise Exception(
-            "when setting a package name alias must provide a name parameter"
-        )
+        raise Exception("when setting a package name alias must provide a name parameter")
     if not component:
         raise Exception("No component provided for package name alias")
     if not role:
@@ -90,7 +92,8 @@ def get_package_name(env, component, role):
     """Return the package file name for the component and role combination."""
     basename = env[PACKAGE_ALIAS_MAP].get(
         # TODO: silent roles shouldn't be included here
-        (component, role), "{component}-{role}".format(component=component, role=role)
+        (component, role),
+        "{component}-{role}".format(component=component, role=role),
     )
 
     return basename
@@ -133,7 +136,14 @@ def collect_transitive_files(env, entry):
         # anyway.
         stack.extend(env.GetTransitivelyInstalledFiles(s))
 
-    return sorted(files)
+    # Setting the AIB_NO_ARCHIVE attribute to True prevents outputs from an
+    # AutoInstall builder from being included into archives produced by this
+    # tool
+    # Usage:
+    # node = env.AutoInstall(...)
+    # setattr(node[0].attributes, 'AIB_NO_ARCHIVE', True)
+    # TODO SERVER-61013 Update documentation once AutoInstall is a real builder
+    return sorted(f for f in files if not getattr(f.attributes, 'AIB_NO_ARCHIVE', False))
 
 
 def auto_archive_gen(first_env, make_archive_script, pkg_fmt):
@@ -194,25 +204,26 @@ def archive_builder(source, target, env, for_signature):
     make_archive_script = source[0]
     tar_cmd = env.WhereIs("tar")
     if archive_type == "tar" and tar_cmd:
-        command_prefix = "{tar} -C {common_ancestor} -czf {archive_name}"
+        command_prefix = "{tar} -C {common_ancestor} -T {file_list} -czf {archive_name}"
     else:
-        command_prefix = "{python} {make_archive_script} {archive_type} {archive_name} {common_ancestor}"
+        command_prefix = "{python} {make_archive_script} {archive_type} {archive_name} {common_ancestor} {file_list}"
 
     archive_name = env.File(target[0])
-    command_prefix = command_prefix.format(
+    command_sig = command_prefix.format(
         tar=tar_cmd,
         python=sys.executable,
         archive_type=archive_type,
         archive_name=archive_name,
         make_archive_script=make_archive_script,
         common_ancestor=common_ancestor,
+        file_list='',
     )
 
     # If we are just being invoked for our signature, we can omit the indirect dependencies
     # found by expanding the transitive dependencies, since we really only have a hard dependency
     # on our direct dependencies.
     if for_signature:
-        return command_prefix
+        return command_sig
 
     component = env["AIB_COMPONENT"]
     role = env["AIB_ROLE"]
@@ -227,32 +238,43 @@ def archive_builder(source, target, env, for_signature):
     # Collect all the installed files for our entry. This is doing a pure DAG
     # walk idea of what should be. So we filter out any that are not in the
     # installed set.
-    transitive_files = [
-        f for f in
-        collect_transitive_files(env, entry)
-        if f in installed
-    ]
+    transitive_files = [f for f in collect_transitive_files(env, entry) if f in installed]
     if not transitive_files:
         return []
-
-    # The env["ESCAPE"] function is used by scons to make arguments
-    # valid for the platform that we're running on. For instance it
-    # will properly quote paths that have spaces in them on Posix
-    # platforms and handle \ / on Windows.
-    escape_func = env.get("ESCAPE", lambda x: x)
 
     # TODO: relpath is costly, and we do it for every file in the archive here.
     # We should find a way to avoid the repeated relpath invocation, probably by
     # bucketing by directory.
     relative_files = [
-        escape_func(os.path.relpath(file.get_abspath(), common_ancestor.get_abspath()))
+        os.path.relpath(file.get_abspath(), common_ancestor.get_abspath())
         for file in transitive_files
     ]
 
-    return "{prefix} {files}".format(
-        prefix=command_prefix,
-        files=" ".join(relative_files)
+    # This is not great for ninja, essentially we are doing realtime operations here, which is
+    # not terrible for scons CommandActionGenerators, because the generation happens right before
+    # executing the command. However, this means for ninja that the realtime things happen during
+    # ninja generation, and are far removed from ninja execution. Even if we split this into a
+    # separate action for ninja's sake, there would still be issues because the reason to make
+    # such a filelist is to prevent creating command lines which are too long, and actions must
+    # be converted to command lines for ninja. When the ninja tool is able to process scons
+    # callbacks in order and not via aggregation then this could be moved to a simple Textfile call.
+    file_list = str(target[0].abspath) + ".filelist"
+    os.makedirs(os.path.dirname(file_list), exist_ok=True)
+    with open(file_list, 'w') as f:
+        for file in relative_files:
+            f.write(file + '\n')
+
+    cmd = command_prefix.format(
+        tar=tar_cmd,
+        python=sys.executable,
+        archive_type=archive_type,
+        archive_name=archive_name,
+        make_archive_script=make_archive_script,
+        common_ancestor=common_ancestor,
+        file_list=file_list,
     )
+
+    return cmd
 
 
 def exists(env):
@@ -266,12 +288,13 @@ def generate(env):
     bld = SCons.Builder.Builder(
         action=SCons.Action.CommandGeneratorAction(
             archive_builder,
-            {"cmdstr": "Building package ${TARGETS[0]} from ${SOURCES[1:]}"},
-        )
-    )
+            {"cmdstr": "Building package ${TARGETS[0]} from ${SOURCES[1:]}"}
+            if not env.Verbose() else {"cmdstr": ""},
+        ))
     env.Append(BUILDERS={"AutoArchive": bld})
     env["AUTO_ARCHIVE_TARBALL_SUFFIX"] = env.get(
-        "AUTO_ARCHIVE_TARBALL_SUFFIX", "tar.gz"
+        "AUTO_ARCHIVE_TARBALL_SUFFIX",
+        "tar.gz",
     )
     env["AUTO_ARCHIVE_ZIP_SUFFIX"] = env.get("AUTO_ARCHIVE_ZIP_SUFFIX", "zip")
     env[PACKAGE_ALIAS_MAP] = {}
@@ -290,5 +313,4 @@ def generate(env):
             "tar": (auto_archive_gen(env, make_archive_script, "tar"), False),
             "zip": (auto_archive_gen(env, make_archive_script, "zip"), False),
             "archive": (auto_archive_gen(env, make_archive_script, "auto"), False),
-        }
-    )
+        })

@@ -29,8 +29,10 @@
 
 #include "mongo/db/pipeline/variables.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
 #include "mongo/db/pipeline/variable_validation.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/platform/basic.h"
@@ -52,6 +54,7 @@ constexpr StringData kClusterTimeName = "CLUSTER_TIME"_sd;
 constexpr StringData kJsScopeName = "JS_SCOPE"_sd;
 constexpr StringData kIsMapReduceName = "IS_MR"_sd;
 constexpr StringData kSearchMetaName = "SEARCH_META"_sd;
+constexpr StringData kUserRolesName = "USER_ROLES"_sd;
 
 const StringMap<Variables::Id> Variables::kBuiltinVarNameToId = {
     {kRootName.rawData(), kRootId},
@@ -60,7 +63,8 @@ const StringMap<Variables::Id> Variables::kBuiltinVarNameToId = {
     {kClusterTimeName.rawData(), kClusterTimeId},
     {kJsScopeName.rawData(), kJsScopeId},
     {kIsMapReduceName.rawData(), kIsMapReduceId},
-    {kSearchMetaName.rawData(), kSearchMetaId}};
+    {kSearchMetaName.rawData(), kSearchMetaId},
+    {kUserRolesName.rawData(), kUserRolesId}};
 
 const std::map<Variables::Id, std::string> Variables::kIdToBuiltinVarName = {
     {kRootId, kRootName.rawData()},
@@ -69,7 +73,8 @@ const std::map<Variables::Id, std::string> Variables::kIdToBuiltinVarName = {
     {kClusterTimeId, kClusterTimeName.rawData()},
     {kJsScopeId, kJsScopeName.rawData()},
     {kIsMapReduceId, kIsMapReduceName.rawData()},
-    {kSearchMetaId, kSearchMetaName.rawData()}};
+    {kSearchMetaId, kSearchMetaName.rawData()},
+    {kUserRolesId, kUserRolesName.rawData()}};
 
 const std::map<StringData, std::function<void(const Value&)>> Variables::kSystemVarValidators = {
     {kNowName,
@@ -93,11 +98,18 @@ const std::map<StringData, std::function<void(const Value&)>> Variables::kSystem
                                << typeName(value.getType()),
                  value.getType() == BSONType::Object);
      }},
-    {kIsMapReduceName, [](const auto& value) {
+    {kIsMapReduceName,
+     [](const auto& value) {
          uassert(ErrorCodes::TypeMismatch,
                  str::stream() << "$$IS_MR must have a bool value, found "
                                << typeName(value.getType()),
                  value.getType() == BSONType::Bool);
+     }},
+    {kUserRolesName, [](const auto& value) {
+         uassert(ErrorCodes::TypeMismatch,
+                 str::stream() << "$$USER_ROLES must have an array value, found "
+                               << typeName(value.getType()),
+                 value.getType() == BSONType::Array);
      }}};
 
 void Variables::setValue(Id id, const Value& value, bool isConstant) {
@@ -157,6 +169,7 @@ Value Variables::getValue(Id id, const Document& root) const {
             case Variables::kClusterTimeId:
             case Variables::kJsScopeId:
             case Variables::kIsMapReduceId:
+            case Variables::kUserRolesId:
                 if (auto it = _definitions.find(id); it != _definitions.end()) {
                     return it->second.value;
                 }
@@ -204,6 +217,9 @@ void Variables::setLegacyRuntimeConstants(const LegacyRuntimeConstants& constant
     if (constants.getIsMapReduce()) {
         _definitions[kIsMapReduceId] = {Value(*constants.getIsMapReduce()), constant};
     }
+    if (constants.getUserRoles()) {
+        _definitions[kUserRolesId] = {Value(constants.getUserRoles().value()), constant};
+    }
 }
 
 void Variables::setDefaultRuntimeConstants(OperationContext* opCtx) {
@@ -213,7 +229,11 @@ void Variables::setDefaultRuntimeConstants(OperationContext* opCtx) {
 void Variables::appendSystemVariables(BSONObjBuilder& bob) const {
     for (auto&& [name, id] : kBuiltinVarNameToId) {
         if (hasValue(id)) {
-            bob << name << getValue(id);
+            // We should serialize the system variables using $literal (as we do with the
+            // user-defined variables) so that they get parsed the same way (for example, not using
+            // $literal to parse a variable value that is an array causes the expression context to
+            // be marked as SBE incompatible through ExpressionArray).
+            bob << name << Value(DOC("$literal" << getValue(id)));
         }
     }
 }
@@ -257,9 +277,9 @@ void Variables::seedVariablesWithLetParameters(ExpressionContext* const expCtx,
         auto expr = Expression::parseOperand(expCtx, elem, expCtx->variablesParseState);
 
         uassert(4890500,
-                "Command let Expression tried to access a field, but this is not allowed because "
+                "Command let Expression tried to access a field, but this is not allowed because"
                 "Command let Expressions run before the query examines any documents.",
-                expr->getDependencies().hasNoRequirements());
+                expression::getDependencies(expr.get()).hasNoRequirements());
         Value value = expr->evaluate(Document{}, &expCtx->variables);
 
         if (maybeSystemVarValidator) {
@@ -321,6 +341,16 @@ LegacyRuntimeConstants Variables::transitionalExtractRuntimeConstants() const {
                     extracted.setIsMapReduce(value.getBool());
                     break;
                 }
+                case kUserRolesId: {
+                    invariant(value.getType() == BSONType::Array);
+                    BSONArrayBuilder bab;
+                    for (const auto& val : value.getArray()) {
+                        invariant(val.getType() == BSONType::Object);
+                        bab.append(val.getDocument().toBson());
+                    }
+                    extracted.setUserRoles(bab.arr());
+                    break;
+                }
                 default:
                     MONGO_UNREACHABLE;
             }
@@ -329,8 +359,26 @@ LegacyRuntimeConstants Variables::transitionalExtractRuntimeConstants() const {
     return extracted;
 }
 
+void Variables::defineUserRoles(OperationContext* opCtx) {
+    auto userRoles = BSONArray{};
+    try {
+        // If the authorization session exists for the client, get the user roles.
+        auto authorizationSession = AuthorizationSession::get(opCtx->getClient());
+        userRoles = authorizationSession->getUserRoles();
+    } catch (const DBException& ex) {
+        // ErrorCodes::NotImplemented would be encountered here when we are running the embedded
+        // library.
+        // TODO SERVER-70429: Remove the check for ErrorCodes::NotImplemented.
+        if (ex.code() != ErrorCodes::NotImplemented) {
+            throw;
+        }
+    }
+    _definitions[kUserRolesId] = {Value(std::move(userRoles)), true /* isConst */};
+}
+
 Variables::Id VariablesParseState::defineVariable(StringData name) {
-    // Caller should have validated before hand by using variableValidationvalidateNameForUserWrite.
+    // Caller should have validated before hand by using
+    // variableValidation::validateNameForUserWrite.
     massert(17275,
             "Can't redefine a non-user-writable variable",
             Variables::kBuiltinVarNameToId.find(name) == Variables::kBuiltinVarNameToId.end());

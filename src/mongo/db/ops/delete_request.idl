@@ -29,22 +29,22 @@
 global:
     cpp_namespace: "mongo"
     cpp_includes:
-        - "mongo/db/logical_session_id.h"
+        - "mongo/db/session/logical_session_id.h"
         - "mongo/db/query/plan_executor.h"
 
 imports:
-    - "mongo/db/logical_session_id.idl"
+    - "mongo/db/session/logical_session_id.idl"
     - "mongo/db/pipeline/legacy_runtime_constants.idl"
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/db/query/hint.idl"
 
 server_parameters:
-    internalBatchUserMultiDeletesForTest:
-        description: "When set, it enables user-initiated multi-document deletes on namespace __internalBatchedDeletesTesting.Collection0. For test only"
-        set_at: [startup, runtime]
+    batchUserMultiDeletes:
+        description: "When set, it batches multi-doc deletes"
+        set_at: [ startup, runtime ]
         cpp_vartype: AtomicWord<bool>
-        cpp_varname: gInternalBatchUserMultiDeletesForTest
-        default: false
+        cpp_varname: gBatchUserMultiDeletes
+        default: true
 
 types:
     yield_policy:

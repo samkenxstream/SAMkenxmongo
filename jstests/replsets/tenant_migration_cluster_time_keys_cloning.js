@@ -5,7 +5,6 @@
  * TODO (SERVER-61231): Adapt for shard merge.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
@@ -15,13 +14,15 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    isShardMergeEnabled,
+    makeX509OptionsForTest
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
 load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
 
 const kInternalKeysNs = "admin.system.keys";
 const kExternalKeysNs = "config.external_validation_keys";
@@ -69,9 +70,9 @@ function assertHasExternalKeys(conn, migrationId) {
     assert.gt(keys.length, 0, tojson(keys));
 }
 
-const kTenantId1 = "testTenantId1";
-const kTenantId2 = "testTenantId2";
-const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
+const kTenantId1 = ObjectId().str;
+const kTenantId2 = ObjectId().str;
+const migrationX509Options = makeX509OptionsForTest();
 
 (() => {
     jsTest.log("Test that the donor and recipient correctly copy each other's cluster time keys " +
@@ -103,8 +104,12 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
 (() => {
     jsTest.log("Test that the donor and recipient correctly copy each other's cluster time keys " +
                "when there is no failover but the recipient syncs data from a secondary.");
-    const recipientRst = new ReplSetTest(
-        {nodes: 3, name: "recipientRst", nodeOptions: migrationX509Options.recipient});
+    const recipientRst = new ReplSetTest({
+        nodes: 3,
+        name: "recipientRst",
+        serverless: true,
+        nodeOptions: migrationX509Options.recipient
+    });
     recipientRst.startSet();
     recipientRst.initiate();
 
@@ -130,11 +135,11 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
 (() => {
     jsTest.log("Test that the donor and recipient correctly copy each other's cluster time keys " +
                "when there is donor failover.");
-    const donorRst =
-        new ReplSetTest({nodes: 3, name: "donorRst", nodeOptions: migrationX509Options.donor});
+    const donorRst = new ReplSetTest(
+        {nodes: 3, name: "donorRst", serverless: true, nodeOptions: migrationX509Options.donor});
     donorRst.startSet();
     donorRst.initiate();
-    if (TenantMigrationUtil.isShardMergeEnabled(donorRst.getPrimary().getDB("adminDB"))) {
+    if (isShardMergeEnabled(donorRst.getPrimary().getDB("adminDB"))) {
         jsTestLog("Skip: featureFlagShardMerge enabled, but shard merge does not survive failover");
         donorRst.stopSet();
         return;
@@ -175,11 +180,15 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
 (() => {
     jsTest.log("Test that the donor and recipient correctly copy each other's cluster time keys " +
                "when there is recipient failover.");
-    const recipientRst = new ReplSetTest(
-        {nodes: 3, name: "recipientRst", nodeOptions: migrationX509Options.recipient});
+    const recipientRst = new ReplSetTest({
+        nodes: 3,
+        name: "recipientRst",
+        serverless: true,
+        nodeOptions: migrationX509Options.recipient
+    });
     recipientRst.startSet();
     recipientRst.initiate();
-    if (TenantMigrationUtil.isShardMergeEnabled(recipientRst.getPrimary().getDB("adminDB"))) {
+    if (isShardMergeEnabled(recipientRst.getPrimary().getDB("adminDB"))) {
         jsTestLog("Skip: featureFlagShardMerge enabled, but shard merge does not survive failover");
         recipientRst.stopSet();
         return;
@@ -223,6 +232,7 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
     const donorRst = new ReplSetTest({
         nodes: [{}, {}, {rsConfig: {priority: 0}}],
         name: "donorRst",
+        serverless: true,
         settings: {chainingAllowed: false},
         nodeOptions: migrationX509Options.donor
     });
@@ -232,8 +242,7 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
     const tenantMigrationTest = new TenantMigrationTest({name: jsTestName(), donorRst});
 
     function runTest(tenantId, withFailover) {
-        if (withFailover &&
-            TenantMigrationUtil.isShardMergeEnabled(donorRst.getPrimary().getDB("adminDB"))) {
+        if (withFailover && isShardMergeEnabled(donorRst.getPrimary().getDB("adminDB"))) {
             jsTestLog(
                 "Skip: featureFlagShardMerge enabled, but shard merge does not survive failover");
             tenantMigrationTest.stop();
@@ -306,5 +315,4 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
 
     donorRst.stopSet();
     tenantMigrationTest.stop();
-})();
 })();

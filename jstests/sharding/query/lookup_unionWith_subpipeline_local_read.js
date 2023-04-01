@@ -2,7 +2,9 @@
  * Tests $lookup, $graphLookup, and $unionWith in a sharded environment to verify the local read
  * behavior of subpipelines dispatched as part of these stages.
  *
- * @tags: [requires_majority_read_concern, requires_fcv_51, featureFlagShardedLookup]
+ * # Ban this test in pre-6.0 versions because the SBE is disabled in v6.0 but enabled in v5.3,
+ * # which could be problematic in multiversion tasks.
+ * @tags: [requires_majority_read_concern, requires_fcv_60]
  */
 
 (function() {
@@ -12,7 +14,6 @@ load('jstests/libs/profiler.js');             // For various profiler helpers.
 load('jstests/aggregation/extras/utils.js');  // For arrayEq()
 load("jstests/libs/fail_point_util.js");      // for configureFailPoint.
 load("jstests/libs/log.js");                  // For findMatchingLogLines.
-load("jstests/libs/sbe_util.js");             // For checkSBEEnabled.
 
 const st = new ShardingTest({name: jsTestName(), mongos: 1, shards: 2, rs: {nodes: 2}});
 
@@ -134,14 +135,17 @@ function assertProfilerEntriesMatch(expected, comment, pipeline) {
                    ' instead in profiler ' +
                    tojson({[node.name]: node.getDB(dbName).system.profile.find().toArray()}));
 
-        const localReadCount = getLocalReadCount(node, foreignNs, comment);
-        let expectedLocalCountList = expected.subPipelineLocal[i];
-        if (!Array.isArray(expectedLocalCountList)) {
-            expectedLocalCountList = [expectedLocalCountList];
+        if (expected.subPipelineLocal) {
+            const localReadCount = getLocalReadCount(node, foreignNs, comment);
+            let expectedLocalCountList = expected.subPipelineLocal[i];
+            if (!Array.isArray(expectedLocalCountList)) {
+                expectedLocalCountList = [expectedLocalCountList];
+            }
+            assert(expectedLocalCountList.includes(localReadCount),
+                   () => 'Expected count of local reads to be in ' +
+                       tojson(expectedLocalCountList) + ' but found ' + localReadCount +
+                       ' instead for node ' + node.name);
         }
-        assert(expectedLocalCountList.includes(localReadCount),
-               () => 'Expected count of local reads to be in ' + tojson(expectedLocalCountList) +
-                   ' but found ' + localReadCount + ' instead for node ' + node.name);
     }
 }
 
@@ -487,29 +491,31 @@ assertAggResultAndRouting(
         subPipelineRemote: [[4, 5], 4],
     });
 
-// TODO SERVER-64596 Update test case for the SBE $lookup after the root cause is identified.
-if (!checkSBEEnabled(mongosDB, ["featureFlagSBELookupPushdown"])) {
-    // Test $lookup when the foreign collection does not exist.
-    st.shardColl(local, {_id: 1}, {_id: 0}, {_id: 0});
+// Test $lookup when the foreign collection does not exist.
+st.shardColl(local, {_id: 1}, {_id: 0}, {_id: 0});
 
-    pipeline[0].$lookup.from = "lookupCollDoesNotExist";
-    expectedRes = [
-        {_id: -2, a: -2, bs: []},
-        {_id: -1, a: 1, bs: []},
-        {_id: 1, a: 2, bs: []},
-        {_id: 2, a: 3, bs: []}
-    ];
-    assertAggResultAndRouting(pipeline, expectedRes, {comment: "lookup_foreign_does_not_exist"}, {
-        // The $lookup is not executed in parallel because mongos defaults to believing the foreign
-        // namespace is unsharded.
-        toplevelExec: [1, 0],
-        // The node executing the $lookup believes it has stale information about the foreign
-        // collection and needs to target shards to properly resolve it. Then, it can use the local
-        // read path for each subpipeline query.
-        subPipelineLocal: [4, 0],
-        subPipelineRemote: [1, 0],
-    });
-}
+pipeline[0].$lookup.from = "lookupCollDoesNotExist";
+expectedRes = [
+    {_id: -2, a: -2, bs: []},
+    {_id: -1, a: 1, bs: []},
+    {_id: 1, a: 2, bs: []},
+    {_id: 2, a: 3, bs: []}
+];
+assertAggResultAndRouting(pipeline, expectedRes, {comment: "lookup_foreign_does_not_exist"}, {
+    // The $lookup is not executed in parallel because mongos defaults to believing the foreign
+    // namespace is unsharded.
+    toplevelExec: [1, 0],
+    // The node executing the $lookup believes it has stale information about the foreign
+    // collection and needs to target shards to properly resolve it. Then, it can use the local
+    // read path for each subpipeline query.
+    subPipelineLocal: [4, 0],
+    // Because $lookup is pushed down, we will try to take a lock on the foreign collection to check
+    // foreign collection's sharding state. Given that the stale shard version is resolved earlier
+    // and we've figured out that the foreign collection is unsharded, we no longer need to target a
+    // shard and instead can read locally. As such, we will not generate an entry in the profiler
+    // for querying the foreign collection.
+    subPipelineRemote: [0, 0],
+});
 
 //
 // Test $lookup where the foreign collection becomes sharded in the middle of the query.
@@ -586,10 +592,12 @@ awaitShell();
 let expectedRouting = {
     // At the beginning, the foreign collection is unsharded, so the $lookup cannot be parallelized.
     toplevelExec: [1, 0],
-    // For the first local document, the $lookup can do local reads, since it is executing on the
-    // primary with an unsharded foreign collection. For the remaining two local documents, $lookup
-    // has to open a cursor on every shard to get correct documents for 'foreign'.
-    subPipelineLocal: [1, 0],
+    // We know from prior tests that the $lookup will do a local read for the first local document,
+    // since it is executing on the primary with an unsharded foreign collection. Checking the local
+    // read log here can be flakey because of the failpoint; the local read log may be rotated off
+    // the internal log buffer before we can check for it. Instead, we can just check that for the
+    // remaining two local documents, $lookup has to open a cursor on every shard to get correct
+    // documents for 'foreign'.
     subPipelineRemote: [2, 2]
 };
 assertProfilerEntriesMatch(expectedRouting, parallelTestComment, pipeline);
@@ -622,10 +630,12 @@ failPoint.off();
 awaitShell();
 
 expectedRouting = {
-    // For the first local document, the $lookup can do local reads, since it is executing on the
-    // primary with an unsharded foreign collection. For the remaining two local documents, $lookup
-    // tries and fails to read locally and must target shards to get correct foreign documents.
-    subPipelineLocal: [1, 0],
+    // We know from prior tests that the $lookup will do a local read for the first document, since
+    // it is executing on the primary with an unsharded foreign collection. Checking the local
+    // read log here can be flakey because of the failpoint; the local read log may be rotated off
+    // the internal log buffer before we can check for it. Instead, we can just check that for the
+    // remaining two local documents, $lookup tries and fails to read locally and must target
+    // shards to get correct foreign documents.
     subPipelineRemote: [0, 2]
 };
 assertProfilerEntriesMatch(expectedRouting, parallelTestComment, pipeline);

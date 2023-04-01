@@ -35,6 +35,7 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/oid.h"
+#include "mongo/db/keys_collection_client.h"
 #include "mongo/s/client/shard_registry.h"
 
 namespace mongo {
@@ -65,17 +66,20 @@ std::unique_ptr<executor::TaskExecutor> makeShardingTaskExecutor(
 /**
  * Initializes the global ShardingCatalogClient, ShardingCatalogManager, and Grid objects.
  */
-Status initializeGlobalShardingState(OperationContext* opCtx,
-                                     std::unique_ptr<CatalogCache> catalogCache,
-                                     std::unique_ptr<ShardRegistry> shardRegistry,
-                                     rpc::ShardingEgressMetadataHookBuilder hookBuilder,
-                                     boost::optional<size_t> taskExecutorPoolSize);
+Status initializeGlobalShardingState(
+    OperationContext* opCtx,
+    std::unique_ptr<CatalogCache> catalogCache,
+    std::unique_ptr<ShardRegistry> shardRegistry,
+    rpc::ShardingEgressMetadataHookBuilder hookBuilder,
+    boost::optional<size_t> taskExecutorPoolSize,
+    std::function<std::unique_ptr<KeysCollectionClient>(ShardingCatalogClient*)> initKeysClient);
 
 /**
- * Loads cluster ID and waits for the reload of the Shard Registry.
+ * Loads global settings from config server such as cluster ID and default write concern.
  */
 
-Status waitForShardRegistryReload(OperationContext* opCtx);
+Status loadGlobalSettingsFromConfigServer(OperationContext* opCtx,
+                                          ShardingCatalogClient* catalogClient);
 
 /**
  * Pre-caches mongod routing info for the calling process.

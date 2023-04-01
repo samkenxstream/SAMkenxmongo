@@ -124,6 +124,13 @@ majority write concern needed to set the CWWC, users can run
 `setDefaultRWConcern` with write concern `{w: 1}` instead of making it a majority write so that
 setting CWWC does not get in the way of being able to do a force reconfig.
 
+#### Code References
+- [The definition of an Oplog Entry](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_entry.idl)
+- [Upper layer uses OpObserver class to write Oplog](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/op_observer/op_observer.h#L112), for example, [it is helpful to take a look at ObObserverImpl::logOperation()](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/op_observer/op_observer_impl.cpp#L114)
+- [Oplog::logOpsInner() is a common function to write Oplogs into Oplog Collection](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog.cpp#L356)
+- [WriteConcernOptions is filled in extractWriteConcern()](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/write_concern.cpp#L71)
+- [Upper level uses waitForWriteConcern() to wait for the write concern to be fulfilled](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/write_concern.cpp#L254)
+
 ## Life as a Secondary
 
 In general, secondaries just choose a node to sync from, their **sync source**, and then pull
@@ -307,11 +314,11 @@ endless loop doing the following:
 6. Use multiple threads to apply the batch in parallel. This means that oplog entries within the
    same batch are not necessarily applied in order. The operations in each batch will be divided
    among the writer threads. The only restriction for creating the vector of operations that each
-   writer thread will apply serially has to do with the namespace that the operation applies to.
-   Operations on a document must be atomic and ordered, so operations on the same namespace will be
-   put on the same thread to be serialized. When applying operations, each writer thread will try to
-   **group** together insert operations for improved performance and will apply all other operations
-   individually.
+   writer thread will apply serially has to do with the documents that the operation applies to.
+   Operations on a document must be atomic and ordered, and are hence put on the same thread to be
+   serialized. Operations on the same collection can still be parallelized if they are working with
+   distinct documents. When applying operations, each writer thread will try to **group** together
+   insert operations for improved performance and will apply all other operations individually.
 7. Tell the storage engine to flush the journal.
 8. Update [**oplog visibility**](../catalog/README.md#oplog-visibility) by notifying the storage
    engine of the new oplog entries. Since entries in an oplog applier batch are applied in
@@ -319,6 +326,16 @@ endless loop doing the following:
    applied, otherwise an oplog hole could be made visible.
 9. Finalize the batch by advancing the global timestamp (and the node's last applied optime) to the
    last optime in the batch.
+
+#### Code References
+- [Start background threads like bgSync/oplogApplier/syncSourceFeedback](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_external_state_impl.cpp#L213)
+- [BackgroundSync starts SyncSourceResolver and OplogFetcher to sync log](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/bgsync.cpp#L225)
+- [SyncSourceResolver chooses a sync source to sync from](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/sync_source_resolver.cpp#L545)
+- [OplogBuffer currently uses a BlockingQueue as underlying data structure](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_buffer_blocking_queue.h#L41)
+- [OplogFetcher queries from sync source and put fetched oplogs in OplogApplier::_oplogBuffer](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_fetcher.cpp#L209)
+- [OplogBatcher polls oplogs from OplogApplier::_oplogBuffer and creates an OplogBatch to apply](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_batcher.cpp#L282)
+- [OplogApplier gets batches of oplog entries from the OplogBatcher and applies entries in parallel](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_applier_impl.cpp#L297)
+- [SyncSourceFeedback keeps checking if there are new oplogs applied on this instance and issues `UpdatePositionCmd` to sync source](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/sync_source_feedback.cpp#L157)
 
 ## Replication and Topology Coordinators
 
@@ -586,6 +603,16 @@ information to its own sync source.
 The `replSetUpdatePosition` command response does not include any information unless there is an
 error, such as in a `ReplSetConfig` mismatch.
 
+#### Code References
+- [OplogFetcher passes on the metadata it received from its sync source](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/oplog_fetcher.cpp#L897)
+- [Node handles heartbeat response and schedules the next heartbeat after it receives heartbeat response](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl_heartbeat.cpp#L190)
+- [Node responds to heartbeat request](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/repl_set_commands.cpp#L752)
+- [Primary advances the replica set's commit point after receiving replSetUpdatePosition command](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L1889)
+- [Secondary advances its understanding of the replica set commit point using metadata fetched from its sync source](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L5649)
+- [TopologyCoordinator updates commit optime](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/topology_coordinator.cpp#L2885)
+- [SyncSourceFeedback triggers replSetUpdatePosition command using Reporter](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/reporter.cpp#L189)
+- [Node updates replica set metadata after receiving replSetUpdatePosition command](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/repl_set_commands.cpp#L675)
+
 ## Read Concern
 
 All reads in MongoDB are executed on snapshots of the data taken at some point in time. However, for
@@ -673,6 +700,9 @@ wait until the committed snapshot is beyond the specified OpTime.
 **afterClusterTime** is a read concern option used for supporting **causal consistency**.
 <!-- TODO: link to the Causal Consistency section of the Sharding Architecture Guide -->
 
+#### Code References
+- [ReadConcernArg is filled in _extractReadConcern()](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/service_entry_point_common.cpp#L261)
+
 # enableMajorityReadConcern Flag
 
 `readConcern: majority` is enabled by default for WiredTiger in MongoDB. This can be problematic
@@ -697,11 +727,11 @@ Guide. <!-- TODO Link to Change Streams Section in Query Arch Guide -->
 ## eMRC=false and Rollback
 
 Even though we added support for taking stable checkpoints when `eMRC=false`, we must still use the
-`rollbackViaRefetch` algorithm instead of the `Recover to A Timestamp` algorithm. As aforementioned,
-when `eMRC=false`, the replication system will set the `stableTimestamp` to the newest `all_durable`
-timestamp. This allows us to take stable checkpoints that are not necessarily majority committed.
-Consequently, the `stableTimestamp` can advance past the `majority commit point`, which will break
-the `Recover to A Timestamp` algorithm.
+`rollbackViaRefetch` algorithm instead of the [`Recover to A Timestamp` algorithm](#Rollback-recover-to-a-timestamp-RTT).
+As aforementioned, when `eMRC=false`, the replication system will set the `stableTimestamp` to the
+newest `all_durable` timestamp. This allows us to take stable checkpoints that are not necessarily
+majority committed. Consequently, the `stableTimestamp` can advance past the `majority commit point`,
+which will break the `Recover to A Timestamp` algorithm.
 
 ### rollbackViaRefetch
 
@@ -710,9 +740,9 @@ realize that the greater than or equal to predicate did not return the last op i
 rolling back, nodes are in the `ROLLBACK` state and reads are prohibited. When a node goes into
 rollback it drops all snapshots.
 
-The rolling-back node first finds the common point between its oplog and its sync source's oplog.
-It then goes through all of the operations in its oplog back to the common point and figures out
-how to undo them.
+The rolling-back node first [finds the common point](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/rs_rollback.cpp#L1228)
+between its oplog and its sync source's oplog. It then goes through all of the operations in its
+oplog back to the common point and figures out how to undo them.
 
 Simply doing the "inverse" operation is sometimes impossible, such as a document remove where we do
 not log the entire document that is removed. Instead, the node simply refetches the problematic
@@ -735,8 +765,8 @@ This process is very similar to initial sync and startup after an unclean shutdo
 operations are applied on data that may already reflect those operations and operations in the
 future. This leads to all of the same idempotency concerns and index constraint relaxation.
 
-Though we primarily use the `Recover To A Timestamp` algorithm from MongoDB 4.0 and onwards, we
-must still keep the `rollbackViaRefetch` to support `eMRC=false` nodes.
+Though we primarily use the [`Recover To A Timestamp`](#rollback-recover-to-a-timestamp-rtt) algorithm
+from MongoDB 4.0 and onwards, we must still keep the `rollbackViaRefetch` to support `eMRC=false` nodes.
 
 ## eMRC=false and Single Replica Set Transactions
 
@@ -775,10 +805,10 @@ aborts, all of its operations abort and all corresponding data changes are abort
 
 ## Life of a Multi-Document Transaction
 
-All transactions are associated with a server session and at any given time, only one open
-transaction can be associated with a single session. The state of a transaction is maintained
-through the
-[`TransactionParticipant`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/transaction_participant.h),
+All transactions are associated with a server session and at any given time,
+[only one open transaction can be associated with a single session](https://github.com/mongodb/mongo/blob/r6.0.5/src/mongo/db/service_entry_point_common.cpp#L881-L902).
+The state of a transaction is maintained
+through the [`TransactionParticipant`](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/transaction_participant.h),
 which is a decoration on the session. Any thread that attempts to modify the state of the
 transaction, which can include committing, aborting, or adding an operation to the transaction, must
 have the correct session checked out before doing so. Only one operation can check out a session at
@@ -789,34 +819,34 @@ a time, so other operations that need to use the same session must wait for it t
 Transactions are started on the server by the first operation in the transaction, indicated by a
 `startTransaction: true` parameter. All operations in a transaction must include an `lsid`, which is
 a unique ID for a session, a `txnNumber`, and an `autocommit:false` parameter. The `txnNumber` must
-be higher than the previous `txnNumber` on this session. Otherwise, we will throw a
-`TransactionTooOld` error.
+be higher than the previous `txnNumber` on this session. Otherwise, we will
+[throw a `TransactionTooOld` error](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/transaction_participant.cpp#L957-L978).
 
 When starting a new transaction, we implicitly abort the previously running transaction (if one
 exists) on the session by updating our `txnNumber`. Next, we update our `txnState` to
 `kInProgress`. The `txnState` maintains the state of the transaction and allows us to determine
 legal state transitions. Finally, we reset the in memory state of the transaction as well as any
-corresponding transaction metrics from a previous transaction.
+[corresponding transaction metrics](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/transaction_participant.cpp#L896-L902) from a previous transaction.
 
-When a node starts a transaction, it will acquire the global lock in intent exclusive mode (and as a
-result, the [RSTL](#replication-state-transition-lock) in intent exclusive as well), which it will
+When a node starts a transaction, it will [acquire the global lock in intent exclusive mode](https://github.com/mongodb/mongo/blob/master/src/mongo/db/transaction/transaction_participant.cpp#L1569)
+(and as a result, the [RSTL](#replication-state-transition-lock) in intent exclusive as well), which it will
 hold for the duration of the transaction. The only exception is when
 [preparing a transaction](#preparing-a-transaction-on-the-primary), which will release the RSTL and
 reacquire it when [committing](#committing-a-prepared-transaction) or
-[aborting](#aborting-a-prepared-transaction) the transaction. It also opens a `WriteUnitOfWork`,
-which begins a storage engine transaction on the `RecoveryUnit`. The `RecoveryUnit` is responsible
-for making sure data is persisted and all on-disk data must be modified through this interface. The
+[aborting](#aborting-a-prepared-transaction) the transaction. It also
+[opens a `WriteUnitOfWork`, which begins a storage engine transaction on the `RecoveryUnit`](https://github.com/mongodb/mongo/blob/411e11d88eaa52d70d02cab8e94d3a5b224900ab/src/mongo/db/transaction/transaction_participant.cpp#L1571-L1577).
+The `RecoveryUnit` is responsible for making sure data is persisted and all on-disk data must be modified through this interface. The
 storage transaction is updated every time an operation comes in so that we can read our own writes
 within a multi-document transaction. These changes are not visible to outside operations because the
 node hasn't committed the transaction (and therefore, the WUOW) yet.
 
 ### Adding Operations to a Transaction
 
-A user can add additional operations to an existing multi-document transaction by running more
+A user can [add additional operations](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/op_observer_impl.cpp#L554) to an existing multi-document transaction by running more
 commands on the same session. These operations are then stored in memory. Once a write completes on
-the primary, we update the corresponding `sessionTxnRecord` in the transactions table
-(`config.transactions`) with information about the transaction. This includes things like the
-`lsid`, the `txnNumber` currently associated with the session, and the `txnState`.
+the primary, [we update the corresponding `sessionTxnRecord`](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/op_observer_impl.cpp#L1664-L1673)
+in the transactions table (`config.transactions`) with information about the transaction. 
+This includes things like the `lsid`, the `txnNumber` currently associated with the session, and the `txnState`.
 
 This table was introduced for retryable writes and is used to keep track of retryable write and
 transaction progress on a session. When checking out a session, this table can be used to restore
@@ -826,24 +856,24 @@ the transactions table is used during transaction recovery.
 
 ### Committing a Single Replica Set Transaction
 
-If we decide to commit this transaction, we retrieve those operations, group them into an `applyOps`
+If we decide to commit this transaction, [we retrieve those operations, group them into an `applyOps`](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/op_observer_impl.cpp#L1981-L1983)
 command and write down an `applyOps` oplog entry. Since an `applyOps` oplog entry can only be up to
 16MB, transactions larger than this require multiple `applyOps` oplog entries upon committing.
 
-If we are committing a read-only transaction, meaning that we did not modify any data, it must wait
+If we are committing a [read-only transaction](#read-concern-behavior-within-transactions), meaning that we did not modify any data, it must wait
 for any data it reads to be majority committed regardless of the `readConcern` level.
 
-Once we log the transaction oplog entries, we must commit the storage-transaction on the
-`OperationContext`. This involves calling commit() on the WUOW. Once commit() is called on the WUOW
+Once we log the transaction oplog entries, [we must commit the storage-transaction](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/transaction_participant.cpp#L1850-L1852)
+on the `OperationContext`. This involves calling commit() on the WUOW. Once commit() is called on the WUOW
 associated with a transaction, all writes that occurred during its lifetime will commit in the
 storage engine.
 
-Finally, we update the transactions table, update our local `txnState` to `kCommitted`, log any
+Finally, we update the transactions table, [update our local `txnState` to `kCommitted`](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/transaction_participant.cpp#L2012), log any
 transactions metrics, and clear our txnResources.
 
 ### Aborting a Single Replica Set Transaction
 
-The process for aborting a multi-document transaction is simpler than committing. We abort the
+The process for aborting a multi-document transaction is simpler than committing. We [abort](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/transaction_participant.cpp#L2072) the
 storage transaction and change our local `txnState` to `kAbortedWithoutPrepare`. We then log any
 transactions metrics and reset the in memory state of the `TransactionParticipant`. None of the
 transaction operations are visible at this point, so we don't need to write an abort oplog entry
@@ -1030,7 +1060,7 @@ actually applying the oplog entry and preparing the transaction, the node will w
 application has completed to reconstruct the transaction. If the node encounters a
 `commitTransaction` oplog entry, it will immediately commit the transaction. If the transaction it's
 about to commit was prepared, the node will find the `prepareTransaction` oplog entry(s) using the
-[`TransactionHistoryIterator`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/transaction_history_iterator.h)
+[`TransactionHistoryIterator`](https://github.com/mongodb/mongo/blob/v6.1/src/mongo/db/transaction/transaction_history_iterator.h)
 to get the operations for the transaction, prepare it and then immediately commit it.
 
 When oplog application for recovery or initial sync completes, the node will iterate
@@ -1364,13 +1394,17 @@ primary.
 
 ### Conditional
 
-The `replSetStepDown` command is one way that a node relinquishes its position as primary. We
-consider this a conditional step down because it can fail if the following conditions are not met:
-* `force` is true and now > `waitUntil` deadline, which is the amount of time we will wait before
-stepping down (Note: If `force` is true, only this condition needs to be met)
-* The [`lastApplied`](#replication-timestamp-glossary) OpTime of the primary must be replicated to
-a majority of the nodes
-* At least one of the up-to-date secondaries is also electable
+The `replSetStepDown` command is one way that a node relinquishes its position as primary. Stepdown via the
+`replSetStepDown` command is called "conditional" because it may or may not succeed. Success in this case
+depends on the params passed to the command as well as the state of nodes of the replica set.
+* If the `force` option is set to `true`:
+  * In this case the primary node will wait for `secondaryCatchUpPeriodSecs`, a `replSetStepDown` parameter,
+  before stepping down regardless of whether the other nodes have caught up or are electable.
+* If the `force` option is omitted or set to `false`, the following conditions must be met for the command to
+succeed:
+  * The [`lastApplied`](#replication-timestamp-glossary) OpTime of the primary must be replicated to a majority
+  of the nodes
+  * At least one of the up-to-date secondaries must also be electable
 
 When a `replSetStepDown` command comes in, the node begins to check if it can step down. First, the
 node attempts to acquire the [RSTL](#replication-state-transition-lock). In order to do so, it must
@@ -1379,11 +1413,14 @@ kill all conflicting user/system operations and abort all unprepared transaction
 Now, the node loops trying to step down. If force is `false`, it repeatedly checks if a majority of
 nodes have reached the `lastApplied` optime, meaning that they are caught up. It must also check
 that at least one of those nodes is electable. If force is `true`, it does not wait for these
-conditions and steps down immediately after it reaches the `waitUntil` deadline.
+conditions and steps down immediately after it reaches the `secondaryCatchUpPeriodSecs` deadline.
 
 Upon a successful stepdown, it yields locks held by
 [prepared transactions](#stepdown-with-a-prepared-transaction) because we are now a secondary.
 Finally, we log stepdown metrics and update our member state to `SECONDARY`.
+* User-facing documentation is
+available [here](https://www.mongodb.com/docs/manual/reference/command/replSetStepDown/#command-fields).
+* [Code spelunking point](https://github.com/mongodb/mongo/blob/843762120897ed2dbfe8bbc69dbbf99b641c009c/src/mongo/db/repl/replication_coordinator_impl.cpp#L2737).
 
 ### Unconditional
 
@@ -1419,11 +1456,11 @@ We try to prevent concurrent conditional stepdown attempts by setting `_leaderMo
 another conditional stepdown attempt from occurring, but still allow unconditional attempts to
 supersede.
 
-# Rollback
+# Rollback: Recover To A Timestamp (RTT)
 
 Rollback is the process whereby a node that diverges from its sync source gets back to a consistent
 point in time on the sync source's branch of history. We currently support two rollback algorithms,
-Recover To A Timestamp (RTT) and Rollback via Refetch. This section will cover the RTT method.
+Recover To A Timestamp (RTT) and [Rollback via Refetch](#rollbackviarefetch). This section will cover the RTT method.
 
 Situations that require rollback can occur due to network partitions. Consider a scenario where a
 secondary can no longer hear from the primary and subsequently runs for an election. We now have
@@ -1440,25 +1477,30 @@ recover to a [`stable_timestamp`](#replication-timestamp-glossary), which is the
 at which the storage engine can take a checkpoint. This can be considered a consistent, majority
 committed point in time for replication and storage.
 
-A node goes into rollback when its last fetched OpTime is greater than its sync source's last
-applied OpTime, but it is in a lower term. In this case, the `OplogFetcher` will return an empty
-batch and fail with an `OplogStartMissing` error.
+A node goes into rollback when its [last fetched OpTime is greater than its sync source's last applied OpTime, but it is in a lower term](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/oplog_fetcher.cpp#L1019-L1024).
+In this case, the `OplogFetcher` will return an empty batch and fail with an `OplogStartMissing` error,
+which [`BackgroundSync` interprets as needing to rollback](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/bgsync.cpp#L600-L603).
 
-During [rollback](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/rollback_impl.cpp#L176),
-nodes first transition to the `ROLLBACK` state and kill all user operations to ensure that we can
-successfully acquire [the RSTL](#replication-state-transition-lock). Reads are prohibited while
-we are in the `ROLLBACK` state.
+During [rollback](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/rollback_impl.cpp#L175),
+nodes first [transition to the `ROLLBACK`](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/rollback_impl.cpp#L194)
+state and kill all user operations to ensure that we can successfully acquire [the RSTL](#replication-state-transition-lock).
+Reads are prohibited while we are in the `ROLLBACK` state.
 
-We then wait for background index builds to complete before finding the `common point` between the
-rolling back node and the sync source node. The `common point` is the OpTime after which the nodes'
-oplogs start to differ. During this step, we keep track of the operations that are rolled back up
+We then [find the `common point`](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/rollback_impl.cpp#L217)
+between the rolling back node and the sync source node. The `common point` is the OpTime after which
+the nodes' oplogs start to differ. During this step, we keep track of the operations that are rolled back up
 until the `common point` and update necessary data structures. This includes metadata that we may
-write out to rollback files and and use to roll back collection fast-counts. Then, we increment
+write out to rollback files and and use to roll back collection fast-counts. Then, we [increment](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/rollback_impl.cpp#L237)
 the Rollback ID (RBID), a monotonically increasing number that is incremented every time a rollback
 occurs. We can use the RBID to check if a rollback has occurred on our sync source since the
-baseline RBID was set.
+baseline RBID was set. [Note that the RBID is stored durably on disk](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/storage_interface_impl.cpp#L181).
 
-Now, we enter the data modification section of the rollback algorithm, which begins with
+We then [wait for background index builds to complete before entering rollback](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/rollback_impl.cpp#L548).
+We aren't sure exactly what issues may arise when index builds run concurrently with rolling back to a
+stable timestamp, but rather than dealing with the complexity we took the conservative approach of waiting
+for all index builds before beginning rollback.
+
+Now, we enter the [data modification section](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/rollback_impl.cpp#L551) of the rollback algorithm, which begins with
 aborting prepared transactions and ends with reconstructing them at the end. If we fail at any point
 during this phase, we must terminate the rollback attempt because we cannot safely recover.
 
@@ -1472,8 +1514,8 @@ in order to avoid unnecessary prepare conflicts when trying to read documents th
 those transactions, which must be aborted for rollback anyway. Finally, if we have rolled back any
 operations, we invalidate all sessions on this server.
 
-Now, we are ready to tell the storage engine to recover to the last `stable_timestamp`. Upon
-success, the storage engine restores the data reflected in the database to the data reflected at the
+Now, we are ready to tell the storage engine to [recover to the last `stable_timestamp`](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/rollback_impl.cpp#L585-L586).
+Upon success, the storage engine restores the data reflected in the database to the data reflected at the
 last `stable_timestamp`. This does not, however, revert the oplog. In order to revert the oplog,
 rollback must remove all oplog entries after the `common point`. This is called the truncate point
 and is written into the `oplogTruncateAfterPoint` document. Now, the recovery process knows where to
@@ -1514,6 +1556,7 @@ applies all oplog entries through the end of the sync source's oplog. See the
 [Startup Recovery](#startup-recovery) section for more information on truncating the oplog and
 applying oplog entries.
 
+Then, we rebuild in-memory structures such as [tenant migration access blockers](https://github.com/mongodb/mongo/blob/r6.0.0/src/mongo/db/repl/rollback_impl.cpp#L652).
 The last thing we do before exiting the data modification section is
 [reconstruct prepared transactions](#recovering-prepared-transactions). We must also restore their
 in-memory state to what it was prior to the rollback in order to fulfill the durability guarantees
@@ -1705,6 +1748,15 @@ flag and tell the storage engine that the [`initialDataTimestamp`](#replication-
 is the node's last applied OpTime. Finally, the `InitialSyncer` shuts down and the
 `ReplicationCoordinator` starts steady state replication.
 
+#### Code References
+- [ReplicationCoordinator starts initial sync if the node is started up without any data](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L887)
+- [Follow this flowchart for initial sync call stack.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/initial_syncer.h#L278)
+- [Initial syncer uses AllDatabaseCloner/DatabaseCloner/CollectionCloner to clone data from sync source, where the state transition is defined in runStages().](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/base_cloner.cpp#L268)
+- [AllDatabaseCloner creates and runs each DatabaseCloner in its post stage.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/all_database_cloner.cpp#L263)
+- [DatabaseCloner creates and runs each CollectionCloner in its post stage.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/database_cloner.cpp#L137)
+- [InitialSyncer uses RollbackChecker to check if there is a rollback on sync source during initial sync.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/initial_syncer.cpp#L2014)
+- [Set lastApplied OpTime as initialDataTimestamp to storage engine after initial sync finishes.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/initial_syncer.cpp#L586-L590)
+- [Start steady state replication after initial sync completes.](https://github.com/mongodb/mongo/blob/r6.2.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L847)
 # File Copy Based Initial Sync
 
 File Copy Based Initial Sync (FCBIS) is an initial sync method implemented by
@@ -2174,122 +2226,7 @@ written to the oplog.
 
 # Feature Compatibility Version
 
-Feature compatibility version (FCV) is the versioning mechanism for a MongoDB cluster that provides
-safety guarantees when upgrading and downgrading between versions. The FCV determines the version of
-the feature set exposed by the cluster and is often set in lockstep with the binary version as a
-part of [upgrading or downgrading the cluster's binary version](https://docs.mongodb.com/v5.0/release-notes/5.0-upgrade-replica-set/#upgrade-a-replica-set-to-5.0).
-
-FCV is used to disable features that may be problematic when active in a mixed version cluster.
-For example, incompatibility issues can arise if a newer version node accepts an instance of a new
-feature *f* while there are still older version nodes in the cluster that are unable to handle
-*f*.
-
-FCV is persisted as a document in the `admin.system.version` collection. It will look something like
-the following if a node were to be in FCV 5.0:
-<pre><code>
-   { "_id" : "featureCompatibilityVersion", "version" : "5.0" }</code></pre>
-
-This document is present in every mongod in the cluster and is replicated to other members of the
-replica set whenever it is updated via writes to the `admin.system.version` collection. The FCV
-document is also present on standalone nodes.
-
-On a clean startup (the server currently has no replicated collections), the server will create the
-FCV document for the first time. If it is running as a shard server (with the `--shardsvr option`),
-the server will set the FCV to be the last LTS version. This is to ensure compatibility when adding
-the shard to a downgraded version cluster. The config server will run
-`setFeatureCompatibilityVersion`on the shard to match the clusters FCV as part of `addShard`. If the
-server is not running as a shard server, then the server will set its FCV to the latest version by
-default.
-
-As part of a startup with an existing FCV document, the server caches an in-memory value of the FCV
-from disk. The `FcvOpObserver` keeps this in-memory value in sync with the on-disk FCV document
-whenever an update to the document is made. In the period of time during startup where the in-memory
-value has yet to be loaded from disk, the FCV is set to `kUnsetDefaultLastLTSBehavior`. This
-indicates that the server will be using the last-LTS feature set as to ensure compatibility with
-other nodes in the replica set.
-
-As part of initial sync, the in-memory FCV value is always initially set to be 
-`kUnsetDefaultLastLTSBehavior`. This is to ensure compatibility between the sync source and sync
-target. If the sync source is actually in a different feature compatibility version, we will find
-out when we clone the `admin.system.version` collection.
-
-A node that starts with `--replSet` will also have an FCV value of `kUnsetDefaultLastLTSBehavior`
-if it has not yet received the `replSetInitiate` command.
-
-## setFeatureCompatibilityVersion
-
-The FCV can be set using the `setFeatureCompatibilityVersion` admin command to one of the following:
-* The version of the last-LTS (Long Term Support) 
-  * Indicates to the server to use the feature set compatible with the last LTS release version.
-* The version of the last-continuous release
-  * Indicates to the server to use the feature set compatible with the last continuous release
-version.
-* The version of the latest(current) release
-  * Indicates to the server to use the feature set compatible with the latest release version.
-In a replica set configuration, this command should be run against the primary node. In a sharded
-configuration this should be run against the mongos. The mongos will forward the command
-to the config servers which then forward request again to shard primaries. As mongos nodes are
-non-data bearing, they do not have an FCV.
-
-Each `mongod` release will support the following upgrade/downgrade paths:
-* Last-Continuous ←→ Latest
-* Last-LTS ←→ Latest
-* Last-LTS → Last-Continuous
-  * This upgrade-only transition is only possible when requested by the [config server](https://docs.mongodb.com/manual/core/sharded-cluster-config-servers/).
-Additionally, the last LTS must not be equal to the last continuous release.
-
-As part of an upgrade/downgrade, the FCV will transition through three states:
-<pre><code>
-Upgrade:
-   kVersion_X → kUpgradingFrom_X_To_Y → kVersion_Y
-
-Downgrade:
-   kVersion_X → kDowngradingFrom_X_To_Y → kVersion_Y
-</code></pre>
-In above, X will be the source version that we are upgrading/downgrading from while Y is the target
-version that we are upgrading/downgrading to.
-
-Transitioning to one of the `kUpgradingFrom_X_To_Y`/`kDowngradingFrom_X_To_Y` states updates
-the FCV document in `admin.system.version` with a new `targetVersion` field. Transitioning to a
-`kDowngradingFrom_X_to_Y` state in particular will also add a `previousVersion` field along with the
-`targetVersion` field. These updates are done with `writeConcern: majority`.
-
-Some examples of on-disk representations of the upgrading and downgrading states:
-<pre><code>
-kUpgradingFrom_5_0_To_5_1:
-{
-    version: 5.0,
-    targetVersion: 5.1
-}
-
-kDowngradingFrom_5_1_To_5_0:
-{ 
-    version: 5.0, 
-    targetVersion: 5.0,
-    previousVersion: 5.1
-}
-</code></pre>
-
-Once this transition is complete, the global lock is acquired in shared
-mode and then released immediately. This creates a barrier and guarantees safety for operations
-that acquire the global lock either in exclusive or intent exclusive mode. If these operations begin
-and acquire the global lock prior to the FCV change, they will proceed in the context of the old
-FCV, and will guarantee to finish before the FCV change takes place. For the operations that begin
-after the FCV change, they will see the updated FCV and behave accordingly.
-
-Transitioning to one of the `kUpgradingFrom_X_To_Y`/`kDowngradingFrom_X_to_Y`/`kVersion_Y`(on
-upgrade) states sets the `minWireVersion` to `WireVersion::LATEST_WIRE_VERSION` and also closes all
-incoming connections from internal clients with lower binary versions.
-
-Finally, as part of transitioning to the `kVersion_Y` state, the `targetVersion` and the
-`previousVersion` (if applicable) fields of the FCV document are deleted while the `version` field
-is updated to reflect the new upgraded or downgraded state. This update is also done using
-`writeConcern: majority`. The new in-memory FCV value will be updated to reflect the on-disk
-changes.
-
-_Code spelunking starting points:_
-* [The template file used to generate the FCV constants](https://github.com/mongodb/mongo/blob/c4d2ed3292b0e113135dd85185c27a8235ea1814/src/mongo/util/version/releases.h.tpl#L1)
-* [The `FCVTransitions` class, that determines valid FCV transitions](https://github.com/mongodb/mongo/blob/c4d2ed3292b0e113135dd85185c27a8235ea1814/src/mongo/db/commands/feature_compatibility_version.cpp#L75)
+See the [FCV and Feature Flag README](FCV_AND_FEATURE_FLAG_README.md).
 
 # System Collections
 

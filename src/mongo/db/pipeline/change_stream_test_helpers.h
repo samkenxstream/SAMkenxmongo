@@ -42,7 +42,8 @@
 namespace mongo::change_stream_test_helper {
 static const Timestamp kDefaultTs(100, 1);
 static const repl::OpTime kDefaultOpTime(kDefaultTs, 1);
-static const NamespaceString nss("unittests.change_stream");
+static const NamespaceString nss =
+    NamespaceString::createNamespaceString_forTest(boost::none, "unittests.change_stream");
 static const BSONObj kDefaultSpec = fromjson("{$changeStream: {}}");
 static const BSONObj kShowExpandedEventsSpec =
     fromjson("{$changeStream: {showExpandedEvents: true}}");
@@ -57,11 +58,19 @@ const UUID& testUuid();
 LogicalSessionFromClient testLsid();
 
 Document makeResumeToken(Timestamp ts,
-                         ImplicitValue uuid = Value(),
-                         ImplicitValue docKey = Value(),
+                         ImplicitValue uuid,
+                         ImplicitValue docKeyOrOpDesc,
+                         StringData operationType,
                          ResumeTokenData::FromInvalidate fromInvalidate =
                              ResumeTokenData::FromInvalidate::kNotFromInvalidate,
                          size_t txnOpIndex = 0);
+
+Document makeResumeTokenWithEventId(Timestamp ts,
+                                    ImplicitValue uuid,
+                                    ImplicitValue eventIdentifier,
+                                    ResumeTokenData::FromInvalidate fromInvalidate =
+                                        ResumeTokenData::FromInvalidate::kNotFromInvalidate,
+                                    size_t txnOpIndex = 0);
 
 /**
  * Creates an OplogEntry with given parameters and preset defaults for this test suite.

@@ -2,19 +2,19 @@
  * Tests creating and using compound indexes on time-series metadata and measurement fields.
  *
  * @tags: [
- *     does_not_support_stepdowns,
- *     does_not_support_transactions,
- *     requires_fcv_51,
- *     requires_find_command,
- *     requires_getmore,
+ *   # This test makes assertions on listIndexes and on the order of the indexes returned.
+ *   assumes_no_implicit_index_creation,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 (function() {
 "use strict";
 
 load("jstests/core/timeseries/libs/timeseries.js");
+load("jstests/libs/feature_flag_util.js");
 
-if (!TimeseriesTest.timeseriesMetricIndexesEnabled(db.getMongo())) {
+if (!FeatureFlagUtil.isEnabled(db, "TimeseriesMetricIndexes")) {
     jsTestLog(
         "Skipped test as the featureFlagTimeseriesMetricIndexes feature flag is not enabled.");
     return;

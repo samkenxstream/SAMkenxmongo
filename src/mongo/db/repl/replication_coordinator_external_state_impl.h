@@ -31,7 +31,6 @@
 
 #include <deque>
 
-#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
@@ -43,8 +42,6 @@
 #include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
-class ServiceContext;
-
 namespace repl {
 
 class DropPendingCollectionReaper;
@@ -81,6 +78,10 @@ public:
     OpTime onTransitionToPrimary(OperationContext* opCtx) override;
     virtual void forwardSecondaryProgress();
     virtual bool isSelf(const HostAndPort& host, ServiceContext* service);
+    bool isSelfFastPath(const HostAndPort& host) final;
+    bool isSelfSlowPath(const HostAndPort& host,
+                        ServiceContext* service,
+                        Milliseconds timeout) final;
     Status createLocalLastVoteCollection(OperationContext* opCtx) final;
     virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx);
     virtual Status storeLocalConfigDocument(OperationContext* opCtx,
@@ -99,6 +100,7 @@ public:
     virtual void signalApplierToChooseNewSyncSource();
     virtual void stopProducer();
     virtual void startProducerIfStopped();
+    void notifyOtherMemberDataChanged() final;
     virtual bool tooStale();
     void clearCommittedSnapshot() final;
     void updateCommittedSnapshot(const OpTime& newCommitPoint) final;

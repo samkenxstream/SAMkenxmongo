@@ -2,7 +2,6 @@
  * Tests that we don't throw an error when the client performs two-phase index build operations,
  * or inserts docs that contain "commitIndexBuild" or "abortIndexBuild" fields.
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_persistence,
@@ -14,13 +13,12 @@
 "use strict";
 
 load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
 const kDbName = "testDb";
 const kCollName = "testColl";
 const kNs = kDbName + "." + kCollName;
 
-const rst = new ReplSetTest({nodes: 1});
+const rst = new ReplSetTest({nodes: 1, serverless: true});
 rst.startSet();
 rst.initiate();
 

@@ -44,18 +44,19 @@ class EvalNode;
 class IntersectNode;
 class UnionNode;
 class ComplementNode;
+class ExplodeNode;
 
 /**
  *  IET is a polyvalue that represents a node of Interval Evaluation Tree.
  */
-using IET =
-    optimizer::algebra::PolyValue<ConstNode, EvalNode, IntersectNode, UnionNode, ComplementNode>;
+using IET = optimizer::algebra::
+    PolyValue<ConstNode, EvalNode, IntersectNode, UnionNode, ComplementNode, ExplodeNode>;
 
 /**
  *  ConstNode is a node that represents an interval with constant bounds, such as (MinKey,
  * MaxKey).
  */
-class ConstNode : public optimizer::algebra::OpSpecificArity<IET, ConstNode, 0> {
+class ConstNode : public optimizer::algebra::OpFixedArity<IET, 0> {
 public:
     explicit ConstNode(const OrderedIntervalList& oil) : oil{oil} {}
 
@@ -66,7 +67,7 @@ public:
  * EvalNode is a node that evaluates an interval from a simple predicate such as {$gt: p1} where
  * p1 is a parameter value known at runtime.
  */
-class EvalNode : public optimizer::algebra::OpSpecificArity<IET, EvalNode, 0> {
+class EvalNode : public optimizer::algebra::OpFixedArity<IET, 0> {
 public:
     using InputParamId = MatchExpression::InputParamId;
 
@@ -87,11 +88,44 @@ private:
 };
 
 /**
+ * ExplodeNode expects the child node to produce a union of point intervals, and it picks a single
+ * point interval from the union, given the index to pick from. This node is used by the
+ * "explode for sort" optimization in the query planner. It also takes a 'cacheKey' that can be used
+ * to search in the evaluation cache to avoid re-evaluating child.
+ */
+class ExplodeNode : public optimizer::algebra::OpFixedArity<IET, 1> {
+public:
+    using Base = optimizer::algebra::OpFixedArity<IET, 1>;
+    using CacheKey = std::pair<int, int>;
+
+    /**
+     * The 'cacheKey' is a pair of integers ('nodeIndex', 'patternIndex'). The 'nodeIndex'
+     * identifies which unexploded index scan this explosion originates from, and 'patternIndex'
+     * identifies which part of sort pattern this IET is for. 'index' is the index to pick from the
+     * list of point intervals.
+     */
+    ExplodeNode(IET child, CacheKey cacheKey, int index)
+        : Base(std::move(child)), _cacheKey(cacheKey), _index(index) {}
+
+    CacheKey cacheKey() const {
+        return _cacheKey;
+    }
+
+    int index() const {
+        return _index;
+    }
+
+private:
+    const CacheKey _cacheKey;
+    const int _index;
+};
+
+/**
  * IntersectNode is a node that represents an intersection of two intervals.
  */
-class IntersectNode : public optimizer::algebra::OpSpecificArity<IET, IntersectNode, 2> {
+class IntersectNode : public optimizer::algebra::OpFixedArity<IET, 2> {
 public:
-    using Base = optimizer::algebra::OpSpecificArity<IET, IntersectNode, 2>;
+    using Base = optimizer::algebra::OpFixedArity<IET, 2>;
 
     IntersectNode(IET lhs, IET rhs) : Base(std::move(lhs), std::move(rhs)) {}
 };
@@ -99,9 +133,9 @@ public:
 /**
  * UnionNode is a node that represents a union of two intervals.
  */
-class UnionNode : public optimizer::algebra::OpSpecificArity<IET, UnionNode, 2> {
+class UnionNode : public optimizer::algebra::OpFixedArity<IET, 2> {
 public:
-    using Base = optimizer::algebra::OpSpecificArity<IET, UnionNode, 2>;
+    using Base = optimizer::algebra::OpFixedArity<IET, 2>;
 
     UnionNode(IET lhs, IET rhs) : Base(std::move(lhs), std::move(rhs)) {}
 };
@@ -109,9 +143,9 @@ public:
 /**
  * ComplementNode is a node that complements its child.
  */
-class ComplementNode : public optimizer::algebra::OpSpecificArity<IET, ComplementNode, 1> {
+class ComplementNode : public optimizer::algebra::OpFixedArity<IET, 1> {
 public:
-    using Base = optimizer::algebra::OpSpecificArity<IET, ComplementNode, 1>;
+    using Base = optimizer::algebra::OpFixedArity<IET, 1>;
 
     ComplementNode(IET child) : Base(std::move(child)) {}
 };
@@ -126,10 +160,39 @@ public:
     void addComplement();
     void addEval(const MatchExpression& expr, const OrderedIntervalList& oil);
     void addConst(const OrderedIntervalList& oil);
+    void addExplode(ExplodeNode::CacheKey cacheKey, int index);
+
+    bool isEmpty() const;
+    void pop();
 
     boost::optional<IET> done() const;
 
 private:
     std::stack<IET> _intervals;
 };
+
+/**
+ * A cache used by 'ExplodeNode' to avoid recomputing common IET evaluation results.
+ */
+struct IndexBoundsEvaluationCache {
+    std::map<ExplodeNode::CacheKey, OrderedIntervalList> unexplodedOils;
+};
+
+/**
+ * Evaluate OrderedIntervalList for the given MatchExpression tree using pre-built IET.
+ *
+ * @param iet is Interval Evaluation Tree to evaluate index intervals
+ * @param inputParamIdMap is a map from assigned inputParamId to MatchExpression, it is used to
+ * evaluate EvalNodes
+ * @param elt is the index pattern field for which intervals are evaluated
+ * @param index is the index entry for which intervals are evaluated
+ * @param cache is the evaluation cache used by the explode nodes to avoid recomputing the common
+ * IET evaluation results
+ * @return evaluated ordered interval list
+ */
+OrderedIntervalList evaluateIntervals(const IET& iet,
+                                      const std::vector<const MatchExpression*>& inputParamIdMap,
+                                      const BSONElement& elt,
+                                      const IndexEntry& index,
+                                      IndexBoundsEvaluationCache* cache = nullptr);
 }  // namespace mongo::interval_evaluation_tree

@@ -12,9 +12,10 @@ TestData.skipCheckDBHashes = true;
 (function() {
 "use strict";
 
-load("jstests/libs/get_index_helpers.js");
+load("jstests/libs/index_catalog_helpers.js");
 load("jstests/libs/write_concern_util.js");
 load("jstests/replsets/rslib.js");
+load("jstests/libs/feature_flag_util.js");
 
 let dbpath = MongoRunner.dataPath + "feature_compatibility_version";
 resetDbpath(dbpath);
@@ -56,62 +57,6 @@ function runStandaloneTest(downgradeVersion) {
     jsTestLog("EXPECTED TO FAIL: setFeatureCompatibilityVersion rejects unknown fields.");
     assert.commandFailed(
         adminDB.runCommand({setFeatureCompatibilityVersion: downgradeFCV, unknown: 1}));
-
-    jsTestLog(
-        "EXPECTED TO FAIL: setFeatureCompatibilityVersion only accepts downgradeOnDiskChanges " +
-        " parameter when downgrading to last-continuous FCV");
-    assert.commandFailedWithCode(
-        adminDB.runCommand(
-            {setFeatureCompatibilityVersion: latestFCV, downgradeOnDiskChanges: true}),
-        ErrorCodes.IllegalOperation);
-
-    assert.commandFailedWithCode(
-        adminDB.runCommand(
-            {setFeatureCompatibilityVersion: latestFCV, downgradeOnDiskChanges: false}),
-        ErrorCodes.IllegalOperation);
-
-    if (downgradeFCV === lastLTSFCV && lastContinuousFCV != lastLTSFCV) {
-        assert.commandFailedWithCode(
-            adminDB.runCommand(
-                {setFeatureCompatibilityVersion: downgradeFCV, downgradeOnDiskChanges: true}),
-            ErrorCodes.IllegalOperation);
-        assert.commandFailedWithCode(
-            adminDB.runCommand(
-                {setFeatureCompatibilityVersion: downgradeFCV, downgradeOnDiskChanges: false}),
-            ErrorCodes.IllegalOperation);
-    } else {
-        jsTestLog("Test that setFeatureCompatibilityVersion succeeds with downgradeOnDiskChanges " +
-                  "parameter when FCV is last-continuous");
-        assert.commandWorked(adminDB.runCommand(
-            {setFeatureCompatibilityVersion: downgradeFCV, downgradeOnDiskChanges: true}));
-        checkFCV(adminDB, downgradeFCV);
-        checkLog.contains(conn, "Downgrading on-disk format");
-        assert.commandWorked(adminDB.runCommand({clearLog: 'global'}));
-
-        // Upgrade still fails with downgradeOnDiskChanges: true.
-        assert.commandFailedWithCode(
-            adminDB.runCommand(
-                {setFeatureCompatibilityVersion: latestFCV, downgradeOnDiskChanges: true}),
-            ErrorCodes.IllegalOperation);
-
-        // Set the FCV back to 'latest'.
-        assert.commandWorked(adminDB.runCommand({setFeatureCompatibilityVersion: latestFCV}));
-        checkFCV(adminDB, latestFCV);
-
-        assert.commandWorked(adminDB.runCommand(
-            {setFeatureCompatibilityVersion: downgradeFCV, downgradeOnDiskChanges: false}));
-        checkFCV(adminDB, downgradeFCV);
-
-        // Upgrade still fails with downgradeOnDiskChanges: false.
-        assert.commandFailedWithCode(
-            adminDB.runCommand(
-                {setFeatureCompatibilityVersion: latestFCV, downgradeOnDiskChanges: false}),
-            ErrorCodes.IllegalOperation);
-
-        // Set the FCV back to 'latest'.
-        assert.commandWorked(adminDB.runCommand({setFeatureCompatibilityVersion: latestFCV}));
-        checkFCV(adminDB, latestFCV);
-    }
 
     jsTestLog(
         "EXPECTED TO FAIL: setFeatureCompatibilityVersion can only be run on the admin database");
@@ -337,9 +282,15 @@ function runReplicaSetTest(downgradeVersion) {
     assert.commandFailedWithCode(res, ErrorCodes.WriteConcernFailed);
     restartServerReplication(secondary);
 
-    // Upgrading the FCV should fail if a previous downgrade has not yet completed.
-    assert.commandFailedWithCode(primary.adminCommand({setFeatureCompatibilityVersion: latestFCV}),
-                                 5147403);
+    // If downgrading->upgrading feature is not enabled,
+    // upgrading the FCV should fail if a previous downgrade has not yet completed.
+    if (!FeatureFlagUtil.isEnabled(primaryAdminDB,
+                                   "DowngradingToUpgrading",
+                                   null /* user not specified */,
+                                   true /* ignores FCV */)) {
+        assert.commandFailedWithCode(
+            primary.adminCommand({setFeatureCompatibilityVersion: latestFCV}), 5147403);
+    }
 
     if (lastContinuousFCV !== lastLTSFCV) {
         // We will fail if we have not yet completed a downgrade and attempt to downgrade to a

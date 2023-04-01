@@ -47,14 +47,18 @@ struct WTimportArgs {
     std::string fileMetadata;
 };
 
+struct WTIndexImportArgs final : WTimportArgs {
+    std::string indexName;
+};
+
 struct CollectionImportMetadata {
-    WTimportArgs importArgs;
+    WTimportArgs collection;
     mongo::NamespaceString ns;
     // An _mdb_catalog document.
     mongo::BSONObj catalogObject;
     long long numRecords;
     long long dataSize;
-    std::vector<WTimportArgs> indexes;
+    std::vector<WTIndexImportArgs> indexes;
 };
 
 /**
@@ -63,7 +67,7 @@ struct CollectionImportMetadata {
  * retrieve collection metadata.
  */
 std::vector<CollectionImportMetadata> wiredTigerRollbackToStableAndGetMetadata(
-    OperationContext* opCtx, const std::string& importPath);
+    OperationContext* opCtx, const std::string& importPath, const UUID& migrationId);
 
 /**
  * When preparing to import a collection within a WUOW, use RecoveryUnit::registerChange to

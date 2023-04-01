@@ -29,7 +29,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include <boost/optional/optional_io.hpp>
 #include <map>
 #include <string>
 #include <vector>
@@ -41,6 +40,8 @@
 #include "mongo/db/query/projection_ast_util.h"
 #include "mongo/db/query/projection_parser.h"
 #include "mongo/db/query/query_planner_test_fixture.h"
+#include "mongo/db/query/serialization_options.h"
+#include "mongo/unittest/inline_auto_update.h"
 
 namespace {
 
@@ -771,5 +772,70 @@ TEST_F(ProjectionASTTest, ShouldThrowWithPositionalOnExclusion) {
         parseWithFindFeaturesEnabled(fromjson("{'c.d.$': 0}"), fromjson("{'c.d': 1}")),
         DBException,
         31395);
+}
+std::string redactFieldNameForTest(StringData s) {
+    return str::stream() << "HASH<" << s << ">";
+}
+
+TEST_F(ProjectionASTTest, TestASTRedaction) {
+    SerializationOptions options;
+    options.replacementForLiteralArgs = "?";
+    options.redactFieldNames = true;
+    options.redactFieldNamesStrategy = redactFieldNameForTest;
+
+
+    auto proj = fromjson("{'a.b': 1}");
+    BSONObj output = projection_ast::serialize(parseWithFindFeaturesEnabled(proj), options);
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"HASH<a>":{"HASH<b>":true},"HASH<_id>":true})",
+        output);
+
+    proj = fromjson("{'a.b': 0}");
+    output = projection_ast::serialize(parseWithFindFeaturesEnabled(proj), options);
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"HASH<a>":{"HASH<b>":false}})",
+        output);
+
+    proj = fromjson("{a: 1, b: 1}");
+    output = projection_ast::serialize(parseWithFindFeaturesEnabled(proj), options);
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"HASH<a>":true,"HASH<b>":true,"HASH<_id>":true})",
+        output);
+
+    // ElemMatch projection
+    proj = fromjson("{f: {$elemMatch: {foo: 'bar'}}}");
+    output = projection_ast::serialize(parseWithFindFeaturesEnabled(proj), options);
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"HASH<f>":{"$elemMatch":{"HASH<foo>":{"$eq":"?"}}},"HASH<_id>":true})",
+        output);
+
+    // Positional projection
+    proj = fromjson("{'x.$': 1}");
+    output =
+        projection_ast::serialize(parseWithFindFeaturesEnabled(proj, fromjson("{'x.a': 2}")), {});
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"x.$":true,"_id":true})",
+        output);
+
+    // Slice (first form)
+    proj = fromjson("{a: {$slice: 1}}");
+    output = projection_ast::serialize(parseWithFindFeaturesEnabled(proj), options);
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"HASH<a>":{"$slice":"?"}})",
+        output);
+
+    // Slice (second form)
+    proj = fromjson("{a: {$slice: [1, 3]}}");
+    output = projection_ast::serialize(parseWithFindFeaturesEnabled(proj), options);
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"HASH<a>":{"$slice":["?","?"]}})",
+        output);
+
+    /// $meta projection
+    proj = fromjson("{foo: {$meta: 'indexKey'}}");
+    output = projection_ast::serialize(parseWithFindFeaturesEnabled(proj), options);
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"HASH<foo>":{"$meta":"indexKey"}})",
+        output);
 }
 }  // namespace

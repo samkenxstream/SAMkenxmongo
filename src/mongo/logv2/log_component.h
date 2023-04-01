@@ -57,6 +57,7 @@ namespace mongo::logv2 {
     X(kControl,                , "control"               , "CONTROL" , kDefault) \
     X(kExecutor,               , "executor"              , "EXECUTOR", kDefault) \
     X(kGeo,                    , "geo"                   , "GEO"     , kDefault) \
+    X(kGlobalIndex,            , "globalIndex"           , "GBL_IDX" , kDefault) \
     X(kIndex,                  , "index"                 , "INDEX"   , kDefault) \
     X(kNetwork,                , "network"               , "NETWORK" , kDefault) \
     X(kProcessHealth,          , "processHealth"         , "HEALTH"  , kDefault) \
@@ -72,6 +73,7 @@ namespace mongo::logv2 {
     X(kShardingMigration,      , "migration"             , "MIGRATE" , kSharding) \
     X(kResharding,             , "reshard"               , "RESHARD" , kSharding) \
     X(kShardMigrationPerf,     , "migrationPerf"         , "MIG_PERF", kSharding) \
+    X(kMovePrimary,            , "movePrimary"           , "MVPRIMRY", kSharding) \
     X(kStorage,                , "storage"               , "STORAGE" , kDefault) \
     X(kStorageRecovery,        , "recovery"              , "RECOVERY", kStorage) \
     X(kJournal,                , "journal"               , "JOURNAL" , kStorage) \
@@ -98,6 +100,7 @@ namespace mongo::logv2 {
     X(kTenantMigration,        , "tenantMigration"       , "TENANT_M", kDefault) \
     X(kConnectionPool,         , "connectionPool"        , "CONNPOOL", kNetwork) \
     X(kTest,                   , "test"                  , "TEST"    , kDefault) \
+    X(kResourceConsumption,    , "resourceConsumption"   , "RES_CONS", kDefault) \
     X(kNumLogComponents,       , "total"                 , "TOTAL"   , kNumLogComponents) \
     /**/
 // clang-format on

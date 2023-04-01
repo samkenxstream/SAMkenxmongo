@@ -36,12 +36,12 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/query/cursor_response.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_client_cursor_impl.h"
 #include "mongo/s/query/cluster_client_cursor_params.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/s/transaction_router.h"
 
 namespace mongo {
@@ -88,15 +88,18 @@ StatusWith<BSONObj> storePossibleCursor(OperationContext* opCtx,
         return incomingCursorResponse.getStatus();
     }
 
-    CurOp::get(opCtx)->debug().nreturned = incomingCursorResponse.getValue().getBatch().size();
-
+    auto&& opDebug = CurOp::get(opCtx)->debug();
+    opDebug.additiveMetrics.nBatches = 1;
     // If nShards has already been set, then we are storing the forwarding $mergeCursors cursor from
     // a split aggregation pipeline, and the shards half of that pipeline may have targeted multiple
     // shards. In that case, leave the current value as-is.
-    CurOp::get(opCtx)->debug().nShards = std::max(CurOp::get(opCtx)->debug().nShards, 1);
+    opDebug.nShards = std::max(opDebug.nShards, 1);
 
     if (incomingCursorResponse.getValue().getCursorId() == CursorId(0)) {
-        CurOp::get(opCtx)->debug().cursorExhausted = true;
+        opDebug.cursorExhausted = true;
+        collectTelemetryMongos(opCtx,
+                               CurOp::get(opCtx)->opDescription(),
+                               incomingCursorResponse.getValue().getBatch().size());
         return cmdResult;
     }
 
@@ -128,23 +131,23 @@ StatusWith<BSONObj> storePossibleCursor(OperationContext* opCtx,
     }
 
     auto ccc = ClusterClientCursorImpl::make(opCtx, std::move(executor), std::move(params));
-    ccc->incNBatches();
+    collectTelemetryMongos(opCtx, ccc, incomingCursorResponse.getValue().getBatch().size());
     // We don't expect to use this cursor until a subsequent getMore, so detach from the current
     // OperationContext until then.
     ccc->detachFromOperationContext();
-    auto authUsers = AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames();
+    auto authUser = AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserName();
     auto clusterCursorId =
         cursorManager->registerCursor(opCtx,
                                       ccc.releaseCursor(),
                                       requestedNss,
                                       ClusterCursorManager::CursorType::SingleTarget,
                                       ClusterCursorManager::CursorLifetime::Mortal,
-                                      authUsers);
+                                      authUser);
     if (!clusterCursorId.isOK()) {
         return clusterCursorId.getStatus();
     }
 
-    CurOp::get(opCtx)->debug().cursorid = clusterCursorId.getValue();
+    opDebug.cursorid = clusterCursorId.getValue();
 
     CursorResponse outgoingCursorResponse(
         requestedNss,

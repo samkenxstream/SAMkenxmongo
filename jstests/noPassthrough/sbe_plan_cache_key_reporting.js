@@ -20,8 +20,8 @@ assert.neq(conn, null, "mongod failed to start");
 const db = conn.getDB("plan_cache_key_reporting");
 const coll = db.coll;
 
-if (!checkSBEEnabled(db, ["featureFlagSbePlanCache"])) {
-    jsTest.log("Skipping test because SBE plan cache is not enabled.");
+if (!checkSBEEnabled(db)) {
+    jsTest.log("Skipping test because SBE is not enabled");
     MongoRunner.stopMongod(conn);
     return;
 }
@@ -39,10 +39,10 @@ function setupCollection() {
 //
 // Calls 'setupCollection' before each run.
 function runTestAgainstSbeAndClassicEngines(testToRun) {
-    return ["sbe", "classic"].map((engine) => {
+    return ["trySbeEngine", "forceClassicEngine"].map((engine) => {
         setupCollection();
-        assert.commandWorked(db.adminCommand(
-            {setParameter: 1, internalQueryForceClassicEngine: engine == "classic"}));
+        assert.commandWorked(
+            db.adminCommand({setParameter: 1, internalQueryFrameworkControl: engine}));
         return testToRun(engine);
     });
 }
@@ -89,8 +89,8 @@ function assertQueryHashAndPlanCacheKey(sbe, classic) {
 
     assert.neq(sbe, null);
     assert.neq(classic, null);
-    assert.eq(sbe.queryExecutionEngine, "sbe", sbe);
-    assert.eq(classic.queryExecutionEngine, "classic", classic);
+    assert.eq(sbe.queryFramework, "sbe", sbe);
+    assert.eq(classic.queryFramework, "classic", classic);
 
     assertQueryHashAndPlanCacheKey(sbe, classic);
 })();
@@ -159,10 +159,68 @@ function assertQueryHashAndPlanCacheKey(sbe, classic) {
 
     assert.neq(sbe, null);
     assert.neq(classic, null);
-    assert.eq(sbe.attr.queryExecutionEngine, "sbe", sbe);
-    assert.eq(classic.attr.queryExecutionEngine, "classic", classic);
+    assert.eq(sbe.attr.queryFramework, "sbe", sbe);
+    assert.eq(classic.attr.queryFramework, "classic", classic);
 
     assertQueryHashAndPlanCacheKey(sbe.attr, classic.attr);
+})();
+
+// Validate that a query with pushed down $lookup stage uses classic plan cache key encoding.
+(function validateLookupQueryHashMap() {
+    const lookupColl = db.lookupColl;
+    lookupColl.drop();
+    assert.commandWorked(lookupColl.createIndex({b: 1}));
+    const [sbe, classic] =
+        runTestAgainstSbeAndClassicEngines(
+            function(engine) {
+                const pipeline = [
+                    {
+                        $lookup:
+                        {
+                            from: lookupColl.getName(),
+                            localField: "a",
+                            foreignField: "b",
+                            as: "whatever"
+                        }
+                    }
+                ];
+                return coll.explain().aggregate(pipeline);
+            });
+
+    assert.neq(sbe, null);
+    assert.neq(classic, null);
+    assert.eq(sbe.explainVersion, "2", sbe);
+    assert.eq(classic.explainVersion, "1", classic);
+
+    // The query hashes and the plan cache keys ('the keys') are different now because
+    // 'internalQueryFrameworkControl' flag is encoded into query shape, once this
+    // flag is removed from the query shape encoding the keys will be different.
+    assertQueryHashAndPlanCacheKey(sbe.queryPlanner, classic.stages[0]["$cursor"].queryPlanner);
+})();
+
+// Validate that a query with pushed down $group stage uses classic plan cache key encoding.
+(function validateGroupQueryHashMap() {
+    const groupColl = db.groupColl;
+    groupColl.drop();
+    assert.commandWorked(groupColl.insertOne({b: 1}));
+    const [sbe, classic] = runTestAgainstSbeAndClassicEngines(function(engine) {
+        const pipeline = [{
+            $group: {
+                _id: "$b",
+            }
+        }];
+        return groupColl.explain().aggregate(pipeline);
+    });
+
+    assert.neq(sbe, null);
+    assert.neq(classic, null);
+    assert.eq(sbe.explainVersion, "2", sbe);
+    assert.eq(classic.explainVersion, "1", classic);
+
+    // The query hashes and the plan cache keys ('the keys') are different now because
+    // 'internalQueryFrameworkControl' flag is encoded into query shape, once this
+    // flag is removed from the query shape encoding the keys will be different.
+    assertQueryHashAndPlanCacheKey(sbe.queryPlanner, classic.stages[0]["$cursor"].queryPlanner);
 })();
 
 MongoRunner.stopMongod(conn);

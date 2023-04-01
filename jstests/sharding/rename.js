@@ -1,5 +1,6 @@
-// Checking UUID consistency involves talking to a shard node, which in this test is shutdown
+// The following checks involve talking to a shard node, which in this test is shutdown.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
 (function() {
 'use strict';
@@ -49,16 +50,32 @@ assert.commandWorked(
 assert.eq(0, db.unsharded.countDocuments({}));
 assert.eq(1, s.getDB('otherDBSamePrimary').foo.countDocuments({}));
 
+const testDB = s.rs0.getPrimary().getDB('test');
+const fcvDoc = testDB.adminCommand({getParameter: 1, featureCompatibilityVersion: 1});
 jsTest.log("Testing that rename operations involving views are not allowed");
 {
     assert.commandWorked(db.collForView.insert({_id: 1}));
     assert.commandWorked(db.createView('view', 'collForView', []));
 
     let toAView = db.unsharded.renameCollection('view', true /* dropTarget */);
-    assert.commandFailed(toAView);
+
+    assert.commandFailedWithCode(
+        toAView,
+        [
+            ErrorCodes.NamespaceExists,
+            ErrorCodes.CommandNotSupportedOnView,  // TODO SERVER-68084 remove this error code
+            ErrorCodes.NamespaceNotFound           // TODO SERVER-68084 remove this error code
+        ],
+        "renameCollection should fail with NamespaceExists when the target is view");
 
     let fromAView = db.view.renameCollection('target');
-    assert.commandFailed(fromAView);
+    assert.commandFailedWithCode(
+        fromAView,
+        [
+            ErrorCodes.CommandNotSupportedOnView,
+            ErrorCodes.NamespaceNotFound  // TODO SERVER-68084 remove this error code
+        ],
+        "renameCollection should fail with CommandNotSupportedOnView when renaming a view");
 }
 
 // Rename a collection to itself fails, without loosing data
@@ -73,6 +90,33 @@ jsTest.log("Testing that rename operations involving views are not allowed");
     assert.eq(1, sameColl.countDocuments({}), "Rename a collection to itself must not loose data");
 }
 
+if (MongoRunner.compareBinVersions(fcvDoc.featureCompatibilityVersion.version, '6.1') >= 0) {
+    // Create collection on non-primary shard (shard1 for test db) to simulate wrong creation via
+    // direct connection: collection rename should fail since `badcollection` uuids are inconsistent
+    // across shards
+    jsTest.log("Testing uuid consistency across shards");
+    assert.commandWorked(
+        s.shard1.getDB('test').badcollection.insert({_id: 1}));               // direct connection
+    assert.commandWorked(s.s0.getDB('test').badcollection.insert({_id: 1}));  // mongos connection
+    assert.commandFailedWithCode(
+        s.s0.getDB('test').badcollection.renameCollection('goodcollection'),
+        [ErrorCodes.InvalidUUID],
+        "collection rename should fail since test.badcollection uuids are inconsistent across shards");
+
+    // Target collection existing on non-primary shard: rename with `dropTarget=false` must fail
+    jsTest.log(
+        "Testing rename behavior when target collection [wrongly] exists on non-primary shards");
+    assert.commandWorked(
+        s.shard1.getDB('test').superbadcollection.insert({_id: 1}));           // direct connection
+    assert.commandWorked(s.s0.getDB('test').goodcollection.insert({_id: 1}));  // mongos connection
+    assert.commandFailedWithCode(
+        s.s0.getDB('test').goodcollection.renameCollection('superbadcollection', false),
+        [ErrorCodes.NamespaceExists],
+        "Collection rename with `dropTarget=false` must have failed because target collection exists on a non-primary shard");
+    // Target collection existing on non-primary shard: rename with `dropTarget=true` must succeed
+    assert.commandWorked(
+        s.s0.getDB('test').goodcollection.renameCollection('superbadcollection', true));
+}
 // Ensure write concern works by shutting down 1 node in a replica set shard
 jsTest.log("Testing write concern (2)");
 

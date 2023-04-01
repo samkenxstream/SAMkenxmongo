@@ -2,9 +2,12 @@
  * Test that in tenant migration, the recipient does not change sync source
  * even after its current sync source steps down as primary.
  *
+ * TODO SERVER-63517: incompatible_with_shard_merge because this relies on
+ * logical cloning behavior.
+ *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
+ *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
  *   requires_persistence,
@@ -12,13 +15,11 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {makeX509OptionsForTest} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
 // Verify the recipient's current sync source is the expected one.
 const verifySyncSource = function(conn, migrationId, expectedSyncSource) {
@@ -33,7 +34,8 @@ const batchSize = 2;
 const recipientRst = new ReplSetTest({
     nodes: 2,
     name: jsTestName() + "_recipient",
-    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().recipient, {
+    serverless: true,
+    nodeOptions: Object.assign(makeX509OptionsForTest().recipient, {
         setParameter: {
             // Use a batch size of 2 so that collection cloner requires more than a single
             // batch to complete.
@@ -52,7 +54,7 @@ const tenantMigrationTest =
 const donorRst = tenantMigrationTest.getDonorRst();
 const donorPrimary = donorRst.getPrimary();
 
-const tenantId = "testTenantId";
+const tenantId = ObjectId().str;
 const dbName = tenantMigrationTest.tenantDB(tenantId, "testDB");
 const collName = "testColl";
 
@@ -67,7 +69,7 @@ const migrationIdString = extractUUIDFromObject(migrationId);
 const migrationOpts = {
     migrationIdString: migrationIdString,
     recipientConnString: tenantMigrationTest.getRecipientConnString(),
-    tenantId: tenantId,
+    tenantId,
     readPreference: {mode: "primary"},  // only sync from donor's primary
 };
 
@@ -98,8 +100,7 @@ assert.soon(() => recipientColl.find().itcount() === batchSize);
 verifySyncSource(recipientPrimary, migrationId, donorPrimary.host);
 
 // Steps down the current donor's primary and wait for the new primary to be discovered.
-donorRst.awaitLastOpCommitted();
-assert.commandWorked(donorRst.getSecondary().adminCommand({replSetStepUp: 1}));
+donorRst.stepUp(donorRst.getSecondary());
 const newDonorPrimary = donorRst.getPrimary();
 assert.neq(newDonorPrimary.host, donorPrimary.host);
 
@@ -112,9 +113,8 @@ hangDuringCollectionClone.off();
 // verify the sync source is still the donor's old primary.
 TenantMigrationTest.assertCommitted(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
 assert.eq(recipientColl.find().itcount(), docs1.length + docs2.length);
-assert.docEq(recipientColl.find().sort({_id: 1}).toArray(), docs1.concat(docs2));
+assert.docEq(docs1.concat(docs2), recipientColl.find().sort({_id: 1}).toArray());
 verifySyncSource(recipientPrimary, migrationId, donorPrimary.host);
 
 tenantMigrationTest.stop();
 recipientRst.stopSet();
-})();

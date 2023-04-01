@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
 #include "mongo/platform/basic.h"
 
@@ -38,9 +37,12 @@
 #include "mongo/db/s/resharding/coordinator_document_gen.h"
 #include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/shard_id.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
+
 
 namespace mongo {
 namespace {
@@ -110,7 +112,7 @@ bool stateTransistionsComplete(WithLock lk,
 template <class TParticipant>
 Status getStatusFromAbortReasonWithShardInfo(const TParticipant& participant,
                                              StringData participantType) {
-    return getStatusFromAbortReason(participant.getMutableState())
+    return resharding::getStatusFromAbortReason(participant.getMutableState())
         .withContext("{} shard {} reached an unrecoverable error"_format(
             participantType, participant.getId().toString()));
 }
@@ -126,7 +128,7 @@ boost::optional<Status> getAbortReasonIfExists(
     if (updatedStateDoc.getAbortReason()) {
         // Note: the absence of context specifying which shard the abortReason originates from
         // implies the abortReason originates from the coordinator.
-        return getStatusFromAbortReason(updatedStateDoc);
+        return resharding::getStatusFromAbortReason(updatedStateDoc);
     }
 
     for (const auto& donorShard : updatedStateDoc.getDonorShards()) {
@@ -160,7 +162,7 @@ void ReshardingCoordinatorObserver::onReshardingParticipantTransition(
     const ReshardingCoordinatorDocument& updatedStateDoc) {
     stdx::lock_guard<Latch> lk(_mutex);
     if (auto abortReason = getAbortReasonIfExists(updatedStateDoc)) {
-        _onAbortOrStepdown(lk, abortReason.get());
+        _onAbortOrStepdown(lk, abortReason.value());
         // Don't exit early since the coordinator waits for all participants to report state 'done'.
     }
 
@@ -229,6 +231,20 @@ void ReshardingCoordinatorObserver::interrupt(Status status) {
     if (!_allDonorsDone.getFuture().isReady()) {
         _allDonorsDone.setError(status);
     }
+}
+
+void ReshardingCoordinatorObserver::fulfillPromisesBeforePersistingStateDoc() {
+    stdx::lock_guard<Latch> lk(_mutex);
+    invariant(!_allDonorsReportedMinFetchTimestamp.getFuture().isReady());
+    invariant(!_allRecipientsFinishedCloning.getFuture().isReady());
+    invariant(!_allRecipientsReportedStrictConsistencyTimestamp.getFuture().isReady());
+    invariant(!_allRecipientsDone.getFuture().isReady());
+    invariant(!_allDonorsDone.getFuture().isReady());
+    _allDonorsReportedMinFetchTimestamp.emplaceValue();
+    _allRecipientsFinishedCloning.emplaceValue();
+    _allRecipientsReportedStrictConsistencyTimestamp.emplaceValue();
+    _allRecipientsDone.emplaceValue();
+    _allDonorsDone.emplaceValue();
 }
 
 void ReshardingCoordinatorObserver::onCriticalSectionTimeout() {

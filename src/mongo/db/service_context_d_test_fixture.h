@@ -30,14 +30,13 @@
 #pragma once
 
 #include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/unittest/temp_dir.h"
+#include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
 
-/**
- * Test fixture class for tests that use the "ephemeralForTest" storage engine.
- */
 class ServiceContextMongoDTest : public virtual ServiceContextTest {
 public:
     constexpr static StorageEngineInitFlags kDefaultStorageEngineInitFlags =
@@ -46,20 +45,78 @@ public:
 protected:
     enum class RepairAction { kNoRepair, kRepair };
 
-    ServiceContextMongoDTest();
+    class Options {
+    public:
+        Options(){};
 
-    /**
-     * Build a ServiceContextMongoDTest, using the named storage engine.
-     */
-    explicit ServiceContextMongoDTest(std::string engine);
-    ServiceContextMongoDTest(std::string engine,
-                             RepairAction repair,
-                             StorageEngineInitFlags initFlags = kDefaultStorageEngineInitFlags,
-                             bool useReplSettings = false,
-                             bool useMockClock = false);
+        Options engine(std::string engine) {
+            _engine = std::move(engine);
+            return std::move(*this);
+        }
+        Options repair(RepairAction repair) {
+            _repair = repair;
+            return std::move(*this);
+        }
+        Options initFlags(StorageEngineInitFlags initFlags) {
+            _initFlags = initFlags;
+            return std::move(*this);
+        }
+        Options useReplSettings(bool useReplSettings) {
+            _useReplSettings = useReplSettings;
+            return std::move(*this);
+        }
+        Options useMockClock(bool useMockClock, Milliseconds autoAdvance = Milliseconds{0}) {
+            _useMockClock = useMockClock;
+            _autoAdvancingMockClockIncrement = autoAdvance;
+            return std::move(*this);
+        }
+        template <class D = Milliseconds>
+        Options useMockTickSource(bool useMockTickSource) {
+            if (useMockTickSource) {
+                _mockTickSource = std::make_unique<TickSourceMock<D>>();
+            }
+            return std::move(*this);
+        }
+        Options useJournalListener(std::unique_ptr<JournalListener> journalListener) {
+            _journalListener = std::move(journalListener);
+            return std::move(*this);
+        }
+
+        Options ephemeral(bool ephemeral) {
+            _ephemeral = ephemeral;
+            return std::move(*this);
+        }
+
+        Options forceDisableTableLogging() {
+            _forceDisableTableLogging = true;
+            return std::move(*this);
+        }
+
+    private:
+        std::string _engine = "wiredTiger";
+        // We use ephemeral instances by default to advise Storage Engines (in particular
+        // WiredTiger) not to perform Disk I/O.
+        bool _ephemeral = true;
+        RepairAction _repair = RepairAction::kNoRepair;
+        StorageEngineInitFlags _initFlags = kDefaultStorageEngineInitFlags;
+        bool _useReplSettings = false;
+        bool _useMockClock = false;
+        Milliseconds _autoAdvancingMockClockIncrement{0};
+        std::unique_ptr<TickSource> _mockTickSource;
+        std::unique_ptr<JournalListener> _journalListener;
+        bool _forceDisableTableLogging = false;
+
+        friend class ServiceContextMongoDTest;
+    };
+
+    explicit ServiceContextMongoDTest(Options options = {});
+
     virtual ~ServiceContextMongoDTest();
 
     void tearDown() override;
+
+    // The JournalListener must stay alive as long as the storage engine is running.
+    std::unique_ptr<JournalListener> _journalListener;
 
 private:
     struct {

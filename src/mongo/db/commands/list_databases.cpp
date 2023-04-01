@@ -31,20 +31,19 @@
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/list_databases_common.h"
 #include "mongo/db/commands/list_databases_gen.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop_failpoint_helpers.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/multitenancy_gen.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
-#include "mongo/db/tenant_database_name.h"
-#include "mongo/db/tenant_namespace.h"
 
 namespace mongo {
 
@@ -56,7 +55,6 @@ namespace {
 // Failpoint which causes to hang "listDatabases" cmd after acquiring global lock in IS mode.
 MONGO_FAIL_POINT_DEFINE(hangBeforeListDatabases);
 
-constexpr auto kName = "name"_sd;
 class CmdListDatabases final : public ListDatabasesCmdVersion1Gen<CmdListDatabases> {
 public:
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
@@ -72,6 +70,9 @@ public:
         return "{ listDatabases:1, [filter: <filterObject>] [, nameOnly: true ] }\n"
                "list databases on this server";
     }
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
 
     class Invocation final : public InvocationBaseGen {
     public:
@@ -84,7 +85,7 @@ public:
         void doCheckAuthorization(OperationContext*) const final {}
 
         NamespaceString ns() const final {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
 
         ListDatabasesReply typedRun(OperationContext* opCtx) final {
@@ -103,8 +104,8 @@ public:
                 if (authDB) {
                     uassert(ErrorCodes::Unauthorized,
                             "Insufficient permissions to list all databases",
-                            authDB.get() || mayListAllDatabases);
-                    return authDB.get();
+                            authDB.value() || mayListAllDatabases);
+                    return authDB.value();
                 }
 
                 // By default, list all databases if we can, otherwise
@@ -113,67 +114,26 @@ public:
             })(cmd.getAuthorizedDatabases());
 
             // {filter: matchExpression}.
-            std::unique_ptr<MatchExpression> filter;
-            if (auto filterObj = cmd.getFilter()) {
-                // The collator is null because database metadata objects are compared using simple
-                // binary comparison.
-                auto expCtx = make_intrusive<ExpressionContext>(
-                    opCtx, std::unique_ptr<CollatorInterface>(nullptr), ns());
-                auto matcher = uassertStatusOK(
-                    MatchExpressionParser::parse(filterObj.get(), std::move(expCtx)));
-                filter = std::move(matcher);
-            }
+            std::unique_ptr<MatchExpression> filter = list_databases::getFilter(cmd, opCtx, ns());
 
-            std::vector<TenantDatabaseName> tenantDbNames;
+            std::vector<DatabaseName> dbNames;
             StorageEngine* storageEngine = getGlobalServiceContext()->getStorageEngine();
             {
                 Lock::GlobalLock lk(opCtx, MODE_IS);
                 CurOpFailpointHelpers::waitWhileFailPointEnabled(
                     &hangBeforeListDatabases, opCtx, "hangBeforeListDatabases", []() {});
-                tenantDbNames = storageEngine->listDatabases();
-            }
 
+                dbNames = storageEngine->listDatabases(cmd.getDbName().tenantId());
+            }
             std::vector<ListDatabasesReplyItem> items;
-
-            const bool filterNameOnly = filter &&
-                filter->getCategory() == MatchExpression::MatchCategory::kLeaf &&
-                filter->path() == kName;
-            long long totalSize = 0;
-            for (const auto& tenantDbName : tenantDbNames) {
-                if (authorizedDatabases &&
-                    !as->isAuthorizedForAnyActionOnAnyResourceInDB(tenantDbName.dbName())) {
-                    // We don't have listDatabases on the cluster or find on this database.
-                    continue;
-                }
-
-                ListDatabasesReplyItem item(tenantDbName.dbName());
-
-                long long size = 0;
-                if (!nameOnly) {
-                    // Filtering on name only should not require taking locks on filtered-out names.
-                    if (filterNameOnly && !filter->matchesBSON(item.toBSON())) {
-                        continue;
-                    }
-
-                    AutoGetDbForReadMaybeLockFree lockFreeReadBlock(opCtx, tenantDbName.dbName());
-                    // The database could have been dropped since we called 'listDatabases()' above.
-                    if (!DatabaseHolder::get(opCtx)->dbExists(opCtx, tenantDbName)) {
-                        continue;
-                    }
-
-                    writeConflictRetry(opCtx, "sizeOnDisk", tenantDbName.dbName(), [&] {
-                        size = storageEngine->sizeOnDiskForDb(opCtx, tenantDbName);
-                    });
-                    item.setSizeOnDisk(size);
-                    item.setEmpty(CollectionCatalog::get(opCtx)
-                                      ->getAllCollectionUUIDsFromDb(tenantDbName)
-                                      .empty());
-                }
-                if (!filter || filter->matchesBSON(item.toBSON())) {
-                    totalSize += size;
-                    items.push_back(std::move(item));
-                }
-            }
+            int64_t totalSize = list_databases::setReplyItems(opCtx,
+                                                              dbNames,
+                                                              items,
+                                                              storageEngine,
+                                                              nameOnly,
+                                                              filter,
+                                                              false /* setTenantId */,
+                                                              authorizedDatabases);
 
             ListDatabasesReply reply(items);
             if (!nameOnly) {

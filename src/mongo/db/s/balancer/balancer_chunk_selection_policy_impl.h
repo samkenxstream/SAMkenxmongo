@@ -47,7 +47,10 @@ public:
                                                     const NamespaceString& ns) override;
 
     StatusWith<MigrateInfoVector> selectChunksToMove(
-        OperationContext* opCtx, stdx::unordered_set<ShardId>* usedShards) override;
+        OperationContext* opCtx,
+        const std::vector<ClusterStatistics::ShardStatistics>& shardStats,
+        stdx::unordered_set<ShardId>* availableShards,
+        stdx::unordered_set<NamespaceString>* imbalancedCollectionsCachePtr) override;
 
     StatusWith<MigrateInfosWithReason> selectChunksToMove(OperationContext* opCtx,
                                                           const NamespaceString& ns) override;
@@ -61,8 +64,8 @@ public:
 
 private:
     /**
-     * Synchronous method, which iterates the collection's chunks and uses the tags information to
-     * figure out whether some of them validate the tag range boundaries and need to be split.
+     * Synchronous method, which iterates the collection's chunks and uses the zones information to
+     * figure out whether some of them validate the zone range boundaries and need to be split.
      */
     StatusWith<SplitInfoVector> _getSplitCandidatesForCollection(
         OperationContext* opCtx,
@@ -70,14 +73,15 @@ private:
         const ShardStatisticsVector& shardStats);
 
     /**
-     * Synchronous method, which iterates the collection's chunks and uses the cluster statistics to
-     * figure out where to place them.
+     * Synchronous method, which iterates the collection's size per shard  to figure out where to
+     * place them.
      */
     StatusWith<MigrateInfosWithReason> _getMigrateCandidatesForCollection(
         OperationContext* opCtx,
         const NamespaceString& nss,
         const ShardStatisticsVector& shardStats,
-        stdx::unordered_set<ShardId>* usedShards);
+        const CollectionDataSizeInfoForBalancing& collDataSizeInfo,
+        stdx::unordered_set<ShardId>* availableShards);
 
     // Source for obtaining cluster statistics. Not owned and must not be destroyed before the
     // policy object is destroyed.

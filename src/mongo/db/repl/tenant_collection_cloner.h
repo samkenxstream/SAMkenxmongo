@@ -44,13 +44,13 @@ namespace repl {
 class TenantCollectionCloner : public TenantBaseCloner {
 public:
     struct Stats {
-        static constexpr StringData kDocumentsToCopyFieldName = "documentsToCopy"_sd;
+        static constexpr StringData kDocumentsToCopyFieldName = "documentsToCopyAtStartOfClone"_sd;
         static constexpr StringData kDocumentsCopiedFieldName = "documentsCopied"_sd;
 
         std::string ns;
         Date_t start;
         Date_t end;
-        size_t documentToCopy{0};
+        size_t documentsToCopyAtStartOfClone{0};
         size_t documentsCopied{0};
         size_t indexes{0};
         size_t insertedBatches{0};
@@ -64,14 +64,6 @@ public:
         BSONObj toBSON() const;
         void append(BSONObjBuilder* builder) const;
     };
-
-    /**
-     * Type of function to schedule storage interface tasks with the executor.
-     *
-     * Used for testing only.
-     */
-    using ScheduleDbWorkFn = unique_function<StatusWith<executor::TaskExecutor::CallbackHandle>(
-        executor::TaskExecutor::CallbackFn)>;
 
     TenantCollectionCloner(const NamespaceString& ns,
                            const CollectionOptions& collectionOptions,
@@ -106,15 +98,6 @@ public:
      */
     void setBatchSize_forTest(int batchSize) {
         _collectionClonerBatchSize = batchSize;
-    }
-
-    /**
-     * Overrides how executor schedules database work.
-     *
-     * For testing only.
-     */
-    void setScheduleDbWorkFn_forTest(ScheduleDbWorkFn scheduleDbWorkFn) {
-        _scheduleDbWorkFn = std::move(scheduleDbWorkFn);
     }
 
     Timestamp getOperationTime_forTest();
@@ -209,25 +192,20 @@ private:
     AfterStageBehavior queryStage();
 
     /**
-     * Put all results from a query batch into a buffer to be inserted, and schedule
-     * it to be inserted.
+     * Put all results from a query batch into a buffer to be inserted, and schedule it to be
+     * inserted.
      */
-    void handleNextBatch(DBClientCursorBatchIterator& iter);
+    void handleNextBatch(DBClientCursor& cursor);
 
     /**
      * Called whenever there is a new batch of documents ready from the DBClientConnection.
      */
-    void insertDocumentsCallback(const executor::TaskExecutor::CallbackArgs& cbd);
+    void insertDocuments(std::vector<BSONObj> docsToInsert);
 
     /**
      * Sends a query command to the source.
      */
     void runQuery();
-
-    /**
-     * Waits for any database work to finish or fail.
-     */
-    void waitForDatabaseWorkToComplete();
 
     // All member variables are labeled with one of the following codes indicating the
     // synchronization rules for accessing them.
@@ -258,14 +236,9 @@ private:
     BSONObj _idIndexSpec;                   // (X)
 
     BSONObj _lastDocId;  // (X)
-    // Function for scheduling database work using the executor.
-    ScheduleDbWorkFn _scheduleDbWorkFn;  // (R)
     // Documents read from source to insert.
     std::vector<BSONObj> _documentsToInsert;  // (M)
     Stats _stats;                             // (M)
-    // We put _dbWorkTaskRunner after anything the database threads depend on to ensure it is
-    // only destroyed after those threads exit.
-    TaskRunner _dbWorkTaskRunner;  // (R)
 
     // The database name prefix of the tenant associated with this migration.
     std::string _tenantId;  // (R)

@@ -19,13 +19,8 @@
 (function() {
 'use strict';
 
-// Skip this test if running with --nojournal and WiredTiger.
-if (jsTest.options().noJournal &&
-    (!jsTest.options().storageEngine || jsTest.options().storageEngine === "wiredTiger")) {
-    print("Skipping test because running WiredTiger without journaling isn't a valid" +
-          " replica set configuration");
-    return;
-}
+// Skip metadata consistency check since the sharded clsuter is started with 0 shards
+TestData.skipCheckMetadataConsistency = true;
 
 var testServer = MongoRunner.runMongod();
 var db = testServer.getDB("test");

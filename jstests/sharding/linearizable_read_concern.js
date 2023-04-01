@@ -19,6 +19,8 @@
  * document. This test is mainly trying to ensure that system behavior is
  * reasonable when executing linearizable reads in a sharded cluster, so as to
  * exercise possible (invalid) user behavior.
+ *
+ * @tags: [temporary_catalog_shard_incompatible]
  */
 
 load("jstests/replsets/rslib.js");
@@ -27,10 +29,10 @@ load("jstests/libs/write_concern_util.js");
 (function() {
 "use strict";
 
-// Skip db hash check and shard replication since this test leaves a replica set shard
-// partitioned.
+// Skip the following checks since this test leaves a replica set shard partitioned.
 TestData.skipCheckDBHashes = true;
 TestData.skipAwaitingReplicationOnShardsBeforeCheckingUUIDs = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
 var testName = "linearizable_read_concern";
 

@@ -34,7 +34,7 @@ global:
     - "mongo/db/s/auto_split_vector.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 types:
     bson_vector:
@@ -47,12 +47,12 @@ structs:
     AutoSplitVectorResponse:
         description: "The reply of an autoSplitVector command."
         strict: false
+        is_command_reply: true
         fields:
             splitKeys: bson_vector
             continuation:
                 type: bool
                 description: "Whether there are more split points available for the requested range"
-                default: false # TODO (SERVER-64350): Remove the default value after 6.0 branching.
 
 commands:
   autoSplitVector:
@@ -75,3 +75,7 @@ commands:
         maxChunkSizeBytes:
             type: safeInt64
             description: "Max chunk size of the collection expressed in bytes"
+        limit:
+            type: int
+            description: "Max number of split points to look for"
+            optional: true

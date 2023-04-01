@@ -74,7 +74,7 @@ public:
                                             &constructAt<T>,
                                             nullptr,
                                             nullptr,
-                                            &destroyAt<T>)));
+                                            getDestructorFn<T>())));
     }
 
     /**
@@ -96,7 +96,7 @@ public:
                                             &constructAt<T>,
                                             &copyConstructAt<T>,
                                             &copyAssignAt<T>,
-                                            &destroyAt<T>)));
+                                            getDestructorFn<T>())));
     }
 
     size_t getDecorationBufferSizeBytes() const {
@@ -114,11 +114,13 @@ public:
 
         auto iter = cbegin(_decorationInfo);
 
-        auto cleanupFunction = [&iter, container, this ]() noexcept->void {
+        auto cleanupFunction = [&iter, container, this]() noexcept -> void {
             using std::crend;
             std::for_each(std::make_reverse_iterator(iter),
                           crend(this->_decorationInfo),
                           [&](auto&& decoration) {
+                              if (!decoration.destructor)
+                                  return;
                               decoration.destructor(
                                   container->getDecoration(decoration.descriptor));
                           });
@@ -147,7 +149,7 @@ public:
 
         auto iter = cbegin(_decorationInfo);
 
-        auto cleanupFunction = [&iter, container, this ]() noexcept->void {
+        auto cleanupFunction = [&iter, container, this]() noexcept -> void {
             using std::crend;
             std::for_each(std::make_reverse_iterator(iter),
                           crend(this->_decorationInfo),
@@ -196,6 +198,8 @@ public:
      */
     void destroy(DecorationContainer<DecoratedType>* const container) const noexcept try {
         std::for_each(_decorationInfo.rbegin(), _decorationInfo.rend(), [&](auto&& decoration) {
+            if (!decoration.destructor)
+                return;
             decoration.destructor(container->getDecoration(decoration.descriptor));
         });
     } catch (...) {
@@ -264,6 +268,14 @@ private:
     template <typename T>
     static void destroyAt(void* location) {
         static_cast<T*>(location)->~T();
+    }
+
+    template <typename T>
+    static constexpr DecorationDestructorFn getDestructorFn() {
+        if constexpr (std::is_trivially_destructible_v<T>)
+            return nullptr;
+        else
+            return &destroyAt<T>;
     }
 
     /**

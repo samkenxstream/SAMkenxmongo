@@ -82,9 +82,7 @@ public:
          */
         bool allowShardedForeignCollection(NamespaceString nss,
                                            bool inMultiDocumentTransaction) const override final {
-            const bool foreignShardedAllowed = feature_flags::gFeatureFlagShardedLookup.isEnabled(
-                serverGlobalParams.featureCompatibility);
-            if (foreignShardedAllowed && !inMultiDocumentTransaction) {
+            if (!inMultiDocumentTransaction) {
                 return true;
             }
             auto involvedNss = getInvolvedNamespaces();
@@ -121,12 +119,12 @@ public:
     /**
      * Copy constructor used for clone().
      */
-    DocumentSourceLookUp(const DocumentSourceLookUp&);
+    DocumentSourceLookUp(const DocumentSourceLookUp&,
+                         const boost::intrusive_ptr<ExpressionContext>&);
 
     const char* getSourceName() const final;
-    void serializeToArray(
-        std::vector<Value>& array,
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    void serializeToArray(std::vector<Value>& array,
+                          SerializationOptions opts = SerializationOptions()) const final override;
 
     /**
      * Returns the 'as' path, and possibly fields modified by an absorbed $unwind.
@@ -141,6 +139,8 @@ public:
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
+
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
 
     void addInvolvedCollections(stdx::unordered_set<NamespaceString>* collectionNames) const final;
@@ -148,6 +148,8 @@ public:
     void detachFromOperationContext() final;
 
     void reattachToOperationContext(OperationContext* opCtx) final;
+
+    bool validateOperationContext(const OperationContext* opCtx) const final;
 
     bool usedDisk() final;
 
@@ -244,13 +246,14 @@ public:
         return buildPipeline(inputDoc);
     }
 
-    boost::intrusive_ptr<DocumentSource> clone() const final;
+    boost::intrusive_ptr<DocumentSource> clone(
+        const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const final;
 
-    bool sbeCompatible() const {
-        return _sbeCompatible;
+    SbeCompatibility sbeCompatibility() const {
+        return _sbeCompatibility;
     }
 
-    const NamespaceString& getFromNs() {
+    const NamespaceString& getFromNs() const {
         return _fromNs;
     }
 
@@ -301,8 +304,8 @@ private:
     /**
      * Should not be called; use serializeToArray instead.
      */
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final {
-        MONGO_UNREACHABLE;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override {
+        MONGO_UNREACHABLE_TASSERT(7484304);
     }
 
     GetNextResult unwindResult();
@@ -357,13 +360,13 @@ private:
     void appendSpecificExecStats(MutableDocument& doc) const;
 
     /**
-     * Returns true if 'featureFlagShardedLookup' is enabled and we are not in a transaction.
+     * Returns true if we are not in a transaction.
      */
     bool foreignShardedLookupAllowed() const;
 
     /**
-     * Checks conditions necessary for SBE compatibility and sets _sbeCompatible flag. Note: when
-     * optimizing the pipeline the flag might be modified.
+     * Checks conditions necessary for SBE compatibility and sets '_sbeCompatibility' flag. Note:
+     * when optimizing the pipeline the flag might be modified.
      */
     void determineSbeCompatibility();
 
@@ -403,7 +406,7 @@ private:
     bool _hasExplicitCollation = false;
 
     // Can this $lookup be pushed down into SBE?
-    bool _sbeCompatible = false;
+    SbeCompatibility _sbeCompatibility = SbeCompatibility::notCompatible;
 
     // The aggregation pipeline to perform against the '_resolvedNs' namespace. Referenced view
     // namespaces have been resolved.

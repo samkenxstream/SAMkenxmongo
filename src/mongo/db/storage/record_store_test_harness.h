@@ -36,15 +36,17 @@
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/test_harness_helper.h"
 
 namespace mongo {
 
-class RecordStore;
 class RecoveryUnit;
 
 class RecordStoreHarnessHelper : public HarnessHelper {
 public:
+    enum class Options { Standalone, ReplicationEnabled };
+
     virtual std::unique_ptr<RecordStore> newRecordStore() = 0;
 
     std::unique_ptr<RecordStore> newRecordStore(const std::string& ns) {
@@ -58,11 +60,29 @@ public:
     virtual std::unique_ptr<RecordStore> newOplogRecordStore() = 0;
 
     virtual KVEngine* getEngine() = 0;
+
+    /**
+     * Advances the stable timestamp of the engine.
+     */
+    void advanceStableTimestamp(Timestamp newTimestamp) {
+        auto opCtx = this->client()->getOperationContext();
+        auto engine = getEngine();
+        // Disable the callback for oldest active transaction as it blocks the timestamps from
+        // advancing.
+        engine->setOldestActiveTransactionTimestampCallback(
+            StorageEngine::OldestActiveTransactionTimestampCallback{});
+        engine->setInitialDataTimestamp(newTimestamp);
+        engine->setStableTimestamp(newTimestamp, true);
+        engine->checkpoint(opCtx);
+    }
 };
 
 void registerRecordStoreHarnessHelperFactory(
-    std::function<std::unique_ptr<RecordStoreHarnessHelper>()> factory);
+    std::function<std::unique_ptr<RecordStoreHarnessHelper>(RecordStoreHarnessHelper::Options)>
+        factory);
 
-std::unique_ptr<RecordStoreHarnessHelper> newRecordStoreHarnessHelper();
+std::unique_ptr<RecordStoreHarnessHelper> newRecordStoreHarnessHelper(
+    RecordStoreHarnessHelper::Options options =
+        RecordStoreHarnessHelper::Options::ReplicationEnabled);
 
 }  // namespace mongo

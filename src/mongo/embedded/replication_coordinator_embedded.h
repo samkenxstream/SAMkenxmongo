@@ -221,6 +221,8 @@ public:
 
     Status setMaintenanceMode(OperationContext*, bool) override;
 
+    bool shouldDropSyncSourceAfterShardSplit(OID replicaSetId) const override;
+
     Status processReplSetSyncFrom(OperationContext*, const HostAndPort&, BSONObjBuilder*) override;
 
     Status processReplSetFreeze(int, BSONObjBuilder*) override;
@@ -235,7 +237,9 @@ public:
 
     Status doOptimizedReconfig(OperationContext* opCtx, GetNewConfigFn getNewConfig) override;
 
-    Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment) override;
+    Status awaitConfigCommitment(OperationContext* opCtx,
+                                 bool waitForOplogCommitment,
+                                 long long term) override;
 
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) override;
 
@@ -341,6 +345,25 @@ public:
     virtual void restartScheduledHeartbeats_forTest() override;
 
     virtual void recordIfCWWCIsSetOnConfigServerOnStartup(OperationContext* opCtx) final;
+
+    class WriteConcernTagChangesEmbedded : public WriteConcernTagChanges {
+        virtual ~WriteConcernTagChangesEmbedded() = default;
+        virtual bool reserveDefaultWriteConcernChange() {
+            return false;
+        };
+        virtual void releaseDefaultWriteConcernChange() {}
+
+        virtual bool reserveConfigWriteConcernTagChange() {
+            return false;
+        };
+        virtual void releaseConfigWriteConcernTagChange() {}
+    };
+
+    virtual WriteConcernTagChanges* getWriteConcernTagChanges() override;
+
+    virtual repl::SplitPrepareSessionManager* getSplitPrepareSessionManager() override;
+
+    virtual bool isRetryableWrite(OperationContext* opCtx) const override;
 
 private:
     // Back pointer to the ServiceContext that has started the instance.

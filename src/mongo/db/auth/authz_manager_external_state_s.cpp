@@ -118,7 +118,7 @@ StatusWith<User> AuthzManagerExternalStateMongos::getUserObject(OperationContext
         return status;
     }
 
-    User user(userReq.name);
+    User user(userReq);
     V2UserDocumentParser dp;
     dp.setTenantId(getActiveTenant(opCtx));
     status = dp.initializeUserFromUserDocument(userDoc, &user);
@@ -193,7 +193,7 @@ Status AuthzManagerExternalStateMongos::getUserDescription(OperationContext* opC
             !userInheritedPrivileges.isABSONObj()) {
             return Status(
                 ErrorCodes::UserDataInconsistent,
-                "Recieved malformed response to request for X509 roles from config server");
+                "Received malformed response to request for X509 roles from config server");
         }
 
         *result =

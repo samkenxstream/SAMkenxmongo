@@ -28,17 +28,20 @@
  */
 
 #include "mongo/util/assert_util.h"
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/document_source_change_stream_add_pre_image.h"
 
 #include "mongo/bson/simple_bsonelement_comparator.h"
+#include "mongo/db/change_stream_serverless_helpers.h"
 #include "mongo/db/pipeline/change_stream_helpers_legacy.h"
 #include "mongo/db/pipeline/change_stream_preimage_gen.h"
-#include "mongo/db/transaction_history_iterator.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
 #include "mongo/util/intrusive_counter.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
@@ -67,7 +70,7 @@ DocumentSourceChangeStreamAddPreImage::createFromBson(
             str::stream() << "the '" << kStageName << "' stage spec must be an object",
             elem.type() == BSONType::Object);
     auto parsedSpec = DocumentSourceChangeStreamAddPreImageSpec::parse(
-        IDLParserErrorContext("DocumentSourceChangeStreamAddPreImageSpec"), elem.Obj());
+        IDLParserContext("DocumentSourceChangeStreamAddPreImageSpec"), elem.Obj());
     return make_intrusive<DocumentSourceChangeStreamAddPreImage>(
         expCtx, parsedSpec.getFullDocumentBeforeChange());
 }
@@ -88,19 +91,8 @@ DocumentSource::GetNextResult DocumentSourceChangeStreamAddPreImage::doGetNext()
         return input;
     }
 
-    // If a pre-image is available, the transform stage will have populated it in the event's
-    // 'fullDocumentBeforeChange' field. If this field is missing and the pre-imaging mode is
-    // 'required', we throw an exception. Otherwise, we pass along the document unmodified.
     auto preImageId = input.getDocument()[kPreImageIdFieldName];
-    if (preImageId.missing()) {
-        uassert(51770,
-                str::stream()
-                    << "Change stream was configured to require a pre-image for all update, delete "
-                       "and replace events, but pre-image id was not available for event: "
-                    << input.getDocument().toString(),
-                _fullDocumentBeforeChangeMode != FullDocumentBeforeChangeModeEnum::kRequired);
-        return input;
-    }
+    tassert(6091900, "Pre-image id field is missing", !preImageId.missing());
     tassert(5868900,
             "Expected pre-image id field to be a document",
             preImageId.getType() == BSONType::Object);
@@ -111,7 +103,7 @@ DocumentSource::GetNextResult DocumentSourceChangeStreamAddPreImage::doGetNext()
         ErrorCodes::NoMatchingDocument,
         str::stream() << "Change stream was configured to require a pre-image for all update, "
                          "delete and replace events, but the pre-image was not found for event: "
-                      << input.getDocument().toString(),
+                      << makePreImageNotFoundErrorMsg(input.getDocument()),
         preImageDoc ||
             _fullDocumentBeforeChangeMode != FullDocumentBeforeChangeModeEnum::kRequired);
 
@@ -128,16 +120,11 @@ DocumentSource::GetNextResult DocumentSourceChangeStreamAddPreImage::doGetNext()
 
 boost::optional<Document> DocumentSourceChangeStreamAddPreImage::lookupPreImage(
     boost::intrusive_ptr<ExpressionContext> pExpCtx, const Document& preImageId) {
-    // If the pre-image id does not contain the nsUUID field, then it is in legacy format. Look
-    // up the pre-image in the oplog.
-    if (preImageId[ChangeStreamPreImageId::kNsUUIDFieldName].missing()) {
-        return change_stream_legacy::legacyLookupPreImage(pExpCtx, preImageId);
-    }
-
     // Look up the pre-image document on the local node by id.
+    const auto tenantId = change_stream_serverless_helpers::resolveTenantId(pExpCtx->ns.tenantId());
     auto lookedUpDoc = pExpCtx->mongoProcessInterface->lookupSingleDocumentLocally(
         pExpCtx,
-        NamespaceString::kChangeStreamPreImagesNamespace,
+        NamespaceString::makePreImageCollectionNSS(tenantId),
         Document{{ChangeStreamPreImage::kIdFieldName, preImageId}});
 
     // Return boost::none to signify that we failed to find the pre-image.
@@ -152,17 +139,37 @@ boost::optional<Document> DocumentSourceChangeStreamAddPreImage::lookupPreImage(
     return preImageField.getDocument().getOwned();
 }
 
-Value DocumentSourceChangeStreamAddPreImage::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    return explain
-        ? Value(Document{
-              {DocumentSourceChangeStream::kStageName,
-               Document{{"stage"_sd, "internalAddPreImage"_sd},
-                        {"fullDocumentBeforeChange"_sd,
-                         FullDocumentBeforeChangeMode_serializer(_fullDocumentBeforeChangeMode)}}}})
-        : Value(Document{
-              {kStageName,
-               DocumentSourceChangeStreamAddPreImageSpec(_fullDocumentBeforeChangeMode).toBSON()}});
+Value DocumentSourceChangeStreamAddPreImage::serialize(SerializationOptions opts) const {
+    BSONObjBuilder builder;
+    if (opts.verbosity) {
+        BSONObjBuilder sub(builder.subobjStart(DocumentSourceChangeStream::kStageName));
+        sub.append("stage"_sd, kStageName);
+        opts.serializeLiteralValue(
+                FullDocumentBeforeChangeMode_serializer(_fullDocumentBeforeChangeMode))
+            .addToBsonObj(&sub, kFullDocumentBeforeChangeFieldName);
+        sub.done();
+    } else {
+        BSONObjBuilder sub(builder.subobjStart(kStageName));
+        if (opts.replacementForLiteralArgs) {
+            sub.append(
+                DocumentSourceChangeStreamAddPreImageSpec::kFullDocumentBeforeChangeFieldName,
+                *opts.replacementForLiteralArgs);
+        } else {
+            DocumentSourceChangeStreamAddPreImageSpec(_fullDocumentBeforeChangeMode)
+                .serialize(&sub);
+        }
+        sub.done();
+    }
+    return Value(builder.obj());
+}
+
+std::string DocumentSourceChangeStreamAddPreImage::makePreImageNotFoundErrorMsg(
+    const Document& event) {
+    auto errMsgDoc = Document{{"operationType", event["operationType"]},
+                              {"ns", event["ns"]},
+                              {"clusterTime", event["clusterTime"]},
+                              {"txnNumber", event["txnNumber"]}};
+    return errMsgDoc.toString();
 }
 
 }  // namespace mongo

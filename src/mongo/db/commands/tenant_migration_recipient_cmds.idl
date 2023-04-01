@@ -37,7 +37,7 @@ imports:
   - "mongo/client/read_preference_setting.idl"
   - "mongo/db/repl/tenant_migration_pem_payload.idl"
   - "mongo/db/serverless/serverless_types.idl"
-  - "mongo/idl/basic_types.idl"
+  - "mongo/db/basic_types.idl"
   - "mongo/s/sharding_types.idl"
   - "mongo/db/repl/replication_types.idl"
   - "mongo/util/net/hostandport.idl"
@@ -46,6 +46,7 @@ structs:
     recipientSyncDataResponse:
         description: "Response for the 'recipientSyncData' command"
         strict: false
+        is_command_reply: true
         fields:
             majorityAppliedDonorOpTime:
                 type: optime
@@ -66,11 +67,15 @@ structs:
           validator:
             callback: "tenant_migration_util::validateConnectionString"
         tenantId:
-          description: >-
-            The prefix from which the migrating database will be matched. The prefixes 'admin',
-            'local', 'config', the empty string, are not allowed.
+          description: "The prefix from which the migrating database will be matched. The prefixes 'admin', 'local', 'config', and the empty string ('') are not allowed. Required for multitenant migration, must be empty for shard merge."
           type: string
-          default: '""'
+          optional: true
+          validator:
+            callback: "tenant_migration_util::validateDatabasePrefix"
+        tenantIds:
+          description: "The tenants to migrate. Required for shard merge, must be empty for multitenant migration."
+          optional: true
+          type: array<tenant_id>
           validator:
             callback: "tenant_migration_util::validateDatabasePrefix"
         readPreference:
@@ -98,6 +103,7 @@ commands:
     strict: true
     namespace: ignored
     api_version: ""
+    reply_type: recipientSyncDataResponse
     inline_chained_structs: true
     chained_structs:
       MigrationRecipientCommonData: MigrationRecipientCommonData
@@ -145,9 +151,15 @@ commands:
   recipientForgetMigration:
     description: "Parser for the 'recipientForgetMigration' command."
     command_name: recipientForgetMigration
+    reply_type: OkReply 
     strict: true
     namespace: ignored
     api_version: ""
     inline_chained_structs: true
     chained_structs:
       MigrationRecipientCommonData: MigrationRecipientCommonData
+    fields:
+      decision:
+        description: "Enumeration that defines whether the migration committed or aborted. This field applies only for shard merge protocol"
+        type: MigrationDecision
+        optional: true

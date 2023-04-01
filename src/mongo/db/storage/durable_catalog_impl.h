@@ -62,28 +62,36 @@ public:
 
     void init(OperationContext* opCtx);
 
-    std::vector<Entry> getAllCatalogEntries(OperationContext* opCtx) const;
+    std::vector<EntryIdentifier> getAllCatalogEntries(OperationContext* opCtx) const;
 
-    Entry getEntry(RecordId catalogId) const;
+    boost::optional<DurableCatalogEntry> scanForCatalogEntryByNss(OperationContext* opCtx,
+                                                                  const NamespaceString& nss) const;
 
-    std::string getCollectionIdent(RecordId catalogId) const;
+    boost::optional<DurableCatalogEntry> scanForCatalogEntryByUUID(OperationContext* opCtx,
+                                                                   const UUID& uuid) const;
+
+    EntryIdentifier getEntry(const RecordId& catalogId) const;
+
+    std::string getCollectionIdent(const RecordId& catalogId) const;
 
     std::string getIndexIdent(OperationContext* opCtx,
-                              RecordId catalogId,
+                              const RecordId& catalogId,
                               StringData idxName) const;
 
-    std::vector<std::string> getIndexIdents(OperationContext* opCtx, RecordId catalogId) const;
+    std::vector<std::string> getIndexIdents(OperationContext* opCtx,
+                                            const RecordId& catalogId) const;
 
-    bool isIndexInEntry(OperationContext* opCtx, RecordId catalogId, StringData idxIdent) const;
-
-    BSONObj getCatalogEntry(OperationContext* opCtx, RecordId catalogId) const {
+    BSONObj getCatalogEntry(OperationContext* opCtx, const RecordId& catalogId) const {
         return _findEntry(opCtx, catalogId);
     }
 
-    std::shared_ptr<BSONCollectionCatalogEntry::MetaData> getMetaData(OperationContext* opCtx,
-                                                                      RecordId catalogId) const;
+    boost::optional<DurableCatalogEntry> getParsedCatalogEntry(
+        OperationContext* opCtx, const RecordId& catalogId) const override;
+
+    std::shared_ptr<BSONCollectionCatalogEntry::MetaData> getMetaData(
+        OperationContext* opCtx, const RecordId& catalogId) const;
     void putMetaData(OperationContext* opCtx,
-                     RecordId catalogId,
+                     const RecordId& catalogId,
                      BSONCollectionCatalogEntry::MetaData& md);
 
     std::vector<std::string> getAllIdents(OperationContext* opCtx) const;
@@ -100,7 +108,9 @@ public:
         return _rs;
     }
 
-    StatusWith<std::string> newOrphanedIdent(OperationContext* opCtx, std::string ident);
+    StatusWith<std::string> newOrphanedIdent(OperationContext* opCtx,
+                                             std::string ident,
+                                             const CollectionOptions& optionsWithUUID);
 
     std::string getFilesystemPathForDb(const std::string& dbName) const;
 
@@ -109,47 +119,57 @@ public:
 
     StatusWith<std::pair<RecordId, std::unique_ptr<RecordStore>>> createCollection(
         OperationContext* opCtx,
-        const TenantNamespace& tenantNs,
+        const NamespaceString& nss,
         const CollectionOptions& options,
         bool allocateDefaultSpace);
 
     Status createIndex(OperationContext* opCtx,
-                       RecordId catalogId,
+                       const RecordId& catalogId,
+                       const NamespaceString& nss,
                        const CollectionOptions& collOptions,
                        const IndexDescriptor* spec);
 
     StatusWith<ImportResult> importCollection(OperationContext* opCtx,
-                                              const TenantNamespace& tenantNs,
+                                              const NamespaceString& nss,
                                               const BSONObj& metadata,
                                               const BSONObj& storageMetadata,
                                               const ImportOptions& importOptions) override;
 
     Status renameCollection(OperationContext* opCtx,
-                            RecordId catalogId,
-                            const TenantNamespace& toTenantNs,
+                            const RecordId& catalogId,
+                            const NamespaceString& toNss,
                             BSONCollectionCatalogEntry::MetaData& md);
 
-    Status dropCollection(OperationContext* opCtx, RecordId catalogId);
+    Status dropCollection(OperationContext* opCtx, const RecordId& catalogId);
 
     Status dropAndRecreateIndexIdentForResume(OperationContext* opCtx,
+                                              const NamespaceString& nss,
                                               const CollectionOptions& collOptions,
                                               const IndexDescriptor* spec,
                                               StringData ident);
 
     bool isIndexMultikey(OperationContext* opCtx,
-                         RecordId catalogId,
+                         const RecordId& catalogId,
                          StringData indexName,
                          MultikeyPaths* multikeyPaths) const;
 
-    int getTotalIndexCount(OperationContext* opCtx, RecordId catalogId) const;
+    int getTotalIndexCount(OperationContext* opCtx, const RecordId& catalogId) const;
 
-    bool isIndexPresent(OperationContext* opCtx, RecordId catalogId, StringData indexName) const;
+    void getReadyIndexes(OperationContext* opCtx, RecordId catalogId, StringSet* names) const;
 
-    bool isIndexReady(OperationContext* opCtx, RecordId catalogId, StringData indexName) const;
+    bool isIndexPresent(OperationContext* opCtx,
+                        const RecordId& catalogId,
+                        StringData indexName) const;
+
+    bool isIndexReady(OperationContext* opCtx,
+                      const RecordId& catalogId,
+                      StringData indexName) const;
 
     void setRand_forTest(const std::string& rand);
 
     std::string getRand_forTest() const;
+
+    std::string generateUniqueIdent(NamespaceString nss, const char* kind);
 
 private:
     class AddIdentChange;
@@ -158,25 +178,22 @@ private:
     friend class DurableCatalogImplTest;
     friend class StorageEngineTest;
 
-    BSONObj _findEntry(OperationContext* opCtx, RecordId catalogId) const;
-    StatusWith<Entry> _addEntry(OperationContext* opCtx,
-                                TenantNamespace tenantNs,
-                                const CollectionOptions& options);
-    StatusWith<Entry> _importEntry(OperationContext* opCtx,
-                                   TenantNamespace tenantNs,
-                                   const BSONObj& metadata);
+    BSONObj _findEntry(OperationContext* opCtx, const RecordId& catalogId) const;
+    StatusWith<EntryIdentifier> _addEntry(OperationContext* opCtx,
+                                          NamespaceString nss,
+                                          const CollectionOptions& options);
+    StatusWith<EntryIdentifier> _importEntry(OperationContext* opCtx,
+                                             NamespaceString nss,
+                                             const BSONObj& metadata);
     Status _replaceEntry(OperationContext* opCtx,
-                         RecordId catalogId,
-                         const TenantNamespace& toTenantNs,
+                         const RecordId& catalogId,
+                         const NamespaceString& toNss,
                          BSONCollectionCatalogEntry::MetaData& md);
-    Status _removeEntry(OperationContext* opCtx, RecordId catalogId);
+    Status _removeEntry(OperationContext* opCtx, const RecordId& catalogId);
 
-    /**
-     * Generates a new unique identifier for a new "thing".
-     * @param tenantNs - the containing tenant namespace
-     * @param kind - what this "thing" is, likely collection or index
-     */
-    std::string _newUniqueIdent(TenantNamespace tenantNs, const char* kind);
+    std::shared_ptr<BSONCollectionCatalogEntry::MetaData> _parseMetaData(
+        const BSONElement& mdElement) const;
+
 
     std::string _newInternalIdent(StringData identStem);
 
@@ -196,7 +213,7 @@ private:
     std::string _rand;
     unsigned long long _next;
 
-    std::map<RecordId, Entry> _catalogIdToEntryMap;
+    std::map<RecordId, EntryIdentifier> _catalogIdToEntryMap;
     mutable Mutex _catalogIdToEntryMapLock =
         MONGO_MAKE_LATCH("DurableCatalogImpl::_catalogIdToEntryMap");
 

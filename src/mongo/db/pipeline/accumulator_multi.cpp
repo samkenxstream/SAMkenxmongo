@@ -35,94 +35,21 @@ namespace mongo {
 using FirstLastSense = AccumulatorFirstLastN::Sense;
 using MinMaxSense = AccumulatorMinMax::Sense;
 
-// Register macros for the various accumulators/expressions in this file. Note that we check
-// 'isEnabledAndIgnoreFCV()' because the feature flag is a property set at startup, while FCV can
-// change while the server is running.
-// TODO SERVER-61855 Add these accumulators/expressions to the stable API.
-REGISTER_ACCUMULATOR_CONDITIONALLY(
-    maxN,
-    AccumulatorMinMaxN::parseMinMaxN<MinMaxSense::kMax>,
-    AllowedWithApiStrict::kNeverInVersion1,
-    AllowedWithClientType::kAny,
-    feature_flags::gFeatureFlagExactTopNAccumulator.getVersion(),
-    feature_flags::gFeatureFlagExactTopNAccumulator.isEnabledAndIgnoreFCV());
-REGISTER_ACCUMULATOR_CONDITIONALLY(
-    minN,
-    AccumulatorMinMaxN::parseMinMaxN<MinMaxSense::kMin>,
-    AllowedWithApiStrict::kNeverInVersion1,
-    AllowedWithClientType::kAny,
-    feature_flags::gFeatureFlagExactTopNAccumulator.getVersion(),
-    feature_flags::gFeatureFlagExactTopNAccumulator.isEnabledAndIgnoreFCV());
-REGISTER_EXPRESSION_CONDITIONALLY(
-    maxN,
-    AccumulatorMinMaxN::parseExpression<MinMaxSense::kMax>,
-    AllowedWithApiStrict::kNeverInVersion1,
-    AllowedWithClientType::kAny,
-    feature_flags::gFeatureFlagExactTopNAccumulator.getVersion(),
-    feature_flags::gFeatureFlagExactTopNAccumulator.isEnabledAndIgnoreFCV());
-REGISTER_EXPRESSION_CONDITIONALLY(
-    minN,
-    AccumulatorMinMaxN::parseExpression<MinMaxSense::kMin>,
-    AllowedWithApiStrict::kNeverInVersion1,
-    AllowedWithClientType::kAny,
-    feature_flags::gFeatureFlagExactTopNAccumulator.getVersion(),
-    feature_flags::gFeatureFlagExactTopNAccumulator.isEnabledAndIgnoreFCV());
-REGISTER_ACCUMULATOR_CONDITIONALLY(
-    firstN,
-    AccumulatorFirstLastN::parseFirstLastN<FirstLastSense::kFirst>,
-    AllowedWithApiStrict::kNeverInVersion1,
-    AllowedWithClientType::kAny,
-    feature_flags::gFeatureFlagExactTopNAccumulator.getVersion(),
-    feature_flags::gFeatureFlagExactTopNAccumulator.isEnabledAndIgnoreFCV());
-REGISTER_ACCUMULATOR_CONDITIONALLY(
-    lastN,
-    AccumulatorFirstLastN::parseFirstLastN<FirstLastSense::kLast>,
-    AllowedWithApiStrict::kNeverInVersion1,
-    AllowedWithClientType::kAny,
-    feature_flags::gFeatureFlagExactTopNAccumulator.getVersion(),
-    feature_flags::gFeatureFlagExactTopNAccumulator.isEnabledAndIgnoreFCV());
-REGISTER_EXPRESSION_CONDITIONALLY(
-    firstN,
-    AccumulatorFirstLastN::parseExpression<FirstLastSense::kFirst>,
-    AllowedWithApiStrict::kNeverInVersion1,
-    AllowedWithClientType::kAny,
-    feature_flags::gFeatureFlagExactTopNAccumulator.getVersion(),
-    feature_flags::gFeatureFlagExactTopNAccumulator.isEnabledAndIgnoreFCV());
-REGISTER_EXPRESSION_CONDITIONALLY(
-    lastN,
-    AccumulatorFirstLastN::parseExpression<FirstLastSense::kLast>,
-    AllowedWithApiStrict::kNeverInVersion1,
-    AllowedWithClientType::kAny,
-    feature_flags::gFeatureFlagExactTopNAccumulator.getVersion(),
-    feature_flags::gFeatureFlagExactTopNAccumulator.isEnabledAndIgnoreFCV());
-REGISTER_ACCUMULATOR_CONDITIONALLY(
-    topN,
-    (AccumulatorTopBottomN<TopBottomSense::kTop, false>::parseTopBottomN),
-    AllowedWithApiStrict::kNeverInVersion1,
-    AllowedWithClientType::kAny,
-    feature_flags::gFeatureFlagExactTopNAccumulator.getVersion(),
-    feature_flags::gFeatureFlagExactTopNAccumulator.isEnabledAndIgnoreFCV());
-REGISTER_ACCUMULATOR_CONDITIONALLY(
-    bottomN,
-    (AccumulatorTopBottomN<TopBottomSense::kBottom, false>::parseTopBottomN),
-    AllowedWithApiStrict::kNeverInVersion1,
-    AllowedWithClientType::kAny,
-    feature_flags::gFeatureFlagExactTopNAccumulator.getVersion(),
-    feature_flags::gFeatureFlagExactTopNAccumulator.isEnabledAndIgnoreFCV());
-REGISTER_ACCUMULATOR_CONDITIONALLY(
-    top,
-    (AccumulatorTopBottomN<TopBottomSense::kTop, true>::parseTopBottomN),
-    AllowedWithApiStrict::kNeverInVersion1,
-    AllowedWithClientType::kAny,
-    feature_flags::gFeatureFlagExactTopNAccumulator.getVersion(),
-    feature_flags::gFeatureFlagExactTopNAccumulator.isEnabledAndIgnoreFCV());
-REGISTER_ACCUMULATOR_CONDITIONALLY(
-    bottom,
-    (AccumulatorTopBottomN<TopBottomSense::kBottom, true>::parseTopBottomN),
-    AllowedWithApiStrict::kNeverInVersion1,
-    AllowedWithClientType::kAny,
-    feature_flags::gFeatureFlagExactTopNAccumulator.getVersion(),
-    feature_flags::gFeatureFlagExactTopNAccumulator.isEnabledAndIgnoreFCV());
+// Register macros for the various accumulators/expressions in this file.
+REGISTER_ACCUMULATOR(maxN, AccumulatorMinMaxN::parseMinMaxN<MinMaxSense::kMax>);
+REGISTER_ACCUMULATOR(minN, AccumulatorMinMaxN::parseMinMaxN<MinMaxSense::kMin>);
+REGISTER_STABLE_EXPRESSION(maxN, AccumulatorMinMaxN::parseExpression<MinMaxSense::kMax>);
+REGISTER_STABLE_EXPRESSION(minN, AccumulatorMinMaxN::parseExpression<MinMaxSense::kMin>);
+REGISTER_ACCUMULATOR(firstN, AccumulatorFirstLastN::parseFirstLastN<FirstLastSense::kFirst>);
+REGISTER_ACCUMULATOR(lastN, AccumulatorFirstLastN::parseFirstLastN<FirstLastSense::kLast>);
+REGISTER_STABLE_EXPRESSION(firstN, AccumulatorFirstLastN::parseExpression<FirstLastSense::kFirst>);
+REGISTER_STABLE_EXPRESSION(lastN, AccumulatorFirstLastN::parseExpression<FirstLastSense::kLast>);
+REGISTER_ACCUMULATOR(topN, (AccumulatorTopBottomN<TopBottomSense::kTop, false>::parseTopBottomN));
+REGISTER_ACCUMULATOR(bottomN,
+                     (AccumulatorTopBottomN<TopBottomSense::kBottom, false>::parseTopBottomN));
+REGISTER_ACCUMULATOR(top, (AccumulatorTopBottomN<TopBottomSense::kTop, true>::parseTopBottomN));
+REGISTER_ACCUMULATOR(bottom,
+                     (AccumulatorTopBottomN<TopBottomSense::kBottom, true>::parseTopBottomN));
 
 AccumulatorN::AccumulatorN(ExpressionContext* const expCtx)
     : AccumulatorState(expCtx), _maxMemUsageBytes(internalQueryTopNAccumulatorBytes.load()) {}
@@ -179,9 +106,9 @@ const char* AccumulatorMinMaxN::getOpName() const {
 
 Document AccumulatorMinMaxN::serialize(boost::intrusive_ptr<Expression> initializer,
                                        boost::intrusive_ptr<Expression> argument,
-                                       bool explain) const {
+                                       SerializationOptions options) const {
     MutableDocument args;
-    AccumulatorN::serializeHelper(initializer, argument, explain, args);
+    AccumulatorN::serializeHelper(initializer, argument, options, args);
     return DOC(getOpName() << args.freeze());
 }
 
@@ -231,17 +158,17 @@ void AccumulatorN::updateAndCheckMemUsage(size_t memAdded) {
 
 void AccumulatorN::serializeHelper(const boost::intrusive_ptr<Expression>& initializer,
                                    const boost::intrusive_ptr<Expression>& argument,
-                                   bool explain,
+                                   SerializationOptions options,
                                    MutableDocument& md) {
-    md.addField(kFieldNameN, Value(initializer->serialize(explain)));
-    md.addField(kFieldNameInput, Value(argument->serialize(explain)));
+    md.addField(kFieldNameN, Value(initializer->serialize(options)));
+    md.addField(kFieldNameInput, Value(argument->serialize(options)));
 }
 
 template <MinMaxSense s>
 AccumulationExpression AccumulatorMinMaxN::parseMinMaxN(ExpressionContext* const expCtx,
                                                         BSONElement elem,
                                                         VariablesParseState vps) {
-    expCtx->sbeGroupCompatible = false;
+    expCtx->sbeGroupCompatibility = SbeCompatibility::notCompatible;
     auto name = [] {
         if constexpr (s == MinMaxSense::kMin) {
             return AccumulatorMinN::getName();
@@ -328,7 +255,7 @@ template <FirstLastSense v>
 AccumulationExpression AccumulatorFirstLastN::parseFirstLastN(ExpressionContext* const expCtx,
                                                               BSONElement elem,
                                                               VariablesParseState vps) {
-    expCtx->sbeGroupCompatible = false;
+    expCtx->sbeGroupCompatibility = SbeCompatibility::notCompatible;
     auto name = [] {
         if constexpr (v == Sense::kFirst) {
             return AccumulatorFirstN::getName();
@@ -386,9 +313,9 @@ const char* AccumulatorFirstLastN::getOpName() const {
 
 Document AccumulatorFirstLastN::serialize(boost::intrusive_ptr<Expression> initializer,
                                           boost::intrusive_ptr<Expression> argument,
-                                          bool explain) const {
+                                          SerializationOptions options) const {
     MutableDocument args;
-    AccumulatorN::serializeHelper(initializer, argument, explain, args);
+    AccumulatorN::serializeHelper(initializer, argument, options, args);
     return DOC(getOpName() << args.freeze());
 }
 
@@ -492,9 +419,10 @@ AccumulatorTopBottomN<sense, single>::AccumulatorTopBottomN(ExpressionContext* c
                                                             bool isRemovable)
     : AccumulatorN(expCtx), _isRemovable(isRemovable), _sortPattern(std::move(sp)) {
 
-    // Modify sortPattern to sort based on fields where they are in the evaluated argument instead
-    // of where they would be in the raw document received by $group and friends.
+    // Make a copy of _sortPattern to sort based on fields where they are in the evaluated argument
+    // instead of where they would be in the raw document received by $group and friends.
     std::vector<SortPattern::SortPatternPart> parts;
+    parts.reserve(_sortPattern.size());
     int sortOrder = 0;
     for (auto part : _sortPattern) {
         const auto newFieldName =
@@ -506,10 +434,10 @@ AccumulatorTopBottomN<sense, single>::AccumulatorTopBottomN(ExpressionContext* c
             // parseAccumulatorTopBottomNSortBy().
             part.expression = nullptr;
         }
-        parts.push_back(part);
+        parts.push_back(std::move(part));
         sortOrder++;
     }
-    SortPattern internalSortPattern(parts);
+    SortPattern internalSortPattern(std::move(parts));
 
     _sortKeyComparator.emplace(internalSortPattern);
     _sortKeyGenerator.emplace(std::move(internalSortPattern), expCtx->getCollator());
@@ -532,13 +460,13 @@ template <TopBottomSense sense, bool single>
 Document AccumulatorTopBottomN<sense, single>::serialize(
     boost::intrusive_ptr<Expression> initializer,
     boost::intrusive_ptr<Expression> argument,
-    bool explain) const {
+    SerializationOptions options) const {
     MutableDocument args;
 
     if constexpr (!single) {
-        args.addField(kFieldNameN, Value(initializer->serialize(explain)));
+        args.addField(kFieldNameN, Value(initializer->serialize(options)));
     }
-    auto serializedArg = argument->serialize(explain);
+    auto serializedArg = argument->serialize(options);
 
     // If 'argument' contains a field named 'output', this means that we are serializing the
     // accumulator's original output expression under the field name 'output'. Otherwise, we are
@@ -551,13 +479,14 @@ Document AccumulatorTopBottomN<sense, single>::serialize(
     }
     args.addField(kFieldNameSortBy,
                   Value(_sortPattern.serialize(
-                      SortPattern::SortKeySerialization::kForPipelineSerialization)));
+                      SortPattern::SortKeySerialization::kForPipelineSerialization, options)));
     return DOC(getOpName() << args.freeze());
 }
 
 template <TopBottomSense sense>
 std::pair<SortPattern, BSONArray> parseAccumulatorTopBottomNSortBy(ExpressionContext* const expCtx,
                                                                    BSONObj sortBy) {
+
     SortPattern sortPattern(sortBy, expCtx);
     BSONArrayBuilder sortFieldsExpBab;
     BSONObjIterator sortByBoi(sortBy);
@@ -582,10 +511,8 @@ template <TopBottomSense sense, bool single>
 AccumulationExpression AccumulatorTopBottomN<sense, single>::parseTopBottomN(
     ExpressionContext* const expCtx, BSONElement elem, VariablesParseState vps) {
     auto name = AccumulatorTopBottomN<sense, single>::getName();
-
     const auto [n, output, sortBy] =
         accumulatorNParseArgs<single>(expCtx, elem, name.rawData(), true, vps);
-
     auto [sortPattern, sortFieldsExp] = parseAccumulatorTopBottomNSortBy<sense>(expCtx, *sortBy);
 
     // Construct argument expression. If given sortBy: {field1: 1, field2: 1} it will be shaped like
@@ -672,12 +599,6 @@ void AccumulatorTopBottomN<sense, single>::_processValue(const Value& val) {
         }
     }
 
-    // TODO SERVER-61281 consider removing this call to fillCache().
-    // Since Document caches fields the size of this cache and getApproximateSize() can vary
-    // depending on access. In order to avoid this and make sure we subtract the right amount if
-    // remove() ever gets called, we can fill the cache to get a consistent view of the size.
-    // Normally the outer window function code handles this, but _genKeyOutPair() makes a new
-    // document for sortKey, so its cache get reset.
     keyOutPair.first.fillCache();
     const auto memUsage = keyOutPair.first.getApproximateSize() +
         keyOutPair.second.getApproximateSize() + sizeof(KeyOutPair);
@@ -699,9 +620,6 @@ void AccumulatorTopBottomN<sense, single>::remove(const Value& val) {
     auto it = _map->lower_bound(keyOutPair.first);
     _map->erase(it);
 
-    // TODO SERVER-61281 consider removing this comment if its no longer relevant.
-    // After calling lower_bound() it uses SortKeyComparator and the sortKey's field cache should be
-    // fully populated so no need to call fillCache() again.
     _memUsageBytes -= keyOutPair.first.getApproximateSize() +
         keyOutPair.second.getApproximateSize() + sizeof(KeyOutPair);
 }
@@ -741,7 +659,7 @@ Value AccumulatorTopBottomN<sense, single>::getValueConst(bool toBeMerged) const
     std::vector<Value> result;
     auto begin = _map->begin();
     auto end = _map->end();
-    if constexpr (sense == kBottom) {
+    if constexpr (sense == TopBottomSense::kBottom) {
         // If this accumulator is removable there may be more than n elements in the map, so we must
         // skip elements that shouldn't be in the result.
         if (static_cast<long long>(_map->size()) > *_n) {

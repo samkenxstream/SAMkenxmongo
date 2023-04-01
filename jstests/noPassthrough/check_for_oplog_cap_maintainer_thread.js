@@ -1,6 +1,6 @@
 /**
- * Checks that the oplog cap maintainer thread is started and the oplog stones calculation is
- * performed under normal startup circumstances. Both of these operations should not be done when
+ * Checks that the oplog cap maintainer thread is started and the oplog truncate markers calculation
+ * is performed under normal startup circumstances. Both of these operations should not be done when
  * starting up with any of the following modes:
  *     - readonly
  *     - repair
@@ -13,24 +13,25 @@
 
 // Verify that the oplog cap maintainer thread is running under normal circumstances.
 jsTestLog("Testing single node replica set mode");
-const rst = new ReplSetTest({nodes: 1, nodeOptions: {setParameter: {logLevel: 1}}});
+const rst = new ReplSetTest(
+    {nodes: 1, nodeOptions: {setParameter: {logComponentVerbosity: tojson({storage: 1})}}});
 rst.startSet();
 rst.initiate();
 
 const primary = rst.getPrimary();
 checkLog.containsJson(primary, 5295000);  // OplogCapMaintainerThread started.
-checkLog.containsJson(primary, 22382);    // Oplog stones calculated.
+checkLog.containsJson(primary, 22382);    // Oplog truncate markers calculated.
 
-rst.stopSet(/*signal=*/null, /*forRestart=*/true);
+rst.stopSet(/*signal=*/ null, /*forRestart=*/ true);
 
 // A subset of startup options prevent the oplog cap maintainer thread from being started. These
 // startup options are currently limited to readOnly, recoverFromOplogAsStandalone and repair.
 function verifyOplogCapMaintainerThreadNotStarted(log) {
     const threadRegex = new RegExp("\"id\":5295000");
-    const oplogStonesRegex = new RegExp("\"id\":22382");
+    const oplogTruncateMarkersRegex = new RegExp("\"id\":22382");
 
     assert(!threadRegex.test(log));
-    assert(!oplogStonesRegex.test(log));
+    assert(!oplogTruncateMarkersRegex.test(log));
 }
 
 jsTestLog("Testing readOnly mode");
@@ -39,7 +40,7 @@ let conn = MongoRunner.runMongod({
     dbpath: primary.dbpath,
     noCleanData: true,
     queryableBackupMode: "",  // readOnly
-    setParameter: {logLevel: 1},
+    setParameter: {logComponentVerbosity: tojson({storage: 1})},
 });
 assert(conn);
 MongoRunner.stopMongod(conn);
@@ -50,7 +51,7 @@ clearRawMongoProgramOutput();
 conn = MongoRunner.runMongod({
     dbpath: primary.dbpath,
     noCleanData: true,
-    setParameter: {recoverFromOplogAsStandalone: true, logLevel: 1},
+    setParameter: {recoverFromOplogAsStandalone: true, logComponentVerbosity: tojson({storage: 1})},
 });
 assert(conn);
 MongoRunner.stopMongod(conn);
@@ -62,7 +63,7 @@ conn = MongoRunner.runMongod({
     dbpath: primary.dbpath,
     noCleanData: true,
     repair: "",
-    setParameter: {logLevel: 1},
+    setParameter: {logComponentVerbosity: tojson({storage: 1})},
 });
 assert(!conn);
 verifyOplogCapMaintainerThreadNotStarted(rawMongoProgramOutput());

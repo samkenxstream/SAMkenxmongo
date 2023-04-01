@@ -63,10 +63,6 @@ public:
 private:
     BSONObj _produceNewDocumentForInsert();
     void _performInsert(BSONObj newDocument);
-
-    void _generateNewDocumentFromSuppliedDoc(const FieldRefSet& immutablePaths);
-    void _generateNewDocumentFromUpdateOp(const FieldRefSet& immutablePaths);
-
     void _assertDocumentToBeInsertedIsValid(const mutablebson::Document& document,
                                             const FieldRefSet& shardKeyPaths);
 };

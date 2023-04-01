@@ -22,6 +22,7 @@ selector:
   # Expects reads to die with a particular error, but other errors are possible if the read is part
   # of a transaction (e.g. ErrorCodes.LockTimeout).
   - jstests/concurrency/fsm_workloads/drop_index_during_replan.js
+  - jstests/concurrency/fsm_workloads/drop_index_during_lookup.js
 
   # Performs direct writes to system.views
   - jstests/concurrency/fsm_workloads/view_catalog_direct_system_writes.js
@@ -87,5 +88,7 @@ executor:
       oplogSize: 1024
       set_parameters:
         enableTestCommands: 1
+        queryAnalysisSamplerConfigurationRefreshSecs: 1
+        queryAnalysisWriterIntervalSecs: 1
         roleGraphInvalidationIsFatal: 1
     num_nodes: 3

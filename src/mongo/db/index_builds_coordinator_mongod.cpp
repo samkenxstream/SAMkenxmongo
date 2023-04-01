@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -45,6 +44,8 @@
 #include "mongo/db/index_build_entry_helpers.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/tenant_migration_access_blocker_util.h"
+#include "mongo/db/s/forwardable_operation_metadata.h"
+#include "mongo/db/s/global_user_write_block_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/resource_consumption_metrics.h"
@@ -57,6 +58,9 @@
 #include "mongo/util/scoped_counter.h"
 #include "mongo/util/str.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+
 namespace mongo {
 
 namespace {
@@ -64,6 +68,8 @@ namespace {
 MONGO_FAIL_POINT_DEFINE(hangAfterAcquiringIndexBuildSlot);
 MONGO_FAIL_POINT_DEFINE(hangBeforeInitializingIndexBuild);
 MONGO_FAIL_POINT_DEFINE(hangIndexBuildAfterSignalPrimaryForCommitReadiness);
+MONGO_FAIL_POINT_DEFINE(hangBeforeRunningIndexBuild);
+MONGO_FAIL_POINT_DEFINE(hangIndexBuildBeforeSignalingPrimaryForAbort);
 
 const StringData kMaxNumActiveUserIndexBuildsServerParameterName = "maxNumActiveUserIndexBuilds"_sd;
 
@@ -90,6 +96,82 @@ ThreadPool::Options makeDefaultThreadPoolOptions() {
     return options;
 }
 
+void runVoteCommand(OperationContext* opCtx,
+                    ReplIndexBuildState* replState,
+                    std::function<BSONObj(const UUID&, const std::string&)> generateCommand,
+                    std::function<bool(BSONObj, const UUID)> validateFn) {
+
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+
+    // No locks should be held.
+    invariant(!opCtx->lockState()->isLocked());
+
+    Backoff exponentialBackoff(Seconds(1), Seconds(2));
+
+    auto onRemoteCmdScheduled = [opCtx, replState](executor::TaskExecutor::CallbackHandle handle) {
+        replState->onVoteRequestScheduled(opCtx, handle);
+    };
+
+    auto onRemoteCmdComplete = [replState](executor::TaskExecutor::CallbackHandle) {
+        replState->clearVoteRequestCbk();
+    };
+
+    auto needToVote = [replState]() -> bool {
+        return !replState->getNextActionNoWait();
+    };
+
+    // Retry command on error until we have been signaled either with commit or abort. This way, we
+    // can make sure majority of nodes will never stop voting and wait for commit or abort signal
+    // until they have received commit or abort signal.
+    while (needToVote()) {
+        // Check for any interrupts, including shutdown-related ones, before starting the voting
+        // process.
+        opCtx->checkForInterrupt();
+
+        // Don't hammer the network.
+        sleepFor(exponentialBackoff.nextSleep());
+        // When index build started during startup recovery can try to get it's address when
+        // rsConfig is uninitialized. So, retry till it gets initialized. Also, it's important, when
+        // we retry, we check if we have received commit or abort signal to ensure liveness. For
+        // e.g., consider a case where  index build gets restarted on startup recovery and
+        // indexBuildsCoordinator thread waits for valid address w/o checking commit or abort
+        // signal. Now, things can go wrong if we try to replay commitIndexBuild oplog entry for
+        // that index build on startup recovery. Oplog applier would get stuck waiting on the
+        // indexBuildsCoordinator thread. As a result, we won't be able to transition to secondary
+        // state, get stuck on startup state.
+        auto myAddress = replCoord->getMyHostAndPort();
+        if (myAddress.empty()) {
+            continue;
+        }
+
+        const BSONObj voteCmdRequest = generateCommand(replState->buildUUID, myAddress.toString());
+
+        BSONObj voteCmdResponse;
+        try {
+            voteCmdResponse = replCoord->runCmdOnPrimaryAndAwaitResponse(
+                opCtx, "admin", voteCmdRequest, onRemoteCmdScheduled, onRemoteCmdComplete);
+        } catch (DBException& ex) {
+            // All errors, including CallbackCanceled and network errors, should be retried.
+            // If ErrorCodes::CallbackCanceled is due to shutdown, then checkForInterrupt() at the
+            // beginning of this loop will catch it and throw an error to the caller. Or, if we
+            // received the CallbackCanceled error because the index build was signaled with abort
+            // or commit signal, then needToVote() would return false and we don't retry the voting
+            // process.
+            LOGV2_DEBUG(4666400,
+                        1,
+                        "Failed to run index build vote command.",
+                        "command"_attr = voteCmdRequest.firstElement().fieldName(),
+                        "indexBuildUUID"_attr = replState->buildUUID,
+                        "errorMsg"_attr = ex);
+            continue;
+        }
+
+        // Check if the command has to be retried.
+        if (validateFn(voteCmdResponse, replState->buildUUID)) {
+            break;
+        }
+    }
+};
 }  // namespace
 
 IndexBuildsCoordinatorMongod::IndexBuildsCoordinatorMongod()
@@ -121,7 +203,7 @@ void IndexBuildsCoordinatorMongod::shutdown(OperationContext* opCtx) {
 
 StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>
 IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
-                                              std::string dbName,
+                                              const DatabaseName& dbName,
                                               const UUID& collectionUUID,
                                               const std::vector<BSONObj>& specs,
                                               const UUID& buildUUID,
@@ -133,7 +215,7 @@ IndexBuildsCoordinatorMongod::startIndexBuild(OperationContext* opCtx,
 
 StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>
 IndexBuildsCoordinatorMongod::resumeIndexBuild(OperationContext* opCtx,
-                                               std::string dbName,
+                                               const DatabaseName& dbName,
                                                const UUID& collectionUUID,
                                                const std::vector<BSONObj>& specs,
                                                const UUID& buildUUID,
@@ -152,7 +234,7 @@ IndexBuildsCoordinatorMongod::resumeIndexBuild(OperationContext* opCtx,
 
 StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>
 IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
-                                               std::string dbName,
+                                               const DatabaseName& dbName,
                                                const UUID& collectionUUID,
                                                const std::vector<BSONObj>& specs,
                                                const UUID& buildUUID,
@@ -160,6 +242,12 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
                                                IndexBuildOptions indexBuildOptions,
                                                const boost::optional<ResumeIndexInfo>& resumeInfo) {
     const NamespaceStringOrUUID nssOrUuid{dbName, collectionUUID};
+
+    auto writeBlockState = GlobalUserWriteBlockState::get(opCtx);
+
+    invariant(!opCtx->lockState()->isRSTLExclusive(), buildUUID.toString());
+
+    const auto nss = CollectionCatalog::get(opCtx)->resolveNamespaceStringOrUUID(opCtx, nssOrUuid);
 
     {
         // Only operations originating from user connections need to wait while there are more than
@@ -183,10 +271,11 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
                         replCoord->canAcceptWritesFor(opCtx, nssOrUuid));
             }
 
-            // The check here catches empty index builds and also allows us to stop index
+            // The checks here catch empty index builds and also allow us to stop index
             // builds before waiting for throttling. It may race with the abort at the start
             // of migration so we do check again later.
             uassertStatusOK(tenant_migration_access_blocker::checkIfCanBuildIndex(opCtx, dbName));
+            uassertStatusOK(writeBlockState->checkIfIndexBuildAllowedToStart(opCtx, nss));
 
             stdx::unique_lock<Latch> lk(_throttlingMutex);
             bool messageLogged = false;
@@ -236,7 +325,7 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
         auto status = Status::OK();
         if (resumeInfo) {
             status = _setUpResumeIndexBuild(
-                opCtx, dbName, collectionUUID, specs, buildUUID, resumeInfo.get());
+                opCtx, dbName, collectionUUID, specs, buildUUID, resumeInfo.value());
         } else {
             status = _setUpIndexBuildForTwoPhaseRecovery(
                 opCtx, dbName, collectionUUID, specs, buildUUID);
@@ -255,7 +344,7 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
             invariant(statusWithOptionalResult.getValue()->isReady());
             // The requested index (specs) are already built or are being built. Return success
             // early (this is v4.0 behavior compatible).
-            return statusWithOptionalResult.getValue().get();
+            return statusWithOptionalResult.getValue().value();
         }
 
         if (opCtx->getClient()->isFromUserConnection()) {
@@ -271,12 +360,20 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
                                                        invariant(_getIndexBuild(buildUUID)));
                 return migrationStatus;
             }
+
+            auto buildBlockedStatus = writeBlockState->checkIfIndexBuildAllowedToStart(opCtx, nss);
+            if (!buildBlockedStatus.isOK()) {
+                LOGV2(6511603,
+                      "Aborted index build due to user index builds being blocked",
+                      "error"_attr = buildBlockedStatus,
+                      "buildUUID"_attr = buildUUID,
+                      "collectionUUID"_attr = collectionUUID);
+                activeIndexBuilds.unregisterIndexBuild(&_indexBuildsManager,
+                                                       invariant(_getIndexBuild(buildUUID)));
+                return buildBlockedStatus;
+            }
         }
     }
-
-    invariant(!opCtx->lockState()->isRSTLExclusive(), buildUUID.toString());
-
-    const auto nss = CollectionCatalog::get(opCtx)->resolveNamespaceStringOrUUID(opCtx, nssOrUuid);
 
     auto& oss = OperationShardingState::get(opCtx);
 
@@ -306,26 +403,27 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
     // Since index builds occur in a separate thread, client attributes that are audited must be
     // extracted from the client object and passed into the thread separately.
     audit::ImpersonatedClientAttrs impersonatedClientAttrs(opCtx->getClient());
+    ForwardableOperationMetadata forwardableOpMetadata(opCtx);
 
     // The thread pool task will be responsible for signalling the condition variable when the index
     // build thread is done running.
     onScopeExitGuard.dismiss();
-    _threadPool.schedule([
-        this,
-        buildUUID,
-        dbName,
-        nss,
-        indexBuildOptions,
-        logicalOp,
-        opDesc,
-        replState,
-        startPromise = std::move(startPromise),
-        startTimestamp,
-        shardVersion = oss.getShardVersion(nss),
-        dbVersion = oss.getDbVersion(dbName),
-        resumeInfo,
-        impersonatedClientAttrs = std::move(impersonatedClientAttrs)
-    ](auto status) mutable noexcept {
+    _threadPool.schedule([this,
+                          buildUUID,
+                          dbName,
+                          nss,
+                          indexBuildOptions,
+                          logicalOp,
+                          opDesc,
+                          replState,
+                          startPromise = std::move(startPromise),
+                          startTimestamp,
+                          shardVersion = oss.getShardVersion(nss),
+                          dbVersion = oss.getDbVersion(dbName.toStringWithTenantId()),
+                          resumeInfo,
+                          impersonatedClientAttrs = std::move(impersonatedClientAttrs),
+                          forwardableOpMetadata =
+                              std::move(forwardableOpMetadata)](auto status) mutable noexcept {
         ScopeGuard onScopeExitGuard([&] {
             stdx::unique_lock<Latch> lk(_throttlingMutex);
             _numActiveIndexBuilds--;
@@ -340,11 +438,17 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
         }
 
         auto opCtx = Client::getCurrent()->makeOperationContext();
+        // Indicate that the index build is scheduled and running under this opCtx.
+        replState->onThreadScheduled(opCtx.get());
+
+        // Forward the forwardable operation metadata from the external client to this thread's
+        // client.
+        forwardableOpMetadata.setOn(opCtx.get());
 
         // Load the external client's attributes into this thread's client for auditing.
         auto authSession = AuthorizationSession::get(opCtx->getClient());
         if (authSession) {
-            authSession->setImpersonatedUserData(std::move(impersonatedClientAttrs.userNames),
+            authSession->setImpersonatedUserData(std::move(impersonatedClientAttrs.userName),
                                                  std::move(impersonatedClientAttrs.roleNames));
         }
 
@@ -364,9 +468,9 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
         // Start collecting metrics for the index build. The metrics for this operation will only be
         // aggregated globally if the node commits or aborts while it is primary.
         auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx.get());
-        if (ResourceConsumption::shouldCollectMetricsForDatabase(dbName) &&
+        if (ResourceConsumption::shouldCollectMetricsForDatabase(dbName.toStringWithTenantId()) &&
             ResourceConsumption::isMetricsCollectionEnabled()) {
-            metricsCollector.beginScopedCollecting(opCtx.get(), dbName);
+            metricsCollector.beginScopedCollecting(opCtx.get(), dbName.toStringWithTenantId());
         }
 
         // Index builds should never take the PBWM lock, even on a primary. This allows the
@@ -378,12 +482,17 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
             status = _setUpIndexBuild(opCtx.get(), buildUUID, startTimestamp, indexBuildOptions);
             if (!status.isOK()) {
                 startPromise.setError(status);
+                // Do not exit with an incomplete future, even if setup fails, we should still
+                // signal waiters.
+                invariant(replState->sharedPromise.getFuture().isReady());
                 return;
             }
         }
 
         // Signal that the index build started successfully.
         startPromise.setWith([] {});
+
+        hangBeforeRunningIndexBuild.pauseWhileSet();
 
         // Runs the remainder of the index build. Sets the promise result and cleans up the index
         // build.
@@ -396,7 +505,10 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
             // Logs the index build statistics if it took longer than the server parameter `slowMs`
             // to complete.
             CurOp::get(opCtx.get())
-                ->completeAndLogOperation(opCtx.get(), MONGO_LOGV2_DEFAULT_COMPONENT);
+                ->completeAndLogOperation(MONGO_LOGV2_DEFAULT_COMPONENT,
+                                          CollectionCatalog::get(opCtx.get())
+                                              ->getDatabaseProfileSettings(nss.dbName())
+                                              .filter);
         } catch (const DBException& e) {
             LOGV2(4656002, "unable to log operation", "error"_attr = e);
         }
@@ -411,6 +523,37 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
         return status;
     }
     return replState->sharedPromise.getFuture();
+}
+
+Status IndexBuildsCoordinatorMongod::voteAbortIndexBuild(OperationContext* opCtx,
+                                                         const UUID& buildUUID,
+                                                         const HostAndPort& votingNode,
+                                                         const StringData& reason) {
+
+    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    auto memberConfig = replCoord->findConfigMemberByHostAndPort(votingNode);
+    if (!memberConfig || memberConfig->isArbiter()) {
+        return Status{ErrorCodes::Error{7329201},
+                      "Non-member and arbiter nodes cannot vote to abort an index build"};
+    }
+
+    if (replCoord->getMyHostAndPort() == votingNode) {
+        LOGV2_DEBUG(7329404, 2, "'voteAbortIndexBuild' loopback", "node"_attr = votingNode);
+    }
+
+    bool aborted = abortIndexBuildByBuildUUID(
+        opCtx,
+        buildUUID,
+        IndexBuildAction::kPrimaryAbort,
+        fmt::format("'voteAbortIndexBuild' received from '{}': {}", votingNode.toString(), reason));
+
+    if (aborted) {
+        return Status::OK();
+    }
+
+    // Index build does not exist or cannot be aborted because it is committing.
+    // No need to wait for write concern.
+    return Status{ErrorCodes::Error{7329202}, "Index build cannot be aborted"};
 }
 
 Status IndexBuildsCoordinatorMongod::voteCommitIndexBuild(OperationContext* opCtx,
@@ -429,7 +572,7 @@ Status IndexBuildsCoordinatorMongod::voteCommitIndexBuild(OperationContext* opCt
         // commit quorum is disabled, do not record their entry into the commit ready nodes.
         // If we fail to retrieve the persisted commit quorum, the index build might be in the
         // middle of tearing down.
-        Lock::SharedLock commitQuorumLk(opCtx->lockState(), replState->commitQuorumLock.get());
+        Lock::SharedLock commitQuorumLk(opCtx, *replState->commitQuorumLock);
         auto commitQuorum =
             uassertStatusOK(indexbuildentryhelpers::getCommitQuorum(opCtx, buildUUID));
         if (commitQuorum.numNodes == CommitQuorumOptions::kDisabled) {
@@ -471,7 +614,7 @@ void IndexBuildsCoordinatorMongod::_signalIfCommitQuorumIsSatisfied(
 
     // Acquire the commitQuorumLk in shared mode to make sure commit quorum value did not change
     // after reading it from config.system.indexBuilds collection.
-    Lock::SharedLock commitQuorumLk(opCtx->lockState(), replState->commitQuorumLock.get());
+    Lock::SharedLock commitQuorumLk(opCtx, *replState->commitQuorumLock);
 
     // Read the index builds entry from config.system.indexBuilds collection.
     auto swIndexBuildEntry =
@@ -485,7 +628,7 @@ void IndexBuildsCoordinatorMongod::_signalIfCommitQuorumIsSatisfied(
         return;
 
     bool commitQuorumSatisfied = repl::ReplicationCoordinator::get(opCtx)->isCommitQuorumSatisfied(
-        indexBuildEntry.getCommitQuorum(), voteMemberList.get());
+        indexBuildEntry.getCommitQuorum(), voteMemberList.value());
 
     if (!commitQuorumSatisfied)
         return;
@@ -518,7 +661,7 @@ bool IndexBuildsCoordinatorMongod::_signalIfCommitQuorumNotEnabled(
 
     // Acquire the commitQuorumLk in shared mode to make sure commit quorum value did not change
     // after reading it from config.system.indexBuilds collection.
-    Lock::SharedLock commitQuorumLk(opCtx->lockState(), replState->commitQuorumLock.get());
+    Lock::SharedLock commitQuorumLk(opCtx, *replState->commitQuorumLock);
 
     // Read the commit quorum value from config.system.indexBuilds collection.
     auto commitQuorum = uassertStatusOKWithContext(
@@ -535,98 +678,120 @@ bool IndexBuildsCoordinatorMongod::_signalIfCommitQuorumNotEnabled(
     return true;
 }
 
-bool IndexBuildsCoordinatorMongod::_checkVoteCommitIndexCmdSucceeded(const BSONObj& response,
-                                                                     const UUID& indexBuildUUID) {
-    auto commandStatus = getStatusFromCommandResult(response);
-    auto wcStatus = getWriteConcernStatusFromCommandResult(response);
-    if (commandStatus.isOK() && wcStatus.isOK()) {
-        return true;
+void IndexBuildsCoordinatorMongod::_signalPrimaryForAbortAndWaitForExternalAbort(
+    OperationContext* opCtx, ReplIndexBuildState* replState, const Status& abortStatus) {
+    LOGV2(7419402,
+          "Index build: signaling primary to abort index build",
+          "buildUUID"_attr = replState->buildUUID,
+          logAttrs(replState->dbName),
+          "collectionUUID"_attr = replState->collectionUUID,
+          "reason"_attr = abortStatus);
+    replState->requestAbortFromPrimary(abortStatus);
+
+    hangIndexBuildBeforeSignalingPrimaryForAbort.pauseWhileSet(opCtx);
+
+    // The abort command might loop back to the same node, resulting in the command killing the
+    // index builder thread (current), causing the cancellation of the command callback handle due
+    // to the opCtx being interrupted. De-registering the callback due to cancellation means the
+    // command did actually abort the index, so it is a non issue to just let it be cancelled. This
+    // might be reflected in the logs as a cancelled command request, even if the command did
+    // actually abort the build.
+    const auto reason = replState->getAbortReason();
+
+    const auto generateCmd = [reason](const UUID& uuid, const std::string& address) {
+        return BSON("voteAbortIndexBuild" << uuid << "hostAndPort" << address << "reason" << reason
+                                          << "writeConcern"
+                                          << BSON("w"
+                                                  << "majority"));
+    };
+
+    const auto checkVoteAbortIndexCmdDone = [](const BSONObj& response,
+                                               const UUID& indexBuildUUID) {
+        auto commandStatus = getStatusFromCommandResult(response);
+        auto wcStatus = getWriteConcernStatusFromCommandResult(response);
+        if (commandStatus.isOK() && wcStatus.isOK()) {
+            return true;
+        }
+        if (!commandStatus.isA<ErrorCategory::NotPrimaryError>()) {
+            // If the index build failed to abort on the primary, retrying won't solve the issue.
+            // This may only happen if the build cannot be aborted because it is being committed, or
+            // because it is already aborted or committed, meaning an active index build is not
+            // registered. In any of these cases, the primary will eventually replicate either a
+            // 'commitIndexBuild' or 'abortIndexBuild' oplog entry. So it is safe to just wait for
+            // the next action after the vote request is done.
+            LOGV2(7329400,
+                  "Index build: 'voteAbortIndexBuild' command failed, index build was not found or "
+                  "is in the process of committing. The command won't be retried.",
+                  "buildUUID"_attr = indexBuildUUID,
+                  "responseStatus"_attr = response);
+            return true;
+        }
+
+        // We should retry if the error is due to primary change.
+        LOGV2(7329401,
+              "Index build: 'voteAbortIndexBuild' command failed due to primary change and will be "
+              "retried",
+              "buildUUID"_attr = indexBuildUUID,
+              "responseStatus"_attr = response);
+        return false;
+    };
+
+    runVoteCommand(opCtx, replState, generateCmd, checkVoteAbortIndexCmdDone);
+
+    // Wait until the index build is externally aborted in this node, either through loopback or
+    // replication, causing the index building thread to be interrupted, or the promise to be
+    // fulfilled. Cleanup is done by the async command or oplog applier thread. If a
+    // 'commitIndexBuild' is replicated in this state, the secondary will crash.
+    try {
+        if (!replState->getNextActionFuture().isReady()) {
+            LOGV2(7329406,
+                  "Index build: waiting for primary to abort the index build after "
+                  "'voteAbortIndexBuild' request",
+                  "buildUUID"_attr = replState->buildUUID);
+            replState->getNextActionFuture().wait(opCtx);
+        }
+        // The promise was fullfilled before waiting.
+        return;
+    } catch (const DBException& ex) {
+        if (ex.code() == ErrorCodes::IndexBuildAborted) {
+            // The build was aborted, and the opCtx interrupted, before the thread checked the
+            // future.
+            return;
+        }
+        throw;
     }
-    LOGV2(3856202,
-          "'voteCommitIndexBuild' command failed.",
-          "indexBuildUUID"_attr = indexBuildUUID,
-          "responseStatus"_attr = response);
-    return false;
 }
 
 void IndexBuildsCoordinatorMongod::_signalPrimaryForCommitReadiness(
     OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {
-    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-
     // Before voting see if we are eligible to skip voting and signal
     // to commit index build if the node is primary.
     if (_signalIfCommitQuorumNotEnabled(opCtx, replState)) {
         return;
     }
 
-    // No locks should be held.
-    invariant(!opCtx->lockState()->isLocked());
-
-    Backoff exponentialBackoff(Seconds(1), Seconds(2));
-
-    auto onRemoteCmdScheduled = [opCtx, replState](executor::TaskExecutor::CallbackHandle handle) {
-        replState->onVoteRequestScheduled(opCtx, handle);
+    const auto generateCmd = [](const UUID& uuid, const std::string& address) {
+        return BSON("voteCommitIndexBuild" << uuid << "hostAndPort" << address << "writeConcern"
+                                           << BSON("w"
+                                                   << "majority"));
     };
 
-    auto onRemoteCmdComplete = [replState](executor::TaskExecutor::CallbackHandle) {
-        replState->clearVoteRequestCbk();
-    };
-
-    auto needToVote = [replState]() -> bool { return !replState->getNextActionNoWait(); };
-
-    // Retry 'voteCommitIndexBuild' command on error until we have been signaled either with commit
-    // or abort. This way, we can make sure majority of nodes will never stop voting and wait for
-    // commit or abort signal until they have received commit or abort signal.
-    while (needToVote()) {
-        // Check for any interrupts, including shutdown-related ones, before starting the voting
-        // process.
-        opCtx->checkForInterrupt();
-
-        // Don't hammer the network.
-        sleepFor(exponentialBackoff.nextSleep());
-        // When index build started during startup recovery can try to get it's address when
-        // rsConfig is uninitialized. So, retry till it gets initialized. Also, it's important, when
-        // we retry, we check if we have received commit or abort signal to ensure liveness. For
-        // e.g., consider a case where  index build gets restarted on startup recovery and
-        // indexBuildsCoordinator thread waits for valid address w/o checking commit or abort
-        // signal. Now, things can go wrong if we try to replay commitIndexBuild oplog entry for
-        // that index build on startup recovery. Oplog applier would get stuck waiting on the
-        // indexBuildsCoordinator thread. As a result, we won't be able to transition to secondary
-        // state, get stuck on startup state.
-        auto myAddress = replCoord->getMyHostAndPort();
-        if (myAddress.empty()) {
-            continue;
-        }
-        auto const voteCmdRequest =
-            BSON("voteCommitIndexBuild" << replState->buildUUID << "hostAndPort"
-                                        << myAddress.toString() << "writeConcern"
-                                        << BSON("w"
-                                                << "majority"));
-
-        BSONObj voteCmdResponse;
-        try {
-            voteCmdResponse = replCoord->runCmdOnPrimaryAndAwaitResponse(
-                opCtx, "admin", voteCmdRequest, onRemoteCmdScheduled, onRemoteCmdComplete);
-        } catch (DBException& ex) {
-            // All errors, including CallbackCanceled and network errors, should be retried.
-            // If ErrorCodes::CallbackCanceled is due to shutdown, then checkForInterrupt() at the
-            // beginning of this loop will catch it and throw an error to the caller. Or, if we
-            // received the CallbackCanceled error because the index build was signaled with abort
-            // or commit signal, then needToVote() would return false and we don't retry the voting
-            // process.
-            LOGV2_DEBUG(4666400,
-                        1,
-                        "Failed to run 'voteCommitIndexBuild' command.",
-                        "indexBuildUUID"_attr = replState->buildUUID,
-                        "errorMsg"_attr = ex);
-            continue;
-        }
-
+    const auto checkVoteCommitIndexCmdSucceeded = [](const BSONObj& response,
+                                                     const UUID& indexBuildUUID) {
         // Command error and write concern error have to be retried.
-        if (_checkVoteCommitIndexCmdSucceeded(voteCmdResponse, replState->buildUUID)) {
-            break;
+        auto commandStatus = getStatusFromCommandResult(response);
+        auto wcStatus = getWriteConcernStatusFromCommandResult(response);
+        if (commandStatus.isOK() && wcStatus.isOK()) {
+            return true;
         }
-    }
+        LOGV2(3856202,
+              "'voteCommitIndexBuild' command failed.",
+              "indexBuildUUID"_attr = indexBuildUUID,
+              "responseStatus"_attr = response);
+        return false;
+    };
+
+    runVoteCommand(opCtx, replState.get(), generateCmd, checkVoteCommitIndexCmdSucceeded);
 
     if (MONGO_unlikely(hangIndexBuildAfterSignalPrimaryForCommitReadiness.shouldFail())) {
         LOGV2(4841707, "Hanging index build after signaling the primary for commit readiness");
@@ -681,7 +846,7 @@ void IndexBuildsCoordinatorMongod::_waitForNextIndexBuildActionAndCommit(
                                 << replState->buildUUID);
 
         auto const nextAction = [&] {
-            const ScopedCounter counter{activeIndexBuildsSSS.waitForCommitQuorum};
+            indexBuildsSSS.waitForCommitQuorum.addAndFetch(1);
             // Future wait can be interrupted.
             return _drainSideWritesUntilNextActionIsAvailable(opCtx, replState);
         }();
@@ -846,7 +1011,7 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
     // About to update the commit quorum value on-disk. So, take the lock in exclusive mode to
     // prevent readers from reading the commit quorum value and making decision on commit quorum
     // satisfied with the stale read commit quorum value.
-    Lock::ExclusiveLock commitQuorumLk(opCtx->lockState(), replState->commitQuorumLock.get());
+    Lock::ExclusiveLock commitQuorumLk(opCtx, *replState->commitQuorumLock);
     {
         if (auto action = replState->getNextActionNoWait()) {
             return Status(ErrorCodes::CommandFailed,

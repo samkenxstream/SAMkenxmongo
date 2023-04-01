@@ -34,10 +34,10 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/crypto/sha256_block.h"
-#include "mongo/db/logical_session_cache.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_list_sessions_gen.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/session/logical_session_cache.h"
 
 namespace mongo {
 
@@ -101,7 +101,10 @@ public:
         return DocumentSourceListLocalSessions::kStageName.rawData();
     }
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final {
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override {
+        if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+            MONGO_UNIMPLEMENTED_TASSERT(7484328);
+        }
         return Value(Document{{getSourceName(), _spec.toBSON()}});
     }
 
@@ -123,6 +126,8 @@ public:
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);

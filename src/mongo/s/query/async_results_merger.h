@@ -299,8 +299,9 @@ private:
         // The identity of the shard which the cursor belongs to.
         ShardId shardId;
 
-        // This flag is set if the connection to the remote shard was lost, or never established in
-        // the first place. Only applicable if the 'allowPartialResults' option is enabled.
+        // This flag is set if the connection to the remote shard was lost or never established in
+        // the first place or the connection is interrupted due to MaxTimeMSExpired.
+        // Only applicable if the 'allowPartialResults' option is enabled.
         bool partialResultsReturned = false;
 
         // The buffer of results that have been retrieved but not yet returned to the caller.
@@ -464,6 +465,11 @@ private:
     void _scheduleKillCursors(WithLock, OperationContext* opCtx);
 
     /**
+     * Checks if we need to schedule a killCursor command for this remote
+     */
+    bool _shouldKillRemote(WithLock, const RemoteCursorData& remote);
+
+    /**
      * Updates the given remote's metadata (e.g. the cursor id) based on information in 'response'.
      */
     void _updateRemoteMetadata(WithLock, size_t remoteIndex, const CursorResponse& response);
@@ -484,8 +490,8 @@ private:
 
     OperationContext* _opCtx;
     std::shared_ptr<executor::TaskExecutor> _executor;
-    TailableModeEnum _tailableMode;
     AsyncResultsMergerParams _params;
+    TailableModeEnum _tailableMode;
 
     // Must be acquired before accessing any data members (other than _params, which is read-only).
     mutable Mutex _mutex = MONGO_MAKE_LATCH("AsyncResultsMerger::_mutex");

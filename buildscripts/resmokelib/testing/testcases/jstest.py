@@ -22,7 +22,7 @@ class _SingleJSTestCase(interface.ProcessTestCase):
 
     REGISTERED_NAME = registry.LEAVE_UNREGISTERED
 
-    def __init__(self, logger, js_filename, _id, shell_executable=None, shell_options=None):  # pylint: disable=too-many-arguments
+    def __init__(self, logger, js_filename, _id, shell_executable=None, shell_options=None):
         """Initialize the _SingleJSTestCase with the JS file to run."""
         interface.ProcessTestCase.__init__(self, logger, "JSTest", js_filename)
 
@@ -52,7 +52,7 @@ class _SingleJSTestCase(interface.ProcessTestCase):
             # dataPath property is the dataDir property with a trailing slash.
             data_path = os.path.join(data_dir, "")
         else:
-            data_path = global_vars["MongoRunner.dataPath"]
+            data_path = os.path.join(os.path.abspath(global_vars["MongoRunner.dataPath"]), "")
 
         global_vars["MongoRunner.dataDir"] = data_dir
         global_vars["MongoRunner.dataPath"] = data_path
@@ -104,14 +104,14 @@ class _SingleJSTestCase(interface.ProcessTestCase):
         data_dir_prefix = utils.default_if_none(config.DBPATH_PREFIX,
                                                 global_vars.get("MongoRunner.dataDir"))
         data_dir_prefix = utils.default_if_none(data_dir_prefix, config.DEFAULT_DBPATH_PREFIX)
-        return os.path.join(data_dir_prefix, "job%d" % self.fixture.job_num,
-                            config.MONGO_RUNNER_SUBDIR)
+        return os.path.abspath(
+            os.path.join(data_dir_prefix, "job%d" % self.fixture.job_num,
+                         config.MONGO_RUNNER_SUBDIR))
 
     def _make_process(self):
         return core.programs.mongo_shell_program(
-            self.logger, self.fixture.job_num, test_id=self._id, executable=self.shell_executable,
-            filename=self.js_filename, connection_string=self.fixture.get_driver_connection_url(),
-            **self.shell_options)
+            self.logger, executable=self.shell_executable, filename=self.js_filename,
+            connection_string=self.fixture.get_driver_connection_url(), **self.shell_options)
 
 
 class JSTestCaseBuilder:

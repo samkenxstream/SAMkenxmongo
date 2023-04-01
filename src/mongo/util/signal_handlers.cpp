@@ -27,14 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/signal_handlers.h"
 
-#include <signal.h>
-#include <time.h>
+#include <csignal>
+#include <ctime>
 
 #if !defined(_WIN32)
 #include <unistd.h>
@@ -50,11 +49,15 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/signal_handlers_synchronous.h"
 #include "mongo/util/signal_win32.h"
 #include "mongo/util/stacktrace.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 namespace mongo {
 
@@ -83,7 +86,7 @@ void consoleTerminate(const char* controlCodeName) {
           "Received event {controlCode}, will terminate after current command ends",
           "Received event, will terminate after current command ends",
           "controlCode"_attr = controlCodeName);
-    exitCleanly(EXIT_KILL);
+    exitCleanly(ExitCode::kill);
 }
 
 BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
@@ -122,10 +125,11 @@ void eventProcessingThread() {
 
     HANDLE event = CreateEventA(nullptr, TRUE, FALSE, eventName.c_str());
     if (event == nullptr) {
+        auto ec = lastSystemError();
         LOGV2_WARNING(23382,
                       "eventProcessingThread CreateEvent failed: {error}",
                       "eventProcessingThread CreateEvent failed",
-                      "error"_attr = errnoWithDescription());
+                      "error"_attr = errorMessage(ec));
         return;
     }
 
@@ -134,16 +138,18 @@ void eventProcessingThread() {
     int returnCode = WaitForSingleObject(event, INFINITE);
     if (returnCode != WAIT_OBJECT_0) {
         if (returnCode == WAIT_FAILED) {
+            auto ec = lastSystemError();
             LOGV2_WARNING(23383,
                           "eventProcessingThread WaitForSingleObject failed: {error}",
                           "eventProcessingThread WaitForSingleObject failed",
-                          "error"_attr = errnoWithDescription());
+                          "error"_attr = errorMessage(ec));
             return;
         } else {
+            auto ec = systemError(returnCode);
             LOGV2_WARNING(23384,
                           "eventProcessingThread WaitForSingleObject failed: {error}",
                           "eventProcessingThread WaitForSingleObject failed",
-                          "error"_attr = errnoWithDescription(returnCode));
+                          "error"_attr = errorMessage(ec));
             return;
         }
     }
@@ -151,7 +157,7 @@ void eventProcessingThread() {
     setThreadName("eventTerminate");
 
     LOGV2(23376, "shutdown event signaled, will terminate after current cmd ends");
-    exitCleanly(EXIT_CLEAN);
+    exitCleanly(ExitCode::clean);
 }
 
 #else
@@ -261,7 +267,7 @@ void handleOneSignal(const SignalWaitResult& waited, LogRotationState* rotation)
 
     // interrupt/terminate signal
     LOGV2(23381, "will terminate after current cmd ends");
-    exitCleanly(EXIT_CLEAN);
+    exitCleanly(ExitCode::clean);
 }
 
 /**

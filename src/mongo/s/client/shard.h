@@ -39,8 +39,8 @@
 #include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/executor/remote_command_response.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 
@@ -109,7 +109,7 @@ public:
     /**
      * Returns the current connection string for the shard.
      */
-    virtual const ConnectionString getConnString() const = 0;
+    virtual ConnectionString getConnString() const = 0;
 
     /**
      * Returns the RemoteCommandTargeter for the hosts in this shard.
@@ -137,7 +137,11 @@ public:
      * (i.e. is safe to retry and has the potential to succeed next time).  The 'options' argument
      * describes whether the operation that generated the given code was idempotent, which affects
      * which codes are safe to retry on.
+     *
+     * isRetriableError() routes to either of the static functions depending on object type.
      */
+    static bool localIsRetriableError(ErrorCodes::Error code, RetryPolicy options);
+    static bool remoteIsRetriableError(ErrorCodes::Error code, RetryPolicy options);
     virtual bool isRetriableError(ErrorCodes::Error code, RetryPolicy options) = 0;
 
     /**
@@ -249,17 +253,6 @@ public:
         boost::optional<long long> limit,
         const boost::optional<BSONObj>& hint = boost::none);
 
-    /**
-     * Builds an index on a config server collection.
-     * Creates the collection if it doesn't yet exist.  Does not error if the index already exists,
-     * so long as the options are the same.
-     * NOTE: Currently only supported for LocalShard.
-     */
-    virtual Status createIndexOnConfig(OperationContext* opCtx,
-                                       const NamespaceString& ns,
-                                       const BSONObj& keys,
-                                       bool unique) = 0;
-
     // This timeout will be used by default in operations against the config server, unless
     // explicitly overridden
     static const Milliseconds kDefaultConfigCommandTimeout;
@@ -271,23 +264,6 @@ public:
      * server called.
      */
     static bool shouldErrorBePropagated(ErrorCodes::Error code);
-
-    /**
-     * Updates this shard's lastCommittedOpTime timestamp, if the given value is greater than the
-     * currently stored value.
-     *
-     * This is only valid to call on ShardRemote instances.
-     */
-    virtual void updateLastCommittedOpTime(LogicalTime lastCommittedOpTime) = 0;
-
-    /**
-     * Returns the latest lastCommittedOpTime timestamp returned by the underlying shard. This
-     * represents the latest opTime timestamp known to be in this shard's majority committed
-     * snapshot.
-     *
-     * This is only valid to call on ShardRemote instances.
-     */
-    virtual LogicalTime getLastCommittedOpTime() const = 0;
 
 protected:
     Shard(const ShardId& id);

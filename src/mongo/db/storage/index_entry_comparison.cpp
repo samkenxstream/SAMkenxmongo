@@ -114,16 +114,7 @@ int IndexEntryComparison::compare(const IndexKeyEntry& lhs, const IndexKeyEntry&
 
 KeyString::Value IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
     const IndexSeekPoint& seekPoint, KeyString::Version version, Ordering ord, bool isForward) {
-
-    // Determines the discriminator used to build the KeyString.
-    auto suffixExclusive = [&]() {
-        for (size_t i = seekPoint.prefixLen; i < seekPoint.keySuffix.size(); i++) {
-            if (!seekPoint.suffixInclusive[i])
-                return true;
-        }
-        return false;
-    };
-    bool inclusive = !seekPoint.prefixExclusive && !suffixExclusive();
+    const bool inclusive = seekPoint.firstExclusive < 0;
     const auto discriminator = isForward == inclusive ? KeyString::Discriminator::kExclusiveBefore
                                                       : KeyString::Discriminator::kExclusiveAfter;
 
@@ -139,24 +130,13 @@ KeyString::Value IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
         }
     }
 
-    // If the prefix is exclusive then the suffix does not matter as it will never be used.
-    if (seekPoint.prefixExclusive) {
-        invariant(seekPoint.prefixLen > 0);
-        return builder.getValueCopy();
-    }
-
     // Handles the suffix. Note that the useful parts of the suffix start at index prefixLen rather
     // than at 0.
-    invariant(seekPoint.keySuffix.size() == seekPoint.suffixInclusive.size());
-    for (size_t i = seekPoint.prefixLen; i < seekPoint.keySuffix.size(); i++) {
+    size_t end = seekPoint.firstExclusive >= 0 ? static_cast<size_t>(seekPoint.firstExclusive + 1)
+                                               : seekPoint.keySuffix.size();
+    for (size_t i = seekPoint.prefixLen; i < end; i++) {
         invariant(seekPoint.keySuffix[i]);
         builder.appendBSONElement(*seekPoint.keySuffix[i]);
-
-        // If an exclusive field exists then no fields after this will matter, since an
-        // exclusive field never evaluates as equal.
-        if (!seekPoint.suffixInclusive[i]) {
-            return builder.getValueCopy();
-        }
     }
     return builder.getValueCopy();
 }
@@ -188,7 +168,8 @@ Status buildDupKeyErrorStatus(const BSONObj& key,
                               const std::string& indexName,
                               const BSONObj& keyPattern,
                               const BSONObj& indexCollation,
-                              DuplicateKeyErrorInfo::FoundValue&& foundValue) {
+                              DuplicateKeyErrorInfo::FoundValue&& foundValue,
+                              const boost::optional<RecordId> duplicateRid) {
     const bool hasCollation = !indexCollation.isEmpty();
 
     StringBuilder sb;
@@ -240,9 +221,11 @@ Status buildDupKeyErrorStatus(const BSONObj& key,
             (hasCollation || !isValidUTF8(keyValueElem.valueStringData()));
 
         if (shouldHexEncode) {
-            auto stringToEncode = keyValueElem.valueStringData();
-            builderForErrmsg.append(keyNameElem.fieldName(),
-                                    "0x" + hexblob::encodeLower(stringToEncode));
+            std::string hexEncoded = "0x" + hexblob::encodeLower(keyValueElem.valueStringData());
+            if (hasCollation) {
+                hexEncoded = str::stream() << "CollationKey(" << hexEncoded << ")";
+            }
+            builderForErrmsg.append(keyNameElem.fieldName(), hexEncoded);
         } else {
             builderForErrmsg.appendAs(keyValueElem, keyNameElem.fieldName());
         }
@@ -250,22 +233,23 @@ Status buildDupKeyErrorStatus(const BSONObj& key,
 
     sb << builderForErrmsg.obj();
 
-    stdx::visit(
-        visit_helper::Overloaded{
-            [](stdx::monostate) {},
-            [&sb](const RecordId& rid) { sb << " found value: " << rid; },
-            [&sb](const BSONObj& obj) {
-                if (obj.objsize() < BSONObjMaxUserSize / 2) {
-                    sb << " found value: " << obj;
-                }
-            },
-        },
-        foundValue);
+    stdx::visit(OverloadedVisitor{
+                    [](stdx::monostate) {},
+                    [&sb](const RecordId& rid) { sb << " found value: " << rid; },
+                    [&sb](const BSONObj& obj) {
+                        if (obj.objsize() < BSONObjMaxUserSize / 2) {
+                            sb << " found value: " << obj;
+                        }
+                    },
+                },
+                foundValue);
 
-    return Status(
-        DuplicateKeyErrorInfo(
-            keyPattern, builderForErrorExtraInfo.obj(), indexCollation, std::move(foundValue)),
-        sb.str());
+    return Status(DuplicateKeyErrorInfo(keyPattern,
+                                        builderForErrorExtraInfo.obj(),
+                                        indexCollation,
+                                        std::move(foundValue),
+                                        duplicateRid),
+                  sb.str());
 }
 
 Status buildDupKeyErrorStatus(const KeyString::Value& keyString,
@@ -293,8 +277,9 @@ Status buildDupKeyErrorStatus(OperationContext* opCtx,
                               const BSONObj& key,
                               const IndexDescriptor* desc) {
     NamespaceString nss;
-    // In testing these may be nullptr, and being a bit more lenient during error handling is OK.
-    if (desc && desc->getEntry())
+    invariant(desc);
+    // In testing this may be nullptr, and being a bit more lenient during error handling is OK.
+    if (desc->getEntry())
         nss = desc->getEntry()->getNSSFromCatalog(opCtx);
     return buildDupKeyErrorStatus(
         key, nss, desc->indexName(), desc->keyPattern(), desc->collation());

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -42,9 +41,13 @@
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -57,40 +60,45 @@ REGISTER_DOCUMENT_SOURCE(geoNear,
                          DocumentSourceGeoNear::createFromBson,
                          AllowedWithApiStrict::kAlways);
 
-Value DocumentSourceGeoNear::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceGeoNear::serialize(SerializationOptions opts) const {
     MutableDocument result;
 
     if (keyFieldPath) {
-        result.setField(kKeyFieldName, Value(keyFieldPath->fullPath()));
+        result.setField(kKeyFieldName, Value(keyFieldPath->redactedFullPath(opts)));
     }
 
     auto nearValue = [&]() -> Value {
         if (auto constGeometry = dynamic_cast<ExpressionConstant*>(_nearGeometry.get());
             constGeometry) {
-            return constGeometry->getValue();
+            return opts.serializeLiteralValue(constGeometry->getValue());
         } else {
-            return _nearGeometry->serialize(static_cast<bool>(explain));
+            return _nearGeometry->serialize(opts);
         }
     }();
     result.setField("near", nearValue);
-    result.setField("distanceField", Value(distanceField->fullPath()));
+    result.setField("distanceField", Value(distanceField->redactedFullPath(opts)));
 
     if (maxDistance) {
-        result.setField("maxDistance", Value(*maxDistance));
+        result.setField("maxDistance", opts.serializeLiteralValue(*maxDistance));
     }
 
     if (minDistance) {
-        result.setField("minDistance", Value(*minDistance));
+        result.setField("minDistance", opts.serializeLiteralValue(*minDistance));
     }
 
-    result.setField("query", Value(query));
-    result.setField("spherical", Value(spherical));
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        auto matchExpr = uassertStatusOK(MatchExpressionParser::parse(query, pExpCtx));
+        result.setField("query", Value(matchExpr->serialize(opts)));
+    } else {
+        result.setField("query", Value(query));
+    }
+    result.setField("spherical", opts.serializeLiteralValue(spherical));
     if (distanceMultiplier) {
-        result.setField("distanceMultiplier", Value(*distanceMultiplier));
+        result.setField("distanceMultiplier", opts.serializeLiteralValue(*distanceMultiplier));
     }
 
     if (includeLocs)
-        result.setField("includeLocs", Value(includeLocs->fullPath()));
+        result.setField("includeLocs", Value(includeLocs->redactedFullPath(opts)));
 
     return Value(DOC(getSourceName() << result.freeze()));
 }
@@ -448,7 +456,7 @@ bool DocumentSourceGeoNear::needsGeoNearPoint() const {
 }
 
 DepsTracker::State DocumentSourceGeoNear::getDependencies(DepsTracker* deps) const {
-    _nearGeometry->addDependencies(deps);
+    expression::addDependencies(_nearGeometry.get(), deps);
     // TODO (SERVER-35424): Implement better dependency tracking. For example, 'distanceField' is
     // produced by this stage, and we could inform the query system that it need not include it in
     // its response. For now, assume that we require the entire document as well as the appropriate
@@ -458,6 +466,10 @@ DepsTracker::State DocumentSourceGeoNear::getDependencies(DepsTracker* deps) con
 
     deps->needWholeDocument = true;
     return DepsTracker::State::EXHAUSTIVE_FIELDS;
+}
+
+void DocumentSourceGeoNear::addVariableRefs(std::set<Variables::Id>* refs) const {
+    expression::addVariableRefs(_nearGeometry.get(), refs);
 }
 
 DocumentSourceGeoNear::DocumentSourceGeoNear(const intrusive_ptr<ExpressionContext>& pExpCtx)

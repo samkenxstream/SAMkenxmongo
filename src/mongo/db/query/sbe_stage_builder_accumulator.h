@@ -34,41 +34,39 @@
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
-#include "mongo/db/query/sbe_stage_builder_eval_frame.h"
 #include "mongo/db/query/sbe_stage_builder_helpers.h"
 
 namespace mongo::stage_builder {
-/**
- * Translates the argument Expression of an AccumulationExpression carried by the
- * AccumulationStatement. The 'stage' parameter provides the input subtree to build on top of.
- */
-std::pair<std::unique_ptr<sbe::EExpression>, EvalStage> buildArgument(
-    StageBuilderState& state,
-    const AccumulationStatement& acc,
-    EvalStage stage,
-    boost::optional<sbe::value::SlotId> optionalRootSlot,
-    PlanNodeId planNodeId);
+class PlanStageSlots;
 
 /**
  * Translates an input AccumulationStatement into an SBE EExpression for accumulation expressions.
- * The 'stage' parameter provides the input subtree to build on top of.
  */
-std::pair<std::vector<std::unique_ptr<sbe::EExpression>>, EvalStage> buildAccumulator(
-    StageBuilderState& state,
+std::vector<std::unique_ptr<sbe::EExpression>> buildAccumulator(
     const AccumulationStatement& acc,
-    EvalStage stage,
     std::unique_ptr<sbe::EExpression> argExpr,
-    PlanNodeId planNodeId);
+    boost::optional<sbe::value::SlotId> collatorSlot,
+    sbe::value::FrameIdGenerator&);
+
+/**
+ * When SBE hash aggregation spills to disk, it spills partial aggregates which need to be combined
+ * later. This function returns the expressions that can be used to combine partial aggregates for
+ * the given accumulator 'acc'. The aggregate-of-aggregates will be stored in a slots owned by the
+ * hash agg stage, while the new partial aggregates to combine can be read from the given
+ * 'inputSlots'.
+ */
+std::vector<std::unique_ptr<sbe::EExpression>> buildCombinePartialAggregates(
+    const AccumulationStatement& acc,
+    const sbe::value::SlotVector& inputSlots,
+    boost::optional<sbe::value::SlotId> collatorSlot,
+    sbe::value::FrameIdGenerator&);
 
 /**
  * Translates an input AccumulationStatement into an SBE EExpression that represents an
  * AccumulationStatement's finalization step. The 'stage' parameter provides the input subtree to
  * build on top of.
  */
-std::pair<std::unique_ptr<sbe::EExpression>, EvalStage> buildFinalize(
-    StageBuilderState& state,
-    const AccumulationStatement& acc,
-    const sbe::value::SlotVector& aggSlots,
-    EvalStage stage,
-    PlanNodeId planNodeId);
+std::unique_ptr<sbe::EExpression> buildFinalize(StageBuilderState& state,
+                                                const AccumulationStatement& acc,
+                                                const sbe::value::SlotVector& aggSlots);
 }  // namespace mongo::stage_builder

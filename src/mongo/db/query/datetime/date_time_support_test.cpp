@@ -963,14 +963,16 @@ TEST(NewYorkTimeAfterEpoch, DoesOutputFormatDate) {
     auto date = Date_t::fromMillisSinceEpoch(1496777923234LL);
     std::ostringstream os;
     auto newYorkZone = kDefaultTimeZoneDatabase.getTimeZone("America/New_York");
-    ASSERT_OK(newYorkZone.outputDateWithFormat(os,
-                                               "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
-                                               "dayOfWeek: %w, week: %U, isoYear: %G, "
-                                               "isoWeek: %V, isoDayOfWeek: %u, percent: %%",
-                                               date));
-    ASSERT_EQ(os.str(),
-              "2017/06/06 15:38:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
-              "isoWeek: 23, isoDayOfWeek: 2, percent: %");
+    ASSERT_OK(newYorkZone.outputDateWithFormat(
+        os,
+        "%Y/%m/%d %H:%M:%S:%L, dayOfYear: %j, "
+        "dayOfWeek: %w, week: %U, isoYear: %G, "
+        "isoWeek: %V, isoDayOfWeek: %u, monthName: %B, monthNameThreeLetter: %b, percent: %%",
+        date));
+    ASSERT_EQ(
+        os.str(),
+        "2017/06/06 15:38:43:234, dayOfYear: 157, dayOfWeek: 3, week: 23, isoYear: 2017, "
+        "isoWeek: 23, isoDayOfWeek: 2, monthName: June, monthNameThreeLetter: Jun, percent: %");
 }
 
 TEST(DateFormat, ThrowsUserExceptionIfGivenUnrecognizedFormatter) {
@@ -1034,6 +1036,17 @@ TEST(DateFromString, CorrectlyParsesStringThatMatchesFormat) {
     auto result = TimeZoneDatabase::utcZone().formatDate(format, date);
     ASSERT_OK(result);
     ASSERT_EQ(input, result.getValue());
+}
+
+TEST(DateFromString, CorrectlyParsesStringWithDayFromYearFormat) {
+    auto input = "2017-302";
+    auto expected = "2017, Day 303";
+    auto inputFormat = "%Y-%j"_sd;
+    auto outputFormat = "%Y, Day %j"_sd;
+    auto date = kDefaultTimeZoneDatabase.fromString(input, kDefaultTimeZone, inputFormat);
+    auto result = TimeZoneDatabase::utcZone().formatDate(outputFormat, date);
+    ASSERT_OK(result);
+    ASSERT_EQ(expected, result.getValue());
 }
 
 TEST(DateFromString, RejectsStringWithInvalidYearFormat) {
@@ -2629,7 +2642,10 @@ TEST(DateAdd, DateAddWithTimezoneDST) {
         {europeAmsterdamZone.createFromDateParts(2020, 10, 24, 2, 0, 1, 0),
          TimeUnit::day,
          1,
-         europeAmsterdamZone.createFromDateParts(2020, 10, 25, 2, 0, 1, 0)},
+         europeAmsterdamZone.createFromDateParts(2020, 10, 25, 1, 59, 59, 0) +
+             Milliseconds{2000}},  // as this date is ambiguous (it could in both timezones, with or
+                                   // without DST) and the computation is expected to return the
+                                   // "with DST" one, obtain it via a computation
         {europeAmsterdamZone.createFromDateParts(2020, 10, 24, 3, 0, 1, 0),
          TimeUnit::day,
          1,
@@ -2721,10 +2737,13 @@ TEST(DateAdd, DateAddWithTimezoneDST) {
          TimeUnit::day,
          1,
          newYorkZone.createFromDateParts(2020, 11, 2, 1, 30, 0, 0)},
-        {newYorkZone.createFromDateParts(2020, 10, 31, 1, 30, 0, 0),
+        {newYorkZone.createFromDateParts(2020, 10, 31, 1, 0, 1, 0),
          TimeUnit::day,
          1,
-         newYorkZone.createFromDateParts(2020, 11, 1, 1, 30, 0, 0)},
+         newYorkZone.createFromDateParts(2020, 11, 1, 0, 59, 59, 0) +
+             Milliseconds{2000}},  // as this date is ambiguous (it could in both timezones, with or
+                                   // without DST) and the computation is expected to return the
+                                   // "with DST" one, obtain it via a computation
         {newYorkZone.createFromDateParts(2020, 11, 1, 3, 0, 0, 0),
          TimeUnit::day,
          -1,
@@ -2785,15 +2804,20 @@ TEST(DateAdd, DateAdd_LordHoweTimezoneDST) {
     auto australiaLordHoweZone = kDefaultTimeZoneDatabase.getTimeZone("Australia/Lord_Howe");
     std::vector<TestCase> tests{
         // DST to Standard change: 2021-04-04T02:00:00 -> 2021-04-04T01:30:00 Lord Howe timezone.
-        {australiaLordHoweZone.createFromDateParts(2021, 4, 4, 1, 30, 0, 0),
+        {australiaLordHoweZone.createFromDateParts(2021, 4, 4, 1, 29, 59, 0) +
+             Milliseconds{1000},  // as this date is ambiguous (it could in both timezones, with or
+                                  // without DST) and the computation is expected to start from the
+                                  // "with DST" one, obtain it via a computation
          TimeUnit::day,
          1,
          australiaLordHoweZone.createFromDateParts(2021, 4, 5, 1, 30, 0, 0)},
-        {australiaLordHoweZone.createFromDateParts(2021, 4, 3, 1, 45, 0, 0),
+        {australiaLordHoweZone.createFromDateParts(2021, 4, 3, 1, 30, 1, 0),
          TimeUnit::day,
          1,
-         // Computed time falls into the repeated 1/2 hour.
-         australiaLordHoweZone.createFromDateParts(2021, 4, 4, 1, 45, 0, 0)},
+         australiaLordHoweZone.createFromDateParts(2021, 4, 4, 1, 29, 59, 0) +
+             Milliseconds{2000}},  // as this date is ambiguous (it could in both timezones, with or
+                                   // without DST) and the computation is expected to return the
+                                   // "with DST" one, obtain it via a computation
         {australiaLordHoweZone.createFromDateParts(2021, 4, 5, 1, 0, 0, 0),
          TimeUnit::day,
          -1,
@@ -2957,6 +2981,14 @@ TEST(ParseDayOfWeek, Basic) {
     ASSERT(DayOfWeek::thursday == parseDayOfWeek("thursday"));
     ASSERT(DayOfWeek::saturday == parseDayOfWeek("SAT"));
     ASSERT_THROWS_CODE(parseDayOfWeek(""), AssertionException, ErrorCodes::FailedToParse);
+}
+
+TEST(TimeZoneToString, Basic) {
+    // Just asserting that these do not throw exceptions.
+    ASSERT_EQ(kDefaultTimeZoneDatabase.getTimeZone("UTC").toString(), "TimeZone(UTC)");
+    ASSERT_EQ(kDefaultTimeZoneDatabase.getTimeZone("America/New_York").toString(),
+              "TimeZone(name=America/New_York)");
+    ASSERT_EQ(kDefaultTimeZoneDatabase.getTimeZone("+02").toString(), "TimeZone(utcOffset=7200s)");
 }
 }  // namespace
 }  // namespace mongo

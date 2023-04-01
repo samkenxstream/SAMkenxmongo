@@ -24,7 +24,8 @@ executor:
   fixture:
     class: MongoDFixture
     mongod_options:
+      # Keep in sync with query_golden_cqf.yml.
       set_parameters:
         enableTestCommands: 1
         featureFlagCommonQueryFramework: true
-        internalQueryEnableCascadesOptimizer: true
+        internalQueryFrameworkControl: "forceBonsai"

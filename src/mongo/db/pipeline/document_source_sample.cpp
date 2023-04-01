@@ -52,8 +52,10 @@ REGISTER_DOCUMENT_SOURCE(sample,
                          AllowedWithApiStrict::kAlways);
 
 DocumentSource::GetNextResult DocumentSourceSample::doGetNext() {
-    if (_size == 0)
+    if (_size == 0) {
+        pSource->dispose();
         return GetNextResult::makeEOF();
+    }
 
     if (!_sortStage->isPopulated()) {
         // Exhaust source stage, add random metadata, and push all into sorter.
@@ -81,8 +83,8 @@ DocumentSource::GetNextResult DocumentSourceSample::doGetNext() {
     return _sortStage->getNext();
 }
 
-Value DocumentSourceSample::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
-    return Value(DOC(kStageName << DOC("size" << _size)));
+Value DocumentSourceSample::serialize(SerializationOptions opts) const {
+    return Value(DOC(kStageName << DOC("size" << opts.serializeLiteralValue(_size))));
 }
 
 namespace {
@@ -128,7 +130,7 @@ boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceSample::dist
     DistributedPlanLogic logic;
     logic.shardsStage = this;
     if (_size > 0) {
-        logic.mergingStage = DocumentSourceLimit::create(pExpCtx, _size);
+        logic.mergingStages = {DocumentSourceLimit::create(pExpCtx, _size)};
     }
 
     // Here we don't use 'randSortSpec' because it uses a metadata sort which the merging logic does

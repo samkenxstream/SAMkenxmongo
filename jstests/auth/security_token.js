@@ -10,14 +10,7 @@ const kAcceptedSecurityTokenID = 5838100;
 const kLogMessageID = 5060500;
 const kLogoutMessageID = 6161506;
 const kStaleAuthenticationMessageID = 6161507;
-const isMongoStoreEnabled = TestData.setParameters.featureFlagMongoStore;
-
-if (!isMongoStoreEnabled) {
-    assert.throws(() => MongoRunner.runMongod({
-        setParameter: "multitenancySupport=true",
-    }));
-    return;
-}
+const isSecurityTokenEnabled = TestData.setParameters.featureFlagSecurityToken;
 
 function assertNoTokensProcessedYet(conn) {
     assert.eq(false,
@@ -40,9 +33,8 @@ function makeTokenAndExpect(user, db) {
     return [token, {token: expect}];
 }
 
-function runTest(conn, enabled, rst = undefined) {
+function runTest(conn, multitenancyEnabled, rst = undefined) {
     const admin = conn.getDB('admin');
-    const tenantAdmin = conn.getDB(tenantID.str + '_admin');
 
     // Must be authenticated as a user with ActionType::useTenant in order to use $tenant
     assert.commandWorked(admin.runCommand({createUser: 'admin', pwd: 'pwd', roles: ['root']}));
@@ -51,7 +43,8 @@ function runTest(conn, enabled, rst = undefined) {
     // Create a tenant-local user.
     const createUserCmd =
         {createUser: 'user1', "$tenant": tenantID, pwd: 'pwd', roles: ['readWriteAnyDatabase']};
-    if (enabled) {
+    const countUserCmd = {count: "system.users", query: {user: 'user1'}, "$tenant": tenantID};
+    if (multitenancyEnabled) {
         assert.commandWorked(admin.runCommand(createUserCmd));
 
         // Confirm the user exists on the tenant authz collection only, and not the global
@@ -59,9 +52,8 @@ function runTest(conn, enabled, rst = undefined) {
         assert.eq(admin.system.users.count({user: 'user1'}),
                   0,
                   'user1 should not exist on global users collection');
-        assert.eq(tenantAdmin.system.users.count({user: 'user1'}),
-                  1,
-                  'user1 should exist on tenant users collection');
+        const usersCount = assert.commandWorked(admin.runCommand(countUserCmd));
+        assert.eq(usersCount.n, 1, 'user1 should exist on tenant users collection');
     } else {
         assert.commandFailed(admin.runCommand(createUserCmd));
     }
@@ -85,15 +77,17 @@ function runTest(conn, enabled, rst = undefined) {
     // Test that no token equates to unauthenticated.
     assert.commandFailed(tokenDB.runCommand({features: 1}));
 
-    // Passing a security token with unknown fields will always fail.
+    // Passing a security token with unknown fields will fail at the client
+    // while trying to construct a signed security token.
+    const kIDLParserUnknownField = 40415;
     tokenConn._setSecurityToken({invalid: 1});
-    assert.commandFailed(tokenDB.runCommand({ping: 1}));
+    assert.throwsWithCode(() => tokenDB.runCommand({ping: 1}), kIDLParserUnknownField);
     assertNoTokensProcessedYet(conn);
 
     const [token, expect] = makeTokenAndExpect('user1', 'admin');
     tokenConn._setSecurityToken(token);
 
-    if (enabled) {
+    if (multitenancyEnabled && isSecurityTokenEnabled) {
         // Basic use.
         assert.commandWorked(tokenDB.runCommand({features: 1}));
 
@@ -114,17 +108,16 @@ function runTest(conn, enabled, rst = undefined) {
         // Negative test, logMessage requires logMessage privilege on cluster (not granted)
         assert.commandFailed(tokenDB.runCommand({logMessage: 'This is a test'}));
 
-        // CRUD operations not yet supported in multitenancy using security token.
-        assert.writeError(tokenConn.getDB('test').coll1.insert({x: 1}));
+        assert.commandWorked(tokenConn.getDB('test').coll1.insert({x: 1}));
 
         const log = checkLog.getGlobalLog(conn).map((l) => JSON.parse(l));
 
-        // We successfully dispatched 2 commands as a token auth'd user.
-        // The failed commands did not dispatch because they are forbidden in multitenancy.
-        // We should see two post-operation logout events.
+        // We successfully dispatched 3 commands as a token auth'd user.
+        // The failed command did not dispatch because they are forbidden in multitenancy.
+        // We should see three post-operation logout events.
         const logoutMessages = log.filter((l) => (l.id === kLogoutMessageID));
         assert.eq(logoutMessages.length,
-                  2,
+                  3,
                   'Unexpected number of logout messages: ' + tojson(logoutMessages));
 
         // None of those authorization sessions should remain active into their next requests.
@@ -153,6 +146,7 @@ function runTests(enabled) {
         runTest(standalone, enabled);
         MongoRunner.stopMongod(standalone);
     }
+
     {
         const rst = new ReplSetTest({nodes: 2, nodeOptions: opts});
         rst.startSet({keyFile: 'jstests/libs/key1'});

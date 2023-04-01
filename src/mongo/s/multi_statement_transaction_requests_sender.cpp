@@ -33,6 +33,7 @@
 
 #include "mongo/db/operation_context.h"
 #include "mongo/s/transaction_router.h"
+#include "mongo/s/transaction_router_resource_yielder.h"
 
 namespace mongo {
 
@@ -48,7 +49,7 @@ std::vector<AsyncRequestsSender::Request> attachTxnDetails(
     std::vector<AsyncRequestsSender::Request> newRequests;
     newRequests.reserve(requests.size());
 
-    for (auto request : requests) {
+    for (const auto& request : requests) {
         newRequests.emplace_back(
             request.shardId,
             txnRouter.attachTxnFieldsIfNeeded(opCtx, request.shardId, request.cmdObj));
@@ -76,18 +77,19 @@ void processReplyMetadata(OperationContext* opCtx, const AsyncRequestsSender::Re
 MultiStatementTransactionRequestsSender::MultiStatementTransactionRequestsSender(
     OperationContext* opCtx,
     std::shared_ptr<executor::TaskExecutor> executor,
-    StringData dbName,
+    const DatabaseName& dbName,
     const std::vector<AsyncRequestsSender::Request>& requests,
     const ReadPreferenceSetting& readPreference,
     Shard::RetryPolicy retryPolicy)
     : _opCtx(opCtx),
-      _ars(std::make_unique<AsyncRequestsSender>(opCtx,
-                                                 std::move(executor),
-                                                 dbName,
-                                                 attachTxnDetails(opCtx, requests),
-                                                 readPreference,
-                                                 retryPolicy,
-                                                 nullptr /* resourceYielder */)) {}
+      _ars(std::make_unique<AsyncRequestsSender>(
+          opCtx,
+          std::move(executor),
+          dbName.db(),
+          attachTxnDetails(opCtx, requests),
+          readPreference,
+          retryPolicy,
+          TransactionRouterResourceYielder::makeForRemoteCommand())) {}
 
 MultiStatementTransactionRequestsSender::~MultiStatementTransactionRequestsSender() {
     invariant(_opCtx);

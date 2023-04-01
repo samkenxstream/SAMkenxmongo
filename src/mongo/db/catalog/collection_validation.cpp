@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -35,8 +34,6 @@
 
 #include <fmt/format.h>
 
-#include "mongo/bson/util/bsoncolumn.h"
-#include "mongo/bson/util/bsoncolumnbuilder.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_consistency.h"
@@ -47,10 +44,12 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id_helpers.h"
 #include "mongo/db/storage/key_string.h"
-#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
@@ -73,13 +72,13 @@ AtomicWord<bool> _validationIsPausedForTest{false};
  * May close or invalidate open cursors.
  */
 void _validateIndexesInternalStructure(OperationContext* opCtx,
+                                       bool full,
                                        ValidateState* validateState,
                                        ValidateResults* results) {
     // Need to use the IndexCatalog here because the 'validateState->indexes' object hasn't been
     // constructed yet. It must be initialized to ensure we're validating all indexes.
     const IndexCatalog* indexCatalog = validateState->getCollection()->getIndexCatalog();
-    const std::unique_ptr<IndexCatalog::IndexIterator> it =
-        indexCatalog->getIndexIterator(opCtx, false);
+    const auto it = indexCatalog->getIndexIterator(opCtx, IndexCatalog::InclusionPolicy::kReady);
 
     // Validate Indexes Internal Structure, checking if index files have been compromised or
     // corrupted.
@@ -94,18 +93,15 @@ void _validateIndexesInternalStructure(OperationContext* opCtx,
                       {LogComponent::kIndex},
                       "Validating internal structure",
                       "index"_attr = descriptor->indexName(),
-                      "namespace"_attr = validateState->nss());
+                      logAttrs(validateState->nss()));
 
-        auto& curIndexResults = (results->indexResultsMap)[descriptor->indexName()];
+        auto indexResults = iam->validate(opCtx, full);
 
-        int64_t numValidated;
-        iam->validate(opCtx, &numValidated, &curIndexResults);
-
-        if (!curIndexResults.valid) {
+        if (!indexResults.valid) {
             results->valid = false;
         }
 
-        curIndexResults.keysTraversedFromFullValidate = numValidated;
+        results->indexResultsMap[descriptor->indexName()] = std::move(indexResults);
     }
 }
 
@@ -129,40 +125,13 @@ void _validateIndexes(OperationContext* opCtx,
                       {LogComponent::kIndex},
                       "Validating index consistency",
                       "index"_attr = descriptor->indexName(),
-                      "namespace"_attr = validateState->nss());
+                      logAttrs(validateState->nss()));
 
         int64_t numTraversedKeys;
         indexValidator->traverseIndex(opCtx, index.get(), &numTraversedKeys, results);
 
         auto& curIndexResults = (results->indexResultsMap)[descriptor->indexName()];
         curIndexResults.keysTraversed = numTraversedKeys;
-
-        // If we are performing a full index validation, we have information on the number of index
-        // keys validated in _validateIndexesInternalStructure (when we validated the internal
-        // structure of the index). Check if this is consistent with 'numTraversedKeys' from
-        // traverseIndex above.
-        if (validateState->isFullIndexValidation()) {
-            invariant(opCtx->lockState()->isCollectionLockedForMode(validateState->nss(), MODE_X));
-
-            // The number of keys counted in _validateIndexesInternalStructure, when checking the
-            // internal structure of the index.
-            const int64_t numIndexKeys = curIndexResults.keysTraversedFromFullValidate;
-
-            // Check if currIndexResults is valid to ensure that this index is not corrupted or
-            // comprised (which was set in _validateIndexesInternalStructure). If the index is
-            // corrupted, there is no use in checking if the traversal yielded the same key count.
-            if (curIndexResults.valid) {
-                if (numIndexKeys != numTraversedKeys) {
-                    curIndexResults.valid = false;
-                    string msg = str::stream()
-                        << "number of traversed index entries (" << numTraversedKeys
-                        << ") does not match the number of expected index entries (" << numIndexKeys
-                        << ")";
-                    results->errors.push_back(msg);
-                    results->valid = false;
-                }
-            }
-        }
 
         if (!curIndexResults.valid) {
             results->valid = false;
@@ -176,11 +145,10 @@ void _validateIndexes(OperationContext* opCtx,
  */
 void _gatherIndexEntryErrors(OperationContext* opCtx,
                              ValidateState* validateState,
-                             IndexConsistency* indexConsistency,
                              ValidateAdaptor* indexValidator,
                              ValidateResults* result) {
-    indexConsistency->setSecondPhase();
-    if (!indexConsistency->limitMemoryUsageForSecondPhase(result)) {
+    indexValidator->setSecondPhase();
+    if (!indexValidator->limitMemoryUsageForSecondPhase(result)) {
         return;
     }
 
@@ -225,12 +193,12 @@ void _gatherIndexEntryErrors(OperationContext* opCtx,
     }
 
     if (validateState->fixErrors()) {
-        indexConsistency->repairMissingIndexEntries(opCtx, result);
+        indexValidator->repairIndexEntries(opCtx, result);
     }
 
     LOGV2_OPTIONS(20301, {LogComponent::kIndex}, "Finished traversing through all the indexes");
 
-    indexConsistency->addIndexEntryErrors(result);
+    indexValidator->addIndexEntryErrors(opCtx, result);
 }
 
 void _validateIndexKeyCount(OperationContext* opCtx,
@@ -244,6 +212,81 @@ void _validateIndexKeyCount(OperationContext* opCtx,
         if (curIndexResults.valid) {
             indexValidator->validateIndexKeyCount(opCtx, index.get(), curIndexResults);
         }
+    }
+}
+
+void _printIndexSpec(const ValidateState* validateState, StringData indexName) {
+    auto& indexes = validateState->getIndexes();
+    auto indexEntry =
+        std::find_if(indexes.begin(),
+                     indexes.end(),
+                     [&](const std::shared_ptr<const IndexCatalogEntry> indexEntry) -> bool {
+                         return indexEntry->descriptor()->indexName() == indexName;
+                     });
+    if (indexEntry != indexes.end()) {
+        auto indexSpec = (*indexEntry)->descriptor()->infoObj();
+        LOGV2_ERROR(7463100, "Index failed validation", "spec"_attr = indexSpec);
+    }
+}
+
+/**
+ * Logs oplog entries related to corrupted records/indexes in validation results.
+ */
+void _logOplogEntriesForInvalidResults(OperationContext* opCtx, ValidateResults* results) {
+    if (results->recordTimestamps.empty()) {
+        return;
+    }
+
+    LOGV2(
+        7464200,
+        "Validation failed: oplog timestamps referenced by corrupted collection and index entries",
+        "numTimestamps"_attr = results->recordTimestamps.size());
+
+    // Set up read on oplog collection.
+    try {
+        AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
+        const auto& oplogCollection = oplogRead.getCollection();
+
+        // Log oplog entries in reverse from most recent timestamp to oldest.
+        // Due to oplog truncation, if we fail to find any oplog entry for a particular timestamp,
+        // we can stop searching for oplog entries with earlier timestamps.
+        auto recordStore = oplogCollection->getRecordStore();
+        uassert(ErrorCodes::InternalError,
+                "Validation failed: Unable to get oplog record store for corrupted collection and "
+                "index entries",
+                recordStore);
+
+        auto cursor = recordStore->getCursor(opCtx, /*forward=*/false);
+        uassert(ErrorCodes::CursorNotFound,
+                "Validation failed: Unable to get cursor to oplog collection.",
+                cursor);
+
+        for (auto it = results->recordTimestamps.rbegin(); it != results->recordTimestamps.rend();
+             it++) {
+            const auto& timestamp = *it;
+
+            // A record id in the oplog collection is equivalent to the document's timestamp field.
+            RecordId recordId(timestamp.asULL());
+            auto record = cursor->seekExact(recordId);
+            if (!record) {
+                LOGV2(7464201,
+                      "    Validation failed: Stopping oplog entry search for corrupted collection "
+                      "and index entries.",
+                      "timestamp"_attr = timestamp);
+                break;
+            }
+
+            LOGV2(
+                7464202,
+                "    Validation failed: Oplog entry found for corrupted collection and index entry",
+                "timestamp"_attr = timestamp,
+                "oplogEntryDoc"_attr = redact(record->data.toBson()));
+        }
+    } catch (DBException& ex) {
+        LOGV2_ERROR(7464203,
+                    "Validation failed: Unable to fetch entries from oplog collection for "
+                    "corrupted collection and index entries",
+                    "ex"_attr = ex);
     }
 }
 
@@ -263,17 +306,19 @@ void _reportValidationResults(OperationContext* opCtx,
 
     // Report detailed index validation results gathered when using {full: true} for validated
     // indexes.
-    for (const auto& index : validateState->getIndexes()) {
-        const std::string indexName = index->descriptor()->indexName();
-        auto& indexResultsMap = results->indexResultsMap;
-        if (indexResultsMap.find(indexName) == indexResultsMap.end()) {
-            continue;
-        }
-
-        auto& vr = indexResultsMap.at(indexName);
-
+    int nIndexes = results->indexResultsMap.size();
+    for (const auto& [indexName, vr] : results->indexResultsMap) {
         if (!vr.valid) {
             results->valid = false;
+            _printIndexSpec(validateState, indexName);
+        }
+
+        if (validateState->getSkippedIndexes().contains(indexName)) {
+            // Index internal state was checked and cleared, so it was reported in indexResultsMap,
+            // but we did not verify the index contents against the collection, so we should exclude
+            // it from this report.
+            --nIndexes;
+            continue;
         }
 
         BSONObjBuilder bob(indexDetails.subobjStart(indexName));
@@ -294,7 +339,7 @@ void _reportValidationResults(OperationContext* opCtx,
         results->errors.insert(results->errors.end(), vr.errors.begin(), vr.errors.end());
     }
 
-    output->append("nIndexes", static_cast<int>(validateState->getIndexes().size()));
+    output->append("nIndexes", nIndexes);
     output->append("keysPerIndex", keysPerIndex.done());
     output->append("indexDetails", indexDetails.done());
 }
@@ -304,6 +349,7 @@ void _reportInvalidResults(OperationContext* opCtx,
                            ValidateResults* results,
                            BSONObjBuilder* output) {
     _reportValidationResults(opCtx, validateState, results, output);
+    _logOplogEntriesForInvalidResults(opCtx, results);
     LOGV2_OPTIONS(20302,
                   {LogComponent::kIndex},
                   "Validation complete -- Corruption found",
@@ -410,20 +456,24 @@ void _validateCatalogEntry(OperationContext* opCtx,
     }
 
     const auto& indexCatalog = collection->getIndexCatalog();
-    auto indexIt = indexCatalog->getIndexIterator(opCtx, /*includeUnfinishedIndexes=*/true);
+    auto indexIt = indexCatalog->getIndexIterator(opCtx,
+                                                  IndexCatalog::InclusionPolicy::kReady |
+                                                      IndexCatalog::InclusionPolicy::kUnfinished |
+                                                      IndexCatalog::InclusionPolicy::kFrozen);
 
     while (indexIt->more()) {
         const IndexCatalogEntry* indexEntry = indexIt->next();
         const std::string indexName = indexEntry->descriptor()->indexName();
 
-        Status status =
-            index_key_validate::validateIndexSpecFieldNames(indexEntry->descriptor()->infoObj());
+        Status status = index_key_validate::validateIndexSpec(
+                            opCtx, indexEntry->descriptor()->infoObj(), true /* inCollValidation */)
+                            .getStatus();
         if (!status.isOK()) {
             results->valid = false;
             results->errors.push_back(
-                fmt::format("The index specification for index '{}' contains invalid field names. "
-                            "{}. Run the 'collMod' command on the collection without any arguments "
-                            "to remove the invalid index options",
+                fmt::format("The index specification for index '{}' contains invalid fields. {}. "
+                            "Run the 'collMod' command on the collection without any arguments "
+                            "to fix the invalid index options",
                             indexName,
                             status.reason()));
         }
@@ -451,113 +501,6 @@ void _validateCatalogEntry(OperationContext* opCtx,
         }
     }
 }
-
-void _validateBSONColumnRoundtrip(OperationContext* opCtx,
-                                  ValidateState* validateState,
-                                  ValidateResults* results) {
-    LOGV2(6104700,
-          "Validating BSONColumn compression/decompression",
-          "namespace"_attr = validateState->nss());
-    std::deque<BSONObj> original;
-    auto cursor = validateState->getCollection()->getRecordStore()->getCursor(opCtx);
-
-    // This function is memory intensive as it needs to store the original documents prior to
-    // compressing and decompressing them to check that the documents are the same afterwards. We'll
-    // limit the number of original documents we hold in-memory to be approximately 25MB to avoid
-    // running out of memory.
-    constexpr size_t kMaxMemoryUsageBytes = 25 * 1024 * 1024;
-    size_t currentMemoryUsageBytes = 0;
-
-    BSONColumnBuilder columnBuilder("",
-                                    feature_flags::gTimeseriesBucketCompressionWithArrays.isEnabled(
-                                        serverGlobalParams.featureCompatibility));
-
-    auto doBSONColumnRoundtrip = [&]() {
-        ON_BLOCK_EXIT([&] {
-            // Reset the in-memory state to prepare for the next round of BSONColumn roundtripping.
-            original.clear();
-            columnBuilder =
-                BSONColumnBuilder("",
-                                  feature_flags::gTimeseriesBucketCompressionWithArrays.isEnabled(
-                                      serverGlobalParams.featureCompatibility));
-            currentMemoryUsageBytes = 0;
-        });
-
-        BSONObjBuilder compressed;
-        try {
-            compressed.append(""_sd, columnBuilder.finalize());
-
-            BSONColumn column(compressed.done().firstElement());
-            size_t index = 0;
-            for (const auto& decompressed : column) {
-                if (!decompressed.binaryEqual(original[index].firstElement())) {
-                    results->valid = false;
-                    results->errors.push_back(
-                        fmt::format("Roundtripping via BSONColumn failed. Index: {}, Original: {}, "
-                                    "Roundtripped: {}",
-                                    index,
-                                    original[index].toString(),
-                                    decompressed.toString()));
-                    return;
-                }
-                ++index;
-            }
-            if (index != original.size()) {
-                results->valid = false;
-                results->errors.push_back(fmt::format(
-                    "Roundtripping via BSONColumn failed. Original size: {}, Roundtripped size: {}",
-                    original.size(),
-                    index));
-            }
-        } catch (const DBException&) {
-            // We swallow any other DBException so we do not interfere with the rest of Collection
-            // validation.
-            return;
-        }
-    };
-
-    while (auto record = cursor->next()) {
-        try {
-            BSONObjBuilder wrapper;
-            wrapper.append(""_sd, record->data.toBson());
-            original.push_back(wrapper.obj());
-            currentMemoryUsageBytes += original.back().objsize();
-        } catch (const ExceptionFor<ErrorCodes::BSONObjectTooLarge>&) {
-            // Improbable but possible, wrapping the data in a new BSONObj may push it over the
-            // limit.
-            continue;
-        } catch (const DBException&) {
-            // We swallow any other DBException so we do not interfere with the rest of Collection
-            // validation. We could have a corrupt document for example.
-            return;
-        }
-
-        try {
-            columnBuilder.append(original.back().firstElement());
-        } catch (const ExceptionFor<ErrorCodes::InvalidBSONType>&) {
-            // Skip this document if it contained MinKey or MaxKey as that's incompatible with
-            // BSONColumn
-            original.pop_back();
-        } catch (const ExceptionFor<ErrorCodes::BSONObjectTooLarge>&) {
-            // If we produced a too large large BSONObj then skip the operation.
-            return;
-        } catch (const DBException&) {
-            // We swallow any other DBException as above. The most likely error to get here is when
-            // we allocate over 64MB in the internal BufBuilder inside BSONColumnBuilder.
-            return;
-        }
-
-        if (currentMemoryUsageBytes >= kMaxMemoryUsageBytes) {
-            doBSONColumnRoundtrip();
-        }
-    }
-
-    if (currentMemoryUsageBytes > 0) {
-        // We've exhausted the cursor but we haven't reached the memory usage threshold to do the
-        // BSONColumn roundtrip yet, so do it now.
-        doBSONColumnRoundtrip();
-    }
-}
 }  // namespace
 
 Status validate(OperationContext* opCtx,
@@ -566,12 +509,12 @@ Status validate(OperationContext* opCtx,
                 RepairMode repairMode,
                 ValidateResults* results,
                 BSONObjBuilder* output,
-                bool turnOnExtraLoggingForTest) {
+                bool logDiagnostics) {
     invariant(!opCtx->lockState()->isLocked() || storageGlobalParams.repair);
 
     // This is deliberately outside of the try-catch block, so that any errors thrown in the
     // constructor fail the cmd, as opposed to returning OK with valid:false.
-    ValidateState validateState(opCtx, nss, mode, repairMode, turnOnExtraLoggingForTest);
+    ValidateState validateState(opCtx, nss, mode, repairMode, logDiagnostics);
 
     const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     // Check whether we are allowed to read from this node after acquiring our locks. If we are
@@ -579,7 +522,9 @@ Status validate(OperationContext* opCtx,
     uassertStatusOK(replCoord->checkCanServeReadsFor(
         opCtx, nss, ReadPreferenceSetting::get(opCtx).canRunOnSecondary()));
 
-    output->append("ns", validateState.nss().ns());
+    output->append("ns", NamespaceStringUtil::serialize(validateState.nss()));
+
+    validateState.uuid().appendToBuilder(output, "uuid");
 
     // Foreground validation needs to ignore prepare conflicts, or else it would deadlock.
     // Repair mode cannot use ignore-prepare because it needs to be able to do writes, and there is
@@ -607,29 +552,26 @@ Status validate(OperationContext* opCtx,
     }
 
     try {
-        // Full record store validation code is executed before we open cursors because it may close
-        // and/or invalidate all open cursors.
-        if (validateState.isFullValidation()) {
-            invariant(opCtx->lockState()->isCollectionLockedForMode(validateState.nss(), MODE_X));
+        invariant(!validateState.isFullIndexValidation() ||
+                  opCtx->lockState()->isCollectionLockedForMode(validateState.nss(), MODE_X));
 
-            // For full record store validation we use the storage engine's validation
-            // functionality.
-            validateState.getCollection()->getRecordStore()->validate(opCtx, results, output);
-        }
-        if (validateState.isFullIndexValidation()) {
-            invariant(opCtx->lockState()->isCollectionLockedForMode(validateState.nss(), MODE_X));
-            // For full index validation, we validate the internal structure of each index and save
-            // the number of keys in the index to compare against _validateIndexes()'s count
-            // results.
-            _validateIndexesInternalStructure(opCtx, &validateState, results);
-        }
+        // Record store validation code is executed before we open cursors because it may close
+        // and/or invalidate all open cursors.
+        validateState.getCollection()->getRecordStore()->validate(
+            opCtx, validateState.isFullValidation(), results);
+
+        // For full index validation, we validate the internal structure of each index and save
+        // the number of keys in the index to compare against _validateIndexes()'s count results.
+        _validateIndexesInternalStructure(
+            opCtx, validateState.isFullIndexValidation(), &validateState, results);
 
         if (!results->valid) {
             _reportInvalidResults(opCtx, &validateState, results, output);
             return Status::OK();
         }
 
-        // Validate in-memory catalog information with persisted info.
+        // Validate in-memory catalog information with persisted info prior to setting the read
+        // source to kCheckpoint otherwise we'd use a checkpointed MDB catalog file.
         _validateCatalogEntry(opCtx, &validateState, results);
 
         if (validateState.isMetadataValidation()) {
@@ -658,8 +600,7 @@ Status validate(OperationContext* opCtx,
                       logAttrs(validateState.nss()),
                       logAttrs(validateState.uuid()));
 
-        IndexConsistency indexConsistency(opCtx, &validateState);
-        ValidateAdaptor indexValidator(&indexConsistency, &validateState);
+        ValidateAdaptor indexValidator(opCtx, &validateState);
 
         // In traverseRecordStore(), the index validator keeps track the records in the record
         // store so that _validateIndexes() can confirm that the index entries match the records in
@@ -671,10 +612,10 @@ Status validate(OperationContext* opCtx,
         // Pause collection validation while a lock is held and between collection and index data
         // validation.
         //
-        // The IndexConsistency object saves document key information during collection data
-        // validation and then compares against that key information during index data validation.
-        // This fail point is placed in between them, in an attempt to catch any inconsistencies
-        // that concurrent CRUD ops might cause if we were to have a bug.
+        // The KeyStringIndexConsistency object saves document key information during collection
+        // data validation and then compares against that key information during index data
+        // validation. This fail point is placed in between them, in an attempt to catch any
+        // inconsistencies that concurrent CRUD ops might cause if we were to have a bug.
         //
         // Only useful for background validation because we hold an intent lock instead of an
         // exclusive lock, and thus allow concurrent operations.
@@ -694,14 +635,13 @@ Status validate(OperationContext* opCtx,
         // Validate indexes and check for mismatches.
         _validateIndexes(opCtx, &validateState, &indexValidator, results);
 
-        if (indexConsistency.haveEntryMismatch()) {
+        if (indexValidator.haveEntryMismatch()) {
             LOGV2_OPTIONS(20305,
                           {LogComponent::kIndex},
                           "Index inconsistencies were detected. "
                           "Starting the second phase of index validation to gather concise errors",
-                          "namespace"_attr = validateState.nss());
-            _gatherIndexEntryErrors(
-                opCtx, &validateState, &indexConsistency, &indexValidator, results);
+                          logAttrs(validateState.nss()));
+            _gatherIndexEntryErrors(opCtx, &validateState, &indexValidator, results);
         }
 
         if (!results->valid) {
@@ -721,31 +661,40 @@ Status validate(OperationContext* opCtx,
         // Report the validation results for the user to see.
         _reportValidationResults(opCtx, &validateState, results, output);
 
-        if (MONGO_unlikely(gRoundtripBsonColumnOnValidate && getTestCommandsEnabled())) {
-            _validateBSONColumnRoundtrip(opCtx, &validateState, results);
-        }
-
         LOGV2_OPTIONS(20306,
                       {LogComponent::kIndex},
                       "Validation complete for collection. No "
                       "corruption found",
                       logAttrs(validateState.nss()),
                       logAttrs(validateState.uuid()));
+    } catch (ExceptionFor<ErrorCodes::CursorNotFound>&) {
+        invariant(validateState.isBackground());
+        string warning = str::stream()
+            << "Collection validation with {background: true} validates"
+            << " the latest checkpoint (data in a snapshot written to disk in a consistent"
+            << " way across all data files). During this validation, some tables have not yet been"
+            << " checkpointed.";
+        results->warnings.push_back(warning);
+
+        // Nothing to validate, so it must be valid.
+        results->valid = true;
+        return Status::OK();
     } catch (const DBException& e) {
-        if (ErrorCodes::isInterruption(e.code())) {
+        if (!opCtx->checkForInterruptNoAssert().isOK() || e.code() == ErrorCodes::Interrupted) {
             LOGV2_OPTIONS(5160301,
                           {LogComponent::kIndex},
                           "Validation interrupted",
-                          "namespace"_attr = validateState.nss());
+                          logAttrs(validateState.nss()));
             return e.toStatus();
         }
+
         string err = str::stream() << "exception during collection validation: " << e.toString();
         results->errors.push_back(err);
         results->valid = false;
         LOGV2_OPTIONS(5160302,
                       {LogComponent::kIndex},
                       "Validation failed due to exception",
-                      "namespace"_attr = validateState.nss(),
+                      logAttrs(validateState.nss()),
                       "error"_attr = e.toString());
     }
 

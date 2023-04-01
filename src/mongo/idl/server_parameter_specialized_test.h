@@ -52,17 +52,17 @@ public:
     SpecializedClusterServerParameterData(const std::string& newStrData, std::uint32_t newIntData)
         : _strData(newStrData), _intData(newIntData) {}
 
-    const LogicalTime getClusterParameterTime() const {
+    LogicalTime getClusterParameterTime() const {
         stdx::lock_guard<Latch> lg(_mutex);
         return _clusterParameterTime;
     }
 
-    const StringData getStrData() const {
+    StringData getStrData() const {
         stdx::lock_guard<Latch> lg(_mutex);
         return _strData;
     }
 
-    const std::uint32_t getIntData() const {
+    std::uint32_t getIntData() const {
         stdx::lock_guard<Latch> lg(_mutex);
         return _intData;
     }
@@ -82,6 +82,11 @@ public:
         _intData = intData;
     }
 
+    void setId(StringData id) {
+        stdx::lock_guard<Latch> lg(_mutex);
+        _id = id.toString();
+    }
+
     void parse(const BSONObj& updatedObj) {
         stdx::lock_guard<Latch> lg(_mutex);
         _clusterParameterTime = LogicalTime(updatedObj["clusterParameterTime"].timestamp());
@@ -89,11 +94,20 @@ public:
         _intData = updatedObj["intData"].Int();
     }
 
-    const void serialize(BSONObjBuilder* builder) const {
+    void serialize(BSONObjBuilder* builder) const {
         stdx::lock_guard<Latch> lg(_mutex);
+        if (_id.is_initialized()) {
+            builder->append("_id"_sd, _id.get());
+        }
         builder->append("clusterParameterTime"_sd, _clusterParameterTime.asTimestamp());
         builder->append("strData"_sd, _strData);
         builder->append("intData"_sd, _intData);
+    }
+
+    BSONObj toBSON() const {
+        BSONObjBuilder builder;
+        serialize(&builder);
+        return builder.obj();
     }
 
     void reset() {
@@ -101,9 +115,11 @@ public:
         _clusterParameterTime = LogicalTime();
         _strData = "default";
         _intData = 30;
+        _id = boost::none;
     }
 
 private:
+    boost::optional<std::string> _id;
     LogicalTime _clusterParameterTime;
     std::string _strData;
     std::int32_t _intData;

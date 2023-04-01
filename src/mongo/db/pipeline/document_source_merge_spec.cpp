@@ -41,7 +41,9 @@
 namespace mongo {
 using namespace fmt::literals;
 
-NamespaceString mergeTargetNssParseFromBSON(const BSONElement& elem) {
+NamespaceString mergeTargetNssParseFromBSON(boost::optional<TenantId> tenantId,
+                                            const BSONElement& elem,
+                                            const SerializationContext& serializationContext) {
     uassert(51178,
             "{} 'into' field  must be either a string or an object, "
             "but found {}"_format(DocumentSourceMerge::kStageName, typeName(elem.type())),
@@ -51,23 +53,29 @@ NamespaceString mergeTargetNssParseFromBSON(const BSONElement& elem) {
         uassert(5786800,
                 "{} 'into' field cannot be an empty string"_format(DocumentSourceMerge::kStageName),
                 !elem.valueStringData().empty());
-        return {"", elem.valueStringData()};
+        return NamespaceStringUtil::parseNamespaceFromRequest(tenantId, "", elem.valueStringData());
     }
-
-    auto spec = NamespaceSpec::parse({elem.fieldNameStringData()}, elem.embeddedObject());
+    auto spec = NamespaceSpec::parse(
+        IDLParserContext(
+            elem.fieldNameStringData(), false /* apiStrict */, tenantId, serializationContext),
+        elem.embeddedObject());
     auto coll = spec.getColl();
     uassert(5786801,
             "{} 'into' field must specify a 'coll' that is not empty, null or undefined"_format(
                 DocumentSourceMerge::kStageName),
             coll && !coll->empty());
 
-    return {spec.getDb().value_or(""), *coll};
+    return NamespaceStringUtil::parseNamespaceFromRequest(
+        spec.getDb().value_or(DatabaseName(tenantId, "")), *coll);
 }
 
 void mergeTargetNssSerializeToBSON(const NamespaceString& targetNss,
                                    StringData fieldName,
-                                   BSONObjBuilder* bob) {
-    bob->append(fieldName, BSON("db" << targetNss.db() << "coll" << targetNss.coll()));
+                                   BSONObjBuilder* bob,
+                                   const SerializationContext& serializationContext) {
+    bob->append(fieldName,
+                BSON("db" << DatabaseNameUtil::serialize(targetNss.dbName(), serializationContext)
+                          << "coll" << targetNss.coll()));
 }
 
 std::vector<std::string> mergeOnFieldsParseFromBSON(const BSONElement& elem) {
@@ -124,7 +132,7 @@ MergeWhenMatchedPolicy mergeWhenMatchedParseFromBSON(const BSONElement& elem) {
 
     invariant(elem.type() == BSONType::String);
 
-    IDLParserErrorContext ctx{DocumentSourceMergeSpec::kWhenMatchedFieldName};
+    IDLParserContext ctx{DocumentSourceMergeSpec::kWhenMatchedFieldName};
     auto value = elem.valueStringData();
     auto mode = MergeWhenMatchedMode_parse(ctx, value);
 

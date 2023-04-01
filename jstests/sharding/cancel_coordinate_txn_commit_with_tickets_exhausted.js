@@ -15,6 +15,7 @@
  * and join the parallel remove operations and transaction thread.
  *
  * @tags: [
+ *   requires_fcv_70,
  *   uses_multi_shard_transaction,
  *   uses_transactions,
  * ]
@@ -35,6 +36,8 @@ const st = new ShardingTest({
     rs: {nodes: 1},
     rsOptions: {
         setParameter: {
+            // This test requires a fixed ticket pool size.
+            storageEngineConcurrencyAdjustmentAlgorithm: "",
             wiredTigerConcurrentWriteTransactions: kNumWriteTickets,
             // Lower transactionLifetimeLimitSeconds to cause TransactionCoordinators which haven't
             // yet made their commit or abort decision to time out and abort the transaction.
@@ -54,6 +57,14 @@ CreateShardedCollectionUtil.shardCollectionWithChunks(sourceCollection, {key: 1}
     {min: {key: MinKey}, max: {key: 0}, shard: st.shard0.shardName},
     {min: {key: 0}, max: {key: MaxKey}, shard: st.shard1.shardName},
 ]);
+
+// The ShardServerCatalogCacheLoader thread may perform deletes in the background on the
+// config.cache.chunks.test.mycoll collection. Its deletes are also eligible to be blocked by the
+// hangWithLockDuringBatchRemove failpoint and will prevent a removeOperation thread from acquiring
+// a WiredTiger write ticket. We wait for it to finish any delete operations by explicitly running
+// the _flushRoutingTableCacheUpdates command.
+assert.commandWorked(
+    txnCoordinator.adminCommand({_flushRoutingTableCacheUpdates: sourceCollection.getFullName()}));
 
 const removeOperationThreads = Array.from({length: kNumWriteTickets}).map(() => {
     return new Thread(function removeOperation(host, dbName, collName, insertLatch) {

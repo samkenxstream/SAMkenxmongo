@@ -16,16 +16,16 @@
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
 // Replica set nodes started with --shardsvr do not enable key generation until they are added to a
 // sharded cluster and reject commands with gossiped clusterTime from users without the
 // advanceClusterTime privilege. This causes ShardingTest setup to fail because the shell briefly
-// authenticates as __system and recieves clusterTime metadata then will fail trying to gossip that
+// authenticates as __system and receives clusterTime metadata then will fail trying to gossip that
 // time later in setup.
 //
 
 // Multiple users cannot be authenticated on one connection within a session.
-// @tags: [live_record_incompatible]
 TestData.disableImplicitSessions = true;
 
 (function() {

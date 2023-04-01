@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -43,6 +42,9 @@
 #include "mongo/logv2/log.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace {
@@ -93,7 +95,7 @@ public:
         const BSONObj oField(BSON("msg"
                                   << "Created temporary resharding collection"));
         const BSONObj o2Field(
-            BSON("type" << kReshardFinalOpLogType << "reshardingUUID" << UUID::gen()));
+            BSON("type" << resharding::kReshardFinalOpLogType << "reshardingUUID" << UUID::gen()));
         return makeOplog(_crudNss, _uuid, repl::OpTypeEnum::kNoop, oField, o2Field, oplogId);
     }
 
@@ -101,7 +103,7 @@ public:
         ReshardingDonorOplogId oplogId(ts, ts);
         const BSONObj oField(BSON("msg"
                                   << "Latest oplog ts from donor's cursor response"));
-        const BSONObj o2Field(BSON("type" << kReshardProgressMark));
+        const BSONObj o2Field(BSON("type" << resharding::kReshardProgressMark));
         return makeOplog(_crudNss, _uuid, repl::OpTypeEnum::kNoop, oField, o2Field, oplogId);
     }
 
@@ -179,9 +181,10 @@ public:
     }
 
 private:
-    const NamespaceString _oplogNss{"{}.{}xxx.yyy"_format(
-        NamespaceString::kConfigDb, NamespaceString::kReshardingLocalOplogBufferPrefix)};
-    const NamespaceString _crudNss{"test.foo"};
+    const NamespaceString _oplogNss = NamespaceString::createNamespaceString_forTest(
+        DatabaseName::kConfig,
+        "{}xxx.yyy"_format(NamespaceString::kReshardingLocalOplogBufferPrefix));
+    const NamespaceString _crudNss = NamespaceString::createNamespaceString_forTest("test.foo");
     const UUID _uuid{UUID::gen()};
 
     RAIIServerParameterControllerForTest controller{"reshardingOplogBatchLimitOperations", 1};
@@ -193,10 +196,10 @@ TEST_F(ReshardingDonorOplogIterTest, BasicExhaust) {
     const auto finalOplog = makeFinalOplog(Timestamp(43, 24));
 
     DBDirectClient client(operationContext());
-    const auto ns = oplogNss().ns();
-    client.insert(ns, oplog1.toBSON());
-    client.insert(ns, oplog2.toBSON());
-    client.insert(ns, finalOplog.toBSON());
+    const auto nss = oplogNss();
+    client.insert(nss, oplog1.toBSON());
+    client.insert(nss, oplog2.toBSON());
+    client.insert(nss, finalOplog.toBSON());
 
     ReshardingDonorOplogIterator iter(oplogNss(), kResumeFromBeginning, &onInsertAlwaysReady);
     auto executor = makeTaskExecutorForIterator();
@@ -225,10 +228,10 @@ TEST_F(ReshardingDonorOplogIterTest, ResumeFromMiddle) {
     const auto finalOplog = makeFinalOplog(Timestamp(43, 24));
 
     DBDirectClient client(operationContext());
-    const auto ns = oplogNss().ns();
-    client.insert(ns, oplog1.toBSON());
-    client.insert(ns, oplog2.toBSON());
-    client.insert(ns, finalOplog.toBSON());
+    const auto nss = oplogNss();
+    client.insert(nss, oplog1.toBSON());
+    client.insert(nss, oplog2.toBSON());
+    client.insert(nss, finalOplog.toBSON());
 
     ReshardingDonorOplogId resumeToken(Timestamp(2, 4), Timestamp(2, 4));
     ReshardingDonorOplogIterator iter(oplogNss(), resumeToken, &onInsertAlwaysReady);
@@ -251,8 +254,8 @@ TEST_F(ReshardingDonorOplogIterTest, ExhaustWithIncomingInserts) {
     const auto finalOplog = makeFinalOplog(Timestamp(43, 24));
 
     DBDirectClient client(operationContext());
-    const auto ns = oplogNss().ns();
-    client.insert(ns, oplog1.toBSON());
+    const auto nss = oplogNss();
+    client.insert(nss, oplog1.toBSON());
 
     class InsertNotifier : public resharding::OnInsertAwaitable {
     public:
@@ -281,9 +284,9 @@ TEST_F(ReshardingDonorOplogIterTest, ExhaustWithIncomingInserts) {
                          DBDirectClient client(opCtx);
 
                          if (numCalls == 1) {
-                             client.insert(ns, oplog2.toBSON());
+                             client.insert(nss, oplog2.toBSON());
                          } else {
-                             client.insert(ns, finalOplog.toBSON());
+                             client.insert(nss, finalOplog.toBSON());
                          }
                      }};
 
@@ -316,10 +319,10 @@ TEST_F(ReshardingDonorOplogIterTest, BatchIncludesProgressMarkEntries) {
     const auto finalOplog = makeFinalOplog(Timestamp(43, 24));
 
     DBDirectClient client(operationContext());
-    const auto ns = oplogNss().ns();
-    client.insert(ns, oplog1.toBSON());
-    client.insert(ns, progressMarkOplog1.toBSON());
-    client.insert(ns, finalOplog.toBSON());
+    const auto nss = oplogNss();
+    client.insert(nss, oplog1.toBSON());
+    client.insert(nss, progressMarkOplog1.toBSON());
+    client.insert(nss, finalOplog.toBSON());
 
     ReshardingDonorOplogIterator iter(oplogNss(), kResumeFromBeginning, &onInsertAlwaysReady);
     auto executor = makeTaskExecutorForIterator();
@@ -353,13 +356,13 @@ DEATH_TEST_REGEX_F(ReshardingDonorOplogIterTest,
     const auto progressMarkOplog4 = makeProgressMarkOplogEntry(Timestamp(65, 4));
 
     DBDirectClient client(operationContext());
-    const auto ns = oplogNss().ns();
-    client.insert(ns, oplog1.toBSON());
-    client.insert(ns, progressMarkOplog1.toBSON());
-    client.insert(ns, finalOplog.toBSON());
-    client.insert(ns, progressMarkOplog2.toBSON());
-    client.insert(ns, progressMarkOplog3.toBSON());
-    client.insert(ns, progressMarkOplog4.toBSON());
+    const auto nss = oplogNss();
+    client.insert(nss, oplog1.toBSON());
+    client.insert(nss, progressMarkOplog1.toBSON());
+    client.insert(nss, finalOplog.toBSON());
+    client.insert(nss, progressMarkOplog2.toBSON());
+    client.insert(nss, progressMarkOplog3.toBSON());
+    client.insert(nss, progressMarkOplog4.toBSON());
 
     ReshardingDonorOplogIterator iter(oplogNss(), kResumeFromBeginning, &onInsertAlwaysReady);
     auto executor = makeTaskExecutorForIterator();

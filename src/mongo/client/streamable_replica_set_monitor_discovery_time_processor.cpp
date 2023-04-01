@@ -26,13 +26,15 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 #include "mongo/client/streamable_replica_set_monitor_discovery_time_processor.h"
 
 #include <memory>
 
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo {
 
@@ -58,7 +60,7 @@ void StreamableReplicaSetMonitor::StreamableReplicaSetMonitorDiscoveryTimeProces
         _elapsedTime.reset();
     }
 }
-const Milliseconds StreamableReplicaSetMonitor::StreamableReplicaSetMonitorDiscoveryTimeProcessor::
+Milliseconds StreamableReplicaSetMonitor::StreamableReplicaSetMonitorDiscoveryTimeProcessor::
     getPrimaryServerChangeElapsedTime() const {
     stdx::lock_guard lock(_mutex);
     return Milliseconds(_elapsedTime.millis());

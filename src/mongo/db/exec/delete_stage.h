@@ -32,7 +32,7 @@
 #include "mongo/db/exec/requires_collection_stage.h"
 #include "mongo/db/exec/write_stage_common.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_id.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/db/storage/remove_saver.h"
 
 namespace mongo {
@@ -121,16 +121,16 @@ public:
                 const CollectionPtr& collection,
                 PlanStage* child);
 
-    bool isEOF() final;
+    bool isEOF();
     StageState doWork(WorkingSetID* out);
 
     StageType stageType() const {
         return STAGE_DELETE;
     }
 
-    std::unique_ptr<PlanStageStats> getStats() final;
+    std::unique_ptr<mongo::PlanStageStats> getStats();
 
-    const SpecificStats* getSpecificStats() const final;
+    const SpecificStats* getSpecificStats() const;
 
 protected:
     void doSaveStateRequiresCollection() final {
@@ -160,9 +160,9 @@ protected:
 private:
     /**
      * Stores 'idToRetry' in '_idRetrying' so the delete can be retried during the next call to
-     * work(). Always returns NEED_YIELD and sets 'out' to WorkingSet::INVALID_ID.
+     * work(). Sets 'out' to WorkingSet::INVALID_ID.
      */
-    StageState prepareToRetryWSM(WorkingSetID idToRetry, WorkingSetID* out);
+    void prepareToRetryWSM(WorkingSetID idToRetry, WorkingSetID* out);
 
     // If not WorkingSet::INVALID_ID, we use this rather than asking our child what to do next.
     WorkingSetID _idRetrying;

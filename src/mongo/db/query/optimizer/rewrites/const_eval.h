@@ -32,18 +32,34 @@
 #include "mongo/db/query/optimizer/reference_tracker.h"
 #include "mongo/db/query/optimizer/utils/abt_hash.h"
 
+
 namespace mongo::optimizer {
+
+// Handler which should return a boolean indicating if we are allowed to inline an EvaluationNode.
+// If the handler returns "true" we can inline, otherwise we are not allowed to.
+using CanInlineEvalFn = std::function<bool(const EvaluationNode& node)>;
+
+// Handler which is called when we erase an unused projection name.
+using ErasedProjFn = std::function<void(const ProjectionName& erasedProjName)>;
+
+// Handler which is called when we inline a projection name (target) with another projection name
+// (source).
+using RenamedProjFn =
+    std::function<void(const ProjectionName& target, const ProjectionName& source)>;
+
 /**
  * This is an example rewriter that does constant evaluation in-place.
  */
 class ConstEval {
 public:
     ConstEval(VariableEnvironment& env,
-              const bool disableSargableInlining = false,
-              ProjectionNameSet* erasedProjNames = nullptr)
-        : _disableSargableInlining(disableSargableInlining),
-          _env(env),
-          _erasedProjNames(erasedProjNames) {}
+              const CanInlineEvalFn& canInlineEval = {},
+              const ErasedProjFn& erasedProj = {},
+              const RenamedProjFn& renamedProj = {})
+        : _env(env),
+          _canInlineEval(canInlineEval),
+          _erasedProj(erasedProj),
+          _renamedProj(renamedProj) {}
 
     // The default noop transport. Note the first ABT& parameter.
     template <typename T, typename... Ts>
@@ -57,22 +73,34 @@ public:
     void prepare(ABT&, const LambdaAbstraction&);
     void transport(ABT&, const LambdaAbstraction&, ABT&);
 
+    void transport(ABT& n, const UnaryOp& op, ABT& child);
     // Specific transport for binary operation
     // The const correctness is probably wrong (as const ABT& lhs, const ABT& rhs does not work for
     // some reason but we can fix it later).
     void transport(ABT& n, const BinaryOp& op, ABT& lhs, ABT& rhs);
     void transport(ABT& n, const FunctionCall& op, std::vector<ABT>& args);
     void transport(ABT& n, const If& op, ABT& cond, ABT& thenBranch, ABT& elseBranch);
+
+    void transport(ABT& n, const EvalPath& op, ABT& path, ABT& input);
+    void transport(ABT& n, const EvalFilter& op, ABT& path, ABT& input);
+
+    void transport(ABT& n, const FilterNode& op, ABT& child, ABT& expr);
     void transport(ABT& n, const EvaluationNode& op, ABT& child, ABT& expr);
 
     void prepare(ABT&, const PathTraverse&);
     void transport(ABT&, const PathTraverse&, ABT&);
+
+    void transport(ABT& n, const PathComposeM& op, ABT& lhs, ABT& rhs);
+    void transport(ABT& n, const PathComposeA& op, ABT& lhs, ABT& rhs);
 
     void prepare(ABT&, const References& refs);
     void transport(ABT& n, const References& op, std::vector<ABT>&);
 
     // The tree is passed in as NON-const reference as we will be updating it.
     bool optimize(ABT& n);
+
+    // Provides constant folding interface.
+    static void constFold(ABT& n);
 
 private:
     struct EvalNodeHash {
@@ -96,10 +124,15 @@ private:
     void swapAndUpdate(ABT& n, ABT newN);
     void removeUnusedEvalNodes();
 
-    // Controls if we can inline certain EvaluationNodes.
-    const bool _disableSargableInlining;
-
     VariableEnvironment& _env;
+
+    // Handler which controls inlining of EvalNodes.
+    const CanInlineEvalFn& _canInlineEval;
+    // Handler called when a projection is erased.
+    const ErasedProjFn& _erasedProj;
+    // Handler called when a projection is renamed.
+    const RenamedProjFn& _renamedProj;
+
     opt::unordered_set<const Variable*> _singleRef;
     opt::unordered_set<const EvaluationNode*> _noRefProj;
     opt::unordered_map<const Let*, std::vector<const Variable*>> _letRefs;
@@ -113,9 +146,6 @@ private:
     bool _inRefBlock{false};
     size_t _inCostlyCtx{0};
     bool _changed{false};
-
-    // Optionally collect projection names from erased Eval nodes.
-    ProjectionNameSet* _erasedProjNames;
 };
 
 }  // namespace mongo::optimizer

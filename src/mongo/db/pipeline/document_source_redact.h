@@ -31,6 +31,7 @@
 
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
 
 namespace mongo {
 
@@ -66,10 +67,14 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     boost::intrusive_ptr<Expression> getExpression() {
         return _expression;
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {
+        expression::addVariableRefs(_expression.get(), refs);
     }
 
 private:

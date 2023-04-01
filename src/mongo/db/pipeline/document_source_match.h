@@ -43,9 +43,10 @@ namespace mongo {
 
 class DocumentSourceMatch : public DocumentSource {
 public:
-    virtual boost::intrusive_ptr<DocumentSource> clone() const {
+    virtual boost::intrusive_ptr<DocumentSource> clone(
+        const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const {
         // Raw new is needed to access non-public constructors.
-        return new auto(*this);
+        return new DocumentSourceMatch(*this, newExpCtx);
     }
 
     static constexpr StringData kStageName = "$match"_sd;
@@ -125,8 +126,7 @@ public:
                 ChangeStreamRequirement::kAllowlist};
     }
 
-    Value serialize(
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const override;
 
     /**
      * Attempts to combine with any subsequent $match stages, joining the query objects with a
@@ -137,9 +137,11 @@ public:
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
+
     GetModPathsReturn getModifiedPaths() const final {
         // This stage does not modify or rename any paths.
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {}};
     }
 
     /**
@@ -198,17 +200,18 @@ public:
      * z: "baz"}} and {$match: {a: "foo"}}.
      */
     std::pair<boost::intrusive_ptr<DocumentSourceMatch>, boost::intrusive_ptr<DocumentSourceMatch>>
-    splitSourceBy(const std::set<std::string>& fields, const StringMap<std::string>& renames) &&;
+    splitSourceBy(const OrderedPathSet& fields, const StringMap<std::string>& renames) &&;
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
 
 protected:
-    DocumentSourceMatch(const DocumentSourceMatch& other)
+    DocumentSourceMatch(const DocumentSourceMatch& other,
+                        const boost::intrusive_ptr<ExpressionContext>& newExpCtx)
         : DocumentSourceMatch(
               other.serialize().getDocument().toBson().firstElement().embeddedObject(),
-              other.pExpCtx) {}
+              newExpCtx ? newExpCtx : other.pExpCtx) {}
 
     GetNextResult doGetNext() override;
     DocumentSourceMatch(const BSONObj& query,
@@ -218,7 +221,7 @@ protected:
 
 private:
     std::pair<boost::intrusive_ptr<DocumentSourceMatch>, boost::intrusive_ptr<DocumentSourceMatch>>
-    splitSourceByFunc(const std::set<std::string>& fields,
+    splitSourceByFunc(const OrderedPathSet& fields,
                       const StringMap<std::string>& renames,
                       expression::ShouldSplitExprFunc func) &&;
 

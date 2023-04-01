@@ -27,14 +27,17 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -55,7 +58,7 @@ public:
         return false;
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
         std::string collectionName;
         if (const auto rootElt = cmdObj["root"]) {
             uassert(ErrorCodes::InvalidNamespace,
@@ -66,13 +69,19 @@ public:
         if (collectionName.empty())
             collectionName = "fs";
         collectionName += ".chunks";
-        return NamespaceString(dbname, collectionName).ns();
+        return NamespaceStringUtil::parseNamespaceFromRequest(dbName, collectionName);
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), ActionType::find));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::find)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -80,12 +89,12 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbName,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbName, cmdObj));
 
-        const auto cm =
+        const auto cri =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
 
         const auto callShardFn = [&](const BSONObj& cmdObj, const BSONObj& routingQuery) {
@@ -93,7 +102,7 @@ public:
                 scatterGatherVersionedTargetByRoutingTable(opCtx,
                                                            nss.db(),
                                                            nss,
-                                                           cm,
+                                                           cri,
                                                            cmdObj,
                                                            ReadPreferenceSetting::get(opCtx),
                                                            Shard::RetryPolicy::kIdempotent,
@@ -112,6 +121,7 @@ public:
         // If the collection is not sharded, or is sharded only on the 'files_id' field, we only
         // need to target a single shard, because the files' chunks can only be contained in a
         // single sharded chunk
+        const auto& cm = cri.cm;
         if (!cm.isSharded() ||
             SimpleBSONObjComparator::kInstance.evaluate(cm.getShardKeyPattern().toBSON() ==
                                                         BSON("files_id" << 1))) {

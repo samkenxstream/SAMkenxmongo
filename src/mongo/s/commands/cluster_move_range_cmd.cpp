@@ -27,13 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/move_range_request_gen.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -43,8 +45,11 @@ public:
     using Request = ClusterMoveRange;
 
     std::string help() const override {
-        // TODO SERVER-64486 document this command with an inline example.
-        return "Move the range delimited by the the given key(s) to the destination shard.";
+        return "Example: move range starting from {num : 7} to shard001 (max bound automatically "
+               "chosen)\n  { moveRange : 'test.foo' , min : { num : 7 } , to : 'shard0001' }\n"
+               "Example: move range with lower bound 0 and upper bound 10 to shard001\n"
+               "  { moveRange : 'test.foo' , min : { num : 0 } , max: { num : 10 } "
+               " , to : 'shard001' }\n";
     }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
@@ -63,19 +68,24 @@ public:
             const auto nss = ns();
             const auto& req = request();
 
+            uassert(ErrorCodes::InvalidOptions,
+                    "Missing required parameter 'min' or 'max'",
+                    req.getMin() || req.getMax());
+
             ConfigsvrMoveRange configsvrRequest(nss);
-            configsvrRequest.setDbName(NamespaceString::kAdminDb);
-            configsvrRequest.setMoveRangeRequest(req.getMoveRangeRequest());
+            configsvrRequest.setDbName(DatabaseName::kAdmin);
+            configsvrRequest.setMoveRangeRequestBase(req.getMoveRangeRequestBase());
+            configsvrRequest.setForceJumbo(request().getForceJumbo() ? ForceJumbo::kForceManual
+                                                                     : ForceJumbo::kDoNotForce);
 
             auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-            const auto commandResponse =
-                uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
-                    opCtx,
-                    ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                    NamespaceString::kAdminDb.toString(),
-                    configsvrRequest.toBSON(BSON(WriteConcernOptions::kWriteConcernField
-                                                 << opCtx->getWriteConcern().toBSON())),
-                    Shard::RetryPolicy::kIdempotent));
+            const auto commandResponse = uassertStatusOK(configShard->runCommand(
+                opCtx,
+                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                DatabaseName::kAdmin.toString(),
+                configsvrRequest.toBSON(BSON(WriteConcernOptions::kWriteConcernField
+                                             << opCtx->getWriteConcern().toBSON())),
+                Shard::RetryPolicy::kIdempotent));
 
             uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(commandResponse));
         }

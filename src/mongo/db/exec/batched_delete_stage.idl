@@ -30,23 +30,24 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 server_parameters:
-  batchedDeletesTargetBatchBytes:
-    description: "Threshold in bytes accounting for documents and index entries at which a batch of document deletions is committed. A value of zero means unlimited"
+  batchedDeletesTargetStagedDocBytes:
+    description: "Threshold in bytes accounting for documents (not index entries) at which a batch of document deletions is committed. A value of zero means unlimited"
     set_at: [startup, runtime]
     cpp_vartype: 'AtomicWord<long long>'
-    cpp_varname: gBatchedDeletesTargetBatchBytes
-    default: 52428800 # 50MB
+    cpp_varname: gBatchedDeletesTargetStagedDocBytes
+    default: 2097152 # 2MB
     validator:
       gte: 0
+      lte: 2147483647
   batchedDeletesTargetBatchDocs:
     description: "Threshold of documents at which a batch of document deletions is committed. A value of zero means unlimited"
     set_at: [startup, runtime]
     cpp_vartype: 'AtomicWord<long long>'
     cpp_varname: "gBatchedDeletesTargetBatchDocs"
-    default: 10 # TODO (SERVER-64547): re-evaluate this default.
+    default: 10
     validator:
       gte: 0
   batchedDeletesTargetBatchTimeMS:
@@ -57,4 +58,3 @@ server_parameters:
     default: 5
     validator:
       gte: 0
-

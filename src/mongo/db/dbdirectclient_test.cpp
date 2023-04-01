@@ -34,7 +34,7 @@
 namespace mongo {
 namespace {
 
-const NamespaceString kNs("a.b");
+const NamespaceString kNs = NamespaceString::createNamespaceString_forTest("a.b");
 
 class DBDirectClientTest : public ServiceContextMongoDTest {
 protected:
@@ -75,7 +75,7 @@ TEST_F(DBDirectClientTest, InsertDuplicateDocumentDoesNotThrow) {
     insertOp.setDocuments({BSON("_id" << 1), BSON("_id" << 1)});
     auto insertReply = client.insert(insertOp);
     ASSERT_EQ(insertReply.getN(), 1);
-    auto writeErrors = insertReply.getWriteErrors().get();
+    auto writeErrors = insertReply.getWriteErrors().value();
     ASSERT_EQ(writeErrors.size(), 1);
     ASSERT_EQ(writeErrors[0].getStatus(), ErrorCodes::DuplicateKey);
 }
@@ -111,7 +111,7 @@ TEST_F(DBDirectClientTest, UpdateDuplicateImmutableFieldDoesNotThrow) {
     auto updateReply = client.update(updateOp);
     ASSERT_EQ(updateReply.getN(), 0);
     ASSERT_EQ(updateReply.getNModified(), 0);
-    auto writeErrors = updateReply.getWriteErrors().get();
+    auto writeErrors = updateReply.getWriteErrors().value();
     ASSERT_EQ(writeErrors.size(), 1);
     ASSERT_EQ(writeErrors[0].getStatus(), ErrorCodes::ImmutableField);
 }
@@ -152,7 +152,7 @@ TEST_F(DBDirectClientTest, DeleteDocumentIncorrectHintDoesNotThrow) {
     }()});
     auto deleteReply = client.remove(deleteOp);
     ASSERT_EQ(deleteReply.getN(), 0);
-    auto writeErrors = deleteReply.getWriteErrors().get();
+    auto writeErrors = deleteReply.getWriteErrors().value();
     ASSERT_EQ(writeErrors.size(), 1);
     ASSERT_EQ(writeErrors[0].getStatus(), ErrorCodes::BadValue);
 }
@@ -171,10 +171,25 @@ TEST_F(DBDirectClientTest, ExhaustQuery) {
     ASSERT_FALSE(insertReply.getWriteErrors());
 
     // The query should work even though exhaust mode is requested.
-    int batchSize = 2;
-    auto cursor = client.query_DEPRECATED(
-        kNs, BSONObj{}, Query{}, 0 /*limit*/, 0 /*skip*/, nullptr, QueryOption_Exhaust, batchSize);
+    FindCommandRequest findCmd{kNs};
+    findCmd.setBatchSize(2);
+    auto cursor = client.find(std::move(findCmd), ReadPreferenceSetting{}, ExhaustMode::kOn);
     ASSERT_EQ(cursor->itcount(), numDocs);
+}
+
+TEST_F(DBDirectClientTest, InternalErrorAllowedToEscapeDBDirectClient) {
+    DBDirectClient client(_opCtx);
+    FindCommandRequest findCmd{kNs};
+
+    FailPointEnableBlock failPoint("failCommand",
+                                   BSON("errorCode" << ErrorCodes::TransactionAPIMustRetryCommit
+                                                    << "failCommands" << BSON_ARRAY("find")
+                                                    << "failInternalCommands" << true
+                                                    << "failLocalClients" << true));
+
+    ASSERT_THROWS_CODE(client.find(std::move(findCmd), ReadPreferenceSetting{}, ExhaustMode::kOff),
+                       DBException,
+                       ErrorCodes::TransactionAPIMustRetryCommit);
 }
 
 }  // namespace

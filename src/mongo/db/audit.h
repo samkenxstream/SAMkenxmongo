@@ -75,7 +75,7 @@ extern std::function<void(ServiceContext*)> initializeSynchronizeJob;
  * roleNames stored in ImpersonatedClientAttrs.
  */
 struct ImpersonatedClientAttrs {
-    std::vector<UserName> userNames;
+    UserName userName;
     std::vector<RoleName> roleNames;
 
     ImpersonatedClientAttrs() = default;
@@ -384,7 +384,7 @@ void logEnableSharding(Client* client, StringData dbname);
 /**
  * Logs the result of a addShard command.
  */
-void logAddShard(Client* client, StringData name, const std::string& servers, long long maxSize);
+void logAddShard(Client* client, StringData name, const std::string& servers);
 
 /**
  * Logs the result of a removeShard command.
@@ -416,6 +416,40 @@ void logUpdateOperation(Client* client, const NamespaceString& nss, const BSONOb
  */
 void logRemoveOperation(Client* client, const NamespaceString& nss, const BSONObj& doc);
 
+/**
+ * Logs values of cluster server parameters requested via getClusterParameter.
+ */
+void logGetClusterParameter(
+    Client* client,
+    const stdx::variant<std::string, std::vector<std::string>>& requestedParameters);
+
+/**
+ * Logs old and new value of given tenant's cluster server parameter when it is updated via
+ * setClusterParameter.
+ */
+void logSetClusterParameter(Client* client,
+                            const BSONObj& oldValue,
+                            const BSONObj& newValue,
+                            const boost::optional<TenantId>& tenantId);
+
+/**
+ * Logs old and new value of given tenant's cluster server parameter when it gets updated in-memory
+ * in response to some on-disk change. This may be due to setClusterParameter or a replication event
+ * such as rollback.
+ */
+void logUpdateCachedClusterParameter(Client* client,
+                                     const BSONObj& oldValue,
+                                     const BSONObj& newValue,
+                                     const boost::optional<TenantId>& tenantId);
+
+/**
+ * Logs details of log file being rotated out to the file that is being rotated
+ * in
+ */
+void logRotateLog(Client* client,
+                  const Status& logStatus,
+                  const std::vector<Status>& errors,
+                  const std::string& suffix);
 
 }  // namespace audit
 }  // namespace mongo

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -35,6 +34,9 @@
 
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -95,8 +97,7 @@ Pipeline::SourceContainer::iterator DocumentSourceInternalShardFilter::doOptimiz
     return ret;
 }
 
-Value DocumentSourceInternalShardFilter::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceInternalShardFilter::serialize(SerializationOptions opts) const {
     return Value(DOC(getSourceName() << Document()));
 }
 

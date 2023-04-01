@@ -27,10 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
-
 #include <set>
 
 #include "mongo/bson/bsontypes.h"
@@ -39,22 +35,22 @@
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/parameters_gen.h"
 #include "mongo/db/commands/parse_log_component_settings.h"
+#include "mongo/db/server_parameter_gen.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/idl/command_generic_argument.h"
-#include "mongo/idl/server_parameter_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 
-using std::string;
-using std::stringstream;
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
-
 namespace {
+
 using logv2::LogComponent;
 using logv2::LogSeverity;
 
@@ -91,7 +87,7 @@ static mutablebson::Element getParentForLogComponent(mutablebson::Document& doc,
  * The "default" log component is an implementation detail. Don't expose this to users.
  */
 void getLogComponentVerbosity(BSONObj* output) {
-    static const string defaultLogComponentName =
+    static const std::string defaultLogComponentName =
         LogComponent(LogComponent::kDefault).getShortName();
 
     mutablebson::Document doc;
@@ -188,10 +184,9 @@ Status setLogComponentVerbosity(const BSONObj& bsonSettings) {
     return Status::OK();
 }
 
-
 GetParameterOptions parseGetParameterOptions(BSONElement elem) {
     if (elem.type() == BSONType::Object) {
-        return GetParameterOptions::parse({"getParameter"}, elem.Obj());
+        return GetParameterOptions::parse(IDLParserContext{"getParameter"}, elem.Obj());
     }
     if ((elem.type() == BSONType::String) && (elem.valueStringDataSafe() == "*"_sd)) {
         GetParameterOptions ret;
@@ -206,25 +201,33 @@ Mutex autoServiceDescriptorMutex;
 std::string autoServiceDescriptorValue;
 }  // namespace
 
-class CmdGet : public ErrmsgCommandDeprecated {
+class CmdGet : public BasicCommand {
 public:
-    CmdGet() : ErrmsgCommandDeprecated("getParameter") {}
+    CmdGet() : BasicCommand("getParameter") {}
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
-    virtual bool adminOnly() const {
+
+    bool adminOnly() const override {
         return true;
     }
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        ActionSet actions;
-        actions.addAction(ActionType::getParameter);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                  ActionType::getParameter)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
+
     std::string help() const override {
         std::string h =
             "get administrative option(s)\nexample:\n"
@@ -235,11 +238,15 @@ public:
         h += "{ getParameter:'*' } or { getParameter:{allParameters: true} } to get everything\n";
         return h;
     }
-    bool errmsgRun(OperationContext* opCtx,
-                   const string& dbname,
-                   const BSONObj& cmdObj,
-                   string& errmsg,
-                   BSONObjBuilder& result) override {
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
+    bool run(OperationContext* opCtx,
+             const DatabaseName& dbName,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         const auto options = parseGetParameterOptions(cmdObj.firstElement());
         const bool all = options.getAllParameters();
 
@@ -247,47 +254,52 @@ public:
 
         const ServerParameter::Map& m = ServerParameterSet::getNodeParameterSet()->getMap();
         for (ServerParameter::Map::const_iterator i = m.begin(); i != m.end(); ++i) {
-            if (all || cmdObj.hasElement(i->first.c_str())) {
+            if (i->second->isEnabled() && (all || cmdObj.hasElement(i->first.c_str()))) {
                 if (options.getShowDetails()) {
                     BSONObjBuilder detailBob(result.subobjStart(i->second->name()));
-                    i->second->append(opCtx, detailBob, "value");
+                    i->second->append(opCtx, &detailBob, "value", boost::none);
                     detailBob.appendBool("settableAtRuntime",
                                          i->second->allowedToChangeAtRuntime());
                     detailBob.appendBool("settableAtStartup",
                                          i->second->allowedToChangeAtStartup());
                     detailBob.doneFast();
                 } else {
-                    i->second->append(opCtx, result, i->second->name());
+                    i->second->append(opCtx, &result, i->second->name(), boost::none);
                 }
             }
         }
-        if (before == result.len()) {
-            errmsg = "no option found to get";
-            return false;
-        }
+        uassert(ErrorCodes::InvalidOptions, "no option found to get", before != result.len());
         return true;
     }
 } cmdGet;
 
-class CmdSet : public ErrmsgCommandDeprecated {
+class CmdSet : public BasicCommand {
 public:
-    CmdSet() : ErrmsgCommandDeprecated("setParameter") {}
+    CmdSet() : BasicCommand("setParameter") {}
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
-    virtual bool adminOnly() const {
+
+    bool adminOnly() const override {
         return true;
     }
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        ActionSet actions;
-        actions.addAction(ActionType::setParameter);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                  ActionType::setParameter)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
+
     std::string help() const override {
         std::string h =
             "set administrative option(s)\n"
@@ -295,11 +307,10 @@ public:
         appendParameterNames(&h);
         return h;
     }
-    bool errmsgRun(OperationContext* opCtx,
-                   const string& dbname,
-                   const BSONObj& cmdObj,
-                   string& errmsg,
-                   BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const DatabaseName& dbName,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         int numSet = 0;
         bool found = false;
 
@@ -328,28 +339,30 @@ public:
             ServerParameter::Map::const_iterator foundParameter = parameterMap.find(parameterName);
 
             // Check to see if this is actually a valid parameter
-            if (foundParameter == parameterMap.end()) {
-                errmsg = str::stream() << "attempted to set unrecognized parameter ["
-                                       << parameterName << "], use help:true to see options ";
-                return false;
-            }
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "attempted to set unrecognized parameter [" << parameterName
+                                  << "], use help:true to see options ",
+                    foundParameter != parameterMap.end());
+
+            // Is the parameter disabled?
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "Server parameter: '" << foundParameter->second->name()
+                                  << "' is disabled",
+                    foundParameter->second->isEnabled());
 
             // Make sure we are allowed to change this parameter
-            if (!foundParameter->second->allowedToChangeAtRuntime()) {
-                errmsg = str::stream()
-                    << "not allowed to change [" << parameterName << "] at runtime";
-                return false;
-            }
+            uassert(ErrorCodes::IllegalOperation,
+                    str::stream() << "not allowed to change [" << parameterName << "] at runtime",
+                    foundParameter->second->allowedToChangeAtRuntime());
 
             // Make sure we are only setting this parameter once
-            if (parametersToSet.count(parameterName)) {
-                errmsg = str::stream()
-                    << "attempted to set parameter [" << parameterName
-                    << "] twice in the same setParameter command, "
-                    << "once to value: [" << parametersToSet[parameterName].toString(false)
-                    << "], and once to value: [" << parameter.toString(false) << "]";
-                return false;
-            }
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "attempted to set parameter [" << parameterName
+                                  << "] twice in the same setParameter command, "
+                                  << "once to value: ["
+                                  << parametersToSet[parameterName].toString(false)
+                                  << "], and once to value: [" << parameter.toString(false) << "]",
+                    parametersToSet.count(parameterName) == 0);
 
             parametersToSet[parameterName] = parameter;
         }
@@ -365,25 +378,23 @@ public:
 
             ServerParameter::Map::const_iterator foundParameter = parameterMap.find(parameterName);
 
-            if (foundParameter == parameterMap.end()) {
-                errmsg = str::stream() << "Parameter: " << parameterName << " that was "
-                                       << "avaliable during our first lookup in the registered "
-                                       << "parameters map is no longer available.";
-                return false;
-            }
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "Parameter: " << parameterName << " that was "
+                                  << "avaliable during our first lookup in the registered "
+                                  << "parameters map is no longer available.",
+                    foundParameter != parameterMap.end());
 
-            if (parameterName == "requireApiVersion" && parameter.trueValue() &&
-                (serverGlobalParams.clusterRole == ClusterRole::ConfigServer ||
-                 serverGlobalParams.clusterRole == ClusterRole::ShardServer)) {
-                errmsg = str::stream()
-                    << "Cannot set parameter requireApiVersion=true on a shard or config server";
-                return false;
-            }
+            uassert(
+                ErrorCodes::IllegalOperation,
+                str::stream()
+                    << "Cannot set parameter requireApiVersion=true on a shard or config server",
+                parameterName != "requireApiVersion" || !parameter.trueValue() ||
+                    (serverGlobalParams.clusterRole.has(ClusterRole::None)));
 
             auto oldValueObj = ([&] {
                 BSONObjBuilder bb;
                 if (numSet == 0) {
-                    foundParameter->second->append(opCtx, bb, "was");
+                    foundParameter->second->append(opCtx, &bb, "was", boost::none);
                 }
                 return bb.obj();
             })();
@@ -394,7 +405,7 @@ public:
             }
 
             try {
-                uassertStatusOK(foundParameter->second->set(parameter));
+                uassertStatusOK(foundParameter->second->set(parameter, boost::none));
             } catch (const DBException& ex) {
                 LOGV2(20496,
                       "Error setting parameter {parameterName} to {newValue} errMsg: {error}",
@@ -433,30 +444,33 @@ public:
             numSet++;
         }
 
-        if (numSet == 0 && !found) {
-            errmsg = "no option found to set, use help:true to see options ";
-            return false;
-        }
+        uassert(ErrorCodes::InvalidOptions,
+                "no option found to set, use help:true to see options ",
+                numSet != 0 || found);
 
         return true;
     }
 } cmdSet;
 
 void LogLevelServerParameter::append(OperationContext*,
-                                     BSONObjBuilder& builder,
-                                     const std::string& name) {
-    builder.append(name,
-                   logv2::LogManager::global()
-                       .getGlobalSettings()
-                       .getMinimumLogSeverity(mongo::logv2::LogComponent::kDefault)
-                       .toInt());
+                                     BSONObjBuilder* builder,
+                                     StringData name,
+                                     const boost::optional<TenantId>&) {
+    builder->append(name,
+                    logv2::LogManager::global()
+                        .getGlobalSettings()
+                        .getMinimumLogSeverity(mongo::logv2::LogComponent::kDefault)
+                        .toInt());
 }
 
-Status LogLevelServerParameter::set(const BSONElement& newValueElement) {
+Status LogLevelServerParameter::set(const BSONElement& newValueElement,
+                                    const boost::optional<TenantId>&) {
     int newValue;
-    if (!newValueElement.coerce(&newValue) || newValue < 0)
+    Status coercionStatus = newValueElement.tryCoerce(&newValue);
+    if (!coercionStatus.isOK() || newValue < 0) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Invalid value for logLevel: " << newValueElement);
+    }
     LogSeverity newSeverity = (newValue > 0) ? LogSeverity::Debug(newValue) : LogSeverity::Log();
 
     logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
@@ -464,7 +478,8 @@ Status LogLevelServerParameter::set(const BSONElement& newValueElement) {
     return Status::OK();
 }
 
-Status LogLevelServerParameter::setFromString(const std::string& strLevel) {
+Status LogLevelServerParameter::setFromString(StringData strLevel,
+                                              const boost::optional<TenantId>&) {
     int newValue;
     Status status = NumberParser{}(strLevel, &newValue);
     if (!status.isOK())
@@ -480,14 +495,16 @@ Status LogLevelServerParameter::setFromString(const std::string& strLevel) {
 }
 
 void LogComponentVerbosityServerParameter::append(OperationContext*,
-                                                  BSONObjBuilder& builder,
-                                                  const std::string& name) {
+                                                  BSONObjBuilder* builder,
+                                                  StringData name,
+                                                  const boost::optional<TenantId>&) {
     BSONObj currentSettings;
     getLogComponentVerbosity(&currentSettings);
-    builder.append(name, currentSettings);
+    builder->append(name, currentSettings);
 }
 
-Status LogComponentVerbosityServerParameter::set(const BSONElement& newValueElement) {
+Status LogComponentVerbosityServerParameter::set(const BSONElement& newValueElement,
+                                                 const boost::optional<TenantId>&) {
     if (!newValueElement.isABSONObj()) {
         return Status(ErrorCodes::TypeMismatch,
                       str::stream()
@@ -496,30 +513,34 @@ Status LogComponentVerbosityServerParameter::set(const BSONElement& newValueElem
     return setLogComponentVerbosity(newValueElement.Obj());
 }
 
-Status LogComponentVerbosityServerParameter::setFromString(const std::string& str) try {
+Status LogComponentVerbosityServerParameter::setFromString(StringData str,
+                                                           const boost::optional<TenantId>&) try {
     return setLogComponentVerbosity(fromjson(str));
 } catch (const DBException& ex) {
     return ex.toStatus();
 }
 
 void AutomationServiceDescriptorServerParameter::append(OperationContext*,
-                                                        BSONObjBuilder& builder,
-                                                        const std::string& name) {
+                                                        BSONObjBuilder* builder,
+                                                        StringData name,
+                                                        const boost::optional<TenantId>&) {
     const stdx::lock_guard<Latch> lock(autoServiceDescriptorMutex);
     if (!autoServiceDescriptorValue.empty()) {
-        builder.append(name, autoServiceDescriptorValue);
+        builder->append(name, autoServiceDescriptorValue);
     }
 }
 
-Status AutomationServiceDescriptorServerParameter::set(const BSONElement& newValueElement) {
+Status AutomationServiceDescriptorServerParameter::set(const BSONElement& newValueElement,
+                                                       const boost::optional<TenantId>&) {
     if (newValueElement.type() != String) {
         return {ErrorCodes::TypeMismatch,
                 "Value for parameter automationServiceDescriptor must be of type 'string'"};
     }
-    return setFromString(newValueElement.String());
+    return setFromString(newValueElement.String(), boost::none);
 }
 
-Status AutomationServiceDescriptorServerParameter::setFromString(const std::string& str) {
+Status AutomationServiceDescriptorServerParameter::setFromString(StringData str,
+                                                                 const boost::optional<TenantId>&) {
     auto kMaxSize = 64U;
     if (str.size() > kMaxSize)
         return {ErrorCodes::Overflow,
@@ -528,7 +549,7 @@ Status AutomationServiceDescriptorServerParameter::setFromString(const std::stri
 
     {
         const stdx::lock_guard<Latch> lock(autoServiceDescriptorMutex);
-        autoServiceDescriptorValue = str;
+        autoServiceDescriptorValue = str.toString();
     }
 
     return Status::OK();

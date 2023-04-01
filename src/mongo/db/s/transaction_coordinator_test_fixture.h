@@ -35,7 +35,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/transaction_coordinator.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/db/shard_id.h"
 
 namespace mongo {
 
@@ -44,6 +44,9 @@ namespace mongo {
  */
 class TransactionCoordinatorTestFixture : public ShardServerTestFixture {
 protected:
+    explicit TransactionCoordinatorTestFixture(Options options = {})
+        : ShardServerTestFixture(std::move(options)) {}
+
     void setUp() override;
     void tearDown() override;
 

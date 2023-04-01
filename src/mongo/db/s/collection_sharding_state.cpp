@@ -27,16 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/collection_sharding_state.h"
 
-#include "mongo/db/repl/read_concern_args.h"
-#include "mongo/s/stale_exception.h"
-#include "mongo/util/fail_point.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
 #include "mongo/util/string_map.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 namespace {
@@ -51,6 +48,14 @@ public:
     CollectionShardingStateMap(std::unique_ptr<CollectionShardingStateFactory> factory)
         : _factory(std::move(factory)) {}
 
+    struct CSSAndLock {
+        CSSAndLock(std::unique_ptr<CollectionShardingState> css)
+            : cssMutex("CSSMutex::" + css->nss().toString()), css(std::move(css)) {}
+
+        const Lock::ResourceMutex cssMutex;
+        std::unique_ptr<CollectionShardingState> css;
+    };
+
     /**
      * Joins the factory, waiting for any outstanding tasks using the factory to be finished. Must
      * be called before destruction.
@@ -59,17 +64,18 @@ public:
         _factory->join();
     }
 
-    std::shared_ptr<CollectionShardingState> getOrCreate(const NamespaceString& nss) {
+    CSSAndLock* getOrCreate(const NamespaceString& nss) noexcept {
         stdx::lock_guard<Latch> lg(_mutex);
 
         auto it = _collections.find(nss.ns());
         if (it == _collections.end()) {
-            auto inserted = _collections.try_emplace(nss.ns(), _factory->make(nss));
+            auto inserted = _collections.try_emplace(
+                nss.ns(), std::make_unique<CSSAndLock>(_factory->make(nss)));
             invariant(inserted.second);
             it = std::move(inserted.first);
         }
 
-        return it->second;
+        return it->second.get();
     }
 
     void appendInfoForShardingStateCommand(BSONObjBuilder* builder) {
@@ -78,7 +84,7 @@ public:
         {
             stdx::lock_guard<Latch> lg(_mutex);
             for (const auto& coll : _collections) {
-                coll.second->appendShardVersion(builder);
+                coll.second->css->appendShardVersion(builder);
             }
         }
 
@@ -86,18 +92,20 @@ public:
     }
 
     void appendInfoForServerStatus(BSONObjBuilder* builder) {
-        auto totalNumberOfRangesScheduledForDeletion = ([this] {
-            stdx::lock_guard lg(_mutex);
-            return std::accumulate(_collections.begin(),
-                                   _collections.end(),
-                                   0LL,
-                                   [](long long total, const auto& coll) {
-                                       return total +
-                                           coll.second->numberOfRangesScheduledForDeletion();
-                                   });
-        })();
+        if (!mongo::feature_flags::gRangeDeleterService.isEnabledAndIgnoreFCV()) {
+            auto totalNumberOfRangesScheduledForDeletion = ([this] {
+                stdx::lock_guard lg(_mutex);
+                return std::accumulate(
+                    _collections.begin(),
+                    _collections.end(),
+                    0LL,
+                    [](long long total, const auto& coll) {
+                        return total + coll.second->css->numberOfRangesScheduledForDeletion();
+                    });
+            })();
 
-        builder->appendNumber("rangeDeleterTasks", totalNumberOfRangesScheduledForDeletion);
+            builder->appendNumber("rangeDeleterTasks", totalNumberOfRangesScheduledForDeletion);
+        }
     }
 
     std::vector<NamespaceString> getCollectionNames() {
@@ -111,11 +119,13 @@ public:
     }
 
 private:
-    using CollectionsMap = StringMap<std::shared_ptr<CollectionShardingState>>;
-
     std::unique_ptr<CollectionShardingStateFactory> _factory;
 
     Mutex _mutex = MONGO_MAKE_LATCH("CollectionShardingStateMap::_mutex");
+
+    // Entries of the _collections map must never be deleted or replaced. This is to guarantee that
+    // a 'nss' is always associated to the same 'ResourceMutex'.
+    using CollectionsMap = StringMap<std::unique_ptr<CSSAndLock>>;
     CollectionsMap _collections;
 };
 
@@ -125,19 +135,42 @@ const ServiceContext::Decoration<boost::optional<CollectionShardingStateMap>>
 
 }  // namespace
 
-CollectionShardingState* CollectionShardingState::get(OperationContext* opCtx,
-                                                      const NamespaceString& nss) {
-    // Collection lock must be held to have a reference to the collection's sharding state
-    dassert(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IS));
+CollectionShardingState::ScopedCollectionShardingState::ScopedCollectionShardingState(
+    Lock::ResourceLock lock, CollectionShardingState* css)
+    : _lock(std::move(lock)), _css(css) {}
 
-    auto& collectionsMap = CollectionShardingStateMap::get(opCtx->getServiceContext());
-    return collectionsMap->getOrCreate(nss).get();
+CollectionShardingState::ScopedCollectionShardingState::ScopedCollectionShardingState(
+    ScopedCollectionShardingState&& other)
+    : _lock(std::move(other._lock)), _css(other._css) {
+    other._css = nullptr;
 }
 
-std::shared_ptr<CollectionShardingState> CollectionShardingState::getSharedForLockFreeReads(
+CollectionShardingState::ScopedCollectionShardingState::~ScopedCollectionShardingState() = default;
+
+CollectionShardingState::ScopedCollectionShardingState
+CollectionShardingState::ScopedCollectionShardingState::acquireScopedCollectionShardingState(
+    OperationContext* opCtx, const NamespaceString& nss, LockMode mode) {
+    CollectionShardingStateMap::CSSAndLock* cssAndLock =
+        CollectionShardingStateMap::get(opCtx->getServiceContext())->getOrCreate(nss);
+
+    // First lock the RESOURCE_MUTEX associated to this nss to guarantee stability of the
+    // CollectionShardingState* . After that, it is safe to get and store the
+    // CollectionShadingState*, as long as the RESOURCE_MUTEX is kept locked.
+    Lock::ResourceLock lock(opCtx->lockState(), cssAndLock->cssMutex.getRid(), mode);
+    return ScopedCollectionShardingState(std::move(lock), cssAndLock->css.get());
+}
+
+CollectionShardingState::ScopedCollectionShardingState
+CollectionShardingState::assertCollectionLockedAndAcquire(OperationContext* opCtx,
+                                                          const NamespaceString& nss) {
+    dassert(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IS));
+
+    return acquire(opCtx, nss);
+}
+
+CollectionShardingState::ScopedCollectionShardingState CollectionShardingState::acquire(
     OperationContext* opCtx, const NamespaceString& nss) {
-    auto& collectionsMap = CollectionShardingStateMap::get(opCtx->getServiceContext());
-    return collectionsMap->getOrCreate(nss);
+    return ScopedCollectionShardingState::acquireScopedCollectionShardingState(opCtx, nss, MODE_IS);
 }
 
 void CollectionShardingState::appendInfoForShardingStateCommand(OperationContext* opCtx,

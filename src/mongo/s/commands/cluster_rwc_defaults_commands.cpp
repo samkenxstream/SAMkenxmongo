@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -39,6 +38,9 @@
 #include "mongo/logv2/log.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -52,14 +54,14 @@ public:
     ClusterSetDefaultRWConcernCommand() : BasicCommand("setDefaultRWConcern") {}
 
     bool run(OperationContext* opCtx,
-             const std::string& dbName,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
         auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
             opCtx,
             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            NamespaceString::kAdminDb.toString(),
+            DatabaseName::kAdmin.toString(),
             CommandHelpers::appendMajorityWriteConcern(
                 CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
                 opCtx->getWriteConcern()),
@@ -69,8 +71,8 @@ public:
         uassertStatusOK(cmdResponse.writeConcernStatus);
 
         // Quickly pick up the new defaults by setting them in the cache.
-        auto newDefaults = RWConcernDefault::parse(
-            IDLParserErrorContext("ClusterSetDefaultRWConcern"), cmdResponse.response);
+        auto newDefaults = RWConcernDefault::parse(IDLParserContext("ClusterSetDefaultRWConcern"),
+                                                   cmdResponse.response);
         if (auto optWC = newDefaults.getDefaultWriteConcern()) {
             if (optWC->hasCustomWriteMode()) {
                 LOGV2_WARNING(
@@ -92,8 +94,8 @@ public:
     }
 
     Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
-                                 const BSONObj& cmdObj) const override {
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
         if (!AuthorizationSession::get(opCtx->getClient())
                  ->isAuthorizedForPrivilege(Privilege{ResourcePattern::forClusterResource(),
                                                       ActionType::setDefaultRWConcern})) {
@@ -146,14 +148,14 @@ public:
             auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
                 opCtx,
                 ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                NamespaceString::kAdminDb.toString(),
+                DatabaseName::kAdmin.toString(),
                 applyReadWriteConcern(opCtx, this, configsvrRequest.toBSON({})),
                 Shard::RetryPolicy::kIdempotent));
 
             uassertStatusOK(cmdResponse.commandStatus);
 
             return GetDefaultRWConcernResponse::parse(
-                IDLParserErrorContext("ClusterGetDefaultRWConcernResponse"), cmdResponse.response);
+                IDLParserContext("ClusterGetDefaultRWConcernResponse"), cmdResponse.response);
         }
 
     private:
@@ -170,7 +172,7 @@ public:
         }
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 

@@ -27,21 +27,25 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/set_user_write_block_mode_gen.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/global_user_write_block_state.h"
 #include "mongo/db/s/user_writes_recoverable_critical_section_service.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 
 namespace mongo {
 namespace {
+
 class SetUserWriteBlockModeCommand final : public TypedCommand<SetUserWriteBlockModeCommand> {
 public:
     using Request = SetUserWriteBlockMode;
@@ -65,15 +69,30 @@ public:
             uassert(ErrorCodes::IllegalOperation,
                     str::stream() << Request::kCommandName
                                   << " cannot be run on shardsvrs nor configsvrs",
-                    serverGlobalParams.clusterRole == ClusterRole::None);
+                    serverGlobalParams.clusterRole.has(ClusterRole::None));
 
             uassert(ErrorCodes::IllegalOperation,
                     str::stream() << Request::kCommandName << " cannot be run on standalones",
                     repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
                         repl::ReplicationCoordinator::modeNone);
 
+            // Only one attempt to change write block mode may make progress at once, because the
+            // way we enable/disable user index build blocking is not concurrency-safe.
+            stdx::lock_guard lock(_mutex);
             {
                 if (request().getGlobal()) {
+                    // Enabling write block mode on a replicaset requires several steps
+                    // First, we must prevent new index builds from starting
+                    auto writeBlockState = GlobalUserWriteBlockState::get(opCtx);
+                    writeBlockState->enableUserIndexBuildBlocking(opCtx);
+                    // Ensure that we eventually restore index build state.
+                    ScopeGuard guard(
+                        [&]() { writeBlockState->disableUserIndexBuildBlocking(opCtx); });
+                    // Abort and wait for ongoing index builds to finish.
+                    IndexBuildsCoordinator::get(opCtx)->abortUserIndexBuildsForUserWriteBlocking(
+                        opCtx);
+
+                    // Engage write blocking
                     UserWritesRecoverableCriticalSectionService::get(opCtx)
                         ->acquireRecoverableCriticalSectionBlockingUserWrites(
                             opCtx,
@@ -86,17 +105,17 @@ public:
                             UserWritesRecoverableCriticalSectionService::
                                 kGlobalUserWritesNamespace);
                 }
-
-                // Wait for the writes to the UserWritesRecoverableCriticalSection collection to be
-                // majority commited.
-                auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
-                WriteConcernResult writeConcernResult;
-                WriteConcernOptions majority(WriteConcernOptions::kMajority,
-                                             WriteConcernOptions::SyncMode::UNSET,
-                                             WriteConcernOptions::kWriteConcernTimeoutUserCommand);
-                uassertStatusOK(waitForWriteConcern(
-                    opCtx, replClient.getLastOp(), majority, &writeConcernResult));
             }
+
+            // Wait for the writes to the UserWritesRecoverableCriticalSection collection to be
+            // majority commited.
+            auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
+            WriteConcernResult writeConcernResult;
+            WriteConcernOptions majority(WriteConcernOptions::kMajority,
+                                         WriteConcernOptions::SyncMode::UNSET,
+                                         WriteConcernOptions::kWriteConcernTimeoutUserCommand);
+            uassertStatusOK(
+                waitForWriteConcern(opCtx, replClient.getLastOp(), majority, &writeConcernResult));
         }
 
     private:
@@ -113,6 +132,8 @@ public:
                         ->isAuthorizedForPrivilege(Privilege{ResourcePattern::forClusterResource(),
                                                              ActionType::setUserWriteBlockMode}));
         }
+
+        Mutex _mutex = MONGO_MAKE_LATCH("SetUserWriteBlockModeCommand::_mutex");
     };
 } setUserWriteBlockModeCommand;
 }  // namespace

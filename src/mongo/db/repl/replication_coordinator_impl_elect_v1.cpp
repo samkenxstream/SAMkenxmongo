@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationElection
 
 #include "mongo/platform/basic.h"
 
@@ -42,10 +41,15 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationElection
+
+
 namespace mongo {
 namespace repl {
 
 MONGO_FAIL_POINT_DEFINE(hangInWritingLastVoteForDryRun);
+MONGO_FAIL_POINT_DEFINE(electionHangsBeforeUpdateMemberState);
+MONGO_FAIL_POINT_DEFINE(hangBeforeOnVoteRequestCompleteCallback);
 
 class ReplicationCoordinatorImpl::ElectionState::LoseElectionGuardV1 {
     LoseElectionGuardV1(const LoseElectionGuardV1&) = delete;
@@ -134,7 +138,12 @@ ReplicationCoordinatorImpl::ElectionState::getElectionDryRunFinishedEvent(WithLo
 
 void ReplicationCoordinatorImpl::ElectionState::cancel(WithLock) {
     _isCanceled = true;
-    _voteRequester->cancel();
+    // This check is necessary because _voteRequester is only initialized in _startVoteRequester.
+    // Since we don't hold mutex during the entire election process, it is possible to get here
+    // before _startVoteRequester is ever called.
+    if (_voteRequester) {
+        _voteRequester->cancel();
+    }
 }
 
 void ReplicationCoordinatorImpl::ElectionState::start(WithLock lk, StartElectionReasonEnum reason) {
@@ -333,8 +342,12 @@ void ReplicationCoordinatorImpl::ElectionState::_writeLastVoteForMyElection(
             return cbData.status;
         }
         auto opCtx = cc().makeOperationContext();
-        // Any writes that occur as part of an election should not be subject to Flow Control.
-        opCtx->setShouldParticipateInFlowControl(false);
+        // Any operation that occurs as part of an election process is critical to the operation of
+        // the cluster. We mark the operation as having Immediate priority to skip ticket
+        // acquisition and flow control.
+        ScopedAdmissionPriorityForLock priority(opCtx->lockState(),
+                                                AdmissionContext::Priority::kImmediate);
+
         LOGV2(6015300,
               "Storing last vote document in local storage for my election",
               "lastVote"_attr = lastVote);
@@ -390,12 +403,15 @@ void ReplicationCoordinatorImpl::ElectionState::_requestVotesForRealElection(
     _replExecutor
         ->onEvent(nextPhaseEvh.getValue(),
                   [=](const executor::TaskExecutor::CallbackArgs&) {
+                      if (MONGO_unlikely(hangBeforeOnVoteRequestCompleteCallback.shouldFail())) {
+                          LOGV2(7277400,
+                                "Hang due to hangBeforeOnVoteRequestCompleteCallback failpoint");
+                          hangBeforeOnVoteRequestCompleteCallback.pauseWhileSet();
+                      }
                       _onVoteRequestComplete(newTerm, reason);
                   })
         .status_with_transitional_ignore();
 }
-
-MONGO_FAIL_POINT_DEFINE(electionHangsBeforeUpdateMemberState);
 
 void ReplicationCoordinatorImpl::ElectionState::_onVoteRequestComplete(
     long long newTerm, StartElectionReasonEnum reason) {

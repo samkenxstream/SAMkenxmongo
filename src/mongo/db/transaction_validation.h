@@ -29,8 +29,9 @@
 
 #pragma once
 
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/db/write_concern_options.h"
 
 namespace mongo {
@@ -57,17 +58,18 @@ void validateWriteConcernForTransaction(const WriteConcernOptions& wcResult, Str
 bool isReadConcernLevelAllowedInTransaction(repl::ReadConcernLevel readConcernLevel);
 
 /**
- * Returns true if the given command is one of the commands that does not check out a session
- * regardless of its session options, e.g. two-phase commit commands.
- */
-bool shouldCommandSkipSessionCheckout(StringData cmdName);
-
-/**
  * Throws if the given session options are invalid for the given command and target namespace.
  */
 void validateSessionOptions(const OperationSessionInfoFromClient& sessionOptions,
                             StringData cmdName,
                             const NamespaceString& nss,
                             bool allowTransactionsOnConfigDatabase);
+
+/**
+ * Throws if the specified namespace refers to a systems collection that is not
+ * allowed to be modified via a transaction, or if the specified namespace
+ * refers to a collection that is unreplicated.
+ */
+void doTransactionValidationForWrites(OperationContext* opCtx, const NamespaceString& ns);
 
 }  // namespace mongo

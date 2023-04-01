@@ -47,12 +47,25 @@ public:
     void visit(tree_walker::MaybeConstPtr<true, sbe::ScanStats> stats) override final {
         _summary.totalDocsExamined += stats->numReads;
     }
+    void visit(tree_walker::MaybeConstPtr<true, sbe::ColumnScanStats> stats) override final {
+        _summary.totalDocsExamined += stats->numRowStoreFetches + stats->numRowStoreScans;
+        for (auto const& stat : stats->cursorStats)
+            _summary.totalKeysExamined += stat.numNexts + stat.numSeeks;
+        for (auto const& stat : stats->parentCursorStats)
+            _summary.totalKeysExamined += stat.numNexts + stat.numSeeks;
+    }
     void visit(tree_walker::MaybeConstPtr<true, sbe::IndexScanStats> stats) override final {
         _summary.totalKeysExamined += stats->keysExamined;
+    }
+    void visit(tree_walker::MaybeConstPtr<true, sbe::HashAggStats> stats) override final {
+        _summary.usedDisk |= stats->spilledRecords > 0;
     }
     void visit(tree_walker::MaybeConstPtr<true, SortStats> stats) override final {
         _summary.hasSortStage = true;
         _summary.usedDisk = _summary.usedDisk || stats->spills > 0;
+        _summary.sortSpills += stats->spills;
+        _summary.sortTotalDataSizeBytes += stats->totalDataSizeBytes;
+        _summary.keysSorted += stats->keysSorted;
     }
     void visit(tree_walker::MaybeConstPtr<true, GroupStats> stats) override final {
         _summary.usedDisk = _summary.usedDisk || stats->spills > 0;
@@ -89,6 +102,9 @@ private:
         _summary.collectionScansNonTailable += statsIn.collectionScansNonTailable;
         _summary.hasSortStage |= statsIn.hasSortStage;
         _summary.usedDisk |= statsIn.usedDisk;
+        _summary.sortSpills += statsIn.sortSpills;
+        _summary.sortTotalDataSizeBytes += statsIn.sortTotalDataSizeBytes;
+        _summary.keysSorted += statsIn.keysSorted;
         _summary.planFailed |= statsIn.planFailed;
         _summary.indexesUsed.insert(statsIn.indexesUsed.begin(), statsIn.indexesUsed.end());
     }

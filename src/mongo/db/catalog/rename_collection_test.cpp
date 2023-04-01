@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <memory>
 #include <set>
 #include <string>
@@ -36,19 +34,20 @@
 
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
-#include "mongo/db/op_observer_noop.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_noop.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
@@ -57,14 +56,14 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
+namespace mongo {
 namespace {
-
-using namespace mongo;
 
 /**
  * Mock OpObserver that tracks dropped collections and databases.
@@ -102,18 +101,19 @@ public:
                            bool fromMigrate) override;
 
     void onInserts(OperationContext* opCtx,
-                   const NamespaceString& nss,
-                   const UUID& uuid,
+                   const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
-                   bool fromMigrate) override;
+                   std::vector<bool> fromMigrate,
+                   bool defaultFromMigrate) override;
 
     void onCreateCollection(OperationContext* opCtx,
                             const CollectionPtr& coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
                             const BSONObj& idIndex,
-                            const OplogSlot& createOpTime) override;
+                            const OplogSlot& createOpTime,
+                            bool fromMigrate) override;
 
     using OpObserver::onDropCollection;
     repl::OpTime onDropCollection(OperationContext* opCtx,
@@ -209,20 +209,20 @@ void OpObserverMock::onAbortIndexBuild(OperationContext* opCtx,
 }
 
 void OpObserverMock::onInserts(OperationContext* opCtx,
-                               const NamespaceString& nss,
-                               const UUID& uuid,
+                               const CollectionPtr& coll,
                                std::vector<InsertStatement>::const_iterator begin,
                                std::vector<InsertStatement>::const_iterator end,
-                               bool fromMigrate) {
+                               std::vector<bool> fromMigrate,
+                               bool defaultFromMigrate) {
     if (onInsertsThrows) {
         uasserted(ErrorCodes::OperationFailed, "insert failed");
     }
 
     onInsertsIsTargetDatabaseExclusivelyLocked =
-        opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_X);
+        opCtx->lockState()->isDbLockedForMode(coll->ns().dbName(), MODE_X);
 
-    _logOp(opCtx, nss, "inserts");
-    OpObserverNoop::onInserts(opCtx, nss, uuid, begin, end, fromMigrate);
+    _logOp(opCtx, coll->ns(), "inserts");
+    OpObserverNoop::onInserts(opCtx, coll, begin, end, std::move(fromMigrate), defaultFromMigrate);
 }
 
 void OpObserverMock::onCreateCollection(OperationContext* opCtx,
@@ -230,9 +230,11 @@ void OpObserverMock::onCreateCollection(OperationContext* opCtx,
                                         const NamespaceString& collectionName,
                                         const CollectionOptions& options,
                                         const BSONObj& idIndex,
-                                        const OplogSlot& createOpTime) {
+                                        const OplogSlot& createOpTime,
+                                        bool fromMigrate) {
     _logOp(opCtx, collectionName, "create");
-    OpObserverNoop::onCreateCollection(opCtx, coll, collectionName, options, idIndex, createOpTime);
+    OpObserverNoop::onCreateCollection(
+        opCtx, coll, collectionName, options, idIndex, createOpTime, fromMigrate);
 }
 
 repl::OpTime OpObserverMock::onDropCollection(OperationContext* opCtx,
@@ -301,22 +303,27 @@ void OpObserverMock::_logOp(OperationContext* opCtx,
     }
     oplogEntries.push_back(operationName);
 }
-
 class RenameCollectionTest : public ServiceContextMongoDTest {
+
 public:
     static ServiceContext::UniqueOperationContext makeOpCtx();
 
-private:
+protected:
     void setUp() override;
     void tearDown() override;
 
-protected:
+    explicit RenameCollectionTest(Options options = {})
+        : ServiceContextMongoDTest(std::move(options)) {}
+
     ServiceContext::UniqueOperationContext _opCtx;
     repl::ReplicationCoordinatorMock* _replCoord = nullptr;
     OpObserverMock* _opObserver = nullptr;
-    NamespaceString _sourceNss;
-    NamespaceString _targetNss;
-    NamespaceString _targetNssDifferentDb;
+    NamespaceString _sourceNss{
+        NamespaceString::createNamespaceString_forTest(boost::none, "test.foo")};
+    NamespaceString _targetNss{
+        NamespaceString::createNamespaceString_forTest(boost::none, "test.bar")};
+    NamespaceString _targetNssDifferentDb{
+        NamespaceString::createNamespaceString_forTest(boost::none, "test2.bar")};
 };
 
 // static
@@ -351,10 +358,6 @@ void RenameCollectionTest::setUp() {
     _opObserver = mockObserver.get();
     opObserver->addObserver(std::move(mockObserver));
     service->setOpObserver(std::move(opObserver));
-
-    _sourceNss = NamespaceString("test.foo");
-    _targetNss = NamespaceString("test.bar");
-    _targetNssDifferentDb = NamespaceString("test2.bar");
 }
 
 void RenameCollectionTest::tearDown() {
@@ -378,7 +381,7 @@ void _createCollection(OperationContext* opCtx,
                        const NamespaceString& nss,
                        const CollectionOptions options = {}) {
     writeConflictRetry(opCtx, "_createCollection", nss.ns(), [=] {
-        AutoGetDb autoDb(opCtx, nss.db(), MODE_X);
+        AutoGetDb autoDb(opCtx, nss.dbName(), MODE_X);
         auto db = autoDb.ensureDbExists(opCtx);
         ASSERT_TRUE(db) << "Cannot create collection " << nss << " because database " << nss.db()
                         << " does not exist.";
@@ -407,14 +410,14 @@ CollectionOptions _makeCollectionOptionsWithUuid() {
 UUID _createCollectionWithUUID(OperationContext* opCtx, const NamespaceString& nss) {
     const auto options = _makeCollectionOptionsWithUuid();
     _createCollection(opCtx, nss, options);
-    return options.uuid.get();
+    return options.uuid.value();
 }
 
 /**
  * Returns true if collection exists.
  */
 bool _collectionExists(OperationContext* opCtx, const NamespaceString& nss) {
-    return AutoGetCollectionForRead(opCtx, nss).getCollection() != nullptr;
+    return static_cast<bool>(AutoGetCollectionForRead(opCtx, nss).getCollection());
 }
 
 /**
@@ -440,8 +443,7 @@ UUID _getCollectionUuid(OperationContext* opCtx, const NamespaceString& nss) {
  * Get collection namespace by UUID.
  */
 NamespaceString _getCollectionNssFromUUID(OperationContext* opCtx, const UUID& uuid) {
-    const CollectionPtr& source =
-        CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, uuid);
+    const Collection* source = CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, uuid);
     return source ? source->ns() : NamespaceString();
 }
 
@@ -493,7 +495,8 @@ void _insertDocument(OperationContext* opCtx, const NamespaceString& nss, const 
 
         WriteUnitOfWork wuow(opCtx);
         OpDebug* const opDebug = nullptr;
-        ASSERT_OK(collection->insertDocument(opCtx, InsertStatement(doc), opDebug));
+        ASSERT_OK(
+            collection_internal::insertDocument(opCtx, *collection, InsertStatement(doc), opDebug));
         wuow.commit();
     });
 }
@@ -505,15 +508,15 @@ void _insertDocument(OperationContext* opCtx, const NamespaceString& nss, const 
 CollectionPtr _getCollection_inlock(OperationContext* opCtx, const NamespaceString& nss) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IS));
     auto databaseHolder = DatabaseHolder::get(opCtx);
-    auto* db = databaseHolder->getDb(opCtx, TenantDatabaseName(boost::none, nss.db()));
+    auto* db = databaseHolder->getDb(opCtx, DatabaseName(boost::none, nss.db()));
     if (!db) {
-        return nullptr;
+        return CollectionPtr();
     }
-    return CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
+    return CollectionPtr(CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss));
 }
 
 TEST_F(RenameCollectionTest, RenameCollectionReturnsNamespaceNotFoundIfDatabaseDoesNotExist) {
-    ASSERT_FALSE(AutoGetDb(_opCtx.get(), _sourceNss.db(), MODE_X).getDb());
+    ASSERT_FALSE(AutoGetDb(_opCtx.get(), _sourceNss.dbName(), MODE_X).getDb());
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
                   renameCollection(_opCtx.get(), _sourceNss, _targetNss, {}));
 }
@@ -544,7 +547,8 @@ TEST_F(RenameCollectionTest, RenameCollectionReturnsNotWritablePrimaryIfNotPrima
 TEST_F(RenameCollectionTest, TargetCollectionNameLong) {
     _createCollection(_opCtx.get(), _sourceNss);
     const std::string targetCollectionName(255, 'a');
-    NamespaceString longTargetNss(_sourceNss.db(), targetCollectionName);
+    NamespaceString longTargetNss =
+        NamespaceString::createNamespaceString_forTest(_sourceNss.db(), targetCollectionName);
     ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, longTargetNss, {}));
 }
 
@@ -563,7 +567,8 @@ TEST_F(RenameCollectionTest, LongIndexNameAllowedForTemporaryCollectionForRename
 
     // Using XXXXX to check namespace length. Each 'X' will be replaced by a random character in
     // renameCollection().
-    const NamespaceString tempNss(_targetNssDifferentDb.getSisterNS("tmpXXXXX.renameCollection"));
+    const NamespaceString tempNss = NamespaceString::createNamespaceString_forTest(
+        _targetNssDifferentDb.getSisterNS("tmpXXXXX.renameCollection"));
 
     _createCollection(_opCtx.get(), _sourceNss);
     std::size_t longIndexLength = 500;
@@ -587,10 +592,9 @@ TEST_F(RenameCollectionTest,
     auto dropPendingNss = _sourceNss.makeDropPendingNamespace(dropOpTime);
     _createCollection(_opCtx.get(), dropPendingNss);
 
-    auto dbName = _sourceNss.db().toString();
     auto cmd = BSON("renameCollection" << dropPendingNss.ns() << "to" << _targetNss.ns());
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
-                  renameCollectionForApplyOps(_opCtx.get(), dbName, boost::none, cmd, {}));
+                  renameCollectionForApplyOps(_opCtx.get(), boost::none, boost::none, cmd, {}));
 
     // Source collections stays in drop-pending state.
     ASSERT_FALSE(_collectionExists(_opCtx.get(), _targetNss));
@@ -605,11 +609,11 @@ TEST_F(
     auto options = _makeCollectionOptionsWithUuid();
     _createCollection(_opCtx.get(), dropPendingNss, options);
 
-    auto dbName = _sourceNss.db().toString();
-    NamespaceString ignoredSourceNss(dbName, "ignored");
+    NamespaceString ignoredSourceNss =
+        NamespaceString::createNamespaceString_forTest(_sourceNss.dbName(), "ignored");
     auto cmd = BSON("renameCollection" << ignoredSourceNss.ns() << "to" << _targetNss.ns());
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
-                  renameCollectionForApplyOps(_opCtx.get(), dbName, options.uuid, cmd, {}));
+                  renameCollectionForApplyOps(_opCtx.get(), options.uuid, boost::none, cmd, {}));
 
     // Source collections stays in drop-pending state.
     ASSERT_FALSE(_collectionExists(_opCtx.get(), _targetNss));
@@ -618,44 +622,40 @@ TEST_F(
 }
 
 TEST_F(RenameCollectionTest, RenameCollectionToItselfByNsForApplyOps) {
-    auto dbName = _sourceNss.db().toString();
     auto uuid = _createCollectionWithUUID(_opCtx.get(), _sourceNss);
     auto cmd = BSON("renameCollection" << _sourceNss.ns() << "to" << _sourceNss.ns() << "dropTarget"
                                        << true);
-    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), dbName, uuid, cmd, {}));
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), uuid, boost::none, cmd, {}));
     ASSERT_TRUE(_collectionExists(_opCtx.get(), _sourceNss));
 }
 
 TEST_F(RenameCollectionTest, RenameCollectionToItselfByUUIDForApplyOps) {
-    auto dbName = _targetNss.db().toString();
     auto uuid = _createCollectionWithUUID(_opCtx.get(), _targetNss);
     auto cmd = BSON("renameCollection" << _sourceNss.ns() << "to" << _targetNss.ns() << "dropTarget"
                                        << true);
-    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), dbName, uuid, cmd, {}));
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), uuid, boost::none, cmd, {}));
     ASSERT_TRUE(_collectionExists(_opCtx.get(), _targetNss));
 }
 
 TEST_F(RenameCollectionTest, RenameCollectionByUUIDRatherThanNsForApplyOps) {
-    auto realRenameFromNss = NamespaceString("test.bar2");
-    auto dbName = realRenameFromNss.db().toString();
+    auto realRenameFromNss = NamespaceString::createNamespaceString_forTest("test.bar2");
     auto uuid = _createCollectionWithUUID(_opCtx.get(), realRenameFromNss);
     auto cmd = BSON("renameCollection" << _sourceNss.ns() << "to" << _targetNss.ns() << "dropTarget"
                                        << true);
-    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), dbName, uuid, cmd, {}));
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), uuid, boost::none, cmd, {}));
     ASSERT_TRUE(_collectionExists(_opCtx.get(), _targetNss));
 }
 
 TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsDropTargetByUUIDTargetDoesNotExist) {
-    const auto& collA = NamespaceString("test.A");
-    const auto& collB = NamespaceString("test.B");
-    const auto& collC = NamespaceString("test.C");
-    auto dbName = collA.db().toString();
+    const auto& collA = NamespaceString::createNamespaceString_forTest("test.A");
+    const auto& collB = NamespaceString::createNamespaceString_forTest("test.B");
+    const auto& collC = NamespaceString::createNamespaceString_forTest("test.C");
     auto collAUUID = _createCollectionWithUUID(_opCtx.get(), collA);
     auto collCUUID = _createCollectionWithUUID(_opCtx.get(), collC);
     // Rename A to B, drop C, where B is not an existing collection
     auto cmd =
         BSON("renameCollection" << collA.ns() << "to" << collB.ns() << "dropTarget" << collCUUID);
-    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), dbName, collAUUID, cmd, {}));
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), collAUUID, boost::none, cmd, {}));
     // A and C should be dropped
     ASSERT_FALSE(_collectionExists(_opCtx.get(), collA));
     ASSERT_FALSE(_collectionExists(_opCtx.get(), collC));
@@ -668,10 +668,9 @@ TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsDropTargetByUUIDTargetDo
 }
 
 TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsDropTargetByUUIDTargetExists) {
-    const auto& collA = NamespaceString("test.A");
-    const auto& collB = NamespaceString("test.B");
-    const auto& collC = NamespaceString("test.C");
-    auto dbName = collA.db().toString();
+    const auto& collA = NamespaceString::createNamespaceString_forTest("test.A");
+    const auto& collB = NamespaceString::createNamespaceString_forTest("test.B");
+    const auto& collC = NamespaceString::createNamespaceString_forTest("test.C");
     auto collAUUID = _createCollectionWithUUID(_opCtx.get(), collA);
     auto collBUUID = _createCollectionWithUUID(_opCtx.get(), collB);
     auto collCUUID = _createCollectionWithUUID(_opCtx.get(), collC);
@@ -679,7 +678,7 @@ TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsDropTargetByUUIDTargetEx
     // B should be kept but with a temporary name
     auto cmd =
         BSON("renameCollection" << collA.ns() << "to" << collB.ns() << "dropTarget" << collCUUID);
-    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), dbName, collAUUID, cmd, {}));
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), collAUUID, boost::none, cmd, {}));
     // A and C should be dropped
     ASSERT_FALSE(_collectionExists(_opCtx.get(), collA));
     ASSERT_FALSE(_collectionExists(_opCtx.get(), collC));
@@ -696,23 +695,22 @@ TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsDropTargetByUUIDTargetEx
 TEST_F(RenameCollectionTest,
        RenameCollectionForApplyOpsDropTargetByUUIDTargetExistsButTemporarily) {
 
-    const auto& collA = NamespaceString("test.A");
-    const auto& collB = NamespaceString("test.B");
-    const auto& collC = NamespaceString("test.C");
+    const auto& collA = NamespaceString::createNamespaceString_forTest("test.A");
+    const auto& collB = NamespaceString::createNamespaceString_forTest("test.B");
+    const auto& collC = NamespaceString::createNamespaceString_forTest("test.C");
 
     CollectionOptions collectionOptions = _makeCollectionOptionsWithUuid();
     collectionOptions.temp = true;
     _createCollection(_opCtx.get(), collB, collectionOptions);
     auto collBUUID = _getCollectionUuid(_opCtx.get(), collB);
 
-    auto dbName = collA.db().toString();
     auto collAUUID = _createCollectionWithUUID(_opCtx.get(), collA);
     auto collCUUID = _createCollectionWithUUID(_opCtx.get(), collC);
     // Rename A to B, drop C, where B is an existing collection
     // B should be kept but with a temporary name
     auto cmd =
         BSON("renameCollection" << collA.ns() << "to" << collB.ns() << "dropTarget" << collCUUID);
-    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), dbName, collAUUID, cmd, {}));
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), collAUUID, boost::none, cmd, {}));
     // A and C should be dropped
     ASSERT_FALSE(_collectionExists(_opCtx.get(), collA));
     ASSERT_FALSE(_collectionExists(_opCtx.get(), collC));
@@ -729,9 +727,8 @@ TEST_F(RenameCollectionTest,
 
 TEST_F(RenameCollectionTest,
        RenameCollectionForApplyOpsDropTargetByUUIDTargetExistsButRealDropTargetDoesNotExist) {
-    const auto& collA = NamespaceString("test.A");
-    const auto& collB = NamespaceString("test.B");
-    auto dbName = collA.db().toString();
+    const auto& collA = NamespaceString::createNamespaceString_forTest("test.A");
+    const auto& collB = NamespaceString::createNamespaceString_forTest("test.B");
     auto collAUUID = _createCollectionWithUUID(_opCtx.get(), collA);
     auto collBUUID = _createCollectionWithUUID(_opCtx.get(), collB);
     auto collCUUID = UUID::gen();
@@ -739,7 +736,7 @@ TEST_F(RenameCollectionTest,
     // B should be kept but with a temporary name
     auto cmd =
         BSON("renameCollection" << collA.ns() << "to" << collB.ns() << "dropTarget" << collCUUID);
-    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), dbName, collAUUID, cmd, {}));
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), collAUUID, boost::none, cmd, {}));
     // A and C should be dropped
     ASSERT_FALSE(_collectionExists(_opCtx.get(), collA));
     // B (originally A) should exist
@@ -762,31 +759,6 @@ TEST_F(RenameCollectionTest,
                   renameCollection(_opCtx.get(), _sourceNss, _targetNss, options));
 }
 
-TEST_F(RenameCollectionTest, RenameCollectionMakesTargetCollectionDropPendingIfDropTargetIsTrue) {
-    _createCollectionWithUUID(_opCtx.get(), _sourceNss);
-    auto targetUUID = _createCollectionWithUUID(_opCtx.get(), _targetNss);
-    RenameCollectionOptions options;
-    options.dropTarget = true;
-    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNss, options));
-    ASSERT_FALSE(_collectionExists(_opCtx.get(), _sourceNss))
-        << "source collection " << _sourceNss << " still exists after successful rename";
-    ASSERT_TRUE(_collectionExists(_opCtx.get(), _targetNss))
-        << "target collection " << _targetNss << " missing after successful rename";
-
-    ASSERT_TRUE(_opObserver->onRenameCollectionCalled);
-    ASSERT(_opObserver->onRenameCollectionDropTarget);
-    ASSERT_EQUALS(targetUUID, *_opObserver->onRenameCollectionDropTarget);
-
-    auto renameOpTime = _opObserver->renameOpTime;
-    ASSERT_GREATER_THAN(renameOpTime, repl::OpTime());
-
-    // Confirm that the target collection has been renamed to a drop-pending collection.
-    auto dpns = _targetNss.makeDropPendingNamespace(renameOpTime);
-    ASSERT_TRUE(_collectionExists(_opCtx.get(), dpns))
-        << "target collection " << _targetNss
-        << " not renamed to drop-pending collection after successful rename";
-}
-
 TEST_F(RenameCollectionTest,
        RenameCollectionOverridesDropTargetIfTargetCollectionIsMissingAndDropTargetIsTrue) {
     _createCollectionWithUUID(_opCtx.get(), _sourceNss);
@@ -806,36 +778,11 @@ TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsRejectsRenameOpTimeIfWri
     ASSERT_TRUE(_opCtx->writesAreReplicated());
 
     _createCollection(_opCtx.get(), _sourceNss);
-    auto dbName = _sourceNss.db().toString();
     auto cmd = BSON("renameCollection" << _sourceNss.ns() << "to" << _targetNss.ns());
     auto renameOpTime = _opObserver->renameOpTime;
     ASSERT_EQUALS(
         ErrorCodes::BadValue,
-        renameCollectionForApplyOps(_opCtx.get(), dbName, boost::none, cmd, renameOpTime));
-}
-
-TEST_F(RenameCollectionTest,
-       RenameCollectionForApplyOpsMakesTargetCollectionDropPendingIfDropTargetIsTrue) {
-    repl::UnreplicatedWritesBlock uwb(_opCtx.get());
-    ASSERT_FALSE(_opCtx->writesAreReplicated());
-
-    // OpObserver::preRenameCollection() must return a null OpTime when writes are not replicated.
-    _opObserver->renameOpTime = {};
-
-    _createCollection(_opCtx.get(), _sourceNss);
-    auto dropTargetUUID = _createCollectionWithUUID(_opCtx.get(), _targetNss);
-    auto dbName = _sourceNss.db().toString();
-    auto cmd = BSON("renameCollection" << _sourceNss.ns() << "to" << _targetNss.ns() << "dropTarget"
-                                       << dropTargetUUID);
-
-    repl::OpTime renameOpTime = {Timestamp(Seconds(200), 1U), 1LL};
-    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), dbName, boost::none, cmd, renameOpTime));
-
-    // Confirm that the target collection has been renamed to a drop-pending collection.
-    auto dpns = _targetNss.makeDropPendingNamespace(renameOpTime);
-    ASSERT_TRUE(_collectionExists(_opCtx.get(), dpns))
-        << "target collection " << _targetNss
-        << " not renamed to drop-pending collection after successful rename for applyOps";
+        renameCollectionForApplyOps(_opCtx.get(), boost::none, boost::none, cmd, renameOpTime));
 }
 
 DEATH_TEST_F(RenameCollectionTest,
@@ -846,112 +793,45 @@ DEATH_TEST_F(RenameCollectionTest,
 
     _createCollection(_opCtx.get(), _sourceNss);
     auto dropTargetUUID = _createCollectionWithUUID(_opCtx.get(), _targetNss);
-    auto dbName = _sourceNss.db().toString();
     auto cmd = BSON("renameCollection" << _sourceNss.ns() << "to" << _targetNss.ns() << "dropTarget"
                                        << dropTargetUUID);
 
     repl::OpTime renameOpTime = {Timestamp(Seconds(200), 1U), 1LL};
-    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), dbName, boost::none, cmd, renameOpTime));
+    ASSERT_OK(
+        renameCollectionForApplyOps(_opCtx.get(), boost::none, boost::none, cmd, renameOpTime));
 }
 
 TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsSourceAndTargetDoNotExist) {
     auto uuid = UUID::gen();
     auto cmd = BSON("renameCollection" << _sourceNss.ns() << "to" << _targetNss.ns() << "dropTarget"
                                        << "true");
-    ASSERT_EQUALS(
-        ErrorCodes::NamespaceNotFound,
-        renameCollectionForApplyOps(_opCtx.get(), _sourceNss.db().toString(), uuid, cmd, {}));
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), uuid, boost::none, cmd, {}));
     ASSERT_FALSE(_collectionExists(_opCtx.get(), _sourceNss));
     ASSERT_FALSE(_collectionExists(_opCtx.get(), _targetNss));
 }
 
 TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsDropTargetEvenIfSourceDoesNotExist) {
     _createCollectionWithUUID(_opCtx.get(), _targetNss);
-    auto missingSourceNss = NamespaceString("test.bar2");
+    auto missingSourceNss = NamespaceString::createNamespaceString_forTest("test.bar2");
     auto uuid = UUID::gen();
     auto cmd =
         BSON("renameCollection" << missingSourceNss.ns() << "to" << _targetNss.ns() << "dropTarget"
                                 << "true");
-    ASSERT_OK(
-        renameCollectionForApplyOps(_opCtx.get(), missingSourceNss.db().toString(), uuid, cmd, {}));
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), uuid, boost::none, cmd, {}));
     ASSERT_FALSE(_collectionExists(_opCtx.get(), _targetNss));
 }
 
 TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsDropTargetByUUIDEvenIfSourceDoesNotExist) {
-    auto missingSourceNss = NamespaceString("test.bar2");
-    auto dropTargetNss = NamespaceString("test.bar3");
+    auto missingSourceNss = NamespaceString::createNamespaceString_forTest("test.bar2");
+    auto dropTargetNss = NamespaceString::createNamespaceString_forTest("test.bar3");
     _createCollectionWithUUID(_opCtx.get(), _targetNss);
     auto dropTargetUUID = _createCollectionWithUUID(_opCtx.get(), dropTargetNss);
     auto uuid = UUID::gen();
     auto cmd = BSON("renameCollection" << missingSourceNss.ns() << "to" << _targetNss.ns()
                                        << "dropTarget" << dropTargetUUID);
-    ASSERT_OK(
-        renameCollectionForApplyOps(_opCtx.get(), missingSourceNss.db().toString(), uuid, cmd, {}));
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), uuid, boost::none, cmd, {}));
     ASSERT_TRUE(_collectionExists(_opCtx.get(), _targetNss));
     ASSERT_FALSE(_collectionExists(_opCtx.get(), dropTargetNss));
-}
-
-TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsDropTargetEvenIfSourceIsDropPending) {
-    repl::OpTime dropOpTime(Timestamp(Seconds(100), 0), 1LL);
-    auto dropPendingNss = _sourceNss.makeDropPendingNamespace(dropOpTime);
-
-    auto dropTargetUUID = _createCollectionWithUUID(_opCtx.get(), _targetNss);
-    auto uuid = _createCollectionWithUUID(_opCtx.get(), dropPendingNss);
-    auto cmd =
-        BSON("renameCollection" << dropPendingNss.ns() << "to" << _targetNss.ns() << "dropTarget"
-                                << "true");
-
-    repl::UnreplicatedWritesBlock uwb(_opCtx.get());
-    repl::OpTime renameOpTime = {Timestamp(Seconds(200), 1U), 1LL};
-    ASSERT_OK(renameCollectionForApplyOps(
-        _opCtx.get(), dropPendingNss.db().toString(), uuid, cmd, renameOpTime));
-
-    // Source collections stays in drop-pending state.
-    ASSERT_TRUE(_collectionExists(_opCtx.get(), dropPendingNss));
-    ASSERT_FALSE(_collectionExists(_opCtx.get(), _targetNss));
-    ASSERT_EQUALS(_targetNss.makeDropPendingNamespace(renameOpTime),
-                  _getCollectionNssFromUUID(_opCtx.get(), dropTargetUUID));
-}
-
-TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsDropTargetByUUIDEvenIfSourceIsDropPending) {
-    repl::OpTime dropOpTime(Timestamp(Seconds(100), 0), 1LL);
-    auto dropPendingNss = _sourceNss.makeDropPendingNamespace(dropOpTime);
-    auto dropTargetNss = NamespaceString("test.bar2");
-
-    _createCollectionWithUUID(_opCtx.get(), _targetNss);
-
-    auto dropTargetUUID = _createCollectionWithUUID(_opCtx.get(), dropTargetNss);
-    auto uuid = _createCollectionWithUUID(_opCtx.get(), dropPendingNss);
-    auto cmd = BSON("renameCollection" << dropPendingNss.ns() << "to" << _targetNss.ns()
-                                       << "dropTarget" << dropTargetUUID);
-
-    repl::UnreplicatedWritesBlock uwb(_opCtx.get());
-    repl::OpTime renameOpTime = {Timestamp(Seconds(200), 1U), 1LL};
-    ASSERT_OK(renameCollectionForApplyOps(
-        _opCtx.get(), dropPendingNss.db().toString(), uuid, cmd, renameOpTime));
-
-    // Source collections stays in drop-pending state.
-    ASSERT_TRUE(_collectionExists(_opCtx.get(), dropPendingNss));
-    ASSERT_FALSE(_collectionExists(_opCtx.get(), dropTargetNss));
-    ASSERT_EQUALS(dropTargetNss.makeDropPendingNamespace(renameOpTime),
-                  _getCollectionNssFromUUID(_opCtx.get(), dropTargetUUID));
-    ASSERT_TRUE(_collectionExists(_opCtx.get(), _targetNss));
-}
-
-TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsDropTargetByUUIDEvenIfSourceEqualsTarget) {
-    auto dropTargetUUID = _createCollectionWithUUID(_opCtx.get(), _targetNss);
-    auto uuid = _createCollectionWithUUID(_opCtx.get(), _sourceNss);
-    auto cmd = BSON("renameCollection" << _sourceNss.ns() << "to" << _sourceNss.ns() << "dropTarget"
-                                       << dropTargetUUID);
-    repl::UnreplicatedWritesBlock uwb(_opCtx.get());
-    repl::OpTime renameOpTime = {Timestamp(Seconds(200), 1U), 1LL};
-    auto dpns = _targetNss.makeDropPendingNamespace(renameOpTime);
-    ASSERT_OK(renameCollectionForApplyOps(
-        _opCtx.get(), _sourceNss.db().toString(), uuid, cmd, renameOpTime));
-
-    ASSERT_TRUE(_collectionExists(_opCtx.get(), _sourceNss));
-    ASSERT_TRUE(_collectionExists(_opCtx.get(), dpns));
-    ASSERT_FALSE(_collectionExists(_opCtx.get(), _targetNss));
 }
 
 void _testRenameCollectionStayTemp(OperationContext* opCtx,
@@ -1056,8 +936,7 @@ void _testRenameCollectionAcrossDatabaseOplogEntries(
     if (forApplyOps) {
         auto cmd = BSON("renameCollection" << sourceNss.ns() << "to" << targetNss.ns()
                                            << "dropTarget" << true);
-        ASSERT_OK(
-            renameCollectionForApplyOps(opCtx, sourceNss.db().toString(), boost::none, cmd, {}));
+        ASSERT_OK(renameCollectionForApplyOps(opCtx, boost::none, sourceNss.tenantId(), cmd, {}));
     } else {
         RenameCollectionOptions options;
         options.dropTarget = true;
@@ -1175,15 +1054,16 @@ TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabasesWithLocks) {
     // from secondary oplog application).
     _createCollection(_opCtx.get(), _sourceNss);
     _insertDocument(_opCtx.get(), _sourceNss, BSON("_id" << 0));
-    Lock::DBLock sourceLk(_opCtx.get(), _sourceNss.db(), MODE_X);
-    Lock::DBLock targetLk(_opCtx.get(), _targetNssDifferentDb.db(), MODE_X);
+    Lock::DBLock sourceLk(_opCtx.get(), _sourceNss.dbName(), MODE_X);
+    Lock::DBLock targetLk(_opCtx.get(), _targetNssDifferentDb.dbName(), MODE_X);
     ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
     ASSERT_TRUE(_opObserver->onInsertsIsTargetDatabaseExclusivelyLocked);
 }
 
 TEST_F(RenameCollectionTest, FailRenameCollectionFromReplicatedToUnreplicatedDB) {
-    NamespaceString sourceNss("foo.isReplicated");
-    NamespaceString targetNss("local.isUnreplicated");
+    NamespaceString sourceNss = NamespaceString::createNamespaceString_forTest("foo.isReplicated");
+    NamespaceString targetNss =
+        NamespaceString::createNamespaceString_forTest("local.isUnreplicated");
 
     _createCollection(_opCtx.get(), sourceNss);
 
@@ -1192,8 +1072,9 @@ TEST_F(RenameCollectionTest, FailRenameCollectionFromReplicatedToUnreplicatedDB)
 }
 
 TEST_F(RenameCollectionTest, FailRenameCollectionFromUnreplicatedToReplicatedDB) {
-    NamespaceString sourceNss("foo.system.profile");
-    NamespaceString targetNss("foo.bar");
+    NamespaceString sourceNss =
+        NamespaceString::createNamespaceString_forTest("foo.system.profile");
+    NamespaceString targetNss = NamespaceString::createNamespaceString_forTest("foo.bar");
 
     _createCollection(_opCtx.get(), sourceNss);
 
@@ -1204,15 +1085,250 @@ TEST_F(RenameCollectionTest, FailRenameCollectionFromUnreplicatedToReplicatedDB)
 TEST_F(RenameCollectionTest,
        RenameCollectionForApplyOpsReturnsInvalidNamespaceIfTargetNamespaceIsInvalid) {
     _createCollection(_opCtx.get(), _sourceNss);
-    auto dbName = _sourceNss.db().toString();
 
     // Create a namespace that is not in the form "database.collection".
-    NamespaceString invalidTargetNss("invalidNamespace");
+    NamespaceString invalidTargetNss =
+        NamespaceString::createNamespaceString_forTest("invalidNamespace");
 
     auto cmd = BSON("renameCollection" << _sourceNss.ns() << "to" << invalidTargetNss.ns());
 
     ASSERT_EQUALS(ErrorCodes::InvalidNamespace,
-                  renameCollectionForApplyOps(_opCtx.get(), dbName, boost::none, cmd, {}));
+                  renameCollectionForApplyOps(_opCtx.get(), boost::none, boost::none, cmd, {}));
+}
+
+TEST_F(RenameCollectionTest, FailRenameCollectionFromSystemJavascript) {
+    NamespaceString sourceNss = NamespaceString::createNamespaceString_forTest(
+        "foo", NamespaceString::kSystemDotJavascriptCollectionName);
+    NamespaceString targetNss = NamespaceString::createNamespaceString_forTest("foo.bar");
+
+    _createCollection(_opCtx.get(), sourceNss);
+
+    auto status = renameCollection(_opCtx.get(), sourceNss, targetNss, {});
+
+    ASSERT_EQUALS(ErrorCodes::IllegalOperation, status);
+    ASSERT_STRING_SEARCH_REGEX(status.reason(), "renaming system.js.*not allowed");
+
+    // Used for sharded rename.
+    ASSERT_THROWS_CODE_AND_WHAT(
+        validateNamespacesForRenameCollection(_opCtx.get(), sourceNss, targetNss),
+        AssertionException,
+        ErrorCodes::IllegalOperation,
+        status.reason());
+}
+
+TEST_F(RenameCollectionTest, FailRenameCollectionToSystemJavascript) {
+    NamespaceString sourceNss = NamespaceString::createNamespaceString_forTest("foo.bar");
+    NamespaceString targetNss = NamespaceString::createNamespaceString_forTest(
+        "foo", NamespaceString::kSystemDotJavascriptCollectionName);
+
+    _createCollection(_opCtx.get(), sourceNss);
+
+    auto status = renameCollection(_opCtx.get(), sourceNss, targetNss, {});
+
+    ASSERT_EQUALS(ErrorCodes::IllegalOperation, status);
+    ASSERT_STRING_SEARCH_REGEX(status.reason(), "renaming to system.js.*not allowed");
+
+    // Used for sharded rename.
+    ASSERT_THROWS_CODE_AND_WHAT(
+        validateNamespacesForRenameCollection(_opCtx.get(), sourceNss, targetNss),
+        AssertionException,
+        ErrorCodes::IllegalOperation,
+        status.reason());
+}
+
+
+class RenameCollectionTestMultitenancy : public RenameCollectionTest {
+
+private:
+    void setUp() override;
+
+protected:
+    TenantId _tenantId{TenantId(OID::gen())};
+    TenantId _otherTenantId{TenantId(OID::gen())};
+    std::string _sourceNs{"test.foo"};
+    std::string _otherNs{"test.bar"};
+
+    NamespaceString _sourceNssTid =
+        (NamespaceString::createNamespaceString_forTest(_tenantId, _sourceNs));
+};
+
+void RenameCollectionTestMultitenancy::setUp() {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+
+    RenameCollectionTest::setUp();
+
+    _createCollection(_opCtx.get(), _sourceNssTid);
+    _createIndexOnEmptyCollection(_opCtx.get(), _sourceNssTid, "a_1");
+    _insertDocument(_opCtx.get(), _sourceNssTid, BSON("_id" << 0));
+
+    ASSERT_TRUE(_collectionExists(_opCtx.get(), _sourceNssTid));
+}
+
+TEST_F(RenameCollectionTestMultitenancy, RenameCollectionForApplyOps) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", true);
+
+    const NamespaceString targetNssTid =
+        NamespaceString::createNamespaceString_forTest(_tenantId, _otherNs);
+    ASSERT_NOT_EQUALS(_sourceNssTid, targetNssTid);
+
+    // A tid field supersedes tenantIds maintained in source or target, ie. we don't take into
+    // account the tenantId from the _sourceNssTid or targetNssTid objects, only the _tenantId obj.
+    // This makes it impossible to mismatch tenantIds between source and target if the only tenantId
+    // being considered is common to both; if it doesn't match the source, rename will fail being
+    // unable to locate the source collection.  If the targetNss tenantId doesn't match, well we're
+    // going to rename the db/collection within the _tenantId, so this effectively ensures it isn't
+    // possible to rename across tenantIds.
+    auto cmd =
+        BSON("renameCollection" << _sourceNssTid.toString() << "to" << targetNssTid.toString());
+
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), boost::none, _tenantId, cmd, {}));
+    ASSERT_TRUE(_collectionExists(_opCtx.get(), targetNssTid));
+    ASSERT_FALSE(_collectionExists(_opCtx.get(), _sourceNssTid));
+}
+
+TEST_F(RenameCollectionTestMultitenancy, RenameCollectionForApplyOpsCommonRandomTid) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", true);
+
+    const NamespaceString targetNssTid =
+        NamespaceString::createNamespaceString_forTest(_otherTenantId, _sourceNs);
+    ASSERT_NOT_EQUALS(_sourceNssTid, targetNssTid);
+
+    // This test only has a single tenantId that belongs to neither source nor target.
+    auto cmd =
+        BSON("renameCollection" << _sourceNssTid.toString() << "to" << targetNssTid.toString());
+
+    // Because the tenantId doesn't belong to the source, we should see a collection not found
+    // error.
+    ASSERT_EQUALS(
+        ErrorCodes::NamespaceNotFound,
+        renameCollectionForApplyOps(_opCtx.get(), boost::none, TenantId(OID::gen()), cmd, {}));
+    ASSERT_TRUE(_collectionExists(_opCtx.get(), _sourceNssTid));
+}
+
+TEST_F(RenameCollectionTestMultitenancy, RenameCollectionForApplyOpsCommonTid) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", true);
+
+    const NamespaceString targetNssTid =
+        NamespaceString::createNamespaceString_forTest(_otherTenantId, _otherNs);
+    ASSERT_NOT_EQUALS(_sourceNssTid, targetNssTid);
+
+    // A tid field supersedes tenantIds maintained in source or target. See above.
+    auto cmd =
+        BSON("renameCollection" << _sourceNssTid.toString() << "to" << targetNssTid.toString());
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), boost::none, _tenantId, cmd, {}));
+    ASSERT_TRUE(_collectionExists(
+        _opCtx.get(),
+        NamespaceString::createNamespaceString_forTest(_tenantId, targetNssTid.toString())));
+    ASSERT_FALSE(_collectionExists(_opCtx.get(), _sourceNssTid));
+}
+
+TEST_F(RenameCollectionTestMultitenancy, RenameCollectionForApplyOpsSourceExistsOnWrongTenant) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", true);
+
+    const NamespaceString otherSourceNssTid =
+        NamespaceString::createNamespaceString_forTest(_otherTenantId, _sourceNs);
+    const NamespaceString targetNssTid =
+        NamespaceString::createNamespaceString_forTest(_otherTenantId, _otherNs);
+    ASSERT_NOT_EQUALS(otherSourceNssTid, targetNssTid);
+
+    // A tid field supersedes tenantIds maintained in source or target. See above.
+    auto cmd =
+        BSON("renameCollection" << otherSourceNssTid.toString() << "to" << targetNssTid.toString());
+    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
+                  renameCollectionForApplyOps(_opCtx.get(), boost::none, _otherTenantId, cmd, {}));
+    ASSERT_TRUE(_collectionExists(_opCtx.get(), _sourceNssTid));
+    ASSERT_FALSE(_collectionExists(_opCtx.get(), otherSourceNssTid));
+    ASSERT_FALSE(_collectionExists(_opCtx.get(), targetNssTid));
+}
+
+TEST_F(RenameCollectionTestMultitenancy,
+       RenameCollectionForApplyOpsSourceExistsOnWrongTenantRequireTenantIdFalse) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", false);
+
+    const NamespaceString otherSourceNssTid =
+        NamespaceString::createNamespaceString_forTest(_otherTenantId, _sourceNs);
+    const NamespaceString targetNssTid =
+        NamespaceString::createNamespaceString_forTest(_otherTenantId, _otherNs);
+    ASSERT_NOT_EQUALS(otherSourceNssTid, targetNssTid);
+
+    // A tid field supersedes tenantIds maintained in source or target. See above.
+    auto cmd = BSON("renameCollection" << otherSourceNssTid.toStringWithTenantId() << "to"
+                                       << targetNssTid.toStringWithTenantId());
+    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
+                  renameCollectionForApplyOps(_opCtx.get(), boost::none, boost::none, cmd, {}));
+    ASSERT_TRUE(_collectionExists(_opCtx.get(), _sourceNssTid));
+    ASSERT_FALSE(_collectionExists(_opCtx.get(), otherSourceNssTid));
+    ASSERT_FALSE(_collectionExists(_opCtx.get(), targetNssTid));
+}
+
+TEST_F(RenameCollectionTestMultitenancy, RenameCollectionForApplyOpsRequireTenantIdFalse) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", false);
+
+    const NamespaceString targetNssTid =
+        NamespaceString::createNamespaceString_forTest(_tenantId, _otherNs);
+    ASSERT_NOT_EQUALS(_sourceNssTid, targetNssTid);
+
+    auto cmd = BSON("renameCollection" << _sourceNssTid.toStringWithTenantId() << "to"
+                                       << targetNssTid.toStringWithTenantId());
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), boost::none, boost::none, cmd, {}));
+    ASSERT_TRUE(_collectionExists(_opCtx.get(), targetNssTid));
+    ASSERT_FALSE(_collectionExists(_opCtx.get(), _sourceNssTid));
+}
+
+TEST_F(RenameCollectionTestMultitenancy, RenameCollectionForApplyOpsSameNS) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", true);
+
+    // A tid field supersedes tenantIds maintained in source or target. See above.
+    auto cmd =
+        BSON("renameCollection" << _sourceNssTid.toString() << "to" << _sourceNssTid.toString());
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), boost::none, _tenantId, cmd, {}));
+}
+
+TEST_F(RenameCollectionTestMultitenancy, RenameCollectionForApplyOpsSameNSRequireTenantIdFalse) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", false);
+
+    auto cmd = BSON("renameCollection" << _sourceNssTid.toStringWithTenantId() << "to"
+                                       << _sourceNssTid.toStringWithTenantId());
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), boost::none, boost::none, cmd, {}));
+}
+
+TEST_F(RenameCollectionTestMultitenancy, RenameCollectionForApplyOpsAcrossTenantIds) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", false);
+
+    const NamespaceString targetNssTid =
+        NamespaceString::createNamespaceString_forTest(_otherTenantId, _sourceNs);
+    ASSERT_NOT_EQUALS(_sourceNssTid, targetNssTid);
+
+    // This test is valid during the transition period, before featureFlagRequireTenantID is
+    // enforced, and will prefix the tenantIds onto the ns fields.
+    auto cmd = BSON("renameCollection" << _sourceNssTid.toStringWithTenantId() << "to"
+                                       << targetNssTid.toStringWithTenantId());
+    ASSERT_THROWS_CODE(renameCollectionForApplyOps(_opCtx.get(), boost::none, boost::none, cmd, {}),
+                       AssertionException,
+                       ErrorCodes::IllegalOperation);
+}
+
+TEST_F(RenameCollectionTestMultitenancy, RenameCollectionAcrossTenantIds) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+    const NamespaceString targetNssTid =
+        NamespaceString::createNamespaceString_forTest(_otherTenantId, _otherNs);
+    ASSERT_NOT_EQUALS(_sourceNssTid, targetNssTid);
+
+    // Renaming collections across tenantIds is not allowed
+    RenameCollectionOptions options;
+    options.dropTarget = true;
+    ASSERT_EQUALS(ErrorCodes::IllegalOperation,
+                  renameCollection(_opCtx.get(), _sourceNssTid, targetNssTid, options));
 }
 
 }  // namespace
+}  // namespace mongo

@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/db/s/balancer/balancer_defragmentation_policy_impl.h"
 #include "mongo/db/dbdirectclient.h"
@@ -37,9 +36,14 @@
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/move_range_request_gen.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
 
 #include <fmt/format.h>
 #include <tuple>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 using namespace fmt::literals;
 
@@ -57,24 +61,27 @@ const std::string kProgress("progress");
 const std::string kNoPhase("none");
 const std::string kRemainingChunksToProcess("remainingChunksToProcess");
 
-ChunkVersion getShardVersion(OperationContext* opCtx,
+static constexpr int64_t kBigChunkMarker = std::numeric_limits<int64_t>::max();
+
+ShardVersion getShardVersion(OperationContext* opCtx,
                              const ShardId& shardId,
                              const NamespaceString& nss) {
-    auto cm = Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfo(opCtx, nss);
-    return cm.getVersion(shardId);
+    auto cri = Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfo(opCtx, nss);
+    return cri.getShardVersion(shardId);
 }
 
 std::vector<ChunkType> getCollectionChunks(OperationContext* opCtx, const CollectionType& coll) {
-    return uassertStatusOK(Grid::get(opCtx)->catalogClient()->getChunks(
-        opCtx,
-        BSON(ChunkType::collectionUUID() << coll.getUuid()) /*query*/,
-        BSON(ChunkType::min() << 1) /*sort*/,
-        boost::none /*limit*/,
-        nullptr /*opTime*/,
-        coll.getEpoch(),
-        coll.getTimestamp(),
-        repl::ReadConcernLevel::kLocalReadConcern,
-        boost::none));
+    auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
+    return uassertStatusOK(
+        catalogClient->getChunks(opCtx,
+                                 BSON(ChunkType::collectionUUID() << coll.getUuid()) /*query*/,
+                                 BSON(ChunkType::min() << 1) /*sort*/,
+                                 boost::none /*limit*/,
+                                 nullptr /*opTime*/,
+                                 coll.getEpoch(),
+                                 coll.getTimestamp(),
+                                 repl::ReadConcernLevel::kLocalReadConcern,
+                                 boost::none));
 }
 
 uint64_t getCollectionMaxChunkSizeBytes(OperationContext* opCtx, const CollectionType& coll) {
@@ -84,9 +91,8 @@ uint64_t getCollectionMaxChunkSizeBytes(OperationContext* opCtx, const Collectio
 }
 
 ZoneInfo getCollectionZones(OperationContext* opCtx, const CollectionType& coll) {
-    ZoneInfo zones;
-    uassertStatusOK(
-        ZoneInfo::addTagsFromCatalog(opCtx, coll.getNss(), coll.getKeyPattern(), zones));
+    auto zones = uassertStatusOK(
+        ZoneInfo::getZonesForCollection(opCtx, coll.getNss(), coll.getKeyPattern()));
     return zones;
 }
 
@@ -133,7 +139,7 @@ void handleActionResult(OperationContext* opCtx,
         LOGV2_DEBUG(6261701,
                     1,
                     "Hit retriable error while defragmenting collection",
-                    "namespace"_attr = nss,
+                    logAttrs(nss),
                     "uuid"_attr = uuid,
                     "currentPhase"_attr = currentPhase,
                     "error"_attr = redact(status));
@@ -141,7 +147,7 @@ void handleActionResult(OperationContext* opCtx,
     } else {
         LOGV2_ERROR(6258601,
                     "Defragmentation for collection hit non-retriable error",
-                    "namespace"_attr = nss,
+                    logAttrs(nss),
                     "uuid"_attr = uuid,
                     "currentPhase"_attr = currentPhase,
                     "error"_attr = redact(status));
@@ -164,6 +170,11 @@ public:
                                                              const CollectionType& coll) {
         auto collectionChunks = getCollectionChunks(opCtx, coll);
         const auto collectionZones = getCollectionZones(opCtx, coll);
+
+        // Calculate small chunk threshold to limit dataSize commands
+        const auto maxChunkSizeBytes = getCollectionMaxChunkSizeBytes(opCtx, coll);
+        const int64_t smallChunkSizeThreshold =
+            (maxChunkSizeBytes / 100) * kSmallChunkSizeThresholdPctg;
 
         stdx::unordered_map<ShardId, PendingActions> pendingActionsByShards;
         // Find ranges of chunks; for single-chunk ranges, request DataSize; for multi-range, issue
@@ -191,6 +202,7 @@ public:
             new MergeAndMeasureChunksPhase(coll.getNss(),
                                            coll.getUuid(),
                                            coll.getKeyPattern().toBSON(),
+                                           smallChunkSizeThreshold,
                                            std::move(pendingActionsByShards)));
     }
 
@@ -202,9 +214,9 @@ public:
         return _nextPhase;
     }
 
-    boost::optional<DefragmentationAction> popNextStreamableAction(
+    boost::optional<BalancerStreamAction> popNextStreamableAction(
         OperationContext* opCtx) override {
-        boost::optional<DefragmentationAction> nextAction = boost::none;
+        boost::optional<BalancerStreamAction> nextAction = boost::none;
         if (!_pendingActionsByShards.empty()) {
             auto it = _shardToProcess ? _pendingActionsByShards.find(*_shardToProcess)
                                       : _pendingActionsByShards.begin();
@@ -216,13 +228,20 @@ public:
 
             if (pendingActions.rangesWithoutDataSize.size() > pendingActions.rangesToMerge.size()) {
                 const auto& rangeToMeasure = pendingActions.rangesWithoutDataSize.back();
-                nextAction = boost::optional<DefragmentationAction>(DataSizeInfo(
-                    shardId, _nss, _uuid, rangeToMeasure, shardVersion, _shardKey, false));
+                nextAction = boost::optional<BalancerStreamAction>(
+                    DataSizeInfo(shardId,
+                                 _nss,
+                                 _uuid,
+                                 rangeToMeasure,
+                                 shardVersion,
+                                 _shardKey,
+                                 true /* estimate */,
+                                 _smallChunkSizeThresholdBytes /* maxSize */));
                 pendingActions.rangesWithoutDataSize.pop_back();
             } else if (!pendingActions.rangesToMerge.empty()) {
                 const auto& rangeToMerge = pendingActions.rangesToMerge.back();
-                nextAction = boost::optional<DefragmentationAction>(
-                    MergeInfo(shardId, _nss, _uuid, shardVersion, rangeToMerge));
+                nextAction = boost::optional<BalancerStreamAction>(
+                    MergeInfo(shardId, _nss, _uuid, shardVersion.placementVersion(), rangeToMerge));
                 pendingActions.rangesToMerge.pop_back();
             }
             if (nextAction.has_value()) {
@@ -244,76 +263,81 @@ public:
     }
 
     boost::optional<MigrateInfo> popNextMigration(
-        OperationContext* opCtx, stdx::unordered_set<ShardId>* usedShards) override {
+        OperationContext* opCtx, stdx::unordered_set<ShardId>* availableShards) override {
         return boost::none;
     }
 
     void applyActionResult(OperationContext* opCtx,
-                           const DefragmentationAction& action,
-                           const DefragmentationActionResponse& response) override {
+                           const BalancerStreamAction& action,
+                           const BalancerStreamActionResponse& response) override {
         ScopeGuard scopedGuard([&] { --_outstandingActions; });
         if (_aborted) {
             return;
         }
-        stdx::visit(
-            visit_helper::Overloaded{
-                [&](const MergeInfo& mergeAction) {
-                    auto& mergeResponse = stdx::get<Status>(response);
-                    auto& shardingPendingActions = _pendingActionsByShards[mergeAction.shardId];
-                    handleActionResult(
-                        opCtx,
-                        _nss,
-                        _uuid,
-                        getType(),
-                        mergeResponse,
-                        [&]() {
-                            shardingPendingActions.rangesWithoutDataSize.emplace_back(
-                                mergeAction.chunkRange);
-                        },
-                        [&]() {
-                            shardingPendingActions.rangesToMerge.emplace_back(
-                                mergeAction.chunkRange);
-                        },
-                        [&]() { _abort(getType()); });
-                },
-                [&](const DataSizeInfo& dataSizeAction) {
-                    auto& dataSizeResponse = stdx::get<StatusWith<DataSizeResponse>>(response);
-                    handleActionResult(
-                        opCtx,
-                        _nss,
-                        _uuid,
-                        getType(),
-                        dataSizeResponse.getStatus(),
-                        [&]() {
-                            ChunkType chunk(dataSizeAction.uuid,
-                                            dataSizeAction.chunkRange,
-                                            dataSizeAction.version,
-                                            dataSizeAction.shardId);
-                            auto catalogManager = ShardingCatalogManager::get(opCtx);
-                            catalogManager->setChunkEstimatedSize(
-                                opCtx,
-                                chunk,
-                                dataSizeResponse.getValue().sizeBytes,
-                                ShardingCatalogClient::kMajorityWriteConcern);
-                        },
-                        [&]() {
+        stdx::visit(OverloadedVisitor{
+                        [&](const MergeInfo& mergeAction) {
+                            auto& mergeResponse = stdx::get<Status>(response);
                             auto& shardingPendingActions =
-                                _pendingActionsByShards[dataSizeAction.shardId];
-                            shardingPendingActions.rangesWithoutDataSize.emplace_back(
-                                dataSizeAction.chunkRange);
+                                _pendingActionsByShards[mergeAction.shardId];
+                            handleActionResult(
+                                opCtx,
+                                _nss,
+                                _uuid,
+                                getType(),
+                                mergeResponse,
+                                [&]() {
+                                    shardingPendingActions.rangesWithoutDataSize.emplace_back(
+                                        mergeAction.chunkRange);
+                                },
+                                [&]() {
+                                    shardingPendingActions.rangesToMerge.emplace_back(
+                                        mergeAction.chunkRange);
+                                },
+                                [&]() { _abort(getType()); });
                         },
-                        [&]() { _abort(getType()); });
-                },
-                [&](const AutoSplitVectorInfo& _) {
-                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                },
-                [&](const SplitInfoWithKeyPattern& _) {
-                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                },
-                [&](const MigrateInfo& _) {
-                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                }},
-            action);
+                        [&](const DataSizeInfo& dataSizeAction) {
+                            auto& dataSizeResponse =
+                                stdx::get<StatusWith<DataSizeResponse>>(response);
+                            handleActionResult(
+                                opCtx,
+                                _nss,
+                                _uuid,
+                                getType(),
+                                dataSizeResponse.getStatus(),
+                                [&]() {
+                                    ChunkType chunk(dataSizeAction.uuid,
+                                                    dataSizeAction.chunkRange,
+                                                    dataSizeAction.version.placementVersion(),
+                                                    dataSizeAction.shardId);
+                                    auto catalogManager = ShardingCatalogManager::get(opCtx);
+                                    // Max out the chunk size if it has has been estimated as bigger
+                                    // than _smallChunkSizeThresholdBytes; this will exlude the
+                                    // chunk from the list of candidates considered by
+                                    // MoveAndMergeChunksPhase
+                                    auto estimatedSize = dataSizeResponse.getValue().maxSizeReached
+                                        ? kBigChunkMarker
+                                        : dataSizeResponse.getValue().sizeBytes;
+                                    catalogManager->setChunkEstimatedSize(
+                                        opCtx,
+                                        chunk,
+                                        estimatedSize,
+                                        ShardingCatalogClient::kMajorityWriteConcern);
+                                },
+                                [&]() {
+                                    auto& shardingPendingActions =
+                                        _pendingActionsByShards[dataSizeAction.shardId];
+                                    shardingPendingActions.rangesWithoutDataSize.emplace_back(
+                                        dataSizeAction.chunkRange);
+                                },
+                                [&]() { _abort(getType()); });
+                        },
+                        [](const MigrateInfo& _) {
+                            uasserted(ErrorCodes::BadValue, "Unexpected action type");
+                        },
+                        [](const MergeAllChunksOnShardInfo& _) {
+                            uasserted(ErrorCodes::BadValue, "Unexpected action type");
+                        }},
+                    action);
     }
 
     bool isComplete() const override {
@@ -321,7 +345,7 @@ public:
     }
 
     void userAbort() override {
-        _abort(DefragmentationPhaseEnum::kSplitChunks);
+        _abort(DefragmentationPhaseEnum::kFinished);
     }
 
     BSONObj reportProgress() const override {
@@ -331,8 +355,8 @@ public:
             rangesToMerge += pendingActions.rangesToMerge.size();
             rangesWithoutDataSize += pendingActions.rangesWithoutDataSize.size();
         }
-        auto remainingChunksToProcess =
-            static_cast<long long>(_outstandingActions + rangesToMerge + rangesWithoutDataSize);
+        auto remainingChunksToProcess = static_cast<long long>(_outstandingActions) +
+            static_cast<long long>(rangesToMerge) + static_cast<long long>(rangesWithoutDataSize);
 
         return BSON(kRemainingChunksToProcess << remainingChunksToProcess);
     }
@@ -346,10 +370,12 @@ private:
         const NamespaceString& nss,
         const UUID& uuid,
         const BSONObj& shardKey,
+        const int64_t smallChunkSizeThresholdBytes,
         stdx::unordered_map<ShardId, PendingActions>&& pendingActionsByShards)
         : _nss(nss),
           _uuid(uuid),
           _shardKey(shardKey),
+          _smallChunkSizeThresholdBytes(smallChunkSizeThresholdBytes),
           _pendingActionsByShards(std::move(pendingActionsByShards)) {}
 
     void _abort(const DefragmentationPhaseEnum nextPhase) {
@@ -361,6 +387,7 @@ private:
     const NamespaceString _nss;
     const UUID _uuid;
     const BSONObj _shardKey;
+    const int64_t _smallChunkSizeThresholdBytes;
     stdx::unordered_map<ShardId, PendingActions> _pendingActionsByShards;
     boost::optional<ShardId> _shardToProcess;
     size_t _outstandingActions{0};
@@ -379,9 +406,7 @@ public:
         stdx::unordered_map<ShardId, ShardInfo> shardInfos;
         for (const auto& shardStats : collectionShardStats) {
             shardInfos.emplace(shardStats.shardId,
-                               ShardInfo(shardStats.currSizeBytes,
-                                         shardStats.maxSizeBytes,
-                                         shardStats.isDraining));
+                               ShardInfo(shardStats.currSizeBytes, shardStats.isDraining));
         }
 
         auto collectionChunks = getCollectionChunks(opCtx, coll);
@@ -395,7 +420,8 @@ public:
                                         std::move(collectionChunks),
                                         std::move(shardInfos),
                                         std::move(collectionZones),
-                                        smallChunkSizeThresholdBytes));
+                                        smallChunkSizeThresholdBytes,
+                                        maxChunkSizeBytes));
     }
 
     DefragmentationPhaseEnum getType() const override {
@@ -406,7 +432,7 @@ public:
         return _nextPhase;
     }
 
-    boost::optional<DefragmentationAction> popNextStreamableAction(
+    boost::optional<BalancerStreamAction> popNextStreamableAction(
         OperationContext* opCtx) override {
         if (_actionableMerges.empty()) {
             return boost::none;
@@ -416,14 +442,14 @@ public:
         _actionableMerges.pop_front();
         const auto& nextRequest = _outstandingMerges.back();
         auto version = getShardVersion(opCtx, nextRequest.getDestinationShard(), _nss);
-        return boost::optional<DefragmentationAction>(
-            nextRequest.asMergeInfo(_uuid, _nss, version));
+        return boost::optional<BalancerStreamAction>(
+            nextRequest.asMergeInfo(_uuid, _nss, version.placementVersion()));
     }
 
     boost::optional<MigrateInfo> popNextMigration(
-        OperationContext* opCtx, stdx::unordered_set<ShardId>* usedShards) override {
+        OperationContext* opCtx, stdx::unordered_set<ShardId>* availableShards) override {
         for (const auto& shardId : _shardProcessingOrder) {
-            if (usedShards->count(shardId) != 0) {
+            if (availableShards->count(shardId) == 0) {
                 // the shard is already busy in a migration
                 continue;
             }
@@ -431,7 +457,7 @@ public:
             ChunkRangeInfoIterator nextSmallChunk;
             std::list<ChunkRangeInfoIterator> candidateSiblings;
             if (!_findNextSmallChunkInShard(
-                    shardId, *usedShards, &nextSmallChunk, &candidateSiblings)) {
+                    shardId, *availableShards, &nextSmallChunk, &candidateSiblings)) {
                 // there isn't a chunk in this shard that can currently be moved and merged with one
                 // of its siblings.
                 continue;
@@ -454,21 +480,22 @@ public:
             // ... then build up the migration request, marking the needed resources as busy.
             nextSmallChunk->busyInOperation = true;
             targetSibling->busyInOperation = true;
-            usedShards->insert(nextSmallChunk->shard);
-            usedShards->insert(targetSibling->shard);
+            availableShards->erase(nextSmallChunk->shard);
+            availableShards->erase(targetSibling->shard);
             auto smallChunkVersion = getShardVersion(opCtx, nextSmallChunk->shard, _nss);
             _outstandingMigrations.emplace_back(nextSmallChunk, targetSibling);
-            return _outstandingMigrations.back().asMigrateInfo(_uuid, _nss, smallChunkVersion);
+            return _outstandingMigrations.back().asMigrateInfo(
+                _uuid, _nss, smallChunkVersion.placementVersion(), _maxChunkSizeBytes);
         }
 
         return boost::none;
     }
 
     void applyActionResult(OperationContext* opCtx,
-                           const DefragmentationAction& action,
-                           const DefragmentationActionResponse& response) override {
+                           const BalancerStreamAction& action,
+                           const BalancerStreamActionResponse& response) override {
         stdx::visit(
-            visit_helper::Overloaded{
+            OverloadedVisitor{
                 [&](const MigrateInfo& migrationAction) {
                     auto& migrationResponse = stdx::get<Status>(response);
                     auto match =
@@ -493,6 +520,7 @@ public:
                                 _nss, boost::none, moveRequest.getDestinationShard());
 
                         auto transferredAmount = moveRequest.getMovedDataSizeBytes();
+                        invariant(transferredAmount <= _smallChunkSizeThresholdBytes);
                         _shardInfos.at(moveRequest.getSourceShard()).currentSizeBytes -=
                             transferredAmount;
                         _shardInfos.at(moveRequest.getDestinationShard()).currentSizeBytes +=
@@ -508,13 +536,21 @@ public:
                     LOGV2_DEBUG(6290000,
                                 1,
                                 "Migration failed during collection defragmentation",
-                                "namespace"_attr = _nss,
+                                logAttrs(_nss),
                                 "uuid"_attr = _uuid,
                                 "currentPhase"_attr = getType(),
                                 "error"_attr = redact(migrationResponse));
 
                     moveRequest.chunkToMove->busyInOperation = false;
                     moveRequest.chunkToMergeWith->busyInOperation = false;
+
+                    if (migrationResponse.code() == ErrorCodes::ChunkTooBig ||
+                        migrationResponse.code() == ErrorCodes::ExceededMemoryLimit) {
+                        // Never try moving this chunk again, it isn't actually small
+                        _removeIteratorFromSmallChunks(moveRequest.chunkToMove,
+                                                       moveRequest.chunkToMove->shard);
+                        return;
+                    }
 
                     if (isRetriableForDefragmentation(migrationResponse)) {
                         // The migration will be eventually retried
@@ -544,7 +580,7 @@ public:
                     LOGV2_ERROR(6290001,
                                 "Encountered non-retriable error on migration during "
                                 "collection defragmentation",
-                                "namespace"_attr = _nss,
+                                logAttrs(_nss),
                                 "uuid"_attr = _uuid,
                                 "currentPhase"_attr = getType(),
                                 "error"_attr = redact(migrationResponse));
@@ -573,7 +609,13 @@ public:
 
                         auto& chunkToDelete = mergeRequest.chunkToMove;
                         mergedChunk->range = mergeRequest.asMergedRange();
-                        mergedChunk->estimatedSizeBytes += chunkToDelete->estimatedSizeBytes;
+                        if (mergedChunk->estimatedSizeBytes != kBigChunkMarker &&
+                            chunkToDelete->estimatedSizeBytes != kBigChunkMarker) {
+                            mergedChunk->estimatedSizeBytes += chunkToDelete->estimatedSizeBytes;
+                        } else {
+                            mergedChunk->estimatedSizeBytes = kBigChunkMarker;
+                        }
+
                         mergedChunk->busyInOperation = false;
                         auto deletedChunkShard = chunkToDelete->shard;
                         // the lookup data structures...
@@ -611,13 +653,10 @@ public:
                                            onNonRetriableError);
                     }
                 },
-                [&](const DataSizeInfo& dataSizeAction) {
+                [](const DataSizeInfo& dataSizeAction) {
                     uasserted(ErrorCodes::BadValue, "Unexpected action type");
                 },
-                [&](const AutoSplitVectorInfo& _) {
-                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                },
-                [&](const SplitInfoWithKeyPattern& _) {
+                [](const MergeAllChunksOnShardInfo& _) {
                     uasserted(ErrorCodes::BadValue, "Unexpected action type");
                 }},
             action);
@@ -629,7 +668,7 @@ public:
     }
 
     void userAbort() override {
-        _abort(DefragmentationPhaseEnum::kSplitChunks);
+        _abort(DefragmentationPhaseEnum::kFinished);
     }
 
     BSONObj reportProgress() const override {
@@ -659,19 +698,14 @@ private:
     };
 
     struct ShardInfo {
-        ShardInfo(uint64_t currentSizeBytes, uint64_t maxSizeBytes, bool draining)
-            : currentSizeBytes(currentSizeBytes), maxSizeBytes(maxSizeBytes), draining(draining) {}
+        ShardInfo(uint64_t currentSizeBytes, bool draining)
+            : currentSizeBytes(currentSizeBytes), draining(draining) {}
 
         bool isDraining() const {
             return draining;
         }
 
-        bool hasCapacityFor(uint64_t newDataSize) const {
-            return (maxSizeBytes == 0 || currentSizeBytes + newDataSize < maxSizeBytes);
-        }
-
         uint64_t currentSizeBytes;
-        const uint64_t maxSizeBytes;
         const bool draining;
     };
 
@@ -702,7 +736,8 @@ private:
 
         MigrateInfo asMigrateInfo(const UUID& collUuid,
                                   const NamespaceString& nss,
-                                  const ChunkVersion& version) const {
+                                  const ChunkVersion& version,
+                                  uint64_t maxChunkSizeBytes) const {
             return MigrateInfo(chunkToMergeWith->shard,
                                chunkToMove->shard,
                                nss,
@@ -710,7 +745,8 @@ private:
                                chunkToMove->range.getMin(),
                                chunkToMove->range.getMax(),
                                version,
-                               MoveChunkRequest::ForceJumbo::kForceBalancer);
+                               ForceJumbo::kDoNotForce,
+                               maxChunkSizeBytes);
         }
 
         ChunkRange asMergedRange() const {
@@ -738,7 +774,7 @@ private:
             return chunkToMove->range.getMin();
         }
 
-        uint64_t getMovedDataSizeBytes() const {
+        int64_t getMovedDataSizeBytes() const {
             return chunkToMove->estimatedSizeBytes;
         }
 
@@ -748,8 +784,6 @@ private:
     private:
         bool _isChunkToMergeLeftSibling;
     };
-
-    static constexpr uint64_t kSmallChunkSizeThresholdPctg = 25;
 
     const NamespaceString _nss;
 
@@ -775,6 +809,8 @@ private:
 
     const int64_t _smallChunkSizeThresholdBytes;
 
+    const uint64_t _maxChunkSizeBytes;
+
     bool _aborted{false};
 
     DefragmentationPhaseEnum _nextPhase{DefragmentationPhaseEnum::kMergeChunks};
@@ -784,7 +820,8 @@ private:
                             std::vector<ChunkType>&& collectionChunks,
                             stdx::unordered_map<ShardId, ShardInfo>&& shardInfos,
                             ZoneInfo&& collectionZones,
-                            uint64_t smallChunkSizeThresholdBytes)
+                            uint64_t smallChunkSizeThresholdBytes,
+                            uint64_t maxChunkSizeBytes)
         : _nss(nss),
           _uuid(uuid),
           _collectionChunks(),
@@ -795,7 +832,8 @@ private:
           _actionableMerges(),
           _outstandingMerges(),
           _zoneInfo(std::move(collectionZones)),
-          _smallChunkSizeThresholdBytes(smallChunkSizeThresholdBytes) {
+          _smallChunkSizeThresholdBytes(smallChunkSizeThresholdBytes),
+          _maxChunkSizeBytes(maxChunkSizeBytes) {
 
         // Load the collection routing table in a std::list to ease later manipulation
         for (auto&& chunk : collectionChunks) {
@@ -803,13 +841,13 @@ private:
                 LOGV2_WARNING(
                     6172701,
                     "Chunk with no estimated size detected while building MoveAndMergeChunksPhase",
-                    "namespace"_attr = _nss,
+                    logAttrs(_nss),
                     "uuid"_attr = _uuid,
                     "range"_attr = chunk.getRange());
                 _abort(DefragmentationPhaseEnum::kMergeAndMeasureChunks);
                 return;
             }
-            const uint64_t estimatedChunkSize = chunk.getEstimatedSizeBytes().get();
+            const uint64_t estimatedChunkSize = chunk.getEstimatedSizeBytes().value();
             _collectionChunks.emplace_back(chunk.getRange(), chunk.getShard(), estimatedChunkSize);
         }
 
@@ -879,7 +917,7 @@ private:
     // Returns true on success (storing the related info in nextSmallChunk + smallChunkSiblings),
     // false otherwise.
     bool _findNextSmallChunkInShard(const ShardId& shard,
-                                    const stdx::unordered_set<ShardId>& usedShards,
+                                    const stdx::unordered_set<ShardId>& availableShards,
                                     ChunkRangeInfoIterator* nextSmallChunk,
                                     std::list<ChunkRangeInfoIterator>* smallChunkSiblings) {
         auto matchingShardInfo = _smallChunksByShard.find(shard);
@@ -905,7 +943,7 @@ private:
             size_t siblingsDiscardedDueToRangeDeletion = 0;
 
             for (const auto& sibling : candidateSiblings) {
-                if (sibling->busyInOperation || usedShards.count(sibling->shard)) {
+                if (sibling->busyInOperation || !availableShards.count(sibling->shard)) {
                     continue;
                 }
                 if ((*candidateIt)->shardsToAvoid.count(sibling->shard)) {
@@ -932,7 +970,7 @@ private:
                                 1,
                                 "Postponing small chunk processing due to pending range deletion "
                                 "on recipient shard(s)",
-                                "namespace"_attr = _nss,
+                                logAttrs(_nss),
                                 "uuid"_attr = _uuid,
                                 "range"_attr = (*candidateIt)->range,
                                 "estimatedSizeBytes"_attr = (*candidateIt)->estimatedSizeBytes,
@@ -943,7 +981,7 @@ private:
                 } else {
                     LOGV2(6290003,
                           "Discarding small chunk due to pending range deletion on recipient shard",
-                          "namespace"_attr = _nss,
+                          logAttrs(_nss),
                           "uuid"_attr = _uuid,
                           "range"_attr = (*candidateIt)->range,
                           "estimatedSizeBytes"_attr = (*candidateIt)->estimatedSizeBytes,
@@ -965,8 +1003,7 @@ private:
 
     uint32_t _rankMergeableSibling(const ChunkRangeInfo& chunkTobeMovedAndMerged,
                                    const ChunkRangeInfo& mergeableSibling) {
-        static constexpr uint32_t kNoMoveRequired = 1 << 4;
-        static constexpr uint32_t kDestinationNotMaxedOut = 1 << 3;
+        static constexpr uint32_t kNoMoveRequired = 1 << 3;
         static constexpr uint32_t kConvenientMove = 1 << 2;
         static constexpr uint32_t kMergeSolvesTwoPendingChunks = 1 << 1;
         static constexpr uint32_t kMergeSolvesOnePendingChunk = 1;
@@ -977,18 +1014,16 @@ private:
                    mergeableSibling.estimatedSizeBytes) {
             ranking += kConvenientMove;
         }
-        auto estimatedMergedSize =
-            chunkTobeMovedAndMerged.estimatedSizeBytes + mergeableSibling.estimatedSizeBytes;
+        auto estimatedMergedSize = (chunkTobeMovedAndMerged.estimatedSizeBytes == kBigChunkMarker ||
+                                    mergeableSibling.estimatedSizeBytes == kBigChunkMarker)
+            ? kBigChunkMarker
+            : chunkTobeMovedAndMerged.estimatedSizeBytes + mergeableSibling.estimatedSizeBytes;
         if (estimatedMergedSize > _smallChunkSizeThresholdBytes) {
             ranking += mergeableSibling.estimatedSizeBytes < _smallChunkSizeThresholdBytes
                 ? kMergeSolvesTwoPendingChunks
                 : kMergeSolvesOnePendingChunk;
         }
-        if (chunkTobeMovedAndMerged.shard == mergeableSibling.shard ||
-            _shardInfos.at(mergeableSibling.shard)
-                .hasCapacityFor(chunkTobeMovedAndMerged.estimatedSizeBytes)) {
-            ranking += kDestinationNotMaxedOut;
-        }
+
         return ranking;
     }
 
@@ -1045,7 +1080,7 @@ public:
         return _nextPhase;
     }
 
-    boost::optional<DefragmentationAction> popNextStreamableAction(
+    boost::optional<BalancerStreamAction> popNextStreamableAction(
         OperationContext* opCtx) override {
         if (_unmergedRangesByShard.empty()) {
             return boost::none;
@@ -1060,8 +1095,8 @@ public:
         invariant(!unmergedRanges.empty());
         auto shardVersion = getShardVersion(opCtx, shardId, _nss);
         const auto& rangeToMerge = unmergedRanges.back();
-        boost::optional<DefragmentationAction> nextAction = boost::optional<DefragmentationAction>(
-            MergeInfo(shardId, _nss, _uuid, shardVersion, rangeToMerge));
+        boost::optional<BalancerStreamAction> nextAction = boost::optional<BalancerStreamAction>(
+            MergeInfo(shardId, _nss, _uuid, shardVersion.placementVersion(), rangeToMerge));
         unmergedRanges.pop_back();
         ++_outstandingActions;
         if (unmergedRanges.empty()) {
@@ -1079,48 +1114,47 @@ public:
     }
 
     boost::optional<MigrateInfo> popNextMigration(
-        OperationContext* opCtx, stdx::unordered_set<ShardId>* usedShards) override {
+        OperationContext* opCtx, stdx::unordered_set<ShardId>* availableShards) override {
         return boost::none;
     }
 
     void applyActionResult(OperationContext* opCtx,
-                           const DefragmentationAction& action,
-                           const DefragmentationActionResponse& response) override {
+                           const BalancerStreamAction& action,
+                           const BalancerStreamActionResponse& response) override {
         ScopeGuard scopedGuard([&] { --_outstandingActions; });
         if (_aborted) {
             return;
         }
         stdx::visit(
-            visit_helper::Overloaded{
-                [&](const MergeInfo& mergeAction) {
-                    auto& mergeResponse = stdx::get<Status>(response);
-                    auto onSuccess = [] {};
-                    auto onRetriableError = [&] {
-                        _unmergedRangesByShard[mergeAction.shardId].emplace_back(
-                            mergeAction.chunkRange);
-                    };
-                    auto onNonretriableError = [this] { _abort(getType()); };
-                    handleActionResult(opCtx,
-                                       _nss,
-                                       _uuid,
-                                       getType(),
-                                       mergeResponse,
-                                       onSuccess,
-                                       onRetriableError,
-                                       onNonretriableError);
-                },
-                [&](const DataSizeInfo& _) {
-                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                },
-                [&](const AutoSplitVectorInfo& _) {
-                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                },
-                [&](const SplitInfoWithKeyPattern& _) {
-                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                },
-                [&](const MigrateInfo& _) {
-                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                }},
+            OverloadedVisitor{[&](const MergeInfo& mergeAction) {
+                                  auto& mergeResponse = stdx::get<Status>(response);
+                                  auto onSuccess = [] {
+                                  };
+                                  auto onRetriableError = [&] {
+                                      _unmergedRangesByShard[mergeAction.shardId].emplace_back(
+                                          mergeAction.chunkRange);
+                                  };
+                                  auto onNonretriableError = [this] {
+                                      _abort(getType());
+                                  };
+                                  handleActionResult(opCtx,
+                                                     _nss,
+                                                     _uuid,
+                                                     getType(),
+                                                     mergeResponse,
+                                                     onSuccess,
+                                                     onRetriableError,
+                                                     onNonretriableError);
+                              },
+                              [](const DataSizeInfo& _) {
+                                  uasserted(ErrorCodes::BadValue, "Unexpected action type");
+                              },
+                              [](const MigrateInfo& _) {
+                                  uasserted(ErrorCodes::BadValue, "Unexpected action type");
+                              },
+                              [](const MergeAllChunksOnShardInfo& _) {
+                                  uasserted(ErrorCodes::BadValue, "Unexpected action type");
+                              }},
             action);
     }
 
@@ -1129,7 +1163,7 @@ public:
     }
 
     void userAbort() override {
-        _abort(DefragmentationPhaseEnum::kSplitChunks);
+        _abort(DefragmentationPhaseEnum::kFinished);
     }
 
     BSONObj reportProgress() const override {
@@ -1137,7 +1171,8 @@ public:
         for (const auto& [_, unmergedRanges] : _unmergedRangesByShard) {
             rangesToMerge += unmergedRanges.size();
         }
-        auto remainingRangesToProcess = static_cast<long long>(_outstandingActions + rangesToMerge);
+        auto remainingRangesToProcess =
+            static_cast<long long>(_outstandingActions) + static_cast<long long>(rangesToMerge);
 
         return BSON(kRemainingChunksToProcess << remainingRangesToProcess);
     }
@@ -1160,244 +1195,31 @@ private:
     boost::optional<ShardId> _shardToProcess;
     size_t _outstandingActions{0};
     bool _aborted{false};
-    DefragmentationPhaseEnum _nextPhase{DefragmentationPhaseEnum::kSplitChunks};
-};
-
-class SplitChunksPhase : public DefragmentationPhase {
-public:
-    static std::unique_ptr<SplitChunksPhase> build(OperationContext* opCtx,
-                                                   const CollectionType& coll) {
-        auto collectionChunks = uassertStatusOK(Grid::get(opCtx)->catalogClient()->getChunks(
-            opCtx,
-            BSON(ChunkType::collectionUUID() << coll.getUuid()) /*query*/,
-            BSON(ChunkType::min() << 1) /*sort*/,
-            boost::none /*limit*/,
-            nullptr /*opTime*/,
-            coll.getEpoch(),
-            coll.getTimestamp(),
-            repl::ReadConcernLevel::kLocalReadConcern,
-            boost::none));
-
-        stdx::unordered_map<ShardId, PendingActions> pendingActionsByShards;
-
-        uint64_t maxChunkSizeBytes = getCollectionMaxChunkSizeBytes(opCtx, coll);
-
-        // Issue AutoSplitVector for all chunks with estimated size greater than max chunk size or
-        // with no estimated size.
-        for (const auto& chunk : collectionChunks) {
-            auto chunkSize = chunk.getEstimatedSizeBytes();
-            if (!chunkSize || (uint64_t)chunkSize.get() > maxChunkSizeBytes) {
-                pendingActionsByShards[chunk.getShard()].rangesToFindSplitPoints.emplace_back(
-                    chunk.getMin(), chunk.getMax());
-            }
-        }
-
-        return std::unique_ptr<SplitChunksPhase>(
-            new SplitChunksPhase(coll.getNss(),
-                                 coll.getUuid(),
-                                 coll.getKeyPattern().toBSON(),
-                                 maxChunkSizeBytes,
-                                 std::move(pendingActionsByShards)));
-    }
-
-    DefragmentationPhaseEnum getType() const override {
-        return DefragmentationPhaseEnum::kSplitChunks;
-    }
-
-    DefragmentationPhaseEnum getNextPhase() const override {
-        return _nextPhase;
-    }
-
-    boost::optional<DefragmentationAction> popNextStreamableAction(
-        OperationContext* opCtx) override {
-        boost::optional<DefragmentationAction> nextAction = boost::none;
-        if (!_pendingActionsByShards.empty()) {
-            auto it = _shardToProcess ? _pendingActionsByShards.find(*_shardToProcess)
-                                      : _pendingActionsByShards.begin();
-
-            invariant(it != _pendingActionsByShards.end());
-
-            auto& [shardId, pendingActions] = *it;
-            auto shardVersion = getShardVersion(opCtx, shardId, _nss);
-
-            if (!pendingActions.rangesToSplit.empty()) {
-                const auto& [rangeToSplit, splitPoints] = pendingActions.rangesToSplit.back();
-                nextAction = boost::optional<DefragmentationAction>(
-                    SplitInfoWithKeyPattern(shardId,
-                                            _nss,
-                                            shardVersion,
-                                            rangeToSplit.getMin(),
-                                            rangeToSplit.getMax(),
-                                            splitPoints,
-                                            _uuid,
-                                            _shardKey));
-                pendingActions.rangesToSplit.pop_back();
-            } else if (!pendingActions.rangesToFindSplitPoints.empty()) {
-                const auto& rangeToAutoSplit = pendingActions.rangesToFindSplitPoints.back();
-                nextAction = boost::optional<DefragmentationAction>(
-                    AutoSplitVectorInfo(shardId,
-                                        _nss,
-                                        _uuid,
-                                        shardVersion,
-                                        _shardKey,
-                                        rangeToAutoSplit.getMin(),
-                                        rangeToAutoSplit.getMax(),
-                                        _maxChunkSizeBytes));
-                pendingActions.rangesToFindSplitPoints.pop_back();
-            }
-            if (nextAction.has_value()) {
-                ++_outstandingActions;
-                if (pendingActions.rangesToFindSplitPoints.empty() &&
-                    pendingActions.rangesToSplit.empty()) {
-                    it = _pendingActionsByShards.erase(it, std::next(it));
-                } else {
-                    ++it;
-                }
-            }
-            if (it != _pendingActionsByShards.end()) {
-                _shardToProcess = it->first;
-            } else {
-                _shardToProcess = boost::none;
-            }
-        }
-        return nextAction;
-    }
-
-    boost::optional<MigrateInfo> popNextMigration(
-        OperationContext* opCtx, stdx::unordered_set<ShardId>* usedShards) override {
-        return boost::none;
-    }
-
-    void applyActionResult(OperationContext* opCtx,
-                           const DefragmentationAction& action,
-                           const DefragmentationActionResponse& response) override {
-        ScopeGuard scopedGuard([&] { --_outstandingActions; });
-        if (_aborted) {
-            return;
-        }
-        stdx::visit(
-            visit_helper::Overloaded{
-                [&](const MergeInfo& _) {
-                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                },
-                [&](const DataSizeInfo& _) {
-                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                },
-                [&](const AutoSplitVectorInfo& autoSplitVectorAction) {
-                    auto& splitVectorResponse =
-                        stdx::get<StatusWith<AutoSplitVectorResponse>>(response);
-                    handleActionResult(
-                        opCtx,
-                        _nss,
-                        _uuid,
-                        getType(),
-                        splitVectorResponse.getStatus(),
-                        [&]() {
-                            auto& splitPoints = splitVectorResponse.getValue().getSplitKeys();
-                            if (!splitPoints.empty()) {
-                                auto& pendingActions =
-                                    _pendingActionsByShards[autoSplitVectorAction.shardId];
-                                pendingActions.rangesToSplit.push_back(
-                                    std::make_pair(ChunkRange(autoSplitVectorAction.minKey,
-                                                              autoSplitVectorAction.maxKey),
-                                                   splitPoints));
-                                if (splitVectorResponse.getValue().getContinuation()) {
-                                    pendingActions.rangesToFindSplitPoints.emplace_back(
-                                        splitPoints.back(), autoSplitVectorAction.maxKey);
-                                }
-                            }
-                        },
-                        [&]() {
-                            auto& pendingActions =
-                                _pendingActionsByShards[autoSplitVectorAction.shardId];
-                            pendingActions.rangesToFindSplitPoints.emplace_back(
-                                autoSplitVectorAction.minKey, autoSplitVectorAction.maxKey);
-                        },
-                        [&]() { _abort(getType()); });
-                },
-                [&](const SplitInfoWithKeyPattern& splitAction) {
-                    auto& splitResponse = stdx::get<Status>(response);
-                    handleActionResult(
-                        opCtx,
-                        _nss,
-                        _uuid,
-                        getType(),
-                        splitResponse,
-                        []() {},
-                        [&]() {
-                            auto& pendingActions =
-                                _pendingActionsByShards[splitAction.info.shardId];
-                            pendingActions.rangesToSplit.push_back(std::make_pair(
-                                ChunkRange(splitAction.info.minKey, splitAction.info.maxKey),
-                                splitAction.info.splitKeys));
-                        },
-                        [&]() { _abort(getType()); });
-                },
-                [&](const MigrateInfo& _) {
-                    uasserted(ErrorCodes::BadValue, "Unexpected action type");
-                }},
-            action);
-    }
-
-    bool isComplete() const override {
-        return _pendingActionsByShards.empty() && _outstandingActions == 0;
-    }
-
-    void userAbort() override {}
-
-    BSONObj reportProgress() const override {
-        size_t rangesToFindSplitPoints = 0, rangesToSplit = 0;
-        for (const auto& [shardId, pendingActions] : _pendingActionsByShards) {
-            rangesToFindSplitPoints += pendingActions.rangesToFindSplitPoints.size();
-            rangesToSplit += pendingActions.rangesToSplit.size();
-        }
-        auto remainingChunksToProcess =
-            static_cast<long long>(_outstandingActions + rangesToFindSplitPoints + rangesToSplit);
-        return BSON(kRemainingChunksToProcess << remainingChunksToProcess);
-    }
-
-private:
-    struct PendingActions {
-        std::vector<ChunkRange> rangesToFindSplitPoints;
-        std::vector<std::pair<ChunkRange, SplitPoints>> rangesToSplit;
-    };
-    SplitChunksPhase(const NamespaceString& nss,
-                     const UUID& uuid,
-                     const BSONObj& shardKey,
-                     const long long& maxChunkSizeBytes,
-                     stdx::unordered_map<ShardId, PendingActions>&& pendingActionsByShards)
-        : _nss(nss),
-          _uuid(uuid),
-          _shardKey(shardKey),
-          _maxChunkSizeBytes(maxChunkSizeBytes),
-          _pendingActionsByShards(std::move(pendingActionsByShards)) {}
-
-    void _abort(const DefragmentationPhaseEnum nextPhase) {
-        _aborted = true;
-        _nextPhase = nextPhase;
-        _pendingActionsByShards.clear();
-    }
-
-    const NamespaceString _nss;
-    const UUID _uuid;
-    const BSONObj _shardKey;
-    const long long _maxChunkSizeBytes;
-    stdx::unordered_map<ShardId, PendingActions> _pendingActionsByShards;
-    boost::optional<ShardId> _shardToProcess;
-    size_t _outstandingActions{0};
-    bool _aborted{false};
     DefragmentationPhaseEnum _nextPhase{DefragmentationPhaseEnum::kFinished};
 };
 
 }  // namespace
 
-void BalancerDefragmentationPolicyImpl::startCollectionDefragmentation(OperationContext* opCtx,
-                                                                       const CollectionType& coll) {
-    {
-        stdx::lock_guard<Latch> lk(_stateMutex);
-        const auto& uuid = coll.getUuid();
-        if (!coll.getDefragmentCollection() || _defragmentationStates.contains(uuid)) {
-            return;
+void BalancerDefragmentationPolicyImpl::startCollectionDefragmentations(OperationContext* opCtx) {
+    stdx::lock_guard<Latch> lk(_stateMutex);
+
+    // Fetch all collections with `defragmentCollection` flag enabled
+    static const auto query = BSON(CollectionType::kDefragmentCollectionFieldName << true);
+    const auto& configShard = ShardingCatalogManager::get(opCtx)->localConfigShard();
+    const auto& collDocs = uassertStatusOK(configShard->exhaustiveFindOnConfig(
+                                               opCtx,
+                                               ReadPreferenceSetting(ReadPreference::Nearest),
+                                               repl::ReadConcernLevel::kMajorityReadConcern,
+                                               NamespaceString::kConfigsvrCollectionsNamespace,
+                                               query,
+                                               BSONObj(),
+                                               boost::none))
+                               .docs;
+
+    for (const BSONObj& obj : collDocs) {
+        const CollectionType coll{obj};
+        if (_defragmentationStates.contains(coll.getUuid())) {
+            continue;
         }
         _initializeCollectionState(lk, opCtx, coll);
     }
@@ -1407,23 +1229,27 @@ void BalancerDefragmentationPolicyImpl::startCollectionDefragmentation(Operation
 void BalancerDefragmentationPolicyImpl::abortCollectionDefragmentation(OperationContext* opCtx,
                                                                        const NamespaceString& nss) {
     stdx::lock_guard<Latch> lk(_stateMutex);
-    auto coll = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, nss, {});
+    auto coll =
+        ShardingCatalogManager::get(opCtx)->localCatalogClient()->getCollection(opCtx, nss, {});
     if (coll.getDefragmentCollection()) {
         if (_defragmentationStates.contains(coll.getUuid())) {
             // Notify phase to abort current phase
             _defragmentationStates.at(coll.getUuid())->userAbort();
             _onStateUpdated();
         }
-        // Change persisted phase to kSplitChunks
-        _persistPhaseUpdate(opCtx, DefragmentationPhaseEnum::kSplitChunks, coll.getUuid());
+        _persistPhaseUpdate(opCtx, DefragmentationPhaseEnum::kFinished, coll.getUuid());
     }
+}
+
+void BalancerDefragmentationPolicyImpl::interruptAllDefragmentations() {
+    stdx::lock_guard<Latch> lk(_stateMutex);
+    _defragmentationStates.clear();
 }
 
 bool BalancerDefragmentationPolicyImpl::isDefragmentingCollection(const UUID& uuid) {
     stdx::lock_guard<Latch> lk(_stateMutex);
     return _defragmentationStates.contains(uuid);
 }
-
 
 BSONObj BalancerDefragmentationPolicyImpl::reportProgressOn(const UUID& uuid) {
     stdx::lock_guard<Latch> lk(_stateMutex);
@@ -1438,7 +1264,8 @@ BSONObj BalancerDefragmentationPolicyImpl::reportProgressOn(const UUID& uuid) {
 }
 
 MigrateInfoVector BalancerDefragmentationPolicyImpl::selectChunksToMove(
-    OperationContext* opCtx, stdx::unordered_set<ShardId>* usedShards) {
+    OperationContext* opCtx, stdx::unordered_set<ShardId>* availableShards) {
+
     MigrateInfoVector chunksToMove;
     {
         stdx::lock_guard<Latch> lk(_stateMutex);
@@ -1465,6 +1292,10 @@ MigrateInfoVector BalancerDefragmentationPolicyImpl::selectChunksToMove(
             for (auto it = collectionUUIDs.begin(); it != collectionUUIDs.end();) {
                 const auto& collUUID = *it;
 
+                if (availableShards->size() == 0) {
+                    return chunksToMove;
+                }
+
                 try {
                     auto defragStateIt = _defragmentationStates.find(collUUID);
                     if (defragStateIt == _defragmentationStates.end()) {
@@ -1479,7 +1310,7 @@ MigrateInfoVector BalancerDefragmentationPolicyImpl::selectChunksToMove(
                         continue;
                     }
                     auto actionableMigration =
-                        collDefragmentationPhase->popNextMigration(opCtx, usedShards);
+                        collDefragmentationPhase->popNextMigration(opCtx, availableShards);
                     if (!actionableMigration.has_value()) {
                         it = popCollectionUUID(it);
                         continue;
@@ -1500,7 +1331,7 @@ MigrateInfoVector BalancerDefragmentationPolicyImpl::selectChunksToMove(
         }
     }
 
-    if (chunksToMove.empty() && usedShards->empty()) {
+    if (chunksToMove.empty()) {
         // If the policy cannot produce new migrations even in absence of temporary constraints, it
         // is possible that some streaming actions must be processed first. Notify an update of the
         // internal state to make it happen.
@@ -1509,13 +1340,13 @@ MigrateInfoVector BalancerDefragmentationPolicyImpl::selectChunksToMove(
     return chunksToMove;
 }
 
-boost::optional<DefragmentationAction> BalancerDefragmentationPolicyImpl::getNextStreamingAction(
+StringData BalancerDefragmentationPolicyImpl::getName() const {
+    return StringData(kPolicyName);
+}
+
+boost::optional<BalancerStreamAction> BalancerDefragmentationPolicyImpl::getNextStreamingAction(
     OperationContext* opCtx) {
     stdx::lock_guard<Latch> lk(_stateMutex);
-    if (_concurrentStreamingOps >= kMaxConcurrentOperations) {
-        return boost::none;
-    }
-
     // Visit the defrag state in round robin fashion starting from a random one
     auto stateIt = [&] {
         auto it = _defragmentationStates.begin();
@@ -1535,7 +1366,6 @@ boost::optional<DefragmentationAction> BalancerDefragmentationPolicyImpl::getNex
                 auto nextAction =
                     currentCollectionDefragmentationState->popNextStreamableAction(opCtx);
                 if (nextAction) {
-                    ++_concurrentStreamingOps;
                     return nextAction;
                 }
                 ++stateIt;
@@ -1571,7 +1401,8 @@ bool BalancerDefragmentationPolicyImpl::_advanceToNextActionablePhase(OperationC
     boost::optional<CollectionType> coll(boost::none);
     while (phaseTransitionNeeded()) {
         if (!coll) {
-            coll = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, collUuid);
+            coll = ShardingCatalogManager::get(opCtx)->localCatalogClient()->getCollection(
+                opCtx, collUuid);
         }
         currentPhase = _transitionPhases(opCtx, *coll, currentPhase->getNextPhase());
         advanced = true;
@@ -1581,28 +1412,34 @@ bool BalancerDefragmentationPolicyImpl::_advanceToNextActionablePhase(OperationC
 
 void BalancerDefragmentationPolicyImpl::applyActionResult(
     OperationContext* opCtx,
-    const DefragmentationAction& action,
-    const DefragmentationActionResponse& response) {
+    const BalancerStreamAction& action,
+    const BalancerStreamActionResponse& response) {
     {
         stdx::lock_guard<Latch> lk(_stateMutex);
         DefragmentationPhase* targetState = nullptr;
         stdx::visit(
-            [&](auto&& act) {
-                if (_defragmentationStates.contains(act.uuid)) {
-                    targetState = _defragmentationStates.at(act.uuid).get();
-                }
-            },
+            OverloadedVisitor{[&](const MergeInfo& act) {
+                                  if (_defragmentationStates.contains(act.uuid)) {
+                                      targetState = _defragmentationStates.at(act.uuid).get();
+                                  }
+                              },
+                              [&](const DataSizeInfo& act) {
+                                  if (_defragmentationStates.contains(act.uuid)) {
+                                      targetState = _defragmentationStates.at(act.uuid).get();
+                                  }
+                              },
+                              [&](const MigrateInfo& act) {
+                                  if (_defragmentationStates.contains(act.uuid)) {
+                                      targetState = _defragmentationStates.at(act.uuid).get();
+                                  }
+                              },
+                              [](const MergeAllChunksOnShardInfo& _) {
+                                  uasserted(ErrorCodes::BadValue, "Unexpected action type");
+                              }},
             action);
 
-        if (!targetState) {
-            return;
-        }
-
-        targetState->applyActionResult(opCtx, action, response);
-        bool streamingActionReceived = !stdx::holds_alternative<MigrateInfo>(action);
-        if (streamingActionReceived) {
-            --_concurrentStreamingOps;
-            invariant(_concurrentStreamingOps >= 0);
+        if (targetState) {
+            targetState->applyActionResult(opCtx, action, response);
         }
     }
     _onStateUpdated();
@@ -1614,6 +1451,7 @@ std::unique_ptr<DefragmentationPhase> BalancerDefragmentationPolicyImpl::_transi
     DefragmentationPhaseEnum nextPhase,
     bool shouldPersistPhase) {
     std::unique_ptr<DefragmentationPhase> nextPhaseObject(nullptr);
+
     try {
         if (shouldPersistPhase) {
             _persistPhaseUpdate(opCtx, nextPhase, coll.getUuid());
@@ -1631,17 +1469,15 @@ std::unique_ptr<DefragmentationPhase> BalancerDefragmentationPolicyImpl::_transi
             case DefragmentationPhaseEnum::kMergeChunks:
                 nextPhaseObject = MergeChunksPhase::build(opCtx, coll);
                 break;
-            case DefragmentationPhaseEnum::kSplitChunks:
-                nextPhaseObject = SplitChunksPhase::build(opCtx, coll);
-                break;
             case DefragmentationPhaseEnum::kFinished:
+            default:  // Exit defragmentation in case of unexpected phase
                 _clearDefragmentationState(opCtx, coll.getUuid());
                 break;
         }
         afterBuildingNextDefragmentationPhase.pauseWhileSet();
         LOGV2(6172702,
               "Collection defragmentation transitioned to new phase",
-              "namespace"_attr = coll.getNss(),
+              logAttrs(coll.getNss()),
               "phase"_attr = nextPhaseObject
                   ? DefragmentationPhase_serializer(nextPhaseObject->getType())
                   : kNoPhase,
@@ -1649,7 +1485,7 @@ std::unique_ptr<DefragmentationPhase> BalancerDefragmentationPolicyImpl::_transi
     } catch (const DBException& e) {
         LOGV2_ERROR(6153101,
                     "Error while building defragmentation phase on collection",
-                    "namespace"_attr = coll.getNss(),
+                    logAttrs(coll.getNss()),
                     "uuid"_attr = coll.getUuid(),
                     "phase"_attr = nextPhase,
                     "error"_attr = e);
@@ -1664,10 +1500,10 @@ void BalancerDefragmentationPolicyImpl::_initializeCollectionState(WithLock,
         return;
     }
     auto phaseToBuild = coll.getDefragmentationPhase()
-        ? coll.getDefragmentationPhase().get()
+        ? coll.getDefragmentationPhase().value()
         : DefragmentationPhaseEnum::kMergeAndMeasureChunks;
-    auto collectionPhase = _transitionPhases(
-        opCtx, coll, phaseToBuild, !coll.getDefragmentationPhase().is_initialized());
+    auto collectionPhase =
+        _transitionPhases(opCtx, coll, phaseToBuild, !coll.getDefragmentationPhase().has_value());
     while (collectionPhase && collectionPhase->isComplete() &&
            MONGO_likely(!skipDefragmentationPhaseTransition.shouldFail())) {
         collectionPhase = _transitionPhases(opCtx, coll, collectionPhase->getNextPhase());

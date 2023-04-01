@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/logv2/log.h"
@@ -40,6 +39,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/change_stream_helpers.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_merge.h"
@@ -52,6 +52,9 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/str.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
+
 namespace mongo {
 
 namespace {
@@ -62,9 +65,10 @@ Value appendCommonExecStats(Value docSource, const CommonStats& stats) {
     invariant(docSource.getType() == BSONType::Object);
     MutableDocument doc(docSource.getDocument());
     auto nReturned = static_cast<long long>(stats.advanced);
-    invariant(stats.executionTimeMillis);
-    auto executionTimeMillisEstimate = static_cast<long long>(*stats.executionTimeMillis);
     doc.addField("nReturned", Value(nReturned));
+
+    invariant(stats.executionTime);
+    auto executionTimeMillisEstimate = durationCount<Milliseconds>(*stats.executionTime);
     doc.addField("executionTimeMillisEstimate", Value(executionTimeMillisEstimate));
     return Value(doc.freeze());
 }
@@ -105,20 +109,38 @@ void validateTopLevelPipeline(const Pipeline& pipeline) {
 
         // If the first stage is a $changeStream stage, then all stages in the pipeline must be
         // either $changeStream stages or allowlisted as being able to run in a change stream.
-        if (firstStageConstraints.isChangeStreamStage()) {
-            for (auto&& source : sources) {
-                uassert(ErrorCodes::IllegalOperation,
-                        str::stream() << source->getSourceName()
-                                      << " is not permitted in a $changeStream pipeline",
-                        source->constraints().isAllowedInChangeStream());
+        const bool isChangeStream = firstStageConstraints.isChangeStreamStage();
+        // Record whether any of the stages in the pipeline is a $changeStreamSplitLargeEvent.
+        bool hasChangeStreamSplitLargeEventStage = false;
+        for (auto&& source : sources) {
+            uassert(ErrorCodes::IllegalOperation,
+                    str::stream() << source->getSourceName()
+                                  << " is not permitted in a $changeStream pipeline",
+                    !(isChangeStream && !source->constraints().isAllowedInChangeStream()));
+            // Check whether any stages must only be run in a change stream pipeline.
+            uassert(ErrorCodes::IllegalOperation,
+                    str::stream() << source->getSourceName()
+                                  << " can only be used in a $changeStream pipeline",
+                    !(source->constraints().requiresChangeStream() && !isChangeStream));
+            // Check whether this is a change stream split stage.
+            if ("$changeStreamSplitLargeEvent"_sd == source->getSourceName()) {
+                hasChangeStreamSplitLargeEventStage = true;
             }
         }
+        auto expCtx = pipeline.getContext();
+        auto spec = isChangeStream ? expCtx->changeStreamSpec : boost::none;
+        auto hasSplitEventResumeToken = spec &&
+            change_stream::resolveResumeTokenFromSpec(expCtx, *spec).fragmentNum.has_value();
+        uassert(ErrorCodes::ChangeStreamFatalError,
+                "To resume from a split event, the $changeStream pipeline must include a "
+                "$changeStreamSplitLargeEvent stage",
+                !(hasSplitEventResumeToken && !hasChangeStreamSplitLargeEventStage));
     }
 
     // Verify that usage of $searchMeta and $search is legal.
     if (pipeline.getContext()->opCtx->getServiceContext()) {
         getSearchHelpers(pipeline.getContext()->opCtx->getServiceContext())
-            ->assertSearchMetaAccessValid(sources);
+            ->assertSearchMetaAccessValid(sources, pipeline.getContext().get());
     }
 }
 
@@ -153,23 +175,27 @@ Pipeline::~Pipeline() {
     invariant(_disposed);
 }
 
-std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::clone() const {
+std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::clone(
+    const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const {
+    auto expCtx = newExpCtx ? newExpCtx : getContext();
     SourceContainer clonedStages;
     for (auto&& stage : _sources) {
-        clonedStages.push_back(stage->clone());
+        clonedStages.push_back(stage->clone(expCtx));
     }
-    return create(clonedStages, getContext());
+    return create(clonedStages, expCtx);
 }
 
-std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::parse(
-    const std::vector<BSONObj>& rawPipeline,
-    const intrusive_ptr<ExpressionContext>& expCtx,
-    PipelineValidatorCallback validator) {
+template <class T>
+std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::parseCommon(
+    const std::vector<T>& rawPipeline,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    PipelineValidatorCallback validator,
+    std::function<BSONObj(T)> getElemFunc) {
 
     SourceContainer stages;
 
-    for (auto&& stageObj : rawPipeline) {
-        auto parsedSources = DocumentSource::parse(expCtx, stageObj);
+    for (auto&& stageElem : rawPipeline) {
+        auto parsedSources = DocumentSource::parse(expCtx, getElemFunc(stageElem));
         stages.insert(stages.end(), parsedSources.begin(), parsedSources.end());
     }
 
@@ -192,6 +218,30 @@ std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::parse(
     return pipeline;
 }
 
+std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::parseFromArray(
+    BSONElement rawPipelineElement,
+    const intrusive_ptr<ExpressionContext>& expCtx,
+    PipelineValidatorCallback validator) {
+
+    tassert(6253719,
+            "Expected array for Pipeline::parseFromArray",
+            rawPipelineElement.type() == BSONType::Array);
+    auto rawStages = rawPipelineElement.Array();
+
+    return parseCommon<BSONElement>(rawStages, expCtx, validator, [](BSONElement e) {
+        uassert(6253720, "Pipeline array element must be an object", e.type() == BSONType::Object);
+        return e.embeddedObject();
+    });
+}
+
+std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::parse(
+    const std::vector<BSONObj>& rawPipeline,
+    const intrusive_ptr<ExpressionContext>& expCtx,
+    PipelineValidatorCallback validator) {
+
+    return parseCommon<BSONObj>(rawPipeline, expCtx, validator, [](BSONObj o) { return o; });
+}
+
 std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::create(
     SourceContainer stages, const intrusive_ptr<ExpressionContext>& expCtx) {
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline(new Pipeline(std::move(stages), expCtx),
@@ -204,39 +254,43 @@ std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::create(
 }
 
 void Pipeline::validateCommon(bool alreadyOptimized) const {
-    size_t i = 0;
-
     uassert(ErrorCodes::FailedToParse,
             str::stream() << "Pipeline length must be no longer than "
                           << internalPipelineLengthLimit << " stages",
             static_cast<int>(_sources.size()) <= internalPipelineLengthLimit);
 
-    for (auto&& stage : _sources) {
+    checkValidOperationContext();
+
+    // Keep track of stages which can only appear once.
+    std::set<StringData> singleUseStages;
+
+    for (auto sourceIter = _sources.begin(); sourceIter != _sources.end(); ++sourceIter) {
+        auto& stage = *sourceIter;
         auto constraints = stage->constraints(_splitState);
 
         // Verify that all stages adhere to their PositionRequirement constraints.
         uassert(40602,
                 str::stream() << stage->getSourceName()
                               << " is only valid as the first stage in a pipeline",
-                !(constraints.requiredPosition == PositionRequirement::kFirst && i != 0));
-        uassert(40603,
-                str::stream() << stage->getSourceName()
-                              << " is only valid as the first stage in an optimized pipeline",
-                !(alreadyOptimized &&
-                  constraints.requiredPosition == PositionRequirement::kFirstAfterOptimization &&
-                  i != 0));
+                !(constraints.requiredPosition == PositionRequirement::kFirst &&
+                  sourceIter != _sources.begin()));
 
+        // TODO SERVER-73790: use PositionRequirement::kCustom to validate $match.
         auto matchStage = dynamic_cast<DocumentSourceMatch*>(stage.get());
         uassert(17313,
                 "$match with $text is only allowed as the first pipeline stage",
-                !(i != 0 && matchStage && matchStage->isTextQuery()));
+                !(sourceIter != _sources.begin() && matchStage && matchStage->isTextQuery()));
 
         uassert(40601,
                 str::stream() << stage->getSourceName()
                               << " can only be the final stage in the pipeline",
                 !(constraints.requiredPosition == PositionRequirement::kLast &&
-                  i != _sources.size() - 1));
-        ++i;
+                  std::next(sourceIter) != _sources.end()));
+
+        // If the stage has a special requirement about its position, validate it.
+        if (constraints.requiredPosition == PositionRequirement::kCustom) {
+            stage->validatePipelinePosition(alreadyOptimized, sourceIter, _sources);
+        }
 
         // Verify that we are not attempting to run a mongoS-only stage on mongoD.
         uassert(40644,
@@ -248,6 +302,17 @@ void Pipeline::validateCommon(bool alreadyOptimized) const {
             str::stream() << "Stage not supported inside of a multi-document transaction: "
                           << stage->getSourceName(),
             !(pCtx->opCtx->inMultiDocumentTransaction() && !constraints.isAllowedInTransaction()));
+
+        // Verify that a stage which can only appear once doesn't appear more than that.
+        uassert(7183900,
+                str::stream() << stage->getSourceName() << " can only be used once in the pipeline",
+                !(constraints.canAppearOnlyOnceInPipeline &&
+                  !singleUseStages.insert(stage->getSourceName()).second));
+
+        tassert(7355707,
+                "If a stage is broadcast to all shard servers then it must be a data source.",
+                constraints.hostRequirement != HostTypeRequirement::kAllShardServers ||
+                    !constraints.requiresInputDocSource);
     }
 }
 
@@ -311,6 +376,9 @@ void Pipeline::detachFromOperationContext() {
     for (auto&& source : _sources) {
         source->detachFromOperationContext();
     }
+
+    // Check for a null operation context to make sure that all children detached correctly.
+    checkValidOperationContext();
 }
 
 void Pipeline::reattachToOperationContext(OperationContext* opCtx) {
@@ -319,6 +387,24 @@ void Pipeline::reattachToOperationContext(OperationContext* opCtx) {
     for (auto&& source : _sources) {
         source->reattachToOperationContext(opCtx);
     }
+
+    checkValidOperationContext();
+}
+
+bool Pipeline::validateOperationContext(const OperationContext* opCtx) const {
+    return std::all_of(_sources.begin(), _sources.end(), [this, opCtx](const auto& s) {
+        // All sources in a pipeline must share its expression context. Subpipelines may have a
+        // different expression context, but must point to the same operation context. Let the
+        // sources validate this themselves since they don't all have the same subpipelines, etc.
+        return s->getContext() == getContext() && s->validateOperationContext(opCtx);
+    });
+}
+
+void Pipeline::checkValidOperationContext() const {
+    tassert(7406000,
+            str::stream()
+                << "All DocumentSources and subpipelines must have the same operation context",
+            validateOperationContext(getContext()->opCtx));
 }
 
 void Pipeline::dispose(OperationContext* opCtx) {
@@ -370,11 +456,19 @@ bool Pipeline::needsMongosMerger() const {
     });
 }
 
+bool Pipeline::needsAllShardServers() const {
+    return std::any_of(_sources.begin(), _sources.end(), [&](const auto& stage) {
+        return stage->constraints().resolvedHostTypeRequirement(pCtx) ==
+            HostTypeRequirement::kAllShardServers;
+    });
+}
+
 bool Pipeline::needsShard() const {
     return std::any_of(_sources.begin(), _sources.end(), [&](const auto& stage) {
         auto hostType = stage->constraints().resolvedHostTypeRequirement(pCtx);
         return (hostType == HostTypeRequirement::kAnyShard ||
-                hostType == HostTypeRequirement::kPrimaryShard);
+                hostType == HostTypeRequirement::kPrimaryShard ||
+                hostType == HostTypeRequirement::kAllShardServers);
     });
 }
 
@@ -419,19 +513,49 @@ stdx::unordered_set<NamespaceString> Pipeline::getInvolvedCollections() const {
     return collectionNames;
 }
 
-vector<Value> Pipeline::serializeContainer(const SourceContainer& container) {
+vector<Value> Pipeline::serializeContainer(const SourceContainer& container,
+                                           boost::optional<SerializationOptions> opts) {
     vector<Value> serializedSources;
     for (auto&& source : container) {
-        source->serializeToArray(serializedSources);
+        source->serializeToArray(serializedSources, opts ? opts.get() : SerializationOptions());
     }
     return serializedSources;
 }
-vector<Value> Pipeline::serialize() const {
-    return serializeContainer(_sources);
+
+vector<Value> Pipeline::serializeContainer(const SourceContainer& container,
+                                           boost::optional<ExplainOptions::Verbosity> explain) {
+    // TODO SERVER-75139 Remove this function once all calls have been removed.
+    vector<Value> serializedSources;
+    for (auto&& source : container) {
+        source->serializeToArray(serializedSources, explain);
+    }
+    return serializedSources;
 }
 
-vector<BSONObj> Pipeline::serializeToBson() const {
-    const auto serialized = serialize();
+vector<Value> Pipeline::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+    // TODO SERVER-75139 Remove this function once all calls have been removed.
+    return serializeContainer(_sources, {explain});
+}
+
+vector<Value> Pipeline::serialize(boost::optional<SerializationOptions> opts) const {
+    return serializeContainer(_sources, opts);
+}
+
+vector<BSONObj> Pipeline::serializeToBson(
+    boost::optional<ExplainOptions::Verbosity> explain) const {
+    const auto serialized = serialize(explain);
+    std::vector<BSONObj> asBson;
+    asBson.reserve(serialized.size());
+    for (auto&& stage : serialized) {
+        invariant(stage.getType() == BSONType::Object);
+        asBson.push_back(stage.getDocument().toBson());
+    }
+    return asBson;
+}
+
+vector<BSONObj> Pipeline::serializeToBson(boost::optional<SerializationOptions> opts) const {
+    // TODO SERVER-75139 Remove this function once all calls have been removed.
+    const auto serialized = serialize(opts);
     std::vector<BSONObj> asBson;
     asBson.reserve(serialized.size());
     for (auto&& stage : serialized) {
@@ -503,6 +627,12 @@ void Pipeline::addFinalSource(intrusive_ptr<DocumentSource> source) {
     _sources.push_back(source);
 }
 
+void Pipeline::addVariableRefs(std::set<Variables::Id>* refs) const {
+    for (auto&& source : _sources) {
+        source->addVariableRefs(refs);
+    }
+}
+
 DepsTracker Pipeline::getDependencies(
     boost::optional<QueryMetadataBitSet> unavailableMetadata) const {
     return getDependenciesForContainer(getContext(), _sources, unavailableMetadata);
@@ -516,6 +646,7 @@ DepsTracker Pipeline::getDependenciesForContainer(
     // us to call 'deps.setNeedsMetadata()' without throwing.
     DepsTracker deps(unavailableMetadata.get_value_or(DepsTracker::kNoMetadata));
 
+    OrderedPathSet generatedPaths;
     bool hasUnsupportedStage = false;
     bool knowAllFields = false;
     bool knowAllMeta = false;
@@ -523,7 +654,6 @@ DepsTracker Pipeline::getDependenciesForContainer(
         DepsTracker localDeps(deps.getUnavailableMetadata());
         DepsTracker::State status = source->getDependencies(&localDeps);
 
-        deps.vars.insert(localDeps.vars.begin(), localDeps.vars.end());
         deps.needRandomGenerator |= localDeps.needRandomGenerator;
 
         if (status == DepsTracker::State::NOT_SUPPORTED) {
@@ -536,10 +666,23 @@ DepsTracker Pipeline::getDependenciesForContainer(
         // If we ever saw an unsupported stage, don't bother continuing to track field and metadata
         // deps: we already have to assume the pipeline depends on everything.
         if (!hasUnsupportedStage && !knowAllFields) {
-            deps.fields.insert(localDeps.fields.begin(), localDeps.fields.end());
+            for (const auto& field : localDeps.fields) {
+                // If a field was generated within the pipeline, we don't need to count it as a
+                // dependency of the pipeline as a whole when it is used in later stages.
+                if (!expression::containsDependency({field}, generatedPaths)) {
+                    deps.fields.emplace(field);
+                }
+            }
             if (localDeps.needWholeDocument)
                 deps.needWholeDocument = true;
             knowAllFields = status & DepsTracker::State::EXHAUSTIVE_FIELDS;
+
+            // Check if this stage modifies any fields that we should track for use by later stages.
+            auto localGeneratedPaths = source->getModifiedPaths();
+            if (localGeneratedPaths.type == DocumentSource::GetModPathsReturn::Type::kFiniteSet) {
+                auto newPathNames = localGeneratedPaths.getNewNames();
+                generatedPaths.insert(newPathNames.begin(), newPathNames.end());
+            }
         }
 
         if (!hasUnsupportedStage && !knowAllMeta) {
@@ -572,12 +715,13 @@ Status Pipeline::_pipelineCanRunOnMongoS() const {
         auto hostRequirement = constraints.resolvedHostTypeRequirement(pCtx);
 
         const bool needsShard = (hostRequirement == HostTypeRequirement::kAnyShard ||
-                                 hostRequirement == HostTypeRequirement::kPrimaryShard);
+                                 hostRequirement == HostTypeRequirement::kPrimaryShard ||
+                                 hostRequirement == HostTypeRequirement::kAllShardServers);
 
         const bool mustWriteToDisk =
             (constraints.diskRequirement == DiskUseRequirement::kWritesPersistentData);
         const bool mayWriteTmpDataAndDiskUseIsAllowed =
-            (pCtx->allowDiskUse && !storageGlobalParams.readOnly &&
+            (pCtx->allowDiskUse && !pCtx->opCtx->readOnly() &&
              constraints.diskRequirement == DiskUseRequirement::kWritesTmpData);
         const bool needsDisk = (mustWriteToDisk || mayWriteTmpDataAndDiskUseIsAllowed);
 
@@ -680,6 +824,41 @@ std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::makePipeline(
     return pipeline;
 }
 
+std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::makePipeline(
+    AggregateCommandRequest& aggRequest,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    boost::optional<BSONObj> shardCursorsSortSpec,
+    const MakePipelineOptions opts) {
+    tassert(7393500, "AttachCursorSource must be set to true.", opts.attachCursorSource);
+
+    boost::optional<BSONObj> readConcern;
+    // If readConcern is set on opts and aggRequest, assert they are equal.
+    if (opts.readConcern && aggRequest.getReadConcern()) {
+        tassert(7393501,
+                "Read concern on aggRequest and makePipelineOpts must match.",
+                opts.readConcern->binaryEqual(*aggRequest.getReadConcern()));
+        readConcern = aggRequest.getReadConcern();
+    } else {
+        readConcern = aggRequest.getReadConcern() ? aggRequest.getReadConcern() : opts.readConcern;
+    }
+
+    auto pipeline = Pipeline::parse(aggRequest.getPipeline(), expCtx, opts.validator);
+    if (opts.optimize) {
+        pipeline->optimizePipeline();
+    }
+
+    constexpr bool alreadyOptimized = true;
+    pipeline->validateCommon(alreadyOptimized);
+    aggRequest.setPipeline(pipeline->serializeToBson());
+
+    return expCtx->mongoProcessInterface->attachCursorSourceToPipeline(aggRequest,
+                                                                       pipeline.release(),
+                                                                       expCtx,
+                                                                       shardCursorsSortSpec,
+                                                                       opts.shardTargetingPolicy,
+                                                                       std::move(readConcern));
+}
+
 Pipeline::SourceContainer::iterator Pipeline::optimizeEndOfPipeline(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     // We must create a new SourceContainer representing the subsection of the pipeline we wish to
@@ -690,6 +869,24 @@ Pipeline::SourceContainer::iterator Pipeline::optimizeEndOfPipeline(
     container->splice(std::next(itr), endOfPipeline);
 
     return std::next(itr);
+}
+
+Pipeline::SourceContainer::iterator Pipeline::optimizeAtEndOfPipeline(
+    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+    if (itr == container->end()) {
+        return itr;
+    }
+    itr = std::next(itr);
+    try {
+        while (itr != container->end()) {
+            invariant((*itr).get());
+            itr = (*itr).get()->optimizeAt(itr, container);
+        }
+    } catch (DBException& ex) {
+        ex.addContext("Failed to optimize pipeline");
+        throw;
+    }
+    return itr;
 }
 
 std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::makePipelineFromViewDefinition(

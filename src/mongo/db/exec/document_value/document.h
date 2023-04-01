@@ -100,6 +100,7 @@ public:
     static constexpr StringData metaFieldSearchScore = "$searchScore"_sd;
     static constexpr StringData metaFieldSearchHighlights = "$searchHighlights"_sd;
     static constexpr StringData metaFieldSearchScoreDetails = "$searchScoreDetails"_sd;
+    static constexpr StringData metaFieldSearchSortValues = "$searchSortValues"_sd;
     static constexpr StringData metaFieldIndexKey = "$indexKey"_sd;
 
     static const StringDataSet allMetadataFieldNames;
@@ -137,16 +138,16 @@ public:
      * instead.
      */
     template <typename T>
-    const Value operator[](T key) const {
+    Value operator[](T key) const {
         return getField(key);
     }
     template <typename T>
-    const Value getField(T key) const {
+    Value getField(T key) const {
         return storage().getField(key);
     }
 
     /// Look up a field by Position. See positionOf and getNestedField.
-    const Value getField(Position pos) const {
+    Value getField(Position pos) const {
         return storage().getField(pos).val;
     }
 
@@ -155,8 +156,7 @@ public:
      * If 'positions' is non-null, it will be filled with a path suitable to pass to
      * MutableDocument::setNestedField().
      */
-    const Value getNestedField(const FieldPath& path,
-                               std::vector<Position>* positions = nullptr) const;
+    Value getNestedField(const FieldPath& path, std::vector<Position>* positions = nullptr) const;
 
     /**
      * Returns field at given path as either BSONElement or Value, depending on how it is
@@ -191,7 +191,8 @@ public:
 
     /**
      * Get the approximate size of the Document, plus its underlying storage and sub-values. Returns
-     * size in bytes.
+     * size in bytes. The return value of this function is snapshotted. All subsequent calls of this
+     * method will return the same value.
      *
      * Note: Some memory may be shared with other Documents or between fields within a single
      * Document so this can overestimate usage.
@@ -200,6 +201,11 @@ public:
      * the document.
      */
     size_t getApproximateSize() const;
+
+    /**
+     * Same as 'getApproximateSize()', but this method re-computes the size on every call.
+     */
+    size_t getCurrentApproximateSize() const;
 
     /**
      * Return the approximate amount of space used by metadata.
@@ -253,12 +259,30 @@ public:
     void hash_combine(size_t& seed, const StringData::ComparatorInterface* stringComparator) const;
 
     /**
+     * Returns true, if this document is trivially convertible to BSON, meaning the underlying
+     * storage is already in BSON format and there are no damages.
+     */
+    bool isTriviallyConvertible() const {
+        return !storage().isModified() && !storage().stripMetadata();
+    }
+
+    /**
      * Serializes this document to the BSONObj under construction in 'builder'. Metadata is not
      * included. Throws a AssertionException if 'recursionLevel' exceeds the maximum allowable
      * depth.
      */
     void toBson(BSONObjBuilder* builder, size_t recursionLevel = 1) const;
-    BSONObj toBson() const;
+
+    template <typename BSONTraits = BSONObj::DefaultSizeTrait>
+    BSONObj toBson() const {
+        if (isTriviallyConvertible()) {
+            return storage().bsonObj();
+        }
+
+        BSONObjBuilder bb;
+        toBson(&bb);
+        return bb.obj<BSONTraits>();
+    }
 
     /**
      * Serializes this document iff the conversion is "trivial," meaning that the underlying storage
@@ -331,6 +355,13 @@ public:
     Document getOwned() &&;
 
     /**
+     * Needed to satisfy the Sorter interface. This method throws an assertion.
+     */
+    void makeOwned() {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
      * Returns true if the underlying BSONObj is owned.
      */
     bool isOwned() const {
@@ -370,12 +401,6 @@ private:
     getNestedFieldNonCachingHelper(const FieldPath& dottedField, size_t level) const;
 
     boost::intrusive_ptr<const DocumentStorage> _storage;
-
-    /**
-     * Returns the approximate size of this `Document` instance without considering the size of its
-     * backing BSON object.
-     */
-    size_t getApproximateSizeWithoutBackingBSON() const;
 };
 
 //
@@ -654,6 +679,7 @@ public:
      *  TODO: there are some optimizations that may make sense at freeze time.
      */
     Document freeze() {
+        resetSnapshottedApproximateSize();
         // This essentially moves _storage into a new Document by way of temp.
         Document ret;
         boost::intrusive_ptr<const DocumentStorage> temp(storagePtr(), /*inc_ref_count=*/false);
@@ -672,8 +698,12 @@ public:
      *  Note that unlike freeze(), this indicates intention to continue
      *  modifying this document. The returned Document will not observe
      *  future changes to this MutableDocument.
+     *
+     *  Note that the computed snapshotted approximate size of the Document
+     *  is not preserved across calls.
      */
     Document peek() {
+        resetSnapshottedApproximateSize();
         return Document(storagePtr());
     }
 
@@ -739,10 +769,17 @@ private:
     MutableValue getNestedFieldHelper(const FieldPath& dottedField, size_t level);
     MutableValue getNestedFieldHelper(const std::vector<Position>& positions, size_t level);
 
-    // this should only be called by storage methods and peek/freeze
+    // this should only be called by storage methods and peek/freeze/resetsnapshottedApproximateSize
     const DocumentStorage* storagePtr() const {
         dassert(!_storage || typeid(*_storage) == typeid(const DocumentStorage));
         return static_cast<const DocumentStorage*>(_storage);
+    }
+
+    void resetSnapshottedApproximateSize() {
+        auto mutableStorage = const_cast<DocumentStorage*>(storagePtr());
+        if (mutableStorage) {
+            mutableStorage->resetSnapshottedApproximateSize();
+        }
     }
 
     // These are both const to prevent modifications bypassing storage() method.

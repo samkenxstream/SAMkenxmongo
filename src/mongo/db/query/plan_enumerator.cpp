@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/query/plan_enumerator.h"
 
@@ -37,6 +36,9 @@
 #include "mongo/db/query/indexability.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/string_map.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace {
 
@@ -261,7 +263,8 @@ PlanEnumerator::PlanEnumerator(const PlanEnumeratorParams& params)
       _ixisect(params.intersect),
       _enumerateOrChildrenLockstep(params.enumerateOrChildrenLockstep),
       _orLimit(params.maxSolutionsPerOr),
-      _intersectLimit(params.maxIntersectPerAnd) {}
+      _intersectLimit(params.maxIntersectPerAnd),
+      _disableOrPushdown(params.disableOrPushdown) {}
 
 PlanEnumerator::~PlanEnumerator() {
     typedef stdx::unordered_map<MemoID, NodeAssignment*> MemoMap;
@@ -374,7 +377,7 @@ unique_ptr<MatchExpression> PlanEnumerator::getNext() {
     // Tag with our first solution.
     tagMemo(memoIDForNode(_root));
 
-    unique_ptr<MatchExpression> tree(_root->shallowClone());
+    unique_ptr<MatchExpression> tree(_root->clone());
     tagForSort(tree.get());
 
     _root->resetTag();
@@ -492,7 +495,7 @@ bool PlanEnumerator::prepMemo(MatchExpression* node, PrepMemoContext context) {
         NodeAssignment* assign;
         allocateAssignment(node, &assign, &myMemoID);
 
-        assign->arrayAssignment.reset(aa.release());
+        assign->arrayAssignment = std::move(aa);
         return true;
     } else if (Indexability::nodeCanUseIndexOnOwnField(node) ||
                Indexability::isBoundsGeneratingNot(node) ||
@@ -526,10 +529,14 @@ bool PlanEnumerator::prepMemo(MatchExpression* node, PrepMemoContext context) {
         // preds to 'indexedPreds'. Adding the mandatory preds directly to 'indexedPreds' would lead
         // to problems such as pulling a predicate beneath an OR into a set joined by an AND.
         getIndexedPreds(node, childContext, &indexedPreds);
-        // Pass in the indexed predicates as outside predicates when prepping the subnodes.
+        // Pass in the indexed predicates as outside predicates when prepping the subnodes. But if
+        // match expression optimization is disabled, skip this part: we don't want to do
+        // OR-pushdown because it relies on the expression being canonicalized.
         auto childContextCopy = childContext;
-        for (auto pred : indexedPreds) {
-            childContextCopy.outsidePreds[pred] = OutsidePredRoute{};
+        if (MONGO_likely(!_disableOrPushdown)) {
+            for (auto pred : indexedPreds) {
+                childContextCopy.outsidePreds[pred] = OutsidePredRoute{};
+            }
         }
         if (!prepSubNodes(node, childContextCopy, &subnodes, &mandatorySubnodes)) {
             return false;
@@ -833,6 +840,13 @@ void PlanEnumerator::assignPredicate(
     MatchExpression* pred,
     size_t position,
     OneIndexAssignment* indexAssignment) {
+    if (MONGO_unlikely(_disableOrPushdown)) {
+        // If match expression optimization is disabled, we also disable OR-pushdown,
+        // so we should never get 'outsidePreds' here.
+        tassert(7059700,
+                "Tried to do OR-pushdown despite disableMatchExpressionOptimization",
+                outsidePreds.empty());
+    }
     if (outsidePreds.find(pred) != outsidePreds.end()) {
         OrPushdownTag::Destination dest;
         dest.route = outsidePreds.at(pred).route;
@@ -1689,8 +1703,8 @@ bool PlanEnumerator::LockstepOrAssignment::allIdentical() const {
     return true;
 }
 
-bool PlanEnumerator::LockstepOrAssignment::shouldResetBeforeProceeding(
-    size_t totalEnumerated) const {
+bool PlanEnumerator::LockstepOrAssignment::shouldResetBeforeProceeding(size_t totalEnumerated,
+                                                                       size_t orLimit) const {
     if (totalEnumerated == 0 || !exhaustedLockstepIteration) {
         return false;
     }
@@ -1700,7 +1714,12 @@ bool PlanEnumerator::LockstepOrAssignment::shouldResetBeforeProceeding(
         if (!subnode.maxIterCount) {
             return false;  // Haven't yet looped over this child entirely, not ready yet.
         }
-        totalPossibleEnumerations *= subnode.maxIterCount.get();
+        totalPossibleEnumerations *= subnode.maxIterCount.value();
+        // If 'totalPossibleEnumerations' reaches the limit, we can just shortcut it. Otherwise,
+        // 'totalPossibleEnumerations' could overflow if we have a large $or.
+        if (totalPossibleEnumerations >= orLimit) {
+            return false;
+        }
     }
 
     // If we're able to compute a total number expected enumerations, we must have already cycled
@@ -1737,7 +1756,7 @@ bool PlanEnumerator::_nextMemoForLockstepOrAssignment(
         }
         // Edge case: if every child has only one option available, we are already finished
         // enumerating.
-        if (assignment->shouldResetBeforeProceeding(assignment->totalEnumerated)) {
+        if (assignment->shouldResetBeforeProceeding(assignment->totalEnumerated, _orLimit)) {
             assignment->exhaustedLockstepIteration = false;
             return true;  // We're back at the beginning, no need to reset.
         }
@@ -1776,7 +1795,7 @@ bool PlanEnumerator::_nextMemoForLockstepOrAssignment(
     // This special ordering is tricky to reset. Because it iterates the sub nodes in such a
     // unique order, it can be difficult to know when it has actually finished iterating. Our
     // strategy is just to compute a total and go back to the beginning once we hit that total.
-    if (!assignment->shouldResetBeforeProceeding(assignment->totalEnumerated)) {
+    if (!assignment->shouldResetBeforeProceeding(assignment->totalEnumerated, _orLimit)) {
         return false;
     }
     // Reset!

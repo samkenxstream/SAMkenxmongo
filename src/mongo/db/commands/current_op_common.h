@@ -59,7 +59,7 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) final;
 
@@ -73,8 +73,8 @@ private:
      * Runs the aggregation specified by the supplied AggregateCommandRequest, returning a
      * CursorResponse if successful or a Status containing the error otherwise.
      */
-    virtual StatusWith<CursorResponse> runAggregation(
-        OperationContext* opCtx, const AggregateCommandRequest& request) const = 0;
+    virtual StatusWith<CursorResponse> runAggregation(OperationContext* opCtx,
+                                                      AggregateCommandRequest& request) const = 0;
 
     /**
      * Allows overriders to optionally write additional data to the response object before the final

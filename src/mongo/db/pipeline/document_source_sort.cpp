@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -59,9 +58,6 @@ using std::unique_ptr;
 using std::vector;
 
 namespace {
-constexpr StringData kMin = "min"_sd;
-constexpr StringData kMax = "max"_sd;
-
 struct BoundMakerMin {
     const long long offset;  // Offset in millis
 
@@ -72,7 +68,9 @@ struct BoundMakerMin {
     }
 
     Document serialize() const {
-        return Document{{{"base"_sd, kMin}, {"offset"_sd, offset}}};
+        // Convert from millis to seconds.
+        return Document{{{"base"_sd, DocumentSourceSort::kMin},
+                         {DocumentSourceSort::kOffset, (offset / 1000)}}};
     }
 };
 
@@ -86,7 +84,9 @@ struct BoundMakerMax {
     }
 
     Document serialize() const {
-        return Document{{{"base"_sd, kMax}, {"offset"_sd, offset}}};
+        // Convert from millis to seconds.
+        return Document{{{"base"_sd, DocumentSourceSort::kMax},
+                         {DocumentSourceSort::kOffset, (offset / 1000)}}};
     }
 };
 struct CompAsc {
@@ -145,33 +145,109 @@ REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(
     _internalBoundedSort,
     LiteParsedDocumentSourceDefault::parse,
     DocumentSourceSort::parseBoundedSort,
-    AllowedWithApiStrict::kNeverInVersion1,
-    AllowedWithClientType::kAny,
-    boost::
-        none /* TODO SERVER-52286 feature_flags::gFeatureFlagBucketUnpackWithSort.getVersion() */,
+    ::mongo::getTestCommandsEnabled() ? AllowedWithApiStrict::kNeverInVersion1
+                                      : AllowedWithApiStrict::kInternal,
+    ::mongo::getTestCommandsEnabled() ? AllowedWithClientType::kAny
+                                      : AllowedWithClientType::kInternal,
+    feature_flags::gFeatureFlagBucketUnpackWithSort,
     feature_flags::gFeatureFlagBucketUnpackWithSort.isEnabledAndIgnoreFCV());
 
+DocumentSource::GetNextResult::ReturnStatus DocumentSourceSort::timeSorterPeek() {
+    if (_timeSorterNextDoc) {
+        return GetNextResult::ReturnStatus::kAdvanced;
+    }
+    if (_timeSorterInputEOF) {
+        return GetNextResult::ReturnStatus::kEOF;
+    }
+
+    auto next = pSource->getNext();
+    auto status = next.getStatus();
+    switch (status) {
+        case GetNextResult::ReturnStatus::kAdvanced: {
+            _timeSorterNextDoc = next.getDocument();
+            return status;
+        }
+        case GetNextResult::ReturnStatus::kEOF:
+            _timeSorterInputEOF = true;
+            return status;
+        case GetNextResult::ReturnStatus::kPauseExecution:
+            return status;
+    }
+    MONGO_UNREACHABLE_TASSERT(6434800);
+}
+
+Document DocumentSourceSort::timeSorterGetNext() {
+    tassert(6434801,
+            "timeSorterGetNext() is only valid after timeSorterPeek() returns isAdvanced()",
+            _timeSorterNextDoc);
+    auto result = std::move(*_timeSorterNextDoc);
+    _timeSorterNextDoc.reset();
+    return result;
+}
+
+DocumentSource::GetNextResult::ReturnStatus DocumentSourceSort::timeSorterPeekSamePartition() {
+    auto status = timeSorterPeek();
+    switch (status) {
+        case GetNextResult::ReturnStatus::kEOF:
+        case GetNextResult::ReturnStatus::kPauseExecution:
+            return status;
+        case GetNextResult::ReturnStatus::kAdvanced:
+            break;
+    }
+
+    if (!_timeSorterPartitionKeyGen) {
+        // No partition key means everything is in the same partition.
+        return GetNextResult::ReturnStatus::kAdvanced;
+    } else {
+        auto prevPartition = std::move(_timeSorterCurrentPartition);
+        _timeSorterCurrentPartition =
+            _timeSorterPartitionKeyGen->computeSortKeyFromDocument(*_timeSorterNextDoc);
+
+        if (!prevPartition) {
+            // No previous partition means there is no constraint.
+            return GetNextResult::ReturnStatus::kAdvanced;
+        } else if (pExpCtx->getValueComparator().evaluate(*_timeSorterCurrentPartition ==
+                                                          *prevPartition)) {
+            // Next is in the same partition.
+            return GetNextResult::ReturnStatus::kAdvanced;
+        } else {
+            // Next is in a new partition: pretend we don't have a next document.
+            return GetNextResult::ReturnStatus::kEOF;
+        }
+    }
+}
 
 DocumentSource::GetNextResult DocumentSourceSort::doGetNext() {
     if (_timeSorter) {
+        // If the _timeSorter is exhausted but we have more input, it must be because we just
+        // finished a partition. Restart the _timeSorter to make it ready for the next partition.
+        if (_timeSorter->getState() == TimeSorterInterface::State::kDone &&
+            timeSorterPeek() == GetNextResult::ReturnStatus::kAdvanced) {
+            _timeSorter->restart();
+            _timeSorterCurrentPartition.reset();
+        }
+
         // Only pull input as necessary to get _timeSorter to have a result.
         while (_timeSorter->getState() == TimeSorterInterface::State::kWait) {
-            auto input = pSource->getNext();
-            switch (input.getStatus()) {
+            auto status = timeSorterPeekSamePartition();
+            switch (status) {
                 case GetNextResult::ReturnStatus::kPauseExecution:
-                    return input;
+                    return GetNextResult::makePauseExecution();
                 case GetNextResult::ReturnStatus::kEOF:
-                    // Tell _timeSorter there will be no more input. In response, its state
-                    // will never be kWait again, and so we'll never call pSource->getNext() again.
+                    // We've reached the end of the current partition. Tell _timeSorter there will
+                    // be no more input. In response, its state will never be kWait again unless we
+                    // restart it, so we can proceed to drain all the documents currently held by
+                    // the sorter.
                     _timeSorter->done();
+                    tassert(
+                        6434802,
+                        "DocumentSourceSort::_timeSorter waiting for input that will not arrive",
+                        _timeSorter->getState() != TimeSorterInterface::State::kWait);
                     continue;
                 case GetNextResult::ReturnStatus::kAdvanced:
-                    Document doc = input.getDocument();
-                    auto time = doc.getField(_sortExecutor->sortPattern()[0].fieldPath->fullPath());
-                    uassert(6369909,
-                            "$_internalBoundedSort only handles Date values",
-                            time.getType() == Date);
-                    _timeSorter->add({time.getDate()}, doc);
+                    auto [time, doc] = extractTime(timeSorterGetNext());
+
+                    _timeSorter->add({time}, doc);
                     continue;
             }
         }
@@ -197,32 +273,47 @@ DocumentSource::GetNextResult DocumentSourceSort::doGetNext() {
     return GetNextResult{_sortExecutor->getNext().second};
 }
 
-boost::intrusive_ptr<DocumentSource> DocumentSourceSort::clone() const {
-    return create(pExpCtx,
+boost::intrusive_ptr<DocumentSource> DocumentSourceSort::clone(
+    const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const {
+    return create(newExpCtx ? newExpCtx : pExpCtx,
                   getSortKeyPattern(),
                   _sortExecutor->getLimit(),
                   _sortExecutor->getMaxMemoryBytes());
 }
 
-void DocumentSourceSort::serializeToArray(
-    std::vector<Value>& array, boost::optional<ExplainOptions::Verbosity> explain) const {
+void DocumentSourceSort::serializeToArray(std::vector<Value>& array,
+                                          SerializationOptions opts) const {
+    auto explain = opts.verbosity;
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484310);
+    }
+
     if (_timeSorter) {
         tassert(6369900,
                 "$_internalBoundedSort should not absorb a $limit",
                 !_sortExecutor->hasLimit());
 
-        // TODO SERVER-63637 Implement execution stats.
-
         // {$_internalBoundedSort: {sortKey, bound}}
         auto sortKey = _sortExecutor->sortPattern().serialize(
             SortPattern::SortKeySerialization::kForPipelineSerialization);
-        array.push_back(Value{Document{{
+
+        MutableDocument mutDoc{Document{{
             {"$_internalBoundedSort"_sd,
-             Document{{
-                 {"sortKey"_sd, std::move(sortKey)},
-                 {"bound"_sd, _timeSorter->serializeBound()},
-             }}},
-        }}});
+             Document{{{"sortKey"_sd, std::move(sortKey)},
+                       {"bound"_sd, _timeSorter->serializeBound()},
+                       {"limit"_sd, static_cast<long long>(_timeSorter->limit())}}}},
+        }}};
+
+        if (explain >= ExplainOptions::Verbosity::kExecStats) {
+            mutDoc["totalDataSizeSortedBytesEstimate"] =
+                Value(static_cast<long long>(_timeSorter->stats().bytesSorted()));
+            mutDoc["usedDisk"] = Value(_timeSorter->stats().spilledRanges() > 0);
+            mutDoc["spills"] = Value(static_cast<long long>(_timeSorter->stats().spilledRanges()));
+            mutDoc["spilledDataStorageSize"] =
+                Value(static_cast<long long>(_sortExecutor->spilledDataStorageSize()));
+        }
+
+        array.push_back(Value{mutDoc.freeze()});
         return;
     }
     uint64_t limit = _sortExecutor->getLimit();
@@ -255,6 +346,8 @@ void DocumentSourceSort::serializeToArray(
             Value(static_cast<long long>(stats.totalDataSizeBytes));
         mutDoc["usedDisk"] = Value(stats.spills > 0);
         mutDoc["spills"] = Value(static_cast<long long>(stats.spills));
+        mutDoc["spilledDataStorageSize"] =
+            Value(static_cast<long long>(_sortExecutor->spilledDataStorageSize()));
     }
 
     array.push_back(Value(mutDoc.freeze()));
@@ -318,6 +411,10 @@ DepsTracker::State DocumentSourceSort::getDependencies(DepsTracker* deps) const 
     return DepsTracker::State::SEE_NEXT;
 }
 
+void DocumentSourceSort::addVariableRefs(std::set<Variables::Id>* refs) const {
+    // It's impossible for $sort or the find command's sort to refer to a variable.
+}
+
 intrusive_ptr<DocumentSource> DocumentSourceSort::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
     uassert(15973, "the $sort key specification must be an object", elem.type() == Object);
@@ -337,6 +434,59 @@ intrusive_ptr<DocumentSourceSort> DocumentSourceSort::create(
     return pSort;
 }
 
+intrusive_ptr<DocumentSourceSort> DocumentSourceSort::createBoundedSort(
+    SortPattern pat,
+    StringData boundBase,
+    long long boundOffset,
+    boost::optional<long long> limit,
+    const intrusive_ptr<ExpressionContext>& expCtx) {
+
+    auto ds = DocumentSourceSort::create(expCtx, pat);
+
+    SortOptions opts;
+    opts.maxMemoryUsageBytes = internalQueryMaxBlockingSortMemoryUsageBytes.load();
+    if (expCtx->allowDiskUse) {
+        opts.extSortAllowed = true;
+        opts.tempDir = expCtx->tempDir;
+        opts.sorterFileStats = ds->getSorterFileStats();
+    }
+
+    if (limit) {
+        opts.Limit(limit.value());
+    }
+
+    if (boundBase == kMin) {
+        if (pat.back().isAscending) {
+            ds->_timeSorter.reset(
+                new TimeSorterAscMin{opts, CompAsc{}, BoundMakerMin{boundOffset}});
+        } else {
+            ds->_timeSorter.reset(
+                new TimeSorterDescMin{opts, CompDesc{}, BoundMakerMin{boundOffset}});
+        }
+        ds->_requiredMetadata.set(DocumentMetadataFields::MetaType::kTimeseriesBucketMinTime);
+    } else if (boundBase == kMax) {
+        if (pat.back().isAscending) {
+            ds->_timeSorter.reset(
+                new TimeSorterAscMax{opts, CompAsc{}, BoundMakerMax{boundOffset}});
+        } else {
+            ds->_timeSorter.reset(
+                new TimeSorterDescMax{opts, CompDesc{}, BoundMakerMax{boundOffset}});
+        }
+        ds->_requiredMetadata.set(DocumentMetadataFields::MetaType::kTimeseriesBucketMaxTime);
+    } else {
+        MONGO_UNREACHABLE;
+    }
+
+    if (pat.size() > 1) {
+        SortPattern partitionKey =
+            std::vector<SortPattern::SortPatternPart>(pat.begin(), pat.end() - 1);
+        ds->_timeSorterPartitionKeyGen =
+            SortKeyGenerator{std::move(partitionKey), expCtx->getCollator()};
+    }
+
+    return ds;
+}
+
 intrusive_ptr<DocumentSourceSort> DocumentSourceSort::parseBoundedSort(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {
     uassert(6369905,
@@ -346,20 +496,30 @@ intrusive_ptr<DocumentSourceSort> DocumentSourceSort::parseBoundedSort(
 
     BSONElement key = args["sortKey"];
     uassert(6369904, "$_internalBoundedSort sortKey must be an object", key.type() == Object);
+
+    // Empty sort pattern is not allowed for the bounded sort.
+    uassert(6900501,
+            "$_internalBoundedSort stage must have at least one sort key",
+            !key.embeddedObject().isEmpty());
     SortPattern pat{key.embeddedObject(), expCtx};
-    uassert(6369903, "$_internalBoundedSort doesn't support compound sort", pat.size() == 1);
-    uassert(6369901,
-            "$_internalBoundedSort doesn't support an expression in the sortKey",
-            pat[0].expression == nullptr);
-    uassert(6369907,
-            "$_internalBoundedSort doesn't support dotted field names",
-            pat[0].fieldPath->getPathLength() == 1);
+
+    {
+        auto timePart = pat.back();
+        uassert(6369901,
+                "$_internalBoundedSort doesn't support an expression in the time field (the last "
+                "component of sortKey)",
+                timePart.expression == nullptr);
+        uassert(6369907,
+                "$_internalBoundedSort doesn't support dotted field names in the time field (the "
+                "last component of sortKey)",
+                timePart.fieldPath->getPathLength() == 1);
+    }
 
     BSONElement bound = args["bound"];
     uassert(
         6460200, "$_internalBoundedSort bound must be an object", bound && bound.type() == Object);
 
-    BSONElement boundOffsetElem = bound.Obj()["offset"];
+    BSONElement boundOffsetElem = bound.Obj()[DocumentSourceSort::kOffset];
     long long boundOffset = 0;
     if (boundOffsetElem && boundOffsetElem.isNumber()) {
         boundOffset = uassertStatusOK(boundOffsetElem.parseIntegerElementToLong()) *
@@ -376,16 +536,24 @@ intrusive_ptr<DocumentSourceSort> DocumentSourceSort::parseBoundedSort(
                           << kMax << "'",
             boundBase == kMin || boundBase == kMax);
 
+    auto ds = DocumentSourceSort::create(expCtx, pat);
+
     SortOptions opts;
-    opts.maxMemoryUsageBytes = internalQueryMaxBlockingSortMemoryUsageBytes.load();
+    opts.MaxMemoryUsageBytes(internalQueryMaxBlockingSortMemoryUsageBytes.load());
     if (expCtx->allowDiskUse) {
-        opts.extSortAllowed = true;
-        opts.tempDir = expCtx->tempDir;
+        opts.ExtSortAllowed(true);
+        opts.TempDir(expCtx->tempDir);
+        opts.FileStats(ds->getSorterFileStats());
+    }
+    if (BSONElement limitElem = args["limit"]) {
+        uassert(6588100,
+                "$_internalBoundedSort limit must be a non-negative number if specified",
+                limitElem.isNumber() && limitElem.numberLong() >= 0);
+        opts.Limit(limitElem.numberLong());
     }
 
-    auto ds = DocumentSourceSort::create(expCtx, pat);
     if (boundBase == kMin) {
-        if (pat[0].isAscending) {
+        if (pat.back().isAscending) {
             ds->_timeSorter.reset(
                 new TimeSorterAscMin{opts, CompAsc{}, BoundMakerMin{boundOffset}});
         } else {
@@ -394,7 +562,7 @@ intrusive_ptr<DocumentSourceSort> DocumentSourceSort::parseBoundedSort(
         }
         ds->_requiredMetadata.set(DocumentMetadataFields::MetaType::kTimeseriesBucketMinTime);
     } else if (boundBase == kMax) {
-        if (pat[0].isAscending) {
+        if (pat.back().isAscending) {
             ds->_timeSorter.reset(
                 new TimeSorterAscMax{opts, CompAsc{}, BoundMakerMax{boundOffset}});
         } else {
@@ -405,6 +573,14 @@ intrusive_ptr<DocumentSourceSort> DocumentSourceSort::parseBoundedSort(
     } else {
         MONGO_UNREACHABLE;
     }
+
+    if (pat.size() > 1) {
+        SortPattern partitionKey =
+            std::vector<SortPattern::SortPatternPart>(pat.begin(), pat.end() - 1);
+        ds->_timeSorterPartitionKeyGen =
+            SortKeyGenerator{std::move(partitionKey), expCtx->getCollator()};
+    }
+
     return ds;
 }
 
@@ -458,6 +634,24 @@ std::pair<Value, Document> DocumentSourceSort::extractSortKey(Document&& doc) co
     }
 }
 
+std::pair<Date_t, Document> DocumentSourceSort::extractTime(Document&& doc) const {
+    auto time = doc.getField(_sortExecutor->sortPattern().back().fieldPath->fullPath());
+    uassert(6369909, "$_internalBoundedSort only handles Date values", time.getType() == Date);
+    auto date = time.getDate();
+
+    if (pExpCtx->needsMerge) {
+        // If this sort stage is part of a merged pipeline, make sure that each Document's sort key
+        // gets saved with its metadata.
+        Value sortKey = _sortKeyGen->computeSortKeyFromDocument(doc);
+        MutableDocument toBeSorted(std::move(doc));
+        toBeSorted.metadata().setSortKey(sortKey, _sortKeyGen->isSingleElementKey());
+
+        return std::make_pair(date, toBeSorted.freeze());
+    }
+
+    return std::make_pair(date, std::move(doc));
+}
+
 boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceSort::distributedPlanLogic() {
     uassert(6369906,
             "$_internalBoundedSort cannot be the first stage on the merger, because it requires "
@@ -470,13 +664,13 @@ boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceSort::distri
                                  .serialize(SortPattern::SortKeySerialization::kForSortKeyMerging)
                                  .toBson();
     if (auto limit = getLimit()) {
-        split.mergingStage = DocumentSourceLimit::create(pExpCtx, *limit);
+        split.mergingStages = {DocumentSourceLimit::create(pExpCtx, *limit)};
     }
     return split;
 }
 
 bool DocumentSourceSort::canRunInParallelBeforeWriteStage(
-    const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const {
+    const OrderedPathSet& nameOfShardKeyFieldsUponEntryToStage) const {
     // This is an interesting special case. If there are no further stages which require merging the
     // streams into one, a $sort should not require it. This is only the case because the sort order
     // doesn't matter for a pipeline ending with a write stage. We may encounter it here as an
@@ -504,6 +698,9 @@ std::string nextFileName() {
 }  // namespace mongo
 
 #include "mongo/db/sorter/sorter.cpp"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 template class ::mongo::BoundedSorter<::mongo::DocumentSourceSort::SortableDate,
                                       ::mongo::Document,
                                       ::mongo::CompAsc,

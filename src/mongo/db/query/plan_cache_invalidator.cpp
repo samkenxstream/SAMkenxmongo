@@ -27,12 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/query/plan_cache_invalidator.h"
 
 #include "mongo/db/query/sbe_plan_cache.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 namespace {
@@ -64,7 +66,8 @@ void PlanCacheInvalidator::clearPlanCache() const {
     // Some unit tests cannot properly initialize CollectionQueryInfo but rely on it partially
     // initialized to make PlanCacheKeys.
     if (_serviceContext && _uuid) {
-        sbe::clearPlanCacheEntriesWith(_serviceContext, *_uuid, _version);
+        sbe::clearPlanCacheEntriesWith(
+            _serviceContext, *_uuid, _version, true /*matchSecondaryCollections*/);
     }
 }
 

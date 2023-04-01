@@ -32,8 +32,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>  // strlen
 #include <fmt/format.h>
-#include <string.h>  // strlen
 #include <string>
 #include <vector>
 
@@ -115,7 +115,7 @@ public:
     std::string String() const {
         return chk(mongo::String).str();
     }
-    const StringData checkAndGetStringData() const {
+    StringData checkAndGetStringData() const {
         return chk(mongo::String).valueStringData();
     }
     Date_t Date() const {
@@ -318,7 +318,7 @@ public:
         return fieldNameSize_;
     }
 
-    const StringData fieldNameStringData() const {
+    StringData fieldNameStringData() const {
         return StringData(fieldName(), eoo() ? 0 : fieldNameSize() - 1);
     }
 
@@ -371,6 +371,11 @@ public:
      * True if element is of a numeric type.
      */
     bool isNumber() const;
+
+    /**
+     * True if element is a NaN double or decimal.
+     */
+    bool isNaN() const;
 
     /**
      * Return double value for this field. MUST be NumberDouble type.
@@ -569,7 +574,7 @@ public:
      * Returns a StringData pointing into this element's data.  Does not validate that the
      * element is actually of type String.
      */
-    const StringData valueStringData() const {
+    StringData valueStringData() const {
         return StringData(valuestr(), valuestrsize() - 1);
     }
 
@@ -630,6 +635,13 @@ public:
             len = valuestrsize() - 4;
             return value() + 5 + 4;
         }
+    }
+
+    static BinDataType binDataType(const char* raw, size_t length) {
+        // BinData: <int len> <byte subtype> <byte[len] data>
+        verify(length >= 5);
+        unsigned char c = raw[4];
+        return static_cast<BinDataType>(c);
     }
 
     BinDataType binDataType() const {
@@ -771,7 +783,7 @@ public:
         return (type() == BinData) && (binDataType() == bdt);
     }
 
-    const std::array<unsigned char, 16> uuid() const {
+    std::array<unsigned char, 16> uuid() const {
         int len = 0;
         const char* data = nullptr;
         if (isBinData(BinDataType::newUUID)) {
@@ -785,7 +797,7 @@ public:
         return result;
     }
 
-    const std::array<unsigned char, 16> md5() const {
+    std::array<unsigned char, 16> md5() const {
         int len = 0;
         const char* data = nullptr;
         if (isBinData(BinDataType::MD5Type)) {
@@ -815,7 +827,7 @@ public:
         return value() + 4;
     }
 
-    const mongo::OID dbrefOID() const {
+    mongo::OID dbrefOID() const {
         uassert(10064, "not a dbref", type() == DBRef);
         const char* start = value();
         start += 4 + ConstDataView(start).read<LittleEndian<int>>();
@@ -901,6 +913,24 @@ public:
 
 private:
     /**
+     * This is to enable structured bindings for BSONElement, it should not be used explicitly.
+     * When used in a structed binding, BSONElement behaves as-if it is a
+     * std::pair<StringData, BSONElement>.
+     *
+     * Example:
+     *   for (auto [name, elem] : someBsonObj) {...}
+     */
+    template <size_t I>
+    friend auto get(const BSONElement& elem) {
+        static_assert(I <= 1);
+        if constexpr (I == 0) {
+            return elem.fieldNameStringData();
+        } else if constexpr (I == 1) {
+            return elem;
+        }
+    }
+
+    /**
      * Get a string's value. Also gives you start of the real data for an embedded object.
      * You must assure data is of an appropriate type first, like the type check in
      * valueStringDataSafe(). You should use the string's size when performing any operations
@@ -975,6 +1005,21 @@ inline bool BSONElement::isNumber() const {
         case NumberDecimal:
         case NumberInt:
             return true;
+        default:
+            return false;
+    }
+}
+
+inline bool BSONElement::isNaN() const {
+    switch (type()) {
+        case NumberDouble: {
+            double d = _numberDouble();
+            return std::isnan(d);
+        }
+        case NumberDecimal: {
+            Decimal128 d = _numberDecimal();
+            return d.isNaN();
+        }
         default:
             return false;
     }
@@ -1227,3 +1272,13 @@ inline BSONElement::BSONElement() {
     totalSize = 1;
 }
 }  // namespace mongo
+
+// These template specializations in namespace std are required in order to support structured
+// bindings using the "tuple protocol".
+namespace std {
+template <>
+struct tuple_size<mongo::BSONElement> : std::integral_constant<size_t, 2> {};
+template <size_t I>
+struct tuple_element<I, mongo::BSONElement>
+    : std::tuple_element<I, std::pair<mongo::StringData, mongo::BSONElement>> {};
+}  // namespace std

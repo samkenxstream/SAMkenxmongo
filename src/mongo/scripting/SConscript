@@ -3,8 +3,8 @@
 Import([
     'env',
     'get_option',
+    'jsEngine',
     'serverJs',
-    'usemozjs',
 ])
 
 env.Library(
@@ -18,20 +18,18 @@ env.Library(
         'utils.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/client/clientdriver_minimal',
+        '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/shell/mongojs',
         '$BUILD_DIR/mongo/util/md5',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/idl/server_parameter',
+        'bson_template_evaluator',
     ],
 )
 
 env.Library(
     target='bson_template_evaluator',
     source=[
-        "bson_template_evaluator.cpp",
+        'bson_template_evaluator.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -46,12 +44,9 @@ env.Library(
     LIBDEPS=[
         'scripting_common',
     ],
-    LBDEPS_PRIVATE=[
-        'bson_template_evaluator',
-    ]
 )
 
-if usemozjs:
+if jsEngine:
     scriptingEnv = env.Clone()
 
     scriptingEnv.Append(
@@ -59,16 +54,13 @@ if usemozjs:
             # TODO(SERVER-59992): Remove -Wno-class-memacces where possible.
             '-Wno-unknown-warning-option',
             '-Wno-class-memaccess',
-        ],
-    )
+        ], )
 
     scriptingEnv.InjectMozJS()
 
     scriptingEnv.JSHeader(
         target='mozjs/mongohelpers_js.cpp',
-        source=[
-            'mozjs/mongohelpers.js'
-        ]
+        source=['mozjs/mongohelpers.js'],
     )
 
     env.Alias('generated-sources', 'mozjs/mongohelpers_js.cpp')
@@ -100,6 +92,7 @@ if usemozjs:
             'mozjs/jsthread.cpp',
             'mozjs/maxkey.cpp',
             'mozjs/minkey.cpp',
+            'mozjs/module_loader.cpp',
             'mozjs/mongo.cpp',
             'mozjs/mongohelpers.cpp',
             'mozjs/mongohelpers_js.cpp',
@@ -123,24 +116,33 @@ if usemozjs:
             'mozjs/scripting_util.idl',
         ],
         LIBDEPS=[
-            '$BUILD_DIR/mongo/db/service_context',
-            '$BUILD_DIR/mongo/shell/mongojs',
-            '$BUILD_DIR/third_party/mozjs/mozjs',
-            'bson_template_evaluator',
             'scripting_common',
         ],
         LIBDEPS_PRIVATE=[
             '$BUILD_DIR/mongo/client/clientdriver_network',
-            '$BUILD_DIR/mongo/idl/server_parameter',
+            '$BUILD_DIR/mongo/db/service_context',
+            '$BUILD_DIR/third_party/mozjs/mozjs',
+        ],
+    )
+
+    scriptingEnv.CppUnitTest(
+        target='scripting_mozjs_test',
+        source=['mozjs/module_loader_test.cpp'],
+        LIBDEPS=[
+            'bson_template_evaluator',
+            'scripting',
         ],
     )
 else:
     env.Library(
         target='scripting',
         source=[
-            'scripting_none.cpp'
+            'scripting_none.cpp',
         ],
         LIBDEPS=[
+            'scripting_common',
+        ],
+        LIBDEPS_PRIVATE=[
             'scripting_none',
         ],
     )
@@ -162,7 +164,6 @@ env.CppUnitTest(
         'deadline_monitor_test.cpp',
     ],
     LIBDEPS=[
-        'bson_template_evaluator',
         'scripting_common',
     ],
 )

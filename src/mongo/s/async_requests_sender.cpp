@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -37,16 +36,20 @@
 #include <memory>
 
 #include "mongo/client/remote_command_targeter.h"
+#include "mongo/db/curop.h"
+#include "mongo/executor/hedge_options_util.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/hedge_options_util.h"
 #include "mongo/transport/baton.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 using namespace fmt::literals;
 
@@ -57,7 +60,6 @@ namespace {
 // Maximum number of retries for network and replication NotPrimary errors (per host).
 const int kMaxNumFailedHostRetryAttempts = 3;
 
-MONGO_FAIL_POINT_DEFINE(hangBeforeSchedulingRemoteCommand);
 MONGO_FAIL_POINT_DEFINE(hangBeforePollResponse);
 
 }  // namespace
@@ -87,6 +89,8 @@ AsyncRequestsSender::AsyncRequestsSender(OperationContext* opCtx,
         // Kick off requests immediately.
         _remotes.emplace_back(this, request.shardId, request.cmdObj).executeRequest();
     }
+
+    CurOp::get(_opCtx)->ensureRecordRemoteOpWait();
 }
 
 AsyncRequestsSender::Response AsyncRequestsSender::next() noexcept {
@@ -117,13 +121,28 @@ AsyncRequestsSender::Response AsyncRequestsSender::next() noexcept {
             _resourceYielder->yield(_opCtx);
         }
 
-        // Only wait for the next result without popping it, so an error unyielding doesn't discard
-        // an already popped response.
-        _responseQueue.waitForNonEmpty(_opCtx);
-
-        if (_resourceYielder) {
-            _resourceYielder->unyield(_opCtx);
+        auto curOp = CurOp::get(_opCtx);
+        // Calculating the total wait time for remote operations relies on the CurOp's timing
+        // measurement facility and we can't use such facility when the current operation is marked
+        // as done. Some commands such as 'analyzeShardKey' command may send remote operations using
+        // AsyncRequestsSender even after marking the current operation done and so we need to check
+        // whether the current operation is still in progress.
+        auto curOpInProgress = !curOp->isDone();
+        if (curOpInProgress) {
+            curOp->startRemoteOpWaitTimer();
         }
+        // Only wait for the next result without popping it, so an error unyielding doesn't
+        // discard an already popped response.
+        auto waitStatus = _responseQueue.waitForNonEmptyNoThrow(_opCtx);
+        if (curOpInProgress) {
+            curOp->stopRemoteOpWaitTimer();
+        }
+
+        auto unyieldStatus =
+            _resourceYielder ? _resourceYielder->unyieldNoThrow(_opCtx) : Status::OK();
+
+        uassertStatusOK(waitStatus);
+        uassertStatusOK(unyieldStatus);
 
         // There should always be a response ready after the wait above.
         auto response = _responseQueue.tryPop();
@@ -168,9 +187,10 @@ AsyncRequestsSender::RemoteData::RemoteData(AsyncRequestsSender* ars,
                                             BSONObj cmdObj)
     : _ars(ars), _shardId(std::move(shardId)), _cmdObj(std::move(cmdObj)) {}
 
-std::shared_ptr<Shard> AsyncRequestsSender::RemoteData::getShard() {
-    // TODO: Pass down an OperationContext* to use here.
-    return Grid::get(getGlobalServiceContext())->shardRegistry()->getShardNoReload(_shardId);
+SemiFuture<std::shared_ptr<Shard>> AsyncRequestsSender::RemoteData::getShard() noexcept {
+    return Grid::get(getGlobalServiceContext())
+        ->shardRegistry()
+        ->getShard(*_ars->_subBaton, _shardId);
 }
 
 void AsyncRequestsSender::RemoteData::executeRequest() {
@@ -190,7 +210,12 @@ void AsyncRequestsSender::RemoteData::executeRequest() {
 
 auto AsyncRequestsSender::RemoteData::scheduleRequest()
     -> SemiFuture<RemoteCommandOnAnyCallbackArgs> {
-    return resolveShardIdToHostAndPorts(_ars->_readPreference)
+    return getShard()
+        .thenRunOn(*_ars->_subBaton)
+        .then([this](auto&& shard) {
+            return shard->getTargeter()->findHosts(_ars->_readPreference,
+                                                   CancellationToken::uncancelable());
+        })
         .thenRunOn(*_ars->_subBaton)
         .then([this](auto&& hostAndPorts) {
             _shardHostAndPort.emplace(hostAndPorts.front());
@@ -200,41 +225,12 @@ auto AsyncRequestsSender::RemoteData::scheduleRequest()
         .semi();
 }
 
-SemiFuture<std::vector<HostAndPort>> AsyncRequestsSender::RemoteData::resolveShardIdToHostAndPorts(
-    const ReadPreferenceSetting& readPref) {
-    const auto shard = getShard();
-    if (!shard) {
-        return Status(ErrorCodes::ShardNotFound,
-                      str::stream() << "Could not find shard " << _shardId);
-    }
-
-    return shard->getTargeter()->findHosts(readPref, CancellationToken::uncancelable());
-}
-
 auto AsyncRequestsSender::RemoteData::scheduleRemoteCommand(std::vector<HostAndPort>&& hostAndPorts)
     -> SemiFuture<RemoteCommandOnAnyCallbackArgs> {
-    hangBeforeSchedulingRemoteCommand.executeIf(
-        [&](const BSONObj& data) {
-            while (MONGO_unlikely(hangBeforeSchedulingRemoteCommand.shouldFail())) {
-                LOGV2(4625505,
-                      "Hanging in ARS due to "
-                      "'hangBeforeSchedulingRemoteCommand' failpoint");
-                sleepmillis(100);
-            }
-        },
-        [&](const BSONObj& data) {
-            return MONGO_unlikely(std::count(hostAndPorts.begin(),
-                                             hostAndPorts.end(),
-                                             HostAndPort(data.getStringField("hostAndPort"))));
-        });
-
-    auto hedgeOptions = extractHedgeOptions(_cmdObj, _ars->_readPreference);
-    executor::RemoteCommandRequestOnAny request(std::move(hostAndPorts),
-                                                _ars->_db,
-                                                _cmdObj,
-                                                _ars->_metadataObj,
-                                                _ars->_opCtx,
-                                                hedgeOptions);
+    HedgeOptions options =
+        getHedgeOptions(_cmdObj.firstElementFieldNameStringData(), _ars->_readPreference);
+    executor::RemoteCommandRequestOnAny request(
+        std::move(hostAndPorts), _ars->_db, _cmdObj, _ars->_metadataObj, _ars->_opCtx, options);
 
     // We have to make a promise future pair because the TaskExecutor doesn't currently support a
     // future returning variant of scheduleRemoteCommand
@@ -276,43 +272,47 @@ auto AsyncRequestsSender::RemoteData::handleResponse(RemoteCommandOnAnyCallbackA
     }
 
     // There was an error with either the response or the command.
-    auto shard = getShard();
-    if (!shard) {
-        uasserted(ErrorCodes::ShardNotFound, str::stream() << "Could not find shard " << _shardId);
-    } else {
-        std::vector<HostAndPort> failedTargets;
+    return getShard()
+        .thenRunOn(*_ars->_subBaton)
+        .then([this, status = std::move(status), rcr = std::move(rcr)](
+                  std::shared_ptr<mongo::Shard>&& shard) {
+            std::vector<HostAndPort> failedTargets;
 
-        if (rcr.response.target) {
-            failedTargets = {*rcr.response.target};
-        } else {
-            failedTargets = rcr.request.target;
-        }
+            if (rcr.response.target) {
+                failedTargets = {*rcr.response.target};
+            } else {
+                failedTargets = rcr.request.target;
+            }
 
-        shard->updateReplSetMonitor(failedTargets.front(), status);
-        bool isStartingTransaction = _cmdObj.getField("startTransaction").booleanSafe();
-        if (!_ars->_stopRetrying && shard->isRetriableError(status.code(), _ars->_retryPolicy) &&
-            _retryCount < kMaxNumFailedHostRetryAttempts && !isStartingTransaction) {
+            shard->updateReplSetMonitor(failedTargets.front(), status);
+            bool isStartingTransaction = _cmdObj.getField("startTransaction").booleanSafe();
+            if (!_ars->_stopRetrying &&
+                shard->isRetriableError(status.code(), _ars->_retryPolicy) &&
+                _retryCount < kMaxNumFailedHostRetryAttempts && !isStartingTransaction) {
 
-            LOGV2_DEBUG(4615637,
-                        1,
-                        "Command to remote {shardId} for hosts {hosts} failed with retryable error "
-                        "{error} and will be retried",
-                        "Command to remote shard failed with retryable error and will be retried",
-                        "shardId"_attr = _shardId,
-                        "hosts"_attr = failedTargets,
-                        "error"_attr = redact(status));
-            ++_retryCount;
-            _shardHostAndPort.reset();
-            // retry through recursion
-            return scheduleRequest();
-        }
-    }
+                LOGV2_DEBUG(
+                    4615637,
+                    1,
+                    "Command to remote {shardId} for hosts {hosts} failed with retryable error "
+                    "{error} and will be retried",
+                    "Command to remote shard failed with retryable error and will be retried",
+                    "shardId"_attr = _shardId,
+                    "hosts"_attr = failedTargets,
+                    "error"_attr = redact(status));
+                ++_retryCount;
+                _shardHostAndPort.reset();
+                // retry through recursion
+                return scheduleRequest();
+            }
 
-    // Status' in the response.status field that aren't retried get converted to top level errors
-    uassertStatusOK(rcr.response.status);
+            // Status' in the response.status field that aren't retried get converted to top level
+            // errors
+            uassertStatusOK(rcr.response.status);
 
-    // We're not okay (on the remote), but still not going to retry
-    return std::move(rcr);
+            // We're not okay (on the remote), but still not going to retry
+            return Future<RemoteCommandOnAnyCallbackArgs>::makeReady(std::move(rcr)).semi();
+        })
+        .semi();
 };
 
 }  // namespace mongo

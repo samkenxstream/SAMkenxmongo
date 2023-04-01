@@ -12,6 +12,8 @@
 "use strict";
 
 load("jstests/noPassthrough/libs/index_build.js");
+load("jstests/libs/sbe_util.js");          // For checkSBEEnabled.
+load("jstests/libs/columnstore_util.js");  // For setUpServerForColumnStoreIndexTest.
 
 const dbName = "test";
 const collName = jsTestName();
@@ -22,6 +24,10 @@ rst.initiate();
 
 let primary = rst.getPrimary();
 let coll = primary.getDB(dbName).getCollection(collName);
+const columnstoreEnabled =
+    checkSBEEnabled(
+        primary.getDB(dbName), ["featureFlagColumnstoreIndexes"], true /* checkAllNodes */) &&
+    setUpServerForColumnStoreIndexTest(primary.getDB(dbName));
 
 assert.commandWorked(coll.insert({a: 1}));
 
@@ -49,6 +55,57 @@ ResumableIndexBuildTest.runFailToResume(rst,
                                         {removeTempFilesBeforeStartup: true},
                                         [{a: 10}, {a: 11}],
                                         [{a: 12}, {a: 13}]);
+
+if (columnstoreEnabled) {
+    ResumableIndexBuildTest.runFailToResume(
+        rst,
+        dbName,
+        collName,
+        {"$**": "columnstore"},
+        {failPointAfterStartup: "failToParseResumeIndexInfo"},
+        (function(collection) {
+            assert.commandWorked(collection.insert([{a: [{b: 14}]}, {a: 15}]));
+            assert.commandWorked(collection.update({a: 1}, {a: 2}));
+            assert.commandWorked(collection.remove({"a.b": 14}));
+            assert.commandWorked(collection.insert({a: 1}));
+            assert.commandWorked(collection.remove({a: 1}));
+            assert.commandWorked(collection.update({a: 15}, {a: 1}));
+        }),
+        [{a: 16}, {a: 17}],
+        true /* failWhileParsing */);
+
+    ResumableIndexBuildTest.runFailToResume(
+        rst,
+        dbName,
+        collName,
+        {"$**": "columnstore"},
+        {failPointAfterStartup: "failSetUpResumeIndexBuild"},
+        (function(collection) {
+            assert.commandWorked(collection.insert([{a: [{b: 18}]}, {a: 19}]));
+            assert.commandWorked(collection.update({a: 1}, {a: 2}));
+            assert.commandWorked(collection.remove({"a.b": 18}));
+            assert.commandWorked(collection.insert({a: 1}));
+            assert.commandWorked(collection.remove({a: 1}));
+            assert.commandWorked(collection.update({a: 19}, {a: 1}));
+        }),
+        [{a: 20}, {a: 21}]);
+
+    ResumableIndexBuildTest.runFailToResume(
+        rst,
+        dbName,
+        collName,
+        {"$**": "columnstore"},
+        {removeTempFilesBeforeStartup: true},
+        (function(collection) {
+            assert.commandWorked(collection.insert([{a: [{b: 22}]}, {a: 23}]));
+            assert.commandWorked(collection.update({a: 1}, {a: 2}));
+            assert.commandWorked(collection.remove({"a.b": 22}));
+            assert.commandWorked(collection.insert({a: 1}));
+            assert.commandWorked(collection.remove({a: 1}));
+            assert.commandWorked(collection.update({a: 23}, {a: 1}));
+        }),
+        [{a: 24}, {a: 25}]);
+}
 
 rst.stopSet();
 })();

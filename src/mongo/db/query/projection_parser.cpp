@@ -415,11 +415,17 @@ void parseInclusion(ParseContext* ctx,
 
         FieldPath path(pathWithoutPositionalOperator);
 
-        auto matcher = CopyableMatchExpression{ctx->queryObj,
-                                               ctx->expCtx,
-                                               std::make_unique<ExtensionsCallbackNoop>(),
-                                               MatchExpressionParser::kBanAllSpecialFeatures,
-                                               true /* optimize expression */};
+        // Parse the match expression in order to ensure that no special features are used with
+        // positional projection.
+        uassertStatusOK(
+            MatchExpressionParser::parse(ctx->queryObj,
+                                         ctx->expCtx,
+                                         ExtensionsCallbackNoop{},
+                                         MatchExpressionParser::kBanAllSpecialFeatures));
+
+        // Copy the original match expression, which makes sure to preserve any input parameter ids
+        // attached to the tree.
+        CopyableMatchExpression matcher{ctx->queryObj, ctx->query->clone()};
 
         invariant(ctx->query);
         addNodeAtPath(parent,
@@ -586,7 +592,7 @@ Projection parseAndAnalyze(boost::intrusive_ptr<ExpressionContext> expCtx,
                            const BSONObj& queryObj,
                            ProjectionPolicies policies,
                            bool shouldOptimize) {
-    if (!policies.findOnlyFeaturesAllowed()) {
+    if (!policies.emptyProjectionAllowed()) {
         // In agg-style syntax it is illegal to have an empty projection specification.
         uassert(51272, "projection specification must have at least one field", !obj.isEmpty());
     }

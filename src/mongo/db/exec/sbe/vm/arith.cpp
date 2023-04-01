@@ -30,6 +30,7 @@
 #include "mongo/db/exec/sbe/vm/vm.h"
 
 #include "mongo/db/exec/sbe/accumulator_sum_value_enum.h"
+#include "mongo/db/exec/sbe/values/arith_common.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/util/represent_as.h"
@@ -48,157 +49,6 @@ static constexpr double kDoublePi = 3.141592653589793;
 static constexpr double kDoublePiOver180 = kDoublePi / 180.0;
 static constexpr double kDouble180OverPi = 180.0 / kDoublePi;
 
-/**
- * The addition operation used by genericArithmeticOp.
- */
-struct Addition {
-    /**
-     * Returns true if the operation failed (overflow).
-     */
-    template <typename T>
-    static bool doOperation(const T& lhs, const T& rhs, T& result) {
-        if constexpr (std::is_same_v<T, Decimal128>) {
-            result = lhs.add(rhs);
-
-            // We do not check overflows with Decimal128.
-            return false;
-        } else if constexpr (std::is_same_v<T, double>) {
-            result = lhs + rhs;
-
-            // We do not check overflows with double.
-            return false;
-        } else {
-            return overflow::add(lhs, rhs, &result);
-        }
-    }
-};
-
-/**
- * The subtraction operation used by genericArithmeticOp.
- */
-struct Subtraction {
-    /**
-     * Returns true if the operation failed (overflow).
-     */
-    template <typename T>
-    static bool doOperation(const T& lhs, const T& rhs, T& result) {
-        if constexpr (std::is_same_v<T, Decimal128>) {
-            result = lhs.subtract(rhs);
-
-            // We do not check overflows with Decimal128.
-            return false;
-        } else if constexpr (std::is_same_v<T, double>) {
-            result = lhs - rhs;
-
-            // We do not check overflows with double.
-            return false;
-        } else {
-            return overflow::sub(lhs, rhs, &result);
-        }
-    }
-};
-
-/**
- * The multiplication operation used by genericArithmeticOp.
- */
-struct Multiplication {
-    /**
-     * Returns true if the operation failed (overflow).
-     */
-    template <typename T>
-    static bool doOperation(const T& lhs, const T& rhs, T& result) {
-        if constexpr (std::is_same_v<T, Decimal128>) {
-            result = lhs.multiply(rhs);
-
-            // We do not check overflows with Decimal128.
-            return false;
-        } else if constexpr (std::is_same_v<T, double>) {
-            result = lhs * rhs;
-
-            // We do not check overflows with double.
-            return false;
-        } else {
-            return overflow::mul(lhs, rhs, &result);
-        }
-    }
-};
-
-/**
- * This is a simple arithmetic operation templated by the Op parameter. It supports operations on
- * standard numeric types and also operations on the Date type.
- */
-template <typename Op>
-std::tuple<bool, value::TypeTags, value::Value> genericArithmeticOp(value::TypeTags lhsTag,
-                                                                    value::Value lhsValue,
-                                                                    value::TypeTags rhsTag,
-                                                                    value::Value rhsValue) {
-    if (value::isNumber(lhsTag) && value::isNumber(rhsTag)) {
-        switch (getWidestNumericalType(lhsTag, rhsTag)) {
-            case value::TypeTags::NumberInt32: {
-                int32_t result;
-
-                if (!Op::doOperation(numericCast<int32_t>(lhsTag, lhsValue),
-                                     numericCast<int32_t>(rhsTag, rhsValue),
-                                     result)) {
-                    return {
-                        false, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(result)};
-                }
-                // The result does not fit into int32_t so fallthru to the wider type.
-            }
-            case value::TypeTags::NumberInt64: {
-                int64_t result;
-                if (!Op::doOperation(numericCast<int64_t>(lhsTag, lhsValue),
-                                     numericCast<int64_t>(rhsTag, rhsValue),
-                                     result)) {
-                    return {
-                        false, value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(result)};
-                }
-                // The result does not fit into int64_t so fallthru to the wider type.
-            }
-            case value::TypeTags::NumberDecimal: {
-                Decimal128 result;
-                Op::doOperation(numericCast<Decimal128>(lhsTag, lhsValue),
-                                numericCast<Decimal128>(rhsTag, rhsValue),
-                                result);
-                auto [tag, val] = value::makeCopyDecimal(result);
-                return {true, tag, val};
-            }
-            case value::TypeTags::NumberDouble: {
-                double result;
-                Op::doOperation(numericCast<double>(lhsTag, lhsValue),
-                                numericCast<double>(rhsTag, rhsValue),
-                                result);
-                return {false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(result)};
-            }
-            default:
-                MONGO_UNREACHABLE;
-        }
-    } else if (lhsTag == TypeTags::Date || rhsTag == TypeTags::Date) {
-        if (isNumber(lhsTag)) {
-            int64_t result;
-            if (!Op::doOperation(
-                    numericCast<int64_t>(lhsTag, lhsValue), bitcastTo<int64_t>(rhsValue), result)) {
-                return {false, value::TypeTags::Date, value::bitcastFrom<int64_t>(result)};
-            }
-        } else if (isNumber(rhsTag)) {
-            int64_t result;
-            if (!Op::doOperation(
-                    bitcastTo<int64_t>(lhsValue), numericCast<int64_t>(rhsTag, rhsValue), result)) {
-                return {false, value::TypeTags::Date, value::bitcastFrom<int64_t>(result)};
-            }
-        } else {
-            int64_t result;
-            if (!Op::doOperation(
-                    bitcastTo<int64_t>(lhsValue), bitcastTo<int64_t>(lhsValue), result)) {
-                return {false, value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(result)};
-            }
-        }
-        // We got here if the Date operation overflowed.
-        uasserted(ErrorCodes::Overflow, "date overflow");
-    }
-
-    return {false, value::TypeTags::Nothing, 0};
-}
 
 // Structures defining trigonometric functions computation.
 struct Acos {
@@ -338,8 +188,8 @@ struct Tanh {
  * computation of the respective trigonometric function.
  */
 template <typename TrigFunction>
-std::tuple<bool, value::TypeTags, value::Value> genericTrigonometricFun(value::TypeTags argTag,
-                                                                        value::Value argValue) {
+FastTuple<bool, value::TypeTags, value::Value> genericTrigonometricFun(value::TypeTags argTag,
+                                                                       value::Value argValue) {
     if (value::isNumber(argTag)) {
         switch (argTag) {
             case value::TypeTags::NumberInt32: {
@@ -371,12 +221,6 @@ std::tuple<bool, value::TypeTags, value::Value> genericTrigonometricFun(value::T
 }
 }  // namespace
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericAdd(value::TypeTags lhsTag,
-                                                                     value::Value lhsValue,
-                                                                     value::TypeTags rhsTag,
-                                                                     value::Value rhsValue) {
-    return genericArithmeticOp<Addition>(lhsTag, lhsValue, rhsTag, rhsValue);
-}
 
 namespace {
 void setNonDecimalTotal(TypeTags nonDecimalTotalTag,
@@ -503,6 +347,57 @@ void ByteCode::aggDoubleDoubleSumImpl(value::Array* arr,
     }
 }
 
+void ByteCode::aggMergeDoubleDoubleSumsImpl(value::Array* accumulator,
+                                            value::TypeTags rhsTag,
+                                            value::Value rhsValue) {
+    auto [accumWidestType, _1] = accumulator->getAt(AggSumValueElems::kNonDecimalTotalTag);
+
+    tassert(7039532, "value must be of type 'Array'", rhsTag == value::TypeTags::Array);
+    auto nextDoubleDoubleArr = value::getArrayView(rhsValue);
+
+    tassert(7039533,
+            "array does not have enough elements",
+            nextDoubleDoubleArr->size() >= AggSumValueElems::kMaxSizeOfArray - 1);
+
+    // First aggregate the non-decimal sum, then the non-decimal addend. Both should be doubles.
+    auto [sumTag, sum] = nextDoubleDoubleArr->getAt(AggSumValueElems::kNonDecimalTotalSum);
+    tassert(7039534, "expected 'NumberDouble'", sumTag == value::TypeTags::NumberDouble);
+    aggDoubleDoubleSumImpl(accumulator, sumTag, sum);
+
+    auto [addendTag, addend] = nextDoubleDoubleArr->getAt(AggSumValueElems::kNonDecimalTotalAddend);
+    tassert(7039535, "expected 'NumberDouble'", addendTag == value::TypeTags::NumberDouble);
+    // There is a special case when the 'sum' is infinite and the 'addend' is NaN. This DoubleDouble
+    // value represents infinity, not NaN. Therefore, we avoid incorporating the NaN 'addend' value
+    // into the sum.
+    if (std::isfinite(value::bitcastTo<double>(sum)) ||
+        !std::isnan(value::bitcastTo<double>(addend))) {
+        aggDoubleDoubleSumImpl(accumulator, addendTag, addend);
+    }
+
+    // Determine the widest non-decimal type that we've seen so far, and set the accumulator state
+    // accordingly. We do this after computing the sums, since 'aggDoubleDoubleSumImpl()' will
+    // set the widest type to 'NumberDouble' when we call it above.
+    auto [newValWidestType, _2] = nextDoubleDoubleArr->getAt(AggSumValueElems::kNonDecimalTotalTag);
+    tassert(
+        7039536, "unexpected 'NumberDecimal'", newValWidestType != value::TypeTags::NumberDecimal);
+    tassert(
+        7039537, "unexpected 'NumberDecimal'", accumWidestType != value::TypeTags::NumberDecimal);
+    auto widestType = getWidestNumericalType(newValWidestType, accumWidestType);
+    accumulator->setAt(
+        AggSumValueElems::kNonDecimalTotalTag, widestType, value::bitcastFrom<int32_t>(0));
+
+    // If there's a decimal128 sum as part of the incoming DoubleDouble sum, incorporate it into the
+    // accumulator.
+    if (nextDoubleDoubleArr->size() == AggSumValueElems::kMaxSizeOfArray) {
+        auto [decimalTotalTag, decimalTotalVal] =
+            nextDoubleDoubleArr->getAt(AggSumValueElems::kDecimalTotal);
+        tassert(7039538,
+                "The decimalTotal must be 'NumberDecimal'",
+                decimalTotalTag == TypeTags::NumberDecimal);
+        aggDoubleDoubleSumImpl(accumulator, decimalTotalTag, decimalTotalVal);
+    }
+}
+
 void ByteCode::aggStdDevImpl(value::Array* arr, value::TypeTags rhsTag, value::Value rhsValue) {
     if (!isNumber(rhsTag)) {
         return;
@@ -551,7 +446,68 @@ void ByteCode::aggStdDevImpl(value::Array* arr, value::TypeTags rhsTag, value::V
     return setStdDevArray(newCountVal, newMeanVal, newM2Val, arr);
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::aggStdDevFinalizeImpl(
+void ByteCode::aggMergeStdDevsImpl(value::Array* accumulator,
+                                   value::TypeTags rhsTag,
+                                   value::Value rhsValue) {
+    tassert(7039542, "expected value of type 'Array'", rhsTag == value::TypeTags::Array);
+    auto nextArr = value::getArrayView(rhsValue);
+
+    tassert(7039543,
+            "expected array to have exactly 3 elements",
+            accumulator->size() == AggStdDevValueElems::kSizeOfArray);
+    tassert(7039544,
+            "expected array to have exactly 3 elements",
+            nextArr->size() == AggStdDevValueElems::kSizeOfArray);
+
+    auto [newCountTag, newCountVal] = nextArr->getAt(AggStdDevValueElems::kCount);
+    tassert(7039545, "expected 64-bit int", newCountTag == value::TypeTags::NumberInt64);
+    int64_t newCount = value::bitcastTo<int64_t>(newCountVal);
+
+    // If the incoming partial aggregate has a count of zero, then it represents the partial
+    // standard deviation of no data points. This means that it can be safely ignored, and we return
+    // the accumulator as is.
+    if (newCount == 0) {
+        return;
+    }
+
+    auto [oldCountTag, oldCountVal] = accumulator->getAt(AggStdDevValueElems::kCount);
+    tassert(7039546, "expected 64-bit int", oldCountTag == value::TypeTags::NumberInt64);
+    int64_t oldCount = value::bitcastTo<int64_t>(oldCountVal);
+
+    auto [oldMeanTag, oldMeanVal] = accumulator->getAt(AggStdDevValueElems::kRunningMean);
+    tassert(7039547, "expected double", oldMeanTag == value::TypeTags::NumberDouble);
+    double oldMean = value::bitcastTo<double>(oldMeanVal);
+
+    auto [newMeanTag, newMeanVal] = nextArr->getAt(AggStdDevValueElems::kRunningMean);
+    tassert(7039548, "expected double", newMeanTag == value::TypeTags::NumberDouble);
+    double newMean = value::bitcastTo<double>(newMeanVal);
+
+    auto [oldM2Tag, oldM2Val] = accumulator->getAt(AggStdDevValueElems::kRunningM2);
+    tassert(7039531, "expected double", oldM2Tag == value::TypeTags::NumberDouble);
+    double oldM2 = value::bitcastTo<double>(oldM2Val);
+
+    auto [newM2Tag, newM2Val] = nextArr->getAt(AggStdDevValueElems::kRunningM2);
+    tassert(7039541, "expected double", newM2Tag == value::TypeTags::NumberDouble);
+    double newM2 = value::bitcastTo<double>(newM2Val);
+
+    const double delta = newMean - oldMean;
+    // We've already handled the case where 'newCount' is zero above. This means that 'totalCount'
+    // must be positive, and prevents us from ever dividing by zero in the subsequent calculation.
+    int64_t totalCount = oldCount + newCount;
+    if (delta != 0) {
+        newMean = ((oldCount * oldMean) + (newCount * newMean)) / totalCount;
+        newM2 += delta * delta *
+            (static_cast<double>(oldCount) * static_cast<double>(newCount) / totalCount);
+    }
+    newM2 += oldM2;
+
+    setStdDevArray(value::bitcastFrom<int64_t>(totalCount),
+                   value::bitcastFrom<double>(newMean),
+                   value::bitcastFrom<double>(newM2),
+                   accumulator);
+}
+
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::aggStdDevFinalizeImpl(
     value::Value fieldValue, bool isSamp) {
     auto arr = value::getArrayView(fieldValue);
 
@@ -579,25 +535,13 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::aggStdDevFinalizeImpl(
     return {true, value::TypeTags::NumberDouble, value::bitcastFrom<double>(stdDev)};
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericSub(value::TypeTags lhsTag,
-                                                                     value::Value lhsValue,
-                                                                     value::TypeTags rhsTag,
-                                                                     value::Value rhsValue) {
-    return genericArithmeticOp<Subtraction>(lhsTag, lhsValue, rhsTag, rhsValue);
-}
-
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericMul(value::TypeTags lhsTag,
-                                                                     value::Value lhsValue,
-                                                                     value::TypeTags rhsTag,
-                                                                     value::Value rhsValue) {
-    return genericArithmeticOp<Multiplication>(lhsTag, lhsValue, rhsTag, rhsValue);
-}
-
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericDiv(value::TypeTags lhsTag,
-                                                                     value::Value lhsValue,
-                                                                     value::TypeTags rhsTag,
-                                                                     value::Value rhsValue) {
-    auto assertNonZero = [](bool nonZero) { uassert(4848401, "can't $divide by zero", nonZero); };
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericDiv(value::TypeTags lhsTag,
+                                                                    value::Value lhsValue,
+                                                                    value::TypeTags rhsTag,
+                                                                    value::Value rhsValue) {
+    auto assertNonZero = [](bool nonZero) {
+        uassert(4848401, "can't $divide by zero", nonZero);
+    };
 
     if (value::isNumber(lhsTag) && value::isNumber(rhsTag)) {
         switch (getWidestNumericalType(lhsTag, rhsTag)) {
@@ -634,11 +578,13 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericDiv(value::Type
     return {false, value::TypeTags::Nothing, 0};
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericIDiv(value::TypeTags lhsTag,
-                                                                      value::Value lhsValue,
-                                                                      value::TypeTags rhsTag,
-                                                                      value::Value rhsValue) {
-    auto assertNonZero = [](bool nonZero) { uassert(4848402, "can't $divide by zero", nonZero); };
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericIDiv(value::TypeTags lhsTag,
+                                                                     value::Value lhsValue,
+                                                                     value::TypeTags rhsTag,
+                                                                     value::Value rhsValue) {
+    auto assertNonZero = [](bool nonZero) {
+        uassert(4848402, "can't $divide by zero", nonZero);
+    };
 
     if (value::isNumber(lhsTag) && value::isNumber(rhsTag)) {
         switch (getWidestNumericalType(lhsTag, rhsTag)) {
@@ -686,11 +632,13 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericIDiv(value::Typ
     return {false, value::TypeTags::Nothing, 0};
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericMod(value::TypeTags lhsTag,
-                                                                     value::Value lhsValue,
-                                                                     value::TypeTags rhsTag,
-                                                                     value::Value rhsValue) {
-    auto assertNonZero = [](bool nonZero) { uassert(4848403, "can't $mod by zero", nonZero); };
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericMod(value::TypeTags lhsTag,
+                                                                    value::Value lhsValue,
+                                                                    value::TypeTags rhsTag,
+                                                                    value::Value rhsValue) {
+    auto assertNonZero = [](bool nonZero) {
+        uassert(4848403, "can't $mod by zero", nonZero);
+    };
 
     if (value::isNumber(lhsTag) && value::isNumber(rhsTag)) {
         switch (getWidestNumericalType(lhsTag, rhsTag)) {
@@ -727,28 +675,8 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericMod(value::Type
     return {false, value::TypeTags::Nothing, 0};
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericNumConvert(
-    value::TypeTags lhsTag, value::Value lhsValue, value::TypeTags targetTag) {
-    if (value::isNumber(lhsTag)) {
-        switch (lhsTag) {
-            case value::TypeTags::NumberInt32:
-                return numericConvLossless<int32_t>(value::bitcastTo<int32_t>(lhsValue), targetTag);
-            case value::TypeTags::NumberInt64:
-                return numericConvLossless<int64_t>(value::bitcastTo<int64_t>(lhsValue), targetTag);
-            case value::TypeTags::NumberDouble:
-                return numericConvLossless<double>(value::bitcastTo<double>(lhsValue), targetTag);
-            case value::TypeTags::NumberDecimal:
-                return numericConvLossless<Decimal128>(value::bitcastTo<Decimal128>(lhsValue),
-                                                       targetTag);
-            default:
-                MONGO_UNREACHABLE
-        }
-    }
-    return {false, value::TypeTags::Nothing, 0};
-}
-
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericAbs(value::TypeTags operandTag,
-                                                                     value::Value operandValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericAbs(value::TypeTags operandTag,
+                                                                    value::Value operandValue) {
     switch (operandTag) {
         case value::TypeTags::NumberInt32: {
             auto operand = value::bitcastTo<int32_t>(operandValue);
@@ -788,8 +716,8 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericAbs(value::Type
     }
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericCeil(value::TypeTags operandTag,
-                                                                      value::Value operandValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericCeil(value::TypeTags operandTag,
+                                                                     value::Value operandValue) {
     if (isNumber(operandTag)) {
         switch (operandTag) {
             case value::TypeTags::NumberDouble: {
@@ -815,8 +743,8 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericCeil(value::Typ
     return {false, value::TypeTags::Nothing, 0};
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericFloor(value::TypeTags operandTag,
-                                                                       value::Value operandValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericFloor(value::TypeTags operandTag,
+                                                                      value::Value operandValue) {
     if (isNumber(operandTag)) {
         switch (operandTag) {
             case value::TypeTags::NumberDouble: {
@@ -842,8 +770,8 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericFloor(value::Ty
     return {false, value::TypeTags::Nothing, 0};
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericTrunc(value::TypeTags operandTag,
-                                                                       value::Value operandValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericTrunc(value::TypeTags operandTag,
+                                                                      value::Value operandValue) {
     if (!isNumber(operandTag)) {
         return {false, value::TypeTags::Nothing, 0};
     }
@@ -871,8 +799,8 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericTrunc(value::Ty
     }
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericExp(value::TypeTags operandTag,
-                                                                     value::Value operandValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericExp(value::TypeTags operandTag,
+                                                                    value::Value operandValue) {
     switch (operandTag) {
         case value::TypeTags::NumberDouble: {
             auto result = exp(value::bitcastTo<double>(operandValue));
@@ -895,8 +823,8 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericExp(value::Type
     }
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericLn(value::TypeTags operandTag,
-                                                                    value::Value operandValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericLn(value::TypeTags operandTag,
+                                                                   value::Value operandValue) {
     switch (operandTag) {
         case value::TypeTags::NumberDouble: {
             auto operand = value::bitcastTo<double>(operandValue);
@@ -937,8 +865,8 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericLn(value::TypeT
     }
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericLog10(value::TypeTags operandTag,
-                                                                       value::Value operandValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericLog10(value::TypeTags operandTag,
+                                                                      value::Value operandValue) {
     switch (operandTag) {
         case value::TypeTags::NumberDouble: {
             auto operand = value::bitcastTo<double>(operandValue);
@@ -978,8 +906,8 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericLog10(value::Ty
     }
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericSqrt(value::TypeTags operandTag,
-                                                                      value::Value operandValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericSqrt(value::TypeTags operandTag,
+                                                                     value::Value operandValue) {
     switch (operandTag) {
         case value::TypeTags::NumberDouble: {
             auto operand = value::bitcastTo<double>(operandValue);
@@ -1053,40 +981,40 @@ std::pair<value::TypeTags, value::Value> ByteCode::compare3way(value::TypeTags l
     return value::compareValue(lhsTag, lhsValue, rhsTag, rhsValue, comparator);
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericAcos(value::TypeTags argTag,
-                                                                      value::Value argValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericAcos(value::TypeTags argTag,
+                                                                     value::Value argValue) {
     return genericTrigonometricFun<Acos>(argTag, argValue);
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericAcosh(value::TypeTags argTag,
-                                                                       value::Value argValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericAcosh(value::TypeTags argTag,
+                                                                      value::Value argValue) {
     return genericTrigonometricFun<Acosh>(argTag, argValue);
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericAsin(value::TypeTags argTag,
-                                                                      value::Value argValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericAsin(value::TypeTags argTag,
+                                                                     value::Value argValue) {
     return genericTrigonometricFun<Asin>(argTag, argValue);
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericAsinh(value::TypeTags argTag,
-                                                                       value::Value argValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericAsinh(value::TypeTags argTag,
+                                                                      value::Value argValue) {
     return genericTrigonometricFun<Asinh>(argTag, argValue);
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericAtan(value::TypeTags argTag,
-                                                                      value::Value argValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericAtan(value::TypeTags argTag,
+                                                                     value::Value argValue) {
     return genericTrigonometricFun<Atan>(argTag, argValue);
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericAtanh(value::TypeTags argTag,
-                                                                       value::Value argValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericAtanh(value::TypeTags argTag,
+                                                                      value::Value argValue) {
     return genericTrigonometricFun<Atanh>(argTag, argValue);
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericAtan2(value::TypeTags argTag1,
-                                                                       value::Value argValue1,
-                                                                       value::TypeTags argTag2,
-                                                                       value::Value argValue2) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericAtan2(value::TypeTags argTag1,
+                                                                      value::Value argValue1,
+                                                                      value::TypeTags argTag2,
+                                                                      value::Value argValue2) {
     if (value::isNumber(argTag1) && value::isNumber(argTag2)) {
         switch (getWidestNumericalType(argTag1, argTag2)) {
             case value::TypeTags::NumberInt32:
@@ -1109,17 +1037,17 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericAtan2(value::Ty
     return {false, value::TypeTags::Nothing, 0};
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericCos(value::TypeTags argTag,
-                                                                     value::Value argValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericCos(value::TypeTags argTag,
+                                                                    value::Value argValue) {
     return genericTrigonometricFun<Cos>(argTag, argValue);
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericCosh(value::TypeTags argTag,
-                                                                      value::Value argValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericCosh(value::TypeTags argTag,
+                                                                     value::Value argValue) {
     return genericTrigonometricFun<Cosh>(argTag, argValue);
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericDegreesToRadians(
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericDegreesToRadians(
     value::TypeTags argTag, value::Value argValue) {
     if (value::isNumber(argTag)) {
         switch (argTag) {
@@ -1142,7 +1070,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericDegreesToRadian
     return {false, value::TypeTags::Nothing, 0};
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericRadiansToDegrees(
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericRadiansToDegrees(
     value::TypeTags argTag, value::Value argValue) {
     if (value::isNumber(argTag)) {
         switch (argTag) {
@@ -1165,23 +1093,23 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericRadiansToDegree
     return {false, value::TypeTags::Nothing, 0};
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericSin(value::TypeTags argTag,
-                                                                     value::Value argValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericSin(value::TypeTags argTag,
+                                                                    value::Value argValue) {
     return genericTrigonometricFun<Sin>(argTag, argValue);
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericSinh(value::TypeTags argTag,
-                                                                      value::Value argValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericSinh(value::TypeTags argTag,
+                                                                     value::Value argValue) {
     return genericTrigonometricFun<Sinh>(argTag, argValue);
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericTan(value::TypeTags argTag,
-                                                                     value::Value argValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericTan(value::TypeTags argTag,
+                                                                    value::Value argValue) {
     return genericTrigonometricFun<Tan>(argTag, argValue);
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericTanh(value::TypeTags argTag,
-                                                                      value::Value argValue) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericTanh(value::TypeTags argTag,
+                                                                     value::Value argValue) {
     return genericTrigonometricFun<Tanh>(argTag, argValue);
 }
 

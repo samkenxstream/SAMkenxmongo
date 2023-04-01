@@ -18,9 +18,6 @@ selector:
   - jstests/concurrency/fsm_workloads/distinct_noindex.js
   - jstests/concurrency/fsm_workloads/distinct_projection.js
 
-  # SERVER-17397 Drops of sharded namespaces may not fully succeed
-  - jstests/concurrency/fsm_workloads/create_database.js
-
   # Disabled due to SERVER-33753, '.count() without a predicate can be wrong on sharded
   # collections'. This bug is problematic for these workloads because they assert on count()
   # values:
@@ -28,6 +25,7 @@ selector:
 
   # $lookup and $graphLookup are not supported on sharded collections with transactions.
   - jstests/concurrency/fsm_workloads/agg_graph_lookup.js
+  - jstests/concurrency/fsm_workloads/agg_lookup.js
   - jstests/concurrency/fsm_workloads/view_catalog_cycle_lookup.js
 
   # Disabled because MapReduce can lose cursors if the primary goes down during the operation.
@@ -120,6 +118,7 @@ selector:
   # Expects reads to die with a particular error, but other errors are possible if the read is part
   # of a transaction (e.g. ErrorCodes.LockTimeout).
   - jstests/concurrency/fsm_workloads/drop_index_during_replan.js
+  - jstests/concurrency/fsm_workloads/drop_index_during_lookup.js
 
   # Performs direct writes to system.views
   - jstests/concurrency/fsm_workloads/view_catalog_direct_system_writes.js
@@ -164,6 +163,7 @@ selector:
   - jstests/concurrency/fsm_workloads/view_catalog_cycle_with_drop.js
   - jstests/concurrency/fsm_workloads/view_catalog_direct_system_writes.js
   - jstests/concurrency/fsm_workloads/random_moveChunk_timeseries_deletes.js
+  - jstests/concurrency/fsm_workloads/timeseries_deletes_and_inserts.js
 
   ##
   # Denylists specific to this suite
@@ -224,6 +224,7 @@ executor:
   archive:
     hooks:
       - CheckReplDBHash
+      - CheckMetadataConsistencyInBackground
       - ValidateCollections
     tests: true
   config:
@@ -231,13 +232,12 @@ executor:
       global_vars:
         TestData:
           runInsideTransaction: true
-          runningWithAutoSplit: false
           runningWithBalancer: false
           runningWithConfigStepdowns: true
           runningWithSessions: true
           runningWithShardStepdowns: true
           traceExceptions: false
-          useStepdownPermittedFile: true
+          useActionPermittedFile: true
   hooks:
   # We use a stepdown interval of 15 seconds because we will retry all commands in a transaction
   # so we need to allow time for at most 10 operations to be re-run and then re-committed. If
@@ -247,10 +247,12 @@ executor:
     kill: true
     shard_stepdown: true
     stepdown_interval_ms: 15000
-    use_stepdown_permitted_file: true
-    wait_for_mongos_retarget: true
+    use_action_permitted_file: true
   - class: CheckReplDBHash
+  - class: CheckMetadataConsistencyInBackground
   - class: CheckOrphansDeleted
+  - class: CheckRoutingTableConsistency
+  - class: CheckShardFilteringMetadata
   - class: ValidateCollections # Validation can interfere with other operations, so this goes last.
     shell_options:
       global_vars:
@@ -260,10 +262,10 @@ executor:
   fixture:
     class: ShardedClusterFixture
     enable_balancer: false
-    enable_autosplit: false
     mongos_options:
       set_parameters:
         enableTestCommands: 1
+        queryAnalysisSamplerConfigurationRefreshSecs: 1
     configsvr_options:
       num_nodes: 3
       all_nodes_electable: true
@@ -287,6 +289,7 @@ executor:
         enableElectionHandoff: 0
         roleGraphInvalidationIsFatal: 1
         receiveChunkWaitForRangeDeleterTimeoutMS: 90000
+        queryAnalysisWriterIntervalSecs: 1
     num_rs_nodes_per_shard: 3
     num_shards: 2
     num_mongos: 2

@@ -1,15 +1,13 @@
 /**
  * Tests the behavior of the $_internalBoundedSort stage.
  * @tags: [
- *   # TODO SERVER-52286 should be requires_fcv_60
- *   requires_fcv_53,
- *   # Cannot insert into a time-series collection in a multi-document transaction.
- *   does_not_support_transactions,
+ *   # Explain of a resolved view must be executed by mongos.
+ *   directly_against_shardsvrs_incompatible,
  *   # Refusing to run a test that issues an aggregation command with explain because it may return
  *   # incomplete results if interrupted by a stepdown.
  *   does_not_support_stepdowns,
- *   # Explain of a resolved view must be executed by mongos.
- *   directly_against_shardsvrs_incompatible,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 (function() {
@@ -31,24 +29,30 @@ assert.commandWorked(
 const bucketMaxSpanSeconds =
     db.getCollectionInfos({name: coll.getName()})[0].options.timeseries.bucketMaxSpanSeconds;
 
+// Create a descending time index to allow sorting by control.max.t
+assert.commandWorked(coll.createIndex({t: -1}));
+
 // Insert some data.
 {
     const numBatches = 10;
     const batchSize = 1000;
+    const intervalMillis = 100000;  // 100 seconds
+    const batchOffset = Math.floor(intervalMillis / (numBatches + 1));
     const start = new Date();
-    const intervalMillis = 1000;  // 1 second
     for (let i = 0; i < numBatches; ++i) {
-        const batch = Array.from(
-            {length: batchSize},
-            (_, j) =>
-                ({t: new Date(+start + i * batchSize * intervalMillis + j * intervalMillis)}));
+        const batch =
+            Array.from({length: batchSize},
+                       (_, j) => ({t: new Date(+start + i * batchOffset + j * intervalMillis)}));
         assert.commandWorked(coll.insert(batch));
         print(`Inserted ${i + 1} of ${numBatches} batches`);
     }
     assert.gt(buckets.aggregate([{$count: 'n'}]).next().n, 1, 'Expected more than one bucket');
+
+    TimeseriesTest.ensureDataIsDistributedIfSharded(
+        coll, new Date(+start + ((batchSize / 2) * intervalMillis)));
 }
 
-const unpackStage = getAggPlanStage(coll.explain().aggregate(), '$_internalUnpackBucket');
+const unpackStage = getAggPlanStages(coll.explain().aggregate(), '$_internalUnpackBucket')[0];
 
 function assertSorted(result, ascending) {
     let prev = ascending ? {t: -Infinity} : {t: Infinity};
@@ -67,51 +71,55 @@ function assertSorted(result, ascending) {
     }
 }
 
+function checkAgainstReference(reference, pipeline, hint, sortOrder) {
+    const opt = coll.aggregate(pipeline, {hint}).toArray();
+    assertSorted(opt, sortOrder);
+    assert.eq(reference, opt);
+
+    const plan = coll.explain({}).aggregate(pipeline, {hint});
+    const stages = getAggPlanStages(plan, "$_internalBoundedSort");
+    assert.neq(null, stages, plan);
+    assert.lte(1, stages.length, plan);
+}
+
 function runTest(ascending) {
     // Test sorting the whole collection
     {
-        const naive = buckets
-                          .aggregate([
-                              unpackStage,
-                              {$_internalInhibitOptimization: {}},
-                              {$sort: {t: ascending ? 1 : -1}},
-                          ])
-                          .toArray();
-        assertSorted(naive, ascending);
+        const reference = buckets
+                              .aggregate([
+                                  unpackStage,
+                                  {$_internalInhibitOptimization: {}},
+                                  {$sort: {t: ascending ? 1 : -1}},
+                              ])
+                              .toArray();
+        assertSorted(reference, ascending);
 
-        const optFromMin =
-            buckets
-                .aggregate([
-                    {$sort: {'control.min.t': ascending ? 1 : -1}},
-                    unpackStage,
-                    {
-                        $_internalBoundedSort: {
-                            sortKey: {t: ascending ? 1 : -1},
-                            bound: ascending ? {base: "min"}
-                                             : {base: "min", offset: bucketMaxSpanSeconds}
-                        }
-                    },
-                ])
-                .toArray();
-        assertSorted(optFromMin, ascending);
-        assert.eq(naive, optFromMin);
+        // Check plan using control.min.t
+        checkAgainstReference(reference,
+                              [
+                                  {$sort: {t: ascending ? 1 : -1}},
+                              ],
+                              {"$natural": ascending ? 1 : -1},
+                              ascending);
 
-        const optFromMax =
-            buckets
-                .aggregate([
-                    {$sort: {'control.max.t': ascending ? 1 : -1}},
-                    unpackStage,
-                    {
-                        $_internalBoundedSort: {
-                            sortKey: {t: ascending ? 1 : -1},
-                            bound: ascending ? {base: "max", offset: -bucketMaxSpanSeconds}
-                                             : {base: "max"}
-                        }
-                    },
-                ])
-                .toArray();
-        assertSorted(optFromMax, ascending);
-        assert.eq(naive, optFromMax);
+        // Check plan using control.max.t
+        if (ascending) {
+            const opt = coll.aggregate(
+                                [
+                                    {$sort: {t: 1}},
+                                ],
+                                {hint: {t: -1}})
+                            .toArray();
+            assertSorted(opt, ascending);
+            assert.eq(reference, opt);
+        } else {
+            checkAgainstReference(reference,
+                                  [
+                                      {$sort: {t: ascending ? 1 : -1}},
+                                  ],
+                                  {"t": -1},
+                                  ascending);
+        }
     }
 
     // Test $sort + $limit.
@@ -136,10 +144,10 @@ function runTest(ascending) {
                         $_internalBoundedSort: {
                             sortKey: {t: ascending ? 1 : -1},
                             bound: ascending ? {base: "min"}
-                                             : {base: "min", offset: bucketMaxSpanSeconds}
+                                             : {base: "min", offsetSeconds: bucketMaxSpanSeconds},
+                            limit: 100
                         }
                     },
-                    {$limit: 100},
                 ])
                 .toArray();
         assertSorted(optFromMin, ascending);
@@ -154,11 +162,11 @@ function runTest(ascending) {
                     {
                         $_internalBoundedSort: {
                             sortKey: {t: ascending ? 1 : -1},
-                            bound: ascending ? {base: "max", offset: -bucketMaxSpanSeconds}
-                                             : {base: "max"}
+                            bound: ascending ? {base: "max", offsetSeconds: -bucketMaxSpanSeconds}
+                                             : {base: "max"},
+                            limit: 100
                         }
-                    },
-                    {$limit: 100},
+                    }
                 ])
                 .toArray();
         assertSorted(optFromMax, ascending);

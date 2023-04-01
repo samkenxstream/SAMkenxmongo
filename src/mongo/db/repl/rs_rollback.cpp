@@ -27,35 +27,31 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationRollback
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/repl/rs_rollback.h"
 
 #include <algorithm>
-#include <memory>
 
 #include "mongo/bson/bsonelement_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/catalog/capped_collection_maintenance.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_build_oplog_entry.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/rename_collection.h"
+#include "mongo/db/catalog/unique_collection_name.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
@@ -72,16 +68,19 @@
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/rollback_source.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
-#include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/session_catalog_mongod.h"
 #include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/db/storage/remove_saver.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationRollback
 
 namespace mongo {
 
@@ -311,7 +310,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
             txnBob.append("_id", sessionId->toBSON());
             auto txnObj = txnBob.obj();
 
-            DocID txnDoc(txnObj, txnObj.firstElement(), transactionTableUUID.get());
+            DocID txnDoc(txnObj, txnObj.firstElement(), transactionTableUUID.value());
             txnDoc.ns = NamespaceString::kSessionTransactionsTableNamespace.ns();
 
             fixUpInfo.docsToRefetch.insert(txnDoc);
@@ -337,6 +336,8 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
         BSONElement first = obj.firstElement();
 
         switch (oplogEntry.getCommandType()) {
+            case OplogEntry::CommandType::kCreateGlobalIndex:
+                // Drop the collection created for global index.
             case OplogEntry::CommandType::kCreate: {
                 // Example create collection oplog entry
                 // {
@@ -354,6 +355,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                 fixUpInfo.collectionsToDrop.insert(*uuid);
                 return Status::OK();
             }
+            case OplogEntry::CommandType::kDropGlobalIndex:
             case OplogEntry::CommandType::kDrop: {
                 // Example drop collection oplog entry
                 // {
@@ -402,7 +404,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                         "Missing index name in dropIndexes operation on rollback.");
                 }
 
-                BSONObj obj2 = oplogEntry.getObject2().get().getOwned();
+                BSONObj obj2 = oplogEntry.getObject2().value().getOwned();
 
                 // Inserts the index name and the index spec of the index to be created into the map
                 // of index name and index specs that need to be created for the given collection.
@@ -790,7 +792,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
         static constexpr char message[] = "Cannot roll back op with no _id";
         LOGV2_FATAL_CONTINUE(21737,
                              message,
-                             "namespace"_attr = nss.ns(),
+                             logAttrs(nss),
                              "oplogEntry"_attr = redact(oplogEntry.toBSONForLogging()));
         throw RSFatalException(str::stream() << message << ". ns: " << nss.ns());
     }
@@ -860,15 +862,16 @@ void dropIndex(OperationContext* opCtx,
                const string& indexName,
                NamespaceString& nss) {
     IndexCatalog* indexCatalog = collection->getIndexCatalog();
-    bool includeUnfinishedIndexes = true;
-    auto indexDescriptor =
-        indexCatalog->findIndexByName(opCtx, indexName, includeUnfinishedIndexes);
+    auto indexDescriptor = indexCatalog->findIndexByName(
+        opCtx,
+        indexName,
+        IndexCatalog::InclusionPolicy::kReady | IndexCatalog::InclusionPolicy::kUnfinished);
     if (!indexDescriptor) {
         LOGV2_WARNING(21725,
                       "Rollback failed to drop index {indexName} in {namespace}: index not found.",
                       "Rollback failed to drop index: index not found",
                       "indexName"_attr = indexName,
-                      "namespace"_attr = nss.toString());
+                      logAttrs(nss));
         return;
     }
 
@@ -880,7 +883,7 @@ void dropIndex(OperationContext* opCtx,
                         "Rollback failed to drop index {indexName} in {namespace}: {error}",
                         "Rollback failed to drop index",
                         "indexName"_attr = indexName,
-                        "namespace"_attr = nss.toString(),
+                        logAttrs(nss),
                         "error"_attr = redact(status));
         }
     } else {
@@ -891,7 +894,7 @@ void dropIndex(OperationContext* opCtx,
                 "Rollback failed to drop unfinished index {indexName} in {namespace}: {error}",
                 "Rollback failed to drop unfinished index",
                 "indexName"_attr = indexName,
-                "namespace"_attr = nss.toString(),
+                logAttrs(nss),
                 "error"_attr = redact(status));
         }
     }
@@ -906,7 +909,7 @@ void rollbackCreateIndexes(OperationContext* opCtx, UUID uuid, std::set<std::str
     boost::optional<NamespaceString> nss =
         CollectionCatalog::get(opCtx)->lookupNSSByUUID(opCtx, uuid);
     invariant(nss);
-    Lock::DBLock dbLock(opCtx, nss->db(), MODE_X);
+    Lock::DBLock dbLock(opCtx, nss->dbName(), MODE_X);
     CollectionWriter collection(opCtx, uuid);
 
     // If we cannot find the collection, we skip over dropping the index.
@@ -941,12 +944,12 @@ void rollbackCreateIndexes(OperationContext* opCtx, UUID uuid, std::set<std::str
               "Dropping index in rollback for collection: {namespace}, UUID: {uuid}, index: "
               "{indexName}",
               "Dropping index in rollback",
-              "namespace"_attr = *nss,
+              logAttrs(*nss),
               "uuid"_attr = uuid,
               "indexName"_attr = indexName);
 
         WriteUnitOfWork wuow(opCtx);
-        dropIndex(opCtx, collection.getWritableCollection(), indexName, *nss);
+        dropIndex(opCtx, collection.getWritableCollection(opCtx), indexName, *nss);
         wuow.commit();
 
         LOGV2_DEBUG(21673,
@@ -954,7 +957,7 @@ void rollbackCreateIndexes(OperationContext* opCtx, UUID uuid, std::set<std::str
                     "Dropped index in rollback for collection: {namespace}, UUID: {uuid}, index: "
                     "{indexName}",
                     "Dropped index in rollback",
-                    "namespace"_attr = *nss,
+                    logAttrs(*nss),
                     "uuid"_attr = uuid,
                     "indexName"_attr = indexName);
     }
@@ -970,9 +973,9 @@ void rollbackDropIndexes(OperationContext* opCtx,
     auto catalog = CollectionCatalog::get(opCtx);
     boost::optional<NamespaceString> nss = catalog->lookupNSSByUUID(opCtx, uuid);
     invariant(nss);
-    Lock::DBLock dbLock(opCtx, nss->db(), MODE_IX);
+    Lock::DBLock dbLock(opCtx, nss->dbName(), MODE_IX);
     Lock::CollectionLock collLock(opCtx, *nss, MODE_X);
-    CollectionPtr collection = catalog->lookupCollectionByNamespace(opCtx, *nss);
+    const Collection* collection = catalog->lookupCollectionByNamespace(opCtx, *nss);
 
     // If we cannot find the collection, we skip over dropping the index.
     if (!collection) {
@@ -994,18 +997,18 @@ void rollbackDropIndexes(OperationContext* opCtx,
               "Creating index in rollback for collection: {namespace}, UUID: {uuid}, index: "
               "{indexName}",
               "Creating index in rollback",
-              "namespace"_attr = *nss,
+              logAttrs(*nss),
               "uuid"_attr = uuid,
               "indexName"_attr = indexName);
 
-        createIndexForApplyOps(opCtx, indexSpec, *nss, OplogApplication::Mode::kRecovering);
+        createIndexForApplyOps(opCtx, indexSpec, *nss, OplogApplication::Mode::kStableRecovering);
 
         LOGV2_DEBUG(21676,
                     1,
                     "Created index in rollback for collection: {namespace}, UUID: {uuid}, index: "
                     "{indexName}",
                     "Created index in rollback",
-                    "namespace"_attr = *nss,
+                    logAttrs(*nss),
                     "uuid"_attr = uuid,
                     "indexName"_attr = indexName);
     }
@@ -1026,7 +1029,7 @@ void dropCollection(OperationContext* opCtx,
               "file for a collection with uuid {uuid} to "
               "{rollbackFile}",
               "Rolling back createCollection: Preparing to write documents to a rollback file",
-              "namespace"_attr = nss,
+              logAttrs(nss),
               "uuid"_attr = collection->uuid(),
               "rollbackFile"_attr = removeSaver.file().generic_string());
 
@@ -1046,7 +1049,7 @@ void dropCollection(OperationContext* opCtx,
                                          "write document to remove saver file: {error}",
                                          "Rolling back createCollection failed to write document "
                                          "to remove saver file",
-                                         "namespace"_attr = nss,
+                                         logAttrs(nss),
                                          "error"_attr = redact(status));
                     throw RSFatalException(
                         "Rolling back createCollection. Failed to write document to remove saver "
@@ -1058,7 +1061,7 @@ void dropCollection(OperationContext* opCtx,
                                  "Rolling back createCollection on {namespace} failed with "
                                  "{error}. A full resync is necessary",
                                  "Rolling back createCollection failed. A full resync is necessary",
-                                 "namespace"_attr = nss,
+                                 logAttrs(nss),
                                  "error"_attr = redact(exceptionToStatus()));
             throw RSFatalException(
                 "Rolling back createCollection failed. A full resync is necessary.");
@@ -1088,11 +1091,11 @@ void renameOutOfTheWay(OperationContext* opCtx, RenameCollectionInfo info, Datab
 
     // The generated unique collection name is only guaranteed to exist if the database is
     // exclusively locked.
-    invariant(opCtx->lockState()->isDbLockedForMode(db->name().dbName(), LockMode::MODE_X));
+    invariant(opCtx->lockState()->isDbLockedForMode(db->name(), LockMode::MODE_X));
     // Creates the oplog entry to temporarily rename the collection that is
     // preventing the renameCollection command from rolling back to a unique
     // namespace.
-    auto tmpNameResult = db->makeUniqueCollectionNamespace(opCtx, "rollback.tmp%%%%%");
+    auto tmpNameResult = makeUniqueCollectionName(opCtx, db->name(), "rollback.tmp%%%%%");
     if (!tmpNameResult.isOK()) {
         LOGV2_FATAL_CONTINUE(
             21743,
@@ -1139,8 +1142,7 @@ void renameOutOfTheWay(OperationContext* opCtx, RenameCollectionInfo info, Datab
  */
 void rollbackRenameCollection(OperationContext* opCtx, UUID uuid, RenameCollectionInfo info) {
 
-    auto dbName = info.renameFrom.db();
-    const TenantDatabaseName tenantDbName(boost::none, dbName);
+    auto dbName = info.renameFrom.dbName();
 
     LOGV2(21679,
           "Attempting to rename collection with UUID: {uuid}, from: {renameFrom}, to: "
@@ -1151,7 +1153,7 @@ void rollbackRenameCollection(OperationContext* opCtx, UUID uuid, RenameCollecti
           "renameTo"_attr = info.renameTo);
     Lock::DBLock dbLock(opCtx, dbName, MODE_X);
     auto databaseHolder = DatabaseHolder::get(opCtx);
-    auto db = databaseHolder->openDb(opCtx, tenantDbName);
+    auto db = databaseHolder->openDb(opCtx, dbName);
     invariant(db);
 
     auto status = renameCollectionForRollback(opCtx, info.renameTo, uuid);
@@ -1197,134 +1199,18 @@ void rollbackRenameCollection(OperationContext* opCtx, UUID uuid, RenameCollecti
                 "renameTo"_attr = info.renameTo);
 }
 
-Status _syncRollback(OperationContext* opCtx,
-                     const OplogInterface& localOplog,
-                     const RollbackSource& rollbackSource,
-                     const IndexBuilds& stoppedIndexBuilds,
-                     int requiredRBID,
-                     ReplicationCoordinator* replCoord,
-                     ReplicationProcess* replicationProcess) {
-    invariant(!opCtx->lockState()->isLocked());
-
-    FixUpInfo how;
-    how.localTopOfOplog = replCoord->getMyLastAppliedOpTime();
-    LOGV2(21681,
-          "Starting rollback. Sync source: {syncSource}",
-          "Starting rollback",
-          "syncSource"_attr = rollbackSource.getSource());
-    how.rbid = rollbackSource.getRollbackId();
-    uassert(
-        40506, "Upstream node rolled back. Need to retry our rollback.", how.rbid == requiredRBID);
-
-    // Find the UUID of the transactions collection. An OperationContext is required because the
-    // UUID is not known at compile time, so the SessionCatalog needs to load the collection.
-    how.transactionTableUUID = MongoDSessionCatalog::getTransactionTableUUID(opCtx);
-
-    // Populate the initial list of index builds to restart with the builds that were stopped due to
-    // rollback. They may need to be restarted if no associated oplog entries are rolled-back, or
-    // they may be made redundant by a rolled-back startIndexBuild oplog entry.
-    how.indexBuildsToRestart.insert(stoppedIndexBuilds.begin(), stoppedIndexBuilds.end());
-
-    LOGV2(21682, "Finding the Common Point");
-    try {
-
-        auto processOperationForFixUp = [&how, &opCtx, &localOplog](const BSONObj& operation) {
-            return updateFixUpInfoFromLocalOplogEntry(opCtx, localOplog, how, operation, false);
-        };
-
-        // Calls syncRollBackLocalOperations to run updateFixUpInfoFromLocalOplogEntry
-        // on each oplog entry up until the common point.
-        auto res = syncRollBackLocalOperations(
-            localOplog, rollbackSource.getOplog(), processOperationForFixUp);
-        if (!res.isOK()) {
-            const auto status = res.getStatus();
-            switch (status.code()) {
-                case ErrorCodes::OplogStartMissing:
-                case ErrorCodes::UnrecoverableRollbackError:
-                    return status;
-                default:
-                    throw RSFatalException(status.toString());
-            }
-        }
-
-        how.commonPoint = res.getValue().getOpTime();
-        how.commonPointOurDiskloc = res.getValue().getRecordId();
-        how.removeRedundantOperations();
-    } catch (const RSFatalException& e) {
-        return Status(ErrorCodes::UnrecoverableRollbackError,
-                      str::stream()
-                          << "need to rollback, but unable to determine common point between"
-                             " local and remote oplog: "
-                          << e.what());
-    }
-
-    OpTime commonPointOpTime = how.commonPoint;
-    OpTime lastCommittedOpTime = replCoord->getLastCommittedOpTime();
-    OpTime committedSnapshot = replCoord->getCurrentCommittedSnapshotOpTime();
-
-    LOGV2(21683,
-          "Rollback common point is {commonPoint}",
-          "Rollback common point",
-          "commonPoint"_attr = commonPointOpTime);
-
-    // This failpoint is used for testing the invariant below.
-    if (MONGO_unlikely(rollbackViaRefetchHangCommonPointBeforeReplCommitPoint.shouldFail()) &&
-        (commonPointOpTime.getTimestamp() < lastCommittedOpTime.getTimestamp())) {
-        LOGV2(6009600,
-              "Hanging due to rollbackViaRefetchHangCommonPointBeforeReplCommitPoint failpoint");
-        rollbackViaRefetchHangCommonPointBeforeReplCommitPoint.pauseWhileSet(opCtx);
-    }
-
-    // Rollback common point should be >= the replication commit point.
-    invariant(commonPointOpTime.getTimestamp() >= lastCommittedOpTime.getTimestamp());
-    invariant(commonPointOpTime >= lastCommittedOpTime);
-
-    // Rollback common point should be >= the committed snapshot optime.
-    invariant(commonPointOpTime.getTimestamp() >= committedSnapshot.getTimestamp());
-    invariant(commonPointOpTime >= committedSnapshot);
-
-    try {
-        // It is always safe to increment the rollback ID first, even if we fail to complete
-        // the rollback.
-        auto status = replicationProcess->incrementRollbackID(opCtx);
-        fassert(40497, status);
-
-        syncFixUp(opCtx, how, rollbackSource, replCoord, replicationProcess);
-
-        if (MONGO_unlikely(rollbackExitEarlyAfterCollectionDrop.shouldFail())) {
-            LOGV2(21684,
-                  "rollbackExitEarlyAfterCollectionDrop fail point enabled. Returning early "
-                  "until fail point is disabled");
-            return Status(ErrorCodes::NamespaceNotFound,
-                          str::stream() << "Failing rollback because "
-                                           "rollbackExitEarlyAfterCollectionDrop fail point "
-                                           "enabled.");
-        }
-    } catch (const RSFatalException& e) {
-        return Status(ErrorCodes::UnrecoverableRollbackError, e.what());
-    }
-
-    if (MONGO_unlikely(rollbackHangBeforeFinish.shouldFail())) {
-        // This log output is used in js tests so please leave it.
-        LOGV2(21685,
-              "rollback - rollbackHangBeforeFinish fail point "
-              "enabled. Blocking until fail point is disabled.");
-        while (MONGO_unlikely(rollbackHangBeforeFinish.shouldFail())) {
-            invariant(!globalInShutdownDeprecated());  // It is an error to shutdown while enabled.
-            mongo::sleepsecs(1);
-        }
-    }
-
-    return Status::OK();
-}
-
-}  // namespace
-
-void rollback_internal::syncFixUp(OperationContext* opCtx,
-                                  const FixUpInfo& fixUpInfo,
-                                  const RollbackSource& rollbackSource,
-                                  ReplicationCoordinator* replCoord,
-                                  ReplicationProcess* replicationProcess) {
+/**
+ * This function uses the FixUpInfo struct to undo all of the operations that occurred after the
+ * common point on the rolling back node, checking the rollback ID and updating minValid as
+ * necessary. This includes refetching, updating, and deleting individual documents, resyncing
+ * collection data and metadata, and dropping and creating collections and indexes. Truncates the
+ * oplog and triggers necessary in-memory refreshes before returning.
+ */
+void syncFixUp(OperationContext* opCtx,
+               const FixUpInfo& fixUpInfo,
+               const RollbackSource& rollbackSource,
+               ReplicationCoordinator* replCoord,
+               ReplicationProcess* replicationProcess) {
     unsigned long long totalSize = 0;
 
     // UUID -> doc id -> doc
@@ -1348,7 +1234,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                             2,
                             "Refetching document, collection: {namespace}, UUID: {uuid}, {_id}",
                             "Refetching document",
-                            "namespace"_attr = *nss,
+                            logAttrs(*nss),
                             "uuid"_attr = uuid,
                             "_id"_attr = redact(doc._id));
             } else {
@@ -1465,7 +1351,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
     // collection drops, because one of the preconditions of dropping a collection is that there are
     // no unfinished indxes.
     LOGV2(21694, "Rolling back unfinished startIndexBuild operations");
-    for (auto index : fixUpInfo.unfinishedIndexesToDrop) {
+    for (const auto& index : fixUpInfo.unfinishedIndexesToDrop) {
         UUID uuid = index.first;
         std::set<std::string> indexNames = index.second;
 
@@ -1503,20 +1389,20 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
             LOGV2(21697,
                   "Dropping collection: {namespace}, UUID: {uuid}",
                   "Dropping collection",
-                  "namespace"_attr = *nss,
+                  logAttrs(*nss),
                   "uuid"_attr = uuid);
-            AutoGetDb dbLock(opCtx, nss->db(), MODE_X);
+            AutoGetDb dbLock(opCtx, nss->dbName(), MODE_X);
 
             Database* db = dbLock.getDb();
             if (db) {
-                CollectionPtr collection =
-                    CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, uuid);
+                CollectionPtr collection(
+                    CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, uuid));
                 dropCollection(opCtx, *nss, collection, db);
                 LOGV2_DEBUG(21698,
                             1,
                             "Dropped collection: {namespace}, UUID: {uuid}",
                             "Dropped collection",
-                            "namespace"_attr = *nss,
+                            logAttrs(*nss),
                             "uuid"_attr = uuid);
             }
         }
@@ -1553,7 +1439,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                     "collection: {namespace}",
                     "Rolling back collection pending being dropped",
                     "optime"_attr = optime,
-                    "namespace"_attr = collectionNamespace);
+                    logAttrs(collectionNamespace));
         DropPendingCollectionReaper::get(opCtx)->rollBackDropPendingCollection(
             opCtx, optime, collectionNamespace);
     }
@@ -1575,20 +1461,19 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
             LOGV2(21702,
                   "Resyncing collection metadata for collection: {namespace}, UUID: {uuid}",
                   "Resyncing collection metadata",
-                  "namespace"_attr = *nss,
+                  logAttrs(*nss),
                   "uuid"_attr = uuid);
 
-            const TenantDatabaseName tenantDbName(boost::none, nss->db());
-            Lock::DBLock dbLock(opCtx, nss->db(), MODE_X);
+            Lock::DBLock dbLock(opCtx, nss->dbName(), MODE_X);
 
             auto databaseHolder = DatabaseHolder::get(opCtx);
-            auto db = databaseHolder->openDb(opCtx, tenantDbName);
+            auto db = databaseHolder->openDb(opCtx, nss->dbName());
             invariant(db);
 
             CollectionWriter collection(opCtx, uuid);
             invariant(collection);
 
-            auto infoResult = rollbackSource.getCollectionInfoByUUID(nss->db().toString(), uuid);
+            auto infoResult = rollbackSource.getCollectionInfoByUUID(nss->dbName(), uuid);
 
             if (!infoResult.isOK()) {
                 // The collection was dropped by the sync source so we can't correctly change it
@@ -1601,7 +1486,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                       "operation. Instead, we will drop the collection soon.",
                       "Namespace not found on remote host, so we do not roll back collmod "
                       "operation. Instead, we will drop the collection soon",
-                      "namespace"_attr = nss->ns());
+                      logAttrs(*nss));
                 continue;
             }
 
@@ -1632,12 +1517,12 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
             WriteUnitOfWork wuow(opCtx);
 
             // Set collection to whatever temp status is on the sync source.
-            collection.getWritableCollection()->setIsTemp(opCtx, options.temp);
+            collection.getWritableCollection(opCtx)->setIsTemp(opCtx, options.temp);
 
             // Set any document validation options. We update the validator fields without
             // parsing/validation, since we fetched the options object directly from the sync
             // source, and we should set our validation options to match it exactly.
-            auto validatorStatus = collection.getWritableCollection()->updateValidator(
+            auto validatorStatus = collection.getWritableCollection(opCtx)->updateValidator(
                 opCtx, options.validator, options.validationLevel, options.validationAction);
             if (!validatorStatus.isOK()) {
                 throw RSFatalException(str::stream()
@@ -1654,7 +1539,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                         "with: {info}, "
                         "to: {catalogId}",
                         "Resynced collection metadata",
-                        "namespace"_attr = *nss,
+                        logAttrs(*nss),
                         "uuid"_attr = uuid,
                         "info"_attr = redact(info),
                         "catalogId"_attr = redact(collection->getCollectionOptions().toBSON()));
@@ -1710,7 +1595,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                   "{namespace} "
                   "with uuid {uuid} to {rollbackFile}",
                   "Preparing to write deleted documents to a rollback file",
-                  "namespace"_attr = *nss,
+                  logAttrs(*nss),
                   "uuid"_attr = uuid.toString(),
                   "rollbackFile"_attr = removeSaver->file().generic_string());
         }
@@ -1735,8 +1620,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
                 // TODO: Lots of overhead in context. This can be faster.
                 const NamespaceString docNss(doc.ns);
-                Lock::DBLock docDbLock(opCtx, docNss.db(), MODE_X);
-                OldClientContext ctx(opCtx, doc.ns.toString());
+                Lock::DBLock docDbLock(opCtx, docNss.dbName(), MODE_X);
+                OldClientContext ctx(opCtx, docNss);
                 CollectionWriter collection(opCtx, uuid);
 
                 // Adds the doc to our rollback file if the collection was not dropped while
@@ -1747,7 +1632,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
                 if (collection && removeSaver) {
                     BSONObj obj;
-                    bool found = Helpers::findOne(opCtx, collection.get(), pattern, obj, false);
+                    bool found = Helpers::findOne(opCtx, collection.get(), pattern, obj);
                     if (found) {
                         auto status = removeSaver->goingToDelete(obj);
                         if (!status.isOK()) {
@@ -1756,7 +1641,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                                 "Rollback cannot write document in namespace {namespace} to "
                                 "archive file: {error}",
                                 "Rollback cannot write document to archive file",
-                                "namespace"_attr = nss->ns(),
+                                logAttrs(*nss),
                                 "error"_attr = redact(status));
                             throw RSFatalException(str::stream()
                                                    << "Rollback cannot write document in namespace "
@@ -1768,7 +1653,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                             "Rollback cannot find object: {pattern} in namespace {namespace}",
                             "Rollback cannot find object",
                             "pattern"_attr = pattern,
-                            "namespace"_attr = nss->ns());
+                            logAttrs(*nss));
                     }
                 }
 
@@ -1779,7 +1664,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                                 "UUID: {uuid}",
                                 "Deleting document",
                                 "_id"_attr = redact(doc._id),
-                                "namespace"_attr = doc.ns,
+                                logAttrs(docNss),
                                 "uuid"_attr = uuid);
                     // If the document could not be found on the primary, deletes the document.
                     // TODO 1.6 : can't delete from a capped collection. Need to handle that
@@ -1798,28 +1683,25 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
                                 const auto clock = opCtx->getServiceContext()->getFastClockSource();
                                 const auto findOneStart = clock->now();
-                                RecordId loc =
-                                    Helpers::findOne(opCtx, collection.get(), pattern, false);
+                                RecordId loc = Helpers::findOne(opCtx, collection.get(), pattern);
                                 if (clock->now() - findOneStart > Milliseconds(200))
                                     LOGV2_WARNING(
                                         21726,
                                         "Roll back slow no _id index for {namespace} perhaps?",
                                         "Roll back slow no _id index for namespace perhaps?",
-                                        "namespace"_attr = nss->ns());
+                                        logAttrs(*nss));
                                 // Would be faster but requires index:
                                 // RecordId loc = Helpers::findById(nsd, pattern);
                                 if (!loc.isNull()) {
                                     try {
-                                        writeConflictRetry(opCtx,
-                                                           "cappedTruncateAfter",
-                                                           collection->ns().ns(),
-                                                           [&] {
-                                                               WriteUnitOfWork wunit(opCtx);
-                                                               collection.getWritableCollection()
-                                                                   ->cappedTruncateAfter(
-                                                                       opCtx, loc, true);
-                                                               wunit.commit();
-                                                           });
+                                        writeConflictRetry(
+                                            opCtx,
+                                            "cappedTruncateAfter",
+                                            collection->ns().ns(),
+                                            [&] {
+                                                collection_internal::cappedTruncateAfter(
+                                                    opCtx, collection.get(), loc, true);
+                                            });
                                     } catch (const DBException& e) {
                                         if (e.code() == 13415) {
                                             // hack: need to just make cappedTruncate do this...
@@ -1827,7 +1709,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                                                 opCtx, "truncate", collection->ns().ns(), [&] {
                                                     WriteUnitOfWork wunit(opCtx);
                                                     uassertStatusOK(
-                                                        collection.getWritableCollection()
+                                                        collection.getWritableCollection(opCtx)
                                                             ->truncate(opCtx));
                                                     wunit.commit();
                                                 });
@@ -1847,7 +1729,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                                               "{_id}: {error}",
                                               "Ignoring failure to roll back change to capped "
                                               "collection",
-                                              "namespace"_attr = nss->ns(),
+                                              logAttrs(*nss),
                                               "_id"_attr = redact(idAndDoc.first._id.toString(
                                                   /*includeFieldName*/ false)),
                                               "error"_attr = redact(e));
@@ -1889,7 +1771,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                 LOGV2(21713,
                       "Exception in rollback ns:{namespace} {pattern} {error} ndeletes:{deletes}",
                       "Exception in rollback",
-                      "namespace"_attr = nss->ns(),
+                      logAttrs(*nss),
                       "pattern"_attr = pattern,
                       "error"_attr = redact(e),
                       "deletes"_attr = deletes);
@@ -1955,9 +1837,9 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
     // Cleans up the oplog.
     {
         const NamespaceString oplogNss(NamespaceString::kRsOplogNamespace);
-        Lock::DBLock oplogDbLock(opCtx, oplogNss.db(), MODE_IX);
+        Lock::DBLock oplogDbLock(opCtx, oplogNss.dbName(), MODE_IX);
         Lock::CollectionLock oplogCollectionLoc(opCtx, oplogNss, MODE_X);
-        OldClientContext ctx(opCtx, oplogNss.ns());
+        OldClientContext ctx(opCtx, oplogNss);
         auto oplogCollection =
             CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, oplogNss);
         if (!oplogCollection) {
@@ -1966,8 +1848,18 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                 Status(ErrorCodes::UnrecoverableRollbackError,
                        str::stream() << "Can't find " << NamespaceString::kRsOplogNamespace.ns()));
         }
+
+        // The oplog collection doesn't have indexes and therefore can take full advantage of the
+        // truncation mechanism that the underlying storage engine offers. Because of this, here we
+        // invoke the record store's truncation logic directly without specifying a per-document
+        // callback.
+        //
         // TODO: fatal error if this throws?
-        oplogCollection->cappedTruncateAfter(opCtx, fixUpInfo.commonPointOurDiskloc, false);
+        oplogCollection->getRecordStore()->cappedTruncateAfter(
+            opCtx,
+            fixUpInfo.commonPointOurDiskloc,
+            false /* inclusive */,
+            nullptr /* aboutToDelete callback */);
     }
 
     if (!serverGlobalParams.enableMajorityReadConcern) {
@@ -2004,19 +1896,12 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
     // If necessary, clear the memory of existing sessions.
     if (fixUpInfo.refetchTransactionDocs) {
-        MongoDSessionCatalog::invalidateAllSessions(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        mongoDSessionCatalog->invalidateAllSessions(opCtx);
     }
 
     if (auto validator = LogicalTimeValidator::get(opCtx)) {
         validator->resetKeyManagerCache();
-    }
-
-    // Force the config server to update its shard registry on next access. Otherwise it may have
-    // the stale data that has been just rolled back.
-    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-        if (auto shardRegistry = Grid::get(opCtx)->shardRegistry()) {
-            shardRegistry->clearEntries();
-        }
     }
 
     // Force the default read/write concern cache to reload on next access in case the defaults
@@ -2031,6 +1916,130 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
     // 'minValid'.
     replCoord->resetLastOpTimesFromOplog(opCtx);
 }
+
+Status _syncRollback(OperationContext* opCtx,
+                     const OplogInterface& localOplog,
+                     const RollbackSource& rollbackSource,
+                     const IndexBuilds& stoppedIndexBuilds,
+                     int requiredRBID,
+                     ReplicationCoordinator* replCoord,
+                     ReplicationProcess* replicationProcess) {
+    invariant(!opCtx->lockState()->isLocked());
+
+    FixUpInfo how;
+    how.localTopOfOplog = replCoord->getMyLastAppliedOpTime();
+    LOGV2(21681,
+          "Starting rollback. Sync source: {syncSource}",
+          "Starting rollback",
+          "syncSource"_attr = rollbackSource.getSource());
+    how.rbid = rollbackSource.getRollbackId();
+    uassert(
+        40506, "Upstream node rolled back. Need to retry our rollback.", how.rbid == requiredRBID);
+
+    // Find the UUID of the transactions collection. An OperationContext is required because the
+    // UUID is not known at compile time, so the SessionCatalog needs to load the collection.
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    how.transactionTableUUID = mongoDSessionCatalog->getTransactionTableUUID(opCtx);
+
+    // Populate the initial list of index builds to restart with the builds that were stopped due to
+    // rollback. They may need to be restarted if no associated oplog entries are rolled-back, or
+    // they may be made redundant by a rolled-back startIndexBuild oplog entry.
+    how.indexBuildsToRestart.insert(stoppedIndexBuilds.begin(), stoppedIndexBuilds.end());
+
+    LOGV2(21682, "Finding the Common Point");
+    try {
+
+        auto processOperationForFixUp = [&how, &opCtx, &localOplog](const BSONObj& operation) {
+            return updateFixUpInfoFromLocalOplogEntry(opCtx, localOplog, how, operation, false);
+        };
+
+        // Calls syncRollBackLocalOperations to run updateFixUpInfoFromLocalOplogEntry
+        // on each oplog entry up until the common point.
+        auto res = syncRollBackLocalOperations(
+            localOplog, rollbackSource.getOplog(), processOperationForFixUp);
+        if (!res.isOK()) {
+            const auto status = res.getStatus();
+            switch (status.code()) {
+                case ErrorCodes::OplogStartMissing:
+                case ErrorCodes::UnrecoverableRollbackError:
+                    return status;
+                default:
+                    throw RSFatalException(status.toString());
+            }
+        }
+
+        how.commonPoint = res.getValue().getOpTime();
+        how.commonPointOurDiskloc = res.getValue().getRecordId();
+        how.removeRedundantOperations();
+    } catch (const RSFatalException& e) {
+        return Status(ErrorCodes::UnrecoverableRollbackError,
+                      str::stream()
+                          << "need to rollback, but unable to determine common point between"
+                             " local and remote oplog: "
+                          << e.what());
+    }
+
+    OpTime commonPointOpTime = how.commonPoint;
+    OpTime lastCommittedOpTime = replCoord->getLastCommittedOpTime();
+    OpTime committedSnapshot = replCoord->getCurrentCommittedSnapshotOpTime();
+
+    LOGV2(21683,
+          "Rollback common point is {commonPoint}",
+          "Rollback common point",
+          "commonPoint"_attr = commonPointOpTime);
+
+    // This failpoint is used for testing the invariant below.
+    if (MONGO_unlikely(rollbackViaRefetchHangCommonPointBeforeReplCommitPoint.shouldFail()) &&
+        (commonPointOpTime.getTimestamp() < lastCommittedOpTime.getTimestamp())) {
+        LOGV2(6009600,
+              "Hanging due to rollbackViaRefetchHangCommonPointBeforeReplCommitPoint failpoint");
+        rollbackViaRefetchHangCommonPointBeforeReplCommitPoint.pauseWhileSet(opCtx);
+    }
+
+    // Rollback common point should be >= the replication commit point.
+    invariant(commonPointOpTime.getTimestamp() >= lastCommittedOpTime.getTimestamp());
+    invariant(commonPointOpTime >= lastCommittedOpTime);
+
+    // Rollback common point should be >= the committed snapshot optime.
+    invariant(commonPointOpTime.getTimestamp() >= committedSnapshot.getTimestamp());
+    invariant(commonPointOpTime >= committedSnapshot);
+
+    try {
+        // It is always safe to increment the rollback ID first, even if we fail to complete
+        // the rollback.
+        auto status = replicationProcess->incrementRollbackID(opCtx);
+        fassert(40497, status);
+
+        syncFixUp(opCtx, how, rollbackSource, replCoord, replicationProcess);
+
+        if (MONGO_unlikely(rollbackExitEarlyAfterCollectionDrop.shouldFail())) {
+            LOGV2(21684,
+                  "rollbackExitEarlyAfterCollectionDrop fail point enabled. Returning early "
+                  "until fail point is disabled");
+            return Status(ErrorCodes::NamespaceNotFound,
+                          str::stream() << "Failing rollback because "
+                                           "rollbackExitEarlyAfterCollectionDrop fail point "
+                                           "enabled.");
+        }
+    } catch (const RSFatalException& e) {
+        return Status(ErrorCodes::UnrecoverableRollbackError, e.what());
+    }
+
+    if (MONGO_unlikely(rollbackHangBeforeFinish.shouldFail())) {
+        // This log output is used in js tests so please leave it.
+        LOGV2(21685,
+              "rollback - rollbackHangBeforeFinish fail point "
+              "enabled. Blocking until fail point is disabled.");
+        while (MONGO_unlikely(rollbackHangBeforeFinish.shouldFail())) {
+            invariant(!globalInShutdownDeprecated());  // It is an error to shutdown while enabled.
+            mongo::sleepsecs(1);
+        }
+    }
+
+    return Status::OK();
+}
+
+}  // namespace
 
 Status syncRollback(OperationContext* opCtx,
                     const OplogInterface& localOplog,

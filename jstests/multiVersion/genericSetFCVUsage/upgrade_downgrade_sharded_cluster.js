@@ -14,25 +14,11 @@
 'use strict';
 
 load('jstests/multiVersion/libs/multi_cluster.js');  // For upgradeCluster
+load("jstests/libs/feature_flag_util.js");
 
 const dbName = jsTestName();
 
-// TODO SERVER-57417 remove feature flag check once enabled
-const noMoreAutoSplitterFeatureFlagEnabled = TestData.setParameters.featureFlagNoMoreAutoSplitter;
-
-//==========//
-// TODO SERVER-64400 remove code delimited with //==========// once 6.0 branches out
-const kRangeDeletionNs = "config.rangeDeletions";
-const testOrphansTrackingNS = dbName + '.testOrphansTracking';
-const numOrphanedDocs = 10;
-if (noMoreAutoSplitterFeatureFlagEnabled) {
-    TestData.skipCheckOrphans = true;
-}
-//==========//
-
 function setupClusterAndDatabase(binVersion) {
-    // TODO SERVER-64400 remove params related with no-more-autosplitter once 6.0 branches out
-    const params = noMoreAutoSplitterFeatureFlagEnabled ? {disableResumableRangeDeleter: true} : {};
     const st = new ShardingTest({
         mongos: 1,
         config: 1,
@@ -42,11 +28,8 @@ function setupClusterAndDatabase(binVersion) {
             configOptions: {binVersion: binVersion},
             rsOptions: {
                 binVersion: binVersion,
-                setParameter: params,
             },
             rs: {nodes: 2},
-            // TODO SERVER-64171 evaluate whether the balancer needs to be enabled
-            enableBalancer: noMoreAutoSplitterFeatureFlagEnabled ? false : true
         }
     });
     st.configRS.awaitReplication();
@@ -54,31 +37,41 @@ function setupClusterAndDatabase(binVersion) {
     assert.commandWorked(
         st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
-    // TODO SERVER-57417 remove feature flag check once enabled
-    if (noMoreAutoSplitterFeatureFlagEnabled) {
-        // TODO SERVER-64400 remove this scope once 6.0 branches out
-        // - Shard collection (one big chunk on shard0)
-        // - Insert data in range [0, MaxKey)
-        // - Split chunk at 0
-        // - Move chunks [0, MaxKey] on shard1
-        assert.commandWorked(
-            st.s.adminCommand({shardCollection: testOrphansTrackingNS, key: {_id: 1}}));
-        var batch = st.s.getCollection(testOrphansTrackingNS).initializeOrderedBulkOp();
-        for (var i = 0; i < numOrphanedDocs; i++) {
-            batch.insert({_id: i});
-        }
-        assert.commandWorked(batch.execute());
-        assert.commandWorked(st.splitAt(testOrphansTrackingNS, {_id: 0}));
-        st.s.adminCommand(
-            {moveChunk: testOrphansTrackingNS, find: {_id: 0}, to: st.shard1.shardName});
-    }
-
     return st;
 }
 
 function getNodeName(node) {
     const info = node.adminCommand({hello: 1});
     return info.setName + '_' + (info.secondary ? 'secondary' : 'primary');
+}
+
+function checkConfigVersionDoc() {
+    // TODO: SERVER-68889 remove this function once 7.0 becomes last LTS
+    const versionDoc = st.s.getCollection('config.version').findOne();
+
+    if (FeatureFlagUtil.isPresentAndEnabled(st.s, "StopUsingConfigVersion")) {
+        // Check that the version doc doesn't contain any of the deprecatedFields
+        const deprecatedFields = [
+            "excluding",
+            "upgradeId",
+            "upgradeState",
+            "currentVersion",
+            "minCompatibleVersion",
+        ];
+
+        deprecatedFields.forEach(deprecatedField => {
+            assert(!versionDoc.hasOwnProperty(deprecatedField),
+                   `Found deprecated field '${deprecatedField}' in version document ${
+                       tojson(versionDoc)}`);
+        });
+    } else {
+        assert.eq(versionDoc.minCompatibleVersion,
+                  5,
+                  "Version doc does not contain expected value for minCompatibleVersion field");
+        assert.eq(versionDoc.currentVersion,
+                  6,
+                  "Version doc does not contain expected value for currentVersion field");
+    }
 }
 
 function checkConfigAndShardsFCV(expectedFCV) {
@@ -103,35 +96,25 @@ function checkConfigAndShardsFCV(expectedFCV) {
 
 function checkClusterBeforeUpgrade(fcv) {
     checkConfigAndShardsFCV(fcv);
+    checkConfigVersionDoc();
 }
 
 function checkClusterAfterBinaryUpgrade() {
-    // To implement in the future, if necessary.
+    checkConfigVersionDoc();
 }
 
 function checkClusterAfterFCVUpgrade(fcv) {
     checkConfigAndShardsFCV(fcv);
-    // TODO SERVER-57417 remove feature flag check once enabled
-    if (noMoreAutoSplitterFeatureFlagEnabled) {
-        // TODO SERVER-64400 remove this scope once 6.0 branches out
-        // Check that orphans counter has been populated
-        var doc = st.shard0.getCollection(kRangeDeletionNs).findOne({nss: testOrphansTrackingNS});
-        assert.eq(numOrphanedDocs, doc.numOrphanDocs);
-    }
+    checkConfigVersionDoc();
 }
 
 function checkClusterAfterFCVDowngrade() {
-    // TODO SERVER-57417 remove feature flag check once enabled
-    if (noMoreAutoSplitterFeatureFlagEnabled) {
-        // TODO SERVER-64400 remove this scope once 6.0 branches out
-        // Check that orphans counter has been unset
-        var doc = st.shard0.getCollection(kRangeDeletionNs).findOne({nss: testOrphansTrackingNS});
-        assert.eq(undefined, doc.numOrphanDocs);
-    }
+    checkConfigVersionDoc();
 }
 
 function checkClusterAfterBinaryDowngrade(fcv) {
     checkConfigAndShardsFCV(fcv);
+    checkConfigVersionDoc();
 }
 
 for (const oldVersion of [lastLTSFCV, lastContinuousFCV]) {
@@ -165,7 +148,7 @@ for (const oldVersion of [lastLTSFCV, lastContinuousFCV]) {
     checkClusterAfterFCVDowngrade();
 
     jsTest.log('Downgrading binaries to version ' + oldVersion);
-    st.upgradeCluster(oldVersion);
+    st.downgradeCluster(oldVersion);
 
     checkClusterAfterBinaryDowngrade(oldVersion);
 

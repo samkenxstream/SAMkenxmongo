@@ -80,7 +80,7 @@ public:
     /**
      * Serializes this stage to be sent to perform the merging on a different host.
      */
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         StageConstraints constraints(StreamType::kStreaming,
@@ -148,11 +148,15 @@ public:
         _ownCursors = false;
     }
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
 protected:
     GetNextResult doGetNext() final;
     void doDispose() final;
 
 private:
+    friend class DocumentSourceMergeCursorsMultiTenancyTest;
+
     DocumentSourceMergeCursors(const boost::intrusive_ptr<ExpressionContext>&,
                                AsyncResultsMergerParams,
                                boost::optional<BSONObj> ownedParamsSpec = boost::none);
@@ -167,6 +171,17 @@ private:
      * Adds the shard Ids of the given remote cursors into the _shardsWithCursors set.
      */
     void recordRemoteCursorShardIds(const std::vector<RemoteCursor>& remoteCursors);
+
+    /**
+     * Get the Async Results Merger Params or return boost:none if it is not set. This is used by
+     * DocumentSourceMergeCursorsMultiTenancyTest for unit test purpose.
+     */
+    boost::optional<NamespaceString> getAsyncResultMergerParamsNss_forTest() const {
+        if (_armParams) {
+            return _armParams->getNss();
+        }
+        return boost::none;
+    }
 
     // When we have parsed the params out of a BSONObj, the object needs to stay around while the
     // params are in use. We store them here.

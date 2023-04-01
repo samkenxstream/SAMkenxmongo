@@ -44,7 +44,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceQueue::createFromBson(
             arrayElem.type() == BSONType::Array);
     auto queue = DocumentSourceQueue::create(expCtx);
     // arrayElem is an Array and can be iterated through by using .Obj() method
-    for (auto elem : arrayElem.Obj()) {
+    for (const auto& elem : arrayElem.Obj()) {
         uassert(5858202,
                 "literal documents specification must be an array of objects",
                 elem.type() == BSONType::Object);
@@ -80,9 +80,13 @@ DocumentSource::GetNextResult DocumentSourceQueue::doGetNext() {
     return next;
 }
 
-Value DocumentSourceQueue::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceQueue::serialize(SerializationOptions opts) const {
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484319);
+    }
+
     ValueArrayStream vals;
-    for (auto elem : _queue) {
+    for (const auto& elem : _queue) {
         vals << elem.getDocument().getOwned();
     }
     return Value(DOC(kStageName << vals.done()));

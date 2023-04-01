@@ -27,12 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/mirror_maestro.h"
 
+#include "mongo/rpc/get_status_from_command_result.h"
 #include <cmath>
 #include <cstdlib>
 #include <utility>
@@ -58,6 +58,9 @@
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/synchronized_value.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
 namespace mongo {
 
 namespace {
@@ -70,8 +73,10 @@ constexpr auto kMirroredReadsParamName = "mirrorReads"_sd;
 
 constexpr auto kMirroredReadsSeenKey = "seen"_sd;
 constexpr auto kMirroredReadsSentKey = "sent"_sd;
+constexpr auto kMirroredReadsProcessedAsSecondaryKey = "processedAsSecondary"_sd;
 constexpr auto kMirroredReadsResolvedKey = "resolved"_sd;
 constexpr auto kMirroredReadsResolvedBreakdownKey = "resolvedBreakdown"_sd;
+constexpr auto kMirroredReadsSucceededKey = "succeeded"_sd;
 constexpr auto kMirroredReadsPendingKey = "pending"_sd;
 
 MONGO_FAIL_POINT_DEFINE(mirrorMaestroExpectsResponse);
@@ -80,17 +85,17 @@ MONGO_FAIL_POINT_DEFINE(mirrorMaestroTracksPending);
 class MirrorMaestroImpl {
 public:
     /**
-     * Make the TaskExecutor and initialize other components
+     * Make the TaskExecutor and initialize other components.
      */
     void init(ServiceContext* serviceContext) noexcept;
 
     /**
-     * Shutdown the TaskExecutor and cancel any outstanding work
+     * Shutdown the TaskExecutor and cancel any outstanding work.
      */
     void shutdown() noexcept;
 
     /**
-     * Mirror only if this maestro has been initialized
+     * Mirror only if this maestro has been initialized.
      */
     void tryMirror(std::shared_ptr<CommandInvocation> invocation) noexcept;
 
@@ -162,6 +167,7 @@ private:
     MirroringSampler _sampler;
     std::shared_ptr<executor::TaskExecutor> _executor;
     repl::TopologyVersionObserver _topologyVersionObserver;
+    PseudoRandom _random{SecureRandom{}.nextInt64()};
 };
 
 const auto getMirrorMaestroImpl = ServiceContext::declareDecoration<MirrorMaestroImpl>();
@@ -182,11 +188,13 @@ public:
         BSONObjBuilder section;
         section.append(kMirroredReadsSeenKey, seen.loadRelaxed());
         section.append(kMirroredReadsSentKey, sent.loadRelaxed());
+        section.append(kMirroredReadsProcessedAsSecondaryKey, processedAsSecondary.loadRelaxed());
 
         if (MONGO_unlikely(mirrorMaestroExpectsResponse.shouldFail())) {
             // We only can see if the command resolved if we got a response
             section.append(kMirroredReadsResolvedKey, resolved.loadRelaxed());
             section.append(kMirroredReadsResolvedBreakdownKey, resolvedBreakdown.toBSON());
+            section.append(kMirroredReadsSucceededKey, succeeded.loadRelaxed());
         }
         if (MONGO_unlikely(mirrorMaestroTracksPending.shouldFail())) {
             section.append(kMirroredReadsPendingKey, pending.loadRelaxed());
@@ -214,7 +222,7 @@ public:
         BSONObj toBSON() const noexcept {
             stdx::lock_guard<Mutex> lk(_mutex);
             BSONObjBuilder bob;
-            for (auto entry : _resolved) {
+            for (const auto& entry : _resolved) {
                 bob.append(entry.first, entry.second);
             }
             return bob.obj();
@@ -228,28 +236,41 @@ public:
 
     ResolvedBreakdownByHost resolvedBreakdown;
 
+    // Counts the number of operations (as primary) recognized as "to be mirrored".
     AtomicWord<CounterT> seen;
+    // Counts the number of remote requests (for mirroring as primary) sent over the network.
     AtomicWord<CounterT> sent;
+    // Counts the number of responses (as primary) from secondaries after mirrored operations.
     AtomicWord<CounterT> resolved;
-    // Counts the number of operations that are scheduled to be mirrored, but haven't yet been sent.
+    // Counts the number of responses (as primary) of successful mirrored operations. Disabled by
+    // default, hidden behind the mirrorMaestroExpectsResponse fail point.
+    AtomicWord<CounterT> succeeded;
+    // Counts the number of operations (as primary) that are scheduled to be mirrored, but
+    // haven't yet been sent. Disabled by default, hidden behind the mirrorMaestroTracksPending
+    // fail point.
     AtomicWord<CounterT> pending;
+    // Counts the number of mirrored operations processed successfully by this node as a
+    // secondary. Disabled by default, hidden behind the mirrorMaestroExpectsResponse fail point.
+    AtomicWord<CounterT> processedAsSecondary;
 } gMirroredReadsSection;
 
 auto parseMirroredReadsParameters(const BSONObj& obj) {
-    IDLParserErrorContext ctx("mirrorReads");
+    IDLParserContext ctx("mirrorReads");
     return MirroredReadsParameters::parse(ctx, obj);
 }
 
 }  // namespace
 
 void MirroredReadsServerParameter::append(OperationContext*,
-                                          BSONObjBuilder& bob,
-                                          const std::string& name) {
-    auto subBob = BSONObjBuilder(bob.subobjStart(name));
+                                          BSONObjBuilder* bob,
+                                          StringData name,
+                                          const boost::optional<TenantId>&) {
+    auto subBob = BSONObjBuilder(bob->subobjStart(name));
     _data->serialize(&subBob);
 }
 
-Status MirroredReadsServerParameter::set(const BSONElement& value) try {
+Status MirroredReadsServerParameter::set(const BSONElement& value,
+                                         const boost::optional<TenantId>&) try {
     auto obj = value.Obj();
 
     _data = parseMirroredReadsParameters(obj);
@@ -259,7 +280,8 @@ Status MirroredReadsServerParameter::set(const BSONElement& value) try {
     return e.toStatus();
 }
 
-Status MirroredReadsServerParameter::setFromString(const std::string& str) try {
+Status MirroredReadsServerParameter::setFromString(StringData str,
+                                                   const boost::optional<TenantId>&) try {
     auto obj = fromjson(str);
 
     _data = parseMirroredReadsParameters(obj);
@@ -292,6 +314,13 @@ void MirrorMaestro::tryMirrorRequest(OperationContext* opCtx) noexcept {
     auto invocation = CommandInvocation::get(opCtx);
 
     impl.tryMirror(std::move(invocation));
+}
+
+void MirrorMaestro::onReceiveMirroredRead(OperationContext* opCtx) noexcept {
+    const auto& invocation = CommandInvocation::get(opCtx);
+    if (MONGO_unlikely(invocation->isMirrored())) {
+        gMirroredReadsSection.processedAsSecondary.fetchAndAddRelaxed(1);
+    }
 }
 
 void MirrorMaestroImpl::tryMirror(std::shared_ptr<CommandInvocation> invocation) noexcept {
@@ -370,6 +399,9 @@ void MirrorMaestroImpl::_mirror(const std::vector<HostAndPort>& hosts,
         // Limit the maxTimeMS
         bob.append("maxTimeMS", params.getMaxTimeMS());
 
+        // Indicate that this is a mirrored read.
+        bob.append("mirrored", true);
+
         {
             // Set secondaryPreferred read preference
             BSONObjBuilder rpBob = bob.subobjStart("$readPreference");
@@ -385,7 +417,7 @@ void MirrorMaestroImpl::_mirror(const std::vector<HostAndPort>& hosts,
     }();
 
     // Mirror to a normalized subset of eligible hosts (i.e., secondaries).
-    const auto startIndex = rand() % hosts.size();
+    const auto startIndex = _random.nextInt64(hosts.size());
     const auto mirroringFactor = std::ceil(params.getSamplingRate() * hosts.size());
 
     for (auto i = 0; i < mirroringFactor; i++) {
@@ -399,6 +431,11 @@ void MirrorMaestroImpl::_mirror(const std::vector<HostAndPort>& hosts,
             // Count both failed and successful reads as resolved
             gMirroredReadsSection.resolved.fetchAndAdd(1);
             gMirroredReadsSection.resolvedBreakdown.onResponseReceived(host);
+
+            if (getStatusFromCommandResult(args.response.data).isOK()) {
+                gMirroredReadsSection.succeeded.fetchAndAdd(1);
+            }
+
             LOGV2_DEBUG(
                 31457, 4, "Response received", "host"_attr = host, "response"_attr = args.response);
 
@@ -416,10 +453,10 @@ void MirrorMaestroImpl::_mirror(const std::vector<HostAndPort>& hosts,
 
         auto newRequest = executor::RemoteCommandRequest(
             host, invocation->ns().db().toString(), payload, nullptr);
-        if (MONGO_likely(!mirrorMaestroExpectsResponse.shouldFail())) {
-            // If we're not expecting a response, set to fire and forget
-            newRequest.fireAndForgetMode = executor::RemoteCommandRequest::FireAndForgetMode::kOn;
-        }
+
+        newRequest.options.fireAndForget = true;
+        if (MONGO_unlikely(mirrorMaestroExpectsResponse.shouldFail()))
+            newRequest.options.fireAndForget = false;
 
         LOGV2_DEBUG(31455, 4, "About to mirror", "host"_attr = host, "request"_attr = newRequest);
 

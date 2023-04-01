@@ -67,6 +67,8 @@ class DependsReportTypes(Enum):
     GRAPH_PATHS = auto()
     CRITICAL_EDGES = auto()
     IN_DEGREE_ONE = auto()
+    SYMBOL_DEPENDS = auto()
+    EFFICIENCY = auto()
 
 
 class LinterTypes(Enum):
@@ -74,6 +76,7 @@ class LinterTypes(Enum):
 
     ALL = auto()
     PUBLIC_UNUSED = auto()
+    EFFICIENCY_LINT = auto()
 
 
 class EdgeProps(Enum):

@@ -27,11 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/query/expression_index.h"
 
 #include <iostream>
+#include <s2cellid.h>
+#include <s2region.h>
+#include <s2regioncoverer.h>
 #include <unordered_set>
 
 #include "mongo/db/geo/geoconstants.h"
@@ -40,9 +42,9 @@
 #include "mongo/db/index/expression_params.h"
 #include "mongo/db/query/expression_index_knobs_gen.h"
 #include "mongo/logv2/log.h"
-#include "third_party/s2/s2cellid.h"
-#include "third_party/s2/s2region.h"
-#include "third_party/s2/s2regioncoverer.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 

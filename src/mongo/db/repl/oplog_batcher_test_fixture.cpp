@@ -109,11 +109,17 @@ bool OplogBufferMock::tryPop(OperationContext* opCtx, Value* value) {
     return true;
 }
 
-bool OplogBufferMock::waitForData(Seconds waitDuration) {
+bool OplogBufferMock::waitForDataFor(Milliseconds waitDuration, Interruptible* interruptible) {
     stdx::unique_lock<Latch> lk(_mutex);
-    _notEmptyCv.wait_for(lk, waitDuration.toSystemDuration(), [&] {
-        return _hasShutDown || _curIndex < _data.size();
-    });
+    interruptible->waitForConditionOrInterruptFor(
+        _notEmptyCv, lk, waitDuration, [&] { return _hasShutDown || _curIndex < _data.size(); });
+    return _curIndex < _data.size();
+}
+
+bool OplogBufferMock::waitForDataUntil(Date_t deadline, Interruptible* interruptible) {
+    stdx::unique_lock<Latch> lk(_mutex);
+    interruptible->waitForConditionOrInterruptUntil(
+        _notEmptyCv, lk, deadline, [&] { return _hasShutDown || _curIndex < _data.size(); });
     return _curIndex < _data.size();
 }
 
@@ -173,9 +179,7 @@ Status OplogBufferMock::seekToTimestamp(OperationContext* opCtx,
 OplogEntry makeInsertOplogEntry(int t, const NamespaceString& nss, boost::optional<UUID> uuid) {
     BSONObj oField = BSON("_id" << t << "a" << t);
     return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
-                              boost::none,                 // hash
                               OpTypeEnum::kInsert,         // op type
-                              boost::none,                 // tenant id
                               nss,                         // namespace
                               uuid,                        // uuid
                               boost::none,                 // fromMigrate
@@ -206,9 +210,7 @@ OplogEntry makeUpdateOplogEntry(int t,
     BSONObj oField = BSON("_id" << t << "a" << t);
     BSONObj o2Field = BSON("_id" << t);
     return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
-                              boost::none,                 // hash
                               OpTypeEnum::kUpdate,         // op type
-                              boost::none,                 // tenant id
                               nss,                         // namespace
                               uuid,                        // uuid
                               boost::none,                 // fromMigrate
@@ -230,9 +232,7 @@ OplogEntry makeUpdateOplogEntry(int t,
 OplogEntry makeNoopOplogEntry(int t, const StringData& msg) {
     BSONObj oField = BSON("msg" << msg << "count" << t);
     return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
-                              boost::none,                 // hash
                               OpTypeEnum::kNoop,           // op type
-                              boost::none,                 // tenant id
                               NamespaceString(""),         // namespace
                               boost::none,                 // uuid
                               boost::none,                 // fromMigrate
@@ -255,7 +255,7 @@ OplogEntry makeNoopOplogEntry(int t, const StringData& msg) {
  * Generates an applyOps oplog entry with the given number used for the timestamp.
  */
 OplogEntry makeApplyOpsOplogEntry(int t, bool prepare, const std::vector<OplogEntry>& innerOps) {
-    auto nss = NamespaceString(NamespaceString::kAdminDb).getCommandNS();
+    auto nss = NamespaceString::createNamespaceString_forTest(DatabaseName::kAdmin).getCommandNS();
     BSONObjBuilder oField;
     BSONArrayBuilder applyOpsBuilder = oField.subarrayStart("applyOps");
     for (const auto& op : innerOps) {
@@ -266,9 +266,7 @@ OplogEntry makeApplyOpsOplogEntry(int t, bool prepare, const std::vector<OplogEn
         oField.append("prepare", true);
     }
     return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
-                              boost::none,                 // hash
                               OpTypeEnum::kCommand,        // op type
-                              boost::none,                 // tenant id
                               nss,                         // namespace
                               boost::none,                 // uuid
                               boost::none,                 // fromMigrate
@@ -292,19 +290,21 @@ OplogEntry makeApplyOpsOplogEntry(int t, bool prepare, const std::vector<OplogEn
  * transaction, with the given number used for the timestamp.
  */
 OplogEntry makeCommitTransactionOplogEntry(int t, StringData dbName, bool prepared, int count) {
-    auto nss = NamespaceString(dbName).getCommandNS();
+    auto nss = NamespaceString::createNamespaceString_forTest(dbName).getCommandNS();
     BSONObj oField;
+
     if (prepared) {
         CommitTransactionOplogObject cmdObj;
-        cmdObj.setCount(count);
         oField = cmdObj.toBSON();
     } else {
-        oField = BSON("applyOps" << BSONArray() << "count" << count);
+        BSONArrayBuilder applyOpsBuilder;
+        for (int i = 0; i < count; i++) {
+            applyOpsBuilder.append(BSONObj());
+        }
+        oField = BSON("applyOps" << applyOpsBuilder.done());
     }
     return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
-                              boost::none,                 // hash
                               OpTypeEnum::kCommand,        // op type
-                              boost::none,                 // tenant id
                               nss,                         // namespace
                               boost::none,                 // uuid
                               boost::none,                 // fromMigrate
@@ -340,13 +340,13 @@ OplogEntry makeLargeTransactionOplogEntries(int t,
                                             int curr,
                                             int count,
                                             const std::vector<OplogEntry> innerOps) {
-    auto nss = NamespaceString(NamespaceString::kAdminDb).getCommandNS();
+    // TODO SERVER-62491: Replace TenantId with kSystemTenantId.
+    auto nss = NamespaceString::createNamespaceString_forTest(DatabaseName::kAdmin).getCommandNS();
     OpTime prevWriteOpTime = isFirst ? OpTime() : OpTime(Timestamp(t - 1, 1), 1);
     BSONObj oField;
     if (isLast && prepared) {
         // Makes a commit command oplog entry if this is the last oplog entry we wish to create.
         CommitTransactionOplogObject cmdObj;
-        cmdObj.setCount(count);
         oField = cmdObj.toBSON();
         invariant(innerOps.empty());
     } else {
@@ -365,9 +365,7 @@ OplogEntry makeLargeTransactionOplogEntries(int t,
         oField = oFieldBuilder.obj();
     }
     return {DurableOplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
-                              boost::none,                 // hash
                               OpTypeEnum::kCommand,        // op type
-                              boost::none,                 // tenant id
                               nss,                         // namespace
                               boost::none,                 // uuid
                               boost::none,                 // fromMigrate

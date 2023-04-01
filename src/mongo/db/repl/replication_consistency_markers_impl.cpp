@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -36,13 +35,14 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/lock_state.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
@@ -89,7 +89,7 @@ boost::optional<MinValidDocument> ReplicationConsistencyMarkersImpl::_getMinVali
     }
 
     auto minValid =
-        MinValidDocument::parse(IDLParserErrorContext("MinValidDocument"), result.getValue());
+        MinValidDocument::parse(IDLParserContext("MinValidDocument"), result.getValue());
     return minValid;
 }
 
@@ -135,8 +135,8 @@ bool ReplicationConsistencyMarkersImpl::getInitialSyncFlag(OperationContext* opC
                 3,
                 "returning initial sync flag value of {flag}",
                 "Returning initial sync flag value",
-                "flag"_attr = flag.get());
-    return flag.get();
+                "flag"_attr = flag.value());
+    return flag.value();
 }
 
 void ReplicationConsistencyMarkersImpl::setInitialSyncFlag(OperationContext* opCtx) {
@@ -169,7 +169,7 @@ void ReplicationConsistencyMarkersImpl::clearInitialSyncFlag(OperationContext* o
               "Clearing the truncate point while primary is unsafe: it is asynchronously updated.");
     setOplogTruncateAfterPoint(opCtx, Timestamp());
 
-    if (getGlobalServiceContext()->getStorageEngine()->isDurable()) {
+    if (!getGlobalServiceContext()->getStorageEngine()->isEphemeral()) {
         JournalFlusher::get(opCtx)->waitForJournalFlush();
         replCoord->setMyLastDurableOpTimeAndWallTime(opTimeAndWallTime);
     }
@@ -192,8 +192,7 @@ OpTime ReplicationConsistencyMarkersImpl::getMinValid(OperationContext* opCtx) c
 }
 
 void ReplicationConsistencyMarkersImpl::setMinValid(OperationContext* opCtx,
-                                                    const OpTime& minValid,
-                                                    bool alwaysAllowUntimestampedWrite) {
+                                                    const OpTime& minValid) {
     LOGV2_DEBUG(21289,
                 3,
                 "setting minvalid to exactly: {minValidString}({minValidBSON})",
@@ -204,11 +203,6 @@ void ReplicationConsistencyMarkersImpl::setMinValid(OperationContext* opCtx,
         BSON("$set" << BSON(MinValidDocument::kMinValidTimestampFieldName
                             << minValid.getTimestamp() << MinValidDocument::kMinValidTermFieldName
                             << minValid.getTerm()));
-
-    // This method is only used with storage engines that do not support recover to stable
-    // timestamp. As a result, their timestamps do not matter.
-    invariant(alwaysAllowUntimestampedWrite ||
-              !opCtx->getServiceContext()->getStorageEngine()->supportsRecoverToStableTimestamp());
 
     _updateMinValidDocument(opCtx, update);
 }
@@ -253,7 +247,7 @@ OpTime ReplicationConsistencyMarkersImpl::getAppliedThrough(OperationContext* op
                 "appliedThroughString"_attr = appliedThrough->toString(),
                 "appliedThroughBSON"_attr = appliedThrough->toBSON());
 
-    return appliedThrough.get();
+    return appliedThrough.value();
 }
 
 void ReplicationConsistencyMarkersImpl::ensureFastCountOnOplogTruncateAfterPoint(
@@ -354,7 +348,7 @@ ReplicationConsistencyMarkersImpl::_getOplogTruncateAfterPointDocument(
     }
 
     auto oplogTruncateAfterPoint = OplogTruncateAfterPointDocument::parse(
-        IDLParserErrorContext("OplogTruncateAfterPointDocument"), doc.getValue());
+        IDLParserContext("OplogTruncateAfterPointDocument"), doc.getValue());
     return oplogTruncateAfterPoint;
 }
 
@@ -423,11 +417,12 @@ ReplicationConsistencyMarkersImpl::refreshOplogTruncateAfterPointIfPrimary(
     }
     ON_BLOCK_EXIT([&] { opCtx->recoveryUnit()->setPrepareConflictBehavior(originalBehavior); });
 
-    // Exempt storage ticket acquisition in order to avoid starving upstream requests waiting
-    // for durability. SERVER-60682 is an example with more pending prepared transactions than
-    // storage tickets; the transaction coordinator could not persist the decision and
-    // had to unnecessarily wait for prepared transactions to expire to make forward progress.
-    SkipTicketAcquisitionForLock skipTicketAcquisition(opCtx);
+    // Exempt waiting for storage ticket acquisition in order to avoid starving upstream requests
+    // waiting for durability. SERVER-60682 is an example with more pending prepared transactions
+    // than storage tickets; the transaction coordinator could not persist the decision and had to
+    // unnecessarily wait for prepared transactions to expire to make forward progress.
+    ScopedAdmissionPriorityForLock setTicketAquisition(opCtx->lockState(),
+                                                       AdmissionContext::Priority::kImmediate);
 
     // The locks necessary to write to the oplog truncate after point's collection and read from the
     // oplog collection must be taken up front so that the mutex can also be taken around both
@@ -480,23 +475,24 @@ ReplicationConsistencyMarkersImpl::refreshOplogTruncateAfterPointIfPrimary(
     // entry (it can be momentarily between oplog entry timestamps), _lastNoHolesOplogTimestamp
     // tracks the oplog entry so as to ensure we send out all updates before desisting until new
     // operations occur.
-    OpTime opTime = fassert(4455502, OpTime::parseFromOplogEntry(truncateOplogEntryBSON.get()));
+    OpTime opTime = fassert(4455502, OpTime::parseFromOplogEntry(truncateOplogEntryBSON.value()));
     _lastNoHolesOplogTimestamp = opTime.getTimestamp();
     _lastNoHolesOplogOpTimeAndWallTime = fassert(
         4455501,
-        OpTimeAndWallTime::parseOpTimeAndWallTimeFromOplogEntry(truncateOplogEntryBSON.get()));
+        OpTimeAndWallTime::parseOpTimeAndWallTimeFromOplogEntry(truncateOplogEntryBSON.value()));
 
     // Pass the _lastNoHolesOplogTimestamp timestamp down to the storage layer to prevent oplog
     // history lte to oplogTruncateAfterPoint from being entirely deleted. There should always be a
     // single oplog entry lte to the oplogTruncateAfterPoint. Otherwise there will not be a valid
     // oplog entry with which to update the caller.
-    _storageInterface->setPinnedOplogTimestamp(opCtx, _lastNoHolesOplogTimestamp.get());
+    _storageInterface->setPinnedOplogTimestamp(opCtx, _lastNoHolesOplogTimestamp.value());
 
     return _lastNoHolesOplogOpTimeAndWallTime;
 }
 
 Status ReplicationConsistencyMarkersImpl::createInternalCollections(OperationContext* opCtx) {
-    for (auto nss : std::vector<NamespaceString>({_oplogTruncateAfterPointNss, _minValidNss})) {
+    for (const auto& nss :
+         std::vector<NamespaceString>({_oplogTruncateAfterPointNss, _minValidNss})) {
         auto status = _storageInterface->createCollection(opCtx, nss, CollectionOptions());
         if (!status.isOK() && status.code() != ErrorCodes::NamespaceExists) {
             return {ErrorCodes::CannotCreateCollection,
@@ -511,8 +507,7 @@ void ReplicationConsistencyMarkersImpl::setInitialSyncIdIfNotSet(OperationContex
     auto status =
         _storageInterface->createCollection(opCtx, _initialSyncIdNss, CollectionOptions());
     if (!status.isOK() && status.code() != ErrorCodes::NamespaceExists) {
-        LOGV2_FATAL(
-            4608500, "Failed to create collection", "namespace"_attr = _initialSyncIdNss.ns());
+        LOGV2_FATAL(4608500, "Failed to create collection", logAttrs(_initialSyncIdNss));
         fassertFailedWithStatus(4608502, status);
     }
 

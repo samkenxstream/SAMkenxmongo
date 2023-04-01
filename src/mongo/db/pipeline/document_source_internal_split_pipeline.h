@@ -75,14 +75,15 @@ public:
                 UnionRequirement::kAllowed};
     }
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
 private:
     DocumentSourceInternalSplitPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                         HostTypeRequirement mergeType)
         : DocumentSource(kStageName, expCtx), _mergeType(mergeType) {}
 
     GetNextResult doGetNext() final;
-
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
     HostTypeRequirement _mergeType = HostTypeRequirement::kNone;
 };
 

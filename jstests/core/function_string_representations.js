@@ -1,6 +1,10 @@
+// The test runs commands that are not allowed with security token: mapReduce.
 // @tags: [
+//   not_allowed_with_security_token,
 //   does_not_support_stepdowns,
 //   uses_map_reduce_with_temp_collections,
+//   # Uses $where operator
+//   requires_scripting,
 // ]
 
 /**

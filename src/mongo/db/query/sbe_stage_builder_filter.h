@@ -38,55 +38,41 @@
 #include "mongo/db/query/sbe_stage_builder_helpers.h"
 
 namespace mongo::stage_builder {
-/**
- * This function generates an SBE plan stage tree implementing a filter expression represented by
- * 'root'. The 'stage' parameter provides the input subtree to build on top of. The 'inputSlot'
- * parameter specifies the input slot the filter should use.
- *
- * Optional slot returned by this function stores index of array element that matches the 'root'
- * match expression. The role of this slot is to be a replacement of 'MatchDetails::elemMatchKey()'.
- * If 'trackIndex' is true and 'root' contains match expression with array semantics (there are
- * certain predicates that do not, such as '{}'), valid slot id is returned. This slot is pointing
- * to an optional value of type int32. Otherwise, 'boost::none' is returned.
- *
- * If match expression found matching array element, value behind slot id is an int32 array index.
- * Otherwise, it is Nothing.
- */
-std::pair<boost::optional<sbe::value::SlotId>, EvalStage> generateFilter(
-    StageBuilderState& state,
-    const MatchExpression* root,
-    EvalStage stage,
-    sbe::value::SlotId inputSlot,
-    PlanNodeId planNodeId,
-    bool trackIndex = false);
+class PlanStageSlots;
 
 /**
- * Similar to 'generateFilter' but used to generate a PlanStage sub-tree implementing a filter
- * attached to an 'IndexScan' QSN. It differs from 'generateFilter' in the following way:
- *  - Instead of a single input slot it takes 'keyFields' and 'keySlots' vectors representing a
- *    subset of the fields of the index key pattern that are depended on to evaluate the predicate,
- *    and corresponding slots for each of the fields.
- *  - It cannot track and returned an index of a matching element within an array, because index
- *    keys cannot contain an array. As such, this function doesn't take a 'trackIndex' parameter
- *    and doesn't return an optional SLotId holding the index of a matching array element.
+ * This function generates an EvalExpr that implements the filter expression represented by 'root'.
+ * The 'inputSlot' and 'slots' parameters specify the input(s) that the filter should use.
+ *
+ * The 'isFilterOverIxscan' parameter controls if we should search for kField slots in 'slots' that
+ * correspond to the full paths needed by the filter. Typically 'isFilterOverIxscan' is false unless
+ * we are generating a filter over an index scan.
+ *
+ * If the caller sets 'isFilterOverIxscan' to true, then the caller must also provide a vector of
+ * key field names ('keyFields') that lists the names of all the kField slots that are needed by
+ * 'root'.
+ *
+ * This function returns an EvalExpr. If 'root' is an AND with no children, this function will
+ * return a null EvalExpr to indicate that there is no filter condition.
  */
-EvalStage generateIndexFilter(StageBuilderState& state,
-                              const MatchExpression* root,
-                              EvalStage stage,
-                              sbe::value::SlotVector keySlots,
-                              std::vector<std::string> keyFields,
-                              PlanNodeId planNodeId);
+EvalExpr generateFilter(StageBuilderState& state,
+                        const MatchExpression* root,
+                        boost::optional<sbe::value::SlotId> inputSlot,
+                        const PlanStageSlots* slots,
+                        const std::vector<std::string>& keyFields = {},
+                        bool isFilterOverIxscan = false);
 
 /**
  * Converts the list of equalities inside the given $in expression ('expr') into an SBE array, which
  * is returned as a (typeTag, value) pair. The caller owns the resulting value.
  *
- * The returned tuple also includes two booleans, in this order:
+ * The returned tuple also includes three booleans, in this order:
  *  - 'hasArray': True if at least one of the values inside the $in equality list is an array.
+ *  - 'hasObject': True if at least one of the values inside the $in equality list is an object.
  *  - 'hasNull': True if at least one of the values inside the $in equality list is a literal null
  * value.
  */
-std::tuple<sbe::value::TypeTags, sbe::value::Value, bool, bool> convertInExpressionEqualities(
+std::tuple<sbe::value::TypeTags, sbe::value::Value, bool, bool, bool> convertInExpressionEqualities(
     const InMatchExpression* expr);
 
 /**
@@ -96,4 +82,29 @@ std::tuple<sbe::value::TypeTags, sbe::value::Value, bool, bool> convertInExpress
  */
 std::pair<sbe::value::TypeTags, sbe::value::Value> convertBitTestBitPositions(
     const BitTestMatchExpression* expr);
+
+/**
+ * The following family of functions convert the given MatchExpression that consumes a single input
+ * into an EExpression that consumes the input from the provided slot.
+ */
+EvalExpr generateComparisonExpr(StageBuilderState& state,
+                                const ComparisonMatchExpression* expr,
+                                sbe::EPrimBinary::Op binaryOp,
+                                EvalExpr inputExpr);
+EvalExpr generateInExpr(StageBuilderState& state,
+                        const InMatchExpression* expr,
+                        EvalExpr inputExpr);
+EvalExpr generateBitTestExpr(StageBuilderState& state,
+                             const BitTestMatchExpression* expr,
+                             const sbe::BitTestBehavior& bitOp,
+                             EvalExpr inputExpr);
+EvalExpr generateModExpr(StageBuilderState& state,
+                         const ModMatchExpression* expr,
+                         EvalExpr inputExpr);
+EvalExpr generateRegexExpr(StageBuilderState& state,
+                           const RegexMatchExpression* expr,
+                           EvalExpr inputExpr);
+EvalExpr generateWhereExpr(StageBuilderState& state,
+                           const WhereMatchExpression* expr,
+                           EvalExpr inputExpr);
 }  // namespace mongo::stage_builder

@@ -27,14 +27,17 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/db/s/set_allow_migrations_coordinator.h"
 
 #include "mongo/db/commands.h"
+#include "mongo/db/s/sharding_logging.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/grid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 
@@ -48,19 +51,11 @@ bool isCollectionSharded(OperationContext* opCtx, const NamespaceString& nss) {
     }
 }
 
-SetAllowMigrationsCoordinator::SetAllowMigrationsCoordinator(ShardingDDLCoordinatorService* service,
-                                                             const BSONObj& initialState)
-    : ShardingDDLCoordinator(service, initialState),
-      _doc(SetAllowMigrationsCoordinatorDocument::parse(
-          IDLParserErrorContext("SetAllowMigrationsCoordinatorDocument"), initialState)),
-      _allowMigrations(_doc.getAllowMigrations()) {}
-
-
 void SetAllowMigrationsCoordinator::checkIfOptionsConflict(const BSONObj& doc) const {
     // If we have two set allow migrations on the same namespace, then the arguments must be the
     // same.
     const auto otherDoc = SetAllowMigrationsCoordinatorDocument::parse(
-        IDLParserErrorContext("SetAllowMigrationsCoordinatorDocument"), doc);
+        IDLParserContext("SetAllowMigrationsCoordinatorDocument"), doc);
 
     uassert(ErrorCodes::ConflictingOperationInProgress,
             "Another set allow migrations with different arguments is already running for the same "
@@ -70,23 +65,9 @@ void SetAllowMigrationsCoordinator::checkIfOptionsConflict(const BSONObj& doc) c
                 otherDoc.getSetAllowMigrationsRequest().toBSON()));
 }
 
-boost::optional<BSONObj> SetAllowMigrationsCoordinator::reportForCurrentOp(
-    MongoProcessInterface::CurrentOpConnectionsMode connMode,
-    MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept {
-    BSONObjBuilder cmdBob;
-    if (const auto& optComment = getForwardableOpMetadata().getComment()) {
-        cmdBob.append(optComment.get().firstElement());
-    }
-    cmdBob.appendElements(_doc.getSetAllowMigrationsRequest().toBSON());
-
-    BSONObjBuilder bob;
-    bob.append("type", "op");
-    bob.append("desc", "SetAllowMigrationsCoordinator");
-    bob.append("op", "command");
-    bob.append("ns", nss().toString());
-    bob.append("command", cmdBob.obj());
-    bob.append("active", true);
-    return bob.obj();
+void SetAllowMigrationsCoordinator::appendCommandInfo(BSONObjBuilder* cmdInfoBuilder) const {
+    stdx::lock_guard lk{_docMutex};
+    cmdInfoBuilder->appendElements(_doc.getSetAllowMigrationsRequest().toBSON());
 }
 
 ExecutorFuture<void> SetAllowMigrationsCoordinator::_runImpl(
@@ -130,11 +111,16 @@ ExecutorFuture<void> SetAllowMigrationsCoordinator::_runImpl(
                                                               Shard::RetryPolicy::kIdempotent);
 
             uassertStatusOK(response.toStatus());
+
+            ShardingLogging::get(opCtx)->logChange(opCtx,
+                                                   "setPermitMigrations",
+                                                   nss().ns(),
+                                                   BSON("permitMigrations" << _allowMigrations));
         })
         .onError([this, anchor = shared_from_this()](const Status& status) {
             LOGV2_ERROR(5622700,
                         "Error running set allow migrations",
-                        "namespace"_attr = nss(),
+                        logAttrs(nss()),
                         "error"_attr = redact(status));
             return status;
         });

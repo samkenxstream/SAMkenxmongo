@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -37,6 +36,9 @@
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_tree.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -185,28 +187,28 @@ std::unique_ptr<MatchExpression> RewriteExpr::_buildComparisonMatchExpression(
 
     switch (comparisonOp) {
         case ExpressionCompare::EQ: {
-            matchExpr = std::make_unique<InternalExprEqMatchExpression>(fieldAndValue.fieldName(),
-                                                                        fieldAndValue);
+            matchExpr = std::make_unique<InternalExprEqMatchExpression>(
+                fieldAndValue.fieldNameStringData(), fieldAndValue);
             break;
         }
         case ExpressionCompare::GT: {
-            matchExpr = std::make_unique<InternalExprGTMatchExpression>(fieldAndValue.fieldName(),
-                                                                        fieldAndValue);
+            matchExpr = std::make_unique<InternalExprGTMatchExpression>(
+                fieldAndValue.fieldNameStringData(), fieldAndValue);
             break;
         }
         case ExpressionCompare::GTE: {
-            matchExpr = std::make_unique<InternalExprGTEMatchExpression>(fieldAndValue.fieldName(),
-                                                                         fieldAndValue);
+            matchExpr = std::make_unique<InternalExprGTEMatchExpression>(
+                fieldAndValue.fieldNameStringData(), fieldAndValue);
             break;
         }
         case ExpressionCompare::LT: {
-            matchExpr = std::make_unique<InternalExprLTMatchExpression>(fieldAndValue.fieldName(),
-                                                                        fieldAndValue);
+            matchExpr = std::make_unique<InternalExprLTMatchExpression>(
+                fieldAndValue.fieldNameStringData(), fieldAndValue);
             break;
         }
         case ExpressionCompare::LTE: {
-            matchExpr = std::make_unique<InternalExprLTEMatchExpression>(fieldAndValue.fieldName(),
-                                                                         fieldAndValue);
+            matchExpr = std::make_unique<InternalExprLTEMatchExpression>(
+                fieldAndValue.fieldNameStringData(), fieldAndValue);
             break;
         }
         default:
@@ -231,7 +233,7 @@ bool RewriteExpr::_canRewriteComparison(
     const auto& operandList = expression->getOperandList();
     bool hasFieldPath = false;
 
-    for (auto operand : operandList) {
+    for (const auto& operand : operandList) {
         if (auto exprFieldPath = dynamic_cast<ExpressionFieldPath*>(operand.get())) {
             if (exprFieldPath->isVariableReference() || exprFieldPath->isROOT()) {
                 // Rather than a local document field path, this field path refers to either a

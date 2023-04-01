@@ -27,12 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+#include "mongo/bson/bsonelement.h"
 
 #include "mongo/db/jsobj.h"
 
 #include "mongo/base/data_range.h"
-#include "mongo/bson/bson_validate.h"
 #include "mongo/bson/bsonelement_comparator_interface.h"
 #include "mongo/bson/generator_extended_canonical_2_0_0.h"
 #include "mongo/bson/generator_extended_relaxed_2_0_0.h"
@@ -42,6 +41,9 @@
 #include "mongo/util/allocator.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
@@ -87,6 +89,8 @@ int compareObjects(const BSONObj& firstObj,
 
 /* BSONObj ------------------------------------------------------------*/
 
+const BSONObj BSONObj::kEmptyObject;
+
 void BSONObj::_assertInvalid(int maxSize) const {
     StringBuilder ss;
     int os = objsize();
@@ -127,6 +131,12 @@ BSONObj BSONObj::copy() const {
     return BSONObj(std::move(storage));
 }
 
+void BSONObj::makeOwned() {
+    if (!isOwned()) {
+        *this = copy();
+    }
+}
+
 BSONObj BSONObj::getOwned() const {
     if (isOwned())
         return *this;
@@ -137,25 +147,57 @@ BSONObj BSONObj::getOwned(const BSONObj& obj) {
     return obj.getOwned();
 }
 
-BSONObj BSONObj::redact() const {
+BSONObj BSONObj::redact(bool onlyEncryptedFields,
+                        std::function<std::string(const BSONElement&)> fieldNameRedactor) const {
     _validateUnownedSize(objsize());
 
     // Helper to get an "internal function" to be able to do recursion
     struct redactor {
-        void operator()(BSONObjBuilder& builder, const BSONObj& obj, bool appendMask) {
+        void appendRedactedElem(BSONObjBuilder& builder,
+                                const StringData& fieldNameString,
+                                bool appendMask) {
+            if (appendMask) {
+                builder.append(fieldNameString, "###"_sd);
+            } else {
+                builder.appendNull(fieldNameString);
+            }
+        }
+
+        void operator()(BSONObjBuilder& builder,
+                        const BSONObj& obj,
+                        bool appendMask,
+                        bool onlyEncryptedFields,
+                        std::function<std::string(const BSONElement&)> fieldNameRedactor) {
             for (BSONElement e : obj) {
+                StringData fieldNameString;
+                // Temporarily allocated string that must live long enough to be copied by builder.
+                std::string tempString;
+                if (!fieldNameRedactor) {
+                    fieldNameString = e.fieldNameStringData();
+                } else {
+                    tempString = fieldNameRedactor(e);
+                    fieldNameString = {tempString};
+                }
                 if (e.type() == Object) {
-                    BSONObjBuilder subBuilder = builder.subobjStart(e.fieldNameStringData());
-                    operator()(subBuilder, e.Obj(), appendMask);
+                    BSONObjBuilder subBuilder = builder.subobjStart(fieldNameString);
+                    operator()(
+                        subBuilder, e.Obj(), appendMask, onlyEncryptedFields, fieldNameRedactor);
                     subBuilder.done();
                 } else if (e.type() == Array) {
-                    BSONObjBuilder subBuilder = builder.subarrayStart(e.fieldNameStringData());
-                    operator()(subBuilder, e.Obj(), appendMask);
+                    BSONObjBuilder subBuilder = builder.subarrayStart(fieldNameString);
+                    operator()(
+                        subBuilder, e.Obj(), appendMask, onlyEncryptedFields, fieldNameRedactor);
                     subBuilder.done();
-                } else if (appendMask) {
-                    builder.append(e.fieldNameStringData(), "###"_sd);
                 } else {
-                    builder.appendNull(e.fieldNameStringData());
+                    if (onlyEncryptedFields) {
+                        if (e.type() == BinData && e.binDataType() == BinDataType::Encrypt) {
+                            appendRedactedElem(builder, fieldNameString, appendMask);
+                        } else {
+                            builder.append(e);
+                        }
+                    } else {
+                        appendRedactedElem(builder, fieldNameString, appendMask);
+                    }
                 }
             }
         }
@@ -163,7 +205,7 @@ BSONObj BSONObj::redact() const {
 
     try {
         BSONObjBuilder builder;
-        redactor()(builder, *this, /*appendMask=*/true);
+        redactor()(builder, *this, /*appendMask=*/true, onlyEncryptedFields, fieldNameRedactor);
         return builder.obj();
     } catch (const ExceptionFor<ErrorCodes::BSONObjectTooLarge>&) {
     }
@@ -173,7 +215,7 @@ BSONObj BSONObj::redact() const {
     // we use BSONType::jstNull, which ensures the redacted object will not be larger than the
     // original.
     BSONObjBuilder builder;
-    redactor()(builder, *this, /*appendMask=*/false);
+    redactor()(builder, *this, /*appendMask=*/false, onlyEncryptedFields, fieldNameRedactor);
     return builder.obj();
 }
 
@@ -280,9 +322,6 @@ BSONObj BSONObj::jsonStringBuffer(JsonStringFormat format,
     }
 }
 
-bool BSONObj::valid() const {
-    return validateBSON(objdata(), objsize()).isOK();
-}
 
 int BSONObj::woCompare(const BSONObj& r,
                        const Ordering& o,

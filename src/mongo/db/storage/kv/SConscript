@@ -9,9 +9,9 @@ env.Library(
     target='kv_drop_pending_ident_reaper',
     source=['kv_drop_pending_ident_reaper.cpp'],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/concurrency/exception_util',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
-        '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
-        '$BUILD_DIR/mongo/db/curop',
+        '$BUILD_DIR/mongo/db/query/op_metrics',
         '$BUILD_DIR/mongo/db/storage/write_unit_of_work',
     ],
 )
@@ -29,9 +29,9 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
         '$BUILD_DIR/mongo/db/storage/durable_catalog_impl',
         '$BUILD_DIR/mongo/db/storage/key_string',
+        '$BUILD_DIR/mongo/db/storage/record_store_base',
         '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/unittest/unittest',
         '$BUILD_DIR/mongo/util/clock_source_mock',
     ],
 )
-

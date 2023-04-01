@@ -55,7 +55,7 @@ public:
 
     Value evaluate(const Document& root, Variables* variables) const final;
 
-    Value serialize(bool explain) const final;
+    Value serialize(SerializationOptions options) const final;
 
     void acceptVisitor(ExpressionMutableVisitor* visitor) final {
         return visitor->visit(this);
@@ -91,8 +91,6 @@ private:
     ExpressionInternalJsEmit(ExpressionContext* expCtx,
                              boost::intrusive_ptr<Expression> thisRef,
                              std::string funcSourceString);
-
-    void _doAddDependencies(DepsTracker* deps) const final override;
 
     const boost::intrusive_ptr<Expression>& _thisRef;
     std::string _funcSource;

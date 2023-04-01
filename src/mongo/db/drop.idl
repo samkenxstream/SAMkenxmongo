@@ -33,29 +33,30 @@ global:
 
 imports:
     - "mongo/db/auth/action_type.idl"
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 structs:
     DropReply:
         description: "The drop command's reply."
+        is_command_reply: true
         fields:
             nIndexesWas:
                 type: int
                 optional: true
-                unstable: false
+                stability: stable
             ns:
                 type: namespacestring
                 optional: true
-                unstable: false
+                stability: stable
             info:
                 type: string
                 optional: true
-                unstable: false
+                stability: stable
             # Include "ok" so mongos can use this struct to parse shard replies.
             ok:
                 type: safeDouble
                 optional: true
-                unstable: false
+                stability: stable
 
 commands:
     drop:
@@ -76,4 +77,4 @@ commands:
                 description: "The expected UUID of the collection."
                 type: uuid
                 optional: true
-                unstable: true
+                stability: unstable

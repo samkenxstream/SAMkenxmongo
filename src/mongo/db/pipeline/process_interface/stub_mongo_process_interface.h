@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/util/assert_util.h"
@@ -50,6 +51,22 @@ public:
     std::unique_ptr<TransactionHistoryIteratorBase> createTransactionHistoryIterator(
         repl::OpTime time) const override {
         MONGO_UNREACHABLE;
+    }
+
+    class StubWriteSizeEstimator final : public WriteSizeEstimator {
+    public:
+        int estimateInsertSizeBytes(const BSONObj& insert) const override {
+            MONGO_UNREACHABLE;
+        }
+
+        int estimateUpdateSizeBytes(const BatchObject& batchObject,
+                                    UpsertType type) const override {
+            MONGO_UNREACHABLE;
+        }
+    };
+    std::unique_ptr<WriteSizeEstimator> getWriteSizeEstimator(
+        OperationContext* opCtx, const NamespaceString& ns) const override {
+        return std::make_unique<StubWriteSizeEstimator>();
     }
 
     bool isSharded(OperationContext* opCtx, const NamespaceString& ns) override {
@@ -93,6 +110,11 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    boost::optional<BSONObj> getCatalogEntry(OperationContext* opCtx,
+                                             const NamespaceString& ns) const override {
+        MONGO_UNREACHABLE;
+    }
+
     void appendLatencyStats(OperationContext* opCtx,
                             const NamespaceString& nss,
                             bool includeHistograms,
@@ -103,7 +125,8 @@ public:
     Status appendStorageStats(OperationContext* opCtx,
                               const NamespaceString& nss,
                               const StorageStatsSpec& spec,
-                              BSONObjBuilder* builder) const override {
+                              BSONObjBuilder* builder,
+                              const boost::optional<BSONObj>& filterObj) const override {
         MONGO_UNREACHABLE;
     }
 
@@ -125,15 +148,17 @@ public:
 
     void renameIfOptionsAndIndexesHaveNotChanged(
         OperationContext* opCtx,
-        const BSONObj& renameCommandObj,
+        const NamespaceString& sourceNs,
         const NamespaceString& targetNs,
+        bool dropTarget,
+        bool stayTemp,
         const BSONObj& originalCollectionOptions,
         const std::list<BSONObj>& originalIndexes) override {
         MONGO_UNREACHABLE;
     }
 
     void createCollection(OperationContext* opCtx,
-                          const std::string& dbName,
+                          const DatabaseName& dbName,
                           const BSONObj& cmdObj) override {
         MONGO_UNREACHABLE;
     }
@@ -154,18 +179,24 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+        const AggregateCommandRequest& aggRequest,
+        Pipeline* pipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        boost::optional<BSONObj> shardCursorsSortSpec = boost::none,
+        ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
+        boost::optional<BSONObj> readConcern = boost::none) override {
+        MONGO_UNREACHABLE;
+    }
+
     BSONObj preparePipelineAndExplain(Pipeline* ownedPipeline,
                                       ExplainOptions::Verbosity verbosity) override {
         MONGO_UNREACHABLE;
     }
 
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipelineForLocalRead(
-        Pipeline* pipeline) override {
-        MONGO_UNREACHABLE;
-    }
-
-    std::unique_ptr<ShardFilterer> getShardFilterer(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx) const override {
+        Pipeline* pipeline,
+        boost::optional<const AggregateCommandRequest&> aggRequest = boost::none) override {
         MONGO_UNREACHABLE;
     }
 
@@ -180,6 +211,10 @@ public:
     }
 
     std::string getShardName(OperationContext* opCtx) const override {
+        MONGO_UNREACHABLE;
+    }
+
+    bool inShardedEnvironment(OperationContext* opCtx) const override {
         MONGO_UNREACHABLE;
     }
 
@@ -218,11 +253,11 @@ public:
         return BackupCursorState{UUID::gen(), boost::none, nullptr, {}};
     }
 
-    void closeBackupCursor(OperationContext* opCtx, const UUID& backupId) final {}
+    void closeBackupCursor(OperationContext* opCtx, const UUID& backupId) override {}
 
     BackupCursorExtendState extendBackupCursor(OperationContext* opCtx,
                                                const UUID& backupId,
-                                               const Timestamp& extendTo) final {
+                                               const Timestamp& extendTo) override {
         return {{}};
     }
 
@@ -238,7 +273,7 @@ public:
         return true;
     }
 
-    boost::optional<ChunkVersion> refreshAndGetCollectionVersion(
+    boost::optional<ShardVersion> refreshAndGetCollectionVersion(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const NamespaceString& nss) const override {
         return boost::none;
@@ -255,15 +290,16 @@ public:
     }
 
     std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
-    ensureFieldsUniqueOrResolveDocumentKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                           boost::optional<std::set<FieldPath>> fieldPaths,
-                                           boost::optional<ChunkVersion> targetCollectionVersion,
-                                           const NamespaceString& outputNs) const override {
+    ensureFieldsUniqueOrResolveDocumentKey(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        boost::optional<std::set<FieldPath>> fieldPaths,
+        boost::optional<ChunkVersion> targetCollectionPlacementVersion,
+        const NamespaceString& outputNs) const override {
         if (!fieldPaths) {
-            return {std::set<FieldPath>{"_id"}, targetCollectionVersion};
+            return {std::set<FieldPath>{"_id"}, targetCollectionPlacementVersion};
         }
 
-        return {*fieldPaths, targetCollectionVersion};
+        return {*fieldPaths, targetCollectionPlacementVersion};
     }
 
     std::unique_ptr<ScopedExpectUnshardedCollection> expectUnshardedCollectionInScope(

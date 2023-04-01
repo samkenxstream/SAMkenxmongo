@@ -96,7 +96,7 @@ Pipeline::SourceContainer::iterator DocumentSourceSequentialDocumentCache::doOpt
     _hasOptimizedPos = true;
 
     // If the cache is the only stage in the pipeline, return immediately.
-    if (itr == container->begin()) {
+    if (itr == container->begin() && std::next(itr) == container->end()) {
         return container->end();
     }
 
@@ -123,9 +123,11 @@ Pipeline::SourceContainer::iterator DocumentSourceSequentialDocumentCache::doOpt
     //  2. depends on a variable defined in this scope, or
     //  3. generates random numbers.
     DocumentSource* lastPtr = nullptr;
+    std::set<Variables::Id> prefixVarRefs;
     for (; prefixSplit != container->end(); ++prefixSplit) {
+        (*prefixSplit)->addVariableRefs(&prefixVarRefs);
         if (((*prefixSplit)->getDependencies(&deps) == DepsTracker::State::NOT_SUPPORTED) ||
-            deps.hasVariableReferenceTo(varIDs) || deps.needRandomGenerator) {
+            Variables::hasVariableReferenceTo(prefixVarRefs, varIDs) || deps.needRandomGenerator) {
             break;
         }
 
@@ -153,16 +155,18 @@ Pipeline::SourceContainer::iterator DocumentSourceSequentialDocumentCache::doOpt
     return container->end();
 }
 
-Value DocumentSourceSequentialDocumentCache::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    if (explain) {
+Value DocumentSourceSequentialDocumentCache::serialize(SerializationOptions opts) const {
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484315);
+    }
+    if (opts.verbosity) {
         return Value(Document{
             {kStageName,
              Document{{"maxSizeBytes"_sd, Value(static_cast<long long>(_cache->maxSizeBytes()))},
                       {"status"_sd,
-                       _cache->isBuilding()
-                           ? "kBuilding"_sd
-                           : _cache->isServing() ? "kServing"_sd : "kAbandoned"_sd}}}});
+                       _cache->isBuilding()      ? "kBuilding"_sd
+                           : _cache->isServing() ? "kServing"_sd
+                                                 : "kAbandoned"_sd}}}});
     }
 
     return Value();

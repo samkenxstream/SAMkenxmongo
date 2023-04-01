@@ -27,6 +27,7 @@
  *    it in the license file.
  */
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/unittest/unittest.h"
 
 #include "mongo/db/matcher/expression_parser.h"
@@ -41,6 +42,7 @@
 #include "mongo/db/pipeline/expression_context_for_test.h"
 
 namespace mongo {
+
 
 TEST(MatchExpressionParserTest, SimpleEQ1) {
     BSONObj query = BSON("x" << 2);

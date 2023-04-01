@@ -2,7 +2,6 @@
  * Tests that the donor will retry its steps if its OperationContext is interrupted by a killOp.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
@@ -12,21 +11,23 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    createTenantMigrationDonorRoleIfNotExist,
+    createTenantMigrationRecipientRoleIfNotExist,
+    forgetMigrationAsync,
+    makeX509OptionsForTest,
+    runMigrationAsync
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+load("jstests/replsets/rslib.js");  // 'createRstArgs'
 
 const kGarbageCollectionDelayMS = 5 * 1000;
-const kDelayMS = 100000;  // Set some arbitrarily large blockTimeMS to let recipientSyncData command
-                          // hang until we use kill op to kill it.
-const kTenantIdPrefix = "testTenantId";
-let testNum = 0;
-const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
+
+const migrationX509Options = makeX509OptionsForTest();
 const garbageCollectionOpts = {
     // Set the delay before a donor state doc is garbage collected to be short to speed
     // up the test.
@@ -35,7 +36,7 @@ const garbageCollectionOpts = {
 };
 
 function makeTenantId() {
-    return kTenantIdPrefix + testNum++;
+    return ObjectId().str;
 }
 
 {
@@ -61,10 +62,9 @@ function makeTenantId() {
         const donorPrimary = tenantMigrationTest.getDonorPrimary();
         let fp = configureFailPoint(donorPrimary, fpName);
 
-        const donorRstArgs = TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst());
+        const donorRstArgs = createRstArgs(tenantMigrationTest.getDonorRst());
 
-        const runMigrationThread =
-            new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
+        const runMigrationThread = new Thread(runMigrationAsync, migrationOpts, donorRstArgs);
         runMigrationThread.start();
         fp.wait();
 
@@ -105,8 +105,7 @@ function makeTenantId() {
         // waits for a rebuild, which is why this test is tagged as 'multiversion_incompatible'.
         tenantMigrationTest.getDonorRst().initiate(
             null, null, {doNotWaitForPrimaryOnlyServices: true});
-        TenantMigrationUtil.createTenantMigrationRecipientRoleIfNotExist(
-            tenantMigrationTest.getDonorRst());
+        createTenantMigrationRecipientRoleIfNotExist(tenantMigrationTest.getDonorRst());
 
         jsTestLog(
             "Setting failpoint \"" + fpName +
@@ -120,9 +119,8 @@ function makeTenantId() {
 
         };
         const donorPrimary = tenantMigrationTest.getDonorPrimary();
-        const donorRstArgs = TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst());
-        const runMigrationThread =
-            new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
+        const donorRstArgs = createRstArgs(tenantMigrationTest.getDonorRst());
+        const runMigrationThread = new Thread(runMigrationAsync, migrationOpts, donorRstArgs);
         runMigrationThread.start();
 
         const res = assert.commandWorked(donorPrimary.adminCommand({
@@ -156,15 +154,13 @@ function makeTenantId() {
         tenantMigrationTest.getDonorRst().startSet(
             Object.assign({}, migrationX509Options.donor, {setParameter: garbageCollectionOpts}));
         tenantMigrationTest.getDonorRst().initiate();
-        TenantMigrationUtil.createTenantMigrationRecipientRoleIfNotExist(
-            tenantMigrationTest.getDonorRst());
+        createTenantMigrationRecipientRoleIfNotExist(tenantMigrationTest.getDonorRst());
 
         tenantMigrationTest.getRecipientRst().stopSet();
         tenantMigrationTest.getRecipientRst().startSet(Object.assign(
             {}, migrationX509Options.recipient, {setParameter: garbageCollectionOpts}));
         tenantMigrationTest.getRecipientRst().initiate();
-        TenantMigrationUtil.createTenantMigrationDonorRoleIfNotExist(
-            tenantMigrationTest.getRecipientRst());
+        createTenantMigrationDonorRoleIfNotExist(tenantMigrationTest.getRecipientRst());
 
         jsTestLog(
             "Setting failpoint \"" + fpName +
@@ -184,10 +180,9 @@ function makeTenantId() {
             tenantMigrationTest.runMigration(migrationOpts, {automaticForgetMigration: false}));
 
         const donorPrimary = tenantMigrationTest.getDonorPrimary();
-        const donorRstArgs = TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst());
-        const forgetMigrationThread = new Thread(TenantMigrationUtil.forgetMigrationAsync,
-                                                 migrationOpts.migrationIdString,
-                                                 donorRstArgs);
+        const donorRstArgs = createRstArgs(tenantMigrationTest.getDonorRst());
+        const forgetMigrationThread =
+            new Thread(forgetMigrationAsync, migrationOpts.migrationIdString, donorRstArgs);
         forgetMigrationThread.start();
 
         fp.wait();
@@ -207,4 +202,3 @@ function makeTenantId() {
         tenantMigrationTest.stop();
     }
 }
-})();

@@ -104,15 +104,7 @@ struct CommonStats {
     // The field must be populated when running explain or when running with the profiler on. It
     // must also be populated when multi planning, in order to gather stats stored in the plan
     // cache.
-    boost::optional<long long> executionTimeMillis;
-
-    // TODO: have some way of tracking WSM sizes (or really any series of #s).  We can measure
-    // the size of our inputs and the size of our outputs.  We can do a lot with the WS here.
-
-    // TODO: once we've picked a plan, collect different (or additional) stats for display to
-    // the user, eg. time_t totalTimeSpent;
-
-    // TODO: keep track of the total yield time / fetch time done for a plan.
+    boost::optional<Nanoseconds> executionTime;
 
     bool failed;
     bool isEOF;
@@ -188,7 +180,7 @@ private:
     BasePlanStageStats& operator=(const BasePlanStageStats<C, T>&) = delete;
 };
 
-using PlanStageStats = BasePlanStageStats<CommonStats, StageType>;
+using PlanStageStats = BasePlanStageStats<mongo::CommonStats, StageType>;
 
 struct AndHashStats : public SpecificStats {
     AndHashStats() = default;
@@ -419,6 +411,22 @@ struct DeleteStats : public SpecificStats {
     }
 
     size_t docsDeleted = 0u;
+    size_t bytesDeleted = 0u;
+};
+
+struct BatchedDeleteStats : public DeleteStats {
+    BatchedDeleteStats() = default;
+
+    // Unlike a standard multi:true delete, BatchedDeleteStage can complete with PlanStage::IS_EOF
+    // before deleting all the documents that match the query, if a 'BatchedDeleteStageParams'
+    // 'pass' target is met.
+    //
+    // True indicates the operation reaches completion because a 'pass' target is met.
+    //
+    // False indicates either (1) the operation hasn't reached completion or (2) the operation
+    // removed all the documents that matched the criteria to reach completion - this is always the
+    // case with the default 'BatchedDeleteStageParams'.
+    bool passTargetMet = false;
 };
 
 struct DistinctScanStats : public SpecificStats {
@@ -784,6 +792,9 @@ struct SortStats : public SpecificStats {
 
     // The number of times that we spilled data to disk during the execution of this query.
     uint64_t spills = 0u;
+
+    // The maximum size of the spill file written to disk, or 0 if no spilling occurred.
+    uint64_t spilledDataStorageSize = 0u;
 };
 
 struct MergeSortStats : public SpecificStats {
@@ -1032,8 +1043,18 @@ struct GroupStats : public SpecificStats {
     // Tracks an estimate of the total size of all documents output by the group stage in bytes.
     size_t totalOutputDataSizeBytes = 0;
 
+    // The size of the file spilled to disk. Note that this is not the same as the number of bytes
+    // spilled to disk, as any data spilled to disk will be compressed before being written to a
+    // file.
+    uint64_t spilledDataStorageSize = 0u;
+
+    // The number of bytes evicted from memory and spilled to disk.
+    uint64_t numBytesSpilledEstimate = 0u;
+
     // The number of times that we spilled data to disk while grouping the data.
     uint64_t spills = 0u;
+
+    uint64_t spilledRecords = 0u;
 };
 
 struct DocumentSourceCursorStats : public SpecificStats {
@@ -1143,6 +1164,27 @@ struct UnpackTimeseriesBucketStats final : public SpecificStats {
     size_t nBucketsUnpacked = 0u;
 };
 
+struct TimeseriesModifyStats final : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<TimeseriesModifyStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    size_t bucketsUnpacked = 0u;
+    size_t measurementsDeleted = 0u;
+};
+
 struct SampleFromTimeseriesBucketStats final : public SpecificStats {
     std::unique_ptr<SpecificStats> clone() const final {
         return std::make_unique<SampleFromTimeseriesBucketStats>(*this);
@@ -1163,5 +1205,28 @@ struct SampleFromTimeseriesBucketStats final : public SpecificStats {
     size_t nBucketsDiscarded = 0u;
     size_t dupsTested = 0u;
     size_t dupsDropped = 0u;
+};
+
+struct SpoolStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const {
+        return std::make_unique<SpoolStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // The amount of data we've spooled in bytes.
+    uint64_t totalDataSizeBytes = 0u;
+
+    // TODO SERVER-74437 add more stats for spilling metrics
 };
 }  // namespace mongo

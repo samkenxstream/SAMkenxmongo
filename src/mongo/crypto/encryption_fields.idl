@@ -27,9 +27,25 @@
 
 global:
     cpp_namespace: "mongo"
+    cpp_includes:
+        - "mongo/db/exec/document_value/value.h"
+        - "mongo/crypto/encryption_fields_validation.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
+
+types:
+  encrypted_numeric:
+    bson_serialization_type:
+    - date
+    - decimal
+    - double
+    - int
+    - long
+    description: A value with any encrypted range numeric BSON type.
+    cpp_type: Value
+    serializer: Value::serializeForIDL
+    deserializer: Value::deserializeForIDL
 
 enums:
     QueryType:
@@ -37,11 +53,21 @@ enums:
         type: string
         values:
             Equality: "equality"
+            RangePreview: "rangePreview"
 
 feature_flags:
-    featureFlagFLE2:
-        description: "Enable FLE2 support"
-        cpp_varname: gFeatureFlagFLE2
+    featureFlagFLE2Range:
+        description: "Enable support for range indexes in Queryable Encryption"
+        version: 6.2
+        cpp_varname: gFeatureFlagFLE2Range
+        default: true
+    featureFlagFLE2ProtocolVersion2:
+        description: "Enable support for version 2 of Queryable Encryption wire protocol"
+        cpp_varname: gFeatureFlagFLE2ProtocolVersion2
+        default: false
+    featureFlagFLE2CleanupCommand:
+        description: "Enable support for the Cleanup Structured Encryption Data command"
+        cpp_varname: gFeatureFlagFLE2CleanupCommand
         default: false
 
 structs:
@@ -53,58 +79,85 @@ structs:
             queryType:
                 description: "Type of supported queries"
                 type: QueryType
-                unstable: true
+                stability: unstable
             contention:
                 description: "Contention factor for field, 0 means it has extremely high set number of distinct values"
-                type: long
-                default: 0
-                unstable: true
+                type: exactInt64
+                default: 4
+                stability: unstable
+                validator: { gte: 0 }
+            min:
+                description: "Defines the lower bound for field values in this encrypted index. Only applicable for queryType range"
+                type: encrypted_numeric
+                optional: true
+                stability: unstable
+            max:
+                description: "Defines the upper bound for field values in this encrypted index. Only applicable for queryType range"
+                type: encrypted_numeric
+                optional: true
+                stability: unstable
+            sparsity:
+                description: "Lower value - higher storage overhead, faster query."
+                type: exactInt64
+                optional: true
+                stability: unstable
+                validator: { gte: 1, lte: 4 }
+            precision:
+                description: >-
+                    Defines the number of digits after the decimal point for floating point numbers.
+                    Only applicable to floating point numbers and for queryType range.
+                type: safeInt
+                optional: true
+                stability: unstable
                 validator: { gte: 0 }
 
     EncryptedField:
         description: "Information about encrypted fields"
         strict: true
+        cpp_validator_func: "validateEncryptedField"
         fields:
             keyId:
                 description: "UUID of key in key vault to use for encryption"
                 type: uuid
-                unstable: true
+                stability: unstable
             path:
                 description: "Path to field to encrypt"
                 type: string
-                unstable: true
+                stability: unstable
             bsonType:
                 description: "BSON type of field to encrypt"
                 type: string
                 validator: { callback: "isValidBSONTypeName" }
-                unstable: true
+                optional: true
+                stability: unstable
             queries:
                 description: "List of supported query types"
                 type:
                     variant: [QueryTypeConfig, array<QueryTypeConfig>]
                 optional: true
-                unstable: true
+                stability: unstable
 
     EncryptedFieldConfig:
         description: "Information about encrypted fields and state collections"
         strict: true
+        cpp_validator_func: "validateEncryptedFieldConfig"
         fields:
             escCollection:
                 description: "Encrypted State Collection name, defaults to <collection>.esc"
                 type: string
                 optional: true
-                unstable: true
+                stability: unstable
             eccCollection:
                 description: "Encrypted Cache Collection name, defaults to <collection>.ecc"
                 type: string
                 optional: true
-                unstable: true
+                stability: unstable
             ecocCollection:
                 description: "Encrypted Compaction Collection name, defaults to <collection>.ecoc"
                 type: string
                 optional: true
-                unstable: true
+                stability: unstable
             fields:
                 description: "Array of encrypted fields"
                 type: array<EncryptedField>
-                unstable: true
+                stability: unstable

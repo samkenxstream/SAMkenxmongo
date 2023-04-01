@@ -119,7 +119,7 @@ BSONObj appendDbVersionIfPresent(BSONObj cmdObj, DatabaseVersion dbVersion);
 /**
  * Returns a copy of 'cmdObj' with 'version' appended.
  */
-BSONObj appendShardVersion(BSONObj cmdObj, ChunkVersion version);
+BSONObj appendShardVersion(BSONObj cmdObj, ShardVersion version);
 
 /**
  * Returns a copy of 'cmdObj' with the read/writeConcern from the OpCtx appended, unless the
@@ -166,18 +166,23 @@ std::vector<AsyncRequestsSender::Response> scatterGatherUnversionedTargetAllShar
  * Utility for dispatching versioned commands on a namespace, deciding which shards to
  * target by applying the passed-in query and collation to the local routing table cache.
  *
+ * If the command is eligible for sampling, attaches a unique sample id to one of the requests if
+ * the collection has query sampling enabled and the rate-limited sampler successfully generates a
+ * sample id for it.
+ *
  * Does not retry on StaleConfigException.
  */
-std::vector<AsyncRequestsSender::Response> scatterGatherVersionedTargetByRoutingTable(
+[[nodiscard]] std::vector<AsyncRequestsSender::Response> scatterGatherVersionedTargetByRoutingTable(
     OperationContext* opCtx,
     StringData dbName,
     const NamespaceString& nss,
-    const ChunkManager& cm,
+    const CollectionRoutingInfo& cri,
     const BSONObj& cmdObj,
     const ReadPreferenceSetting& readPref,
     Shard::RetryPolicy retryPolicy,
     const BSONObj& query,
-    const BSONObj& collation);
+    const BSONObj& collation,
+    bool eligibleForSampling = false);
 
 
 /**
@@ -193,7 +198,7 @@ scatterGatherVersionedTargetByRoutingTableNoThrowOnStaleShardVersionErrors(
     OperationContext* opCtx,
     StringData dbName,
     const NamespaceString& nss,
-    const ChunkManager& cm,
+    const CollectionRoutingInfo& cri,
     const std::set<ShardId>& shardsToSkip,
     const BSONObj& cmdObj,
     const ReadPreferenceSetting& readPref,
@@ -222,7 +227,7 @@ AsyncRequestsSender::Response executeCommandAgainstDatabasePrimary(
 AsyncRequestsSender::Response executeCommandAgainstShardWithMinKeyChunk(
     OperationContext* opCtx,
     const NamespaceString& nss,
-    const ChunkManager& cm,
+    const CollectionRoutingInfo& cri,
     const BSONObj& cmdObj,
     const ReadPreferenceSetting& readPref,
     Shard::RetryPolicy retryPolicy);
@@ -235,7 +240,7 @@ AsyncRequestsSender::Response executeCommandAgainstShardWithMinKeyChunk(
  * string representation of all errors to 'errmsg.'
  *
  * ShardNotFound responses are not treated as errors if any shard returned success. We allow
- * ShardNotFound errors to be ignored as errors since this node may not heave realized that a
+ * ShardNotFound errors to be ignored as errors since this node may not have realized that a
  * shard has been removed.
  *
  * Returns:
@@ -270,7 +275,7 @@ BSONObj extractCollation(const BSONObj& cmdObj);
 bool appendEmptyResultSet(OperationContext* opCtx,
                           BSONObjBuilder& result,
                           Status status,
-                          const std::string& ns);
+                          const NamespaceString& ns);
 
 /**
  * Returns the shards that would be targeted for the given query according to the given routing
@@ -288,7 +293,7 @@ std::set<ShardId> getTargetedShardsForQuery(boost::intrusive_ptr<ExpressionConte
 std::vector<std::pair<ShardId, BSONObj>> getVersionedRequestsForTargetedShards(
     OperationContext* opCtx,
     const NamespaceString& nss,
-    const ChunkManager& cm,
+    const CollectionRoutingInfo& cri,
     const BSONObj& cmdObj,
     const BSONObj& query,
     const BSONObj& collation);
@@ -301,8 +306,8 @@ std::vector<std::pair<ShardId, BSONObj>> getVersionedRequestsForTargetedShards(
  *
  * Should be used by all router commands that can be run in a transaction when targeting shards.
  */
-StatusWith<ChunkManager> getCollectionRoutingInfoForTxnCmd(OperationContext* opCtx,
-                                                           const NamespaceString& nss);
+StatusWith<CollectionRoutingInfo> getCollectionRoutingInfoForTxnCmd(OperationContext* opCtx,
+                                                                    const NamespaceString& nss);
 
 /**
  * Loads all of the indexes for the given namespace from the appropriate shard. For unsharded

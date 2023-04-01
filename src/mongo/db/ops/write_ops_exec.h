@@ -38,12 +38,17 @@
 #include "mongo/db/ops/single_write_result_gen.h"
 #include "mongo/db/ops/update_result.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/ops/write_ops_exec_util.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/s/stale_exception.h"
 
 namespace mongo {
 
+class DeleteRequest;
 class OpDebug;
 class ParsedUpdate;
+class PlanExecutor;
 
 namespace write_ops_exec {
 
@@ -63,6 +68,74 @@ struct WriteResult {
     // In case of an error, whether the operation can continue.
     bool canContinue = true;
 };
+
+/**
+ * Returns true if the batch can continue, false to stop the batch, or throws to fail the command.
+ */
+bool handleError(OperationContext* opCtx,
+                 const DBException& ex,
+                 const NamespaceString& nss,
+                 bool ordered,
+                 bool isMultiUpdate,
+                 boost::optional<UUID> sampleId,
+                 WriteResult* out);
+
+bool getFleCrudProcessed(OperationContext* opCtx,
+                         const boost::optional<EncryptionInformation>& encryptionInfo);
+
+/**
+ * Returns true if caller should try to insert more documents. Does nothing else if batch is empty.
+ */
+bool insertBatchAndHandleErrors(OperationContext* opCtx,
+                                const NamespaceString& nss,
+                                const boost::optional<mongo::UUID>& collectionUUID,
+                                bool ordered,
+                                std::vector<InsertStatement>& batch,
+                                LastOpFixer* lastOpFixer,
+                                WriteResult* out,
+                                OperationSource source);
+
+/**
+ * If the operation succeeded, then returns either a document to return to the client, or
+ * boost::none if no matching document to update/remove was found. If the operation failed, throws.
+ */
+boost::optional<BSONObj> advanceExecutor(OperationContext* opCtx,
+                                         PlanExecutor* exec,
+                                         bool isRemove);
+
+/**
+ * Executes a findAndModify with remove:false, the returned document is placed into docFound (if
+ * applicable). Should be called in a writeConflictRetry loop.
+ */
+UpdateResult writeConflictRetryUpsert(OperationContext* opCtx,
+                                      const NamespaceString& nsString,
+                                      CurOp* curOp,
+                                      OpDebug* opDebug,
+                                      bool inTransaction,
+                                      bool remove,
+                                      bool upsert,
+                                      boost::optional<BSONObj>& docFound,
+                                      ParsedUpdate* parsedUpdate);
+
+/**
+ * Executes a findAndModify with remove:true, the returned document is placed into docFound (if
+ * applicable). Should be called in a writeConflictRetry loop.
+ */
+long long writeConflictRetryRemove(OperationContext* opCtx,
+                                   const NamespaceString& nsString,
+                                   DeleteRequest* deleteRequest,
+                                   CurOp* curOp,
+                                   OpDebug* opDebug,
+                                   bool inTransaction,
+                                   boost::optional<BSONObj>& docFound);
+
+/**
+ * Generates a WriteError for a given Status.
+ */
+boost::optional<write_ops::WriteError> generateError(OperationContext* opCtx,
+                                                     const Status& status,
+                                                     int index,
+                                                     size_t numErrors);
 
 /**
  * Performs a batch of inserts, updates, or deletes.
@@ -108,6 +181,12 @@ void recordUpdateResultInOpDebug(const UpdateResult& updateResult, OpDebug* opDe
  */
 bool shouldRetryDuplicateKeyException(const ParsedUpdate& parsedUpdate,
                                       const DuplicateKeyErrorInfo& errorInfo);
+
+/**
+ * Returns an InsertCommandReply if the timeseries writes succeeded.
+ */
+write_ops::InsertCommandReply performTimeseriesWrites(
+    OperationContext* opCtx, const write_ops::InsertCommandRequest& request);
 
 }  // namespace write_ops_exec
 }  // namespace mongo

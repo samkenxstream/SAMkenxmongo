@@ -11,12 +11,14 @@
  * - Benignly fail to run --repair on the latest version.
  * - Successfully restart the node in the original version.
  * - Verify data files are intact.
+ *
+ * @tags: [requires_v4_0]
  */
 
 (function() {
 'use strict';
 
-load('jstests/libs/get_index_helpers.js');
+load('jstests/libs/index_catalog_helpers.js');
 
 const dbpath = MongoRunner.dataPath + 'skip_level_upgrade';
 resetDbpath(dbpath);
@@ -29,8 +31,8 @@ const defaultOptions = {
 
 // This lists all binary versions older than the last-lts version.
 const versions = [
-    {binVersion: '4.0', testCollection: 'four_zero'},
-    {binVersion: '4.2', testCollection: 'four_two'}
+    {binVersion: '4.2', testCollection: 'four_two'},
+    {binVersion: '5.0', testCollection: 'five_zero'},
 ];
 
 // Iterate through versions specified in the versions list, and follow the steps outlined at
@@ -76,7 +78,7 @@ for (let i = 0; i < versions.length; i++) {
                   tojson(mongodOptions));
     assert.neq(
         null,
-        GetIndexHelpers.findByKeyPattern(testDB[version.testCollection].getIndexes(), {a: 1}),
+        IndexCatalogHelpers.findByKeyPattern(testDB[version.testCollection].getIndexes(), {a: 1}),
         `index from ${version.testCollection} should be available; options: ` +
             tojson(mongodOptions));
 

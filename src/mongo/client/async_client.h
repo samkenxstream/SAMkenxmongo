@@ -33,9 +33,11 @@
 
 #include "mongo/client/authenticate.h"
 #include "mongo/db/service_context.h"
+#include "mongo/executor/connection_metrics.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
+#include "mongo/logv2/log_severity_suppressor.h"
 #include "mongo/rpc/unique_message.h"
 #include "mongo/transport/baton.h"
 #include "mongo/transport/message_compressor_manager.h"
@@ -48,7 +50,7 @@ namespace mongo {
 class AsyncDBClient : public std::enable_shared_from_this<AsyncDBClient> {
 public:
     explicit AsyncDBClient(const HostAndPort& peer,
-                           transport::SessionHandle session,
+                           std::shared_ptr<transport::Session> session,
                            ServiceContext* svcCtx)
         : _peer(std::move(peer)), _session(std::move(session)), _svcCtx(svcCtx) {}
 
@@ -60,13 +62,18 @@ public:
         ServiceContext* context,
         transport::ReactorHandle reactor,
         Milliseconds timeout,
+        std::shared_ptr<ConnectionMetrics> connectionMetrics,
         std::shared_ptr<const transport::SSLConnectionContext> transientSSLContext = nullptr);
 
     Future<executor::RemoteCommandResponse> runCommandRequest(
-        executor::RemoteCommandRequest request, const BatonHandle& baton = nullptr);
-    Future<rpc::UniqueReply> runCommand(OpMsgRequest request,
-                                        const BatonHandle& baton = nullptr,
-                                        bool fireAndForget = false);
+        executor::RemoteCommandRequest request,
+        const BatonHandle& baton = nullptr,
+        boost::optional<std::shared_ptr<Timer>> fromConnAcquiredTimer = boost::none);
+    Future<rpc::UniqueReply> runCommand(
+        OpMsgRequest request,
+        const BatonHandle& baton = nullptr,
+        bool fireAndForget = false,
+        boost::optional<std::shared_ptr<Timer>> fromConnAcquiredTimer = boost::none);
 
     Future<executor::RemoteCommandResponse> beginExhaustCommandRequest(
         executor::RemoteCommandRequest request, const BatonHandle& baton = nullptr);
@@ -95,6 +102,7 @@ public:
 
     const HostAndPort& remote() const;
     const HostAndPort& local() const;
+    static constexpr Seconds kSlowConnAcquiredToWireLogSuppresionPeriod{5};
 
 private:
     Future<executor::RemoteCommandResponse> _continueReceiveExhaustResponse(
@@ -111,7 +119,7 @@ private:
     auth::RunCommandHook _makeAuthRunCommandHook();
 
     const HostAndPort _peer;
-    transport::SessionHandle _session;
+    std::shared_ptr<transport::Session> _session;
     ServiceContext* const _svcCtx;
     MessageCompressorManager _compressorManager;
 };

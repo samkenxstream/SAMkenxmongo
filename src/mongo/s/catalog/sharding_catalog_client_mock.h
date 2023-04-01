@@ -41,6 +41,11 @@ public:
     ShardingCatalogClientMock();
     ~ShardingCatalogClientMock();
 
+    std::vector<BSONObj> runCatalogAggregation(OperationContext* opCtx,
+                                               AggregateCommandRequest& aggRequest,
+                                               const repl::ReadConcernArgs& readConcern,
+                                               const Milliseconds& maxTimeout) override;
+
     DatabaseType getDatabase(OperationContext* opCtx,
                              StringData db,
                              repl::ReadConcernLevel readConcernLevel) override;
@@ -58,10 +63,13 @@ public:
 
     std::vector<CollectionType> getCollections(OperationContext* opCtx,
                                                StringData db,
-                                               repl::ReadConcernLevel readConcernLevel) override;
+                                               repl::ReadConcernLevel readConcernLevel,
+                                               const BSONObj& sort) override;
 
-    std::vector<NamespaceString> getAllShardedCollectionsForDb(
-        OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) override;
+    std::vector<NamespaceString> getAllShardedCollectionsForDb(OperationContext* opCtx,
+                                                               StringData dbName,
+                                                               repl::ReadConcernLevel readConcern,
+                                                               const BSONObj& sort) override;
 
     StatusWith<std::vector<std::string>> getDatabasesForShard(OperationContext* opCtx,
                                                               const ShardId& shardName) override;
@@ -82,8 +90,16 @@ public:
         const ChunkVersion& sinceVersion,
         const repl::ReadConcernArgs& readConcern) override;
 
+    std::pair<CollectionType, std::vector<IndexCatalogType>>
+    getCollectionAndShardingIndexCatalogEntries(OperationContext* opCtx,
+                                                const NamespaceString& nss,
+                                                const repl::ReadConcernArgs& readConcern) override;
+
     StatusWith<std::vector<TagsType>> getTagsForCollection(OperationContext* opCtx,
                                                            const NamespaceString& nss) override;
+
+    std::vector<NamespaceString> getAllNssThatHaveZonesForDatabase(
+        OperationContext* opCtx, const StringData& dbName) override;
 
     StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
         OperationContext* opCtx, repl::ReadConcernLevel readConcern) override;
@@ -101,15 +117,6 @@ public:
                                       const BSONObj& cmdObj,
                                       BSONObjBuilder* result) override;
 
-    Status applyChunkOpsDeprecated(OperationContext* opCtx,
-                                   const BSONArray& updateOps,
-                                   const BSONArray& preCondition,
-                                   const UUID& uuid,
-                                   const NamespaceString& nss,
-                                   const ChunkVersion& lastChunkVersion,
-                                   const WriteConcernOptions& writeConcern,
-                                   repl::ReadConcernLevel readConcern) override;
-
     StatusWith<BSONObj> getGlobalSettings(OperationContext* opCtx, StringData key) override;
 
     StatusWith<VersionType> getConfigVersion(OperationContext* opCtx,
@@ -119,11 +126,6 @@ public:
                                 const NamespaceString& nss,
                                 const BSONObj& doc,
                                 const WriteConcernOptions& writeConcern) override;
-
-    void insertConfigDocumentsAsRetryableWrite(OperationContext* opCtx,
-                                               const NamespaceString& nss,
-                                               std::vector<BSONObj> docs,
-                                               const WriteConcernOptions& writeConcern) override;
 
     StatusWith<bool> updateConfigDocument(OperationContext* opCtx,
                                           const NamespaceString& nss,
@@ -153,6 +155,25 @@ public:
         StringData purpose,
         const LogicalTime& newerThanThis,
         repl::ReadConcernLevel readConcernLevel) override;
+
+    HistoricalPlacement getShardsThatOwnDataForCollAtClusterTime(
+        OperationContext* opCtx,
+        const NamespaceString& collName,
+        const Timestamp& clusterTime) override;
+
+    HistoricalPlacement getShardsThatOwnDataForDbAtClusterTime(
+        OperationContext* opCtx,
+        const NamespaceString& dbName,
+        const Timestamp& clusterTime) override;
+
+    HistoricalPlacement getShardsThatOwnDataAtClusterTime(OperationContext* opCtx,
+                                                          const Timestamp& clusterTime) override;
+
+    HistoricalPlacement getHistoricalPlacement(
+        OperationContext* opCtx,
+        const Timestamp& atClusterTime,
+        const boost::optional<NamespaceString>& nss) override;
+
 
 private:
     StatusWith<repl::OpTimeWith<std::vector<BSONObj>>> _exhaustiveFindOnConfig(

@@ -86,7 +86,7 @@ public:
 
     explicit RenameParticipantInstance(const BSONObj& participantDoc)
         : _doc(RenameCollectionParticipantDocument::parse(
-              IDLParserErrorContext("RenameCollectionParticipantDocument"), participantDoc)) {}
+              IDLParserContext("RenameCollectionParticipantDocument"), participantDoc)) {}
 
     ~RenameParticipantInstance();
 
@@ -96,7 +96,7 @@ public:
      */
     bool hasSameOptions(const BSONObj& participantDoc);
 
-    const BSONObj doc() {
+    BSONObj doc() {
         return _doc.toBSON();
     }
 
@@ -136,6 +136,8 @@ public:
         MongoProcessInterface::CurrentOpConnectionsMode connMode,
         MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override;
 
+    void checkIfOptionsConflict(const BSONObj& stateDoc) const override {}
+
 private:
     RenameCollectionParticipantDocument _doc;
 
@@ -148,7 +150,7 @@ private:
     void interrupt(Status status) noexcept override final;
 
     template <typename Func>
-    auto _executePhase(const Phase& newPhase, Func&& func) {
+    auto _buildPhaseHandler(const Phase& newPhase, Func&& handlerFn) {
         return [=] {
             const auto& currPhase = _doc.getPhase();
 
@@ -160,7 +162,7 @@ private:
                 // Persist the new phase if this is the first time we are executing it.
                 _enterPhase(newPhase);
             }
-            return func();
+            return handlerFn();
         };
     }
 

@@ -37,17 +37,17 @@ def compare_optime(optime1, optime2):
         return compare_timestamp(optime1["ts"], optime2["ts"])
 
 
-class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-instance-attributes, too-many-public-methods
+class ReplicaSetFixture(interface.ReplFixture):
     """Fixture which provides JSTests with a replica set to run against."""
 
-    def __init__(  # pylint: disable=too-many-arguments, too-many-locals
-            self, logger, job_num, fixturelib, mongod_executable=None, mongod_options=None,
-            dbpath_prefix=None, preserve_dbpath=False, num_nodes=2, start_initial_sync_node=False,
-            write_concern_majority_journal_default=None, auth_options=None,
-            replset_config_options=None, voting_secondaries=True, all_nodes_electable=False,
-            use_replica_set_connection_string=None, linear_chain=False, default_read_concern=None,
-            default_write_concern=None, shard_logging_prefix=None, replicaset_logging_prefix=None,
-            replset_name=None):
+    def __init__(self, logger, job_num, fixturelib, mongod_executable=None, mongod_options=None,
+                 dbpath_prefix=None, preserve_dbpath=False, num_nodes=2,
+                 start_initial_sync_node=False, electable_initial_sync_node=False,
+                 write_concern_majority_journal_default=None, auth_options=None,
+                 replset_config_options=None, voting_secondaries=True, all_nodes_electable=False,
+                 use_replica_set_connection_string=None, linear_chain=False,
+                 default_read_concern=None, default_write_concern=None, shard_logging_prefix=None,
+                 replicaset_logging_prefix=None, replset_name=None):
         """Initialize ReplicaSetFixture."""
 
         interface.ReplFixture.__init__(self, logger, job_num, fixturelib,
@@ -58,6 +58,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
             self.fixturelib.default_if_none(mongod_options, {}))
         self.preserve_dbpath = preserve_dbpath
         self.start_initial_sync_node = start_initial_sync_node
+        self.electable_initial_sync_node = electable_initial_sync_node
         self.write_concern_majority_journal_default = write_concern_majority_journal_default
         self.auth_options = auth_options
         self.replset_config_options = self.fixturelib.make_historic(
@@ -110,7 +111,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         self.initial_sync_node = None
         self.initial_sync_node_idx = -1
 
-    def setup(self):  # pylint: disable=too-many-branches,too-many-statements,too-many-locals
+    def setup(self):
         """Set up the replica set."""
 
         # Version-agnostic options for mongod/s can be set here.
@@ -140,15 +141,19 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
                     member_info["votes"] = 0
             members.append(member_info)
         if self.initial_sync_node:
-            members.append({
+            member_config = {
                 "_id": self.initial_sync_node_idx,
-                "host": self.initial_sync_node.get_internal_connection_string(), "priority": 0,
-                "hidden": 1, "votes": 0
-            })
+                "host": self.initial_sync_node.get_internal_connection_string(),
+            }
+            if not self.electable_initial_sync_node:
+                member_config["hidden"] = 1
+                member_config["votes"] = 0
+                member_config["priority"] = 0
+
+            members.append(member_config)
 
         repl_config = {"_id": self.replset_name, "protocolVersion": 1}
-        client = self.nodes[0].mongo_client()
-        interface.authenticate(client, self.auth_options)
+        client = interface.build_client(self.nodes[0], self.auth_options)
 
         if client.local.system.replset.count_documents(filter={}):
             # Skip initializing the replset if there is an existing configuration.
@@ -160,9 +165,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
                 "writeConcernMajorityJournalDefault"] = self.write_concern_majority_journal_default
         else:
             server_status = client.admin.command({"serverStatus": 1})
-            cmd_line_opts = client.admin.command({"getCmdLineOpts": 1})
-            if not (server_status["storageEngine"]["persistent"] and cmd_line_opts["parsed"].get(
-                    "storage", {}).get("journal", {}).get("enabled", True)):
+            if not server_status["storageEngine"]["persistent"]:
                 repl_config["writeConcernMajorityJournalDefault"] = False
 
         if self.replset_config_options.get("configsvr", False):
@@ -279,8 +282,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
 
     def await_last_op_committed(self, timeout_secs=None):
         """Wait for the last majority committed op to be visible."""
-        primary_client = self.get_primary().mongo_client()
-        interface.authenticate(primary_client, self.auth_options)
+        primary_client = interface.build_client(self.get_primary(), self.auth_options)
 
         primary_optime = get_last_optime(primary_client, self.fixturelib)
         up_to_date_nodes = set()
@@ -340,6 +342,8 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
                 except pymongo.errors.OperationFailure as err:
                     if err.code != ReplicaSetFixture._INTERRUPTED_DUE_TO_STORAGE_CHANGE:
                         raise
+                except pymongo.errors.AutoReconnect:
+                    self.logger.info("AutoReconnect exception thrown, retrying...")
                 time.sleep(0.1)  # Wait a little bit before trying again.
             self.logger.info("Secondary on port %d is now available.", secondary.port)
 
@@ -359,8 +363,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
 
         # Since this method is called at startup we expect the first node to be primary even when
         # self.all_nodes_electable is True.
-        primary_client = self.nodes[0].mongo_client()
-        interface.authenticate(primary_client, self.auth_options)
+        primary_client = interface.build_client(self.nodes[0], self.auth_options)
 
         # All nodes must be in primary/secondary state prior to this point. Perform a majority
         # write to ensure there is a committed operation on the set. The commit point will
@@ -373,8 +376,8 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         for node in self.nodes:
             self.logger.info("Waiting for node on port %d to have a stable recovery timestamp.",
                              node.port)
-            client = node.mongo_client(read_preference=pymongo.ReadPreference.SECONDARY)
-            interface.authenticate(client, self.auth_options)
+            client = interface.build_client(node, self.auth_options,
+                                            read_preference=pymongo.ReadPreference.SECONDARY)
 
             client_admin = client["admin"]
 
@@ -431,8 +434,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
 
         self.logger.info("Waiting to remove all 'newlyAdded' fields")
         primary = self.get_primary()
-        client = primary.mongo_client()
-        interface.authenticate(client, self.auth_options)
+        client = interface.build_client(primary, self.auth_options)
         while self._should_await_newly_added_removals_longer(client):
             time.sleep(0.1)  # Wait a little bit before trying again.
         self.logger.info("All 'newlyAdded' fields removed")
@@ -450,7 +452,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         primary.mongo_client().admin.command(cmd)
 
     def _do_teardown(self, mode=None):
-        self.logger.info("Stopping all members of the replica set...")
+        self.logger.info("Stopping all members of the replica set '%s'...", self.replset_name)
 
         running_at_start = self.is_running()
         if not running_at_start:
@@ -512,8 +514,13 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
             timeout_secs = self.AWAIT_REPL_TIMEOUT_MINS * 60
         start = time.time()
         clients = {}
+
+        all_nodes = self.nodes.copy()
+        if self.electable_initial_sync_node:
+            all_nodes.append(self.initial_sync_node)
+
         while True:
-            for node in self.nodes:
+            for node in all_nodes:
                 now = time.time()
                 if (now - start) >= timeout_secs:
                     msg = "Timed out while {} for replica set '{}'.".format(msg, self.replset_name)
@@ -522,8 +529,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
 
                 try:
                     if node.port not in clients:
-                        clients[node.port] = interface.authenticate(node.mongo_client(),
-                                                                    self.auth_options)
+                        clients[node.port] = interface.build_client(node, self.auth_options)
 
                     if fn(clients[node.port], node):
                         return node
@@ -539,9 +545,9 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         # Check that the fixture is still running before stepping down or killing the primary.
         # This ensures we still detect some cases in which the fixture has already crashed.
         if not self.is_running():
-            raise pymongo.errors.ServerFailure("ReplicaSetFixture {} expected to be running in"
-                                               " ContinuousStepdown, but wasn't.".format(
-                                                   self.replset_name))
+            raise self.fixturelib.ServerFailure("ReplicaSetFixture {} expected to be running in"
+                                                " ContinuousStepdown, but wasn't.".format(
+                                                    self.replset_name))
 
         # If we're running with background reconfigs, it's possible to be in a scenario
         # where we kill a necessary voting node (i.e. in a 5 node repl set), only 2 are
@@ -604,7 +610,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
 
                 return self.nodes[chosen_index]
 
-        primary_client = interface.authenticate(primary.mongo_client(), auth_options)
+        primary_client = interface.build_client(primary, auth_options)
         retry_time_secs = self.AWAIT_REPL_TIMEOUT_MINS * 60
         retry_start_time = time.time()
 
@@ -633,7 +639,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
                 break
 
             if time.time() - retry_start_time > retry_time_secs:
-                raise pymongo.errors.ServerFailure(
+                raise self.fixturelib.ServerFailure(
                     "The old primary on port {} of replica set {} did not step up in"
                     " {} seconds.".format(chosen_node.port, self.replset_name, retry_time_secs))
 
@@ -645,7 +651,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
             self.logger.info(
                 "Attempting to step up the chosen secondary on port %d of replica set '%s'.",
                 node.port, self.replset_name)
-            client = interface.authenticate(node.mongo_client(), auth_options)
+            client = interface.build_client(node, auth_options)
             client.admin.command("replSetStepUp")
             return True
         except pymongo.errors.OperationFailure:

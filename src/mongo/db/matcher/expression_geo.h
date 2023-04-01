@@ -73,7 +73,8 @@ private:
     // e.g.
     // { "$intersect" : { "$geometry" : { "type" : "Point", "coordinates": [ 40, 5 ] } } }
     Status parseQuery(const BSONObj& obj);
-
+    BSONObj redactGeoExpression(const BSONObj& obj,
+                                boost::optional<StringData> literalArgsReplacement);
     // Name of the field in the query.
     std::string field;
     std::shared_ptr<GeometryContainer> geoContainer;
@@ -83,11 +84,11 @@ private:
 class GeoMatchExpression : public LeafMatchExpression {
 
 public:
-    GeoMatchExpression(StringData path,
+    GeoMatchExpression(boost::optional<StringData> path,
                        const GeoExpression* query,
                        const BSONObj& rawObj,
                        clonable_ptr<ErrorAnnotation> annotation = nullptr);
-    GeoMatchExpression(StringData path,
+    GeoMatchExpression(boost::optional<StringData> path,
                        std::shared_ptr<const GeoExpression> query,
                        const BSONObj& rawObj,
                        clonable_ptr<ErrorAnnotation> annotation = nullptr);
@@ -97,16 +98,20 @@ public:
                          const GeoExpression::Predicate& queryPredicate,
                          bool skipValidation,
                          const BSONElement& e,
-                         MatchDetails* details);
+                         MatchDetails*);
+    static bool contains(const GeometryContainer& queryGeom,
+                         const GeoExpression::Predicate& queryPredicate,
+                         GeometryContainer* geometry);
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
+    bool matchesGeoContainer(const GeometryContainer&) const;
 
     virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
-    BSONObj getSerializedRightHandSide() const final;
+    BSONObj getSerializedRightHandSide(SerializationOptions opts) const final;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
-    virtual std::unique_ptr<MatchExpression> shallowClone() const;
+    virtual std::unique_ptr<MatchExpression> clone() const;
 
     void setCanSkipValidation(bool val) {
         _canSkipValidation = val;
@@ -130,7 +135,9 @@ public:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     // The original geo specification provided by the user.
@@ -187,8 +194,10 @@ private:
 
 class GeoNearMatchExpression : public LeafMatchExpression {
 public:
-    GeoNearMatchExpression(StringData path, const GeoNearExpression* query, const BSONObj& rawObj);
-    GeoNearMatchExpression(StringData path,
+    GeoNearMatchExpression(boost::optional<StringData> path,
+                           const GeoNearExpression* query,
+                           const BSONObj& rawObj);
+    GeoNearMatchExpression(boost::optional<StringData> path,
                            std::shared_ptr<const GeoNearExpression> query,
                            const BSONObj& rawObj);
 
@@ -202,11 +211,11 @@ public:
 
     virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
-    BSONObj getSerializedRightHandSide() const final;
+    BSONObj getSerializedRightHandSide(SerializationOptions opts) const final;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
-    virtual std::unique_ptr<MatchExpression> shallowClone() const;
+    virtual std::unique_ptr<MatchExpression> clone() const;
 
     const GeoNearExpression& getData() const {
         return *_query;
@@ -222,7 +231,9 @@ public:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     // The original geo specification provided by the user.
@@ -239,11 +250,11 @@ private:
  */
 class TwoDPtInAnnulusExpression : public LeafMatchExpression {
 public:
-    TwoDPtInAnnulusExpression(const R2Annulus& annulus, StringData twoDPath)
+    TwoDPtInAnnulusExpression(const R2Annulus& annulus, boost::optional<StringData> twoDPath)
         : LeafMatchExpression(INTERNAL_2D_POINT_IN_ANNULUS, twoDPath), _annulus(annulus) {}
 
-    void serialize(BSONObjBuilder* out, bool includePath) const final {
-        out->append("TwoDPtInAnnulusExpression", true);
+    void serialize(BSONObjBuilder* out, SerializationOptions opts) const final {
+        out->append("$TwoDPtInAnnulusExpression", true);
     }
 
     bool matchesSingleElement(const BSONElement& e, MatchDetails* details = nullptr) const final {
@@ -261,7 +272,7 @@ public:
     // These won't be called.
     //
 
-    BSONObj getSerializedRightHandSide() const final {
+    BSONObj getSerializedRightHandSide(SerializationOptions opts) const final {
         MONGO_UNREACHABLE;
     }
 
@@ -274,7 +285,7 @@ public:
         return false;
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         MONGO_UNREACHABLE;
         return nullptr;
     }
@@ -289,7 +300,9 @@ public:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     R2Annulus _annulus;

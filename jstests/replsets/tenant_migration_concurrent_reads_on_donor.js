@@ -8,7 +8,6 @@
  *   reads after the migration aborts.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
@@ -17,14 +16,12 @@
  * ]
  */
 
-(function() {
-'use strict';
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {getTenantMigrationAccessBlocker} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
 const tenantMigrationTest = new TenantMigrationTest({
     name: jsTestName(),
@@ -45,8 +42,7 @@ function checkTenantMigrationAccessBlocker(node, tenantId, {
     numTenantMigrationCommittedErrors = 0,
     numTenantMigrationAbortedErrors = 0
 }) {
-    const mtab =
-        TenantMigrationUtil.getTenantMigrationAccessBlocker({donorNode: node, tenantId}).donor;
+    const mtab = getTenantMigrationAccessBlocker({donorNode: node, tenantId}).donor;
     if (!mtab) {
         assert.eq(0, numBlockedReads);
         assert.eq(0, numTenantMigrationCommittedErrors);
@@ -65,14 +61,10 @@ function checkTenantMigrationAccessBlocker(node, tenantId, {
  * To be used to resume a migration that is paused after entering the blocking state. Waits for the
  * number of blocked reads to reach 'targetNumBlockedReads' and unpauses the migration.
  */
-function resumeMigrationAfterBlockingRead(host, tenantId, targetNumBlockedReads) {
-    load("jstests/libs/fail_point_util.js");
-    load("jstests/replsets/libs/tenant_migration_util.js");
+async function resumeMigrationAfterBlockingRead(host, tenantId, targetNumBlockedReads) {
+    const {getNumBlockedReads} = await import("jstests/replsets/libs/tenant_migration_util.js");
     const primary = new Mongo(host);
-
-    assert.soon(() => TenantMigrationUtil.getNumBlockedReads(primary, tenantId) ==
-                    targetNumBlockedReads);
-
+    assert.soon(() => getNumBlockedReads(primary, tenantId) == targetNumBlockedReads);
     assert.commandWorked(primary.adminCommand(
         {configureFailPoint: "pauseTenantMigrationBeforeLeavingBlockingState", mode: "off"}));
 }
@@ -126,7 +118,7 @@ function testRejectReadsAfterMigrationCommitted(testCase, dbName, collName) {
     donorRst.awaitLastOpCommitted();
 
     const donorDoc = donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS).findOne({
-        tenantId: tenantId
+        _id: UUID(migrationIdString),
     });
     const nodes = testCase.isSupportedOnSecondaries ? donorRst.nodes : [donorPrimary];
     nodes.forEach(node => {
@@ -182,7 +174,7 @@ function testDoNotRejectReadsAfterMigrationAborted(testCase, dbName, collName) {
     donorRst.awaitLastOpCommitted();
 
     const donorDoc = donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS).findOne({
-        tenantId: tenantId
+        _id: UUID(migrationIdString),
     });
     const nodes = testCase.isSupportedOnSecondaries ? donorRst.nodes : [donorPrimary];
     nodes.forEach(node => {
@@ -235,7 +227,7 @@ function testBlockReadsAfterMigrationEnteredBlocking(testCase, dbName, collName)
     donorRst.awaitLastOpCommitted();
 
     const donorDoc = donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS).findOne({
-        tenantId: tenantId
+        _id: UUID(migrationIdString),
     });
     const command = testCase.requiresReadTimestamp
         ? testCase.command(collName, donorDoc.blockTimestamp)
@@ -298,7 +290,7 @@ function testRejectBlockedReadsAfterMigrationCommitted(testCase, dbName, collNam
     donorRst.awaitLastOpCommitted();
 
     const donorDoc = donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS).findOne({
-        tenantId: tenantId
+        _id: UUID(migrationIdString),
     });
     const command = testCase.requiresReadTimestamp
         ? testCase.command(collName, donorDoc.blockTimestamp)
@@ -366,7 +358,7 @@ function testUnblockBlockedReadsAfterMigrationAborted(testCase, dbName, collName
     donorRst.awaitLastOpCommitted();
 
     const donorDoc = donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS).findOne({
-        tenantId: tenantId
+        _id: UUID(migrationIdString),
     });
     const command = testCase.requiresReadTimestamp
         ? testCase.command(collName, donorDoc.blockTimestamp)
@@ -509,11 +501,11 @@ const testFuncs = {
 
 for (const [testName, testFunc] of Object.entries(testFuncs)) {
     for (const [testCaseName, testCase] of Object.entries(testCases)) {
-        jsTest.log(`Testing ${testName} with testCase ${testCaseName}`);
-        const dbName = `${testCaseName}-${testName}_${kTenantDefinedDbName}`;
+        const tenantId = ObjectId().str;
+        jsTest.log(`Testing ${testName} with testCase ${testCaseName} with tenantId ${tenantId}`);
+        const dbName = `${tenantId}_${kTenantDefinedDbName}`;
         testFunc(testCase, dbName, kCollName);
     }
 }
 
 tenantMigrationTest.stop();
-})();

@@ -66,6 +66,17 @@ const mongos = st.s0;
     testRename(st, dbName, toNs, false /* dropTarget */, false /* mustFail */);
 }
 
+// Rename non-existing source collection must fail
+{
+    const dbName = 'notExistingSource';
+    assert.commandWorked(
+        mongos.adminCommand({enablesharding: dbName, primaryShard: st.shard0.shardName}));
+    assert.commandFailedWithCode(
+        st.getDB(dbName).adminCommand(
+            {renameCollection: dbName + ".source", to: dbName + ".target"}),
+        ErrorCodes.NamespaceNotFound);
+}
+
 // Rename to existing sharded target collection with dropTarget=true must succeed
 {
     const dbName = 'testRenameToExistingShardedCollection';
@@ -234,6 +245,67 @@ const mongos = st.s0;
 
         const tooLongNs = longEnoughNs + 'x';
         testRename(st, dbName, tooLongNs, false /* dropTarget */, true /* mustFail */);
+    }
+}
+
+// For C2C: rename of existing collection with correct uuid as argument must succeed
+// (Also creating target collection to test target UUID internal check)
+{
+    const dbName = 'testRenameToUnshardedCollectionWithSourceUUID';
+    const fromCollName = 'from';
+    const fromNs = dbName + '.' + fromCollName;
+    const toNs = dbName + '.to';
+    assert.commandWorked(
+        mongos.adminCommand({enablesharding: dbName, primaryShard: st.shard0.shardName}));
+    const fromColl = mongos.getCollection(fromNs);
+    fromColl.insert({a: 0});
+
+    const toColl = mongos.getCollection(toNs);
+    toColl.insert({b: 0});
+
+    const sourceUUID = assert.commandWorked(st.getDB(dbName).runCommand({listCollections: 1}))
+                           .cursor.firstBatch.find(c => c.name === fromCollName)
+                           .info.uuid;
+
+    // The command succeeds when the correct UUID is provided.
+    assert.commandWorked(mongos.adminCommand({
+        renameCollection: fromNs,
+        to: toNs,
+        dropTarget: true,
+        collectionUUID: sourceUUID,
+    }));
+}
+
+// Rename between DBs after movePrimary works correctly
+{
+    // TODO SERVER-72796 remove this check once v7.0 branches out
+    const fcvDoc =
+        st.configRS.getPrimary().adminCommand({getParameter: 1, featureCompatibilityVersion: 1});
+    if (MongoRunner.compareBinVersions(fcvDoc.featureCompatibilityVersion.version, '7.0') >= 0) {
+        const db0Name = 'testMovePrimaryWithRenameDB0';
+        const db1Name = 'testMovePrimaryWithRenameDB1';
+        const collOnDB0 = db0Name + '.from';
+        const collOnDB1 = db1Name + '.to';
+        assert.commandWorked(
+            mongos.adminCommand({enablesharding: db0Name, primaryShard: st.shard0.shardName}));
+        assert.commandWorked(
+            mongos.adminCommand({enablesharding: db1Name, primaryShard: st.shard0.shardName}));
+
+        mongos.getCollection(collOnDB0).insert({a: 0});
+
+        assert.commandWorked(mongos.adminCommand({movePrimary: db0Name, to: st.shard1.name}));
+        assert.commandWorked(mongos.adminCommand({movePrimary: db1Name, to: st.shard1.name}));
+        assert.commandWorked(mongos.adminCommand({
+            renameCollection: collOnDB0,
+            to: collOnDB1,
+        }));
+
+        assert.commandWorked(mongos.adminCommand({movePrimary: db0Name, to: st.shard0.name}));
+        assert.commandWorked(mongos.adminCommand({movePrimary: db1Name, to: st.shard0.name}));
+        assert.commandWorked(mongos.adminCommand({
+            renameCollection: collOnDB1,
+            to: collOnDB0,
+        }));
     }
 }
 

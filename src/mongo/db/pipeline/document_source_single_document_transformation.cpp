@@ -87,11 +87,15 @@ void DocumentSourceSingleDocumentTransformation::doDispose() {
     }
 }
 
-Value DocumentSourceSingleDocumentTransformation::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    return Value(Document{{getSourceName(),
-                           _parsedTransform ? _parsedTransform->serializeTransformation(explain)
-                                            : _cachedStageOptions}});
+Value DocumentSourceSingleDocumentTransformation::serialize(SerializationOptions opts) const {
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484312);
+    }
+
+    return Value(
+        Document{{getSourceName(),
+                  _parsedTransform ? _parsedTransform->serializeTransformation(opts.verbosity)
+                                   : _cachedStageOptions}});
 }
 
 Pipeline::SourceContainer::iterator DocumentSourceSingleDocumentTransformation::doOptimizeAt(
@@ -116,6 +120,11 @@ DepsTracker::State DocumentSourceSingleDocumentTransformation::getDependencies(
     // Each parsed transformation is responsible for adding its own dependencies, and returning
     // the correct dependency return type for that transformation.
     return _parsedTransform->addDependencies(deps);
+}
+
+void DocumentSourceSingleDocumentTransformation::addVariableRefs(
+    std::set<Variables::Id>* refs) const {
+    _parsedTransform->addVariableRefs(refs);
 }
 
 DocumentSource::GetModPathsReturn DocumentSourceSingleDocumentTransformation::getModifiedPaths()

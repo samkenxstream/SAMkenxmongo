@@ -5,10 +5,22 @@
 // may be routed to a secondary. This is incompatible with embedded right now since the command
 // compact does not exist on such storage engines.
 //
+// The test runs commands that are not allowed with security token: compact, dataSize,reIndex,
+// whatsmyuri.
 // @tags: [
+//   not_allowed_with_security_token,
 //   assumes_read_preference_unchanged,
-//   incompatible_with_embedded,
+//   does_not_support_repeated_reads,
 //   requires_collstats,
+//   # Tenant migrations passthrough suites automatically retry operations on TenantMigrationAborted
+//   # errors.
+//   tenant_migration_incompatible,
+//   # Some passthroughs which implicitly create indexes (e.g. the column store index passthrough)
+//   # will override the 'getIndexes()' helper to hide the implicitly created index. This override
+//   # messes with the latency stats tracking and counts the operation as an aggregate instead of a
+//   # command. It's an implementation detail that leaks and invalidates the test.
+//   assumes_no_implicit_index_creation,
+//   uses_compact
 // ]
 //
 

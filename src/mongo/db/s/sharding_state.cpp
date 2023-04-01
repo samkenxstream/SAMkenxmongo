@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -36,6 +35,9 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -94,20 +96,24 @@ bool ShardingState::enabled() const {
 }
 
 Status ShardingState::canAcceptShardedCommands() const {
-    if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
+    if (!serverGlobalParams.clusterRole.has(ClusterRole::ShardServer)) {
         return {ErrorCodes::NoShardingEnabled,
-                "Cannot accept sharding commands if not started with --shardsvr"};
-    } else if (!enabled()) {
+                "Cannot accept sharding commands if node does not have shard role"};
+    }
+
+    if (!enabled()) {
         return {ErrorCodes::ShardingStateNotInitialized,
                 "Cannot accept sharding commands if sharding state has not "
                 "been initialized with a shardIdentity document"};
-    } else {
-        return Status::OK();
     }
+
+    return Status::OK();
 }
 
 ShardId ShardingState::shardId() {
-    invariant(enabled());
+    if (!enabled()) {
+        return ShardId();
+    }
     return _shardId;
 }
 

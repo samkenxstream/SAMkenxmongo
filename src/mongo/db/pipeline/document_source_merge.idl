@@ -33,12 +33,12 @@ global:
     cpp_includes:
         - "mongo/db/namespace_string.h"
         - "mongo/db/pipeline/document_source_merge_spec.h"
+        - "mongo/s/chunk_version.h"
 
 imports:
     - "mongo/db/pipeline/document_source_merge_modes.idl"
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/s/chunk_version.idl"
-
 types:
     MergeTargetNss:
         bson_serialization_type: any
@@ -47,6 +47,7 @@ types:
         cpp_type: mongo::NamespaceString
         serializer: "::mongo::mergeTargetNssSerializeToBSON"
         deserializer: "::mongo::mergeTargetNssParseFromBSON"
+        deserialize_with_tenant: true
 
     MergeOnFields:
         bson_serialization_type: any
@@ -70,7 +71,7 @@ structs:
         strict: true
         fields:
             db:
-                type: string
+                type: database_name
                 optional: true
                 description: The database field for this namespace.
             coll:
@@ -112,7 +113,7 @@ structs:
                              do not match.
 
             targetCollectionVersion:
-                type: ChunkVersionArrayWronglyEncodedAsBSONObjFormat
+                type: ChunkVersion
                 optional: true
                 description: If set, the collection's ChunkVersion found when parsed on mongos. Can
                              be used to check if a collection has since been dropped and re-created,

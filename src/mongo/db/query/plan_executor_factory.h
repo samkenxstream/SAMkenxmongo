@@ -29,12 +29,14 @@
 
 #pragma once
 
+#include "mongo/util/duration.h"
 #include <queue>
 
 #include "mongo/db/exec/sbe/stages/stages.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/plan_executor_pipeline.h"
+#include "mongo/db/query/cqf_get_executor.h"
 #include "mongo/db/query/optimizer/explain_interface.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_yield_policy_sbe.h"
@@ -42,6 +44,7 @@
 #include "mongo/db/query/sbe_plan_ranker.h"
 #include "mongo/db/query/sbe_runtime_planner.h"
 #include "mongo/db/query/sbe_stage_builder.h"
+#include "mongo/db/shard_role.h"
 
 namespace mongo::plan_executor_factory {
 
@@ -69,7 +72,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     std::unique_ptr<CanonicalQuery> cq,
     std::unique_ptr<WorkingSet> ws,
     std::unique_ptr<PlanStage> rt,
-    const CollectionPtr* collection,
+    stdx::variant<const CollectionPtr*, const ScopedCollectionAcquisition*> collection,
     PlanYieldPolicy::YieldPolicy yieldPolicy,
     size_t plannerOptions,
     NamespaceString nss = NamespaceString(),
@@ -86,7 +89,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     std::unique_ptr<WorkingSet> ws,
     std::unique_ptr<PlanStage> rt,
-    const CollectionPtr* collection,
+    stdx::variant<const CollectionPtr*, const ScopedCollectionAcquisition*> collection,
     PlanYieldPolicy::YieldPolicy yieldPolicy,
     size_t plannerOptions,
     NamespaceString nss = NamespaceString(),
@@ -99,7 +102,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     std::unique_ptr<QuerySolution> qs,
     std::unique_ptr<CanonicalQuery> cq,
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const CollectionPtr* collection,
+    stdx::variant<const CollectionPtr*, const ScopedCollectionAcquisition*> collection,
     size_t plannerOptions,
     NamespaceString nss,
     PlanYieldPolicy::YieldPolicy yieldPolicy);
@@ -115,10 +118,11 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     std::unique_ptr<QuerySolution> solution,
     std::pair<std::unique_ptr<sbe::PlanStage>, stage_builder::PlanStageData> root,
     std::unique_ptr<optimizer::AbstractABTPrinter> optimizerData,
-    const MultipleCollectionAccessor& collections,
     size_t plannerOptions,
     NamespaceString nss,
-    std::unique_ptr<PlanYieldPolicySBE> yieldPolicy);
+    std::unique_ptr<PlanYieldPolicySBE> yieldPolicy,
+    bool isFromPlanCache,
+    bool generatedByBonsai);
 
 /**
  * Similar to the factory function above in that it also constructs an executor for the winning SBE

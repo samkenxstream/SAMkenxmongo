@@ -39,16 +39,19 @@
 
 namespace mongo {
 namespace {
-std::function<std::unique_ptr<RecordStoreHarnessHelper>()> recordStoreHarnessFactory;
+std::function<std::unique_ptr<RecordStoreHarnessHelper>(RecordStoreHarnessHelper::Options)>
+    recordStoreHarnessFactory;
 }
 
 void registerRecordStoreHarnessHelperFactory(
-    std::function<std::unique_ptr<RecordStoreHarnessHelper>()> factory) {
+    std::function<std::unique_ptr<RecordStoreHarnessHelper>(RecordStoreHarnessHelper::Options)>
+        factory) {
     recordStoreHarnessFactory = std::move(factory);
 }
 
-auto newRecordStoreHarnessHelper() -> std::unique_ptr<RecordStoreHarnessHelper> {
-    return recordStoreHarnessFactory();
+auto newRecordStoreHarnessHelper(RecordStoreHarnessHelper::Options options)
+    -> std::unique_ptr<RecordStoreHarnessHelper> {
+    return recordStoreHarnessFactory(options);
 }
 
 namespace {
@@ -451,7 +454,6 @@ TEST(RecordStoreTestHarness, ClusteredRecordStore) {
     }
 
     if (auto cursor = rs->getRandomCursor(opCtx.get())) {
-        // Verify random cursors work on ObjectId's.
         auto record = cursor->next();
         ASSERT(record);
 
@@ -468,7 +470,6 @@ TEST(RecordStoreTestHarness, ClusteredRecordStore) {
     }
 
     {
-        // Verify that find works with ObjectId.
         for (int i = 0; i < numRecords; i += 10) {
             RecordData rd;
             ASSERT_TRUE(rs->findRecord(opCtx.get(), records.at(i).id, &rd));
@@ -484,7 +485,6 @@ TEST(RecordStoreTestHarness, ClusteredRecordStore) {
     }
 
     {
-        // Verify that update works with ObjectId.
         BSONObj doc = BSON("i"
                            << "updated");
 
@@ -503,7 +503,6 @@ TEST(RecordStoreTestHarness, ClusteredRecordStore) {
     }
 
     {
-        // Verify that delete works with ObjectId.
         WriteUnitOfWork wuow(opCtx.get());
         for (int i = 0; i < numRecords; i += 10) {
             rs->deleteRecord(opCtx.get(), records.at(i).id);

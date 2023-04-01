@@ -45,8 +45,11 @@ namespace mongo {
 class DocumentSourceBucketAuto final : public DocumentSource {
 public:
     static constexpr StringData kStageName = "$bucketAuto"_sd;
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
+
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
 
     const char* getSourceName() const final;
     boost::intrusive_ptr<DocumentSource> optimize() final;
@@ -92,8 +95,18 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
-    const boost::intrusive_ptr<Expression> getGroupByExpression() const;
+    /**
+     * Returns the groupBy expression. The mutable getter can be used to alter
+     * the expression, but should not be used after execution has begun.
+     */
+    boost::intrusive_ptr<Expression> getGroupByExpression() const;
+    boost::intrusive_ptr<Expression>& getMutableGroupByExpression();
+    /**
+     * Returns the accumulated fields expressions. The mutable getter can be used to alter
+     * the expression, but should not be used after execution has begun.
+     */
     const std::vector<AccumulationStatement>& getAccumulatedFields() const;
+    std::vector<AccumulationStatement>& getMutableAccumulatedFields();
 
 protected:
     GetNextResult doGetNext() final;

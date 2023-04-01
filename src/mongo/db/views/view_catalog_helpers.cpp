@@ -150,13 +150,14 @@ StatusWith<ResolvedView> resolveView(OperationContext* opCtx,
     int depth = 0;
     boost::optional<bool> mixedData = boost::none;
     boost::optional<TimeseriesOptions> tsOptions = boost::none;
+    boost::optional<bool> hasExtendedRange = boost::none;
 
     for (; depth < ViewGraph::kMaxViewDepth; depth++) {
         auto view = catalog->lookupView(opCtx, *resolvedNss);
         if (!view) {
             // Return error status if pipeline is too large.
             int pipelineSize = 0;
-            for (auto obj : resolvedPipeline) {
+            for (const auto& obj : resolvedPipeline) {
                 pipelineSize += obj.objsize();
             }
             if (pipelineSize > ViewGraph::kMaxViewPipelineSizeBytes) {
@@ -171,9 +172,10 @@ StatusWith<ResolvedView> resolveView(OperationContext* opCtx,
             return StatusWith<ResolvedView>(
                 {*resolvedNss,
                  std::move(resolvedPipeline),
-                 collation ? std::move(collation.get()) : CollationSpec::kSimpleSpec,
+                 collation ? std::move(collation.value()) : CollationSpec::kSimpleSpec,
                  tsOptions,
-                 mixedData});
+                 mixedData,
+                 hasExtendedRange});
         }
 
         resolvedNss = &view->viewOn();
@@ -193,6 +195,7 @@ StatusWith<ResolvedView> resolveView(OperationContext* opCtx,
             if (tsCollection) {
                 mixedData = tsCollection->getTimeseriesBucketsMayHaveMixedSchemaData();
                 tsOptions = tsCollection->getTimeseriesOptions();
+                hasExtendedRange = tsCollection->getRequiresTimeseriesExtendedRangeSupport();
             }
         }
 
@@ -216,7 +219,7 @@ StatusWith<ResolvedView> resolveView(OperationContext* opCtx,
             curOp->debug().addResolvedViews(dependencyChain, resolvedPipeline);
 
             return StatusWith<ResolvedView>(
-                {*resolvedNss, std::move(resolvedPipeline), std::move(collation.get())});
+                {*resolvedNss, std::move(resolvedPipeline), std::move(collation.value())});
         }
     }
 

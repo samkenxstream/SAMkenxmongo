@@ -5,32 +5,28 @@ import { counts } from "./counts";
 import { nodeInfo } from "./nodeInfo";
 import { loading } from "./loading";
 import { links } from "./links";
+import { linksTrans } from "./linksTrans";
+import { showTransitive } from "./showTransitive";
 import { graphData } from "./graphData";
 import { findNode } from "./findNode";
 import { graphPaths } from "./graphPaths";
+import { listSearchTerm } from "./listSearchTerm";
 
 export const initialState = {
   loading: false,
   graphFiles: [
-    // {id: 0, value: 'graphfile.graphml', version: 1, git: '1234567', selected: false}
+    // { id: 0, value: 'graphfile.graphml', version: 1, git: '1234567', selected: false }
   ],
   nodes: [
-    {
-      id: 0,
-      node: "test/test1.so",
-      name: "test1",
-      check: "checkbox",
-      selected: false,
-    },
-    {
-      id: 1,
-      node: "test/test2.so",
-      name: "test2",
-      check: "checkbox",
-      selected: false,
-    },
+    // { id: 0, node: "test/test1.so", name: "test1", check: "checkbox", selected: false }
   ],
-  links: [{ source: "test/test1.so", target: "test/test2.so" }],
+  links: [
+    // { source: "test/test1.so", target: "test/test2.so" }
+  ],
+  linksTrans: [
+    // { source: "test/test1.so", target: "test/test2.so" }
+  ],
+  showTransitive: false,
   graphData: {
     nodes: [
       // {id: 'test/test1.so', name: 'test1.so'},
@@ -61,6 +57,16 @@ export const initialState = {
       dependencies: [{ node: "test/test2.so", symbols: [] }],
     },
   ],
+  listSearchTerm: "",
+};
+
+export const getCurrentGraphHash = (state) => {
+  let selectedGraphFiles = state.graphFiles.filter(x => x.selected == true);
+  let selectedGraph = undefined;
+  if (selectedGraphFiles.length > 0) {
+    selectedGraph = selectedGraphFiles[0].git;
+  }
+  return selectedGraph;
 };
 
 export const getLoading = (state) => {
@@ -83,42 +89,70 @@ export const getNodeInfos = (state) => {
 export const getCounts = (state) => {
   const counts = state.counts;
   return {
+    selectedGraph: getCurrentGraphHash(state),
     counts: state.counts,
   };
 };
 
 export const getRows = (state) => {
+  let searchedNodes = state.nodes.filter(node => node.node.indexOf(state.listSearchTerm) > -1);
   return {
-    rowCount: state.nodes.length,
-    rowGetter: ({ index }) => state.nodes[index],
-    checkBox: ({ index }) => state.nodes[index].selected,
+    selectedGraph: getCurrentGraphHash(state),
+    rowCount: searchedNodes.length,
+    rowGetter: ({ index }) => searchedNodes[index],
+    checkBox: ({ index }) => searchedNodes[index].selected,
     nodes: state.nodes,
+    searchedNodes: searchedNodes,
+    showTransitive: state.showTransitive,
   };
 };
 
 export const getSelected = (state) => {
   return {
+    selectedGraph: getCurrentGraphHash(state),
     selectedNodes: state.nodes.filter((node) => node.selected),
+    nodes: state.nodes,
+    links: state.links,
     selectedEdges: [],
     loading: state.loading,
     graphPaths: state.graphPaths,
+    showTransitive: state.showTransitive,
   };
 };
 
 export const getNodes = (state) => {
   return {
+    selectedGraph: getCurrentGraphHash(state),
     nodes: state.nodes,
     loading: state.loading,
+    listSearchTerm: state.listSearchTerm,
+    searchedNodes: state.nodes.filter(node => node.node.indexOf(state.listSearchTerm) > -1),
+    showTransitive: state.showTransitive
+  };
+};
+
+export const getEdges = (state) => {
+  return {
+    selectedGraph: getCurrentGraphHash(state),
+    nodes: state.nodes,
+    links: state.links,
+    linksTrans: state.linksTrans,
+    selectedLinks: state.links.filter(link => link.selected == true),
+    searchedNodes: state.nodes.filter(node => node.node.indexOf(state.listSearchTerm) > -1),
+    showTransitive: state.showTransitive,
   };
 };
 
 export const getGraphData = (state) => {
   return {
+    selectedGraph: getCurrentGraphHash(state),
     nodes: state.nodes,
+    links: state.links,
     graphData: state.graphData,
     loading: state.loading,
     findNode: state.findNode,
     graphPaths: state.graphPaths,
+    showTransitive: state.showTransitive,
   };
 };
 
@@ -134,9 +168,12 @@ const store = createStore(
     graphFiles,
     loading,
     links,
+    linksTrans,
     graphData,
     findNode,
     graphPaths,
+    listSearchTerm,
+    showTransitive
   }),
   initialState
 );

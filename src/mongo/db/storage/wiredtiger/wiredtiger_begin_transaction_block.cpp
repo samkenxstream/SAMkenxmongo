@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -39,6 +38,9 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/util/errno_util.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+
 namespace mongo {
 using namespace fmt::literals;
 
@@ -46,7 +48,8 @@ WiredTigerBeginTxnBlock::WiredTigerBeginTxnBlock(
     WT_SESSION* session,
     PrepareConflictBehavior prepareConflictBehavior,
     RoundUpPreparedTimestamps roundUpPreparedTimestamps,
-    RoundUpReadTimestamp roundUpReadTimestamp)
+    RoundUpReadTimestamp roundUpReadTimestamp,
+    RecoveryUnit::UntimestampedWriteAssertionLevel allowUntimestampedWrite)
     : _session(session) {
     invariant(!_rollback);
 
@@ -66,6 +69,9 @@ WiredTigerBeginTxnBlock::WiredTigerBeginTxnBlock(
             builder << "read=true";
         }
         builder << "),";
+    }
+    if (allowUntimestampedWrite != RecoveryUnit::UntimestampedWriteAssertionLevel::kEnforce) {
+        builder << "no_timestamp=true,";
     }
 
     const std::string beginTxnConfigString = builder;
@@ -88,16 +94,9 @@ WiredTigerBeginTxnBlock::~WiredTigerBeginTxnBlock() {
 
 Status WiredTigerBeginTxnBlock::setReadSnapshot(Timestamp readTimestamp) {
     invariant(_rollback);
-    // Avoid heap allocation in favour of a stack allocation for the configuration string.
-    static constexpr auto configFmtString = "read_timestamp={:x}";
-    static constexpr auto numBytesRequired = std::char_traits<char>::length(configFmtString) +
-        (sizeof(decltype(readTimestamp.asULL())) * 2) + 1;
-    std::array<char, numBytesRequired> configString;
-    auto end =
-        fmt::format_to(configString.begin(), FMT_STRING(configFmtString), readTimestamp.asULL());
-    *end = '\0';
-
-    return wtRCToStatus(_session->timestamp_transaction(_session, configString.data()), _session);
+    return wtRCToStatus(
+        _session->timestamp_transaction_uint(_session, WT_TS_TXN_TYPE_READ, readTimestamp.asULL()),
+        _session);
 }
 
 void WiredTigerBeginTxnBlock::done() {

@@ -27,24 +27,20 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/startup_recovery.h"
 
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/create_collection.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
-#include "mongo/db/commands/feature_compatibility_version_document_gen.h"
-#include "mongo/db/commands/feature_compatibility_version_documentation.h"
-#include "mongo/db/commands/feature_compatibility_version_parser.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/feature_compatibility_version_document_gen.h"
+#include "mongo/db/feature_compatibility_version_documentation.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
@@ -54,18 +50,18 @@
 #include "mongo/db/repl_set_member_in_standalone_mode.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/storage_repair_observer.h"
-#include "mongo/db/tenant_namespace.h"
+#include "mongo/db/timeseries/timeseries_extended_range.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/quick_exit.h"
 
-#if !defined(_WIN32)
-#include <sys/file.h>
-#endif
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 namespace mongo {
 namespace {
+
 using startup_recovery::StartupRecoveryMode;
 
 // Exit after repair has started, but before data is repaired.
@@ -75,7 +71,7 @@ MONGO_FAIL_POINT_DEFINE(exitBeforeRepairInvalidatesConfig);
 
 // Returns true if storage engine is writable.
 bool isWriteableStorageEngine() {
-    return !storageGlobalParams.readOnly && (storageGlobalParams.engine != "devnull");
+    return storageGlobalParams.engine != "devnull";
 }
 
 // Attempt to restore the featureCompatibilityVersion document if it is missing.
@@ -85,12 +81,11 @@ Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx
     // If the admin database, which contains the server configuration collection with the
     // featureCompatibilityVersion document, does not exist, create it.
     auto databaseHolder = DatabaseHolder::get(opCtx);
-    const TenantDatabaseName fcvTenantDbName(boost::none, fcvNss.db());
-    auto db = databaseHolder->getDb(opCtx, fcvTenantDbName);
+    auto db = databaseHolder->getDb(opCtx, fcvNss.dbName());
     if (!db) {
         LOGV2(20998, "Re-creating admin database that was dropped.");
     }
-    db = databaseHolder->openDb(opCtx, fcvTenantDbName);
+    db = databaseHolder->openDb(opCtx, fcvNss.dbName());
     invariant(db);
 
     // If the server configuration collection, which contains the FCV document, does not exist, then
@@ -103,12 +98,11 @@ Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx
               "Re-creating featureCompatibilityVersion document that was deleted. Creating new "
               "document with last LTS version.",
               "version"_attr = multiversion::toString(multiversion::GenericFCV::kLastLTS));
-        uassertStatusOK(
-            createCollection(opCtx, fcvNss.db().toString(), BSON("create" << fcvNss.coll())));
+        uassertStatusOK(createCollection(opCtx, fcvNss.dbName(), BSON("create" << fcvNss.coll())));
     }
 
-    const CollectionPtr& fcvColl =
-        catalog->lookupCollectionByNamespace(opCtx, NamespaceString::kServerConfigurationNamespace);
+    const CollectionPtr fcvColl(catalog->lookupCollectionByNamespace(
+        opCtx, NamespaceString::kServerConfigurationNamespace));
     invariant(fcvColl);
 
     // Restore the featureCompatibilityVersion document if it is missing.
@@ -129,9 +123,8 @@ Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx
 
         writeConflictRetry(opCtx, "insertFCVDocument", fcvNss.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
-            OpDebug* const nullOpDebug = nullptr;
-            uassertStatusOK(fcvColl->insertDocument(
-                opCtx, InsertStatement(fcvDoc.toBSON()), nullOpDebug, false));
+            uassertStatusOK(collection_internal::insertDocument(
+                opCtx, fcvColl, InsertStatement(fcvDoc.toBSON()), nullptr /* OpDebug */, false));
             wunit.commit();
         });
     }
@@ -146,12 +139,12 @@ Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx
  * Returns true if the collection associated with the given CollectionCatalogEntry has an index on
  * the _id field
  */
-bool checkIdIndexExists(OperationContext* opCtx, const CollectionPtr& coll) {
+bool checkIdIndexExists(OperationContext* opCtx, const Collection* coll) {
     auto indexCount = coll->getTotalIndexCount();
     auto indexNames = std::vector<std::string>(indexCount);
     coll->getAllIndexes(&indexNames);
 
-    for (auto name : indexNames) {
+    for (const auto& name : indexNames) {
         if (name == "_id_") {
             return true;
         }
@@ -162,13 +155,18 @@ bool checkIdIndexExists(OperationContext* opCtx, const CollectionPtr& coll) {
 Status buildMissingIdIndex(OperationContext* opCtx, Collection* collection) {
     LOGV2(4805002, "Building missing _id index", logAttrs(*collection));
     MultiIndexBlock indexer;
+    // This method is called in startup recovery so we can safely build the id index in foreground
+    // mode. This prevents us from yielding a MODE_X lock (which is disallowed).
+    indexer.setIndexBuildMethod(IndexBuildMethod::kForeground);
+
     ScopeGuard abortOnExit([&] {
         CollectionWriter collWriter(collection);
         indexer.abortIndexBuild(opCtx, collWriter, MultiIndexBlock::kNoopOnCleanUpFn);
     });
 
+    CollectionPtr collPtr(collection);
     const auto indexCatalog = collection->getIndexCatalog();
-    const auto idIndexSpec = indexCatalog->getDefaultIdIndexSpec(collection);
+    const auto idIndexSpec = indexCatalog->getDefaultIdIndexSpec(collPtr);
 
     CollectionWriter collWriter(collection);
     auto swSpecs = indexer.init(opCtx, collWriter, idIndexSpec, MultiIndexBlock::kNoopOnInitFn);
@@ -176,12 +174,12 @@ Status buildMissingIdIndex(OperationContext* opCtx, Collection* collection) {
         return swSpecs.getStatus();
     }
 
-    auto status = indexer.insertAllDocumentsInCollection(opCtx, collection);
+    auto status = indexer.insertAllDocumentsInCollection(opCtx, collPtr);
     if (!status.isOK()) {
         return status;
     }
 
-    status = indexer.checkConstraints(opCtx, collection);
+    status = indexer.checkConstraints(opCtx, collPtr);
     if (!status.isOK()) {
         return status;
     }
@@ -211,11 +209,11 @@ auto downgradeError =
  */
 enum class EnsureIndexPolicy { kBuildMissing, kError };
 Status ensureCollectionProperties(OperationContext* opCtx,
-                                  Database* db,
+                                  const DatabaseName& dbName,
                                   EnsureIndexPolicy ensureIndexPolicy) {
     auto catalog = CollectionCatalog::get(opCtx);
-    for (auto collIt = catalog->begin(opCtx, db->name()); collIt != catalog->end(opCtx); ++collIt) {
-        auto coll = collIt.getWritableCollection(opCtx, CollectionCatalog::LifetimeMode::kInplace);
+    for (auto collIt = catalog->begin(opCtx, dbName); collIt != catalog->end(opCtx); ++collIt) {
+        auto coll = *collIt;
         if (!coll) {
             break;
         }
@@ -234,7 +232,9 @@ Status ensureCollectionProperties(OperationContext* opCtx,
                   "Collection is missing an _id index",
                   logAttrs(*coll));
             if (EnsureIndexPolicy::kBuildMissing == ensureIndexPolicy) {
-                auto status = buildMissingIdIndex(opCtx, coll);
+                auto writableCollection =
+                    catalog->lookupCollectionByUUIDForMetadataWrite(opCtx, collIt.uuid());
+                auto status = buildMissingIdIndex(opCtx, writableCollection);
                 if (!status.isOK()) {
                     LOGV2_ERROR(21021,
                                 "could not build an _id index on collection {coll_ns}: {error}",
@@ -246,6 +246,11 @@ Status ensureCollectionProperties(OperationContext* opCtx,
             } else {
                 return downgradeError;
             }
+        }
+
+        if (coll->getTimeseriesOptions() &&
+            timeseries::collectionMayRequireExtendedRangeSupport(opCtx, *coll)) {
+            coll->setRequiresTimeseriesExtendedRangeSupport(opCtx);
         }
     }
     return Status::OK();
@@ -259,13 +264,12 @@ void openDatabases(OperationContext* opCtx, const StorageEngine* storageEngine, 
     invariant(opCtx->lockState()->isW());
 
     auto databaseHolder = DatabaseHolder::get(opCtx);
-    auto tenantDbNames = storageEngine->listDatabases();
-    for (const auto& tenantDbName : tenantDbNames) {
-        LOGV2_DEBUG(21010, 1, "    Opening database: {dbName}", "dbName"_attr = tenantDbName);
-        auto db = databaseHolder->openDb(opCtx, tenantDbName);
+    auto dbNames = storageEngine->listDatabases();
+    for (const auto& dbName : dbNames) {
+        LOGV2_DEBUG(21010, 1, "    Opening database: {dbName}", "dbName"_attr = dbName);
+        auto db = databaseHolder->openDb(opCtx, dbName);
         invariant(db);
-
-        onDatabase(db);
+        onDatabase(db->name());
     }
 }
 
@@ -279,20 +283,20 @@ bool hasReplSetConfigDoc(OperationContext* opCtx) {
     // 'kSystemReplSetNamespace' collection have been populated if the collection exists. If the
     // "local" database doesn't exist at this point yet, then it will be created.
     const auto nss = NamespaceString::kSystemReplSetNamespace;
-    const TenantDatabaseName tenantDbName(boost::none, nss.db());
-    databaseHolder->openDb(opCtx, tenantDbName);
+
+    databaseHolder->openDb(opCtx, nss.dbName());
     BSONObj config;
-    return Helpers::getSingleton(opCtx, nss.ns().c_str(), config);
+    return Helpers::getSingleton(opCtx, nss, config);
 }
 
 /**
  * Check that the oplog is capped, and abort the process if it is not.
  * Caller must lock DB before calling this function.
  */
-void assertCappedOplog(OperationContext* opCtx, Database* db) {
+void assertCappedOplog(OperationContext* opCtx) {
     const NamespaceString oplogNss(NamespaceString::kRsOplogNamespace);
-    invariant(opCtx->lockState()->isDbLockedForMode(oplogNss.db(), MODE_IS));
-    const CollectionPtr& oplogCollection =
+    invariant(opCtx->lockState()->isDbLockedForMode(oplogNss.dbName(), MODE_IS));
+    const Collection* oplogCollection =
         CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, oplogNss);
     if (oplogCollection && !oplogCollection->isCapped()) {
         LOGV2_FATAL_NOTRACE(
@@ -339,8 +343,11 @@ void reconcileCatalogAndRebuildUnfinishedIndexes(
     OperationContext* opCtx,
     StorageEngine* storageEngine,
     StorageEngine::LastShutdownState lastShutdownState) {
+
     auto reconcileResult =
-        fassert(40593, storageEngine->reconcileCatalogAndIdents(opCtx, lastShutdownState));
+        fassert(40593,
+                storageEngine->reconcileCatalogAndIdents(
+                    opCtx, storageEngine->getStableTimestamp(), lastShutdownState));
 
     auto tempDir = boost::filesystem::path(storageGlobalParams.dbpath).append("_tmp");
     if (reconcileResult.indexBuildsToResume.empty() ||
@@ -396,7 +403,7 @@ void reconcileCatalogAndRebuildUnfinishedIndexes(
             LOGV2(21004,
                   "Rebuilding index. Collection: {collNss} Index: {indexName}",
                   "Rebuilding index",
-                  "namespace"_attr = collNss,
+                  logAttrs(collNss),
                   "index"_attr = indexName);
         }
 
@@ -441,7 +448,7 @@ void setReplSetMemberInStandaloneMode(OperationContext* opCtx, StartupRecoveryMo
     }
 
     invariant(opCtx->lockState()->isW());
-    CollectionPtr collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
+    const Collection* collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
         opCtx, NamespaceString::kSystemReplSetNamespace);
     if (collection && !collection->isEmpty(opCtx)) {
         setReplSetMemberInStandaloneMode(opCtx->getServiceContext(), true);
@@ -453,11 +460,11 @@ void setReplSetMemberInStandaloneMode(OperationContext* opCtx, StartupRecoveryMo
 
 // Perform startup procedures for --repair mode.
 void startupRepair(OperationContext* opCtx, StorageEngine* storageEngine) {
-    invariant(!storageGlobalParams.readOnly);
+    invariant(!storageGlobalParams.queryableBackupMode);
 
     if (MONGO_unlikely(exitBeforeDataRepair.shouldFail())) {
         LOGV2(21006, "Exiting because 'exitBeforeDataRepair' fail point was set.");
-        quickExit(EXIT_ABRUPT);
+        quickExit(ExitCode::abrupt);
     }
 
     // Repair, restore, and initialize the featureCompatibilityVersion document before allowing
@@ -469,12 +476,13 @@ void startupRepair(OperationContext* opCtx, StorageEngine* storageEngine) {
     // order to allow downgrading to older binary versions.
     ScopeGuard abortRepairOnFCVErrors(
         [&] { StorageRepairObserver::get(opCtx->getServiceContext())->onRepairDone(opCtx); });
-    if (auto fcvColl = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
+
+    auto catalog = CollectionCatalog::get(opCtx);
+    if (auto fcvColl = catalog->lookupCollectionByNamespace(
             opCtx, NamespaceString::kServerConfigurationNamespace)) {
         auto databaseHolder = DatabaseHolder::get(opCtx);
 
-        const TenantDatabaseName fcvTenantDbName(boost::none, fcvColl->ns().db());
-        databaseHolder->openDb(opCtx, fcvTenantDbName);
+        databaseHolder->openDb(opCtx, fcvColl->ns().dbName());
         fassertNoTrace(4805000,
                        repair::repairCollection(
                            opCtx, storageEngine, NamespaceString::kServerConfigurationNamespace));
@@ -486,32 +494,31 @@ void startupRepair(OperationContext* opCtx, StorageEngine* storageEngine) {
     // The local database should be repaired before any other replicated collections so we know
     // whether not to rebuild unfinished two-phase index builds if this is a replica set node
     // running in standalone mode.
-    auto tenantDbNames = storageEngine->listDatabases();
-    if (auto it = std::find(tenantDbNames.begin(),
-                            tenantDbNames.end(),
-                            TenantDatabaseName(boost::none, NamespaceString::kLocalDb));
-        it != tenantDbNames.end()) {
+    auto dbNames = storageEngine->listDatabases();
+    if (auto it = std::find(dbNames.begin(), dbNames.end(), DatabaseName::kLocal);
+        it != dbNames.end()) {
         fassertNoTrace(4805001, repair::repairDatabase(opCtx, storageEngine, *it));
 
         // This must be set before rebuilding index builds on replicated collections.
         setReplSetMemberInStandaloneMode(opCtx, StartupRecoveryMode::kAuto);
-        tenantDbNames.erase(it);
+        dbNames.erase(it);
     }
 
     // Repair the remaining databases.
-    for (const auto& tenantDbName : tenantDbNames) {
-        fassertNoTrace(18506, repair::repairDatabase(opCtx, storageEngine, tenantDbName));
+    for (const auto& dbName : dbNames) {
+        fassertNoTrace(18506, repair::repairDatabase(opCtx, storageEngine, dbName));
     }
 
-    openDatabases(opCtx, storageEngine, [&](auto db) {
+    openDatabases(opCtx, storageEngine, [&](auto dbName) {
         // Ensures all collections meet requirements such as having _id indexes, and corrects them
         // if needed.
-        uassertStatusOK(ensureCollectionProperties(opCtx, db, EnsureIndexPolicy::kBuildMissing));
+        uassertStatusOK(
+            ensureCollectionProperties(opCtx, dbName, EnsureIndexPolicy::kBuildMissing));
     });
 
     if (MONGO_unlikely(exitBeforeRepairInvalidatesConfig.shouldFail())) {
         LOGV2(21008, "Exiting because 'exitBeforeRepairInvalidatesConfig' fail point was set.");
-        quickExit(EXIT_ABRUPT);
+        quickExit(ExitCode::abrupt);
     }
 
     auto repairObserver = StorageRepairObserver::get(opCtx->getServiceContext());
@@ -538,26 +545,12 @@ void startupRepair(OperationContext* opCtx, StorageEngine* storageEngine) {
     }
 }
 
-// Perform startup procedures for read-only mode.
-void startupRecoveryReadOnly(OperationContext* opCtx, StorageEngine* storageEngine) {
-    invariant(!storageGlobalParams.repair);
-
-    setReplSetMemberInStandaloneMode(opCtx, StartupRecoveryMode::kAuto);
-
-    FeatureCompatibilityVersion::initializeForStartup(opCtx);
-
-    openDatabases(opCtx, storageEngine, [&](auto db) {
-        // Ensures all collections meet requirements such as having _id indexes.
-        uassertStatusOK(ensureCollectionProperties(opCtx, db, EnsureIndexPolicy::kError));
-    });
-}
-
 // Perform routine startup recovery procedure.
 void startupRecovery(OperationContext* opCtx,
                      StorageEngine* storageEngine,
                      StorageEngine::LastShutdownState lastShutdownState,
                      StartupRecoveryMode mode) {
-    invariant(!storageGlobalParams.readOnly && !storageGlobalParams.repair);
+    invariant(!storageGlobalParams.repair);
 
     // Determine whether this is a replica set node running in standalone mode. This must be set
     // before determining whether to restart index builds.
@@ -578,25 +571,24 @@ void startupRecovery(OperationContext* opCtx,
     const bool shouldClearNonLocalTmpCollections =
         !(hasReplSetConfigDoc(opCtx) || usingReplication);
 
-    openDatabases(opCtx, storageEngine, [&](auto db) {
-        auto dbName = db->name().dbName();
-
+    openDatabases(opCtx, storageEngine, [&](const DatabaseName& dbName) {
         // Ensures all collections meet requirements such as having _id indexes, and corrects them
         // if needed.
-        uassertStatusOK(ensureCollectionProperties(opCtx, db, EnsureIndexPolicy::kBuildMissing));
+        uassertStatusOK(
+            ensureCollectionProperties(opCtx, dbName, EnsureIndexPolicy::kBuildMissing));
 
         if (usingReplication) {
             // We only care about _id indexes and drop-pending collections if we are in a replset.
-            db->checkForIdIndexesAndDropPendingCollections(opCtx);
+            checkForIdIndexesAndDropPendingCollections(opCtx, dbName);
             // Ensure oplog is capped (mongodb does not guarantee order of inserts on noncapped
             // collections)
-            if (dbName == NamespaceString::kLocalDb) {
-                assertCappedOplog(opCtx, db);
+            if (dbName == DatabaseName::kLocal) {
+                assertCappedOplog(opCtx);
             }
         }
 
-        if (shouldClearNonLocalTmpCollections || dbName == NamespaceString::kLocalDb) {
-            db->clearTmpCollections(opCtx);
+        if (shouldClearNonLocalTmpCollections || dbName == DatabaseName::kLocal) {
+            clearTempCollections(opCtx, dbName);
         }
     });
 }
@@ -614,6 +606,12 @@ void repairAndRecoverDatabases(OperationContext* opCtx,
     auto const storageEngine = opCtx->getServiceContext()->getStorageEngine();
     Lock::GlobalWrite lk(opCtx);
 
+    // Use the BatchedCollectionCatalogWriter so all Collection writes to the in-memory catalog are
+    // done in a single copy-on-write of the catalog. This avoids quadratic behavior where we
+    // iterate over every collection and perform writes where the catalog would be copied every
+    // time.
+    BatchedCollectionCatalogWriter catalog(opCtx);
+
     // Create the FCV document for the first time, if necessary. Replica set nodes only initialize
     // the FCV when the replica set is first initiated or by data replication.
     const bool usingReplication = repl::ReplicationCoordinator::get(opCtx)->isReplEnabled();
@@ -623,8 +621,6 @@ void repairAndRecoverDatabases(OperationContext* opCtx,
 
     if (storageGlobalParams.repair) {
         startupRepair(opCtx, storageEngine);
-    } else if (storageGlobalParams.readOnly) {
-        startupRecoveryReadOnly(opCtx, storageEngine);
     } else {
         startupRecovery(opCtx, storageEngine, lastShutdownState, StartupRecoveryMode::kAuto);
     }
@@ -641,7 +637,7 @@ void runStartupRecoveryInMode(OperationContext* opCtx,
     auto const storageEngine = opCtx->getServiceContext()->getStorageEngine();
     Lock::GlobalWrite lk(opCtx);
 
-    invariant(isWriteableStorageEngine() && !storageGlobalParams.readOnly);
+    invariant(isWriteableStorageEngine());
     invariant(!storageGlobalParams.repair);
     const bool usingReplication = repl::ReplicationCoordinator::get(opCtx)->isReplEnabled();
     invariant(usingReplication);

@@ -37,9 +37,6 @@
 
 namespace mongo {
 
-class StringData;
-class NamespaceStringOrUUID;
-
 class Lock {
 public:
     /**
@@ -50,60 +47,60 @@ public:
      * resources other than RESOURCE_GLOBAL, RESOURCE_DATABASE and RESOURCE_COLLECTION.
      */
     class ResourceLock {
-        ResourceLock(const ResourceLock&) = delete;
-        ResourceLock& operator=(const ResourceLock&) = delete;
-
     public:
-        ResourceLock(Locker* locker, ResourceId rid)
-            : _rid(rid), _locker(locker), _result(LOCK_INVALID) {}
+        ResourceLock(OperationContext* opCtx,
+                     ResourceId rid,
+                     LockMode mode,
+                     Date_t deadline = Date_t::max())
+            : _opCtx(opCtx), _locker(_opCtx->lockState()), _rid(rid) {
+            _lock(mode, deadline);
+        }
 
+        // TODO (SERVER-69461): Do not any new usages of this constructor and get rid of it
         ResourceLock(Locker* locker, ResourceId rid, LockMode mode)
-            : ResourceLock(nullptr, locker, rid, mode) {}
-
-        ResourceLock(OperationContext* opCtx, Locker* locker, ResourceId rid, LockMode mode)
-            : _rid(rid), _locker(locker), _result(LOCK_INVALID) {
-            lock(opCtx, mode);
+            : _opCtx(nullptr), _locker(locker), _rid(rid) {
+            _lock(mode);
         }
 
         ResourceLock(ResourceLock&& otherLock)
-            : _rid(otherLock._rid), _locker(otherLock._locker), _result(otherLock._result) {
-            // Mark as moved so the destructor doesn't invalidate the newly-
-            // constructed lock.
+            : _opCtx(otherLock._opCtx),
+              _locker(otherLock._locker),
+              _rid(std::move(otherLock._rid)),
+              _result(otherLock._result) {
+            otherLock._opCtx = nullptr;
+            otherLock._locker = nullptr;
             otherLock._result = LOCK_INVALID;
         }
 
         ~ResourceLock() {
-            if (isLocked()) {
-                unlock();
-            }
+            _unlock();
         }
 
+    protected:
         /**
          * Acquires lock on this specified resource in the specified mode.
          *
-         * If 'opCtx' is provided, it will be used to interrupt a LOCK_WAITING state.
          * If 'deadline' is provided, we will wait until 'deadline' for the lock to be granted.
          * Otherwise, this parameter defaults to an infinite deadline.
          *
          * This function may throw an exception if it is interrupted.
          */
-        void lock(OperationContext* opCtx, LockMode mode, Date_t deadline = Date_t::max());
-
-        void unlock();
-
-        bool isLocked() const {
+        void _lock(LockMode mode, Date_t deadline = Date_t::max());
+        void _unlock();
+        bool _isLocked() const {
             return _result == LOCK_OK;
         }
 
+        OperationContext* _opCtx;
+
+        // TODO (SERVER-69461): Get rid of this field when the Locker-only constructor is removed.
+        Locker* _locker;
+
+        ResourceId _rid;
+
     private:
-        const ResourceId _rid;
-        Locker* const _locker;
-
-        LockResult _result;
+        LockResult _result{LOCK_INVALID};
     };
-
-    class SharedLock;
-    class ExclusiveLock;
 
     /**
      * For use as general mutex or readers/writers lock, outside the general multi-granularity
@@ -117,7 +114,14 @@ public:
 
         std::string getName() const {
             return getName(_rid);
-        };
+        }
+
+        /**
+         * Each instantiation of this class allocates a new ResourceId.
+         */
+        ResourceId getRid() const {
+            return _rid;
+        }
 
         static std::string getName(ResourceId resourceId);
 
@@ -126,17 +130,27 @@ public:
         bool isAtLeastReadLocked(Locker* locker);
 
     private:
-        friend class Lock::SharedLock;
-        friend class Lock::ExclusiveLock;
+        const ResourceId _rid;
 
         /**
-         * Each instantiation of this class allocates a new ResourceId.
+         * ResourceMutexes can be constructed during initialization, thus the code must ensure the
+         * vector of labels is constructed before items are added to it. This factory encapsulates
+         * all members that need to be initialized before first use.
          */
-        ResourceId rid() const {
-            return _rid;
-        }
+        class ResourceIdFactory {
+        public:
+            static ResourceId newResourceIdForMutex(std::string resourceLabel);
 
-        const ResourceId _rid;
+            static std::string nameForId(ResourceId resourceId);
+
+        private:
+            static ResourceIdFactory& _resourceIdFactory();
+            ResourceId _newResourceIdForMutex(std::string resourceLabel);
+
+            std::uint64_t nextId = 0;
+            std::vector<std::string> labels;
+            Mutex labelsMutex = MONGO_MAKE_LATCH("ResourceIdFactory::labelsMutex");
+        };
     };
 
     /**
@@ -144,23 +158,30 @@ public:
      */
     class ExclusiveLock : public ResourceLock {
     public:
+        ExclusiveLock(OperationContext* opCtx, ResourceMutex mutex)
+            : ResourceLock(opCtx, mutex.getRid(), MODE_X) {}
+
         ExclusiveLock(Locker* locker, ResourceMutex mutex)
-            : ExclusiveLock(nullptr, locker, mutex) {}
+            : ResourceLock(locker, mutex.getRid(), MODE_X) {}
 
-        /**
-         * Interruptible lock acquisition.
-         */
-        ExclusiveLock(OperationContext* opCtx, Locker* locker, ResourceMutex mutex)
-            : ResourceLock(opCtx, locker, mutex.rid(), MODE_X) {}
+        // Lock/unlock overloads to allow ExclusiveLock to be used with condition_variable-like
+        // utilities such as stdx::condition_variable_any and waitForConditionOrInterrupt
 
-        using ResourceLock::lock;
-
-        /**
-         * Parameterless overload to allow ExclusiveLock to be used with stdx::unique_lock and
-         * stdx::condition_variable_any
-         */
         void lock() {
-            lock(nullptr, MODE_X);
+            // The contract of the condition_variable-like utilities is that that the lock is
+            // returned in the locked state so the acquisition below must be guaranteed to always
+            // succeed.
+            invariant(_opCtx);
+            UninterruptibleLockGuard ulg(_opCtx->lockState());  // NOLINT.
+            _lock(MODE_X);
+        }
+
+        void unlock() {
+            _unlock();
+        }
+
+        bool isLocked() const {
+            return _isLocked();
         }
     };
 
@@ -171,13 +192,11 @@ public:
      */
     class SharedLock : public ResourceLock {
     public:
-        SharedLock(Locker* locker, ResourceMutex mutex) : SharedLock(nullptr, locker, mutex) {}
+        SharedLock(OperationContext* opCtx, ResourceMutex mutex)
+            : ResourceLock(opCtx, mutex.getRid(), MODE_IS) {}
 
-        /**
-         * Interruptible lock acquisition.
-         */
-        SharedLock(OperationContext* opCtx, Locker* locker, ResourceMutex mutex)
-            : ResourceLock(opCtx, locker, mutex.rid(), MODE_IS) {}
+        SharedLock(Locker* locker, ResourceMutex mutex)
+            : ResourceLock(locker, mutex.getRid(), MODE_IS) {}
     };
 
     /**
@@ -187,6 +206,11 @@ public:
         kThrow,         // Throw the interruption exception.
         kLeaveUnlocked  // Suppress the exception, but leave unlocked such that a call to isLocked()
                         // returns false.
+    };
+
+    struct GlobalLockSkipOptions {
+        bool skipFlowControlTicket = false;
+        bool skipRSTLLock = false;
     };
 
     /**
@@ -212,8 +236,13 @@ public:
         GlobalLock(OperationContext* opCtx,
                    LockMode lockMode,
                    Date_t deadline,
+                   InterruptBehavior behavior);
+
+        GlobalLock(OperationContext* opCtx,
+                   LockMode lockMode,
+                   Date_t deadline,
                    InterruptBehavior behavior,
-                   bool skipRSTLLock = false);
+                   GlobalLockSkipOptions skipOptions);
 
         GlobalLock(GlobalLock&&);
 
@@ -250,8 +279,11 @@ public:
         void _unlock();
 
         OperationContext* const _opCtx;
-        LockResult _result;
-        ResourceLock _pbwm;
+        LockResult _result{LOCK_INVALID};
+
+        boost::optional<ResourceLock> _pbwm;
+        boost::optional<ResourceLock> _fcvLock;
+
         InterruptBehavior _interruptBehavior;
         bool _skipRSTLLock;
         const bool _isOutermostLock;
@@ -287,6 +319,8 @@ public:
             : GlobalLock(opCtx, MODE_S, deadline, behavior) {}
     };
 
+    using DBLockSkipOptions = GlobalLockSkipOptions;
+
     /**
      * Database lock.
      *
@@ -304,20 +338,18 @@ public:
     class DBLock {
     public:
         DBLock(OperationContext* opCtx,
-               StringData db,
+               const DatabaseName& dbName,
                LockMode mode,
-               Date_t deadline = Date_t::max(),
-               bool skipGlobalAndRSTLLocks = false);
+               Date_t deadline = Date_t::max());
+
+        DBLock(OperationContext* opCtx,
+               const DatabaseName& dbName,
+               LockMode mode,
+               Date_t deadline,
+               DBLockSkipOptions skipOptions);
+
         DBLock(DBLock&&);
         ~DBLock();
-
-        /**
-         * Releases the DBLock and reacquires it with the new mode. The global intent
-         * lock is retained (so the database can't disappear). Relocking from MODE_IS or
-         * MODE_S to MODE_IX or MODE_X is not allowed to avoid violating the global intent.
-         * Use relockWithMode() instead of upgrading to avoid deadlock.
-         */
-        void relockWithMode(LockMode newMode);
 
         bool isLocked() const {
             return _result == LOCK_OK;
@@ -359,7 +391,7 @@ public:
 
     public:
         CollectionLock(OperationContext* opCtx,
-                       const NamespaceStringOrUUID& nssOrUUID,
+                       const NamespaceString& ns,
                        LockMode mode,
                        Date_t deadline = Date_t::max());
 
@@ -382,7 +414,7 @@ public:
         ParallelBatchWriterMode& operator=(const ParallelBatchWriterMode&) = delete;
 
     public:
-        explicit ParallelBatchWriterMode(Locker* lockState);
+        explicit ParallelBatchWriterMode(OperationContext* opCtx);
 
     private:
         ResourceLock _pbwm;

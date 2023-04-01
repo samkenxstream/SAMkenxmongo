@@ -27,118 +27,40 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands/authentication_commands.h"
 
-#include <memory>
 #include <string>
-#include <vector>
 
 #include "mongo/base/status.h"
-#include "mongo/bson/mutable/algorithm.h"
-#include "mongo/bson/mutable/document.h"
 #include "mongo/client/authenticate.h"
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/auth_options_gen.h"
 #include "mongo/db/auth/authentication_session.h"
+#include "mongo/db/auth/authorization_manager_global_parameters_gen.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/cluster_auth_mode.h"
-#include "mongo/db/auth/privilege.h"
-#include "mongo/db/auth/security_key.h"
-#include "mongo/db/auth/user_name.h"
-#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/authentication_commands_gen.h"
 #include "mongo/db/commands/test_commands_enabled.h"
-#include "mongo/db/commands/user_management_commands_gen.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/logv2/log.h"
-#include "mongo/platform/random.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/transport/session.h"
-#include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/net/ssl_types.h"
-#include "mongo/util/text.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
+
 
 namespace mongo {
 namespace {
 
 constexpr auto kExternalDB = "$external"_sd;
 constexpr auto kDBFieldName = "db"_sd;
-
-/**
- * Returns a random 64-bit nonce.
- *
- * Previously, this command would have been called prior to {authenticate: ...}
- * when using the MONGODB-CR authentication mechanism.
- * Since that mechanism has been removed from MongoDB 3.8,
- * it is nominally no longer required.
- *
- * Unfortunately, mongo-tools uses a connection library
- * which optimistically invokes {getnonce: 1} upon connection
- * under the assumption that it will eventually be used as part
- * of "classic" authentication.
- * If the command dissapeared, then all of mongo-tools would
- * fail to connect, despite using SCRAM-SHA-1 or another valid
- * auth mechanism. Thus, we have to keep this command around for now.
- *
- * Note that despite nonces being available, they are not bound
- * to the AuthorizationSession anymore, and the authenticate
- * command doesn't acknowledge their existence.
- */
-class CmdGetNonce : public BasicCommand {
-public:
-    CmdGetNonce() : BasicCommand("getnonce") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kAlways;
-    }
-
-    std::string help() const final {
-        return "internal";
-    }
-
-    bool supportsWriteConcern(const BSONObj& cmd) const final {
-        return false;
-    }
-
-    bool requiresAuth() const override {
-        return false;
-    }
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const final {
-        // No auth required since this command was explicitly part
-        // of an authentication workflow.
-    }
-
-    bool run(OperationContext* opCtx,
-             const std::string&,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) final {
-        CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
-        auto n = getNextNonce();
-        std::stringstream ss;
-        ss << std::hex << n;
-        result.append("nonce", ss.str());
-        return true;
-    }
-
-private:
-    int64_t getNextNonce() {
-        stdx::lock_guard<SimpleMutex> lk(_randMutex);
-        return _random.nextInt64();
-    }
-
-    SimpleMutex _randMutex;  // Synchronizes accesses to _random.
-    SecureRandom _random;
-} cmdGetNonce;
 
 /**
  * A simple class to track "global" parameters related to the logout command.
@@ -198,7 +120,8 @@ public:
             auto dbname = request().getDbName();
             auto* as = AuthorizationSession::get(opCtx->getClient());
 
-            as->logoutDatabase(opCtx->getClient(), dbname, "Logging out on user request");
+            as->logoutDatabase(
+                opCtx->getClient(), dbname.toStringWithTenantId(), "Logging out on user request");
             if (getTestCommandsEnabled() && (dbname == kAdminDB)) {
                 // Allows logging out as the internal user against the admin database, however
                 // this actually logs out of the local database as well. This is to
@@ -214,6 +137,32 @@ public:
 } cmdLogout;
 
 #ifdef MONGO_CONFIG_SSL
+}  // namespace
+
+UserRequest getX509UserRequest(OperationContext* opCtx, UserRequest request) {
+    std::shared_ptr<transport::Session> session;
+    if (opCtx && opCtx->getClient()) {
+        session = opCtx->getClient()->session();
+    }
+
+    if (!allowRolesFromX509Certificates || !session || request.roles) {
+        return request;
+    }
+
+    auto& sslPeerInfo = SSLPeerInfo::forSession(session);
+    auto&& peerRoles = sslPeerInfo.roles();
+    if (peerRoles.empty() || (sslPeerInfo.subjectName().toString() != request.name.getUser())) {
+        return request;
+    }
+
+    // In order to be hashable, the role names must be converted from unordered_set to a set.
+    request.roles = std::set<RoleName>();
+    std::copy(
+        peerRoles.begin(), peerRoles.end(), std::inserter(*request.roles, request.roles->begin()));
+    return request;
+}
+
+namespace {
 constexpr auto kX509AuthenticationDisabledMessage = "x.509 authentication is disabled."_sd;
 
 /**
@@ -232,15 +181,15 @@ void _authenticateX509(OperationContext* opCtx, AuthenticationSession* session) 
     auto client = opCtx->getClient();
 
     auto& sslPeerInfo = SSLPeerInfo::forSession(client->session());
-    auto clientName = sslPeerInfo.subjectName;
+    auto clientName = sslPeerInfo.subjectName();
     uassert(ErrorCodes::AuthenticationFailed,
             "No verified subject name available from client",
             !clientName.empty());
 
-    auto user = [&] {
+    UserName userName = ([&] {
         if (session->getUserName().empty()) {
             auto user = UserName(clientName.toString(), session->getDatabase().toString());
-            session->updateUserName(user);
+            session->updateUserName(user, true /* isMechX509 */);
             return user;
         } else {
             uassert(ErrorCodes::AuthenticationFailed,
@@ -248,7 +197,7 @@ void _authenticateX509(OperationContext* opCtx, AuthenticationSession* session) 
                     session->getUserName() == clientName.toString());
             return UserName(session->getUserName().toString(), session->getDatabase().toString());
         }
-    }();
+    })();
 
     uassert(ErrorCodes::ProtocolError,
             "SSL support is required for the MONGODB-X509 mechanism.",
@@ -256,15 +205,15 @@ void _authenticateX509(OperationContext* opCtx, AuthenticationSession* session) 
 
     AuthorizationSession* authorizationSession = AuthorizationSession::get(client);
 
-    auto sslConfiguration = opCtx->getClient()->session()->getSSLConfiguration();
+    auto sslConfiguration = opCtx->getClient()->session()->getSSLManager()->getSSLConfiguration();
 
     uassert(ErrorCodes::AuthenticationFailed,
             "Unable to verify x.509 certificate, as no CA has been provided.",
-            sslConfiguration->hasCA);
+            sslConfiguration.hasCA);
 
     uassert(ErrorCodes::ProtocolError,
             "X.509 authentication must always use the $external database.",
-            user.getDB() == kExternalDB);
+            userName.getDB() == kExternalDB);
 
     auto isInternalClient = [&]() -> bool {
         return opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient;
@@ -272,14 +221,15 @@ void _authenticateX509(OperationContext* opCtx, AuthenticationSession* session) 
 
     const auto clusterAuthMode = ClusterAuthMode::get(opCtx->getServiceContext());
 
+    auto request = getX509UserRequest(opCtx, UserRequest(userName, boost::none));
     auto authorizeExternalUser = [&] {
         uassert(ErrorCodes::BadValue,
                 kX509AuthenticationDisabledMessage,
                 !isX509AuthDisabled(opCtx->getServiceContext()));
-        uassertStatusOK(authorizationSession->addAndAuthorizeUser(opCtx, user));
+        uassertStatusOK(authorizationSession->addAndAuthorizeUser(opCtx, request, boost::none));
     };
 
-    if (sslConfiguration->isClusterMember(clientName)) {
+    if (sslConfiguration.isClusterMember(clientName)) {
         // Handle internal cluster member auth, only applies to server-server connections
         if (!clusterAuthMode.allowsX509()) {
             uassert(ErrorCodes::AuthenticationFailed,
@@ -333,55 +283,37 @@ AuthenticateReply authCommand(OperationContext* opCtx,
                     "client"_attr = client->getRemote(),
                     "mechanism"_attr = mechanism,
                     "user"_attr = user,
-                    "db"_attr = dbname);
+                    logAttrs(dbname));
     }
 
+    session->metrics()->restart();
+
     auto& internalSecurityUser = (*internalSecurity.getUser())->getName();
-    if (getTestCommandsEnabled() && dbname == "admin" && user == internalSecurityUser.getUser()) {
+    if (getTestCommandsEnabled() && dbname.db() == "admin" &&
+        user == internalSecurityUser.getUser()) {
         // Allows authenticating as the internal user against the admin database.  This is to
         // support the auth passthrough test framework on mongos (since you can't use the local
         // database on a mongos, so you can't auth as the internal user without this).
-        session->updateUserName(internalSecurityUser);
+        session->updateUserName(internalSecurityUser, mechanism == auth::kMechanismMongoX509);
     } else {
-        session->updateUserName(UserName{user, dbname});
+        session->updateUserName(UserName{user, dbname}, mechanism == auth::kMechanismMongoX509);
     }
 
     if (mechanism.empty()) {
         uasserted(ErrorCodes::BadValue, "Auth mechanism not specified");
     }
+
     session->setMechanismName(mechanism);
 
-    try {
-        _authenticate(opCtx, session, mechanism);
-        if (!serverGlobalParams.quiet.load()) {
-            LOGV2(20429,
-                  "Successfully authenticated",
-                  "client"_attr = client->getRemote(),
-                  "mechanism"_attr = mechanism,
-                  "user"_attr = session->getUserName(),
-                  "db"_attr = session->getDatabase());
-        }
+    _authenticate(opCtx, session, mechanism);
 
-        session->markSuccessful();
+    session->markSuccessful();
 
-        AuthenticateReply reply;
-        reply.setUser(session->getUserName());
-        reply.setDbname(session->getDatabase());
-        return reply;
+    AuthenticateReply reply;
+    reply.setUser(session->getUserName());
+    reply.setDbname(session->getDatabase());
 
-    } catch (const AssertionException& ex) {
-        if (!serverGlobalParams.quiet.load()) {
-            LOGV2(20428,
-                  "Failed to authenticate",
-                  "client"_attr = client->getRemote(),
-                  "mechanism"_attr = mechanism,
-                  "user"_attr = session->getUserName(),
-                  "db"_attr = session->getDatabase(),
-                  "error"_attr = ex.toStatus());
-        }
-
-        throw;
-    }
+    return reply;
 }
 
 class CmdAuthenticate final : public AuthenticateCmdVersion1Gen<CmdAuthenticate> {
@@ -402,17 +334,30 @@ public:
             return NamespaceString(request().getDbName());
         }
 
-        Reply typedRun(OperationContext* opCtx) final {
+        Reply typedRun(OperationContext* opCtx) final try {
             return AuthenticationSession::doStep(
                 opCtx, AuthenticationSession::StepType::kAuthenticate, [&](auto session) {
                     CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
                     return authCommand(opCtx, session, request());
                 });
+        } catch (const DBException& ex) {
+            switch (ex.code()) {
+                case ErrorCodes::UserNotFound:
+                case ErrorCodes::ProtocolError:
+                    throw;
+                default:
+                    uasserted(AuthorizationManager::authenticationFailedStatus.code(),
+                              AuthorizationManager::authenticationFailedStatus.reason());
+            }
         }
     };
 
     bool requiresAuth() const final {
         return false;
+    }
+
+    HandshakeRole handshakeRole() const final {
+        return HandshakeRole::kAuth;
     }
 
 } cmdAuthenticate;
@@ -442,8 +387,8 @@ void doSpeculativeAuthenticate(OperationContext* opCtx,
         cmd.append(AuthenticateCommand::kDbNameFieldName, kExternalDB);
     }
 
-    auto authCmdObj = AuthenticateCommand::parse(
-        IDLParserErrorContext("speculative X509 Authenticate"), cmd.obj());
+    auto authCmdObj =
+        AuthenticateCommand::parse(IDLParserContext("speculative X509 Authenticate"), cmd.obj());
 
     AuthenticationSession::doStep(
         opCtx, AuthenticationSession::StepType::kSpeculativeAuthenticate, [&](auto session) {

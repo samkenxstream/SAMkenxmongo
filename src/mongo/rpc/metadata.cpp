@@ -33,7 +33,7 @@
 
 #include "mongo/client/read_preference.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/security_token.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_time_validator.h"
@@ -95,9 +95,7 @@ void readRequestMetadata(OperationContext* opCtx, const OpMsg& opMsg, bool cmdRe
     }
 
     readImpersonatedUserMetadata(impersonationElem, opCtx);
-    auth::readSecurityTokenMetadata(opCtx, opMsg.securityToken);
-
-    parseDollarTenantFromRequest(opCtx, opMsg);
+    auth::ValidatedTenancyScope::set(opCtx, opMsg.validatedTenancyScope);
 
     // We check for "$client" but not "client" here, because currentOp can filter on "client" as
     // a top-level field.
@@ -135,30 +133,19 @@ bool isArrayOfObjects(BSONElement array) {
 }
 }  // namespace
 
-OpMsgRequest upconvertRequest(StringData db, BSONObj cmdObj, int queryFlags) {
+
+OpMsgRequest upconvertRequest(const DatabaseName& dbName, BSONObj cmdObj, int queryFlags) {
     cmdObj = cmdObj.getOwned();  // Usually this is a no-op since it is already owned.
 
     auto readPrefContainer = BSONObj();
-    const StringData firstFieldName = cmdObj.firstElementFieldName();
-    if (firstFieldName == "$query" || firstFieldName == "query") {
-        // Commands sent over OP_QUERY specify read preference by putting it at the top level and
-        // putting the command in a nested field called either query or $query.
-
-        // Check if legacyCommand has an invalid $maxTimeMS option.
-        uassert(ErrorCodes::InvalidOptions,
-                "cannot use $maxTimeMS query option with commands; use maxTimeMS command option "
-                "instead",
-                !cmdObj.hasField("$maxTimeMS"));
-
-        if (auto readPref = cmdObj["$readPreference"])
-            readPrefContainer = readPref.wrap();
-
-        cmdObj = cmdObj.firstElement().Obj().shareOwnershipWith(cmdObj);
-    } else if (auto queryOptions = cmdObj["$queryOptions"]) {
+    if (auto queryOptions = cmdObj["$queryOptions"]) {
         // Mongos rewrites commands with $readPreference to put it in a field nested inside of
         // $queryOptions. Its command implementations often forward commands in that format to
         // shards. This function is responsible for rewriting it to a format that the shards
         // understand.
+        //
+        // TODO SERVER-29091: The use of $queryOptions is a holdover related to the
+        // no-longer-supported OP_QUERY format. We should remove it from the code base.
         readPrefContainer = queryOptions.Obj().shareOwnershipWith(cmdObj);
         cmdObj = cmdObj.removeField("$queryOptions");
     }
@@ -182,13 +169,13 @@ OpMsgRequest upconvertRequest(StringData db, BSONObj cmdObj, int queryFlags) {
         ? BSONElement()
         : cmdObj[docSequenceIt->second];
     if (!isArrayOfObjects(docSequenceElem))
-        return OpMsgRequest::fromDBAndBody(db, std::move(cmdObj));
+        return OpMsgRequestBuilder::create(dbName, std::move(cmdObj));
 
     auto docSequenceName = docSequenceElem.fieldNameStringData();
 
     // Note: removing field before adding "$db" to avoid the need to copy the potentially large
     // array.
-    auto out = OpMsgRequest::fromDBAndBody(db, cmdObj.removeField(docSequenceName));
+    auto out = OpMsgRequestBuilder::create(dbName, cmdObj.removeField(docSequenceName));
     out.sequences.push_back({docSequenceName.toString()});
     for (auto elem : docSequenceElem.Obj()) {
         out.sequences[0].objs.push_back(elem.Obj().shareOwnershipWith(cmdObj));

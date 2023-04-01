@@ -70,13 +70,16 @@ var ChunkHelper = (function() {
             moveChunk: db[collName].getFullName(),
             bounds: bounds,
             to: toShard,
-            _waitForDelete: waitForDelete
         };
+
+        if (waitForDelete != null) {
+            cmd._waitForDelete = waitForDelete;
+        }
 
         // Using _secondaryThrottle adds coverage for additional waits for write concern on the
         // recipient during cloning.
-        if (secondaryThrottle) {
-            cmd._secondaryThrottle = true;
+        if (secondaryThrottle != null) {
+            cmd._secondaryThrottle = secondaryThrottle;
             cmd.writeConcern = {w: "majority"};  // _secondaryThrottle requires a write concern.
         }
 
@@ -89,6 +92,9 @@ var ChunkHelper = (function() {
             res => (res.code === ErrorCodes.ConflictingOperationInProgress ||
                     res.code === ErrorCodes.ChunkRangeCleanupPending ||
                     res.code === ErrorCodes.LockTimeout ||
+                    // TODO: SERVER-74105 remove. setFCV can cause catalog cache refresh to get
+                    // interrupted.
+                    res.code === ErrorCodes.Interrupted ||
                     // The chunk migration has surely been aborted if the startCommit of the
                     // procedure was interrupted by a stepdown.
                     (runningWithStepdowns && res.code === ErrorCodes.CommandFailed &&

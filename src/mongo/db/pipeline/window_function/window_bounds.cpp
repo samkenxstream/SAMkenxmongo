@@ -63,12 +63,15 @@ WindowBounds::Bound<T> parseBound(ExpressionContext* expCtx,
 }
 
 template <class T>
-Value serializeBound(const WindowBounds::Bound<T>& bound) {
+Value serializeBound(const WindowBounds::Bound<T>& bound, SerializationOptions opts) {
     return stdx::visit(
-        visit_helper::Overloaded{
-            [](const WindowBounds::Unbounded&) { return Value(WindowBounds::kValUnbounded); },
-            [](const WindowBounds::Current&) { return Value(WindowBounds::kValCurrent); },
-            [](const T& n) { return Value(n); },
+        OverloadedVisitor{
+            [&](const WindowBounds::Unbounded&) { return Value(WindowBounds::kValUnbounded); },
+            [&](const WindowBounds::Current&) { return Value(WindowBounds::kValCurrent); },
+            [&](const T& n) {
+                // If not "unbounded" or "current", n must be a literal constant
+                return opts.serializeLiteralValue(n);
+            },
         },
         bound);
 }
@@ -114,12 +117,16 @@ bool WindowBounds::isUnbounded() const {
     return stdx::visit(unbounded, bounds);
 }
 
-WindowBounds WindowBounds::parse(BSONObj args,
+WindowBounds WindowBounds::parse(BSONElement args,
                                  const boost::optional<SortPattern>& sortBy,
                                  ExpressionContext* expCtx) {
-    auto documents = args[kArgDocuments];
-    auto range = args[kArgRange];
-    auto unit = args[kArgUnit];
+    uassert(ErrorCodes::FailedToParse,
+            "'window' field must be an object",
+            args.type() == BSONType::Object);
+    auto argObj = args.embeddedObject();
+    auto documents = argObj[kArgDocuments];
+    auto range = argObj[kArgRange];
+    auto unit = argObj[kArgUnit];
 
     uassert(ErrorCodes::FailedToParse,
             str::stream() << "Window bounds can specify either '" << kArgDocuments << "' or '"
@@ -137,7 +144,7 @@ WindowBounds WindowBounds::parse(BSONObj args,
                 str::stream() << "'window' field can only contain '" << kArgDocuments
                               << "' as the only argument or '" << kArgRange
                               << "' with an optional '" << kArgUnit << "' field",
-                args.nFields() == 0);
+                argObj.nFields() == 0);
         return defaultBounds();
     }
 
@@ -154,7 +161,7 @@ WindowBounds WindowBounds::parse(BSONObj args,
         uassert(ErrorCodes::FailedToParse,
                 str::stream() << "'window' field that specifies " << kArgDocuments
                               << " cannot have other fields",
-                args.nFields() == 1);
+                argObj.nFields() == 1);
         // Parse document-based bounds.
         auto [lowerElem, upperElem] = unpack(documents);
 
@@ -178,7 +185,7 @@ WindowBounds WindowBounds::parse(BSONObj args,
             uassert(ErrorCodes::FailedToParse,
                     str::stream() << "'window' field that specifies " << kArgUnit
                                   << " cannot have other fields besides 'range'",
-                    args.nFields() == 2);
+                    argObj.nFields() == 2);
             uassert(ErrorCodes::FailedToParse,
                     str::stream() << "'" << kArgUnit << "' must be a string",
                     unit.type() == BSONType::String);
@@ -200,7 +207,7 @@ WindowBounds WindowBounds::parse(BSONObj args,
             uassert(ErrorCodes::FailedToParse,
                     str::stream() << "'window' field that specifies " << kArgRange
                                   << " cannot have other fields besides 'unit'",
-                    args.nFields() == 1);
+                    argObj.nFields() == 1);
             auto parseNumber = [](Value v) -> Value {
                 uassert(ErrorCodes::FailedToParse,
                         "Range-based bounds expression must be a number",
@@ -218,25 +225,25 @@ WindowBounds WindowBounds::parse(BSONObj args,
         return bounds;
     }
 }
-void WindowBounds::serialize(MutableDocument& args) const {
-    stdx::visit(
-        visit_helper::Overloaded{
-            [&](const DocumentBased& docBounds) {
-                args[kArgDocuments] = Value{std::vector<Value>{
-                    serializeBound(docBounds.lower),
-                    serializeBound(docBounds.upper),
-                }};
-            },
-            [&](const RangeBased& rangeBounds) {
-                args[kArgRange] = Value{std::vector<Value>{
-                    serializeBound(rangeBounds.lower),
-                    serializeBound(rangeBounds.upper),
-                }};
-                if (rangeBounds.unit) {
-                    args[kArgUnit] = Value{serializeTimeUnit(*rangeBounds.unit)};
-                }
-            },
-        },
-        bounds);
+void WindowBounds::serialize(MutableDocument& args, SerializationOptions opts) const {
+    stdx::visit(OverloadedVisitor{
+                    [&](const DocumentBased& docBounds) {
+                        args[kArgDocuments] = Value{std::vector<Value>{
+                            serializeBound(docBounds.lower, opts),
+                            serializeBound(docBounds.upper, opts),
+                        }};
+                    },
+                    [&](const RangeBased& rangeBounds) {
+                        args[kArgRange] = Value{std::vector<Value>{
+                            serializeBound(rangeBounds.lower, opts),
+                            serializeBound(rangeBounds.upper, opts),
+                        }};
+                        if (rangeBounds.unit) {
+                            args[kArgUnit] = Value{
+                                opts.serializeLiteralValue(serializeTimeUnit(*rangeBounds.unit))};
+                        }
+                    },
+                },
+                bounds);
 }
 }  // namespace mongo

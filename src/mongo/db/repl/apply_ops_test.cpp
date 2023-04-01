@@ -34,7 +34,7 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
-#include "mongo/db/op_observer_noop.h"
+#include "mongo/db/op_observer/op_observer_noop.h"
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
@@ -56,7 +56,7 @@ public:
      * Called by applyOps() when ops are applied atomically.
      */
     void onApplyOps(OperationContext* opCtx,
-                    const std::string& dbName,
+                    const DatabaseName& dbName,
                     const BSONObj& applyOpCmd) override;
 
     // If not empty, holds the command object passed to last invocation of onApplyOps().
@@ -64,7 +64,7 @@ public:
 };
 
 void OpObserverMock::onApplyOps(OperationContext* opCtx,
-                                const std::string& dbName,
+                                const DatabaseName& dbName,
                                 const BSONObj& applyOpCmd) {
     ASSERT_FALSE(applyOpCmd.isEmpty());
     // Get owned copy because 'applyOpCmd' may be a temporary BSONObj created by applyOps().
@@ -139,7 +139,7 @@ TEST_F(ApplyOpsTest, CommandInNestedApplyOpsReturnsSuccess) {
     auto opCtx = cc().makeOperationContext();
     auto mode = OplogApplication::Mode::kApplyOpsCmd;
     BSONObjBuilder resultBuilder;
-    NamespaceString nss("test", "foo");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "foo");
     auto innerCmdObj =
         BSON("op"
              << "c"
@@ -150,42 +150,8 @@ TEST_F(ApplyOpsTest, CommandInNestedApplyOpsReturnsSuccess) {
                                  << BSON("applyOps" << BSON_ARRAY(innerCmdObj)));
     auto cmdObj = BSON("applyOps" << BSON_ARRAY(innerApplyOpsObj));
 
-    ASSERT_OK(applyOps(opCtx.get(), nss.db().toString(), cmdObj, mode, &resultBuilder));
+    ASSERT_OK(applyOps(opCtx.get(), nss.dbName(), cmdObj, mode, &resultBuilder));
     ASSERT_BSONOBJ_EQ({}, _opObserver->onApplyOpsCmdObj);
-}
-
-TEST_F(ApplyOpsTest, InsertInNestedApplyOpsReturnsSuccess) {
-    auto opCtx = cc().makeOperationContext();
-    auto mode = OplogApplication::Mode::kApplyOpsCmd;
-    // Make sure the apply ops command object contains the correct UUID information.
-    CollectionOptions options;
-    options.uuid = UUID::gen();
-    BSONObjBuilder resultBuilder;
-    NamespaceString nss("test", "foo");
-    auto innerCmdObj = BSON("op"
-                            << "i"
-                            << "ns" << nss.ns() << "o"
-                            << BSON("_id"
-                                    << "a")
-                            << "ui" << options.uuid.get());
-    auto innerApplyOpsObj = BSON("op"
-                                 << "c"
-                                 << "ns" << nss.getCommandNS().ns() << "o"
-                                 << BSON("applyOps" << BSON_ARRAY(innerCmdObj)));
-    auto cmdObj = BSON("applyOps" << BSON_ARRAY(innerApplyOpsObj));
-
-    ASSERT_OK(_storage->createCollection(opCtx.get(), nss, options));
-    ASSERT_OK(applyOps(opCtx.get(), nss.db().toString(), cmdObj, mode, &resultBuilder));
-    ASSERT_BSONOBJ_EQ(BSON("applyOps" << BSON_ARRAY(innerCmdObj)), _opObserver->onApplyOpsCmdObj);
-}
-
-TEST_F(ApplyOpsTest, AtomicApplyOpsWithNoOpsReturnsSuccess) {
-    auto opCtx = cc().makeOperationContext();
-    auto mode = OplogApplication::Mode::kApplyOpsCmd;
-    BSONObjBuilder resultBuilder;
-    auto cmdObj = BSON("applyOps" << BSONArray());
-    ASSERT_OK(applyOps(opCtx.get(), "test", cmdObj, mode, &resultBuilder));
-    ASSERT_BSONOBJ_EQ(cmdObj, _opObserver->onApplyOpsCmdObj);
 }
 
 /**
@@ -203,44 +169,24 @@ BSONObj makeApplyOpsWithInsertOperation(const NamespaceString& nss,
     return BSON("applyOps" << BSON_ARRAY(insertOp));
 }
 
-TEST_F(ApplyOpsTest,
-       AtomicApplyOpsInsertIntoNonexistentCollectionReturnsNamespaceNotFoundInResult) {
+TEST_F(ApplyOpsTest, ApplyOpsInsertIntoNonexistentCollectionReturnsNamespaceNotFoundInResult) {
     auto opCtx = cc().makeOperationContext();
     auto mode = OplogApplication::Mode::kApplyOpsCmd;
-    NamespaceString nss("test.t");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.t");
     auto documentToInsert = BSON("_id" << 0);
     auto cmdObj = makeApplyOpsWithInsertOperation(nss, boost::none, documentToInsert);
     BSONObjBuilder resultBuilder;
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
-                  applyOps(opCtx.get(), "test", cmdObj, mode, &resultBuilder));
+                  applyOps(opCtx.get(), DatabaseName("test"), cmdObj, mode, &resultBuilder));
     auto result = resultBuilder.obj();
     auto status = getStatusFromApplyOpsResult(result);
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, status);
 }
 
-
-TEST_F(ApplyOpsTest, AtomicApplyOpsInsertWithUuidIntoCollectionWithUuid) {
+TEST_F(ApplyOpsTest, ApplyOpsInsertWithUuidIntoCollectionWithOtherUuid) {
     auto opCtx = cc().makeOperationContext();
     auto mode = OplogApplication::Mode::kApplyOpsCmd;
-    NamespaceString nss("test.t");
-
-    auto uuid = UUID::gen();
-
-    CollectionOptions collectionOptions;
-    collectionOptions.uuid = uuid;
-    ASSERT_OK(_storage->createCollection(opCtx.get(), nss, collectionOptions));
-
-    auto documentToInsert = BSON("_id" << 0);
-    auto cmdObj = makeApplyOpsWithInsertOperation(nss, uuid, documentToInsert);
-    BSONObjBuilder resultBuilder;
-    ASSERT_OK(applyOps(opCtx.get(), "test", cmdObj, mode, &resultBuilder));
-    ASSERT_BSONOBJ_EQ(cmdObj, _opObserver->onApplyOpsCmdObj);
-}
-
-TEST_F(ApplyOpsTest, AtomicApplyOpsInsertWithUuidIntoCollectionWithOtherUuid) {
-    auto opCtx = cc().makeOperationContext();
-    auto mode = OplogApplication::Mode::kApplyOpsCmd;
-    NamespaceString nss("test.t");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.t");
 
     auto applyOpsUuid = UUID::gen();
 
@@ -250,38 +196,13 @@ TEST_F(ApplyOpsTest, AtomicApplyOpsInsertWithUuidIntoCollectionWithOtherUuid) {
     ASSERT_NOT_EQUALS(applyOpsUuid, *collectionOptions.uuid);
     ASSERT_OK(_storage->createCollection(opCtx.get(), nss, collectionOptions));
 
-    // The applyOps returns a NamespaceNotFound error because of the failed UUID lookup
+    // The applyOps returns an Unknown error because of the failed UUID lookup
     // even though a collection exists with the same namespace as the insert operation.
     auto documentToInsert = BSON("_id" << 0);
     auto cmdObj = makeApplyOpsWithInsertOperation(nss, applyOpsUuid, documentToInsert);
     BSONObjBuilder resultBuilder;
-    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
-                  applyOps(opCtx.get(), "test", cmdObj, mode, &resultBuilder));
-    auto result = resultBuilder.obj();
-    auto status = getStatusFromApplyOpsResult(result);
-    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, status);
-}
-
-TEST_F(ApplyOpsTest, AtomicApplyOpsInsertWithoutUuidIntoCollectionWithUuid) {
-    auto opCtx = cc().makeOperationContext();
-    auto mode = OplogApplication::Mode::kApplyOpsCmd;
-    NamespaceString nss("test.t");
-
-    auto uuid = UUID::gen();
-
-    CollectionOptions collectionOptions;
-    collectionOptions.uuid = uuid;
-    ASSERT_OK(_storage->createCollection(opCtx.get(), nss, collectionOptions));
-
-    auto documentToInsert = BSON("_id" << 0);
-    auto cmdObj = makeApplyOpsWithInsertOperation(nss, boost::none, documentToInsert);
-    BSONObjBuilder resultBuilder;
-    ASSERT_OK(applyOps(opCtx.get(), "test", cmdObj, mode, &resultBuilder));
-
-    // Insert operation provided by caller did not contain collection uuid but applyOps() should add
-    // the uuid to the oplog entry.
-    auto expectedCmdObj = makeApplyOpsWithInsertOperation(nss, uuid, documentToInsert);
-    ASSERT_BSONOBJ_EQ(expectedCmdObj, _opObserver->onApplyOpsCmdObj);
+    ASSERT_EQUALS(ErrorCodes::UnknownError,
+                  applyOps(opCtx.get(), DatabaseName("test"), cmdObj, mode, &resultBuilder));
 }
 
 TEST_F(ApplyOpsTest, ApplyOpsPropagatesOplogApplicationMode) {
@@ -293,7 +214,7 @@ TEST_F(ApplyOpsTest, ApplyOpsPropagatesOplogApplicationMode) {
 
     // Test that the 'applyOps' function passes the oplog application mode through correctly to the
     // underlying op application functions.
-    NamespaceString nss("test.coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.coll");
     auto uuid = UUID::gen();
 
     // Create a collection for us to insert documents into.
@@ -309,11 +230,8 @@ TEST_F(ApplyOpsTest, ApplyOpsPropagatesOplogApplicationMode) {
     auto docToInsert0 = BSON("_id" << 0);
     auto cmdObj = makeApplyOpsWithInsertOperation(nss, uuid, docToInsert0);
 
-    ASSERT_OK(applyOps(opCtx.get(),
-                       nss.coll().toString(),
-                       cmdObj,
-                       OplogApplication::Mode::kInitialSync,
-                       &resultBuilder));
+    ASSERT_OK(applyOps(
+        opCtx.get(), nss.dbName(), cmdObj, OplogApplication::Mode::kInitialSync, &resultBuilder));
     ASSERT_EQUALS(1,
                   countBSONFormatLogLinesIsSubset(BSON("attr" << BSON("oplogApplicationMode"
                                                                       << "InitialSync"))));
@@ -321,11 +239,8 @@ TEST_F(ApplyOpsTest, ApplyOpsPropagatesOplogApplicationMode) {
     auto docToInsert1 = BSON("_id" << 1);
     cmdObj = makeApplyOpsWithInsertOperation(nss, uuid, docToInsert1);
 
-    ASSERT_OK(applyOps(opCtx.get(),
-                       nss.coll().toString(),
-                       cmdObj,
-                       OplogApplication::Mode::kSecondary,
-                       &resultBuilder));
+    ASSERT_OK(applyOps(
+        opCtx.get(), nss.dbName(), cmdObj, OplogApplication::Mode::kSecondary, &resultBuilder));
     ASSERT_EQUALS(1,
                   countBSONFormatLogLinesIsSubset(BSON("attr" << BSON("oplogApplicationMode"
                                                                       << "Secondary"))));
@@ -339,20 +254,18 @@ TEST_F(ApplyOpsTest, ApplyOpsPropagatesOplogApplicationMode) {
 OplogEntry makeOplogEntry(OpTypeEnum opType,
                           const BSONObj& oField,
                           const std::vector<StmtId>& stmtIds = {}) {
-    return {DurableOplogEntry(OpTime(Timestamp(1, 1), 1),  // optime
-                              boost::none,                 // hash
-                              opType,                      // op type
-                              boost::none,                 // tenant id
-                              NamespaceString("a.a"),      // namespace
-                              boost::none,                 // uuid
-                              boost::none,                 // fromMigrate
-                              OplogEntry::kOplogVersion,   // version
-                              oField,                      // o
-                              boost::none,                 // o2
-                              {},                          // sessionInfo
-                              boost::none,                 // upsert
-                              Date_t(),                    // wall clock time
-                              stmtIds,                     // statement ids
+    return {DurableOplogEntry(OpTime(Timestamp(1, 1), 1),                             // optime
+                              opType,                                                 // op type
+                              NamespaceString::createNamespaceString_forTest("a.a"),  // namespace
+                              boost::none,                                            // uuid
+                              boost::none,                                            // fromMigrate
+                              OplogEntry::kOplogVersion,                              // version
+                              oField,                                                 // o
+                              boost::none,                                            // o2
+                              {},                                                     // sessionInfo
+                              boost::none,                                            // upsert
+                              Date_t(),       // wall clock time
+                              stmtIds,        // statement ids
                               boost::none,    // optime of previous write within same transaction
                               boost::none,    // pre-image optime
                               boost::none,    // post-image optime
@@ -383,19 +296,19 @@ TEST_F(ApplyOpsTest, ExtractOperationsReturnsEmptyArrayIfApplyOpsContainsNoOpera
 }
 
 TEST_F(ApplyOpsTest, ExtractOperationsReturnsOperationsWithSameOpTimeAsApplyOps) {
-    NamespaceString ns1("test.a");
+    NamespaceString ns1 = NamespaceString::createNamespaceString_forTest("test.a");
     auto ui1 = UUID::gen();
     auto op1 = BSON("op"
                     << "i"
                     << "ns" << ns1.ns() << "ui" << ui1 << "o" << BSON("_id" << 1));
 
-    NamespaceString ns2("test.b");
+    NamespaceString ns2 = NamespaceString::createNamespaceString_forTest("test.b");
     auto ui2 = UUID::gen();
     auto op2 = BSON("op"
                     << "i"
                     << "ns" << ns2.ns() << "ui" << ui2 << "o" << BSON("_id" << 2));
 
-    NamespaceString ns3("test.c");
+    NamespaceString ns3 = NamespaceString::createNamespaceString_forTest("test.c");
     auto ui3 = UUID::gen();
     auto op3 = BSON("op"
                     << "u"
@@ -458,13 +371,13 @@ TEST_F(ApplyOpsTest, ExtractOperationsReturnsOperationsWithSameOpTimeAsApplyOps)
 }
 
 TEST_F(ApplyOpsTest, ExtractOperationsFromApplyOpsMultiStmtIds) {
-    NamespaceString ns1("test.a");
+    NamespaceString ns1 = NamespaceString::createNamespaceString_forTest("test.a");
     auto ui1 = UUID::gen();
     auto op1 = BSON("op"
                     << "i"
                     << "ns" << ns1.ns() << "ui" << ui1 << "o" << BSON("_id" << 1));
 
-    NamespaceString ns2("test.b");
+    NamespaceString ns2 = NamespaceString::createNamespaceString_forTest("test.b");
     auto ui2 = UUID::gen();
     auto op2 = BSON("op"
                     << "u"
@@ -518,7 +431,7 @@ TEST_F(ApplyOpsTest, ApplyOpsFailsToDropAdmin) {
     auto mode = OplogApplication::Mode::kApplyOpsCmd;
 
     // Create a collection on the admin database.
-    NamespaceString nss("admin.foo");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("admin.foo");
     CollectionOptions options;
     options.uuid = UUID::gen();
     ASSERT_OK(_storage->createCollection(opCtx.get(), nss, options));
@@ -530,8 +443,7 @@ TEST_F(ApplyOpsTest, ApplyOpsFailsToDropAdmin) {
 
     auto dropDatabaseCmdObj = BSON("applyOps" << BSON_ARRAY(dropDatabaseOp));
     BSONObjBuilder resultBuilder;
-    auto status =
-        applyOps(opCtx.get(), nss.db().toString(), dropDatabaseCmdObj, mode, &resultBuilder);
+    auto status = applyOps(opCtx.get(), nss.dbName(), dropDatabaseCmdObj, mode, &resultBuilder);
     ASSERT_EQUALS(ErrorCodes::IllegalOperation, status);
 }
 

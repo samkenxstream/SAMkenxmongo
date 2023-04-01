@@ -31,9 +31,20 @@
 
 #include <stack>
 
+#include "mongo/db/exec/sbe/abt/abt_lower_defs.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/stages/co_scan.h"
+#include "mongo/db/exec/sbe/stages/limit_skip.h"
+#include "mongo/db/query/sbe_stage_builder_abt_holder_def.h"
+#include "mongo/stdx/variant.h"
+
+namespace mongo::sbe {
+class RuntimeEnvironment;
+}
 
 namespace mongo::stage_builder {
+
+struct StageBuilderState;
 
 /**
  * EvalExpr is a wrapper around an EExpression that can also carry a SlotId. It is used to eliminate
@@ -42,181 +53,195 @@ namespace mongo::stage_builder {
  */
 class EvalExpr {
 public:
-    EvalExpr() = default;
+    EvalExpr() : _storage{false} {}
 
-    EvalExpr(EvalExpr&& e) : _expr(std::move(e._expr)), _slot(e._slot) {
-        e._slot = boost::none;
+    EvalExpr(EvalExpr&& e) : _storage(std::move(e._storage)) {
+        e.reset();
     }
 
-    EvalExpr(std::unique_ptr<sbe::EExpression>&& e) : _expr(std::move(e)) {}
+    EvalExpr(std::unique_ptr<sbe::EExpression>&& e) : _storage(std::move(e)) {}
 
-    EvalExpr(sbe::value::SlotId s) : _expr(sbe::makeE<sbe::EVariable>(s)), _slot(s) {}
+    EvalExpr(sbe::value::SlotId s) : _storage(s) {}
+
+    EvalExpr(const abt::HolderPtr& a);
+
+    EvalExpr(abt::HolderPtr&& a) : _storage(std::move(a)) {}
 
     EvalExpr& operator=(EvalExpr&& e) {
         if (this == &e) {
             return *this;
         }
 
-        _expr = std::move(e._expr);
-        _slot = e._slot;
-        e._slot = boost::none;
+        _storage = std::move(e._storage);
+        e.reset();
         return *this;
     }
 
     EvalExpr& operator=(std::unique_ptr<sbe::EExpression>&& e) {
-        _expr = std::move(e);
-        _slot = boost::none;
+        _storage = std::move(e);
+        e.reset();
         return *this;
     }
 
     EvalExpr& operator=(sbe::value::SlotId s) {
-        _expr = sbe::makeE<sbe::EVariable>(s);
-        _slot = s;
+        _storage = s;
         return *this;
     }
 
-    explicit operator bool() const {
-        return static_cast<bool>(_expr);
-    }
-
-    void reset() {
-        _expr.reset();
-        _slot = boost::none;
-    }
-
-    std::unique_ptr<sbe::EExpression> extractExpr() {
-        return std::move(_expr);
+    EvalExpr& operator=(abt::HolderPtr&& a) {
+        _storage = std::move(a);
+        return *this;
     }
 
     boost::optional<sbe::value::SlotId> getSlot() const {
-        return _slot;
+        return hasSlot() ? boost::make_optional(stdx::get<sbe::value::SlotId>(_storage))
+                         : boost::none;
     }
+
+    bool hasSlot() const {
+        return stdx::holds_alternative<sbe::value::SlotId>(_storage);
+    }
+
+    bool hasExpr() const {
+        return stdx::holds_alternative<std::unique_ptr<sbe::EExpression>>(_storage);
+    }
+
+    bool hasABT() const {
+        return stdx::holds_alternative<abt::HolderPtr>(_storage);
+    }
+
+    EvalExpr clone() const {
+        if (hasSlot()) {
+            return stdx::get<sbe::value::SlotId>(_storage);
+        }
+
+        if (hasABT()) {
+            return stdx::get<abt::HolderPtr>(_storage);
+        }
+
+        if (stdx::holds_alternative<bool>(_storage)) {
+            return EvalExpr{};
+        }
+
+        const auto& expr = stdx::get<std::unique_ptr<sbe::EExpression>>(_storage);
+        if (expr) {
+            return expr->clone();
+        }
+
+        return {};
+    }
+
+    bool isNull() const {
+        return stdx::holds_alternative<bool>(_storage);
+    }
+
+    explicit operator bool() const {
+        return !isNull();
+    }
+
+    void reset() {
+        _storage = false;
+    }
+
+    std::unique_ptr<sbe::EExpression> getExpr(optimizer::SlotVarMap& varMap,
+                                              const sbe::RuntimeEnvironment& runtimeEnv) const {
+        return clone().extractExpr(varMap, runtimeEnv);
+    }
+
+    /**
+     * Extract the expression on top of the stack as an SBE EExpression node. If the expression is
+     * stored as an ABT node, it is lowered into an SBE expression, using the provided map to
+     * convert variable names into slot ids.
+     */
+    std::unique_ptr<sbe::EExpression> extractExpr(optimizer::SlotVarMap& varMap,
+                                                  const sbe::RuntimeEnvironment& runtimeEnv);
+
+    /**
+     * Helper function that obtains data needed for EvalExpr::extractExpr from StageBuilderState
+     */
+    std::unique_ptr<sbe::EExpression> extractExpr(StageBuilderState& state);
+
+    /**
+     * Extract the expression on top of the stack as an ABT node. If the expression is stored as a
+     * slot id, the mapping between the generated ABT node and the slot id is recorded in the map.
+     * Throws an exception if the expression is stored as an SBE EExpression.
+     */
+    abt::HolderPtr extractABT(optimizer::SlotVarMap& varMap);
 
 private:
-    std::unique_ptr<sbe::EExpression> _expr;
-    boost::optional<sbe::value::SlotId> _slot;
+    // The bool type as the first option is used to represent the empty storage.
+    stdx::variant<bool, std::unique_ptr<sbe::EExpression>, sbe::value::SlotId, abt::HolderPtr>
+        _storage;
 };
 
 /**
- * EvalStage contains a PlanStage ('stage') and a vector of slots ('outSlots'). The outSlots vector
- * allows us to make sure important/relevant slots produced by 'stage' remain visible when 'stage'
- * is used on the left side of a LoopJoinStage.
+ * EvalStage contains a PlanStage (_stage) and a vector of slots (_outSlots).
+ *
+ * _stage can be nullptr or it can point to an SBE PlanStage tree. If _stage is nullptr, the
+ * extractStage() method will return a Limit-1/CoScan tree. If _stage is not nullptr, then the
+ * extractStage() method will return _stage. EvalStage's default constructor initializes
+ * _stage to be nullptr.
+ *
+ * The isNull() method allows callers to check if _state is nullptr. Some helper functions (such
+ * as makeLoopJoin()) take advantage of this knowledge and are able to perform optimizations in
+ * the case where isNull() == true.
+ *
+ * The _outSlots vector keeps track of all of the "output" slots that are produced by the current
+ * sbe::PlanStage tree (_stage). The _outSlots vector is used by makeLoopJoin() and makeTraverse()
+ * to ensure that all of the slots produced by the left side are visible to the right side and are
+ * also visible to the parent of the LoopJoinStage/TraverseStage.
  */
-struct EvalStage {
-    std::unique_ptr<sbe::PlanStage> stage;
-    sbe::value::SlotVector outSlots;
-};
-
-/**
- * To support non-leaf operators in general, SBE builders maintain a stack of EvalFrames. An
- * EvalFrame holds a subtree to build on top of (stage), a stack of expressions (exprs) and extra
- * data useful for particular builder (data).
- * Initially there is only one EvalFrame on the stack which holds the main tree. Non-leaf operators
- * can decide to push an EvalFrame on the stack before each of their children is evaluated if
- * desired. If a non-leaf operator pushes one or more EvalFrames onto the stack, it is responsible
- * for removing these EvalFrames from the stack later.
- */
-template <typename T>
-class EvalFrame {
+class EvalStage {
 public:
-    template <typename... Args>
-    EvalFrame(EvalStage stage, Args&&... args)
-        : _data{std::forward<Args>(args)...}, _stage(std::move(stage)) {}
+    EvalStage() {}
 
-    const EvalExpr& topExpr() const {
-        invariant(!_exprs.empty());
-        return _exprs.top();
+    EvalStage(std::unique_ptr<sbe::PlanStage> stage, sbe::value::SlotVector outSlots)
+        : _stage(std::move(stage)), _outSlots(std::move(outSlots)) {}
+
+    EvalStage(EvalStage&& other)
+        : _stage(std::move(other._stage)), _outSlots(std::move(other._outSlots)) {}
+
+    EvalStage& operator=(EvalStage&& other) {
+        _stage = std::move(other._stage);
+        _outSlots = std::move(other._outSlots);
+        return *this;
     }
 
-    void pushExpr(EvalExpr expr) {
-        _exprs.push(std::move(expr));
+    bool isNull() const {
+        return !_stage;
     }
 
-    EvalExpr popExpr() {
-        invariant(!_exprs.empty());
-        auto expr = std::move(_exprs.top());
-        _exprs.pop();
-        return expr;
+    std::unique_ptr<sbe::PlanStage> extractStage(PlanNodeId planNodeId) {
+        return _stage ? std::move(_stage)
+                      : sbe::makeS<sbe::LimitSkipStage>(
+                            sbe::makeS<sbe::CoScanStage>(planNodeId), 1, boost::none, planNodeId);
     }
 
-    size_t exprsCount() const {
-        return _exprs.size();
-    }
-
-    const T& data() const {
-        return _data;
-    }
-
-    T& data() {
-        return _data;
-    }
-
-    void setStage(EvalStage stage) {
+    void setStage(std::unique_ptr<sbe::PlanStage> stage) {
         _stage = std::move(stage);
     }
 
-    const EvalStage& getStage() const {
-        return _stage;
+    const sbe::value::SlotVector& getOutSlots() const {
+        return _outSlots;
     }
 
-    EvalStage extractStage() {
-        return std::move(_stage);
+    sbe::value::SlotVector extractOutSlots() {
+        return std::move(_outSlots);
+    }
+
+    void setOutSlots(sbe::value::SlotVector outSlots) {
+        _outSlots = std::move(outSlots);
+    }
+
+    void addOutSlot(sbe::value::SlotId slot) {
+        _outSlots.push_back(slot);
     }
 
 private:
-    T _data;
-    EvalStage _stage;
-    std::stack<EvalExpr> _exprs;
+    std::unique_ptr<sbe::PlanStage> _stage;
+    sbe::value::SlotVector _outSlots;
 };
-
-/**
- * Empty struct for 'data' field in case builder does not need to carry any additional data with
- * each frame.
- */
-struct NoExtraFrameData {};
 
 using EvalExprStagePair = std::pair<EvalExpr, EvalStage>;
-
-template <typename Data = NoExtraFrameData>
-class EvalStack {
-public:
-    using Frame = EvalFrame<Data>;
-
-    EvalStack() = default;
-
-    template <typename... Args>
-    void emplaceFrame(Args&&... args) {
-        stack.emplace(std::forward<Args>(args)...);
-    }
-
-    Frame& topFrame() {
-        invariant(!stack.empty());
-        return stack.top();
-    }
-
-    const Frame& topFrame() const {
-        invariant(!stack.empty());
-        return stack.top();
-    }
-
-    EvalExprStagePair popFrame() {
-        invariant(framesCount() > 0);
-        auto& frame = topFrame();
-
-        invariant(frame.exprsCount() == 1);
-        auto expr = frame.popExpr();
-        auto stage = frame.extractStage();
-
-        stack.pop();
-        return {std::move(expr), std::move(stage)};
-    }
-
-    size_t framesCount() const {
-        return stack.size();
-    }
-
-private:
-    std::stack<Frame> stack;
-};
 
 }  // namespace mongo::stage_builder

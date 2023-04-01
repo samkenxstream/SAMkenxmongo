@@ -27,22 +27,23 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
 #include "processinfo.h"
 
+#include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <malloc.h>
-#include <pcrecpp.h>
 #include <sched.h>
-#include <stdio.h>
+#include <string>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/time.h>
 #include <sys/utsname.h>
 #include <unistd.h>
+
 #ifdef __BIONIC__
 #include <android/api-level.h>
 #elif __UCLIBC__
@@ -55,12 +56,15 @@
 #include <boost/none.hpp>
 #include <boost/optional.hpp>
 #include <fmt/format.h>
-#include <pcrecpp.h>
 
 #include "mongo/base/parse_number.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/ctype.h"
 #include "mongo/util/file.h"
+#include "mongo/util/pcre.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
 
 #define KLONG long
 #define KLF "l"
@@ -75,8 +79,8 @@ public:
         auto name = "/proc/{}/stat"_format(pid.asUInt32());
         FILE* f = fopen(name.c_str(), "r");
         if (!f) {
-            auto e = errno;
-            msgasserted(13538, "couldn't open [{}] {}"_format(name, errnoWithDescription(e)));
+            auto ec = lastSystemError();
+            msgasserted(13538, "couldn't open [{}] {}"_format(name, errorMessage(ec)));
         }
         int found = fscanf(f,
                            "%d %127s %c "
@@ -254,21 +258,34 @@ namespace {
 // (1)(2)(3:4)(5)   (6)   (7)        (8)        (9)   (10)   (11)
 struct MountRecord {
     bool parseLine(const std::string& line) {
-        static const pcrecpp::RE kRe{
-            //   (1)   (2)   (3)   (4)   (5)   (6)   (7)   (8)                (9)   (10)  (11)
-            R"re((\d+) (\d+) (\d+):(\d+) (\S+) (\S+) (\S+) ((?:\S+:\S+ ?)*) - (\S+) (\S+) (\S+))re"};
-        return kRe.FullMatch(line,
-                             &mountId,
-                             &parentId,
-                             &major,
-                             &minor,
-                             &root,
-                             &mountPoint,
-                             &options,
-                             &fields,
-                             &type,
-                             &source,
-                             &superOpt);
+        static const pcre::Regex kRe{
+            //    (1)   (2)   (3)   (4)   (5)   (6)   (7)   (8)                (9)   (10)  (11)
+            R"re(^(\d+) (\d+) (\d+):(\d+) (\S+) (\S+) (\S+) ((?:\S+:\S+ ?)*) - (\S+) (\S+) (\S+)$)re"};
+        auto m = kRe.matchView(line);
+        if (!m)
+            return false;
+        size_t i = 1;
+        auto load = [&](auto& var) {
+            using T = std::decay_t<decltype(var)>;
+            std::string nextString{m[i++]};
+            if constexpr (std::is_same_v<T, int>) {
+                var = std::stoi(nextString);
+            } else {
+                var = std::move(nextString);
+            }
+        };
+        load(mountId);
+        load(parentId);
+        load(major);
+        load(minor);
+        load(root);
+        load(mountPoint);
+        load(options);
+        load(fields);
+        load(type);
+        load(source);
+        load(superOpt);
+        return true;
     }
 
     void appendBSON(BSONObjBuilder& bob) const {
@@ -316,7 +333,9 @@ void appendMountInfo(BSONObjBuilder& bob) {
 class CpuInfoParser {
 public:
     struct LineProcessor {
-        pcrecpp::RE regex;
+        LineProcessor(std::string pattern, std::function<void(const std::string&)> f)
+            : regex{std::make_shared<pcre::Regex>(std::move(pattern))}, f{std::move(f)} {}
+        std::shared_ptr<pcre::Regex> regex;
         std::function<void(const std::string&)> f;
     };
     std::vector<LineProcessor> lineProcessors;
@@ -328,17 +347,18 @@ public:
 
         bool readSuccess;
         bool unprocessed = false;
-        static StaticImmortal<pcrecpp::RE> lineRegex(R"re((.*?)\s*:\s*(.*))re");
+        static StaticImmortal<pcre::Regex> lineRegex(R"re(^(.*?)\s*:\s*(.*)$)re");
         do {
             std::string fstr;
             readSuccess = f && std::getline(f, fstr);
             if (readSuccess && !fstr.empty()) {
-                std::string key;
-                std::string value;
-                if (!lineRegex->FullMatch(fstr, &key, &value))
+                auto m = lineRegex->matchView(fstr);
+                if (!m)
                     continue;
+                std::string key{m[1]};
+                std::string value{m[2]};
                 for (auto&& [lpr, lpf] : lineProcessors) {
-                    if (lpr.FullMatch(key))
+                    if (lpr->matchView(key, pcre::ANCHORED | pcre::ENDANCHORED))
                         lpf(value);
                 }
                 unprocessed = true;
@@ -387,23 +407,51 @@ public:
         CpuId parsedCpuId;
 
         auto cmp = [](auto&& a, auto&& b) {
-            auto tupLens = [](auto&& o) { return std::tie(o.core, o.physical); };
+            auto tupLens = [](auto&& o) {
+                return std::tie(o.core, o.physical);
+            };
             return tupLens(a) < tupLens(b);
         };
         std::set<CpuId, decltype(cmp)> cpuIds(cmp);
 
-        CpuInfoParser cpuInfoParser{
-            {
-                {"physical id", [&](const std::string& value) { parsedCpuId.physical = value; }},
-                {"core id", [&](const std::string& value) { parsedCpuId.core = value; }},
-            },
-            [&]() {
-                cpuIds.insert(parsedCpuId);
-                parsedCpuId = CpuId{};
-            }};
+        CpuInfoParser cpuInfoParser{{
+                                        {"physical id",
+                                         [&](const std::string& value) {
+                                             parsedCpuId.physical = value;
+                                         }},
+                                        {"core id",
+                                         [&](const std::string& value) {
+                                             parsedCpuId.core = value;
+                                         }},
+                                    },
+                                    [&]() {
+                                        cpuIds.insert(parsedCpuId);
+                                        parsedCpuId = CpuId{};
+                                    }};
         cpuInfoParser.run();
 
         physicalCores = cpuIds.size();
+    }
+
+    /**
+     * count the number of processor packages
+     */
+    static int getNumCpuSockets() {
+        std::set<std::string> socketIds;
+
+        CpuInfoParser cpuInfoParser{{
+                                        {"physical id",
+                                         [&](const std::string& value) {
+                                             socketIds.insert(value);
+                                         }},
+                                    },
+                                    []() {
+                                    }};
+        cpuInfoParser.run();
+
+        // On ARM64, the "physical id" field is unpopulated, causing there to be 0 sockets found. In
+        // this case, we default to 1.
+        return std::max(socketIds.size(), 1ul);
     }
 
     /**
@@ -413,19 +461,37 @@ public:
 
         procCount = 0;
 
-        CpuInfoParser cpuInfoParser{
-            {
+        CpuInfoParser cpuInfoParser{{
 #ifdef __s390x__
-                {R"re(processor\s+\d+)re", [&](const std::string& value) { procCount++; }},
-                {"cpu MHz static", [&](const std::string& value) { freq = value; }},
-                {"features", [&](const std::string& value) { features = value; }},
+                                        {R"re(processor\s+\d+)re",
+                                         [&](const std::string& value) {
+                                             procCount++;
+                                         }},
+                                        {"cpu MHz static",
+                                         [&](const std::string& value) {
+                                             freq = value;
+                                         }},
+                                        {"features",
+                                         [&](const std::string& value) {
+                                             features = value;
+                                         }},
 #else
-                {"processor", [&](const std::string& value) { procCount++; }},
-                {"cpu MHz", [&](const std::string& value) { freq = value; }},
-                {"flags", [&](const std::string& value) { features = value; }},
+                                        {"processor",
+                                         [&](const std::string& value) {
+                                             procCount++;
+                                         }},
+                                        {"cpu MHz",
+                                         [&](const std::string& value) {
+                                             freq = value;
+                                         }},
+                                        {"flags",
+                                         [&](const std::string& value) {
+                                             features = value;
+                                         }},
 #endif
-            },
-            []() {}};
+                                    },
+                                    []() {
+                                    }};
         cpuInfoParser.run();
     }
 
@@ -646,6 +712,49 @@ void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
 
     appendNumber("voluntary_context_switches", ru.ru_nvcsw);
     appendNumber("involuntary_context_switches", ru.ru_nivcsw);
+
+    LinuxProc p(_pid);
+
+    // Append the number of thread in use
+    appendNumber("threads", p._nlwp);
+}
+
+/**
+ * If the process is running with (cc)NUMA enabled, return the number of NUMA nodes. Else, return 0.
+ */
+unsigned long countNumaNodes() {
+    bool hasMultipleNodes = false;
+    bool hasNumaMaps = false;
+
+    try {
+        hasMultipleNodes = boost::filesystem::exists("/sys/devices/system/node/node1");
+        hasNumaMaps = boost::filesystem::exists("/proc/self/numa_maps");
+
+        if (hasMultipleNodes && hasNumaMaps) {
+            // proc is populated with numa entries
+
+            // read the second column of first line to determine numa state
+            // ('default' = enabled, 'interleave' = disabled).  Logic from version.cpp's warnings.
+            std::string line =
+                LinuxSysHelper::readLineFromFile("/proc/self/numa_maps").append(" \0");
+            size_t pos = line.find(' ');
+            if (pos != std::string::npos &&
+                line.substr(pos + 1, 10).find("interleave") == std::string::npos) {
+                // interleave not found, count NUMA nodes by finding the highest numbered node file
+                unsigned long i = 2;
+                while (boost::filesystem::exists(
+                    std::string(str::stream() << "/sys/devices/system/node/node" << i++)))
+                    ;
+                return i;
+            }
+        }
+    } catch (boost::filesystem::filesystem_error& e) {
+        LOGV2(23340,
+              "WARNING: Cannot detect if NUMA interleaving is enabled. Failed to probe",
+              "path"_attr = e.path1().string(),
+              "reason"_attr = e.code().message());
+    }
+    return 0;
 }
 
 /**
@@ -657,17 +766,19 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     std::string cpuFreq, cpuFeatures;
     int cpuCount;
     int physicalCores;
+    int cpuSockets;
 
     std::string verSig = LinuxSysHelper::readLineFromFile("/proc/version_signature");
     LinuxSysHelper::getCpuInfo(cpuCount, cpuFreq, cpuFeatures);
     LinuxSysHelper::getNumPhysicalCores(physicalCores);
+    cpuSockets = LinuxSysHelper::getNumCpuSockets();
     LinuxSysHelper::getLinuxDistro(distroName, distroVersion);
 
     if (uname(&unameData) == -1) {
-        auto e = errno;
+        auto ec = lastSystemError();
         LOGV2(23339,
               "Unable to collect detailed system information",
-              "error"_attr = errnoWithDescription(e));
+              "error"_attr = errorMessage(ec));
     }
 
     osType = "Linux";
@@ -677,9 +788,12 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     memLimit = LinuxSysHelper::getMemorySizeLimit();
     addrSize = sizeof(void*) * CHAR_BIT;
     numCores = cpuCount;
+    numPhysicalCores = physicalCores;
+    numCpuSockets = cpuSockets;
     pageSize = static_cast<unsigned long long>(sysconf(_SC_PAGESIZE));
     cpuArch = unameData.machine;
-    hasNuma = checkNumaEnabled();
+    numNumaNodes = countNumaNodes();
+    hasNuma = numNumaNodes;
 
     BSONObjBuilder bExtra;
     bExtra.append("versionString", LinuxSysHelper::readLineFromFile("/proc/version"));
@@ -704,44 +818,10 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     bExtra.append("pageSize", static_cast<long long>(pageSize));
     bExtra.append("numPages", static_cast<int>(sysconf(_SC_PHYS_PAGES)));
     bExtra.append("maxOpenFiles", static_cast<int>(sysconf(_SC_OPEN_MAX)));
-    bExtra.append("physicalCores", physicalCores);
 
     appendMountInfo(bExtra);
 
     _extraStats = bExtra.obj();
-}
-
-/**
- * Determine if the process is running with (cc)NUMA
- */
-bool ProcessInfo::checkNumaEnabled() {
-    bool hasMultipleNodes = false;
-    bool hasNumaMaps = false;
-
-    try {
-        hasMultipleNodes = boost::filesystem::exists("/sys/devices/system/node/node1");
-        hasNumaMaps = boost::filesystem::exists("/proc/self/numa_maps");
-    } catch (boost::filesystem::filesystem_error& e) {
-        LOGV2(23340,
-              "WARNING: Cannot detect if NUMA interleaving is enabled. Failed to probe",
-              "path"_attr = e.path1().string(),
-              "reason"_attr = e.code().message());
-        return false;
-    }
-
-    if (hasMultipleNodes && hasNumaMaps) {
-        // proc is populated with numa entries
-
-        // read the second column of first line to determine numa state
-        // ('default' = enabled, 'interleave' = disabled).  Logic from version.cpp's warnings.
-        std::string line = LinuxSysHelper::readLineFromFile("/proc/self/numa_maps").append(" \0");
-        size_t pos = line.find(' ');
-        if (pos != std::string::npos &&
-            line.substr(pos + 1, 10).find("interleave") == std::string::npos)
-            // interleave not found;
-            return true;
-    }
-    return false;
 }
 
 }  // namespace mongo

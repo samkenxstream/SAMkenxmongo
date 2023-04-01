@@ -27,42 +27,35 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/config_server_op_observer.h"
 
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/topology_time_ticker.h"
 #include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_config_version.h"
 #include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/cluster_identity_loader.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
+
 namespace mongo {
-
-namespace {
-
-// The number of pending topologyTime tick points (stored in the _topologyTimeTickPoints vector) is
-// generally expected to be small (since shard topology operations should be infrequent, relative to
-// any config server replication lag).  If the size of this vector exceeds this constant (when a
-// tick point is added), then a warning (with id 4740600) will be logged.
-constexpr size_t kPossiblyExcessiveNumTopologyTimeTickPoints = 3;
-
-}  // namespace
 
 ConfigServerOpObserver::ConfigServerOpObserver() = default;
 
 ConfigServerOpObserver::~ConfigServerOpObserver() = default;
 
 void ConfigServerOpObserver::onDelete(OperationContext* opCtx,
-                                      const NamespaceString& nss,
-                                      const UUID& uuid,
+                                      const CollectionPtr& coll,
                                       StmtId stmtId,
                                       const OplogDeleteEntryArgs& args) {
-    if (nss == VersionType::ConfigNS) {
+    if (coll->ns() == VersionType::ConfigNS) {
         if (!repl::ReplicationCoordinator::get(opCtx)->getMemberState().rollback()) {
             uasserted(40302, "cannot delete config.version document while in --configsvr mode");
         } else {
@@ -102,146 +95,111 @@ void ConfigServerOpObserver::_onReplicationRollback(OperationContext* opCtx,
         ShardingCatalogManager::get(opCtx)->discardCachedConfigDatabaseInitializationState();
         ClusterIdentityLoader::get(opCtx)->discardCachedClusterId();
     }
+
+    if (rbInfo.rollbackNamespaces.find(NamespaceString::kConfigsvrShardsNamespace) !=
+        rbInfo.rollbackNamespaces.end()) {
+        // If some entries were rollbacked from config.shards we might need to discard some tick
+        // points from the TopologyTimeTicker
+        const auto lastApplied = repl::ReplicationCoordinator::get(opCtx)->getMyLastAppliedOpTime();
+        TopologyTimeTicker::get(opCtx).onReplicationRollback(lastApplied);
+    }
 }
 
 void ConfigServerOpObserver::onInserts(OperationContext* opCtx,
-                                       const NamespaceString& nss,
-                                       const UUID& uuid,
+                                       const CollectionPtr& coll,
                                        std::vector<InsertStatement>::const_iterator begin,
                                        std::vector<InsertStatement>::const_iterator end,
-                                       bool fromMigrate) {
-    if (nss != ShardType::ConfigNS) {
-        return;
-    }
-
-    boost::optional<Timestamp> maxTopologyTime;
-    for (auto it = begin; it != end; it++) {
-        Timestamp newTopologyTime = it->doc[ShardType::topologyTime.name()].timestamp();
-        if (newTopologyTime != Timestamp()) {
-            if (!maxTopologyTime || newTopologyTime > *maxTopologyTime) {
-                maxTopologyTime = newTopologyTime;
-            }
+                                       std::vector<bool> fromMigrate,
+                                       bool defaultFromMigrate) {
+    if (coll->ns().isServerConfigurationCollection()) {
+        auto idElement = begin->doc["_id"];
+        if (idElement.type() == BSONType::String &&
+            idElement.String() == multiversion::kParameterName) {
+            opCtx->recoveryUnit()->onCommit(
+                [](OperationContext* opCtx, boost::optional<Timestamp>) mutable {
+                    CatalogCacheLoader::get(opCtx).onFCVChanged();
+                });
         }
     }
 
-    if (maxTopologyTime) {
-        opCtx->recoveryUnit()->onCommit(
-            [this, maxTopologyTime](boost::optional<Timestamp> unusedCommitTime) mutable {
-                _registerTopologyTimeTickPoint(*maxTopologyTime);
-            });
+    if (coll->ns() != NamespaceString::kConfigsvrShardsNamespace) {
+        return;
+    }
+
+    if (!topology_time_ticker_utils::inRecoveryMode(opCtx)) {
+        boost::optional<Timestamp> maxTopologyTime;
+        for (auto it = begin; it != end; it++) {
+            Timestamp newTopologyTime = it->doc[ShardType::topologyTime.name()].timestamp();
+            if (newTopologyTime != Timestamp()) {
+                if (!maxTopologyTime || newTopologyTime > *maxTopologyTime) {
+                    maxTopologyTime = newTopologyTime;
+                }
+            }
+        }
+
+        if (maxTopologyTime) {
+            // Insertions into config.shards may be done inside a transaction. This implies that the
+            // callback from onCommit can be invoked by a different thread. Since the
+            // TopologyTimeTicker is associated to the mongod instance and not to the
+            // OperationContext, we can safely obtain a reference at this point and passed it to the
+            // onCommit callback.
+            auto& topologyTicker = TopologyTimeTicker::get(opCtx);
+            opCtx->recoveryUnit()->onCommit(
+                [&topologyTicker, maxTopologyTime](OperationContext* opCtx,
+                                                   boost::optional<Timestamp> commitTime) mutable {
+                    invariant(commitTime);
+                    topologyTicker.onNewLocallyCommittedTopologyTimeAvailable(*commitTime,
+                                                                              *maxTopologyTime);
+                });
+        }
     }
 }
 
-void ConfigServerOpObserver::onApplyOps(OperationContext* opCtx,
-                                        const std::string& dbName,
-                                        const BSONObj& applyOpCmd) {
-    if (dbName != ShardType::ConfigNS.db()) {
+void ConfigServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
+    if (args.coll->ns().isServerConfigurationCollection()) {
+        auto idElement = args.updateArgs->updatedDoc["_id"];
+        if (idElement.type() == BSONType::String &&
+            idElement.String() == multiversion::kParameterName) {
+            opCtx->recoveryUnit()->onCommit(
+                [](OperationContext* opCtx, boost::optional<Timestamp>) mutable {
+                    CatalogCacheLoader::get(opCtx).onFCVChanged();
+                });
+        }
+    }
+
+    if (args.coll->ns() != NamespaceString::kConfigsvrShardsNamespace) {
         return;
     }
 
-    if (applyOpCmd.firstElementFieldNameStringData() != "applyOps") {
-        return;
-    }
+    const auto& updateDoc = args.updateArgs->update;
 
-    const auto& updatesElem = applyOpCmd["applyOps"];
-    if (updatesElem.type() != Array) {
-        return;
-    }
-
-    auto updates = updatesElem.Array();
-    if (updates.size() != 2) {
-        return;
-    }
-
-    if (updates[0].type() != Object) {
-        return;
-    }
-    auto removeShard = updates[0].Obj();
-    if (removeShard["op"].str() != "d") {
-        return;
-    }
-    if (removeShard["ns"].str() != ShardType::ConfigNS.ns()) {
-        return;
-    }
-
-    if (updates[1].type() != Object) {
-        return;
-    }
-    auto updateShard = updates[1].Obj();
-    if (updateShard["op"].str() != "u") {
-        return;
-    }
-    if (updateShard["ns"].str() != ShardType::ConfigNS.ns()) {
-        return;
-    }
-
-    auto updateElem = updateShard["o"];
-    if (updateElem.type() != BSONType::Object) {
-        return;
-    }
-
-    auto updateObj = updateElem.embeddedObject();
-    if (update_oplog_entry::extractUpdateType(updateObj) ==
+    if (update_oplog_entry::extractUpdateType(updateDoc) ==
         update_oplog_entry::UpdateType::kReplacement) {
         return;
     }
 
-    auto newTopologyTime =
-        update_oplog_entry::extractNewValueForField(updateObj, ShardType::topologyTime())
-            .timestamp();
-    if (newTopologyTime == Timestamp()) {
+    auto topologyTimeValue =
+        update_oplog_entry::extractNewValueForField(updateDoc, ShardType::topologyTime());
+    if (!topologyTimeValue.ok()) {
         return;
     }
 
+    auto topologyTime = topologyTimeValue.timestamp();
+    if (topologyTime == Timestamp()) {
+        return;
+    }
+
+    // Updates to config.shards are always done inside a transaction. This implies that the callback
+    // from onCommit can be called in a different thread. Since the TopologyTimeTicker is associated
+    // to the mongod instance and not to the OperationContext, we can safely obtain a reference at
+    // this point and passed it to the onCommit callback.
+    auto& topologyTicker = TopologyTimeTicker::get(opCtx);
     opCtx->recoveryUnit()->onCommit(
-        [this, newTopologyTime](boost::optional<Timestamp> unusedCommitTime) mutable {
-            _registerTopologyTimeTickPoint(newTopologyTime);
+        [&topologyTicker, topologyTime](OperationContext*,
+                                        boost::optional<Timestamp> commitTime) mutable {
+            invariant(commitTime);
+            topologyTicker.onNewLocallyCommittedTopologyTimeAvailable(*commitTime, topologyTime);
         });
-}
-
-void ConfigServerOpObserver::_registerTopologyTimeTickPoint(Timestamp newTopologyTime) {
-    std::vector<Timestamp>::size_type numTickPoints = 0;
-    {
-        stdx::lock_guard lg(_mutex);
-        _topologyTimeTickPoints.push_back(newTopologyTime);
-        numTickPoints = _topologyTimeTickPoints.size();
-    }
-    if (numTickPoints >= kPossiblyExcessiveNumTopologyTimeTickPoints) {
-        LOGV2_WARNING(4740600,
-                      "possibly excessive number of topologyTime tick points",
-                      "numTickPoints"_attr = numTickPoints,
-                      "kPossiblyExcessiveNumTopologyTimeTickPoints"_attr =
-                          kPossiblyExcessiveNumTopologyTimeTickPoints);
-    }
-}
-
-void ConfigServerOpObserver::_tickTopologyTimeIfNecessary(ServiceContext* service,
-                                                          Timestamp newCommitPointTime) {
-    stdx::lock_guard lg(_mutex);
-
-    if (_topologyTimeTickPoints.empty()) {
-        return;
-    }
-
-    // Find and remove the topologyTime tick points that have been passed.
-    boost::optional<Timestamp> maxPassedTime;
-    auto it = _topologyTimeTickPoints.begin();
-    while (it != _topologyTimeTickPoints.end()) {
-        const auto& topologyTimeTickPoint = *it;
-        if (newCommitPointTime >= topologyTimeTickPoint) {
-            if (!maxPassedTime || topologyTimeTickPoint > *maxPassedTime) {
-                maxPassedTime = topologyTimeTickPoint;
-            }
-            it = _topologyTimeTickPoints.erase(it);
-        } else {
-            it++;
-        }
-    }
-
-    // If any tick points were passed, tick TopologyTime to the largest one.
-    if (maxPassedTime) {
-        VectorClockMutable::get(service)->tickTopologyTimeTo(LogicalTime(*maxPassedTime));
-    }
 }
 
 void ConfigServerOpObserver::onMajorityCommitPointUpdate(ServiceContext* service,
@@ -252,7 +210,8 @@ void ConfigServerOpObserver::onMajorityCommitPointUpdate(ServiceContext* service
     // ConfigTime is done first.
     VectorClockMutable::get(service)->tickConfigTimeTo(LogicalTime(newCommitPointTime));
 
-    _tickTopologyTimeIfNecessary(service, newCommitPointTime);
+    // Letting the TopologyTimeTicker know that the majority commit point was advanced
+    TopologyTimeTicker::get(service).onMajorityCommitPointUpdate(service, newCommitPoint);
 }
 
 }  // namespace mongo

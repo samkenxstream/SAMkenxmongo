@@ -27,11 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/db/ops/write_ops_parsers.h"
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 
 #include <algorithm>
@@ -39,38 +34,51 @@
 #include <vector>
 
 #include "mongo/db/auth/authorization_session_impl.h"
+#include "mongo/db/catalog/coll_mod.h"
+#include "mongo/db/coll_mod_gen.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/error_labels.h"
-#include "mongo/db/internal_transactions_feature_flag_gen.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/ops/write_ops_parsers.h"
+#include "mongo/db/pipeline/document_source_group.h"
+#include "mongo/db/pipeline/document_source_lookup.h"
+#include "mongo/db/pipeline/document_source_merge.h"
+#include "mongo/db/pipeline/document_source_project.h"
+#include "mongo/db/pipeline/document_source_union_with.h"
+#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/query_request_helper.h"
+#include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/s/balancer/type_migration.h"
+#include "mongo/db/s/config/index_on_config.h"
 #include "mongo/db/s/sharding_util.h"
-#include "mongo/db/s/type_lockpings.h"
-#include "mongo/db/s/type_locks.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/catalog/config_server_version.h"
+#include "mongo/rpc/metadata/impersonated_user_metadata.h"
+#include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_config_version.h"
+#include "mongo/s/catalog/type_namespace_placement_gen.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/util/log_and_backoff.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 namespace mongo {
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(shardingCatalogManagerWithTransactionFailWCAfterCommit);
+MONGO_FAIL_POINT_DEFINE(shardingCatalogManagerSkipNotifyClusterOnNewDatabases);
 
 const WriteConcernOptions kNoWaitWriteConcern(1, WriteConcernOptions::SyncMode::UNSET, Seconds(0));
 
@@ -110,10 +118,10 @@ OpMsg runCommandInLocalTxn(OperationContext* opCtx,
 BSONObj executeConfigRequest(OperationContext* opCtx,
                              const NamespaceString& nss,
                              const BatchedCommandRequest& request) {
-    invariant(nss.db() == NamespaceString::kConfigDb);
+    invariant(nss.dbName() == DatabaseName::kConfig);
     DBDirectClient client(opCtx);
     BSONObj result;
-    client.runCommand(nss.db().toString(), request.toBSON(), result);
+    client.runCommand(nss.dbName(), request.toBSON(), result);
     return result;
 }
 
@@ -145,11 +153,14 @@ BSONObj commitOrAbortTransaction(OperationContext* opCtx,
     }
     AlternativeClientRegion acr(newClient);
     auto newOpCtx = cc().makeOperationContext();
-    newOpCtx->setAlwaysInterruptAtStepDownOrUp();
+    newOpCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
     AuthorizationSession::get(newOpCtx.get()->getClient())
         ->grantInternalAuthorization(newOpCtx.get()->getClient());
-    newOpCtx.get()->setLogicalSessionId(opCtx->getLogicalSessionId().get());
-    newOpCtx.get()->setTxnNumber(txnNumber);
+    {
+        auto lk = stdx::lock_guard(*newOpCtx->getClient());
+        newOpCtx->setLogicalSessionId(opCtx->getLogicalSessionId().value());
+        newOpCtx->setTxnNumber(txnNumber);
+    }
 
     BSONObjBuilder bob;
     bob.append(cmdName, true);
@@ -163,15 +174,14 @@ BSONObj commitOrAbortTransaction(OperationContext* opCtx,
 
     const auto cmdObj = bob.obj();
 
-    const auto replyOpMsg =
-        OpMsg::parseOwned(newOpCtx->getServiceContext()
-                              ->getServiceEntryPoint()
-                              ->handleRequest(newOpCtx.get(),
-                                              OpMsgRequest::fromDBAndBody(
-                                                  NamespaceString::kAdminDb.toString(), cmdObj)
-                                                  .serialize())
-                              .get()
-                              .response);
+    const auto replyOpMsg = OpMsg::parseOwned(
+        newOpCtx->getServiceContext()
+            ->getServiceEntryPoint()
+            ->handleRequest(
+                newOpCtx.get(),
+                OpMsgRequest::fromDBAndBody(DatabaseName::kAdmin.toString(), cmdObj).serialize())
+            .get()
+            .response);
     return replyOpMsg.body;
 }
 
@@ -202,35 +212,63 @@ void abortTransaction(OperationContext* opCtx,
 
 Status createIndexesForConfigChunks(OperationContext* opCtx) {
     const bool unique = true;
-    auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-    Status result = configShard->createIndexOnConfig(
+    Status result = createIndexOnConfigCollection(
         opCtx,
         ChunkType::ConfigNS,
         BSON(ChunkType::collectionUUID() << 1 << ChunkType::min() << 1),
         unique);
     if (!result.isOK()) {
-        return result.withContext("couldn't create uuid_1_min_1 index on config db");
+        return result.withContext("couldn't create uuid_1_min_1 index on config.chunks");
     }
 
-    result = configShard->createIndexOnConfig(
+    result = createIndexOnConfigCollection(
         opCtx,
         ChunkType::ConfigNS,
         BSON(ChunkType::collectionUUID() << 1 << ChunkType::shard() << 1 << ChunkType::min() << 1),
         unique);
     if (!result.isOK()) {
-        return result.withContext("couldn't create uuid_1_shard_1_min_1 index on config db");
+        return result.withContext("couldn't create uuid_1_shard_1_min_1 index on config.chunks");
     }
 
-    result = configShard->createIndexOnConfig(
+    result = createIndexOnConfigCollection(
         opCtx,
         ChunkType::ConfigNS,
         BSON(ChunkType::collectionUUID() << 1 << ChunkType::lastmod() << 1),
         unique);
     if (!result.isOK()) {
-        return result.withContext("couldn't create uuid_1_lastmod_1 index on config db");
+        return result.withContext("couldn't create uuid_1_lastmod_1 index on config.chunks");
+    }
+
+    result = createIndexOnConfigCollection(opCtx,
+                                           ChunkType::ConfigNS,
+                                           BSON(ChunkType::collectionUUID()
+                                                << 1 << ChunkType::shard() << 1
+                                                << ChunkType::onCurrentShardSince() << 1),
+                                           false /* unique */);
+    if (!result.isOK()) {
+        return result.withContext(
+            "couldn't create uuid_1_shard_1_onCurrentShardSince_1 index on config.chunks");
     }
 
     return Status::OK();
+}
+
+Status createIndexForConfigPlacementHistory(OperationContext* opCtx, bool waitForMajority) {
+    auto status = createIndexOnConfigCollection(
+        opCtx,
+        NamespaceString::kConfigsvrPlacementHistoryNamespace,
+        BSON(NamespacePlacementType::kNssFieldName
+             << 1 << NamespacePlacementType::kTimestampFieldName << -1),
+        true /*unique*/);
+    if (status.isOK() && waitForMajority) {
+        auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
+        WriteConcernResult unusedResult;
+        status = waitForWriteConcern(opCtx,
+                                     replClient.getLastOp(),
+                                     ShardingCatalogClient::kMajorityWriteConcern,
+                                     &unusedResult);
+    }
+    return status;
 }
 
 // creates a vector of a vector of BSONObj (one for each batch) from the docs vector
@@ -267,14 +305,230 @@ std::vector<std::vector<BSONObj>> createBulkWriteBatches(const std::vector<BSONO
 
     return out;
 };
+
+class PipelineBuilder {
+
+public:
+    PipelineBuilder(OperationContext* opCtx,
+                    const NamespaceString& nss,
+                    std::vector<NamespaceString>&& resolvedNamespaces)
+        : _expCtx{make_intrusive<ExpressionContext>(opCtx, nullptr /*collator*/, nss)} {
+
+        StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespacesMap;
+
+        for (const auto& collNs : resolvedNamespaces) {
+            resolvedNamespacesMap[collNs.coll()] = {collNs, std::vector<BSONObj>() /* pipeline */};
+        }
+
+        _expCtx->setResolvedNamespaces(resolvedNamespacesMap);
+    }
+
+    PipelineBuilder(const boost::intrusive_ptr<ExpressionContext>& expCtx) : _expCtx(expCtx) {}
+
+    template <typename T>
+    PipelineBuilder& addStage(mongo::BSONObj&& bsonObj) {
+        _stages.emplace_back(_toStage<T>(_expCtx, std::move(bsonObj)));
+        return *this;
+    }
+
+    std::vector<BSONObj> buildAsBson() {
+        auto pipelinePtr = Pipeline::create(_stages, _expCtx);
+        return pipelinePtr->serializeToBson();
+    }
+
+    AggregateCommandRequest buildAsAggregateCommandRequest() {
+        return AggregateCommandRequest(_expCtx->ns, buildAsBson());
+    }
+
+    boost::intrusive_ptr<ExpressionContext>& getExpCtx() {
+        return _expCtx;
+    }
+
+private:
+    template <typename T>
+    boost::intrusive_ptr<DocumentSource> _toStage(boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                                  mongo::BSONObj&& bsonObj) {
+        return T::createFromBson(
+            Document{{T::kStageName, std::move(bsonObj)}}.toBson().firstElement(), expCtx);
+    }
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
+    Pipeline::SourceContainer _stages;
+};
+
+AggregateCommandRequest createInitPlacementHistoryAggregationRequest(
+    OperationContext* opCtx, const Timestamp& initTimestamp) {
+    /* Compose the pipeline to generate a NamespacePlacementType for each existing collection and
+     * database in the cluster based on the content of the sharding catalog.
+     *
+     * 1. Join config.collections with config.chunks to extract
+     * - the collection name and uuid
+     * - the list of shards containing one or more chunks of the collection
+     * - the timestamp of the most recent collection chunk migration received by each shard
+     *
+     * 2. Project the output to
+     * - select the most recent collection chunk migration across shards (using initTimestamp as a
+     *   fallback in case no timestamp could be retrieved on stage 1)
+     * - fit each document to the  NamespacePlacementType schema
+     *
+     * 3. Add to the previous results a projection of the config.databases entries that fits the
+     *    NamespacePlacementType schema
+     *
+     * 4. merge everything into config.placementHistory.
+     *
+     db.collections.aggregate([
+     {
+         $lookup: {
+         from: "chunks",
+         localField: "uuid",
+         foreignField: "uuid",
+         as: "timestampByShard",
+         pipeline: [
+             {
+              $group: {
+                 _id: "$shard",
+                 value: {
+                 $max: "$onCurrentShardSince"
+                 }
+             }
+             }
+         ],
+         }
+     },
+     {
+         $project: {
+         _id: 0,
+         nss: "$_id",
+         shards: "$timestampByShard._id",
+         uuid: 1,
+         timestamp: {
+             $ifNull: [
+             {
+                 $max: "$timestampByShard.timestamp"
+             },
+             <initTimestamp>
+             ]
+         },
+         }
+     },
+     {
+         $unionWith: {
+          coll: "databases",
+          pipeline: [
+             {
+             $project: {
+                 _id: 0,
+                 nss: "$_id",
+                 shards: [
+                 "$primary"
+                 ],
+                 timestamp: "$version.timestamp"
+             }
+             }
+         ]
+         }
+     },
+     {
+         $merge:
+         {
+             into: "config.placementHistory",
+             on: ["nss", "timestamp"],
+             whenMatched: "replace",
+             whenNotMatched: "insert"
+         }
+     }
+     ])
+     */
+    using Lookup = DocumentSourceLookUp;
+    using UnionWith = DocumentSourceUnionWith;
+    using Merge = DocumentSourceMerge;
+    using Group = DocumentSourceGroup;
+    using Project = DocumentSourceProject;
+
+    // Aliases for the field names of the the final projections
+    const auto kNss = NamespacePlacementType::kNssFieldName.toString();
+    const auto kUuid = NamespacePlacementType::kUuidFieldName.toString();
+    const auto kShards = NamespacePlacementType::kShardsFieldName.toString();
+    const auto kTimestamp = NamespacePlacementType::kTimestampFieldName.toString();
+
+    auto pipeline = PipelineBuilder(opCtx,
+                                    CollectionType::ConfigNS,
+                                    {ChunkType::ConfigNS,
+                                     CollectionType::ConfigNS,
+                                     NamespaceString::kConfigDatabasesNamespace,
+                                     NamespaceString::kConfigsvrPlacementHistoryNamespace});
+
+    // Stage 1. Join config.collections and config.chunks using the collection UUID to create the
+    // placement-by-shard info documents
+    {
+        auto lookupPipelineObj = PipelineBuilder(pipeline.getExpCtx())
+                                     .addStage<Group>(BSON("_id"
+                                                           << "$shard"
+                                                           << "value"
+                                                           << BSON("$max"
+                                                                   << "$onCurrentShardSince")))
+                                     .buildAsBson();
+
+        pipeline.addStage<Lookup>(BSON("from" << ChunkType::ConfigNS.coll() << "localField"
+                                              << CollectionType::kUuidFieldName << "foreignField"
+                                              << ChunkType::collectionUUID.name() << "as"
+                                              << "timestampByShard"
+                                              << "pipeline" << lookupPipelineObj));
+    }
+
+    // Stage 2. Adapt the info on collections to the config.placementHistory entry format
+    {
+        // Get the most recent collection placement timestamp among all the shards: if not found,
+        // apply initTimestamp as a fallback.
+        const auto placementTimestampExpr =
+            BSON("$ifNull" << BSON_ARRAY(BSON("$max"
+                                              << "$timestampByShard.value")
+                                         << initTimestamp));
+
+        pipeline.addStage<Project>(BSON("_id" << 0 << kNss << "$_id" << kShards
+                                              << "$timestampByShard._id" << kUuid << 1 << kTimestamp
+                                              << placementTimestampExpr));
+    }
+
+    // Stage 3 Add placement info on each database of the cluster
+    {
+        pipeline.addStage<UnionWith>(
+            BSON("coll" << NamespaceString::kConfigDatabasesNamespace.coll() << "pipeline"
+                        << PipelineBuilder(pipeline.getExpCtx())
+                               .addStage<Project>(BSON("_id" << 0 << kNss << "$_id" << kShards
+                                                             << BSON_ARRAY("$primary") << kTimestamp
+                                                             << "$version.timestamp"))
+                               .buildAsBson()));
+    }
+
+    // Stage 4. Merge into the placementHistory collection
+    {
+        pipeline.addStage<Merge>(BSON("into"
+                                      << NamespaceString::kConfigsvrPlacementHistoryNamespace.coll()
+                                      << "on" << BSON_ARRAY(kNss << kTimestamp) << "whenMatched"
+                                      << "replace"
+                                      << "whenNotMatched"
+                                      << "insert"));
+    }
+
+    return pipeline.buildAsAggregateCommandRequest();
+}
+
 }  // namespace
 
 void ShardingCatalogManager::create(ServiceContext* serviceContext,
-                                    std::unique_ptr<executor::TaskExecutor> addShardExecutor) {
+                                    std::unique_ptr<executor::TaskExecutor> addShardExecutor,
+                                    std::shared_ptr<Shard> localConfigShard,
+                                    std::unique_ptr<ShardingCatalogClient> localCatalogClient) {
+    invariant(serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
+
     auto& shardingCatalogManager = getShardingCatalogManager(serviceContext);
     invariant(!shardingCatalogManager);
 
-    shardingCatalogManager.emplace(serviceContext, std::move(addShardExecutor));
+    shardingCatalogManager.emplace(serviceContext,
+                                   std::move(addShardExecutor),
+                                   std::move(localConfigShard),
+                                   std::move(localCatalogClient));
 }
 
 void ShardingCatalogManager::clearForTests(ServiceContext* serviceContext) {
@@ -296,9 +550,14 @@ ShardingCatalogManager* ShardingCatalogManager::get(OperationContext* operationC
 }
 
 ShardingCatalogManager::ShardingCatalogManager(
-    ServiceContext* serviceContext, std::unique_ptr<executor::TaskExecutor> addShardExecutor)
+    ServiceContext* serviceContext,
+    std::unique_ptr<executor::TaskExecutor> addShardExecutor,
+    std::shared_ptr<Shard> localConfigShard,
+    std::unique_ptr<ShardingCatalogClient> localCatalogClient)
     : _serviceContext(serviceContext),
       _executorForAddShard(std::move(addShardExecutor)),
+      _localConfigShard(std::move(localConfigShard)),
+      _localCatalogClient(std::move(localCatalogClient)),
       _kShardMembershipLock("shardMembershipLock"),
       _kChunkOpLock("chunkOpLock"),
       _kZoneOpLock("zoneOpLock") {
@@ -349,6 +608,13 @@ Status ShardingCatalogManager::initializeConfigDatabaseIfNeeded(OperationContext
         return status;
     }
 
+    if (feature_flags::gConfigSettingsSchema.isEnabled(serverGlobalParams.featureCompatibility)) {
+        status = _initConfigSettings(opCtx);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
     // Make sure to write config.version last since we detect rollbacks of config.version and
     // will re-run initializeConfigDatabaseIfNeeded if that happens, but we don't detect rollback
     // of the index builds.
@@ -363,114 +629,85 @@ Status ShardingCatalogManager::initializeConfigDatabaseIfNeeded(OperationContext
     return Status::OK();
 }
 
+Status ShardingCatalogManager::upgradeConfigSettings(OperationContext* opCtx) {
+    return _initConfigSettings(opCtx);
+}
+
+ShardingCatalogClient* ShardingCatalogManager::localCatalogClient() {
+    invariant(serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
+    return _localCatalogClient.get();
+}
+
+const std::shared_ptr<Shard>& ShardingCatalogManager::localConfigShard() {
+    invariant(serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
+    return _localConfigShard;
+}
+
 void ShardingCatalogManager::discardCachedConfigDatabaseInitializationState() {
     stdx::lock_guard<Latch> lk(_mutex);
     _configInitialized = false;
 }
 
 Status ShardingCatalogManager::_initConfigVersion(OperationContext* opCtx) {
-    const auto catalogClient = Grid::get(opCtx)->catalogClient();
-
     auto versionStatus =
-        catalogClient->getConfigVersion(opCtx, repl::ReadConcernLevel::kLocalReadConcern);
-    if (!versionStatus.isOK()) {
+        _localCatalogClient->getConfigVersion(opCtx, repl::ReadConcernLevel::kLocalReadConcern);
+    if (versionStatus.isOK() || versionStatus != ErrorCodes::NoMatchingDocument) {
         return versionStatus.getStatus();
     }
 
-    const auto& versionInfo = versionStatus.getValue();
-    if (versionInfo.getMinCompatibleVersion() > CURRENT_CONFIG_VERSION) {
-        return {ErrorCodes::IncompatibleShardingConfigVersion,
-                str::stream() << "current version v" << CURRENT_CONFIG_VERSION
-                              << " is older than the cluster min compatible v"
-                              << versionInfo.getMinCompatibleVersion()};
+    VersionType newVersion;
+    newVersion.setClusterId(OID::gen());
+
+    if (!feature_flags::gStopUsingConfigVersion.isEnabled(
+            serverGlobalParams.featureCompatibility)) {
+        newVersion.setCurrentVersion(VersionType::CURRENT_CONFIG_VERSION);
+        newVersion.setMinCompatibleVersion(VersionType::MIN_COMPATIBLE_CONFIG_VERSION);
     }
-
-    if (versionInfo.getCurrentVersion() == UpgradeHistory_EmptyVersion) {
-        VersionType newVersion;
-        newVersion.setClusterId(OID::gen());
-        newVersion.setMinCompatibleVersion(MIN_COMPATIBLE_CONFIG_VERSION);
-        newVersion.setCurrentVersion(CURRENT_CONFIG_VERSION);
-
-        BSONObj versionObj(newVersion.toBSON());
-        auto insertStatus = catalogClient->insertConfigDocument(
-            opCtx, VersionType::ConfigNS, versionObj, kNoWaitWriteConcern);
-
-        return insertStatus;
-    }
-
-    if (versionInfo.getCurrentVersion() == UpgradeHistory_UnreportedVersion) {
-        return {ErrorCodes::IncompatibleShardingConfigVersion,
-                "Assuming config data is old since the version document cannot be found in the "
-                "config server and it contains databases besides 'local' and 'admin'. "
-                "Please upgrade if this is the case. Otherwise, make sure that the config "
-                "server is clean."};
-    }
-
-    if (versionInfo.getCurrentVersion() < CURRENT_CONFIG_VERSION) {
-        return {ErrorCodes::IncompatibleShardingConfigVersion,
-                str::stream() << "need to upgrade current cluster version to v"
-                              << CURRENT_CONFIG_VERSION << "; currently at v"
-                              << versionInfo.getCurrentVersion()};
-    }
-
-    return Status::OK();
+    auto insertStatus = _localCatalogClient->insertConfigDocument(
+        opCtx, VersionType::ConfigNS, newVersion.toBSON(), kNoWaitWriteConcern);
+    return insertStatus;
 }
 
 Status ShardingCatalogManager::_initConfigIndexes(OperationContext* opCtx) {
     const bool unique = true;
-    auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
 
     Status result = createIndexesForConfigChunks(opCtx);
     if (result != Status::OK()) {
         return result;
     }
 
-    result = configShard->createIndexOnConfig(
-        opCtx,
-        MigrationType::ConfigNS,
-        BSON(MigrationType::ns() << 1 << MigrationType::min() << 1),
-        unique);
-    if (!result.isOK()) {
-        return result.withContext("couldn't create ns_1_min_1 index on config.migrations");
-    }
-
-    result = configShard->createIndexOnConfig(
-        opCtx, ShardType::ConfigNS, BSON(ShardType::host() << 1), unique);
+    result = createIndexOnConfigCollection(
+        opCtx, NamespaceString::kConfigsvrShardsNamespace, BSON(ShardType::host() << 1), unique);
     if (!result.isOK()) {
         return result.withContext("couldn't create host_1 index on config db");
     }
 
-    result = configShard->createIndexOnConfig(
-        opCtx, LocksType::ConfigNS, BSON(LocksType::lockID() << 1), !unique);
-    if (!result.isOK()) {
-        return result.withContext("couldn't create lock id index on config db");
-    }
-
-    result =
-        configShard->createIndexOnConfig(opCtx,
-                                         LocksType::ConfigNS,
-                                         BSON(LocksType::state() << 1 << LocksType::process() << 1),
-                                         !unique);
-    if (!result.isOK()) {
-        return result.withContext("couldn't create state and process id index on config db");
-    }
-
-    result = configShard->createIndexOnConfig(
-        opCtx, LockpingsType::ConfigNS, BSON(LockpingsType::ping() << 1), !unique);
-    if (!result.isOK()) {
-        return result.withContext("couldn't create lockping ping time index on config db");
-    }
-
-    result = configShard->createIndexOnConfig(
+    result = createIndexOnConfigCollection(
         opCtx, TagsType::ConfigNS, BSON(TagsType::ns() << 1 << TagsType::min() << 1), unique);
     if (!result.isOK()) {
         return result.withContext("couldn't create ns_1_min_1 index on config db");
     }
 
-    result = configShard->createIndexOnConfig(
+    result = createIndexOnConfigCollection(
         opCtx, TagsType::ConfigNS, BSON(TagsType::ns() << 1 << TagsType::tag() << 1), !unique);
     if (!result.isOK()) {
         return result.withContext("couldn't create ns_1_tag_1 index on config db");
+    }
+
+    if (feature_flags::gGlobalIndexesShardingCatalog.isEnabled(
+            serverGlobalParams.featureCompatibility)) {
+        result = sharding_util::createShardingIndexCatalogIndexes(opCtx);
+        if (!result.isOK()) {
+            return result;
+        }
+    }
+
+    if (feature_flags::gHistoricalPlacementShardingCatalog.isEnabled(
+            serverGlobalParams.featureCompatibility)) {
+        result = createIndexForConfigPlacementHistory(opCtx, false /*waitForMajority*/);
+        if (!result.isOK()) {
+            return result;
+        }
     }
 
     return Status::OK();
@@ -487,7 +724,7 @@ Status ShardingCatalogManager::_initConfigCollections(OperationContext* opCtx) {
 
     BSONObj cmd = BSON("create" << CollectionType::ConfigNS.coll());
     BSONObj result;
-    const bool ok = client.runCommand(CollectionType::ConfigNS.db().toString(), cmd, result);
+    const bool ok = client.runCommand(CollectionType::ConfigNS.dbName(), cmd, result);
     if (!ok) {  // create returns error NamespaceExists if collection already exists
         Status status = getStatusFromCommandResult(result);
         if (status != ErrorCodes::NamespaceExists) {
@@ -497,17 +734,71 @@ Status ShardingCatalogManager::_initConfigCollections(OperationContext* opCtx) {
     return Status::OK();
 }
 
+Status ShardingCatalogManager::_initConfigSettings(OperationContext* opCtx) {
+    DBDirectClient client(opCtx);
+
+    /**
+     * $jsonSchema: {
+     *   oneOf: [
+     *       {"properties": {_id: {enum: ["chunksize"]}},
+     *                      {value: {bsonType: "number", minimum: 1, maximum: 1024}}},
+     *       {"properties": {_id: {enum: ["balancer", "autosplit", "ReadWriteConcernDefaults",
+     *                                    "audit"]}}}
+     *   ]
+     * }
+     *
+     * Note: the schema uses "number" for the chunksize instead of "int" because "int" requires the
+     * user to pass NumberInt(x) as the value rather than x (as all of our docs recommend). Non-
+     * integer values will be handled as they were before the schema, by the balancer failing until
+     * a new value is set.
+     */
+    const auto chunkSizeValidator =
+        BSON("properties" << BSON("_id" << BSON("enum" << BSON_ARRAY(ChunkSizeSettingsType::kKey))
+                                        << "value"
+                                        << BSON("bsonType"
+                                                << "number"
+                                                << "minimum" << 1 << "maximum" << 1024))
+                          << "additionalProperties" << false);
+    const auto noopValidator =
+        BSON("properties" << BSON(
+                 "_id" << BSON("enum" << BSON_ARRAY(
+                                   BalancerSettingsType::kKey
+                                   << AutoSplitSettingsType::kKey << AutoMergeSettingsType::kKey
+                                   << ReadWriteConcernDefaults::kPersistedDocumentId << "audit"))));
+    const auto fullValidator =
+        BSON("$jsonSchema" << BSON("oneOf" << BSON_ARRAY(chunkSizeValidator << noopValidator)));
+
+    BSONObj cmd = BSON("create" << NamespaceString::kConfigSettingsNamespace.coll());
+    BSONObj result;
+    const bool ok =
+        client.runCommand(NamespaceString::kConfigSettingsNamespace.dbName(), cmd, result);
+    if (!ok) {  // create returns error NamespaceExists if collection already exists
+        Status status = getStatusFromCommandResult(result);
+        if (status != ErrorCodes::NamespaceExists) {
+            return status.withContext("Could not create config.settings");
+        }
+    }
+
+    // Collection already exists, create validator on that collection
+    CollMod collModCmd{NamespaceString::kConfigSettingsNamespace};
+    collModCmd.getCollModRequest().setValidator(fullValidator);
+    collModCmd.getCollModRequest().setValidationLevel(ValidationLevelEnum::strict);
+    BSONObjBuilder builder;
+    return processCollModCommand(
+        opCtx, {NamespaceString::kConfigSettingsNamespace}, collModCmd, &builder);
+}
+
 Status ShardingCatalogManager::setFeatureCompatibilityVersionOnShards(OperationContext* opCtx,
                                                                       const BSONObj& cmdObj) {
 
     // No shards should be added until we have forwarded featureCompatibilityVersion to all shards.
-    Lock::SharedLock lk(opCtx->lockState(), _kShardMembershipLock);
+    Lock::SharedLock lk(opCtx, _kShardMembershipLock);
 
     // We do a direct read of the shards collection with local readConcern so no shards are missed,
     // but don't go through the ShardRegistry to prevent it from caching data that may be rolled
     // back.
-    const auto opTimeWithShards = uassertStatusOK(Grid::get(opCtx)->catalogClient()->getAllShards(
-        opCtx, repl::ReadConcernLevel::kLocalReadConcern));
+    const auto opTimeWithShards = uassertStatusOK(
+        _localCatalogClient->getAllShards(opCtx, repl::ReadConcernLevel::kLocalReadConcern));
 
     for (const auto& shardType : opTimeWithShards.value) {
         const auto shardStatus =
@@ -516,6 +807,12 @@ Status ShardingCatalogManager::setFeatureCompatibilityVersionOnShards(OperationC
             continue;
         }
         const auto shard = shardStatus.getValue();
+
+        if (shard->isConfig()) {
+            // The config server will run shard upgrade/downgrade tasks directly instead of sending
+            // a command to itself.
+            continue;
+        }
 
         auto response = shard->runCommandWithFixedRetryAttempts(
             opCtx,
@@ -542,15 +839,14 @@ StatusWith<bool> ShardingCatalogManager::_isShardRequiredByZoneStillInUse(
     const ReadPreferenceSetting& readPref,
     const std::string& shardName,
     const std::string& zoneName) {
-    auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
     auto findShardStatus =
-        configShard->exhaustiveFindOnConfig(opCtx,
-                                            readPref,
-                                            repl::ReadConcernLevel::kLocalReadConcern,
-                                            ShardType::ConfigNS,
-                                            BSON(ShardType::tags() << zoneName),
-                                            BSONObj(),
-                                            2);
+        _localConfigShard->exhaustiveFindOnConfig(opCtx,
+                                                  readPref,
+                                                  repl::ReadConcernLevel::kLocalReadConcern,
+                                                  NamespaceString::kConfigsvrShardsNamespace,
+                                                  BSON(ShardType::tags() << zoneName),
+                                                  BSONObj(),
+                                                  2);
 
     if (!findShardStatus.isOK()) {
         return findShardStatus.getStatus();
@@ -576,13 +872,13 @@ StatusWith<bool> ShardingCatalogManager::_isShardRequiredByZoneStillInUse(
         }
 
         auto findChunkRangeStatus =
-            configShard->exhaustiveFindOnConfig(opCtx,
-                                                readPref,
-                                                repl::ReadConcernLevel::kLocalReadConcern,
-                                                TagsType::ConfigNS,
-                                                BSON(TagsType::tag() << zoneName),
-                                                BSONObj(),
-                                                1);
+            _localConfigShard->exhaustiveFindOnConfig(opCtx,
+                                                      readPref,
+                                                      repl::ReadConcernLevel::kLocalReadConcern,
+                                                      TagsType::ConfigNS,
+                                                      BSON(TagsType::tag() << zoneName),
+                                                      BSONObj(),
+                                                      1);
 
         if (!findChunkRangeStatus.isOK()) {
             return findChunkRangeStatus.getStatus();
@@ -594,11 +890,89 @@ StatusWith<bool> ShardingCatalogManager::_isShardRequiredByZoneStillInUse(
     return false;
 }
 
+Status ShardingCatalogManager::_notifyClusterOnNewDatabases(
+    OperationContext* opCtx, const DatabasesAdded& event, const std::vector<ShardId>& recipients) {
+    if (MONGO_unlikely(shardingCatalogManagerSkipNotifyClusterOnNewDatabases.shouldFail()) ||
+        event.getNames().empty() || recipients.empty()) {
+        // Nothing to be notified.
+        return Status::OK();
+    }
+    try {
+        // Setup an AlternativeClientRegion and a non-interruptible Operation Context to ensure that
+        // the notification may be also sent out while the node is stepping down.
+        auto altClient = opCtx->getServiceContext()->makeClient("_notifyClusterOnNewDatabases");
+        AlternativeClientRegion acr(altClient);
+        auto altOpCtxHolder = cc().makeOperationContext();
+        auto altOpCtx = altOpCtxHolder.get();
+
+        // Compose the request and decorate it with the needed write concern and auth parameters.
+        ShardsvrNotifyShardingEventRequest request(EventTypeEnum::kDatabasesAdded, event.toBSON());
+        BSONObjBuilder bob;
+        request.serialize(
+            BSON(WriteConcernOptions::kWriteConcernField << WriteConcernOptions::Majority), &bob);
+        rpc::writeAuthDataToImpersonatedUserMetadata(altOpCtx, &bob);
+
+        // send cmd
+        auto executor = Grid::get(altOpCtx)->getExecutorPool()->getFixedExecutor();
+        auto responses = sharding_util::sendCommandToShards(altOpCtx,
+                                                            DatabaseName::kAdmin.db(),
+                                                            bob.obj(),
+                                                            recipients,
+                                                            executor,
+                                                            false /*throwOnError*/);
+
+        size_t successfulNotifications = 0, incompatibleRecipients = 0, retriableFailures = 0;
+        for (const auto& cmdResponse : responses) {
+            if (cmdResponse.swResponse.isOK()) {
+                ++successfulNotifications;
+            } else {
+                LOGV2_WARNING(7175401,
+                              "Failed to send sharding event notification",
+                              "recipient"_attr = cmdResponse.shardId,
+                              "error"_attr = cmdResponse.swResponse.getStatus());
+                if (cmdResponse.swResponse.getStatus().code() == ErrorCodes::CommandNotFound) {
+                    ++incompatibleRecipients;
+                } else if (ErrorCodes::isA<ErrorCategory::RetriableError>(
+                               cmdResponse.swResponse.getStatus().code())) {
+                    ++retriableFailures;
+                }
+            }
+        }
+
+        /*
+         * The notification is considered succesful when at least one instantiation of the command
+         * is succesfully completed, assuming that:
+         * - each recipient of the notification is reacting with the emission of an entry in its
+         * oplog before returning an OK status
+         * - other processes interested in events of new database creations (e.g, a mongos that
+         * serves a change stream targeting the namespace being created) are tailing the oplogs of
+         * all the shards of the cluster.
+         *
+         * If all the failures reported by the remote nodes are classified as retryable, an error
+         * code of the same category will be returned back to the caller of this function to allow
+         * the re-execution of the original request.
+         *
+         * (Failures caused by recipients running a legacy FCV are ignored).
+         */
+        if (successfulNotifications != 0 || incompatibleRecipients == recipients.size()) {
+            return Status::OK();
+        }
+
+        auto errorCode = successfulNotifications + retriableFailures + incompatibleRecipients ==
+                recipients.size()
+            ? ErrorCodes::HostNotFound
+            : ErrorCodes::InternalError;
+        return Status(errorCode, "Unable to notify any shard on new database additions");
+    } catch (const DBException& e) {
+        return e.toStatus();
+    }
+}
+
 BSONObj ShardingCatalogManager::writeToConfigDocumentInTxn(OperationContext* opCtx,
                                                            const NamespaceString& nss,
                                                            const BatchedCommandRequest& request,
                                                            TxnNumber txnNumber) {
-    invariant(nss.db() == NamespaceString::kConfigDb);
+    invariant(nss.dbName() == DatabaseName::kConfig);
     auto response = runCommandInLocalTxn(
                         opCtx, nss.db(), false /* startTransaction */, txnNumber, request.toBSON())
                         .body;
@@ -612,7 +986,7 @@ void ShardingCatalogManager::insertConfigDocuments(OperationContext* opCtx,
                                                    const NamespaceString& nss,
                                                    std::vector<BSONObj> docs,
                                                    boost::optional<TxnNumber> txnNumber) {
-    invariant(nss.db() == NamespaceString::kConfigDb);
+    invariant(nss.dbName() == DatabaseName::kConfig);
 
     // if the operation is in a transaction then the overhead for each document is different.
     const auto documentOverhead = txnNumber
@@ -629,7 +1003,7 @@ void ShardingCatalogManager::insertConfigDocuments(OperationContext* opCtx,
         }());
 
         if (txnNumber) {
-            writeToConfigDocumentInTxn(opCtx, nss, request, txnNumber.get());
+            writeToConfigDocumentInTxn(opCtx, nss, request, txnNumber.value());
         } else {
             uassertStatusOK(
                 getStatusFromWriteCommandReply(executeConfigRequest(opCtx, nss, request)));
@@ -643,7 +1017,7 @@ boost::optional<BSONObj> ShardingCatalogManager::findOneConfigDocumentInTxn(
     TxnNumber txnNumber,
     const BSONObj& query) {
 
-    invariant(nss.db() == NamespaceString::kConfigDb);
+    invariant(nss.dbName() == DatabaseName::kConfig);
 
     FindCommandRequest findCommand(nss);
     findCommand.setFilter(query);
@@ -666,34 +1040,40 @@ boost::optional<BSONObj> ShardingCatalogManager::findOneConfigDocumentInTxn(
     return result.front().getOwned();
 }
 
+BSONObj ShardingCatalogManager::findOneConfigDocument(OperationContext* opCtx,
+                                                      const NamespaceString& nss,
+                                                      const BSONObj& query) {
+    invariant(nss.dbName().db() == DatabaseName::kConfig.db());
+
+    FindCommandRequest findCommand(nss);
+    findCommand.setFilter(query);
+
+    DBDirectClient client(opCtx);
+    return client.findOne(findCommand);
+}
+
 void ShardingCatalogManager::withTransactionAPI(OperationContext* opCtx,
                                                 const NamespaceString& namespaceForInitialFind,
                                                 txn_api::Callback callback) {
-    // Callers should check this, but including as a sanity check.
-    uassert(ErrorCodes::IllegalOperation,
-            "Internal transaction API not enabled",
-            feature_flags::gFeatureFlagInternalTransactions.isEnabled(
-                serverGlobalParams.featureCompatibility));
-
     auto txn =
-        txn_api::TransactionWithRetries(opCtx,
-                                        Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
-                                        nullptr /* resourceYielder */);
-    txn.runSync(opCtx,
-                [innerCallback = std::move(callback),
-                 namespaceForInitialFind](const txn_api::TransactionClient& txnClient,
-                                          ExecutorPtr txnExec) -> SemiFuture<void> {
-                    // Begin the transaction with a noop find.
-                    FindCommandRequest findCommand(namespaceForInitialFind);
-                    findCommand.setBatchSize(0);
-                    findCommand.setSingleBatch(true);
-                    return txnClient.exhaustiveFind(findCommand)
-                        .thenRunOn(txnExec)
-                        .then([&innerCallback, &txnClient, txnExec](auto foundDocs) {
-                            return innerCallback(txnClient, txnExec);
-                        })
-                        .semi();
-                });
+        txn_api::SyncTransactionWithRetries(opCtx,
+                                            Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
+                                            nullptr /* resourceYielder */);
+    txn.run(opCtx,
+            [innerCallback = std::move(callback),
+             namespaceForInitialFind](const txn_api::TransactionClient& txnClient,
+                                      ExecutorPtr txnExec) -> SemiFuture<void> {
+                // Begin the transaction with a noop find.
+                FindCommandRequest findCommand(namespaceForInitialFind);
+                findCommand.setBatchSize(0);
+                findCommand.setSingleBatch(true);
+                return txnClient.exhaustiveFind(findCommand)
+                    .thenRunOn(txnExec)
+                    .then([&innerCallback, &txnClient, txnExec](auto foundDocs) {
+                        return innerCallback(txnClient, txnExec);
+                    })
+                    .semi();
+            });
 }
 
 void ShardingCatalogManager::withTransaction(
@@ -718,7 +1098,7 @@ void ShardingCatalogManager::withTransaction(
         stdx::lock_guard<Client> lk(*client);
         client->setSystemOperationKillableByStepdown(lk);
     }
-    asr.opCtx()->setAlwaysInterruptAtStepDownOrUp();
+    asr.opCtx()->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
     AuthorizationSession::get(client)->grantInternalAuthorization(client);
     TxnNumber txnNumber = 0;
 
@@ -734,10 +1114,8 @@ void ShardingCatalogManager::withTransaction(
 
     size_t attempt = 1;
     while (true) {
-        // Some ErrorCategory::Interruption errors are also considered transient transaction
-        // errors. We don't attempt to enumerate them explicitly. Instead, we retry on all
-        // ErrorCategory::Interruption errors (e.g. LockTimeout) and detect whether asr.opCtx()
-        // was killed by explicitly checking if it has been interrupted.
+        // We retry on transient transaction errors like LockTimeout and detect whether
+        // asr.opCtx() was killed by explicitly checking if it has been interrupted.
         asr.opCtx()->checkForInterrupt();
         ++txnNumber;
 
@@ -800,6 +1178,141 @@ void ShardingCatalogManager::withTransaction(
         guard.dismiss();
         return;
     }
+}
+
+
+void ShardingCatalogManager::initializePlacementHistory(OperationContext* opCtx) {
+    // Initialize the collection.
+    uassertStatusOK(createIndexForConfigPlacementHistory(opCtx, true /*waitForMajority*/));
+
+    /**
+     * This function will establish an initialization time to collect a consistent description of
+     * the placement of each existing namespace through a snapshot read of the sharding catalog.
+     * Such description will then be persisted in config.placementHistory.
+     *
+     * Concurrently, sharding DDL operations and chunk may also commit - and insert new documents
+     * into config.placementHistory if they alter the distribution of the targeted namespace. All
+     * these writes operations are not supposed to collide, since:
+     * - initializePlacementHistory() will make use of the config time to access already
+     *   majority-committed information
+     * - incoming (or not yet materialized) DDLs will insert more recent placement information,
+     *   which will have the effect of "updating" the snapshot produced by this function.
+     */
+    Timestamp initializationTime;
+    std::vector<ShardId> shardsAtInitializationTime;
+    {
+        Shard::QueryResponse allShardsQueryResponse;
+        {
+            // Ensure isolation from concurrent add/removeShards while the initializationTime is
+            // set. Also, retrieve the content of config.shards (it will later form part of the
+            // metadata describing the initialization of config.placementHistor).
+            auto topologyScopedLock = enterStableTopologyRegion(opCtx);
+
+            const auto now = VectorClock::get(opCtx)->getTime();
+            initializationTime = now.configTime().asTimestamp();
+
+            allShardsQueryResponse = uassertStatusOK(_localConfigShard->exhaustiveFindOnConfig(
+                opCtx,
+                ReadPreferenceSetting(ReadPreference::Nearest, TagSet{}),
+                repl::ReadConcernLevel::kMajorityReadConcern,
+                NamespaceString::kConfigsvrShardsNamespace,
+                {},
+                {},
+                boost::none));
+        }
+
+        std::transform(allShardsQueryResponse.docs.begin(),
+                       allShardsQueryResponse.docs.end(),
+                       std::back_inserter(shardsAtInitializationTime),
+                       [](const BSONObj& doc) {
+                           return ShardId(doc.getStringField(ShardType::name.name()).toString());
+                       });
+    }
+
+    // Setup and run the aggregation that will perform the snapshot read of the sharding catalog and
+    // persist its output into config.placementHistory.
+    // (This operation includes a $merge stage writing into the config database, which requires
+    // internal client credentials).
+    {
+        auto altClient = opCtx->getServiceContext()->makeClient("initializePlacementHistory");
+        AuthorizationSession::get(altClient.get())->grantInternalAuthorization(altClient.get());
+        AlternativeClientRegion acr(altClient);
+        auto executor =
+            Grid::get(opCtx->getServiceContext())->getExecutorPool()->getFixedExecutor();
+        CancelableOperationContext altOpCtx(
+            cc().makeOperationContext(), opCtx->getCancellationToken(), executor);
+
+        auto aggRequest =
+            createInitPlacementHistoryAggregationRequest(altOpCtx.get(), initializationTime);
+        aggRequest.setUnwrappedReadPref({});
+        repl::ReadConcernArgs readConcernArgs(repl::ReadConcernLevel::kSnapshotReadConcern);
+        readConcernArgs.setArgsAtClusterTimeForSnapshot(initializationTime);
+        aggRequest.setReadConcern(readConcernArgs.toBSONInner());
+        aggRequest.setWriteConcern({});
+        auto noopCallback = [](const std::vector<BSONObj>& batch,
+                               const boost::optional<BSONObj>& postBatchResumeToken) {
+            return true;
+        };
+
+        Status status = _localConfigShard->runAggregation(altOpCtx.get(), aggRequest, noopCallback);
+        uassertStatusOK(status);
+    }
+
+    /*
+     * config.placementHistory has now a full representation of the cluster at initializationTime,
+     * while earlier points in time have no consistent placement data persisted.
+     *
+     * As a final step, two extra "metadata documents" (identified by
+     * kConfigsvrPlacementHistoryFcvMarkerNamespace) are inserted to describe the operation
+     * boundaries of config.placementHistory:
+     * - initializationTimeInfo: contains the time of the initialization and an empty set of shards.
+     *   It will allow ShardingCatalogClient to serve accurate responses to historical placement
+     *   queries within the [initializationTime, +inf) range.
+     * - approximatedPlacementData: contains the cluster topology at the time of the
+     *   initialization and is marked with Timestamp(0,1).
+     *   It will be used by ShardingCatalogClient to serve approximated responses to historical
+     *   placement queries within the [-inf, initializationTime) range.
+     */
+    auto transactionChain = [initializationTime,
+                             shardsAtInitializationTime = std::move(shardsAtInitializationTime)](
+                                const txn_api::TransactionClient& txnClient, ExecutorPtr txnExec) {
+        NamespacePlacementType approximatedPlacementData(
+            NamespaceString::kConfigsvrPlacementHistoryFcvMarkerNamespace,
+            Timestamp(0, 1),
+            std::move(shardsAtInitializationTime));
+        NamespacePlacementType initializationTimeInfo(
+            NamespaceString::kConfigsvrPlacementHistoryFcvMarkerNamespace, initializationTime, {});
+        write_ops::UpdateCommandRequest upsertInitializationMetadata(
+            NamespaceString::kConfigsvrPlacementHistoryNamespace);
+        auto buildOpEntryFor = [](const NamespacePlacementType& descriptor) {
+            write_ops::UpdateOpEntry entry;
+            entry.setUpsert(true);
+            entry.setQ(BSON(NamespacePlacementType::kNssFieldName
+                            << descriptor.getNss().ns()
+                            << NamespacePlacementType::kTimestampFieldName
+                            << descriptor.getTimestamp()));
+            entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(descriptor.toBSON()));
+            return entry;
+        };
+
+        upsertInitializationMetadata.setUpdates(
+            {buildOpEntryFor(approximatedPlacementData), buildOpEntryFor(initializationTimeInfo)});
+        return txnClient.runCRUDOp(upsertInitializationMetadata, {} /*stmtIds*/)
+            .thenRunOn(txnExec)
+            .then([&](const BatchedCommandResponse& insertPlacementEntryResponse) {
+                uassertStatusOK(insertPlacementEntryResponse.toStatus());
+            })
+            .semi();
+    };
+
+    WriteConcernOptions originalWC = opCtx->getWriteConcern();
+    opCtx->setWriteConcern(WriteConcernOptions{WriteConcernOptions::kMajority,
+                                               WriteConcernOptions::SyncMode::UNSET,
+                                               WriteConcernOptions::kNoTimeout});
+    ScopeGuard resetWriteConcerGuard([opCtx, &originalWC] { opCtx->setWriteConcern(originalWC); });
+    auto& executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+    txn_api::SyncTransactionWithRetries txn(opCtx, executor, nullptr /*resourceYielder*/);
+    txn.run(opCtx, transactionChain);
 }
 
 }  // namespace mongo

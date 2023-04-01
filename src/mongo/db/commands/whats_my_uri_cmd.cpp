@@ -55,12 +55,14 @@ public:
         return "{whatsmyuri:1}";
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {}  // No auth required
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        return Status::OK();  // No auth required
+    }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         result << "you" << opCtx->getClient()->clientAddress(true /*includePort*/);

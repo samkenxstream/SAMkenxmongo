@@ -58,6 +58,8 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/encryption_hooks.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/s/is_mongos.h"
@@ -65,15 +67,7 @@
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/str.h"
 
-// As this file is included in various places we need to handle the case of having the log header
-// already included
-#ifndef MONGO_LOGV2_DEFAULT_COMPONENT
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
-#endif
-
-#ifndef MONGO_UTIL_LOGV2_H_
-#include "mongo/logv2/log.h"
-#endif
 
 namespace mongo {
 
@@ -128,8 +122,8 @@ inline std::string myErrnoWithDescription() {
     return sb.str();
 }
 
-template <typename Data, typename Comparator>
-void dassertCompIsSane(const Comparator& comp, const Data& lhs, const Data& rhs) {
+template <typename Key, typename Comparator>
+void dassertCompIsSane(const Comparator& comp, const Key& lhs, const Key& rhs) {
 #if defined(MONGO_CONFIG_DEBUG_BUILD) && !defined(_MSC_VER)
     // MSVC++ already does similar verification in debug mode in addition to using
     // algorithms that do more comparisons. Doing our own verification in addition makes
@@ -541,8 +535,8 @@ private:
         template <typename Ptr>
         bool operator()(const Ptr& lhs, const Ptr& rhs) const {
             // first compare data
-            dassertCompIsSane(_comp, lhs->current(), rhs->current());
-            int ret = _comp(lhs->current(), rhs->current());
+            dassertCompIsSane(_comp, lhs->current().first, rhs->current().first);
+            int ret = _comp(lhs->current().first, rhs->current().first);
             if (ret)
                 return ret > 0;
 
@@ -604,7 +598,6 @@ protected:
      * following:
      *
      * {1, 2, 3, 4, 5}
-     * {12, 3, 4, 5}
      * {12, 34, 5}
      * {1234, 5}
      */
@@ -621,8 +614,8 @@ protected:
                    "maxNumSpills"_attr = numTargetedSpills);
 
         while (iterators.size() > numTargetedSpills) {
-            std::shared_ptr<File> newSpillsFile =
-                std::make_shared<File>(this->_opts.tempDir + "/" + nextFileName());
+            std::shared_ptr<File> newSpillsFile = std::make_shared<File>(
+                this->_opts.tempDir + "/" + nextFileName(), this->_opts.sorterFileStats);
 
             LOGV2_DEBUG(6033103,
                         1,
@@ -654,7 +647,7 @@ protected:
                 auto iteratorPtr = std::shared_ptr<Iterator>(writer.done());
                 mergeIterator->closeSource();
                 mergedIterators.push_back(std::move(iteratorPtr));
-                this->_numSpills++;
+                this->_stats.incrementSpilledRanges();
             }
 
             LOGV2_DEBUG(6033101,
@@ -680,6 +673,7 @@ template <typename Key, typename Value, typename Comparator>
 class NoLimitSorter : public MergeableSorter<Key, Value, Comparator> {
 public:
     typedef std::pair<Key, Value> Data;
+    typedef std::function<Value()> ValueProducer;
     using Iterator = typename MergeableSorter<Key, Value, Comparator>::Iterator;
     using Settings = typename MergeableSorter<Key, Value, Comparator>::Settings;
 
@@ -715,33 +709,40 @@ public:
                                this->_opts.dbName,
                                range.getChecksum());
                        });
-        this->_numSpills = this->_iters.size();
+        this->_stats.setSpilledRanges(this->_iters.size());
     }
 
-    void add(const Key& key, const Value& val) {
+    template <typename DataProducer>
+    void addImpl(DataProducer dataProducer) {
         invariant(!_done);
 
-        _data.emplace_back(key.getOwned(), val.getOwned());
+        auto& keyVal = _data.emplace_back(dataProducer());
 
-        auto memUsage = key.memUsageForSorter() + val.memUsageForSorter();
-        _memUsed += memUsage;
-        this->_totalDataSizeSorted += memUsage;
+        auto& memPool = this->_memPool;
+        if (memPool) {
+            auto memUsedInsideSorter = (sizeof(Key) + sizeof(Value)) * (_data.size() + 1);
+            this->_stats.setMemUsage(memPool->memUsage() + memUsedInsideSorter);
+        } else {
+            auto memUsage = keyVal.first.memUsageForSorter() + keyVal.second.memUsageForSorter();
+            this->_stats.incrementMemUsage(memUsage);
+        }
 
-        if (_memUsed > this->_opts.maxMemoryUsageBytes)
+        if (this->_stats.memUsage() > this->_opts.maxMemoryUsageBytes) {
             spill();
+        }
     }
 
-    void emplace(Key&& key, Value&& val) override {
-        invariant(!_done);
+    void add(const Key& key, const Value& val) override {
+        addImpl([&]() -> Data { return {key.getOwned(), val.getOwned()}; });
+    }
 
-        auto memUsage = key.memUsageForSorter() + val.memUsageForSorter();
-        _memUsed += memUsage;
-        this->_totalDataSizeSorted += memUsage;
-
-        _data.emplace_back(std::move(key), std::move(val));
-
-        if (_memUsed > this->_opts.maxMemoryUsageBytes)
-            spill();
+    void emplace(Key&& key, ValueProducer valProducer) override {
+        addImpl([&]() -> Data {
+            key.makeOwned();
+            auto val = valProducer();
+            val.makeOwned();
+            return {std::move(key), std::move(val)};
+        });
     }
 
     Iterator* done() {
@@ -766,8 +767,8 @@ private:
     public:
         explicit STLComparator(const Comparator& comp) : _comp(comp) {}
         bool operator()(const Data& lhs, const Data& rhs) const {
-            dassertCompIsSane(_comp, lhs, rhs);
-            return _comp(lhs, rhs) < 0;
+            dassertCompIsSane(_comp, lhs.first, rhs.first);
+            return _comp(lhs.first, rhs.first) < 0;
         }
 
     private:
@@ -777,7 +778,15 @@ private:
     void sort() {
         STLComparator less(this->_comp);
         std::stable_sort(_data.begin(), _data.end(), less);
-        this->_numSorted += _data.size();
+        this->_stats.incrementNumSorted(_data.size());
+        auto& memPool = this->_memPool;
+        if (memPool) {
+            invariant(memPool->totalFragmentBytesUsed() >= this->_stats.bytesSorted());
+            this->_stats.incrementBytesSorted(memPool->totalFragmentBytesUsed() -
+                                              this->_stats.bytesSorted());
+        } else {
+            this->_stats.incrementBytesSorted(this->_stats.memUsage());
+        }
     }
 
     void spill() {
@@ -805,13 +814,19 @@ private:
 
         this->_iters.push_back(std::shared_ptr<Iterator>(iteratorPtr));
 
-        _memUsed = 0;
+        auto& memPool = this->_memPool;
+        if (memPool) {
+            // We expect that all buffers are unused at this point.
+            memPool->freeUnused();
+            this->_stats.setMemUsage(memPool->memUsage());
+        } else {
+            this->_stats.resetMemUsage();
+        }
 
-        this->_numSpills++;
+        this->_stats.incrementSpilledRanges();
     }
 
     bool _done = false;
-    size_t _memUsed = 0;
     std::deque<Data> _data;  // Data that has not been spilled.
 };
 
@@ -821,26 +836,41 @@ class LimitOneSorter : public Sorter<Key, Value> {
     // spill to disk and only tracks memory usage if explicitly requested.
 public:
     typedef std::pair<Key, Value> Data;
+    typedef std::function<Value()> ValueProducer;
     typedef SortIteratorInterface<Key, Value> Iterator;
 
     LimitOneSorter(const SortOptions& opts, const Comparator& comp)
-        : _comp(comp), _haveData(false) {
+        : Sorter<Key, Value>(opts), _comp(comp), _haveData(false) {
         verify(opts.limit == 1);
     }
 
-    void add(const Key& key, const Value& val) {
-        Data contender(key, val);
-
-        this->_numSorted += 1;
+    template <typename DataProducer>
+    void addImpl(const Key& key, DataProducer dataProducer) {
+        this->_stats.incrementNumSorted();
         if (_haveData) {
-            dassertCompIsSane(_comp, _best, contender);
-            if (_comp(_best, contender) <= 0)
+            dassertCompIsSane(_comp, _best.first, key);
+            if (_comp(_best.first, key) <= 0)
                 return;  // not good enough
         } else {
             _haveData = true;
         }
 
-        _best = {contender.first.getOwned(), contender.second.getOwned()};
+        // Invoking dataProducer could invalidate key if it uses move semantics,
+        // don't reference them anymore from this point on.
+        _best = dataProducer();
+    }
+
+    void add(const Key& key, const Value& val) override {
+        addImpl(key, [&]() -> Data { return {key.getOwned(), val.getOwned()}; });
+    }
+
+    void emplace(Key&& key, ValueProducer valProducer) override {
+        addImpl(key, [&]() -> Data {
+            key.makeOwned();
+            auto val = valProducer();
+            val.makeOwned();
+            return {std::move(key), std::move(val)};
+        });
     }
 
     Iterator* done() {
@@ -868,6 +898,7 @@ template <typename Key, typename Value, typename Comparator>
 class TopKSorter : public MergeableSorter<Key, Value, Comparator> {
 public:
     typedef std::pair<Key, Value> Data;
+    typedef std::function<Value()> ValueProducer;
     using Iterator = typename MergeableSorter<Key, Value, Comparator>::Iterator;
     using Settings = typename MergeableSorter<Key, Value, Comparator>::Settings;
 
@@ -875,7 +906,6 @@ public:
                const Comparator& comp,
                const Settings& settings = Settings())
         : MergeableSorter<Key, Value, Comparator>(opts, comp, settings),
-          _memUsed(0),
           _haveCutoff(false),
           _worstCount(0),
           _medianCount(0) {
@@ -891,28 +921,29 @@ public:
         }
     }
 
-    void add(const Key& key, const Value& val) {
+    template <typename DataProducer>
+    void addImpl(const Key& key, DataProducer dataProducer) {
         invariant(!_done);
 
-        this->_numSorted += 1;
+        this->_stats.incrementNumSorted();
 
         STLComparator less(this->_comp);
-        Data contender(key, val);
 
         if (_data.size() < this->_opts.limit) {
-            if (_haveCutoff && !less(contender, _cutoff))
+            if (_haveCutoff && this->_comp(key, _cutoff.first) >= 0)
                 return;
 
-            _data.emplace_back(contender.first.getOwned(), contender.second.getOwned());
+            // Invoking dataProducer could invalidate key if it uses move semantics,
+            // don't reference them anymore from this point on.
+            auto& keyVal = _data.emplace_back(dataProducer());
 
-            auto memUsage = key.memUsageForSorter() + val.memUsageForSorter();
-            _memUsed += memUsage;
-            this->_totalDataSizeSorted += memUsage;
+            auto memUsage = keyVal.first.memUsageForSorter() + keyVal.second.memUsageForSorter();
+            this->_stats.incrementMemUsage(memUsage);
 
             if (_data.size() == this->_opts.limit)
                 std::make_heap(_data.begin(), _data.end(), less);
 
-            if (_memUsed > this->_opts.maxMemoryUsageBytes)
+            if (this->_stats.memUsage() > this->_opts.maxMemoryUsageBytes)
                 spill();
 
             return;
@@ -920,24 +951,40 @@ public:
 
         invariant(_data.size() == this->_opts.limit);
 
-        if (!less(contender, _data.front()))
+        if (this->_comp(key, _data.front().first) >= 0)
             return;  // not good enough
 
         // Remove the old worst pair and insert the contender, adjusting _memUsed
 
-        auto memUsage = key.memUsageForSorter() + val.memUsageForSorter();
-        _memUsed += memUsage;
-        this->_totalDataSizeSorted += memUsage;
-
-        _memUsed -= _data.front().first.memUsageForSorter();
-        _memUsed -= _data.front().second.memUsageForSorter();
+        this->_stats.decrementMemUsage(_data.front().first.memUsageForSorter());
+        this->_stats.decrementMemUsage(_data.front().second.memUsageForSorter());
 
         std::pop_heap(_data.begin(), _data.end(), less);
-        _data.back() = {contender.first.getOwned(), contender.second.getOwned()};
+
+        // Invoking dataProducer could invalidate key if it uses move semantics,
+        // don't reference them anymore from this point on.
+        _data.back() = dataProducer();
+
+        this->_stats.incrementMemUsage(_data.back().first.memUsageForSorter());
+        this->_stats.incrementMemUsage(_data.back().second.memUsageForSorter());
+
         std::push_heap(_data.begin(), _data.end(), less);
 
-        if (_memUsed > this->_opts.maxMemoryUsageBytes)
+        if (this->_stats.memUsage() > this->_opts.maxMemoryUsageBytes)
             spill();
+    }
+
+    void add(const Key& key, const Value& val) override {
+        addImpl(key, [&]() -> Data { return {key.getOwned(), val.getOwned()}; });
+    }
+
+    void emplace(Key&& key, ValueProducer valProducer) override {
+        addImpl(key, [&]() -> Data {
+            key.makeOwned();
+            auto val = valProducer();
+            val.makeOwned();
+            return {std::move(key), std::move(val)};
+        });
     }
 
     Iterator* done() {
@@ -962,8 +1009,8 @@ private:
     public:
         explicit STLComparator(const Comparator& comp) : _comp(comp) {}
         bool operator()(const Data& lhs, const Data& rhs) const {
-            dassertCompIsSane(_comp, lhs, rhs);
-            return _comp(lhs, rhs) < 0;
+            dassertCompIsSane(_comp, lhs.first, rhs.first);
+            return _comp(lhs.first, rhs.first) < 0;
         }
 
     private:
@@ -978,6 +1025,8 @@ private:
         } else {
             std::stable_sort(_data.begin(), _data.end(), less);
         }
+
+        this->_stats.incrementBytesSorted(this->_stats.memUsage());
     }
 
     // Can only be called after _data is sorted
@@ -1075,9 +1124,6 @@ private:
                           << " Pass allowDiskUse:true to opt in.");
         }
 
-        // We should check readOnly before getting here.
-        invariant(!storageGlobalParams.readOnly);
-
         sort();
         updateCutoff();
 
@@ -1092,13 +1138,11 @@ private:
         Iterator* iteratorPtr = writer.done();
         this->_iters.push_back(std::shared_ptr<Iterator>(iteratorPtr));
 
-        _memUsed = 0;
-
-        this->_numSpills++;
+        this->_stats.resetMemUsage();
+        this->_stats.incrementSpilledRanges();
     }
 
     bool _done = false;
-    size_t _memUsed;
 
     // Data that has not been spilled. Organized as max-heap if size == limit.
     std::vector<Data> _data;
@@ -1114,20 +1158,39 @@ private:
 
 }  // namespace sorter
 
+namespace {
+SharedBufferFragmentBuilder makeMemPool() {
+    return SharedBufferFragmentBuilder(
+        gOperationMemoryPoolBlockInitialSizeKB.loadRelaxed() * static_cast<size_t>(1024),
+        SharedBufferFragmentBuilder::DoubleGrowStrategy(
+            gOperationMemoryPoolBlockMaxSizeKB.loadRelaxed() * static_cast<size_t>(1024)));
+}
+}  // namespace
+
 template <typename Key, typename Value>
 Sorter<Key, Value>::Sorter(const SortOptions& opts)
-    : _opts(opts),
-      _file(opts.extSortAllowed
-                ? std::make_shared<Sorter<Key, Value>::File>(opts.tempDir + "/" + nextFileName())
-                : nullptr) {}
+    : SorterBase(opts.sorterTracker),
+      _opts(opts),
+      _file(opts.extSortAllowed ? std::make_shared<Sorter<Key, Value>::File>(
+                                      opts.tempDir + "/" + nextFileName(), opts.sorterFileStats)
+                                : nullptr) {
+    if (opts.useMemPool) {
+        _memPool.emplace(makeMemPool());
+    }
+}
 
 template <typename Key, typename Value>
 Sorter<Key, Value>::Sorter(const SortOptions& opts, const std::string& fileName)
-    : _opts(opts),
-      _file(std::make_shared<Sorter<Key, Value>::File>(opts.tempDir + "/" + fileName)) {
+    : SorterBase(opts.sorterTracker),
+      _opts(opts),
+      _file(std::make_shared<Sorter<Key, Value>::File>(opts.tempDir + "/" + fileName,
+                                                       opts.sorterFileStats)) {
     invariant(opts.extSortAllowed);
     invariant(!opts.tempDir.empty());
     invariant(!fileName.empty());
+    if (opts.useMemPool) {
+        _memPool.emplace(makeMemPool());
+    }
 }
 
 template <typename Key, typename Value>
@@ -1145,7 +1208,20 @@ typename Sorter<Key, Value>::PersistedState Sorter<Key, Value>::persistDataForSh
 }
 
 template <typename Key, typename Value>
+Sorter<Key, Value>::File::File(std::string path, SorterFileStats* stats)
+    : _path(std::move(path)), _stats(stats) {
+    invariant(!_path.empty());
+    if (_stats && boost::filesystem::exists(_path) && boost::filesystem::is_regular_file(_path)) {
+        _stats->addSpilledDataSize(boost::filesystem::file_size(_path));
+    }
+}
+
+template <typename Key, typename Value>
 Sorter<Key, Value>::File::~File() {
+    if (_stats && _file.is_open()) {
+        _stats->closed.addAndFetch(1);
+    }
+
     if (_keep) {
         return;
     }
@@ -1201,6 +1277,9 @@ void Sorter<Key, Value>::File::write(const char* data, std::streamsize size) {
     try {
         _file.write(data, size);
         _offset += size;
+        if (_stats) {
+            this->_stats->addSpilledDataSize(size);
+        };
     } catch (const std::system_error& ex) {
         if (ex.code() == std::errc::no_space_on_device) {
             uasserted(ErrorCodes::OutOfDiskSpace,
@@ -1238,6 +1317,10 @@ void Sorter<Key, Value>::File::_open() {
             str::stream() << "Error opening file " << _path.string() << ": "
                           << sorter::myErrnoWithDescription(),
             _file.good());
+
+    if (_stats) {
+        _stats->opened.addAndFetch(1);
+    }
 }
 
 template <typename Key, typename Value>
@@ -1266,7 +1349,7 @@ SortedFileWriter<Key, Value>::SortedFileWriter(
     : _settings(settings),
       _file(std::move(file)),
       _fileStartOffset(_file->currentOffset()),
-      _dbName(opts.dbName) {
+      _opts(opts) {
     // This should be checked by consumers, but if we get here don't allow writes.
     uassert(
         16946, "Attempting to use external sort from mongos. This is not allowed.", !isMongos());
@@ -1292,22 +1375,26 @@ void SortedFileWriter<Key, Value>::addAlreadySorted(const Key& key, const Value&
         addDataToChecksum(_buffer.buf() + _nextObjPos, _buffer.len() - _nextObjPos, _checksum);
 
     if (_buffer.len() > static_cast<int>(kSortedFileBufferSize))
-        spill();
+        writeChunk();
 }
 
 template <typename Key, typename Value>
-void SortedFileWriter<Key, Value>::spill() {
+void SortedFileWriter<Key, Value>::writeChunk() {
     int32_t size = _buffer.len();
     char* outBuffer = _buffer.buf();
 
     if (size == 0)
         return;
 
+    if (_opts.sorterFileStats) {
+        _opts.sorterFileStats->addSpilledDataSizeUncompressed(size);
+    }
+
     std::string compressed;
     snappy::Compress(outBuffer, size, &compressed);
     verify(compressed.size() <= size_t(std::numeric_limits<int32_t>::max()));
 
-    const bool shouldCompress = compressed.size() < size_t(_buffer.len() / 10 * 9);
+    const bool shouldCompress = compressed.size() < (size_t(_buffer.len()) / 10 * 9);
     if (shouldCompress) {
         size = compressed.size();
         outBuffer = const_cast<char*>(compressed.data());
@@ -1323,7 +1410,7 @@ void SortedFileWriter<Key, Value>::spill() {
                                                         reinterpret_cast<uint8_t*>(out.get()),
                                                         protectedSizeMax,
                                                         &resultLen,
-                                                        _dbName);
+                                                        _opts.dbName);
         uassert(28842,
                 str::stream() << "Failed to compress data: " << status.toString(),
                 status.isOK());
@@ -1341,10 +1428,24 @@ void SortedFileWriter<Key, Value>::spill() {
 
 template <typename Key, typename Value>
 SortIteratorInterface<Key, Value>* SortedFileWriter<Key, Value>::done() {
-    spill();
+    writeChunk();
 
     return new sorter::FileIterator<Key, Value>(
-        _file, _fileStartOffset, _file->currentOffset(), _settings, _dbName, _checksum);
+        _file, _fileStartOffset, _file->currentOffset(), _settings, _opts.dbName, _checksum);
+}
+
+template <typename Key, typename Value>
+std::shared_ptr<SortIteratorInterface<Key, Value>>
+SortedFileWriter<Key, Value>::createFileIteratorForResume(
+    std::shared_ptr<typename Sorter<Key, Value>::File> file,
+    std::streamoff fileStartOffset,
+    std::streamoff fileEndOffset,
+    const Settings& settings,
+    const boost::optional<std::string>& dbName,
+    const uint32_t checksum) {
+
+    return std::shared_ptr<SortIteratorInterface<Key, Value>>(new sorter::FileIterator<Key, Value>(
+        file, fileStartOffset, fileEndOffset, settings, dbName, checksum));
 }
 
 template <typename Key, typename Value, typename Comparator, typename BoundMaker>
@@ -1352,14 +1453,14 @@ BoundedSorter<Key, Value, Comparator, BoundMaker>::BoundedSorter(const SortOptio
                                                                  Comparator comp,
                                                                  BoundMaker makeBound,
                                                                  bool checkInput)
-    : compare(comp),
+    : BoundedSorterInterface<Key, Value>(opts),
+      compare(comp),
       makeBound(makeBound),
-      _comparePairs{compare},
       _checkInput(checkInput),
       _opts(opts),
       _heap(Greater{&compare}),
       _file(opts.extSortAllowed ? std::make_shared<typename Sorter<Key, Value>::File>(
-                                      opts.tempDir + "/" + nextFileName())
+                                      opts.tempDir + "/" + nextFileName(), opts.sorterFileStats)
                                 : nullptr) {}
 
 template <typename Key, typename Value, typename Comparator, typename BoundMaker>
@@ -1367,7 +1468,8 @@ void BoundedSorter<Key, Value, Comparator, BoundMaker>::add(Key key, Value value
     invariant(!_done);
     // If a new value violates what we thought was our min bound, something has gone wrong.
     uassert(6369910,
-            "BoundedSorter input is too out-of-order.",
+            str::stream() << "BoundedSorter input is too out-of-order: with bound "
+                          << _min->toString() << ", did not expect input " << key.toString(),
             !_checkInput || !_min || compare(*_min, key) <= 0);
 
     // Each new item can potentially give us a tighter bound (a higher min).
@@ -1378,17 +1480,44 @@ void BoundedSorter<Key, Value, Comparator, BoundMaker>::add(Key key, Value value
     auto memUsage = key.memUsageForSorter() + value.memUsageForSorter();
     _heap.emplace(std::move(key), std::move(value));
 
-    _memUsed += memUsage;
-    this->_totalDataSizeSorted += memUsage;
-
-    if (_memUsed > _opts.maxMemoryUsageBytes)
+    this->_stats.incrementMemUsage(memUsage);
+    this->_stats.incrementBytesSorted(memUsage);
+    if (this->_stats.memUsage() > _opts.maxMemoryUsageBytes)
         _spill();
+}
+
+template <typename Key, typename Value, typename Comparator, typename BoundMaker>
+void BoundedSorter<Key, Value, Comparator, BoundMaker>::restart() {
+    tassert(
+        6434804, "BoundedSorter must be in state kDone to restart()", getState() == State::kDone);
+
+    // In state kDone, the heap and spill are usually empty, because kDone means the sorter has
+    // no more elements to return. However, if there is a limit then we can also reach state
+    // kDone when 'this->_stats.numSorted() == _opts.limit'.
+    _spillIter.reset();
+    _heap = decltype(_heap){Greater{&compare}};
+    this->_stats.resetMemUsage();
+
+    _done = false;
+    _min.reset();
+
+    // There are now two possible states we could be in:
+    // - Typically, we should be ready for more input (kWait).
+    // - If there is a limit and we reached it, then we're done. We were done before restart()
+    //   and we're still done.
+    if (_opts.limit && this->_stats.numSorted() == _opts.limit) {
+        tassert(6434806,
+                "BoundedSorter has fulfilled _opts.limit and should still be in state kDone",
+                getState() == State::kDone);
+    } else {
+        tassert(6434805, "BoundedSorter should now be ready for input", getState() == State::kWait);
+    }
 }
 
 template <typename Key, typename Value, typename Comparator, typename BoundMaker>
 typename BoundedSorterInterface<Key, Value>::State
 BoundedSorter<Key, Value, Comparator, BoundMaker>::getState() const {
-    if (_opts.limit > 0 && _opts.limit == _numSorted) {
+    if (_opts.limit > 0 && _opts.limit == this->_stats.numSorted()) {
         return State::kDone;
     }
 
@@ -1424,10 +1553,11 @@ std::pair<Key, Value> BoundedSorter<Key, Value, Comparator, BoundMaker>::next() 
         _heap.pop();
 
         auto memUsage = result.first.memUsageForSorter() + result.second.memUsageForSorter();
-        tassert(6409301,
-                "Memory usage for BoundedSorter is invalid",
-                memUsage >= 0 && static_cast<size_t>(memUsage) <= _memUsed);
-        _memUsed -= memUsage;
+        if (static_cast<int64_t>(memUsage) > static_cast<int64_t>(this->_stats.memUsage())) {
+            this->_stats.resetMemUsage();
+        } else {
+            this->_stats.decrementMemUsage(memUsage);
+        }
     };
 
     auto pullFromSpilled = [this, &result]() {
@@ -1438,7 +1568,7 @@ std::pair<Key, Value> BoundedSorter<Key, Value, Comparator, BoundMaker>::next() 
     };
 
     if (!_heap.empty() && _spillIter) {
-        if (_comparePairs(_heap.top(), _spillIter->current()) <= 0) {
+        if (compare(_heap.top().first, _spillIter->current().first) <= 0) {
             pullFromHeap();
         } else {
             pullFromSpilled();
@@ -1449,7 +1579,7 @@ std::pair<Key, Value> BoundedSorter<Key, Value, Comparator, BoundMaker>::next() 
         pullFromSpilled();
     }
 
-    ++_numSorted;
+    this->_stats.incrementNumSorted();
 
     return result;
 }
@@ -1462,17 +1592,17 @@ void BoundedSorter<Key, Value, Comparator, BoundMaker>::_spill() {
     // If we have a small $limit, we can simply extract that many of the smallest elements from
     // the _heap and discard the rest, avoiding an expensive spill to disk.
     if (_opts.limit > 0 && _opts.limit < (_heap.size() / 2)) {
-        _memUsed = 0;
+        this->_stats.resetMemUsage();
         decltype(_heap) retained{Greater{&compare}};
         for (size_t i = 0; i < _opts.limit; ++i) {
-            _memUsed +=
-                _heap.top().first.memUsageForSorter() + _heap.top().second.memUsageForSorter();
+            this->_stats.incrementMemUsage(_heap.top().first.memUsageForSorter() +
+                                           _heap.top().second.memUsageForSorter());
             retained.emplace(_heap.top());
             _heap.pop();
         }
         _heap.swap(retained);
 
-        if (_memUsed < _opts.maxMemoryUsageBytes) {
+        if (this->_stats.memUsage() < _opts.maxMemoryUsageBytes) {
             return;
         }
     }
@@ -1482,7 +1612,7 @@ void BoundedSorter<Key, Value, Comparator, BoundMaker>::_spill() {
                           << " bytes, but did not opt in to external sorting.",
             _opts.extSortAllowed);
 
-    ++_numSpills;
+    this->_stats.incrementSpilledRanges();
 
     // Write out all the values from the heap in sorted order.
     SortedFileWriter<Key, Value> writer(_opts, _file, {});
@@ -1492,23 +1622,17 @@ void BoundedSorter<Key, Value, Comparator, BoundMaker>::_spill() {
     }
     std::shared_ptr<SpillIterator> iteratorPtr(writer.done());
 
-    if (auto* mergeIter = static_cast<typename sorter::MergeIterator<Key, Value, PairComparator>*>(
+    if (auto* mergeIter = static_cast<typename sorter::MergeIterator<Key, Value, Comparator>*>(
             _spillIter.get())) {
         mergeIter->addSource(std::move(iteratorPtr));
     } else {
         std::vector<std::shared_ptr<SpillIterator>> iters{std::move(iteratorPtr)};
-        _spillIter.reset(SpillIterator::merge(iters, _opts, _comparePairs));
+        _spillIter.reset(SpillIterator::merge(iters, _opts, compare));
     }
 
     dassert(_spillIter->more());
 
-    _memUsed = 0;
-}
-
-template <typename Key, typename Value, typename Comparator, typename BoundMaker>
-int BoundedSorter<Key, Value, Comparator, BoundMaker>::PairComparator::operator()(
-    const std::pair<Key, Value>& p1, const std::pair<Key, Value>& p2) const {
-    return compare(p1.first, p2.first);
+    this->_stats.resetMemUsage();
 }
 
 //
@@ -1563,3 +1687,4 @@ Sorter<Key, Value>* Sorter<Key, Value>::makeFromExistingRanges(
         fileName, ranges, opts, comp, settings);
 }
 }  // namespace mongo
+#undef MONGO_LOGV2_DEFAULT_COMPONENT

@@ -35,8 +35,8 @@
 #include <memory>
 #include <vector>
 
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_id.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/db/storage/storage_change_lock.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/platform/atomic_word.h"
@@ -370,7 +370,8 @@ public:
      *
      * If supplied, "session" is the transport::Session used for communicating with the client.
      */
-    UniqueClient makeClient(std::string desc, transport::SessionHandle session = nullptr);
+    UniqueClient makeClient(std::string desc,
+                            std::shared_ptr<transport::Session> session = nullptr);
 
     /**
      * Creates a new OperationContext on "client".
@@ -566,6 +567,12 @@ public:
     void setTickSource(std::unique_ptr<TickSource> newSource);
 
     /**
+     * Replaces the current tick/clock source with a new one. In other words, the old source will be
+     * destroyed. So make sure that no one is using the old source when calling this.
+     */
+    void setFastTickSource(std::unique_ptr<TickSource> newSource);
+
+    /**
      * Call this method with a ClockSource implementation that may be less precise than
      * the _preciseClockSource but may be cheaper to call.
      */
@@ -601,6 +608,24 @@ public:
 
     void incrementCatalogGeneration() {
         _catalogGeneration.fetchAndAdd(1);
+    }
+
+    void disallowUserWrites() {
+        _userWritesAllowed.store(false);
+    }
+
+    /**
+     * Returns true if user writes are allowed.
+     *
+     * User writes are disallowed when starting with queryableBackupMode or
+     * recoverFromOplogAsStandalone to prevent users from writing to replicated collections in
+     * standalone mode.
+     *
+     * To determine whether an operation must run in read-only mode, use
+     * OperationContext::readOnly().
+     */
+    bool userWritesAllowed() const {
+        return _userWritesAllowed.load();
     }
 
     LockedClient getLockedClient(OperationId id);
@@ -735,6 +760,7 @@ private:
      */
     SyncUnique<ClockSource> _fastClockSource;
 
+
     /**
      * A ClockSource implementation that is very precise but may be expensive to call.
      */
@@ -748,6 +774,9 @@ private:
 
     // When the catalog is restarted, the generation goes up by one each time.
     AtomicWord<uint64_t> _catalogGeneration{0};
+
+    // Server-wide flag indicating whether users' writes are allowed.
+    AtomicWord<bool> _userWritesAllowed{true};
 
     bool _startupComplete = false;
     stdx::condition_variable _startupCompleteCondVar;

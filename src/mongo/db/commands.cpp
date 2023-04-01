@@ -27,10 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/commands.h"
 
 #include <string>
@@ -53,7 +49,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/read_write_concern_defaults.h"
-#include "mongo/idl/basic_types_gen.h"
 #include "mongo/idl/command_generic_argument.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
@@ -64,8 +59,11 @@
 #include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 using namespace fmt::literals;
 
@@ -78,12 +76,6 @@ const std::set<std::string> kApiVersions1 = {"1"};
 namespace {
 
 const char kWriteConcernField[] = "writeConcern";
-const WriteConcernOptions kMajorityWriteConcern(
-    WriteConcernOptions::kMajority,
-    // Note: Even though we're setting UNSET here, kMajority implies JOURNAL if journaling is
-    // supported by the mongod.
-    WriteConcernOptions::SyncMode::UNSET,
-    WriteConcernOptions::kWriteConcernTimeoutUserCommand);
 
 // Returns true if found to be authorized, false if undecided. Throws if unauthorized.
 bool checkAuthorizationImplPreParse(OperationContext* opCtx,
@@ -92,11 +84,18 @@ bool checkAuthorizationImplPreParse(OperationContext* opCtx,
     auto client = opCtx->getClient();
     if (client->isInDirectClient())
         return true;
+
     uassert(ErrorCodes::Unauthorized,
             str::stream() << command->getName() << " may only be run against the admin database.",
-            !command->adminOnly() || request.getDatabase() == NamespaceString::kAdminDb);
+            !command->adminOnly() || request.getDatabase() == DatabaseName::kAdmin.db());
 
     auto authzSession = AuthorizationSession::get(client);
+    uassert(ErrorCodes::ReauthenticationRequired,
+            fmt::format("Command {} requires reauthentication since the current authorization "
+                        "session has expired. Please re-auth.",
+                        command->getName()),
+            !command->requiresAuth() || !authzSession->isExpired());
+
     if (!authzSession->getAuthorizationManager().isAuthEnabled()) {
         // Running without auth, so everything should be allowed except remotely invoked
         // commands that have the 'localHostOnlyIfNoAuth' restriction.
@@ -107,32 +106,18 @@ bool checkAuthorizationImplPreParse(OperationContext* opCtx,
                     client->getIsLocalHostConnection());
         return true;  // Blanket authorization: don't need to check anything else.
     }
+
     if (authzSession->isUsingLocalhostBypass())
         return false;  // Still can't decide on auth because of the localhost bypass.
+
     uassert(ErrorCodes::Unauthorized,
-            str::stream() << "command " << command->getName() << " requires authentication",
+            str::stream() << "Command " << command->getName() << " requires authentication",
             !command->requiresAuth() || authzSession->isAuthenticated() ||
-                request.securityToken.nFields());
+                (request.validatedTenancyScope &&
+                 request.validatedTenancyScope->hasAuthenticatedUser()));
+
     return false;
 }
-
-// The command names that are allowed in a multi-document transaction.
-const StringMap<int> txnCmdAllowlist = {{"abortTransaction", 1},
-                                        {"aggregate", 1},
-                                        {"commitTransaction", 1},
-                                        {"coordinateCommitTransaction", 1},
-                                        {"create", 1},
-                                        {"createIndexes", 1},
-                                        {"delete", 1},
-                                        {"distinct", 1},
-                                        {"find", 1},
-                                        {"findandmodify", 1},
-                                        {"findAndModify", 1},
-                                        {"getMore", 1},
-                                        {"insert", 1},
-                                        {"killCursors", 1},
-                                        {"prepareTransaction", 1},
-                                        {"update", 1}};
 
 auto getCommandInvocationHooks =
     ServiceContext::declareDecoration<std::unique_ptr<CommandInvocationHooks>>();
@@ -146,6 +131,13 @@ void CommandInvocationHooks::set(ServiceContext* serviceContext,
 
 //////////////////////////////////////////////////////////////
 // CommandHelpers
+
+const WriteConcernOptions CommandHelpers::kMajorityWriteConcern(
+    WriteConcernOptions::kMajority,
+    // Note: Even though we're setting UNSET here, kMajority implies JOURNAL if journaling is
+    // supported by the mongod.
+    WriteConcernOptions::SyncMode::UNSET,
+    WriteConcernOptions::kWriteConcernTimeoutUserCommand);
 
 BSONObj CommandHelpers::runCommandDirectly(OperationContext* opCtx, const OpMsgRequest& request) {
     auto command = globalCommandRegistry()->findCommand(request.getCommandName());
@@ -171,22 +163,15 @@ BSONObj CommandHelpers::runCommandDirectly(OperationContext* opCtx, const OpMsgR
     return replyBuilder.releaseBody();
 }
 
-Future<void> CommandHelpers::runCommandInvocation(
-    std::shared_ptr<RequestExecutionContext> rec,
-    std::shared_ptr<CommandInvocation> invocation,
-    transport::ServiceExecutor::ThreadingModel threadingModel) {
-    switch (threadingModel) {
-        case transport::ServiceExecutor::ThreadingModel::kBorrowed:
-            return runCommandInvocationAsync(std::move(rec), std::move(invocation));
-        case transport::ServiceExecutor::ThreadingModel::kDedicated:
-            return makeReadyFutureWith([opCtx = rec->getOpCtx(),
-                                        request = rec->getRequest(),
-                                        invocation = invocation.get(),
-                                        replyBuilder = rec->getReplyBuilder()] {
-                runCommandInvocation(opCtx, request, invocation, replyBuilder);
-            });
-    }
-    MONGO_UNREACHABLE;
+Future<void> CommandHelpers::runCommandInvocation(std::shared_ptr<RequestExecutionContext> rec,
+                                                  std::shared_ptr<CommandInvocation> invocation,
+                                                  bool useDedicatedThread) {
+    if (useDedicatedThread)
+        return makeReadyFutureWith([rec = std::move(rec), invocation = std::move(invocation)] {
+            runCommandInvocation(
+                rec->getOpCtx(), rec->getRequest(), invocation.get(), rec->getReplyBuilder());
+        });
+    return runCommandInvocationAsync(std::move(rec), std::move(invocation));
 }
 
 void CommandHelpers::runCommandInvocation(OperationContext* opCtx,
@@ -194,7 +179,6 @@ void CommandHelpers::runCommandInvocation(OperationContext* opCtx,
                                           CommandInvocation* invocation,
                                           rpc::ReplyBuilderInterface* response) {
     auto&& hooks = getCommandInvocationHooks(opCtx->getServiceContext());
-
     if (hooks) {
         hooks->onBeforeRun(opCtx, request, invocation);
     }
@@ -202,7 +186,7 @@ void CommandHelpers::runCommandInvocation(OperationContext* opCtx,
     invocation->run(opCtx, response);
 
     if (hooks) {
-        hooks->onAfterRun(opCtx, request, invocation);
+        hooks->onAfterRun(opCtx, request, invocation, response);
     }
 }
 
@@ -299,7 +283,7 @@ std::string CommandHelpers::parseNsFullyQualified(const BSONObj& cmdObj) {
     return nss.ns();
 }
 
-NamespaceString CommandHelpers::parseNsCollectionRequired(StringData dbname,
+NamespaceString CommandHelpers::parseNsCollectionRequired(const DatabaseName& dbName,
                                                           const BSONObj& cmdObj) {
     // Accepts both BSON String and Symbol for collection name per SERVER-16260
     // TODO(kangas) remove Symbol support in MongoDB 3.0 after Ruby driver audit
@@ -313,20 +297,22 @@ NamespaceString CommandHelpers::parseNsCollectionRequired(StringData dbname,
     uassert(ErrorCodes::InvalidNamespace,
             str::stream() << "collection name has invalid type " << typeName(first.type()),
             first.canonicalType() == canonicalizeBSONType(mongo::String));
-    const NamespaceString nss(dbname, first.valueStringData());
+    const NamespaceString nss(
+        NamespaceStringUtil::parseNamespaceFromRequest(dbName, first.valueStringData()));
     uassert(ErrorCodes::InvalidNamespace,
             str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
             nss.isValid());
     return nss;
 }
 
-NamespaceStringOrUUID CommandHelpers::parseNsOrUUID(StringData dbname, const BSONObj& cmdObj) {
+NamespaceStringOrUUID CommandHelpers::parseNsOrUUID(const DatabaseName& dbName,
+                                                    const BSONObj& cmdObj) {
     BSONElement first = cmdObj.firstElement();
     if (first.type() == BinData && first.binDataType() == BinDataType::newUUID) {
-        return {dbname.toString(), uassertStatusOK(UUID::parse(first))};
+        return {dbName, uassertStatusOK(UUID::parse(first))};
     } else {
         // Ensure collection identifier is not a Command
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
         uassert(ErrorCodes::InvalidNamespace,
                 str::stream() << "Invalid collection name specified '" << nss.ns(),
                 !(nss.ns().find('$') != std::string::npos && nss.ns() != "local.oplog.$main"));
@@ -335,10 +321,16 @@ NamespaceStringOrUUID CommandHelpers::parseNsOrUUID(StringData dbname, const BSO
 }
 
 std::string CommandHelpers::parseNsFromCommand(StringData dbname, const BSONObj& cmdObj) {
+    return parseNsFromCommand({boost::none, dbname}, cmdObj).ns();
+}
+
+NamespaceString CommandHelpers::parseNsFromCommand(const DatabaseName& dbName,
+                                                   const BSONObj& cmdObj) {
     BSONElement first = cmdObj.firstElement();
     if (first.type() != mongo::String)
-        return dbname.toString();
-    return str::stream() << dbname << '.' << cmdObj.firstElement().valueStringData();
+        return NamespaceString(dbName);
+    return NamespaceStringUtil::parseNamespaceFromRequest(dbName,
+                                                          cmdObj.firstElement().valueStringData());
 }
 
 ResourcePattern CommandHelpers::resourcePatternForNamespace(const std::string& ns) {
@@ -368,8 +360,7 @@ bool CommandHelpers::appendCommandStatusNoThrow(BSONObjBuilder& result, const St
     // construct an invalid error reply.
     if (!status.isOK() && getTestCommandsEnabled()) {
         try {
-            ErrorReply::parse(IDLParserErrorContext("appendCommandStatusNoThrow"),
-                              result.asTempObj());
+            ErrorReply::parse(IDLParserContext("appendCommandStatusNoThrow"), result.asTempObj());
         } catch (const DBException&) {
             invariant(false,
                       "invalid error-response to a command constructed in "
@@ -564,18 +555,22 @@ void CommandHelpers::canUseTransactions(const NamespaceString& nss,
             "http://dochub.mongodb.org/core/transaction-count for a recommended alternative.",
             cmdName != "count"_sd);
 
-    auto inTxnAllowlist = txnCmdAllowlist.find(cmdName) != txnCmdAllowlist.cend();
+    auto command = findCommand(cmdName);
+    uassert(ErrorCodes::CommandNotFound,
+            str::stream() << "Encountered unknown command during check if can run in transactions: "
+                          << cmdName,
+            command);
 
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             str::stream() << "Cannot run '" << cmdName << "' in a multi-document transaction.",
-            inTxnAllowlist);
+            command->allowedInTransactions());
 
-    const auto dbName = nss.db();
+    const auto dbName = nss.dbName();
 
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             str::stream() << "Cannot run command against the '" << dbName
                           << "' database in a transaction.",
-            dbName != NamespaceString::kLocalDb);
+            dbName.db() != DatabaseName::kLocal.db());
 
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             str::stream() << "Cannot run command against the '" << nss
@@ -590,7 +585,7 @@ void CommandHelpers::canUseTransactions(const NamespaceString& nss,
     } else {
         uassert(ErrorCodes::OperationNotSupportedInTransaction,
                 "Cannot run command against the config database in a transaction.",
-                dbName != "config"_sd);
+                dbName.db() != DatabaseName::kConfig.db());
     }
 }
 
@@ -654,6 +649,18 @@ bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
         return false;
     }
 
+    if (data.hasField("failAllCommands")) {
+        LOGV2(6348500,
+              "Activating 'failCommand' failpoint for all commands",
+              "data"_attr = data,
+              "threadName"_attr = threadName,
+              "appName"_attr = appName,
+              logAttrs(nss),
+              "isInternalClient"_attr = isInternalClient,
+              "command"_attr = cmd->getName());
+        return true;
+    }
+
     for (auto&& failCommand : data.getObjectField("failCommands")) {
         if (failCommand.type() == String && cmd->hasAlias(failCommand.valueStringData())) {
             LOGV2(4898500,
@@ -661,7 +668,7 @@ bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
                   "data"_attr = data,
                   "threadName"_attr = threadName,
                   "appName"_attr = appName,
-                  "namespace"_attr = nss,
+                  logAttrs(nss),
                   "isInternalClient"_attr = isInternalClient,
                   "command"_attr = cmd->getName());
 
@@ -810,6 +817,28 @@ void CommandHelpers::handleMarkKillOnClientDisconnect(OperationContext* opCtx,
         });
 }
 
+void CommandHelpers::checkForInternalError(rpc::ReplyBuilderInterface* replyBuilder,
+                                           bool isInternalClient) {
+    if (isInternalClient) {
+        return;
+    }
+
+    auto obj = replyBuilder->getBodyBuilder().asTempObj();
+    if (auto e = obj.getField("code"); MONGO_unlikely(!e.eoo())) {
+        const auto errorCode = static_cast<ErrorCodes::Error>(e.safeNumberInt());
+        try {
+            tassert(
+                errorCode,
+                fmt::format("Attempted to return an internal-only error to the client, errmsg: {}",
+                            obj.getStringField("errmsg")),
+                !ErrorCodes::isInternalOnly(errorCode));
+        } catch (...) {
+            // No need to throw as we only require the diagnostics provided by `tassert` and
+            // do not want to close the connection.
+        }
+    }
+}
+
 namespace {
 // We store the CommandInvocation as a shared_ptr on the OperationContext in case we need to persist
 // the invocation past the lifetime of the op. If so, this shared_ptr can be copied off to another
@@ -876,7 +905,8 @@ public:
         : CommandInvocation(command),
           _command(command),
           _request(request),
-          _dbName(_request.getDatabase().toString()) {}
+          _dbName(DatabaseNameUtil::deserialize(_request.getValidatedTenantId(),
+                                                _request.getDatabase())) {}
 
 private:
     void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
@@ -905,7 +935,7 @@ private:
     }
 
     NamespaceString ns() const override {
-        return NamespaceString(_command->parseNs(_dbName, cmdObj()));
+        return _command->parseNs(_dbName, cmdObj());
     }
 
     bool supportsWriteConcern() const override {
@@ -935,8 +965,7 @@ private:
     }
 
     void doCheckAuthorization(OperationContext* opCtx) const override {
-        uassertStatusOK(_command->checkAuthForOperation(
-            opCtx, _request.getDatabase().toString(), _request.body));
+        uassertStatusOK(_command->checkAuthForOperation(opCtx, _dbName, _request.body));
     }
 
     const BSONObj& cmdObj() const {
@@ -945,7 +974,7 @@ private:
 
     BasicCommandWithReplyBuilderInterface* const _command;
     const OpMsgRequest _request;
-    const std::string _dbName;
+    const DatabaseName _dbName;
 };
 
 Command::~Command() = default;
@@ -974,8 +1003,8 @@ std::unique_ptr<CommandInvocation> BasicCommandWithReplyBuilderInterface::parse(
 Command::Command(StringData name, std::vector<StringData> aliases)
     : _name(name.toString()),
       _aliases(std::move(aliases)),
-      _commandsExecutedMetric("commands." + _name + ".total", &_commandsExecuted),
-      _commandsFailedMetric("commands." + _name + ".failed", &_commandsFailed) {
+      _commandsExecuted("commands." + _name + ".total"),
+      _commandsFailed("commands." + _name + ".failed") {
     globalCommandRegistry()->registerCommand(this, _name, _aliases);
 }
 
@@ -998,22 +1027,6 @@ Status BasicCommandWithReplyBuilderInterface::explain(OperationContext* opCtx,
     return {ErrorCodes::IllegalOperation, str::stream() << "Cannot explain cmd: " << getName()};
 }
 
-Status BasicCommandWithReplyBuilderInterface::checkAuthForOperation(OperationContext* opCtx,
-                                                                    const std::string& dbname,
-                                                                    const BSONObj& cmdObj) const {
-    return checkAuthForCommand(opCtx->getClient(), dbname, cmdObj);
-}
-
-Status BasicCommandWithReplyBuilderInterface::checkAuthForCommand(Client* client,
-                                                                  const std::string& dbname,
-                                                                  const BSONObj& cmdObj) const {
-    std::vector<Privilege> privileges;
-    this->addRequiredPrivileges(dbname, cmdObj, &privileges);
-    if (AuthorizationSession::get(client)->isAuthorizedForPrivileges(privileges))
-        return Status::OK();
-    return Status(ErrorCodes::Unauthorized, "unauthorized");
-}
-
 void Command::generateHelpResponse(OperationContext* opCtx,
                                    rpc::ReplyBuilderInterface* replyBuilder,
                                    const Command& command) {
@@ -1024,11 +1037,11 @@ void Command::generateHelpResponse(OperationContext* opCtx,
 }
 
 bool ErrmsgCommandDeprecated::run(OperationContext* opCtx,
-                                  const std::string& db,
+                                  const DatabaseName& dbName,
                                   const BSONObj& cmdObj,
                                   BSONObjBuilder& result) {
     std::string errmsg;
-    auto ok = errmsgRun(opCtx, db, cmdObj, errmsg, result);
+    auto ok = errmsgRun(opCtx, dbName.toStringWithTenantId(), cmdObj, errmsg, result);
     if (!errmsg.empty()) {
         CommandHelpers::appendSimpleCommandStatus(result, ok, errmsg);
     }

@@ -75,7 +75,9 @@ def exists(env):
     if validated:
         env['CCACHE_VERSION'] = ccache_version
     else:
-        print(f"Error: failed to verify ccache version >= {_ccache_version_min}, found {ccache_version}")
+        print(
+            f"Error: failed to verify ccache version >= {_ccache_version_min}, found {ccache_version}"
+        )
 
     return validated
 
@@ -112,11 +114,15 @@ def generate(env):
     # hash can be calculated on them. This both reduces the amount of work ccache needs to
     # do and increases the likelihood of a cache hit.
     if env.ToolchainIs("clang"):
-        env["ENV"].pop("CCACHE_CPP2", None)
-        env["ENV"]["CCACHE_NOCPP2"] = "1"
-        env.AppendUnique(CCFLAGS=["-frewrite-includes"])
+        if not env.get('CCACHE_EXTRAFILES_USE_SOURCE_PATHS', False):
+            env["ENV"].pop("CCACHE_CPP2", None)
+            env["ENV"]["CCACHE_NOCPP2"] = "1"
+            env.AppendUnique(CCFLAGS=["-frewrite-includes"])
+        else:
+            env["ENV"].pop("CCACHE_NOCPP2", None)
+            env["ENV"]["CCACHE_CPP2"] = "1"
     elif env.ToolchainIs("gcc"):
-        if icecream_enabled:
+        if icecream_enabled and not env.get('CCACHE_EXTRAFILES_USE_SOURCE_PATHS', False):
             # Newer versions of Icecream will drop -fdirectives-only from
             # preprocessor and compiler flags if it does not find a remote
             # build host to build on. ccache, on the other hand, will not
@@ -143,10 +149,8 @@ def generate(env):
     # compiler parameter and differences in the file need to be accounted for in the
     # hash result to prevent erroneous cache hits.
     if "CCACHE_EXTRAFILES" in env and env["CCACHE_EXTRAFILES"]:
-        env["ENV"]["CCACHE_EXTRAFILES"] = ":".join([
-            denyfile.path
-            for denyfile in env["CCACHE_EXTRAFILES"]
-        ])
+        env["ENV"]["CCACHE_EXTRAFILES"] = ":".join(
+            [denyfile.path for denyfile in env["CCACHE_EXTRAFILES"]])
 
     # Make a generator to expand to CCACHE in the case where we are
     # not a conftest. We don't want to use ccache for configure tests
@@ -161,6 +165,7 @@ def generate(env):
         if "conftest" not in str(target[0]):
             return '$CCACHE'
         return ''
+
     env['CCACHE_GENERATOR'] = ccache_generator
 
     # Add ccache to the relevant command lines. Wrap the reference to

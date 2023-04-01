@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -38,6 +37,8 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/database_sharding_state.h"
@@ -49,8 +50,33 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/flush_database_cache_updates_gen.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
+
 namespace mongo {
 namespace {
+
+/**
+ * Inserts a database collection entry with fixed metadata for the `config` or `admin` database. If
+ * the entry key already exists, it's not updated.
+ */
+Status insertDatabaseEntryForBackwardCompatibility(OperationContext* opCtx,
+                                                   const DatabaseName& dbName) {
+    invariant(dbName == DatabaseName::kAdmin || dbName == DatabaseName::kConfig);
+
+    DBDirectClient client(opCtx);
+    auto commandResponse = client.runCommand([&] {
+        auto dbMetadata =
+            DatabaseType(dbName.toString(), ShardId::kConfigServerId, DatabaseVersion::makeFixed());
+
+        write_ops::InsertCommandRequest insertOp(NamespaceString::kShardConfigDatabasesNamespace);
+        insertOp.setDocuments({dbMetadata.toBSON()});
+        return insertOp.serialize({});
+    }());
+
+    auto commandStatus = getStatusFromWriteCommandReply(commandResponse->getCommandReply());
+    return commandStatus.code() == ErrorCodes::DuplicateKey ? Status::OK() : commandStatus;
+}
 
 template <typename Derived>
 class FlushDatabaseCacheUpdatesCmdBase : public TypedCommand<Derived> {
@@ -115,7 +141,27 @@ public:
 
             uassert(ErrorCodes::IllegalOperation,
                     "Can't call _flushDatabaseCacheUpdates if in read-only mode",
-                    !storageGlobalParams.readOnly);
+                    !opCtx->readOnly());
+
+            if (_dbName() == DatabaseName::kAdmin || _dbName() == DatabaseName::kConfig) {
+                // The admin and config databases have fixed metadata that does not need to be
+                // refreshed.
+
+                if (Base::request().getSyncFromConfig()) {
+                    // To ensure compatibility with old secondaries that still call the
+                    // _flushDatabaseCacheUpdates command to get updated database metadata from
+                    // primary, an entry with fixed metadata is inserted in the
+                    // config.cache.databases collection.
+
+                    LOGV2_DEBUG(6910800,
+                                1,
+                                "Inserting a database collection entry with fixed metadata",
+                                "db"_attr = _dbName());
+                    uassertStatusOK(insertDatabaseEntryForBackwardCompatibility(opCtx, _dbName()));
+                }
+
+                return;
+            }
 
             boost::optional<SharedSemiFuture<void>> criticalSectionSignal;
 
@@ -127,10 +173,10 @@ public:
                 // inclusive of the commit (and new writes to the committed chunk) that hasn't yet
                 // propagated back to this shard. This ensures the read your own writes causal
                 // consistency guarantee.
-                const auto dss = DatabaseShardingState::get(opCtx, _dbName());
-                auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
+                const auto scopedDss =
+                    DatabaseShardingState::assertDbLockedAndAcquireShared(opCtx, ns().dbName());
                 criticalSectionSignal =
-                    dss->getCriticalSectionSignal(ShardingMigrationCriticalSection::kRead, dssLock);
+                    scopedDss->getCriticalSectionSignal(ShardingMigrationCriticalSection::kWrite);
             }
 
             if (criticalSectionSignal)

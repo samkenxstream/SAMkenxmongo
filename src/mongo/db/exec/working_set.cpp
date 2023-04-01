@@ -184,7 +184,7 @@ bool WorkingSetMember::getFieldDotted(const string& field, BSONElement* out) con
 
     // Our state should be such that we have index data/are covered.
     if (auto outOpt = IndexKeyDatum::getFieldDotted(keyData, field)) {
-        *out = outOpt.get();
+        *out = outOpt.value();
         return true;
     } else {
         return false;
@@ -311,15 +311,18 @@ SortableWorkingSetMember SortableWorkingSetMember::getOwned() const {
     return ret;
 }
 
-WorkingSetRegisteredIndexId WorkingSet::registerIndexAccessMethod(
-    const IndexAccessMethod* indexAccess) {
+void SortableWorkingSetMember::makeOwned() {
+    _holder->makeObjOwnedIfNeeded();
+}
+
+WorkingSetRegisteredIndexId WorkingSet::registerIndexIdent(const std::string& ident) {
     for (WorkingSetRegisteredIndexId i = 0; i < _registeredIndexes.size(); ++i) {
-        if (_registeredIndexes[i] == indexAccess) {
+        if (_registeredIndexes[i] == ident) {
             return i;
         }
     }
 
-    _registeredIndexes.push_back(indexAccess);
+    _registeredIndexes.push_back(ident);
     return _registeredIndexes.size() - 1;
 }
 

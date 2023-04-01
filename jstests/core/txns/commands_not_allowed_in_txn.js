@@ -1,8 +1,13 @@
 // Test commands that are not allowed in multi-document transactions.
+// The test runs commands that are not allowed with security token: applyOps, endSession, mapReduce.
 // @tags: [
+//   not_allowed_with_security_token,
 //   uses_snapshot_read_concern,
 //   uses_transactions,
+//   # Tenant migrations don't support applyOps.
+//   tenant_migration_incompatible,
 // ]
+
 (function() {
 "use strict";
 
@@ -130,8 +135,16 @@ const commands = [
 
 // There is no applyOps command on mongos.
 if (!isMongos) {
-    commands.push(
-        {applyOps: [{op: "u", ns: testColl.getFullName(), o2: {_id: 0}, o: {$set: {a: 5}}}]});
+    commands.push({
+        applyOps: [{
+            op: "u",
+            ns: testColl.getFullName(),
+            o2: {_id: 0},
+            o:
+
+                {$v: 2, diff: {u: {a: 5}}}
+        }]
+    });
 }
 
 commands.forEach(testCommand);

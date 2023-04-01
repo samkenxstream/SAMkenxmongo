@@ -27,18 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/index_build_entry_helpers.h"
 
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/commit_quorum_options.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_build_entry_gen.h"
 #include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/namespace_string.h"
@@ -47,6 +43,9 @@
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
@@ -71,7 +70,7 @@ Status upsert(OperationContext* opCtx, const IndexBuildEntry& indexBuildEntry) {
 
                                   WriteUnitOfWork wuow(opCtx);
                                   Helpers::upsert(opCtx,
-                                                  NamespaceString::kIndexBuildEntryNamespace.ns(),
+                                                  NamespaceString::kIndexBuildEntryNamespace,
                                                   indexBuildEntry.toBSON(),
                                                   /*fromMigrate=*/false);
                                   wuow.commit();
@@ -99,7 +98,7 @@ std::pair<const BSONObj, const BSONObj> buildIndexBuildEntryFilterAndUpdate(
     // '$addToSet' to prevent any duplicate entries written to "commitReadyMembers" field.
     if (auto commitReadyMembers = indexBuildEntry.getCommitReadyMembers()) {
         BSONArrayBuilder arrayBuilder;
-        for (const auto& item : commitReadyMembers.get()) {
+        for (const auto& item : commitReadyMembers.value()) {
             arrayBuilder.append(item.toString());
         }
         const auto commitReadyMemberList = BSON(IndexBuildEntry::kCommitReadyMembersFieldName
@@ -126,7 +125,7 @@ Status upsert(OperationContext* opCtx, const BSONObj& filter, const BSONObj& upd
 
                                   WriteUnitOfWork wuow(opCtx);
                                   Helpers::upsert(opCtx,
-                                                  NamespaceString::kIndexBuildEntryNamespace.ns(),
+                                                  NamespaceString::kIndexBuildEntryNamespace,
                                                   filter,
                                                   updateMod,
                                                   /*fromMigrate=*/false);
@@ -151,7 +150,7 @@ Status update(OperationContext* opCtx, const BSONObj& filter, const BSONObj& upd
 
                                   WriteUnitOfWork wuow(opCtx);
                                   Helpers::update(opCtx,
-                                                  NamespaceString::kIndexBuildEntryNamespace.ns(),
+                                                  NamespaceString::kIndexBuildEntryNamespace,
                                                   filter,
                                                   updateMod,
                                                   /*fromMigrate=*/false);
@@ -170,7 +169,7 @@ void ensureIndexBuildEntriesNamespaceExists(OperationContext* opCtx) {
         "createIndexBuildCollection",
         NamespaceString::kIndexBuildEntryNamespace.ns(),
         [&]() -> void {
-            AutoGetDb autoDb(opCtx, NamespaceString::kIndexBuildEntryNamespace.db(), MODE_IX);
+            AutoGetDb autoDb(opCtx, NamespaceString::kIndexBuildEntryNamespace.dbName(), MODE_IX);
             auto db = autoDb.ensureDbExists(opCtx);
 
             // Ensure the database exists.
@@ -183,8 +182,8 @@ void ensureIndexBuildEntriesNamespaceExists(OperationContext* opCtx) {
                 AutoGetCollection autoColl(
                     opCtx, NamespaceString::kIndexBuildEntryNamespace, LockMode::MODE_IX);
                 CollectionOptions defaultCollectionOptions;
-                CollectionPtr collection = db->createCollection(
-                    opCtx, NamespaceString::kIndexBuildEntryNamespace, defaultCollectionOptions);
+                CollectionPtr collection = CollectionPtr(db->createCollection(
+                    opCtx, NamespaceString::kIndexBuildEntryNamespace, defaultCollectionOptions));
 
                 // Ensure the collection exists.
                 invariant(collection);
@@ -234,8 +233,9 @@ Status addIndexBuildEntry(OperationContext* opCtx, const IndexBuildEntry& indexB
             // documents out-of-order into the oplog.
             auto oplogInfo = LocalOplogInfo::get(opCtx);
             auto oplogSlot = oplogInfo->getNextOpTimes(opCtx, 1U)[0];
-            Status status = collection->insertDocument(
+            Status status = collection_internal::insertDocument(
                 opCtx,
+                *collection,
                 InsertStatement(kUninitializedStmtId, indexBuildEntry.toBSON(), oplogSlot),
                 nullptr);
 
@@ -270,7 +270,8 @@ Status removeIndexBuildEntry(OperationContext* opCtx,
 
             WriteUnitOfWork wuow(opCtx);
             OpDebug opDebug;
-            collection->deleteDocument(opCtx, kUninitializedStmtId, rid, &opDebug);
+            collection_internal::deleteDocument(
+                opCtx, collection, kUninitializedStmtId, rid, &opDebug);
             wuow.commit();
             return Status::OK();
         });
@@ -287,13 +288,6 @@ StatusWith<IndexBuildEntry> getIndexBuildEntry(OperationContext* opCtx, UUID ind
     // build entry from the config db collection.
     hangBeforeGettingIndexBuildEntry.pauseWhileSet(Interruptible::notInterruptible());
 
-    if (!collection.getDb()) {
-        str::stream ss;
-        ss << "Cannot read " << NamespaceString::kIndexBuildEntryNamespace.ns()
-           << ". Database not found: " << NamespaceString::kIndexBuildEntryNamespace.db();
-        return Status(ErrorCodes::NamespaceNotFound, ss);
-    }
-
     if (!collection) {
         str::stream ss;
         ss << "Collection not found: " << NamespaceString::kIndexBuildEntryNamespace.ns();
@@ -305,11 +299,8 @@ StatusWith<IndexBuildEntry> getIndexBuildEntry(OperationContext* opCtx, UUID ind
     // exceptions and we must protect it from unanticipated write conflicts from reads.
     bool foundObj = writeConflictRetry(
         opCtx, "getIndexBuildEntry", NamespaceString::kIndexBuildEntryNamespace.ns(), [&]() {
-            return Helpers::findOne(opCtx,
-                                    collection.getCollection(),
-                                    BSON("_id" << indexBuildUUID),
-                                    obj,
-                                    /*requireIndex=*/true);
+            return Helpers::findOne(
+                opCtx, collection.getCollection(), BSON("_id" << indexBuildUUID), obj);
         });
 
     if (!foundObj) {
@@ -319,7 +310,7 @@ StatusWith<IndexBuildEntry> getIndexBuildEntry(OperationContext* opCtx, UUID ind
     }
 
     try {
-        IDLParserErrorContext ctx("IndexBuildsEntry Parser");
+        IDLParserContext ctx("IndexBuildsEntry Parser");
         IndexBuildEntry indexBuildEntry = IndexBuildEntry::parse(ctx, obj);
         return indexBuildEntry;
     } catch (DBException& ex) {

@@ -61,7 +61,6 @@ BtreeAccessMethod::BtreeAccessMethod(IndexCatalogEntry* btreeState,
         std::make_unique<BtreeKeyGenerator>(fieldNames,
                                             fixed,
                                             _descriptor->isSparse(),
-                                            btreeState->getCollator(),
                                             getSortedDataInterface()->getKeyStringVersion(),
                                             getSortedDataInterface()->getOrdering());
 }
@@ -80,10 +79,16 @@ void BtreeAccessMethod::doGetKeys(OperationContext* opCtx,
                                   KeyStringSet* keys,
                                   KeyStringSet* multikeyMetadataKeys,
                                   MultikeyPaths* multikeyPaths,
-                                  boost::optional<RecordId> id) const {
+                                  const boost::optional<RecordId>& id) const {
     const auto skipMultikey = context == GetKeysContext::kValidatingKeys &&
         !_descriptor->getEntry()->isMultikey(opCtx, collection);
-    _keyGenerator->getKeys(pooledBufferBuilder, obj, skipMultikey, keys, multikeyPaths, id);
+    _keyGenerator->getKeys(pooledBufferBuilder,
+                           obj,
+                           skipMultikey,
+                           keys,
+                           multikeyPaths,
+                           _indexCatalogEntry->getCollator(),
+                           id);
 }
 
 }  // namespace mongo

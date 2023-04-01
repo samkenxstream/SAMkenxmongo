@@ -41,6 +41,7 @@
 #include "mongo/db/matcher/match_details.h"
 #include "mongo/db/matcher/matchable.h"
 #include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/query/serialization_options.h"
 #include "mongo/util/fail_point.h"
 
 namespace mongo {
@@ -139,6 +140,7 @@ public:
         INTERNAL_SCHEMA_TYPE,
         INTERNAL_SCHEMA_UNIQUE_ITEMS,
         INTERNAL_SCHEMA_XOR,
+
     };
 
     /**
@@ -326,10 +328,13 @@ public:
     /**
      * Assigns an optional input parameter ID to each node which is eligible for
      * auto-parameterization.
+     * - maxParameterCount - Maximum number of parameters that can be created. If the number of
+     *   parameters would exceed this value, no parameterization will be performed.
      *
-     * Returns true if at least one input parameter ID was assigned.
+     * Returns a map to a parameterized MatchExpression from assigned InputParamId.
      */
-    static bool parameterize(MatchExpression* tree);
+    static std::vector<const MatchExpression*> parameterize(
+        MatchExpression* tree, boost::optional<size_t> maxParameterCount = boost::none);
 
     MatchExpression(MatchType type, clonable_ptr<ErrorAnnotation> annotation = nullptr);
     virtual ~MatchExpression() {}
@@ -376,7 +381,7 @@ public:
     /**
      * Get the path of the leaf.  Returns StringData() if there is no path (node is logical).
      */
-    virtual const StringData path() const {
+    virtual StringData path() const {
         return StringData();
     }
     /**
@@ -406,7 +411,7 @@ public:
      * also ensure that the buffer held by the underlying BSONObj will not be destroyed during the
      * lifetime of the clone.
      */
-    virtual std::unique_ptr<MatchExpression> shallowClone() const = 0;
+    virtual std::unique_ptr<MatchExpression> clone() const = 0;
 
     // XXX document
     virtual bool equivalent(const MatchExpression* other) const = 0;
@@ -472,24 +477,27 @@ public:
     void setCollator(const CollatorInterface* collator);
 
     /**
-     * Add the fields required for matching to 'deps'.
+     * Serialize the MatchExpression to BSON, appending to 'out'.
+     *
+     * See 'SerializationOptions' for some options.
+     *
+     * Generally, the output of this method is expected to be a valid query object that, when
+     * parsed, produces a logically equivalent MatchExpression. However, if special options are set,
+     * this no longer holds.
+     *
+     * If 'options.replacementForLiteralArgs' is set, the result is no longer expected to re-parse,
+     * since we will put strings in places where strings may not be accpeted syntactically (e.g. a
+     * number is always expected, as in with the $mod expression).
      */
-    void addDependencies(DepsTracker* deps) const;
+    virtual void serialize(BSONObjBuilder* out, SerializationOptions options) const = 0;
 
     /**
-     * Serialize the MatchExpression to BSON, appending to 'out'. Output of this method is expected
-     * to be a valid query object, that, when parsed, produces a logically equivalent
-     * MatchExpression. If 'includePath' is false then the serialization should assume it's in a
-     * context where the path has been serialized elsewhere, such as within an $elemMatch value.
+     * Convenience method which serializes this MatchExpression to a BSONObj. See the override with
+     * a BSONObjBuilder* argument for details.
      */
-    virtual void serialize(BSONObjBuilder* out, bool includePath = true) const = 0;
-
-    /**
-     * Convenience method which serializes this MatchExpression to a BSONObj.
-     */
-    BSONObj serialize(bool includePath = true) const {
+    BSONObj serialize(SerializationOptions options = {}) const {
         BSONObjBuilder bob;
-        serialize(&bob, includePath);
+        serialize(&bob, options);
         return bob.obj();
     }
 
@@ -563,9 +571,17 @@ protected:
      */
     virtual void _doSetCollator(const CollatorInterface* collator){};
 
-    virtual void _doAddDependencies(DepsTracker* deps) const {}
-
     void _debugAddSpace(StringBuilder& debug, int indentationLevel) const;
+
+    /** Adds the tag information to the debug string. */
+    void _debugStringAttachTagInfo(StringBuilder* debug) const {
+        MatchExpression::TagData* td = getTag();
+        if (nullptr != td) {
+            td->debugString(debug);
+        } else {
+            *debug << "\n";
+        }
+    }
 
     clonable_ptr<ErrorAnnotation> _errorAnnotation;
 

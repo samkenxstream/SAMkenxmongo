@@ -41,11 +41,13 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/transport/transport_layer_ftdc_collector.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-Status validateCollectionStatsNamespaces(const std::vector<std::string> value) {
+Status validateCollectionStatsNamespaces(const std::vector<std::string> value,
+                                         const boost::optional<TenantId>& tenantId) {
     try {
         for (const auto& nsStr : value) {
             NamespaceString ns(nsStr);
@@ -80,8 +82,12 @@ public:
                 auto result = CommandHelpers::runCommandDirectly(
                     opCtx,
                     OpMsgRequest::fromDBAndBody(
-                        ns.db(), BSON("collStats" << ns.coll() << "waitForLock" << false)));
-                builder.append(nsStr, result);
+                        ns.db(),
+                        BSON("aggregate" << ns.coll() << "cursor" << BSONObj{} << "pipeline"
+                                         << BSON_ARRAY(BSON("$collStats" << BSON(
+                                                                "storageStats" << BSON(
+                                                                    "waitForLock" << false)))))));
+                builder.append(nsStr, result["cursor"]["firstBatch"]["0"].Obj());
 
             } catch (...) {
                 Status s = exceptionToStatus();
@@ -108,15 +114,17 @@ void registerMongoDCollectors(FTDCController* controller) {
             BSON("replSetGetStatus" << 1 << "initialSync" << 0)));
 
         // CollectionStats
-        controller->addPeriodicCollector(
-            std::make_unique<FTDCSimpleInternalCommandCollector>("collStats",
-                                                                 "local.oplog.rs.stats",
-                                                                 "local",
-                                                                 BSON("collStats"
-                                                                      << "oplog.rs"
-                                                                      << "waitForLock" << false
-                                                                      << "numericOnly" << true)));
-        if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
+        controller->addPeriodicCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
+            "aggregate",
+            "local.oplog.rs.stats",
+            "local",
+            BSON("aggregate"
+                 << "oplog.rs"
+                 << "cursor" << BSONObj{} << "pipeline"
+                 << BSON_ARRAY(BSON("$collStats" << BSON(
+                                        "storageStats" << BSON(
+                                            "waitForLock" << false << "numericOnly" << true)))))));
+        if (!serverGlobalParams.clusterRole.exclusivelyHasShardRole()) {
             // GetDefaultRWConcern
             controller->addOnRotateCollector(std::make_unique<FTDCSimpleInternalCommandCollector>(
                 "getDefaultRWConcern",
@@ -127,6 +135,8 @@ void registerMongoDCollectors(FTDCController* controller) {
     }
 
     controller->addPeriodicCollector(std::make_unique<FTDCCollectionStatsCollector>());
+
+    controller->addPeriodicCollector(std::make_unique<transport::TransportLayerFTDCCollector>());
 }
 
 }  // namespace

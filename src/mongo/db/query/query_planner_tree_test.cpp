@@ -433,6 +433,39 @@ TEST_F(QueryPlannerTest, RootedOrOfAndDontCollapseDifferentBounds) {
         "bounds: {c: [[3,3,true,true]], d: [[4,4,true,true]]}}}]}}}}");
 }
 
+TEST_F(QueryPlannerTest, DontCrashTryingToPushToSingleChildIndexedOr1) {
+    FailPointEnableBlock failPoint("disableMatchExpressionOptimization");
+    addIndex(BSON("indexed" << 1));
+    runQuery(
+        fromjson("{ $and : [\n"
+                 "      { $and : [ { indexed : { $gt : 5 } },\n"
+                 "                 { unindexed : 42 } ] },\n"
+                 "      { $or : [ { indexed: { $lt : 100 } } ] }\n"
+                 "  ] }"));
+
+    assertNumSolutions(3U);
+}
+
+TEST_F(QueryPlannerTest, DontCrashTryingToPushToSingleChildIndexedOr2) {
+    // Test that queries with single-child $and, $or do not crash when match-expression optimization
+    // is disabled. Normally these single-child nodes are eliminated, so when they are left in place
+    // it can confuse OR-pushdown optimization.
+    //
+    // Originally designed to reproduce SERVER-70597, which would only happen when the
+    // INDEX_INTERSECTION option is enabled.
+    FailPointEnableBlock failPoint("disableMatchExpressionOptimization");
+    addIndex(BSON("a" << 1 << "b" << 1));
+
+    params.options |= QueryPlannerParams::INDEX_INTERSECTION;
+    runQuery(
+        fromjson("{ $and : [\n"
+                 "      { $and : [ { a : 2 } ] },\n"
+                 "      { $or : [ { b : 3 } ] }\n"
+                 "  ] }"));
+
+    assertNumSolutions(2U);
+}
+
 // SERVER-13960: properly handle $or with a mix of exact and inexact predicates.
 TEST_F(QueryPlannerTest, OrInexactWithExact) {
     addIndex(BSON("name" << 1));
@@ -1374,7 +1407,7 @@ TEST_F(QueryPlannerTest, CannotMergeSort) {
 }
 
 
-TEST_F(QueryPlannerTest, ContainedOr) {
+TEST_F(QueryPlannerTest, ContainedOrBase) {
     addIndex(BSON("b" << 1 << "a" << 1));
     addIndex(BSON("c" << 1 << "a" << 1));
 
@@ -2462,6 +2495,32 @@ TEST_F(QueryPlannerTest, LockstepOrEnumerationSanityCheckTwoChildrenTwoIndexesEa
     assertSolutionExists(
         "{fetch: {filter: {$or: [{b: {$eq: 1}, c: {$eq: 1}}, {b: {$eq: 2}, c: {$eq: 2}}]}, node: "
         "{ixscan: {pattern: {a: 1, c: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, TotalPossibleLockstepOrEnumerationReachesTheOrLimit) {
+    params.options =
+        QueryPlannerParams::NO_TABLE_SCAN | QueryPlannerParams::ENUMERATE_OR_CHILDREN_LOCKSTEP;
+    addIndex(BSON("a" << 1 << "b" << 1));
+    addIndex(BSON("a" << 1 << "c" << 1));
+
+    BSONArrayBuilder orBuilder;
+    // This max number has a value of 65 in order to potentillay triger any overflow of the possible
+    // enumeration count, because each predicate in $or has two possible indexes, allowing for 2^65
+    // possible enumerations.
+    const int maxPredicates = 65;
+    for (int i = 0; i < maxPredicates; i++) {
+        orBuilder.append(BSON("b" << i << "c" << i));
+    }
+
+    auto cmd = BSON("find"
+                    << "testns"
+                    << "filter" << BSON("a" << 1 << "$or" << orBuilder.arr()));
+
+    // Ensure that the query runs fine.
+    runQueryAsCommand(cmd);
+
+    // internalQueryMaxOrSolutions.load() + 2.
+    assertNumSolutions(12U);
 }
 
 // Test that we enumerate the expected plans with the special parameter set. In this test we have

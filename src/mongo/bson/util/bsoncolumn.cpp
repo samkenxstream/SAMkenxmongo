@@ -30,7 +30,6 @@
 #include "mongo/bson/util/bsoncolumn.h"
 
 #include <algorithm>
-#include <third_party/murmurhash3/MurmurHash3.h>
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/util/bsoncolumn_util.h"
@@ -43,8 +42,9 @@ namespace {
 // Start capacity for memory blocks allocated by ElementStorage
 constexpr int kStartCapacity = 128;
 
-// Max capacity for memory blocks allocated by ElementStorage
-constexpr int kMaxCapacity = 1024 * 32;
+// Max capacity for memory blocks allocated by ElementStorage. We need to allow blocks to grow to at
+// least BSONObjMaxUserSize so we can construct user objects efficiently.
+constexpr int kMaxCapacity = BSONObjMaxUserSize;
 
 // Memory offset to get to BSONElement value when field name is an empty string.
 constexpr int kElementValueOffset = 2;
@@ -127,13 +127,6 @@ private:
     bool _recurseIntoArrays;
     BSONType _rootType;
 };
-
-std::size_t hashName(StringData sd) {
-    // Keep in sync with DocumentStorageHasher
-    unsigned out;
-    MurmurHash3_x86_32(sd.rawData(), sd.size(), 0, &out);
-    return out;
-}
 
 }  // namespace
 
@@ -331,14 +324,15 @@ void BSONColumn::Iterator::_initializeInterleaving() {
         *_control == bsoncolumn::kInterleavedStartArrayRootControlByte ? Array : Object;
     _interleavedReferenceObj = BSONObj(_control + 1);
 
-    BSONObjTraversal t(_interleavedArrays,
-                       _interleavedRootType,
-                       [](StringData fieldName, const BSONObj& obj, BSONType type) { return true; },
-                       [this](const BSONElement& elem) {
-                           _states.emplace_back();
-                           _states.back()._loadLiteral(elem);
-                           return true;
-                       });
+    BSONObjTraversal t(
+        _interleavedArrays,
+        _interleavedRootType,
+        [](StringData fieldName, const BSONObj& obj, BSONType type) { return true; },
+        [this](const BSONElement& elem) {
+            _states.emplace_back();
+            _states.back()._loadLiteral(elem);
+            return true;
+        });
     t.traverse(_interleavedReferenceObj);
     uassert(6067610, "Invalid BSONColumn encoding", !_states.empty());
 
@@ -731,6 +725,14 @@ BSONElement BSONColumn::Iterator::DecodingState::_loadDelta(BSONColumn& column,
         case bsonTimestamp: {
             DataView(elem.value()).write<LittleEndian<long long>>(valueToWrite);
         } break;
+        case RegEx:
+        case DBRef:
+        case CodeWScope:
+        case Symbol:
+        case Object:
+        case Array:
+        case EOO:  // EOO indicates the end of an interleaved object.
+            uasserted(6785500, "Invalid delta in BSON Column encoding");
         default:
             // No other types use int64 and need to allocate value storage
             MONGO_UNREACHABLE;
@@ -765,7 +767,7 @@ BSONElement BSONColumn::Iterator::DecodingState::_loadDelta(BSONColumn& column,
     }
 
     // Write value depending on type
-    auto elem = [&]() -> ElementStorage::Element {
+    auto elemFn = [&]() -> ElementStorage::Element {
         switch (_lastType) {
             case String:
             case Code: {
@@ -808,7 +810,7 @@ BSONElement BSONColumn::Iterator::DecodingState::_loadDelta(BSONColumn& column,
         }
     }();
 
-    _lastValue = elem.element();
+    _lastValue = elemFn.element();
     return _lastValue;
 }
 
@@ -819,7 +821,6 @@ BSONColumn::BSONColumn(BSONElement bin) {
 
     _binary = bin.binData(_size);
     _name = bin.fieldNameStringData().toString();
-    _nameHash = hashName(_name);
     _init();
 }
 
@@ -828,7 +829,6 @@ BSONColumn::BSONColumn(BSONBinData bin, StringData name) {
     _binary = static_cast<const char*>(bin.data);
     _size = bin.length;
     _name = name.toString();
-    _nameHash = hashName(_name);
     _init();
 }
 
@@ -889,6 +889,43 @@ size_t BSONColumn::size() {
 
     invariant(_fullyDecompressed);
     return _decompressed.size();
+}
+
+bool BSONColumn::contains_forTest(BSONType elementType) const {
+    const char* byteIter = _binary;
+    const char* columnEnd = _binary + _size;
+
+    uint8_t control;
+    while (byteIter != columnEnd) {
+        control = static_cast<uint8_t>(*byteIter);
+        if (Iterator::_isLiteral(control)) {
+            BSONElement literalElem(byteIter, 1, -1);
+            if (control == elementType) {
+                return true;
+            } else if (control == BSONType::EOO) {
+                // TODO: check for valid encoding
+                // reached end of column
+                return false;
+            }
+
+            byteIter += literalElem.size();
+        } else if (Iterator::_isInterleavedStart(*byteIter)) {
+
+            // TODO SERVER-74926 add interleaved support
+            uasserted(6580401,
+                      "Interleaved mode not yet supported for BSONColumn::contains_forTest.");
+        } else { /* Simple-8b Delta Block */
+            uint8_t numBlocks = Iterator::_numSimple8bBlocks(control);
+            int simple8bBlockSize = sizeof(uint64_t) * numBlocks;
+            uassert(
+                6580400, "Invalid BSON Column encoding", byteIter + simple8bBlockSize < columnEnd);
+
+            // skip simple8b control blocks
+            byteIter += simple8bBlockSize;
+        }
+    }
+
+    return false;
 }
 
 void BSONColumn::DecodingStartPosition::setIfLarger(size_t index, const char* control) {

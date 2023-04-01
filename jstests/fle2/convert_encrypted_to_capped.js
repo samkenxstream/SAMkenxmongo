@@ -2,7 +2,9 @@
 
 /**
  * @tags: [
- *  featureFlagFLE2,
+ * assumes_unsharded_collection,
+ * requires_non_retryable_commands,
+ * assumes_against_mongod_not_mongos
  * ]
  */
 load("jstests/fle2/libs/encrypted_client_util.js");

@@ -1,10 +1,5 @@
 /**
  * Tests that unique indexes can be built with a large number of unique values.
- *
- * @tags: [
- *  // This workload is too impactful on ephemeralForTest
- *  requires_wiredtiger,
- * ]
  */
 
 (function() {
@@ -24,7 +19,7 @@ function loadCollectionWithDocs(collection, numDocs) {
         for (let i = 0; i < kMaxChunkSize && inserted + docs.length < numDocs; i++) {
             docs.push({"a": inserted + i});
         }
-        collection.insertMany(docs);
+        assert.commandWorked(collection.insertMany(docs, {ordered: false}));
         inserted += docs.length;
     }
 }

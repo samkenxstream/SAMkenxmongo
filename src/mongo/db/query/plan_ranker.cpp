@@ -27,13 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/query/plan_ranker.h"
 
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo::plan_ranker {
 namespace log_detail {
@@ -45,18 +47,19 @@ void logScoreFormula(std::function<std::string()> formula,
                      double noSortBonus,
                      double noIxisectBonus,
                      double tieBreakers) {
-    LOGV2_DEBUG(20961, 2, "Score formula", "formula"_attr = [&]() {
-        StringBuilder sb;
-        sb << "score(" << str::convertDoubleToString(score) << ") = baseScore("
-           << str::convertDoubleToString(baseScore) << ")"
-           << " + productivity(" << formula() << " = " << str::convertDoubleToString(productivity)
-           << ")"
-           << " + tieBreakers(" << str::convertDoubleToString(noFetchBonus) << " noFetchBonus + "
-           << str::convertDoubleToString(noSortBonus) << " noSortBonus + "
-           << str::convertDoubleToString(noIxisectBonus)
-           << " noIxisectBonus = " << str::convertDoubleToString(tieBreakers) << ")";
-        return sb.str();
-    }());
+    LOGV2_DEBUG(
+        20961, 2, "Score formula", "formula"_attr = [&]() {
+            StringBuilder sb;
+            sb << "score(" << str::convertDoubleToString(score) << ") = baseScore("
+               << str::convertDoubleToString(baseScore) << ")"
+               << " + productivity(" << formula() << " = "
+               << str::convertDoubleToString(productivity) << ")"
+               << " + tieBreakers(" << str::convertDoubleToString(noFetchBonus)
+               << " noFetchBonus + " << str::convertDoubleToString(noSortBonus) << " noSortBonus + "
+               << str::convertDoubleToString(noIxisectBonus)
+               << " noIxisectBonus = " << str::convertDoubleToString(tieBreakers) << ")";
+            return sb.str();
+        }());
 }
 
 void logScoreBoost(double score) {

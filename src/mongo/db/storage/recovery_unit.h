@@ -30,13 +30,14 @@
 #pragma once
 
 #include <cstdint>
-#include <stdlib.h>
+#include <cstdlib>
 #include <string>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/storage/snapshot.h"
+#include "mongo/db/storage/storage_stats.h"
 #include "mongo/util/decorable.h"
 
 namespace mongo {
@@ -76,49 +77,60 @@ enum class PrepareConflictBehavior {
 };
 
 /**
- * Storage statistics management class, with interfaces to provide the statistics in the BSON format
- * and an operator to add the statistics values.
- */
-class StorageStats {
-    StorageStats(const StorageStats&) = delete;
-    StorageStats& operator=(const StorageStats&) = delete;
-
-public:
-    StorageStats() = default;
-
-    virtual ~StorageStats(){};
-
-    /**
-     * Provides the storage statistics in the form of a BSONObj.
-     */
-    virtual BSONObj toBSON() = 0;
-
-    /**
-     * Add the statistics values.
-     */
-    virtual StorageStats& operator+=(const StorageStats&) = 0;
-
-    /**
-     * Provides the ability to create an instance of this class outside of the storage integration
-     * layer.
-     */
-    virtual std::shared_ptr<StorageStats> getCopy() = 0;
-};
-
-
-/**
  * A RecoveryUnit is responsible for ensuring that data is persisted.
  * All on-disk information must be mutated through this interface.
  */
-class RecoveryUnit : public Decorable<RecoveryUnit> {
+class RecoveryUnit {
     RecoveryUnit(const RecoveryUnit&) = delete;
     RecoveryUnit& operator=(const RecoveryUnit&) = delete;
 
 public:
+    /**
+     * A Snapshot is a decorable type whose lifetime is tied to the the lifetime of a snapshot
+     * within the RecoveryUnit. Snapshots hold no storage engine state and are to be used for
+     * snapshot ID comparison on a single RecoveryUnit and to support decorated types that should be
+     * destructed when the storage snapshot is invalidated.
+     *
+     * Classes that decorate a Snapshot are constructed before a new storage snapshot is established
+     * and destructed after the storage engine snapshot has been released.
+     */
+    class Snapshot : public Decorable<Snapshot> {
+    public:
+        explicit Snapshot(SnapshotId id) : _id(id) {}
+        Snapshot(const Snapshot&) = delete;
+        Snapshot& operator=(const Snapshot&) = delete;
+        Snapshot(Snapshot&&) = default;
+        Snapshot& operator=(Snapshot&&) = default;
+
+        SnapshotId getId() const {
+            return _id;
+        }
+
+    private:
+        SnapshotId _id;
+    };
+
+    /**
+     * Returns the current snapshot on this RecoveryUnit. Will be destructed and re-constructed when
+     * the storage engine snapshot is closed via calls to abandonSnapshot, commitUnitOfWork, or
+     * abortUnitOfWork.
+     *
+     * Note that the RecoveryUnit does not make any guarantees that this reference remains valid
+     * except for the lifetime of the Snapshot.
+     */
+    Snapshot& getSnapshot();
+
     // Behavior for abandonSnapshot().
     enum class AbandonSnapshotMode {
         kAbort,  // default
         kCommit
+    };
+
+    // Specifies the level of suppression of untimestamped writes errors.
+    enum class UntimestampedWriteAssertionLevel {
+        kSuppressOnce,    // Suppress errors throughout one write unit of work.
+        kSuppressAlways,  // Suppress errors throughout the lifetime of the RecoveryUnit.
+        kEnforce          // Enforce untimestamped writes errors (this is the default).
     };
 
     void commitRegisteredChanges(boost::optional<Timestamp> commitTimestamp);
@@ -129,9 +141,12 @@ public:
      * Marks the beginning of a unit of work. Each call must be matched with exactly one call to
      * either commitUnitOfWork or abortUnitOfWork.
      *
+     * When called with readOnly=true, no unit of work is started. Calling commitUnitOfWork or
+     * abortUnitOfWork will invariant.
+     *
      * Should be called through WriteUnitOfWork rather than directly.
      */
-    virtual void beginUnitOfWork(OperationContext* opCtx) = 0;
+    void beginUnitOfWork(bool readOnly);
 
     /**
      * Marks the end of a unit of work and commits all changes registered by calls to onCommit or
@@ -139,10 +154,7 @@ public:
      *
      * Should be called through WriteUnitOfWork rather than directly.
      */
-    void commitUnitOfWork() {
-        doCommitUnitOfWork();
-        assignNextSnapshotId();
-    }
+    void commitUnitOfWork();
 
     /**
      * Marks the end of a unit of work and rolls back all changes registered by calls to onRollback
@@ -151,10 +163,14 @@ public:
      *
      * Should be called through WriteUnitOfWork rather than directly.
      */
-    void abortUnitOfWork() {
-        doAbortUnitOfWork();
-        assignNextSnapshotId();
-    }
+    void abortUnitOfWork();
+
+    /**
+     * Cleans up any state set for this unit of work.
+     *
+     * Should be called through WriteUnitOfWork rather than directly.
+     */
+    void endReadOnlyUnitOfWork();
 
     /**
      * Transitions the active unit of work to the "prepared" state. Must be called after
@@ -199,7 +215,7 @@ public:
     /**
      * Waits until all commits that happened before this call are durable in the journal. Returns
      * true, unless the storage engine cannot guarantee durability, which should never happen when
-     * isDurable() returned true. This cannot be called from inside a unit of work, and should
+     * the engine is non-ephemeral. This cannot be called from inside a unit of work, and should
      * fail if it is. This method invariants if the caller holds any locks, except for repair.
      *
      * Can throw write interruption errors from the JournalListener.
@@ -228,10 +244,7 @@ public:
      * On return no transaction is active. It is a programming error to call this inside of a
      * WriteUnitOfWork, even if the AbandonSnapshotMode is 'kCommit'.
      */
-    void abandonSnapshot() {
-        doAbandonSnapshot();
-        assignNextSnapshotId();
-    }
+    void abandonSnapshot();
 
     void setAbandonSnapshotMode(AbandonSnapshotMode mode) {
         _abandonSnapshotMode = mode;
@@ -239,6 +252,12 @@ public:
     AbandonSnapshotMode abandonSnapshotMode() const {
         return _abandonSnapshotMode;
     }
+
+    /**
+     * Sets the OperationContext that currently owns this RecoveryUnit. Should only be called by the
+     * OperationContext.
+     */
+    void setOperationContext(OperationContext* opCtx);
 
     /**
      * Informs the RecoveryUnit that a snapshot will be needed soon, if one was not already
@@ -300,7 +319,7 @@ public:
      * This is unrelated to Timestamp which must be globally comparable.
      */
     SnapshotId getSnapshotId() const {
-        return SnapshotId{_mySnapshotId};
+        return _snapshot->getId();
     }
 
     /**
@@ -384,7 +403,7 @@ public:
 
     /**
      * Sets catalog conflicting timestamp.
-     * This cannot be called after WiredTigerRecoveryUnit::_txnOpen.
+     * This can only be called while the RecoveryUnit is in an inactive state.
      *
      * This value must be set when both of the following conditions are true:
      * - A storage engine snapshot is opened without a read timestamp
@@ -406,16 +425,29 @@ public:
     }
 
     /**
-     * Fetches the storage level statistics.
+     * MongoDB must update documents with non-decreasing timestamp values. A storage engine is
+     * allowed to assert when this contract is violated. An untimestamped write is a subset of these
+     * violations, which may be necessary in limited circumstances. This API can be called before a
+     * WriteUnitOfWork begins and will suppress this subset of errors until the WriteUnitOfWork is
+     * committed or rolled-back.
      */
-    virtual std::shared_ptr<StorageStats> getOperationStatistics() const {
-        return (nullptr);
-    }
+    virtual void allowOneUntimestampedWrite() {}
 
     /**
-     * Refreshes a read transaction by resetting the snapshot in use
+     * Suppresses untimestamped write errors over the lifetime of a RecoveryUnit.
+     *
+     * NOTE: we should be extremely intentional with suppressing untimestamped errors. In most
+     * cases we should enforce untimestamped write errors.
      */
-    virtual void refreshSnapshot() {}
+    virtual void allowAllUntimestampedWrites() {}
+
+    /**
+     * Computes the storage level statistics accrued since the last call to this function, or
+     * since the recovery unit was instantiated. Should be called at the end of each operation.
+     */
+    virtual std::unique_ptr<StorageStats> computeOperationStatisticsSinceLastCall() {
+        return (nullptr);
+    }
 
     /**
      * The ReadSource indicates which external or provided timestamp to read from for future
@@ -446,7 +478,11 @@ public:
         /**
          * Read from the timestamp provided to setTimestampReadSource.
          */
-        kProvided
+        kProvided,
+        /**
+         * Read from the latest checkpoint.
+         */
+        kCheckpoint
     };
 
     static std::string toString(ReadSource rs) {
@@ -463,6 +499,8 @@ public:
                 return "kAllDurableSnapshot";
             case ReadSource::kProvided:
                 return "kProvided";
+            case ReadSource::kCheckpoint:
+                return "kCheckpoint";
         }
         MONGO_UNREACHABLE;
     }
@@ -541,30 +579,51 @@ public:
      * A Change is an action that is registerChange()'d while a WriteUnitOfWork exists. The
      * change is either rollback()'d or commit()'d when the WriteUnitOfWork goes out of scope.
      *
-     * Neither rollback() nor commit() may fail or throw exceptions.
+     * Neither rollback() nor commit() may fail or throw exceptions. Acquiring locks or blocking
+     * operations should not be performed in these handlers, as it may lead to deadlocks.
+     * LockManager locks are still held due to 2PL.
      *
-     * Change implementors are responsible for handling their own locking, and must be aware
-     * that rollback() and commit() may be called after resources with a shorter lifetime than
-     * the WriteUnitOfWork have been freed. Each registered change will be committed or rolled
-     * back once.
+     * Change implementors are responsible for handling their own synchronization, and must be aware
+     * that rollback() and commit() may be called out of line and after the WriteUnitOfWork have
+     * been freed. Pointers or references to stack variables should not be bound to the definitions
+     * of rollback() or commit(). Each registered change will be committed or rolled back once.
      *
      * commit() handlers are passed the timestamp at which the transaction is committed. If the
      * transaction is not committed at a particular timestamp, or if the storage engine does not
      * support timestamps, then boost::none will be supplied for this parameter.
+     *
+     * The OperationContext provided in commit() and rollback() handlers is the current
+     * OperationContext and may not be the same as when the Change was registered on the
+     * RecoveryUnit. See above for usage restrictions.
      */
     class Change {
     public:
         virtual ~Change() {}
 
-        virtual void rollback() = 0;
-        virtual void commit(boost::optional<Timestamp> commitTime) = 0;
+        virtual void rollback(OperationContext* opCtx) = 0;
+        virtual void commit(OperationContext* opCtx, boost::optional<Timestamp> commitTime) = 0;
     };
 
     /**
-     * The RecoveryUnit takes ownership of the change. The commitUnitOfWork() method calls the
-     * commit() method of each registered change in order of registration. The endUnitOfWork()
-     * method calls the rollback() method of each registered Change in reverse order of
-     * registration. Either will unregister and delete the changes.
+     * A SnapshotChange is an action that can be registered at anytime. When a WriteUnitOfWork
+     * begins, the openSnapshot() callback is called for any registered snapshot changes. Similarly,
+     * when the snapshot is abandoned, or the WriteUnitOfWork is committed or aborted, the
+     * closeSnapshot() callback is called.
+     *
+     * The same rules apply here that apply to the Change class.
+     */
+    class SnapshotChange {
+    public:
+        virtual ~SnapshotChange() {}
+
+        virtual void openSnapshot(OperationContext* opCtx) = 0;
+        virtual void closeSnapshot(OperationContext* opCtx) = 0;
+    };
+
+    /**
+     * The commitUnitOfWork() method calls the commit() method of each registered change in order of
+     * registration. The endUnitOfWork() method calls the rollback() method of each registered
+     * Change in reverse order of registration. Either will unregister and delete the changes.
      *
      * The registerChange() method may only be called when a WriteUnitOfWork is active, and
      * may not be called during commit or rollback.
@@ -582,11 +641,11 @@ public:
         public:
             CallbackChange(CommitCallback&& commit, RollbackCallback&& rollback)
                 : _rollback(std::move(rollback)), _commit(std::move(commit)) {}
-            void rollback() final {
-                _rollback();
+            void rollback(OperationContext* opCtx) final {
+                _rollback(opCtx);
             }
-            void commit(boost::optional<Timestamp> ts) final {
-                _commit(ts);
+            void commit(OperationContext* opCtx, boost::optional<Timestamp> ts) final {
+                _commit(opCtx, ts);
             }
 
         private:
@@ -619,16 +678,20 @@ public:
      * Registers a callback to be called if the current WriteUnitOfWork rolls back.
      *
      * Be careful about the lifetimes of all variables captured by the callback!
+
+     * Do not capture OperationContext in this callback because it is not guaranteed to be the same
+     * OperationContext to roll-back this unit of work. Use the OperationContext provided by the
+     * callback instead.
      */
     template <typename Callback>
     void onRollback(Callback callback) {
         class OnRollbackChange final : public Change {
         public:
             OnRollbackChange(Callback&& callback) : _callback(std::move(callback)) {}
-            void rollback() final {
-                _callback();
+            void rollback(OperationContext* opCtx) final {
+                _callback(opCtx);
             }
-            void commit(boost::optional<Timestamp>) final {}
+            void commit(OperationContext* opCtx, boost::optional<Timestamp>) final {}
 
         private:
             Callback _callback;
@@ -641,15 +704,19 @@ public:
      * Registers a callback to be called if the current WriteUnitOfWork commits.
      *
      * Be careful about the lifetimes of all variables captured by the callback!
+     *
+     * Do not capture OperationContext in this callback because it is not guaranteed to be the same
+     * OperationContext to commit this unit of work. Use the OperationContext provided by the
+     * callback instead.
      */
     template <typename Callback>
     void onCommit(Callback callback) {
         class OnCommitChange final : public Change {
         public:
             OnCommitChange(Callback&& callback) : _callback(std::move(callback)) {}
-            void rollback() final {}
-            void commit(boost::optional<Timestamp> commitTime) final {
-                _callback(commitTime);
+            void rollback(OperationContext* opCtx) final {}
+            void commit(OperationContext* opCtx, boost::optional<Timestamp> commitTime) final {
+                _callback(opCtx, commitTime);
             }
 
         private:
@@ -728,12 +795,8 @@ public:
     /**
      * Exposed for debugging purposes.
      */
-    State getState() {
+    State getState() const {
         return _getState();
-    }
-
-    void setMustBeTimestamped() {
-        _mustBeTimestamped = true;
     }
 
     void setNoEvictionAfterRollback() {
@@ -763,10 +826,11 @@ protected:
 
     /**
      * Transitions to new state.
+     *
+     * Invokes openSnapshot() for all registered snapshot changes when transitioning to kActive or
+     * kActiveNotInUnitOfWork from an inactive state.
      */
-    void _setState(State newState) {
-        _state = newState;
-    }
+    void _setState(State newState);
 
     /**
      * Returns true if active.
@@ -799,16 +863,15 @@ protected:
      */
     void _executeRollbackHandlers();
 
-    bool _mustBeTimestamped = false;
-
     bool _noEvictionAfterRollback = false;
 
     AbandonSnapshotMode _abandonSnapshotMode = AbandonSnapshotMode::kAbort;
 
 private:
     // Sets the snapshot associated with this RecoveryUnit to a new globally unique id number.
-    void assignNextSnapshotId();
+    void assignNextSnapshot();
 
+    virtual void doBeginUnitOfWork() = 0;
     virtual void doAbandonSnapshot() = 0;
     virtual void doCommitUnitOfWork() = 0;
     virtual void doAbortUnitOfWork() = 0;
@@ -819,9 +882,15 @@ private:
 
     typedef std::vector<std::unique_ptr<Change>> Changes;
     Changes _changes;
+    typedef std::vector<std::unique_ptr<SnapshotChange>> SnapshotChanges;
+    SnapshotChanges _snapshotChanges;
+    // The Snapshot is always initialized by the RecoveryUnit constructor. We use an optional to
+    // simplify destructing and re-constructing the Snapshot in-place.
+    boost::optional<Snapshot> _snapshot;
     std::unique_ptr<Change> _changeForCatalogVisibility;
     State _state = State::kInactive;
-    uint64_t _mySnapshotId;
+    OperationContext* _opCtx = nullptr;
+    bool _readOnly = false;
 };
 
 /**

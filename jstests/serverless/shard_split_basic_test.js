@@ -1,43 +1,35 @@
 /**
- *
  * Tests that runs a shard split to completion.
- * @tags: [requires_fcv_52, featureFlagShardSplit]
+ * @tags: [requires_fcv_63, serverless]
  */
 
-load("jstests/libs/fail_point_util.js");         // for "configureFailPoint"
-load('jstests/libs/parallel_shell_helpers.js');  // for "startParallelShell"
-load("jstests/serverless/libs/basic_serverless_test.js");
+import {
+    assertMigrationState,
+    findSplitOperation,
+    ShardSplitTest
+} from "jstests/serverless/libs/shard_split_test.js";
 
-(function() {
-"use strict";
-
-const recipientTagName = "recipientNode";
-const recipientSetName = "recipientSetName";
-const test = new BasicServerlessTest({
-    recipientTagName,
-    recipientSetName,
-    quickGarbageCollection: true,
-    nodeOptions: {
-        setParameter:  // Timeout to test that the operation times out waiting for replication
-            {shardSplitTimeoutMS: 2000}
-    }
-});
-
+const tenantIds = [ObjectId(), ObjectId()];
+const test = new ShardSplitTest({quickGarbageCollection: true});
 test.addRecipientNodes();
 test.donor.awaitSecondaryNodes();
 
-const migrationId = UUID();
+const donorPrimary = test.getDonorPrimary();
+const operation = test.createSplitOperation(tenantIds);
+const result = assert.commandWorked(operation.commit());
+assertMigrationState(donorPrimary, operation.migrationId, "committed");
 
-jsTestLog("Running the commitShardSplit operation");
-const admin = test.donor.getPrimary().getDB("admin");
-const tenantIds = ["tenant1", "tenant2"];
-assert.commandWorked(admin.runCommand(
-    {commitShardSplit: 1, migrationId, tenantIds, recipientTagName, recipientSetName}));
+// Confirm blockOpTime in result matches the state document before forgetting the operation
+const stateDoc = findSplitOperation(donorPrimary, operation.migrationId);
+assert.eq(stateDoc.blockOpTime.ts, result.blockOpTime.ts);
 
-test.removeRecipientNodesFromDonor();
+operation.forget();
 
-test.forgetShardSplit(migrationId);
+const status = donorPrimary.adminCommand({serverStatus: 1});
+assert.eq(status.shardSplits.totalCommitted, 1);
+assert.eq(status.shardSplits.totalAborted, 0);
+assert.gt(status.shardSplits.totalCommittedDurationMillis, 0);
+assert.gt(status.shardSplits.totalCommittedDurationWithoutCatchupMillis, 0);
 
-test.waitForGarbageCollection(migrationId, tenantIds);
+test.cleanupSuccesfulCommitted(operation.migrationId, tenantIds);
 test.stop();
-})();

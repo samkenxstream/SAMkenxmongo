@@ -35,6 +35,7 @@
 #include "mongo/db/query/plan_explainer.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/query/sbe_plan_ranker.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 /**
@@ -48,7 +49,8 @@ public:
                      std::unique_ptr<optimizer::AbstractABTPrinter> optimizerData,
                      std::vector<sbe::plan_ranker::CandidatePlan> rejectedCandidates,
                      bool isMultiPlan,
-                     std::unique_ptr<plan_cache_debug_info::DebugInfoSBE> debugInfo)
+                     bool isCachedPlan,
+                     std::shared_ptr<const plan_cache_debug_info::DebugInfoSBE> debugInfo)
         : PlanExplainer{solution},
           _root{root},
           _rootData{data},
@@ -56,17 +58,22 @@ public:
           _optimizerData(std::move(optimizerData)),
           _rejectedCandidates{std::move(rejectedCandidates)},
           _isMultiPlan{isMultiPlan},
-          _debugInfo{std::move(debugInfo)} {
+          _isFromPlanCache{isCachedPlan},
+          _debugInfo{debugInfo} {
         tassert(5968203, "_debugInfo should not be null", _debugInfo);
     }
 
     bool isMultiPlan() const final {
         return _isMultiPlan;
     }
-
+    bool isFromCache() const {
+        return _isFromPlanCache;
+    }
     const ExplainVersion& getVersion() const final;
     std::string getPlanSummary() const final;
     void getSummaryStats(PlanSummaryStats* statsOut) const final;
+    void getSecondarySummaryStats(std::string secondaryColl,
+                                  PlanSummaryStats* statsOut) const override;
     PlanStatsDetails getWinningPlanStats(ExplainOptions::Verbosity verbosity) const final;
     PlanStatsDetails getWinningPlanTrialStats() const final;
     std::vector<PlanStatsDetails> getRejectedPlansStats(
@@ -75,11 +82,11 @@ public:
                                                      ExplainOptions::Verbosity) const final;
 
 private:
-    boost::optional<BSONObj> buildExecPlanDebugInfo(
-        const sbe::PlanStage* root, const stage_builder::PlanStageData* data) const {
+    static boost::optional<BSONObj> buildExecPlanDebugInfo(
+        const sbe::PlanStage* root, const stage_builder::PlanStageData* data) {
         if (root && data) {
             return BSON("slots" << data->debugString() << "stages"
-                                << sbe::DebugPrinter().print(*_root));
+                                << sbe::DebugPrinter().print(*root));
         }
         return boost::none;
     }
@@ -95,7 +102,9 @@ private:
 
     const std::vector<sbe::plan_ranker::CandidatePlan> _rejectedCandidates;
     const bool _isMultiPlan{false};
+    const bool _isFromPlanCache{false};
     // Pre-computed debugging info so we don't necessarily have to collect them from QuerySolution.
-    std::unique_ptr<plan_cache_debug_info::DebugInfoSBE> _debugInfo;
+    // All plans recovered from the same cached entry share the same debug info.
+    const std::shared_ptr<const plan_cache_debug_info::DebugInfoSBE> _debugInfo;
 };
 }  // namespace mongo

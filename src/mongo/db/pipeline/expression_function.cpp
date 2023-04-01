@@ -43,23 +43,21 @@ ExpressionFunction::ExpressionFunction(ExpressionContext* const expCtx,
       _assignFirstArgToThis(assignFirstArgToThis),
       _funcSource(std::move(funcSource)),
       _lang(std::move(lang)) {
-    expCtx->sbeCompatible = false;
+    expCtx->sbeCompatibility = SbeCompatibility::notCompatible;
 }
 
-Value ExpressionFunction::serialize(bool explain) const {
+Value ExpressionFunction::serialize(SerializationOptions options) const {
     MutableDocument d;
-    d["body"] = Value(_funcSource);
-    d["args"] = Value(_passedArgs->serialize(explain));
+    d["body"] = options.replacementForLiteralArgs ? Value(*options.replacementForLiteralArgs)
+                                                  : Value(_funcSource);
+    d["args"] = Value(_passedArgs->serialize(options));
     d["lang"] = Value(_lang);
+
     // This field will only be seralized when desugaring $where in $expr + $_internalJs
     if (_assignFirstArgToThis) {
         d["_internalSetObjToThis"] = Value(_assignFirstArgToThis);
     }
     return Value(Document{{kExpressionName, d.freezeToValue()}});
-}
-
-void ExpressionFunction::_doAddDependencies(mongo::DepsTracker* deps) const {
-    _children[0]->addDependencies(deps);
 }
 
 boost::intrusive_ptr<Expression> ExpressionFunction::parse(ExpressionContext* const expCtx,

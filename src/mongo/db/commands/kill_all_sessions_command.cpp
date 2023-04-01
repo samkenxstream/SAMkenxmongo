@@ -38,13 +38,13 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/kill_sessions.h"
-#include "mongo/db/kill_sessions_common.h"
-#include "mongo/db/kill_sessions_local.h"
-#include "mongo/db/logical_session_cache.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/session/kill_sessions.h"
+#include "mongo/db/session/kill_sessions_common.h"
+#include "mongo/db/session/kill_sessions_local.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
 #include "mongo/db/stats/top.h"
 
 namespace mongo {
@@ -69,8 +69,8 @@ public:
         return "kill all logical sessions, for a user, and their operations";
     }
     Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
-                                 const BSONObj& cmdObj) const override {
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
         AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
         if (!authSession->isAuthorizedForPrivilege(
                 Privilege{ResourcePattern::forClusterResource(), ActionType::killAnySession})) {
@@ -88,10 +88,10 @@ public:
     }
 
     virtual bool run(OperationContext* opCtx,
-                     const std::string& db,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) override {
-        IDLParserErrorContext ctx("KillAllSessionsCmd");
+        IDLParserContext ctx("KillAllSessionsCmd");
         auto ksc = KillAllSessionsCmd::parse(ctx, cmdObj);
 
         KillAllSessionsByPatternSet patterns;

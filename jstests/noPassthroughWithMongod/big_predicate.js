@@ -20,6 +20,7 @@ assert.commandWorked(coll.explain().find(filter).finish());
 
 assert.eq(coll.find({$or: [filter]}).itcount(), 1);
 assert.commandWorked(coll.explain().find({$or: [filter]}).finish());
+assert.commandWorked(coll.explain().find({$and: [filter]}).finish());
 })();
 
 /**
@@ -124,12 +125,27 @@ function testMaxDepth() {
         });
     }
     assert.eq(result.getWriteError().code, ErrorCodes.Overflow);
-    print("Failed at creating a document with a depth of", depth, ".");
+    print("Failed at creating a document with a depth of " + depth + ".");
     depth--;
+
+    let fieldDepth = depth;
+
+    // When ASAN is on, filtering on a long field exceeds the stack limit, causing a segfault.
+    if (_isAddressSanitizerActive()) {
+        fieldDepth = depth / 2;
+        jsTestLog("Lowering the maximum depth from " + depth + " to " + fieldDepth +
+                  " because the address sanitizer is active.");
+        assert.commandWorked(coll.update({foo: 1}, {
+            $set: {
+                ['a' +
+                 '.a'.repeat(fieldDepth - 1)]: 1,
+            }
+        }));
+    }
 
     let filterOnLongField = {
         ['a' +
-         '.a'.repeat(depth - 1)]: 1
+         '.a'.repeat(fieldDepth - 1)]: 1
     };
 
     assert.eq(coll.find(filterOnLongField).itcount(), 1);
@@ -140,7 +156,7 @@ function testMaxDepth() {
 
     let sliceProjectionOnLongField = {
         ['a' +
-         '.a'.repeat(depth - 1)]: {$slice: 1}
+         '.a'.repeat(fieldDepth - 1)]: {$slice: 1}
     };
 
     assert.eq(coll.find({foo: 1}, sliceProjectionOnLongField).itcount(), 1);

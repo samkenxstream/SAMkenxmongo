@@ -27,18 +27,23 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/s/drop_collection_coordinator.h"
+#include "mongo/db/s/sharding_ddl_coordinator_gen.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/s/chunk_manager_targeter.h"
+#include "mongo/s/collection_routing_info_targeter.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -71,7 +76,7 @@ public:
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
-            opCtx->setAlwaysInterruptAtStepDownOrUp();
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             try {
                 const auto coll = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, ns());
@@ -83,25 +88,38 @@ public:
                 // The collection is not sharded or doesn't exist.
             }
 
-            // If 'ns()' is a sharded time-series view collection, 'targetNs' is a namespace
-            // for time-series buckets collection. For all other collections, 'targetNs' is equal
-            // to 'ns()'.
-            const auto targeter = ChunkManagerTargeter(opCtx, ns());
-            const auto targetNs = targeter.getNS();
-
             // Since this operation is not directly writing locally we need to force its db
             // profile level increase in order to be logged in "<db>.system.profile"
             CurOp::get(opCtx)->raiseDbProfileLevel(
-                CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(targetNs.db()));
+                CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(ns().dbName()));
 
-            auto coordinatorDoc = DropCollectionCoordinatorDocument();
-            coordinatorDoc.setShardingDDLCoordinatorMetadata(
-                {{targetNs, DDLCoordinatorTypeEnum::kDropCollection}});
-            coordinatorDoc.setCollectionUUID(request().getCollectionUUID());
+            auto dropCollCoordinator = [&] {
+                FixedFCVRegion fixedFcvRegion{opCtx};
+                const auto targetNss = [&] {
+                    if (!feature_flags::gImplicitDDLTimeseriesNssTranslation.isEnabled(
+                            *fixedFcvRegion)) {
+                        // If 'ns()' is a sharded time-series view collection, 'targetNs' is a
+                        // namespace for time-series buckets collection. For all other collections,
+                        // 'targetNs' is equal to 'ns()'.
+                        return CollectionRoutingInfoTargeter(opCtx, ns()).getNS();
+                    }
+                    return ns();
+                }();
+                // TODO SERVER-73627: Remove once 7.0 becomes last LTS.
+                const DDLCoordinatorTypeEnum coordType =
+                    feature_flags::gDropCollectionHoldingCriticalSection.isEnabled(*fixedFcvRegion)
+                    ? DDLCoordinatorTypeEnum::kDropCollection
+                    : DDLCoordinatorTypeEnum::kDropCollectionPre70Compatible;
 
-            auto service = ShardingDDLCoordinatorService::getService(opCtx);
-            auto dropCollCoordinator = checked_pointer_cast<DropCollectionCoordinator>(
-                service->getOrCreateInstance(opCtx, coordinatorDoc.toBSON()));
+                auto coordinatorDoc = DropCollectionCoordinatorDocument();
+                coordinatorDoc.setShardingDDLCoordinatorMetadata({{targetNss, coordType}});
+                coordinatorDoc.setCollectionUUID(request().getCollectionUUID());
+
+                auto service = ShardingDDLCoordinatorService::getService(opCtx);
+                return checked_pointer_cast<DropCollectionCoordinator>(
+                    service->getOrCreateInstance(opCtx, coordinatorDoc.toBSON()));
+            }();
+
             dropCollCoordinator->getCompletionFuture().get(opCtx);
         }
 

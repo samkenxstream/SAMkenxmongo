@@ -48,32 +48,32 @@ void StorageGlobalParams::reset() {
     upgrade = false;
     repair = false;
     restore = false;
-
-    // The intention here is to enable the journal by default if we are running on a 64 bit system.
-    dur = (sizeof(void*) == 8);
+    magicRestore = false;
 
     noTableScan.store(false);
     directoryperdb = false;
     syncdelay = 60.0;
-    readOnly = false;
+    queryableBackupMode = false;
     groupCollections = false;
     oplogMinRetentionHours.store(0.0);
     allowOplogTruncation = true;
     disableLockFreeReads = false;
     checkpointDelaySecs = 0;
+    forceDisableTableLogging = false;
 }
 
 StorageGlobalParams storageGlobalParams;
 
-Status StorageDirectoryPerDbParameter::setFromString(const std::string&) {
+Status StorageDirectoryPerDbParameter::setFromString(StringData, const boost::optional<TenantId>&) {
     return {ErrorCodes::IllegalOperation,
             str::stream() << name() << " cannot be set via setParameter"};
 };
 
 void StorageDirectoryPerDbParameter::append(OperationContext* opCtx,
-                                            BSONObjBuilder& builder,
-                                            const std::string& name) {
-    builder.append(name, storageGlobalParams.directoryperdb);
+                                            BSONObjBuilder* builder,
+                                            StringData name,
+                                            const boost::optional<TenantId>&) {
+    builder->append(name, storageGlobalParams.directoryperdb);
 }
 
 

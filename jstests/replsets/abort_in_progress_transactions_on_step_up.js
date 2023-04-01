@@ -87,7 +87,7 @@ jsTestLog("Wait for the new primary to apply the first op of transaction at time
 assert.soon(() => {
     const lastOpTime = getLastOpTime(newPrimary);
     jsTestLog("Current lastOpTime on the new primary: " + tojson(lastOpTime));
-    return lastOpTime >= startOpTime;
+    return rs.compareOpTimes(lastOpTime, startOpTime) >= 0;
 });
 
 // Now the transaction should be in-progress on newPrimary.
@@ -144,8 +144,8 @@ const secondDoc = {
 };
 assert.commandWorked(newSession.getDatabase(dbName).getCollection(collName).insert(secondDoc));
 assert.commandWorked(newSession.commitTransaction_forTesting());
-assert.docEq(testDB.getCollection(collName).find().toArray(), [secondDoc]);
-assert.docEq(newTestDB.getCollection(collName).find().toArray(), [secondDoc]);
+assert.docEq([secondDoc], testDB.getCollection(collName).find().toArray());
+assert.docEq([secondDoc], newTestDB.getCollection(collName).find().toArray());
 
 replTest.stopSet();
 })();

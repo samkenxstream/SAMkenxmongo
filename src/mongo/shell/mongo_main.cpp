@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -38,12 +37,11 @@
 #include <boost/log/attributes/value_extraction.hpp>
 #include <boost/log/core.hpp>
 #include <boost/log/sinks.hpp>
+#include <csignal>
+#include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iostream>
-#include <pcrecpp.h>
-#include <signal.h>
-#include <stdio.h>
-#include <string.h>
 
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
@@ -51,6 +49,7 @@
 #include "mongo/client/authenticate.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/sasl_aws_client_options.h"
+#include "mongo/client/sasl_oidc_client_params.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/client.h"
@@ -68,18 +67,21 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/linenoise.h"
+#include "mongo/shell/program_runner.h"
 #include "mongo/shell/shell_options.h"
 #include "mongo/shell/shell_utils.h"
 #include "mongo/shell/shell_utils_launcher.h"
 #include "mongo/stdx/utility.h"
-#include "mongo/transport/transport_layer_asio.h"
+#include "mongo/transport/asio/asio_transport_layer.h"
 #include "mongo/util/ctype.h"
 #include "mongo/util/errno_util.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/file.h"
 #include "mongo/util/net/ocsp/ocsp_manager.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/password.h"
+#include "mongo/util/pcre.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/signal_handlers.h"
@@ -96,6 +98,9 @@
 #else
 #include <unistd.h>
 #endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 using namespace std::literals::string_literals;
 
@@ -116,14 +121,14 @@ const std::string kDefaultMongoURL = "mongodb://"s + kDefaultMongoHost + ":"s + 
 // level. The server is responsible for rejecting usages of new features if its
 // featureCompatibilityVersion is lower.
 MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersionLatest,
-                                     ("EndStartupOptionSetup"))
+                                     ("EndStartupOptionStorage"))
 // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
 (InitializerContext* context) {
     mongo::serverGlobalParams.mutableFeatureCompatibility.setVersion(
         multiversion::GenericFCV::kLatest);
 }
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(WireSpec, ("EndStartupOptionSetup"))(InitializerContext*) {
+MONGO_INITIALIZER_WITH_PREREQUISITES(WireSpec, ("EndStartupOptionHandling"))(InitializerContext*) {
     WireSpec::instance().initialize(WireSpec::Specification{});
 }
 
@@ -276,16 +281,16 @@ void shellHistoryAdd(const char* line) {
     // be able to add things like `.author`, so be smart about how this is
     // detected by using regular expresions. This is so we can avoid storing passwords
     // in the history file in plaintext.
-    static pcrecpp::RE hiddenHelpers(
+    static pcre::Regex hiddenHelpers(
         "\\.\\s*(auth|createUser|updateUser|changeUserPassword)\\s*\\(");
     // Also don't want the raw user management commands to show in the shell when run directly
     // via runCommand.
-    static pcrecpp::RE hiddenCommands(
+    static pcre::Regex hiddenCommands(
         "(run|admin)Command\\s*\\(\\s*{\\s*(createUser|updateUser)\\s*:");
 
-    static pcrecpp::RE hiddenFLEConstructor(".*Mongo\\(([\\s\\S]*)secretAccessKey([\\s\\S]*)");
-    if (!hiddenHelpers.PartialMatch(line) && !hiddenCommands.PartialMatch(line) &&
-        !hiddenFLEConstructor.PartialMatch(line)) {
+    static pcre::Regex hiddenFLEConstructor(".*Mongo\\(([\\s\\S]*)secretAccessKey([\\s\\S]*)");
+    if (!hiddenHelpers.matchView(line) && !hiddenCommands.matchView(line) &&
+        !hiddenFLEConstructor.matchView(line)) {
         linenoiseHistoryAdd(line);
     }
 }
@@ -304,7 +309,7 @@ void killOps() {
 }
 
 extern "C" void quitNicely(int sig) {
-    shutdown(EXIT_CLEAN);
+    shutdown(ExitCode::clean);
 }
 
 // the returned string is allocated with strdup() or malloc() and must be freed by calling free()
@@ -352,7 +357,7 @@ std::string getURIFromArgs(const std::string& arg,
     if ((arg.find('/') != std::string::npos) && (host.size() || port.size())) {
         std::cerr << "If a full URI is provided, you cannot also specify --host or --port"
                   << std::endl;
-        quickExit(-1);
+        quickExit(ExitCode::badOptions);
     }
 
     const auto parseDbHost = [port](const std::string& db, const std::string& host) -> std::string {
@@ -420,7 +425,7 @@ std::string getURIFromArgs(const std::string& arg,
                         std::cerr
                             << "connection string bears different port than provided by --port"
                             << std::endl;
-                        quickExit(-1);
+                        quickExit(ExitCode::badOptions);
                     }
                     ss << ':' << uriEncode(myport);
                 } else if (port.size()) {
@@ -599,7 +604,8 @@ static void edit(const std::string& whatToEdit) {
     FILE* tempFileStream;
     tempFileStream = fopen(filename.c_str(), "wt");
     if (!tempFileStream) {
-        std::cout << "couldn't create temp file (" << filename << "): " << errnoWithDescription()
+        auto ec = lastPosixError();
+        std::cout << "couldn't create temp file (" << filename << "): " << errorMessage(ec)
                   << std::endl;
         return;
     }
@@ -607,9 +613,8 @@ static void edit(const std::string& whatToEdit) {
     // Write JSON into the temp file
     size_t fileSize = js.size();
     if (fwrite(js.data(), sizeof(char), fileSize, tempFileStream) != fileSize) {
-        int systemErrno = errno;
-        std::cout << "failed to write to temp file: " << errnoWithDescription(systemErrno)
-                  << std::endl;
+        auto ec = lastPosixError();
+        std::cout << "failed to write to temp file: " << errorMessage(ec) << std::endl;
         fclose(tempFileStream);
         remove(filename.c_str());
         return;
@@ -625,9 +630,9 @@ static void edit(const std::string& whatToEdit) {
     }();
     if (ret) {
         if (ret == -1) {
-            int systemErrno = errno;
-            std::cout << "failed to launch $EDITOR (" << editor
-                      << "): " << errnoWithDescription(systemErrno) << std::endl;
+            auto ec = lastPosixError();
+            std::cout << "failed to launch $EDITOR (" << editor << "): " << errorMessage(ec)
+                      << std::endl;
         } else
             std::cout << "editor exited with error (" << ret << "), not applying changes"
                       << std::endl;
@@ -638,7 +643,8 @@ static void edit(const std::string& whatToEdit) {
     // The editor gave return code zero, so read the file back in
     tempFileStream = fopen(filename.c_str(), "rt");
     if (!tempFileStream) {
-        std::cout << "couldn't open temp file on return from editor: " << errnoWithDescription()
+        auto ec = lastPosixError();
+        std::cout << "couldn't open temp file on return from editor: " << errorMessage(ec)
                   << std::endl;
         remove(filename.c_str());
         return;
@@ -649,7 +655,8 @@ static void edit(const std::string& whatToEdit) {
         char buf[1024];
         bytes = fread(buf, sizeof(char), sizeof buf, tempFileStream);
         if (ferror(tempFileStream)) {
-            std::cout << "failed to read temp file: " << errnoWithDescription() << std::endl;
+            auto ec = lastPosixError();
+            std::cout << "failed to read temp file: " << errorMessage(ec) << std::endl;
             fclose(tempFileStream);
             remove(filename.c_str());
             return;
@@ -674,9 +681,9 @@ static void edit(const std::string& whatToEdit) {
 
 bool mechanismRequiresPassword(const MongoURI& uri) {
     if (const auto authMechanisms = uri.getOption("authMechanism")) {
-        constexpr std::array<StringData, 2> passwordlessMechanisms{auth::kMechanismGSSAPI,
-                                                                   auth::kMechanismMongoX509};
-        const std::string& authMechanism = authMechanisms.get();
+        constexpr std::array<StringData, 3> passwordlessMechanisms{
+            auth::kMechanismGSSAPI, auth::kMechanismMongoX509, auth::kMechanismMongoOIDC};
+        const std::string& authMechanism = authMechanisms.value();
         for (const auto& mechanism : passwordlessMechanisms) {
             if (mechanism.toString() == authMechanism) {
                 return false;
@@ -689,7 +696,6 @@ bool mechanismRequiresPassword(const MongoURI& uri) {
 }  // namespace
 
 int mongo_main(int argc, char* argv[]) {
-
     try {
 
         registerShutdownTask([] {
@@ -720,13 +726,14 @@ int mongo_main(int argc, char* argv[]) {
 #ifdef MONGO_CONFIG_SSL
         OCSPManager::start(serviceContext);
 #endif
+        shell_utils::ProgramRegistry::create(serviceContext);
 
-        transport::TransportLayerASIO::Options opts;
+        transport::AsioTransportLayer::Options opts;
         opts.enableIPv6 = shellGlobalParams.enableIPv6;
-        opts.mode = transport::TransportLayerASIO::Options::kEgress;
+        opts.mode = transport::AsioTransportLayer::Options::kEgress;
 
         serviceContext->setTransportLayer(
-            std::make_unique<transport::TransportLayerASIO>(opts, nullptr));
+            std::make_unique<transport::AsioTransportLayer>(opts, nullptr));
         auto tlPtr = serviceContext->getTransportLayer();
         uassertStatusOK(tlPtr->setup());
         uassertStatusOK(tlPtr->start());
@@ -779,18 +786,23 @@ int mongo_main(int argc, char* argv[]) {
                                                awsIam::saslAwsClientGlobalParams.awsSessionToken);
         }
 #endif
+        if (!oidcClientGlobalParams.oidcAccessToken.empty()) {
+            parsedURI.setOptionIfNecessary("authmechanismproperties"s,
+                                           str::stream() << "OIDC_ACCESS_TOKEN:"
+                                                         << oidcClientGlobalParams.oidcAccessToken);
+        }
 
         if (const auto authMechanisms = parsedURI.getOption("authMechanism")) {
             std::stringstream ss;
             ss << "DB.prototype._defaultAuthenticationMechanism = \""
-               << str::escape(authMechanisms.get()) << "\";" << std::endl;
+               << str::escape(authMechanisms.value()) << "\";" << std::endl;
             mongo::shell_utils::dbConnect += ss.str();
         }
 
         if (const auto gssapiServiveName = parsedURI.getOption("gssapiServiceName")) {
             std::stringstream ss;
             ss << "DB.prototype._defaultGssapiServiceName = \""
-               << str::escape(gssapiServiveName.get()) << "\";" << std::endl;
+               << str::escape(gssapiServiveName.value()) << "\";" << std::endl;
             mongo::shell_utils::dbConnect += ss.str();
         }
 
@@ -840,6 +852,15 @@ int mongo_main(int argc, char* argv[]) {
         mongo::getGlobalScriptEngine()->enableJavaScriptProtection(
             shellGlobalParams.javascriptProtection);
 
+        if (shellGlobalParams.files.size() > 0) {
+            boost::system::error_code ec;
+            auto loadPath =
+                boost::filesystem::canonical(shellGlobalParams.files[0], ec).parent_path().string();
+            if (!ec) {
+                mongo::getGlobalScriptEngine()->setLoadPath(loadPath);
+            }
+        }
+
         ScopeGuard poolGuard([] { ScriptEngine::dropScopeCache(); });
 
         std::unique_ptr<mongo::Scope> scope(mongo::getGlobalScriptEngine()->newScope());
@@ -887,6 +908,19 @@ int mongo_main(int argc, char* argv[]) {
                 return kInputFileError;
             }
 
+            // If the test began a GoldenTestContext, end it and compare actual/expected results.
+            // NOTE: putting this in ~MongoProgramScope would call it at the end of each load(),
+            // but we only want to call it once the original test file finishes.
+            try {
+                shell_utils::closeGoldenTestContext();
+            } catch (const shell_utils::GoldenTestContextShellFailure& exn) {
+                std::cout << "failed to load: " << shellGlobalParams.files[i] << std::endl;
+                std::cout << exn.toString() << std::endl;
+                exn.diff();
+                std::cout << "exiting with code " << static_cast<int>(kInputFileError) << std::endl;
+                return kInputFileError;
+            }
+
             // Check if the process left any running child processes.
             std::vector<ProcessId> pids = mongo::shell_utils::getRunningMongoChildProcessIds();
 
@@ -897,7 +931,8 @@ int mongo_main(int argc, char* argv[]) {
                     pids.begin(), pids.end(), std::ostream_iterator<ProcessId>(std::cout, " "));
                 std::cout << std::endl;
 
-                if (mongo::shell_utils::KillMongoProgramInstances() != EXIT_SUCCESS) {
+                if (mongo::shell_utils::KillMongoProgramInstances() !=
+                    static_cast<int>(ExitCode::clean)) {
                     std::cout << "one more more child processes exited with an error during "
                               << shellGlobalParams.files[i] << std::endl;
                     std::cout << "exiting with code " << static_cast<int>(kProcessTerminationError)
@@ -1116,10 +1151,10 @@ int mongo_main(int argc, char* argv[]) {
                 {
                     std::string cmd = linePtr;
                     std::string::size_type firstSpace;
-                    if ((firstSpace = cmd.find(" ")) != std::string::npos)
+                    if ((firstSpace = cmd.find(' ')) != std::string::npos)
                         cmd = cmd.substr(0, firstSpace);
 
-                    if (cmd.find("\"") == std::string::npos) {
+                    if (cmd.find('\"') == std::string::npos) {
                         try {
                             lastLineSuccessful = scope->exec(
                                 std::string("__iscmd__ = shellHelper[\"") + cmd + "\"];",

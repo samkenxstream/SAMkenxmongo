@@ -29,6 +29,8 @@
 
 #include "mongo/db/pipeline/change_stream_rewrite_helpers.h"
 
+#include <boost/algorithm/string/replace.hpp>
+
 #include "mongo/db/matcher/expression_always_boolean.h"
 #include "mongo/db/matcher/expression_expr.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
@@ -54,7 +56,7 @@ namespace {
 std::unique_ptr<PathMatchExpression> cloneWithSubstitution(
     const PathMatchExpression* predicate, const StringMap<std::string>& renameList) {
     auto clonedPred = std::unique_ptr<PathMatchExpression>(
-        static_cast<PathMatchExpression*>(predicate->shallowClone().release()));
+        static_cast<PathMatchExpression*>(predicate->clone().release()));
     clonedPred->applyRename(renameList);
     return clonedPred;
 }
@@ -622,8 +624,8 @@ std::unique_ptr<MatchExpression> matchRewriteUpdateDescription(
                 static const std::vector<std::string> oplogFields = {"o.diff.d", "o.$unset"};
                 auto rewrittenEquality = std::make_unique<OrMatchExpression>();
                 for (auto&& oplogField : oplogFields) {
-                    rewrittenEquality->add(
-                        std::make_unique<ExistsMatchExpression>(oplogField + "." + fieldName));
+                    rewrittenEquality->add(std::make_unique<ExistsMatchExpression>(
+                        StringData(oplogField + "." + fieldName)));
                 }
                 return rewrittenEquality;
             };
@@ -888,9 +890,12 @@ std::unique_ptr<MatchExpression> matchRewriteGenericNamespace(
                 }();
 
                 // Convert the MatchExpression $regex into a $regexMatch on the corresponding field.
+                // Backslashes must be escaped to ensure they retain their special behavior.
+                const auto regex =
+                    boost::replace_all_copy(std::string(nsElem.regex()), R"(\)", R"(\\)");
                 const std::string exprRegexMatch = str::stream()
-                    << "{$regexMatch: {input: " << exprDbOrCollName << ", regex: '"
-                    << nsElem.regex() << "', options: '" << nsElem.regexFlags() << "'}}";
+                    << "{$regexMatch: {input: " << exprDbOrCollName << ", regex: '" << regex
+                    << "', options: '" << nsElem.regexFlags() << "'}}";
 
                 // Finally, wrap the regex in a $let which defines the '$$oplogField' variable.
                 const std::string exprRewrittenPredicate = str::stream()
@@ -1061,7 +1066,8 @@ std::unique_ptr<MatchExpression> matchRewriteNs(
         matchRewriteGenericNamespace(expCtx, predicate, "ns"_sd, true /* nsFieldIsCmdNs */);
     tassert(5554105, "Unexpected rewrite failure", dropDbNsRewrite);
     auto andDropDbNsRewrite = std::make_unique<AndMatchExpression>(std::move(dropDbNsRewrite));
-    andDropDbNsRewrite->add(std::make_unique<EqualityMatchExpression>("o.dropDatabase", Value(1)));
+    andDropDbNsRewrite->add(
+        std::make_unique<EqualityMatchExpression>("o.dropDatabase"_sd, Value(1)));
     cmdCases->add(std::move(andDropDbNsRewrite));
 
     // Create the final namespace filter for {op: 'c'} operations.
@@ -1256,6 +1262,60 @@ boost::intrusive_ptr<Expression> exprRewriteTo(
         expCtx.get(), fromjson(condRename.str()), expCtx->variablesParseState);
 }
 
+/**
+ * Rewrites filters on 'fullDocumentBeforeChange' in a format that can be applied directly to the
+ * oplog.
+ */
+std::unique_ptr<MatchExpression> matchRewriteFullDocumentBeforeChange(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const PathMatchExpression* predicate,
+    bool allowInexact) {
+    tassert(6199800, "Unexpected empty path", !predicate->path().empty());
+    tassert(6199801,
+            str::stream() << "Unexpected predicate path: " << predicate->path(),
+            predicate->fieldRef()->getPart(0) ==
+                DocumentSourceChangeStream::kFullDocumentBeforeChangeField);
+
+    // If this predicate matches a missing value, e.g. {$eq: null}, we cannot rewrite it. Predicates
+    // such as this will match all non-update and non-delete operations, and we do not know whether
+    // the post-image will be available later in the pipeline. We also cannot continue if an exact
+    // rewrite is required. In both cases, return nullptr immediately.
+    if (!allowInexact || predicate->matchesSingleElement({})) {
+        return nullptr;
+    }
+
+    // Only an update or a delete can possibly match a predicate on fullDocumentBeforeChange.
+    auto updatePred = std::make_unique<AndMatchExpression>(
+        MatchExpressionParser::parseAndNormalize(fromjson("{op: 'u'}"), expCtx));
+    auto deletePred = std::make_unique<AndMatchExpression>(
+        MatchExpressionParser::parseAndNormalize(fromjson("{op: 'd'}"), expCtx));
+
+    // If the predicate is on the _id field, we can apply it to the documentKey in the oplog.
+    /* Example:
+     *   '{'fullDocumentBeforeChange._id': {$lt: 3}}' gets rewritten to
+     *                           {$or:[
+     *                              {$and: [
+     *                                  {op: {$eq: 'd'}},
+     *                                  {'o._id': {$lt: 3}}
+     *                              ]},
+     *                              {$and: [
+     *                                  {op: {$eq: 'u'}},
+     *                                  {'o2._id': {$lt: 3}}
+     *                              ]}
+     *                           ]}
+     */
+    if (predicate->fieldRef()->numParts() > 1 && predicate->fieldRef()->getPart(1) == "_id") {
+        updatePred->add(cloneWithSubstitution(predicate, {{"fullDocumentBeforeChange", "o2"}}));
+        deletePred->add(cloneWithSubstitution(predicate, {{"fullDocumentBeforeChange", "o"}}));
+    }
+
+    // Wrap the update and delete predicates in an $or, and return the completed rewrite.
+    auto finalPred = std::make_unique<OrMatchExpression>(std::move(updatePred), nullptr);
+    finalPred->add(std::move(deletePred));
+
+    return finalPred;
+}
+
 // Map of fields names for which a simple rename is sufficient when rewriting.
 StringMap<std::string> renameRegistry = {
     {"clusterTime", "ts"}, {"lsid", "lsid"}, {"txnNumber", "txnNumber"}};
@@ -1265,6 +1325,7 @@ StringMap<MatchExpressionRewrite> matchRewriteRegistry = {
     {"operationType", matchRewriteOperationType},
     {"documentKey", matchRewriteDocumentKey},
     {"fullDocument", matchRewriteFullDocument},
+    {"fullDocumentBeforeChange", matchRewriteFullDocumentBeforeChange},
     {"updateDescription", matchRewriteUpdateDescription},
     {"ns", matchRewriteNs},
     {"to", matchRewriteTo}};

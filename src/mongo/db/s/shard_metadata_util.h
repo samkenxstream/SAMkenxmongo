@@ -32,7 +32,7 @@
 #include <string>
 #include <vector>
 
-#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/oid.h"
 #include "mongo/s/chunk_version.h"
@@ -40,17 +40,11 @@
 namespace mongo {
 
 class ChunkType;
-class CollectionMetadata;
 class NamespaceString;
 class OperationContext;
 class ShardCollectionType;
 class ShardDatabaseType;
-template <typename T>
-class StatusWith;
 
-/**
- * Function helpers to locally, using a DBDirectClient, read and write sharding metadata on a shard.
- */
 namespace shardmetadatautil {
 
 /**
@@ -59,25 +53,6 @@ namespace shardmetadatautil {
 struct QueryAndSort {
     const BSONObj query;
     const BSONObj sort;
-};
-
-/**
- * Subset of the shard's collections collection document that relates to refresh state.
- */
-struct RefreshState {
-    bool operator==(const RefreshState& other) const;
-
-    std::string toString() const;
-
-    // The current epoch of the collection metadata.
-    OID epoch;
-
-    // Whether a refresh is currently in progress.
-    bool refreshing;
-
-    // The collection version after the last complete refresh. Indicates change if refreshing has
-    // started and finished since last loaded.
-    ChunkVersion lastRefreshedCollectionVersion;
 };
 
 /**
@@ -95,17 +70,17 @@ struct RefreshState {
  * due to the yield described above. If updates are applied in ascending version order, the newer
  * update is applied last.
  */
-QueryAndSort createShardChunkDiffQuery(const ChunkVersion& collectionVersion);
+QueryAndSort createShardChunkDiffQuery(const ChunkVersion& collectionPlacementVersion);
 
 /**
  * Writes a persisted signal to indicate that it is once again safe to read from the chunks
- * collection for 'nss' and updates the collection's collection version to 'refreshedVersion'. It is
- * essential to call this after updating the chunks collection so that secondaries know they can
- * safely use the chunk metadata again.
+ * collection for 'nss' and updates the collection's collection placement version to
+ * 'refreshedVersion'. It is essential to call this after updating the chunks collection so that
+ * secondaries know they can safely use the chunk metadata again.
  *
  * It is safe to call this multiple times: it's an idempotent action.
  *
- * refreshedVersion - the new collection version for the completed refresh.
+ * refreshedVersion - the new collection placement version for the completed refresh.
  *
  * Note: if there is no document present in the collections collection for 'nss', nothing is
  * updated.
@@ -113,6 +88,26 @@ QueryAndSort createShardChunkDiffQuery(const ChunkVersion& collectionVersion);
 Status unsetPersistedRefreshFlags(OperationContext* opCtx,
                                   const NamespaceString& nss,
                                   const ChunkVersion& refreshedVersion);
+
+/**
+ * Represents a subset of a collection's config.cache.collections entry that relates to refresh
+ * state.
+ */
+struct RefreshState {
+    bool operator==(const RefreshState& other) const;
+
+    std::string toString() const;
+
+    // The current generation of the collection.
+    CollectionGeneration generation;
+
+    // Whether a refresh is currently in progress.
+    bool refreshing;
+
+    // The collection placement version after the last complete refresh. Indicates change if
+    // refreshing has started and finished since last loaded.
+    ChunkVersion lastRefreshedCollectionPlacementVersion;
+};
 
 /**
  * Reads the persisted refresh signal for 'nss' and returns those settings.
@@ -135,8 +130,8 @@ StatusWith<ShardDatabaseType> readShardDatabasesEntry(OperationContext* opCtx, S
  * Updates the collections collection entry matching 'query' with 'update' using local write
  * concern.
  *
- * If 'upsert' is true, expects 'lastRefreshedCollectionVersion' to be absent in the update:
- * these refreshing fields should only be added to an existing document.
+ * If 'upsert' is true, expects 'lastRefreshedCollectionPlacementVersion' to be absent in the
+ * update: these refreshing fields should only be added to an existing document.
  */
 Status updateShardCollectionsEntry(OperationContext* opCtx,
                                    const BSONObj& query,

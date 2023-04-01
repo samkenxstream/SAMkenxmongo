@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
 #include "mongo/platform/basic.h"
 
@@ -43,6 +42,9 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
+
 
 namespace mongo {
 
@@ -61,8 +63,13 @@ BSONObj WiredTigerServerStatusSection::generateSection(OperationContext* opCtx,
                         LockMode::MODE_IS,
                         Date_t::now(),
                         Lock::InterruptBehavior::kLeaveUnlocked,
-                        // Replication state change does not affect the following operation.
-                        true /* skipRSTLLock */);
+                        // Replication state change does not affect the following operation and we
+                        // don't need a flow control ticket.
+                        [] {
+                            Lock::GlobalLockSkipOptions options;
+                            options.skipRSTLLock = true;
+                            return options;
+                        }());
     if (!lk.isLocked()) {
         LOGV2_DEBUG(3088800, 2, "Failed to retrieve wiredTiger statistics");
         return BSONObj();
@@ -90,7 +97,7 @@ BSONObj WiredTigerServerStatusSection::generateSection(OperationContext* opCtx,
         bob.append("reason", status.reason());
     }
 
-    WiredTigerKVEngine::appendGlobalStats(bob);
+    WiredTigerKVEngine::appendGlobalStats(opCtx, bob);
 
     WiredTigerKVEngine* engine = checked_cast<WiredTigerKVEngine*>(
         opCtx->getServiceContext()->getStorageEngine()->getEngine());

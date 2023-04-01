@@ -4,7 +4,7 @@
  * never fail without a bug.
  *
  * This test only makes sense for storage engines that support recover to stable timestamp.
- * @tags: [requires_wiredtiger, requires_persistence, requires_journaling, requires_replication,
+ * @tags: [requires_persistence, requires_replication,
  * requires_majority_read_concern,
  * # Restarting as a standalone is not supported in multiversion tests.
  * multiversion_incompatible]
@@ -57,6 +57,11 @@ node = rst.restart(node, {
     noReplSet: true,
     setParameter: {recoverFromOplogAsStandalone: true, logComponentVerbosity: logLevel}
 });
+
+// Verify that the 'config.system.indexBuilds' collection is empty after recovering from the oplog
+// in standalone mode.
+assert.eq(0, node.getCollection("config.system.indexBuilds").count());
+
 reconnect(node);
 
 rst.stopSet();

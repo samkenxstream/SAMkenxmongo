@@ -34,7 +34,7 @@ global:
       - "mongo/client/read_preference.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 server_parameters:
     # From data_replicator_external_state_impl.cpp
@@ -106,6 +106,17 @@ server_parameters:
         cpp_vartype: bool
         cpp_varname: oplogFetcherUsesExhaust
         default: true
+
+    oplogBatchDelayMillis:
+        description: >-
+            How long, in milliseconds, to wait for more data when an oplog application batch is
+            not full.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: oplogBatchDelayMillis
+        default: 0
+        validator:
+            gte: 0
 
     # From bgsync.cpp
     bgSyncOplogFetcherBatchSize:
@@ -472,6 +483,16 @@ server_parameters:
         validator:
             gte: 1
 
+    minTenantMigrationRecipientThreadPoolSize:
+        description: >-
+            The minimum number of threads in the tenant migration recipient's thread pool.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: minTenantMigrationRecipientThreadPoolSize
+        default: 0
+        validator:
+            gte: 1
+
     maxTenantMigrationDonorServiceThreadPoolSize:
         description: >-
             The maximum number of threads in the tenant migration donor service's thread pool.
@@ -481,6 +502,36 @@ server_parameters:
         default: 8
         validator:
             gte: 1
+    
+    minTenantMigrationDonorServiceThreadPoolSize:
+        description: >-
+            The minimum number of threads in the tenant migration donor service's thread pool.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: minTenantMigrationDonorServiceThreadPoolSize
+        default: 0
+        validator:
+            gte: 1
+
+    maxShardSplitDonorServiceThreadPoolSize:
+        description: >-
+            The maximum number of threads in the shard split donor service's thread pool.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: maxShardSplitDonorServiceThreadPoolSize
+        default: 8
+        validator:
+            gte: 1
+    
+    minShardSplitDonorServiceThreadPoolSize:
+        description: >-
+            The minimum number of threads in the shard split donor service's thread pool.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: minShardSplitDonorServiceThreadPoolSize
+        default: 0
+        validator:
+            gte: 1
 
     shardSplitTimeoutMS:
         description: >-
@@ -488,7 +539,7 @@ server_parameters:
         set_at: [ startup, runtime ]
         cpp_vartype: AtomicWord<int>
         cpp_varname: shardSplitTimeoutMS
-        default: 3600000
+        default: 10000
         validator:
             gte: 1
 
@@ -498,7 +549,6 @@ server_parameters:
         set_at: [ startup, runtime ]
         cpp_vartype: AtomicWord<int>
         cpp_varname: tenantMigrationBlockingStateTimeoutMS
-        # TODO: SERVER-53571 determine the best default timeout.
         default: 3600000
         validator:
             gte: 1
@@ -561,6 +611,17 @@ server_parameters:
         cpp_varname: enableReconfigRollbackCommittedWritesCheck
         default: true
 
+    # TODO (SERVER-74398): Remove special handling of 'confirm: true' in setFCV.
+    requireConfirmInSetFcv:
+        description: >-
+            Determines if we must specify 'confirm: true' in the setFCV command. Enabled by default.
+            Test-only.
+        test_only: true
+        set_at: startup
+        cpp_vartype: bool
+        cpp_varname: requireConfirmInSetFcv
+        default: true
+
     initialSyncMethod:
         description: >-
             Specifies which method of initial sync to use. Valid options are: fileCopyBased,
@@ -613,7 +674,8 @@ server_parameters:
         set_at: [ startup, runtime ]
         cpp_vartype: AtomicWord<int>
         cpp_varname: fassertOnLockTimeoutForStepUpDown
-        default: 15
+        # We set the default to 30 seconds explicitly to match sharding's kDefaultConfigCommandTimeout.
+        default: 30
         validator:
             gte: 0
 
@@ -642,6 +704,63 @@ server_parameters:
         default:
             expr: 15 * 60 * 1000
 
+    slowServiceOnStepUpBeginThresholdMS:
+        description: >-
+            The maximum amount of time, in milliseconds, that a single replica set aware
+            service's onStepUpBegin method can take without a warning being logged.
+        set_at: [ startup, runtime ]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: slowServiceOnStepUpBeginThresholdMS
+        default: 200
+        validator:
+            gte: 0
+
+    slowTotalOnStepUpBeginThresholdMS:
+        description: >-
+            The maximum amount of time, in milliseconds, that the total of all replica set
+            aware services' onStepUpBegin methods can take without a warning being logged.
+        set_at: [ startup, runtime ]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: slowTotalOnStepUpBeginThresholdMS
+        default: 500
+        validator:
+            gte: 0
+
+    slowServiceOnStepUpCompleteThresholdMS:
+        description: >-
+            The maximum amount of time, in milliseconds, that a single replica set aware
+            service or primary-only service's onStepUpComplete method can take without a warning
+            being logged.
+        set_at: [ startup, runtime ]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: slowServiceOnStepUpCompleteThresholdMS
+        default: 200
+        validator:
+            gte: 0
+
+    slowTotalOnStepUpCompleteThresholdMS:
+        description: >-
+            The maximum amount of time, in milliseconds, that the total of all replica set
+            aware services' and primary-only services' onStepUpComplete methods can take
+            without a warning being logged.
+        set_at: [ startup, runtime ]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: slowTotalOnStepUpCompleteThresholdMS
+        default: 500
+        validator:
+            gte: 0
+
+    # TODO (SERVER-74847): Remove this server parameter.
+    disableTransitionFromLatestToLastContinuous:
+        description: >-
+            Prohibits downgrading from latest FCV to last continuous FCV. Disabled by default.
+            Test-only.
+        test_only: true
+        set_at: startup
+        cpp_vartype: bool
+        cpp_varname: disableTransitionFromLatestToLastContinuous
+        default: true
+
 feature_flags:
     featureFlagRetryableFindAndModify:
         description: >-
@@ -651,13 +770,6 @@ feature_flags:
         default: true
         version: 5.1
 
-    featureFlagFileCopyBasedInitialSync:
-        description: >-
-            When enabled, file copy based initial sync will be supported in Enterprise Server.
-        cpp_varname: feature_flags::gFileCopyBasedInitialSync
-        default: true
-        version: 5.2
-
     featureFlagShardMerge:
         description: When enabled, multitenant migration uses the "shard merge" protocol.
         cpp_varname: feature_flags::gShardMerge
@@ -666,4 +778,17 @@ feature_flags:
     featureFlagShardSplit:
         description: When enabled, multitenant migration can use the shard split commands.
         cpp_varname: feature_flags::gShardSplit
+        default: true
+        version: 6.3
+
+    featureFlagDowngradingToUpgrading:
+        description: When enabled, 
+                     allow kDowngradingFromLatestToLastLTS -> kUpgrading -> kUpgraded path.
+        cpp_varname: feature_flags::gDowngradingToUpgrading
+        default: true
+        version: 7.0
+
+    featureFlagApplyPreparedTxnsInParallel:
+        description: when enabled, secondaries will apply prepared transactions in parallel.
+        cpp_varname: feature_flags::gApplyPreparedTxnsInParallel
         default: false

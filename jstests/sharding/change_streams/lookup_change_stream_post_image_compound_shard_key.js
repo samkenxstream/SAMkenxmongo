@@ -63,22 +63,24 @@ for (let id = 0; id < nDocs; ++id) {
     assert.commandWorked(mongosColl.update(documentKey, {$set: {updatedCount: 1}}));
 }
 
-[changeStreamSingleColl, changeStreamWholeDb].forEach(function(changeStream) {
-    jsTestLog(`Testing updateLookup on namespace ${changeStream._ns}`);
-    for (let id = 0; id < nDocs; ++id) {
-        assert.soon(() => changeStream.hasNext());
-        let next = changeStream.next();
-        assert.eq(next.operationType, "insert");
-        assert.eq(next.documentKey, Object.merge(shardKeyFromId(id), {_id: id}));
+[changeStreamSingleColl,
+ changeStreamWholeDb]
+    .forEach(function(changeStream) {
+        jsTestLog(`Testing updateLookup on namespace ${changeStream._ns}`);
+        for (let id = 0; id < nDocs; ++id) {
+            assert.soon(() => changeStream.hasNext());
+            let next = changeStream.next();
+            assert.eq(next.operationType, "insert");
+            assert.eq(next.documentKey, Object.merge(shardKeyFromId(id), {_id: id}));
 
-        assert.soon(() => changeStream.hasNext());
-        next = changeStream.next();
-        assert.eq(next.operationType, "update");
-        assert.eq(next.documentKey, Object.merge(shardKeyFromId(id), {_id: id}));
-        assert.docEq(next.fullDocument,
-                     Object.merge(shardKeyFromId(id), {_id: id, updatedCount: 1}));
-    }
-});
+            assert.soon(() => changeStream.hasNext());
+            next = changeStream.next();
+            assert.eq(next.operationType, "update");
+            assert.eq(next.documentKey, Object.merge(shardKeyFromId(id), {_id: id}));
+            assert.docEq(Object.merge(shardKeyFromId(id), {_id: id, updatedCount: 1}),
+                         next.fullDocument);
+        }
+    });
 
 // Test that the change stream can still see the updated post image, even if a chunk is
 // migrated.
@@ -101,8 +103,8 @@ assert.commandWorked(mongosDB.adminCommand({
         let next = changeStream.next();
         assert.eq(next.operationType, "update");
         assert.eq(next.documentKey, Object.merge(shardKeyFromId(id), {_id: id}));
-        assert.docEq(next.fullDocument,
-                     Object.merge(shardKeyFromId(id), {_id: id, updatedCount: 2}));
+        assert.docEq(Object.merge(shardKeyFromId(id), {_id: id, updatedCount: 2}),
+                     next.fullDocument);
     }
 });
 

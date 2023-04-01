@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include <fstream>
 #include <iostream>
@@ -36,7 +35,7 @@
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <boost/format.hpp>
-#include <boost/optional/optional_io.hpp>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/bson/json.h"
 #include "mongo/client/mongo_uri.h"
@@ -46,9 +45,13 @@
 #include "mongo/logv2/log.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/clock_source_mock.h"
+#include "mongo/util/optional_util.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/options_parser/options_parser.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 /**
  * This program runs the Server Discover and Monitoring JSON test files located in
@@ -109,7 +112,7 @@ public:
     PhaseResult execute(TopologyManager& topology) const {
         PhaseResult testResult{{}, _phaseNum};
 
-        for (auto response : _isMasterResponses) {
+        for (const auto& response : _isMasterResponses) {
             auto descriptionStr =
                 (response.getResponse()) ? response.getResponse()->toString() : "[ Network Error ]";
             LOGV2(20202,
@@ -140,7 +143,8 @@ private:
     template <typename T, typename U>
     std::string errorMessageNotEqual(T expected, U actual) const {
         std::stringstream errorMessage;
-        errorMessage << "expected '" << actual << "' to equal '" << expected << "'";
+        errorMessage << "expected '" << optional_io::Extension{actual} << "' to equal '"
+                     << optional_io::Extension{expected} << "'";
         return errorMessage.str();
     }
 
@@ -179,91 +183,98 @@ private:
 
         std::string fieldName = expectedField.fieldName();
         if (fieldName == "type") {
-            doValidateServerField(result,
-                                  serverDescription,
-                                  fieldName,
-                                  [&]() {
-                                      auto status = parseServerType(expectedField.String());
-                                      if (!status.isOK()) {
-                                          auto errorDescription = std::make_pair(
-                                              serverDescriptionFieldName(serverDescription, "type"),
-                                              status.getStatus().toString());
-                                          result->errorDescriptions.push_back(errorDescription);
+            doValidateServerField(
+                result,
+                serverDescription,
+                fieldName,
+                [&]() {
+                    auto status = parseServerType(expectedField.String());
+                    if (!status.isOK()) {
+                        auto errorDescription =
+                            std::make_pair(serverDescriptionFieldName(serverDescription, "type"),
+                                           status.getStatus().toString());
+                        result->errorDescriptions.push_back(errorDescription);
 
-                                          // return the actual value since we already have reported
-                                          // an error about the parsed server type from the json
-                                          // file.
-                                          return serverDescription->getType();
-                                      }
-                                      return status.getValue();
-                                  },
-                                  serverDescription->getType());
+                        // return the actual value since we already have reported
+                        // an error about the parsed server type from the json
+                        // file.
+                        return serverDescription->getType();
+                    }
+                    return status.getValue();
+                },
+                serverDescription->getType());
 
         } else if (fieldName == "setName") {
-            doValidateServerField(result,
-                                  serverDescription,
-                                  fieldName,
-                                  [&]() {
-                                      boost::optional<std::string> result;
-                                      if (expectedField.type() != BSONType::jstNULL) {
-                                          result = expectedField.String();
-                                      }
-                                      return result;
-                                  },
-                                  serverDescription->getSetName());
+            doValidateServerField(
+                result,
+                serverDescription,
+                fieldName,
+                [&]() {
+                    boost::optional<std::string> result;
+                    if (expectedField.type() != BSONType::jstNULL) {
+                        result = expectedField.String();
+                    }
+                    return result;
+                },
+                serverDescription->getSetName());
 
         } else if (fieldName == "setVersion") {
-            doValidateServerField(result,
-                                  serverDescription,
-                                  fieldName,
-                                  [&]() {
-                                      boost::optional<int> result;
-                                      if (expectedField.type() != BSONType::jstNULL) {
-                                          result = expectedField.numberInt();
-                                      }
-                                      return result;
-                                  },
-                                  serverDescription->getElectionIdSetVersionPair().setVersion);
+            doValidateServerField(
+                result,
+                serverDescription,
+                fieldName,
+                [&]() {
+                    boost::optional<int> result;
+                    if (expectedField.type() != BSONType::jstNULL) {
+                        result = expectedField.numberInt();
+                    }
+                    return result;
+                },
+                serverDescription->getElectionIdSetVersionPair().setVersion);
 
         } else if (fieldName == "electionId") {
-            doValidateServerField(result,
-                                  serverDescription,
-                                  fieldName,
-                                  [&]() {
-                                      boost::optional<OID> result;
-                                      if (expectedField.type() != BSONType::jstNULL) {
-                                          result = expectedField.OID();
-                                      }
-                                      return result;
-                                  },
-                                  serverDescription->getElectionIdSetVersionPair().electionId);
+            doValidateServerField(
+                result,
+                serverDescription,
+                fieldName,
+                [&]() {
+                    boost::optional<OID> result;
+                    if (expectedField.type() != BSONType::jstNULL) {
+                        result = expectedField.OID();
+                    }
+                    return result;
+                },
+                serverDescription->getElectionIdSetVersionPair().electionId);
 
         } else if (fieldName == "logicalSessionTimeoutMinutes") {
-            doValidateServerField(result,
-                                  serverDescription,
-                                  fieldName,
-                                  [&]() {
-                                      boost::optional<int> result;
-                                      if (expectedField.type() != BSONType::jstNULL) {
-                                          result = expectedField.numberInt();
-                                      }
-                                      return result;
-                                  },
-                                  serverDescription->getLogicalSessionTimeoutMinutes());
+            doValidateServerField(
+                result,
+                serverDescription,
+                fieldName,
+                [&]() {
+                    boost::optional<int> result;
+                    if (expectedField.type() != BSONType::jstNULL) {
+                        result = expectedField.numberInt();
+                    }
+                    return result;
+                },
+                serverDescription->getLogicalSessionTimeoutMinutes());
 
         } else if (fieldName == "minWireVersion") {
-            doValidateServerField(result,
-                                  serverDescription,
-                                  fieldName,
-                                  [&]() { return expectedField.numberInt(); },
-                                  serverDescription->getMinWireVersion());
+            doValidateServerField(
+                result,
+                serverDescription,
+                fieldName,
+                [&]() { return expectedField.numberInt(); },
+                serverDescription->getMinWireVersion());
 
         } else if (fieldName == "maxWireVersion") {
-            doValidateServerField(result,
-                                  serverDescription,
-                                  fieldName,
-                                  [&]() { return expectedField.numberInt(); },
-                                  serverDescription->getMaxWireVersion());
+            doValidateServerField(
+                result,
+                serverDescription,
+                fieldName,
+                [&]() { return expectedField.numberInt(); },
+                serverDescription->getMaxWireVersion());
 
         } else {
             MONGO_UNREACHABLE;
@@ -335,18 +346,18 @@ private:
 
         {
             constexpr auto fieldName = "setName";
-            doValidateTopologyDescriptionField(result,
-                                               fieldName,
-                                               [&]() {
-                                                   boost::optional<std::string> ret;
-                                                   auto bsonField =
-                                                       bsonTopologyDescription[fieldName];
-                                                   if (!bsonField.isNull()) {
-                                                       ret = bsonField.String();
-                                                   }
-                                                   return ret;
-                                               },
-                                               topologyDescription->getSetName());
+            doValidateTopologyDescriptionField(
+                result,
+                fieldName,
+                [&]() {
+                    boost::optional<std::string> ret;
+                    auto bsonField = bsonTopologyDescription[fieldName];
+                    if (!bsonField.isNull()) {
+                        ret = bsonField.String();
+                    }
+                    return ret;
+                },
+                topologyDescription->getSetName());
         }
 
         {
@@ -538,7 +549,7 @@ public:
     std::vector<JsonTestCase::TestCaseResult> runTests() {
         std::vector<JsonTestCase::TestCaseResult> results;
         const auto testFiles = getTestFiles();
-        for (auto jsonTest : testFiles) {
+        for (const auto& jsonTest : testFiles) {
             auto testCase = JsonTestCase(jsonTest);
             try {
                 LOGV2(20208, "### Executing Test Case ###", "test"_attr = testCase.Name());

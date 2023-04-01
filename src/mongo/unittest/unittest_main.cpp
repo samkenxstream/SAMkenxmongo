@@ -39,8 +39,10 @@
 #include "mongo/logv2/log_domain_global.h"
 #include "mongo/logv2/log_manager.h"
 #include "mongo/unittest/log_test.h"
+#include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/unittest/unittest_options_gen.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/options_parser/options_parser.h"
@@ -76,7 +78,7 @@ int main(int argc, char** argv) {
     Status status = mongo::unittest::addUnitTestOptions(&options);
     if (!status.isOK()) {
         std::cerr << status;
-        return EXIT_FAILURE;
+        return static_cast<int>(mongo::ExitCode::fail);
     }
 
     moe::OptionsParser parser;
@@ -84,7 +86,7 @@ int main(int argc, char** argv) {
     Status ret = parser.run(options, argVec, &environment);
     if (!ret.isOK()) {
         std::cerr << options.helpString();
-        return EXIT_FAILURE;
+        return static_cast<int>(mongo::ExitCode::fail);
     }
 
     bool list = false;
@@ -94,10 +96,15 @@ int main(int argc, char** argv) {
     std::string verbose;
     std::string fileNameFilter;
     std::string internalRunDeathTest;
+    mongo::unittest::AutoUpdateConfig autoUpdateConfig;
 
-    // "list" and "repeat" will be assigned with default values, if not present.
+    // "list", "repeat", and "autoUpdateAsserts" will be assigned with default values, if
+    // not present.
     invariant(environment.get("list", &list));
     invariant(environment.get("repeat", &repeat));
+    invariant(environment.get("autoUpdateAsserts", &autoUpdateConfig.updateFailingAsserts));
+    invariant(environment.get("rewriteAllAutoAsserts", &autoUpdateConfig.revalidateAll));
+
     // The default values of "suite" "filter" and "verbose" are empty.
     environment.get("suite", &suites).ignore();
     environment.get("filter", &filter).ignore();
@@ -105,22 +112,33 @@ int main(int argc, char** argv) {
     environment.get("fileNameFilter", &fileNameFilter).ignore();
     environment.get("internalRunDeathTest", &internalRunDeathTest).ignore();
 
+    if (environment.count("tempPath")) {
+        ::mongo::unittest::TempDir::setTempPath(environment["tempPath"].as<std::string>());
+    }
+
     mongo::unittest::getSpawnInfo() = {argVec, internalRunDeathTest, true};
+
+    if (autoUpdateConfig.revalidateAll && !autoUpdateConfig.updateFailingAsserts) {
+        std::cerr << "--rewriteAllAutoAsserts can only be set if --autoUpdateAsserts is also set."
+                  << std::endl;
+        return static_cast<int>(mongo::ExitCode::fail);
+    }
+    mongo::unittest::getAutoUpdateConfig() = autoUpdateConfig;
 
     if (std::any_of(verbose.cbegin(), verbose.cend(), [](char ch) { return ch != 'v'; })) {
         std::cerr << "The string for the --verbose option cannot contain characters other than 'v'"
                   << std::endl;
         std::cerr << options.helpString();
-        return EXIT_FAILURE;
+        return static_cast<int>(mongo::ExitCode::fail);
     }
     mongo::unittest::setMinimumLoggedSeverity(mongo::logv2::LogSeverity::Debug(verbose.size()));
 
     if (list) {
         auto suiteNames = ::mongo::unittest::getAllSuiteNames();
-        for (auto name : suiteNames) {
+        for (const auto& name : suiteNames) {
             std::cout << name << std::endl;
         }
-        return EXIT_SUCCESS;
+        return static_cast<int>(mongo::ExitCode::clean);
     }
 
     auto result = ::mongo::unittest::Suite::run(suites, filter, fileNameFilter, repeat);

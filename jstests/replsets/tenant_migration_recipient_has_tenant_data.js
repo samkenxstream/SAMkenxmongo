@@ -3,21 +3,20 @@
  * data.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
+ *   incompatible_with_shard_merge,
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {makeX509OptionsForTest} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
 
 const kGarbageCollectionParams = {
     // Set the delay before a donor state doc is garbage collected to be short to speed up
@@ -31,50 +30,47 @@ const kGarbageCollectionParams = {
 const donorRst = new ReplSetTest({
     nodes: 1,
     name: "donor",
-    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor,
-                               {setParameter: kGarbageCollectionParams})
+    serverless: true,
+    nodeOptions:
+        Object.assign(makeX509OptionsForTest().donor, {setParameter: kGarbageCollectionParams})
 });
 
 donorRst.startSet();
 donorRst.initiate();
 
-const tenantMigrationTest = new TenantMigrationTest(
-    {name: jsTestName(), donorRst, sharedOptions: {setParameter: kGarbageCollectionParams}});
+const tenantMigrationTest = new TenantMigrationTest({
+    name: jsTestName(),
+    donorRst,
+    quickGarbageCollection: true,
+    sharedOptions: {setParameter: kGarbageCollectionParams}
+});
 
-const kTenantId = "testTenantId";
+const kTenantId = ObjectId().str;
 const kNs = kTenantId + "_testDb.testColl";
 
 assert.commandWorked(tenantMigrationTest.getDonorPrimary().getCollection(kNs).insert({_id: 0}));
 
 jsTest.log("Start a tenant migration and verify that it commits successfully");
 
-(() => {
-    const migrationId = UUID();
-    const migrationOpts = {
-        migrationIdString: extractUUIDFromObject(migrationId),
-        tenantId: kTenantId,
-    };
+let migrationId = UUID();
+const migrationOpts = {
+    migrationIdString: extractUUIDFromObject(migrationId),
+    tenantId: kTenantId,
+};
 
-    TenantMigrationTest.assertCommitted(tenantMigrationTest.runMigration(migrationOpts));
-    assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
-    tenantMigrationTest.waitForMigrationGarbageCollection(migrationId, kTenantId);
-})();
+TenantMigrationTest.assertCommitted(
+    tenantMigrationTest.runMigration(migrationOpts, {enableDonorStartMigrationFsync: true}));
+tenantMigrationTest.waitForMigrationGarbageCollection(migrationId, kTenantId);
 
 jsTest.log(
     "Retry the migration without dropping tenant database on the recipient and verify that " +
     "the migration aborted with NamespaceExists as the abort reason");
 
-(() => {
-    const migrationId = UUID();
-    const migrationOpts = {
-        migrationIdString: extractUUIDFromObject(migrationId),
-        tenantId: kTenantId,
-    };
+migrationId = UUID();
+migrationOpts.migrationIdString = extractUUIDFromObject(migrationId);
 
-    TenantMigrationTest.assertAborted(tenantMigrationTest.runMigration(migrationOpts),
-                                      ErrorCodes.NamespaceExists);
-})();
+TenantMigrationTest.assertAborted(tenantMigrationTest.runMigration(migrationOpts),
+                                  ErrorCodes.NamespaceExists);
 
 donorRst.stopSet();
 tenantMigrationTest.stop();
-})();

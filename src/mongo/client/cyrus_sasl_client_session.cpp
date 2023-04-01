@@ -32,6 +32,7 @@
 #include "mongo/client/cyrus_sasl_client_session.h"
 
 #include "mongo/base/init.h"
+#include "mongo/client/authenticate.h"
 #include "mongo/client/native_sasl_client_session.h"
 #include "mongo/util/allocator.h"
 #include "mongo/util/assert_util.h"
@@ -47,7 +48,8 @@ void saslSetError(sasl_conn_t* conn, const std::string& msg) {
 }
 
 SaslClientSession* createCyrusSaslClientSession(const std::string& mech) {
-    if ((mech == "SCRAM-SHA-1") || (mech == "SCRAM-SHA-256") || mech == "MONGODB-AWS") {
+    if ((mech == auth::kMechanismScramSha1) || (mech == auth::kMechanismScramSha256) ||
+        (mech == auth::kMechanismMongoAWS) || (mech == auth::kMechanismMongoOIDC)) {
         return new NativeSaslClientSession();
     }
     return new CyrusSaslClientSession();
@@ -116,7 +118,7 @@ MONGO_INITIALIZER(CyrusSaslAllocatorsAndMutexes)(InitializerContext*) {
     sasl_set_mutex(saslMutexAlloc, saslMutexLock, saslMutexUnlock, saslMutexFree);
 }
 
-int saslClientLogSwallow(void* context, int priority, const char* message) throw() {
+int saslClientLogSwallow(void* context, int priority, const char* message) noexcept {
     return SASL_OK;  // do nothing
 }
 
@@ -159,7 +161,7 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(CyrusSaslClientContext,
  * Note that in Mongo, the authentication and authorization ids (authid and authzid) are always
  * the same.  These correspond to SASL_CB_AUTHNAME and SASL_CB_USER.
  */
-int saslClientGetSimple(void* context, int id, const char** result, unsigned* resultLen) throw() {
+int saslClientGetSimple(void* context, int id, const char** result, unsigned* resultLen) noexcept {
     try {
         CyrusSaslClientSession* session = static_cast<CyrusSaslClientSession*>(context);
         if (!session || !result)
@@ -194,7 +196,7 @@ int saslClientGetSimple(void* context, int id, const char** result, unsigned* re
 int saslClientGetPassword(sasl_conn_t* conn,
                           void* context,
                           int id,
-                          sasl_secret_t** outSecret) throw() {
+                          sasl_secret_t** outSecret) noexcept {
     try {
         CyrusSaslClientSession* session = static_cast<CyrusSaslClientSession*>(context);
         if (!session || !outSecret)
@@ -296,7 +298,7 @@ Status CyrusSaslClientSession::step(StringData inputData, std::string* outputDat
     switch (result) {
         case SASL_OK:
             _success = true;
-        // Fall through
+            [[fallthrough]];
         case SASL_CONTINUE:
             *outputData = std::string(output, outputSize);
             return Status::OK();

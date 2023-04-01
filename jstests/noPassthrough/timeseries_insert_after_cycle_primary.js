@@ -9,6 +9,8 @@
 (function() {
 'use strict';
 
+load("jstests/core/timeseries/libs/timeseries.js");
+
 const replTest = new ReplSetTest({nodes: 2});
 replTest.startSet();
 replTest.initiate();
@@ -69,7 +71,7 @@ for (let i = 0; i < numColls; i++) {
 
 const checkColl = function(num, numBuckets) {
     jsTestLog('Checking collection ' + num);
-    assert.docEq(coll(num).find().sort({_id: 1}).toArray(), docs);
+    assert.docEq(docs, coll(num).find().sort({_id: 1}).toArray());
     const buckets = bucketsColl(num).find().toArray();
     assert.eq(buckets.length,
               numBuckets,
@@ -78,9 +80,15 @@ const checkColl = function(num, numBuckets) {
 
 // For collection 0, the original bucket should still be usable.
 checkColl(0, 1);
-// For collections 1 and 2, the original bucket should have been closed.
-checkColl(1, 2);
-checkColl(2, 2);
+if (TimeseriesTest.timeseriesScalabilityImprovementsEnabled(testDB())) {
+    // We expect the buckets to be reopened by the new primary when inserting further measurements.
+    checkColl(1, 1);
+    checkColl(2, 1);
+} else {
+    // For collections 1 and 2, the original bucket should have been closed.
+    checkColl(1, 2);
+    checkColl(2, 2);
+}
 
 replTest.stopSet();
 })();

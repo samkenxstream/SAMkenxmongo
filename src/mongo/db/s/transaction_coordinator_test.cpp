@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -45,6 +44,9 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/tick_source_mock.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 namespace {
@@ -100,6 +102,9 @@ void killClientOpCtx(ServiceContext* service, const std::string& clientName) {
 
 class TransactionCoordinatorTestBase : public TransactionCoordinatorTestFixture {
 protected:
+    explicit TransactionCoordinatorTestBase(Options options = {})
+        : TransactionCoordinatorTestFixture(std::move(options)) {}
+
     void assertPrepareSentAndRespondWithSuccess() {
         assertCommandSentAndRespondWith(
             PrepareTransaction::kCommandName, kPrepareOk, WriteConcernOptions::Majority);
@@ -155,7 +160,7 @@ protected:
         TransactionCoordinatorDocument doc;
         do {
             doc = TransactionCoordinatorDocument::parse(
-                IDLParserErrorContext("dummy"),
+                IDLParserContext("dummy"),
                 dbClient.findOne(NamespaceString::kTransactionCoordinatorsNamespace, BSONObj{}));
         } while (!doc.getDecision());
     }
@@ -178,7 +183,6 @@ protected:
 
     LogicalSessionId _lsid{makeLogicalSessionIdForTest()};
     TxnNumberAndRetryCounter _txnNumberAndRetryCounter{1, 1};
-    RAIIServerParameterControllerForTest _controller{"featureFlagInternalTransactions", true};
 };
 
 class TransactionCoordinatorDriverTest : public TransactionCoordinatorTestBase {
@@ -198,7 +202,7 @@ protected:
 auto makeDummyPrepareCommand(const LogicalSessionId& lsid,
                              const TxnNumberAndRetryCounter& txnNumberAndRetryCounter) {
     PrepareTransaction prepareCmd;
-    prepareCmd.setDbName(NamespaceString::kAdminDb);
+    prepareCmd.setDbName(DatabaseName::kAdmin);
     auto prepareObj = prepareCmd.toBSON(
         BSON("lsid" << lsid.toBSON() << "txnNumber" << txnNumberAndRetryCounter.getTxnNumber()
                     << "txnRetryCounter" << *txnNumberAndRetryCounter.getTxnRetryCounter()
@@ -432,7 +436,9 @@ TEST_F(TransactionCoordinatorDriverTest,
                                    kTwoShardIdList);
 
     onCommands({[&](const executor::RemoteCommandRequest& request) { return kNoSuchTransaction; },
-                [&](const executor::RemoteCommandRequest& request) { return kPrepareOk; }});
+                [&](const executor::RemoteCommandRequest& request) {
+                    return kPrepareOk;
+                }});
 
     auto decision = future.get().decision();
 
@@ -471,7 +477,9 @@ TEST_F(TransactionCoordinatorDriverTest,
                                    kTwoShardIdList);
 
     onCommands({[&](const executor::RemoteCommandRequest& request) { return kNoSuchTransaction; },
-                [&](const executor::RemoteCommandRequest& request) { return kNoSuchTransaction; }});
+                [&](const executor::RemoteCommandRequest& request) {
+                    return kNoSuchTransaction;
+                }});
 
     auto decision = future.get().decision();
     ASSERT(decision.getDecision() == txn::CommitDecision::kAbort);
@@ -594,54 +602,6 @@ TEST_F(TransactionCoordinatorDriverTest,
 
 TEST_F(TransactionCoordinatorDriverTest,
        SendPrepareAndDecisionAttachTxnRetryCounterIfFeatureFlagIsEnabled) {
-    txn::AsyncWorkScheduler aws(getServiceContext());
-    auto prepareFuture = txn::sendPrepare(getServiceContext(),
-                                          aws,
-                                          _lsid,
-                                          _txnNumberAndRetryCounter,
-                                          APIParameters(),
-                                          kOneShardIdList);
-    onCommands({[&](const executor::RemoteCommandRequest& request) {
-        ASSERT_TRUE(request.cmdObj.hasField("txnRetryCounter"));
-        ASSERT_EQUALS(request.cmdObj.getIntField("txnRetryCounter"),
-                      *_txnNumberAndRetryCounter.getTxnRetryCounter());
-        return kNoSuchTransaction;
-    }});
-    prepareFuture.get();
-
-    auto commitFuture = txn::sendCommit(getServiceContext(),
-                                        aws,
-                                        _lsid,
-                                        _txnNumberAndRetryCounter,
-                                        APIParameters(),
-                                        kOneShardIdList,
-                                        {});
-    onCommands({[&](const executor::RemoteCommandRequest& request) {
-        ASSERT_TRUE(request.cmdObj.hasField("txnRetryCounter"));
-        ASSERT_EQUALS(request.cmdObj.getIntField("txnRetryCounter"),
-                      *_txnNumberAndRetryCounter.getTxnRetryCounter());
-        return kNoSuchTransaction;
-    }});
-    commitFuture.get();
-
-    auto abortFuture = txn::sendAbort(getServiceContext(),
-                                      aws,
-                                      _lsid,
-                                      _txnNumberAndRetryCounter,
-                                      APIParameters(),
-                                      kOneShardIdList);
-    onCommands({[&](const executor::RemoteCommandRequest& request) {
-        ASSERT_TRUE(request.cmdObj.hasField("txnRetryCounter"));
-        ASSERT_EQUALS(request.cmdObj.getIntField("txnRetryCounter"),
-                      *_txnNumberAndRetryCounter.getTxnRetryCounter());
-        return kNoSuchTransaction;
-    }});
-    abortFuture.get();
-}
-
-TEST_F(TransactionCoordinatorDriverTest,
-       SendPrepareAndDecisionContinuesToUseTxnRetryCounterIfNotDefault) {
-    RAIIServerParameterControllerForTest controller{"featureFlagInternalTransactions", false};
     txn::AsyncWorkScheduler aws(getServiceContext());
     auto prepareFuture = txn::sendPrepare(getServiceContext(),
                                           aws,
@@ -1116,7 +1076,9 @@ TEST_F(TransactionCoordinatorTest, RunCommitProducesAbortDecisionOnAbortAndCommi
     auto commitDecisionFuture = coordinator.getDecision();
 
     onCommands({[&](const executor::RemoteCommandRequest& request) { return kNoSuchTransaction; },
-                [&](const executor::RemoteCommandRequest& request) { return kPrepareOk; }});
+                [&](const executor::RemoteCommandRequest& request) {
+                    return kPrepareOk;
+                }});
 
     assertAbortSentAndRespondWithSuccess();
     assertAbortSentAndRespondWithSuccess();
@@ -1139,7 +1101,9 @@ TEST_F(TransactionCoordinatorTest,
     auto commitDecisionFuture = coordinator.getDecision();
 
     onCommands({[&](const executor::RemoteCommandRequest& request) { return kPrepareOk; },
-                [&](const executor::RemoteCommandRequest& request) { return kNoSuchTransaction; }});
+                [&](const executor::RemoteCommandRequest& request) {
+                    return kNoSuchTransaction;
+                }});
 
     assertAbortSentAndRespondWithSuccess();
     assertAbortSentAndRespondWithSuccess();
@@ -1161,9 +1125,10 @@ TEST_F(TransactionCoordinatorTest,
     coordinator.runCommit(operationContext(), kTwoShardIdList);
     auto commitDecisionFuture = coordinator.getDecision();
 
-    onCommands(
-        {[&](const executor::RemoteCommandRequest& request) { return kPrepareOk; },
-         [&](const executor::RemoteCommandRequest& request) { return kTxnRetryCounterTooOld; }});
+    onCommands({[&](const executor::RemoteCommandRequest& request) { return kPrepareOk; },
+                [&](const executor::RemoteCommandRequest& request) {
+                    return kTxnRetryCounterTooOld;
+                }});
 
     assertAbortSentAndRespondWithSuccess();
     assertAbortSentAndRespondWithSuccess();
@@ -1209,7 +1174,9 @@ TEST_F(TransactionCoordinatorTest,
 
     // One participant votes commit and other encounters retryable error
     onCommands({[&](const executor::RemoteCommandRequest& request) { return kPrepareOk; },
-                [&](const executor::RemoteCommandRequest& request) { return kRetryableError; }});
+                [&](const executor::RemoteCommandRequest& request) {
+                    return kRetryableError;
+                }});
     advanceClockAndExecuteScheduledTasks();  // Make sure the scheduled retry executes
 
     // One participant votes abort after retry.
@@ -1237,7 +1204,9 @@ TEST_F(TransactionCoordinatorTest,
 
     // One participant votes abort and other encounters retryable error
     onCommands({[&](const executor::RemoteCommandRequest& request) { return kNoSuchTransaction; },
-                [&](const executor::RemoteCommandRequest& request) { return kRetryableError; }});
+                [&](const executor::RemoteCommandRequest& request) {
+                    return kRetryableError;
+                }});
     advanceClockAndExecuteScheduledTasks();  // Make sure the cancellation callback is delivered
 
     assertAbortSentAndRespondWithSuccess();
@@ -1311,12 +1280,13 @@ TEST_F(TransactionCoordinatorTest,
 }
 
 class TransactionCoordinatorMetricsTest : public TransactionCoordinatorTestBase {
-public:
+protected:
+    TransactionCoordinatorMetricsTest()
+        : TransactionCoordinatorTestBase(
+              Options{}.useMockClock(true).useMockTickSource<Microseconds>(true)) {}
+
     void setUp() override {
-        getServiceContext()->setPreciseClockSource(std::make_unique<ClockSourceMock>());
-        auto tickSource = std::make_unique<TickSourceMock<Microseconds>>();
-        tickSource->reset(1);
-        getServiceContext()->setTickSource(std::move(tickSource));
+        tickSource()->reset(1);
 
         TransactionCoordinatorTestBase::setUp();
     }
@@ -2429,7 +2399,7 @@ TEST_F(TransactionCoordinatorMetricsTest, DoesNotLogTransactionsUnderSlowMSThres
     // slowMS setting.
     auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kTransaction,
                                                               logv2::LogSeverity::Log()};
-    serverGlobalParams.slowMS = 100;
+    serverGlobalParams.slowMS.store(100);
     startCapturingLogMessages();
 
     TransactionCoordinator coordinator(
@@ -2461,7 +2431,7 @@ TEST_F(
     // slowMS setting.
     auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kTransaction,
                                                               logv2::LogSeverity::Log()};
-    serverGlobalParams.slowMS = 100;
+    serverGlobalParams.slowMS.store(100);
     startCapturingLogMessages();
 
     TransactionCoordinator coordinator(
@@ -2491,7 +2461,7 @@ TEST_F(TransactionCoordinatorMetricsTest, LogsTransactionsOverSlowMSThreshold) {
     // slowMS setting.
     auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kTransaction,
                                                               logv2::LogSeverity::Log()};
-    serverGlobalParams.slowMS = 100;
+    serverGlobalParams.slowMS.store(100);
     startCapturingLogMessages();
 
     TransactionCoordinator coordinator(

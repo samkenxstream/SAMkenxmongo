@@ -4,32 +4,28 @@
  * these committed transaction entries in its own 'config.transactions' collection.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
+ *   incompatible_with_shard_merge,
  *   requires_fcv_53
  * ]
  */
 
-(function() {
-"use strict";
-
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 load("jstests/replsets/rslib.js");
 load("jstests/libs/uuid_util.js");
 
-const tenantId = "testTenantId";
+const tenantId = ObjectId().str;
 const transactionsNS = "config.transactions";
 const collName = "testColl";
 
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 const tenantDB = tenantMigrationTest.tenantDB(tenantId, "testDB");
-const nonTenantDB = tenantMigrationTest.nonTenantDB(tenantId, "testDB");
+const nonTenantDB = tenantMigrationTest.tenantDB(ObjectId().str, "testDB");
 const tenantNS = `${tenantDB}.${collName}`;
 
 const donorPrimary = tenantMigrationTest.getDonorPrimary();
@@ -121,39 +117,21 @@ const migrationOpts = {
     tenantId,
 };
 
-const pauseAfterRetrievingLastTxnMigrationRecipientInstance =
-    configureFailPoint(recipientPrimary, "pauseAfterRetrievingLastTxnMigrationRecipientInstance");
+const fpAfterFetchingCommittedTransactions =
+    configureFailPoint(recipientPrimary, "fpAfterFetchingCommittedTransactions", {action: "hang"});
 
 assert.commandWorked(tenantMigrationTest.startMigration(migrationOpts));
 
-pauseAfterRetrievingLastTxnMigrationRecipientInstance.wait();
+fpAfterFetchingCommittedTransactions.wait();
 
-let sessionIdBetweenFetchingAndApplyingOpTime;
-{
-    jsTestLog("Start and commit a transaction at startFetchingOpTime < t <= startApplyingOpTime");
-    const session = donorPrimary.startSession({causalConsistency: false});
-    sessionIdBetweenFetchingAndApplyingOpTime = session.getSessionId();
-    const sessionDb = session.getDatabase(tenantDB);
-    const sessionColl = sessionDb.getCollection(collName);
-    session.startTransaction({writeConcern: {w: "majority"}});
-    sessionColl.insert({doc: {}});
-    assert.commandWorked(session.commitTransaction_forTesting());
-    session.endSession();
-}
+// Verify that the recipient has fetched and written the committed transaction entry
+// belonging to the migrating tenant from the donor.
+assert.eq(1, recipientPrimary.getCollection(transactionsNS).find().itcount());
 
-assert.eq(4, donorPrimary.getCollection(transactionsNS).find().itcount());
-
-pauseAfterRetrievingLastTxnMigrationRecipientInstance.off();
+fpAfterFetchingCommittedTransactions.off();
 
 TenantMigrationTest.assertCommitted(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
 
-// Verify that the recipient has fetched and written the two committed transaction entries
-// from the donor.
-assert.eq(2, recipientPrimary.getCollection(transactionsNS).find().itcount());
-
 validateTransactionEntryonRecipient(sessionIdBeforeMigration);
 
-validateTransactionEntryonRecipient(sessionIdBetweenFetchingAndApplyingOpTime);
-
 tenantMigrationTest.stop();
-})();

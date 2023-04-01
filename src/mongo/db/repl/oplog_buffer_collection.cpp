@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -39,12 +38,16 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/catalog/clustered_collection_util.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
+
 
 namespace mongo {
 namespace repl {
@@ -272,10 +275,20 @@ bool OplogBufferCollection::tryPop(OperationContext* opCtx, Value* value) {
     return _pop_inlock(opCtx, value);
 }
 
-bool OplogBufferCollection::waitForData(Seconds waitDuration) {
+bool OplogBufferCollection::waitForDataFor(Milliseconds waitDuration,
+                                           Interruptible* interruptible) {
     stdx::unique_lock<Latch> lk(_mutex);
-    if (!_cvNoLongerEmpty.wait_for(
-            lk, waitDuration.toSystemDuration(), [&]() { return _count != 0; })) {
+    if (!interruptible->waitForConditionOrInterruptFor(
+            _cvNoLongerEmpty, lk, waitDuration, [&]() { return _count != 0; })) {
+        return false;
+    }
+    return _count != 0;
+}
+
+bool OplogBufferCollection::waitForDataUntil(Date_t deadline, Interruptible* interruptible) {
+    stdx::unique_lock<Latch> lk(_mutex);
+    if (!interruptible->waitForConditionOrInterruptUntil(
+            _cvNoLongerEmpty, lk, deadline, [&]() { return _count != 0; })) {
         return false;
     }
     return _count != 0;
@@ -443,7 +456,12 @@ BSONObj OplogBufferCollection::_peek_inlock(OperationContext* opCtx, PeekMode pe
 void OplogBufferCollection::_createCollection(OperationContext* opCtx) {
     CollectionOptions options;
     options.temp = _options.useTemporaryCollection;
-    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+    // This oplog-like collection will benefit from clustering by _id to reduce storage engine
+    // overhead and improve _id query efficiency.
+    options.clusteredIndex = clustered_util::makeDefaultClusteredIdIndex();
+
+    // TODO (SERVER-71443): Fix to be interruptible or document exception.
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
     auto status = _storageInterface->createCollection(opCtx, _nss, options);
     if (status.code() == ErrorCodes::NamespaceExists)
         return;
@@ -451,7 +469,8 @@ void OplogBufferCollection::_createCollection(OperationContext* opCtx) {
 }
 
 void OplogBufferCollection::_dropCollection(OperationContext* opCtx) {
-    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+    // TODO (SERVER-71443): Fix to be interruptible or document exception.
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
     uassertStatusOK(_storageInterface->dropCollection(opCtx, _nss));
 }
 

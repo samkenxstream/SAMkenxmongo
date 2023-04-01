@@ -32,11 +32,11 @@
 #include <string>
 
 #include "mongo/client/connection_string.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/migration_session_id.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/s/request_types/migration_secondary_throttle_options.h"
-#include "mongo/s/shard_id.h"
 
 namespace mongo {
 
@@ -93,6 +93,10 @@ public:
         return _migrationId.is_initialized();
     }
 
+    bool parallelFetchingSupported() const {
+        return _parallelFetchingSupported;
+    }
+
     const UUID& getMigrationId() const {
         invariant(_migrationId);
         return *_migrationId;
@@ -102,7 +106,7 @@ public:
         return _lsid;
     }
 
-    const TxnNumber getTxnNumber() const {
+    TxnNumber getTxnNumber() const {
         return _txnNumber;
     }
 
@@ -161,6 +165,8 @@ private:
 
     // The parsed secondary throttle options
     MigrationSecondaryThrottleOptions _secondaryThrottle;
+
+    bool _parallelFetchingSupported;
 };
 
 }  // namespace mongo

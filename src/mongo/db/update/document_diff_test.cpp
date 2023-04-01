@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -40,6 +39,9 @@
 #include "mongo/platform/random.h"
 #include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/unittest.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo::doc_diff {
 namespace {
@@ -139,10 +141,11 @@ void runTest(TestOptions* options) {
         std::vector<BSONObj> diffs;
         diffs.reserve(options->documents.size() - 1);
         for (size_t i = 1; i < options->documents.size(); ++i) {
-            const auto diffOutput = computeDiff(preDoc,
-                                                options->documents[i],
-                                                update_oplog_entry::kSizeOfDeltaOplogEntryMetadata,
-                                                nullptr);
+            const auto diffOutput =
+                computeOplogDiff(preDoc,
+                                 options->documents[i],
+                                 update_oplog_entry::kSizeOfDeltaOplogEntryMetadata,
+                                 nullptr);
 
             ASSERT(diffOutput);
             diffs.push_back(diffOutput->diff);

@@ -1,5 +1,5 @@
 // Tests large multi-deletes in a transaction to trigger multi-applyOps transaction commit path.
-// @tags: [requires_replication, requires_wiredtiger]
+// @tags: [requires_replication]
 (function() {
 "use strict";
 
@@ -9,7 +9,7 @@ const rst = new ReplSetTest({
     nodes: 1,
     nodeOptions: {
         // Ensure the storage engine cache can accommodate large transactions.
-        wiredTigerCacheSizeGB: 1,
+        wiredTigerCacheSizeGB: 3,
     },
 });
 rst.startSet();

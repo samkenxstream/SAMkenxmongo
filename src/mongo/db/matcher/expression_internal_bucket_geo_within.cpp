@@ -29,8 +29,9 @@
 
 
 #include <boost/optional.hpp>
-
-#include "mongo/platform/basic.h"
+#include <s2cellid.h>
+#include <s2cellunion.h>
+#include <s2regioncoverer.h>
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/bson/dotted_path_support.h"
@@ -39,9 +40,6 @@
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/timeseries/timeseries_constants.h"
 
-#include "third_party/s2/s2cellid.h"
-#include "third_party/s2/s2cellunion.h"
-#include "third_party/s2/s2regioncoverer.h"
 
 namespace mongo {
 constexpr StringData InternalBucketGeoWithinMatchExpression::kName;
@@ -51,16 +49,9 @@ void InternalBucketGeoWithinMatchExpression::debugString(StringBuilder& debug,
     _debugAddSpace(debug, indentationLevel);
 
     BSONObjBuilder builder;
-    serialize(&builder, true);
-    debug << builder.obj().toString() << "\n";
-
-    const auto* tag = getTag();
-    if (tag) {
-        debug << " ";
-        tag->debugString(&debug);
-    }
-
-    debug << "\n";
+    serialize(&builder, {});
+    debug << builder.obj().toString();
+    _debugStringAttachTagInfo(&debug);
 }
 
 bool InternalBucketGeoWithinMatchExpression::equivalent(const MatchExpression* expr) const {
@@ -72,7 +63,7 @@ bool InternalBucketGeoWithinMatchExpression::equivalent(const MatchExpression* e
 
     return SimpleBSONObjComparator::kInstance.evaluate(
                _geoContainer->getGeoElement().Obj() ==
-               other->getGeoContainer()->getGeoElement().Obj()) &&
+               other->getGeoContainer().getGeoElement().Obj()) &&
         _field == other->getField();
 }
 
@@ -194,17 +185,28 @@ bool InternalBucketGeoWithinMatchExpression::_matchesBSONObj(const BSONObj& obj)
 }
 
 void InternalBucketGeoWithinMatchExpression::serialize(BSONObjBuilder* builder,
-                                                       bool includePath) const {
+                                                       SerializationOptions opts) const {
     BSONObjBuilder bob(builder->subobjStart(InternalBucketGeoWithinMatchExpression::kName));
+    // Serialize the geometry shape.
     BSONObjBuilder withinRegionBob(
         bob.subobjStart(InternalBucketGeoWithinMatchExpression::kWithinRegion));
-    withinRegionBob.append(_geoContainer->getGeoElement());
+    if (opts.replacementForLiteralArgs) {
+        bob.append(_geoContainer->getGeoElement().fieldName(), *opts.replacementForLiteralArgs);
+    } else {
+        withinRegionBob.append(_geoContainer->getGeoElement());
+    }
     withinRegionBob.doneFast();
-    bob.append(InternalBucketGeoWithinMatchExpression::kField, _field);
+    // Serialize the field which is being searched over.
+    if (opts.redactFieldNames) {
+        bob.append(InternalBucketGeoWithinMatchExpression::kField,
+                   opts.redactFieldNamesStrategy(_field));
+    } else {
+        bob.append(InternalBucketGeoWithinMatchExpression::kField, _field);
+    }
     bob.doneFast();
 }
 
-std::unique_ptr<MatchExpression> InternalBucketGeoWithinMatchExpression::shallowClone() const {
+std::unique_ptr<MatchExpression> InternalBucketGeoWithinMatchExpression::clone() const {
     std::unique_ptr<InternalBucketGeoWithinMatchExpression> next =
         std::make_unique<InternalBucketGeoWithinMatchExpression>(_geoContainer, _field);
     if (getTag()) {

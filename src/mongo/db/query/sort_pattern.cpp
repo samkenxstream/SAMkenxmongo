@@ -29,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/pipeline/expression_dependencies.h"
 #include "mongo/db/query/sort_pattern.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
 
@@ -105,21 +106,35 @@ QueryMetadataBitSet SortPattern::metadataDeps(QueryMetadataBitSet unavailableMet
     DepsTracker depsTracker{unavailableMetadata};
     for (auto&& part : _sortPattern) {
         if (part.expression) {
-            part.expression->addDependencies(&depsTracker);
+            expression::addDependencies(part.expression.get(), &depsTracker);
         }
     }
 
     return depsTracker.metadataDeps();
 }
 
-Document SortPattern::serialize(SortKeySerialization serializationMode) const {
+Document SortPattern::serialize(SortKeySerialization serializationMode,
+                                SerializationOptions options) const {
     MutableDocument keyObj;
     const size_t n = _sortPattern.size();
     for (size_t i = 0; i < n; ++i) {
         if (_sortPattern[i].fieldPath) {
-            // Append a named integer based on whether the sort is ascending/descending.
-            keyObj.setField(_sortPattern[i].fieldPath->fullPath(),
-                            Value(_sortPattern[i].isAscending ? 1 : -1));
+            std::stringstream serializedFieldName;
+            if (!options.redactFieldNames) {
+                // Append a named integer based on whether the sort is ascending/descending.
+                serializedFieldName << _sortPattern[i].fieldPath->fullPath();
+            } else {
+                // Redact each field name in the full path.
+                for (size_t index = 0; index < _sortPattern[i].fieldPath->getPathLength();
+                     ++index) {
+                    if (index > 0) {
+                        serializedFieldName << ".";
+                    }
+                    serializedFieldName << options.redactFieldNamesStrategy(
+                        _sortPattern[i].fieldPath->getFieldName(index));
+                }
+            }
+            keyObj.setField(serializedFieldName.str(), Value(_sortPattern[i].isAscending ? 1 : -1));
         } else {
             // Sorting by an expression, use a made up field name.
             auto computedFieldName = std::string(str::stream() << "$computed" << i);
@@ -145,7 +160,7 @@ Document SortPattern::serialize(SortKeySerialization serializationMode) const {
 void SortPattern::addDependencies(DepsTracker* deps) const {
     for (auto&& keyPart : _sortPattern) {
         if (keyPart.expression) {
-            keyPart.expression->addDependencies(deps);
+            expression::addDependencies(keyPart.expression.get(), deps);
         } else {
             deps->fields.insert(keyPart.fieldPath->fullPath());
         }

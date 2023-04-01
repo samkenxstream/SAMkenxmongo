@@ -12,12 +12,18 @@
 "use strict";
 
 load("jstests/noPassthrough/libs/index_build.js");
+load("jstests/libs/sbe_util.js");          // For checkSBEEnabled.
+load("jstests/libs/columnstore_util.js");  // For setUpServerForColumnStoreIndexTest.
 
 const dbName = "test";
 
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
 rst.initiate();
+
+const columnstoreEnabled =
+    checkSBEEnabled(rst.getPrimary().getDB(dbName), ["featureFlagColumnstoreIndexes"], true) &&
+    setUpServerForColumnStoreIndexTest(rst.getPrimary().getDB(dbName));
 
 const runTest = function(docs, indexSpecs, failPoints, resumePhases, resumeChecks, collNameSuffix) {
     const coll = rst.getPrimary().getDB(dbName).getCollection(
@@ -56,6 +62,15 @@ const runTests = function(failPoints, resumePhases, resumeChecks) {
             resumePhases,
             resumeChecks,
             "_wildcard");
+
+    if (columnstoreEnabled) {
+        runTest([{a: 1, b: 1}, {a: 2, b: 2}, {a: 3, b: 3}],
+                [[{"$**": "columnstore"}], [{b: 1}]],
+                failPoints,
+                resumePhases,
+                resumeChecks,
+                "_columnstore");
+    }
 };
 
 runTests(
@@ -100,6 +115,5 @@ runTests(
     ],
     ["bulk load", "drain writes"],
     [{skippedPhaseLogID: 20391}, {skippedPhaseLogID: 20392}]);
-
 rst.stopSet();
 })();

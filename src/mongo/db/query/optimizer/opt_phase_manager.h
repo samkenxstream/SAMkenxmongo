@@ -34,6 +34,9 @@
 #include "mongo/db/query/optimizer/cascades/interfaces.h"
 #include "mongo/db/query/optimizer/cascades/logical_rewriter.h"
 #include "mongo/db/query/optimizer/cascades/physical_rewriter.h"
+#include "mongo/db/query/optimizer/reference_tracker.h"
+#include "mongo/db/query/optimizer/utils/memo_utils.h"
+
 
 namespace mongo::optimizer {
 
@@ -45,78 +48,101 @@ using namespace cascades;
  * elimination. Second the logical and physical reordering rewrites are applied using the memo.
  * Third the final transport rewritesd are applied.
  */
+
+#define OPT_PHASE(F)                                                                               \
+    /* ConstEval performs the following rewrites: constant folding, inlining, and dead code        \
+     * elimination. */                                                                             \
+    F(ConstEvalPre)                                                                                \
+    F(PathFuse)                                                                                    \
+                                                                                                   \
+    /* Memo phases below perform Cascades-style optimization. Reorder and transform nodes. Convert \
+     * Filter and Eval nodes to SargableNodes, and possibly merge them.*/                          \
+    F(MemoSubstitutionPhase)                                                                       \
+    /* Performs Local-global and rewrites to enable index intersection. If there is an             \
+     * implementation phase, it runs integrated with the top-down optimization. If there is no     \
+     * implementation phase, it runs standalone.*/                                                 \
+    F(MemoExplorationPhase)                                                                        \
+    /* Implementation and enforcement rules. */                                                    \
+    F(MemoImplementationPhase)                                                                     \
+                                                                                                   \
+    F(PathLower)                                                                                   \
+    F(ConstEvalPost)
+
+MAKE_PRINTABLE_ENUM(OptPhase, OPT_PHASE);
+MAKE_PRINTABLE_ENUM_STRING_ARRAY(OptPhaseEnum, OptPhase, OPT_PHASE);
+#undef OPT_PHASE
+
 class OptPhaseManager {
 public:
-    enum class OptPhase {
-        //  ConstEval performs the following rewrites: constant folding, inlining, and dead code
-        //  elimination.
-        ConstEvalPre,
-        PathFuse,
-
-        // Memo phases below perform Cascades-style optimization.
-        // Reorder and transform nodes. Convert Filter and Eval nodes to SargableNodes, and possibly
-        // merge them.
-        MemoSubstitutionPhase,
-        // Performs Local-global and rewrites to enable index intersection.
-        // If there is an implementation phase, it runs integrated with the top-down optimization.
-        // If there is no implementation phase, it runs standalone.
-        MemoExplorationPhase,
-        // Implementation and enforcement rules.
-        MemoImplementationPhase,
-
-        PathLower,
-        ConstEvalPost
-    };
-
     using PhaseSet = opt::unordered_set<OptPhase>;
 
-    OptPhaseManager(PhaseSet phaseSet, PrefixId& prefixId, Metadata metadata, DebugInfo debugInfo);
     OptPhaseManager(PhaseSet phaseSet,
                     PrefixId& prefixId,
                     bool requireRID,
                     Metadata metadata,
-                    std::unique_ptr<CEInterface> ceDerivation,
-                    std::unique_ptr<CostingInterface> costDerivation,
-                    DebugInfo debugInfo);
+                    std::unique_ptr<CardinalityEstimator> explorationCE,
+                    std::unique_ptr<CardinalityEstimator> substitutionCE,
+                    std::unique_ptr<CostEstimator> costEstimator,
+                    PathToIntervalFn pathToInterval,
+                    ConstFoldFn constFold,
+                    bool supportExplain,
+                    DebugInfo debugInfo,
+                    QueryHints queryHints = {});
+
+    // We only allow moving.
+    OptPhaseManager(const OptPhaseManager& /*other*/) = delete;
+    OptPhaseManager(OptPhaseManager&& /*other*/) = default;
+    OptPhaseManager& operator=(const OptPhaseManager& /*other*/) = delete;
+    OptPhaseManager& operator=(OptPhaseManager&& /*other*/) = delete;
 
     /**
-     * Optimization modifies the input argument.
-     * Return result is true for successful optimization and false for failure.
+     * Note: this method is primarily used for testing.
+     * Optimization modifies the input argument to return the best plan. If there is an optimization
+     * failure (including no plans or more than one plan found), program will tassert.
      */
-    bool optimize(ABT& input);
+    void optimize(ABT& input);
+
+    /**
+     * Note: this method is primarily used for testing.
+     * Same as above, but we also return the associated NodeToGroupPropsMap for the best plan.
+     */
+    [[nodiscard]] PlanAndProps optimizeAndReturnProps(ABT input);
+
+    /**
+     * Similar to optimize, but returns a vector of optimized plans. The vector can be empty if we
+     * failed to find a plan, or contain more than one entry if we also requested the rejected plans
+     * for the implementation phase.
+     */
+    [[nodiscard]] PlanExtractorResult optimizeNoAssert(ABT input, bool includeRejected);
 
     static const PhaseSet& getAllRewritesSet();
 
     MemoPhysicalNodeId getPhysicalNodeId() const;
+    const boost::optional<PlanAndProps>& getPostMemoPlan() const;
 
     const QueryHints& getHints() const;
     QueryHints& getHints();
 
     const Memo& getMemo() const;
 
+    const PathToIntervalFn& getPathToInterval() const;
+
     const Metadata& getMetadata() const;
-
-    PrefixId& getPrefixId() const;
-
-    const NodeToGroupPropsMap& getNodeToGroupPropsMap() const;
-    NodeToGroupPropsMap& getNodeToGroupPropsMap();
-
-    const RIDProjectionsMap& getRIDProjections() const;
 
 private:
     bool hasPhase(OptPhase phase) const;
 
     template <OptPhase phase, class C>
-    bool runStructuralPhase(C instance, VariableEnvironment& env, ABT& input);
+    void runStructuralPhase(C instance, VariableEnvironment& env, ABT& input);
 
     /**
      * Run two structural phases until mutual fixpoint.
      * We assume we can construct from the types by initializing with env.
      */
     template <const OptPhase phase1, const OptPhase phase2, class C1, class C2>
-    bool runStructuralPhases(C1 instance1, C2 instance2, VariableEnvironment& env, ABT& input);
+    void runStructuralPhases(C1 instance1, C2 instance2, VariableEnvironment& env, ABT& input);
 
-    bool runMemoLogicalRewrite(OptPhase phase,
+    void runMemoLogicalRewrite(OptPhase phase,
                                VariableEnvironment& env,
                                const LogicalRewriter::RewriteSet& rewriteSet,
                                GroupIdType& rootGroupId,
@@ -124,18 +150,27 @@ private:
                                std::unique_ptr<LogicalRewriter>& logicalRewriter,
                                ABT& input);
 
-    bool runMemoPhysicalRewrite(OptPhase phase,
-                                VariableEnvironment& env,
-                                GroupIdType rootGroupId,
-                                std::unique_ptr<LogicalRewriter>& logicalRewriter,
-                                ABT& input);
+    [[nodiscard]] PlanExtractorResult runMemoPhysicalRewrite(
+        OptPhase phase,
+        VariableEnvironment& env,
+        GroupIdType rootGroupId,
+        bool includeRejected,
+        std::unique_ptr<LogicalRewriter>& logicalRewriter,
+        ABT& input);
 
-    bool runMemoRewritePhases(VariableEnvironment& env, ABT& input);
+    [[nodiscard]] PlanExtractorResult runMemoRewritePhases(bool includeRejected,
+                                                           VariableEnvironment& env,
+                                                           ABT& input);
 
 
     static PhaseSet _allRewrites;
 
     const PhaseSet _phaseSet;
+
+    /**
+     * True if we should maintain extra internal state in support of explain.
+     */
+    const bool _supportExplain;
 
     const DebugInfo _debugInfo;
 
@@ -149,9 +184,38 @@ private:
     Memo _memo;
 
     /**
-     * Cost derivation function.
+     * Logical properties derivation implementation.
      */
-    std::unique_ptr<CostingInterface> _costDerivation;
+    std::unique_ptr<LogicalPropsInterface> _logicalPropsDerivation;
+
+    /**
+     * Cardinality estimation implementation to be used during the exploraton phase..
+     */
+    std::unique_ptr<CardinalityEstimator> _explorationCE;
+
+    /**
+     * Cardinality estimation implementation to be used during the substitution phase.
+     *
+     * The substitution phase typically doesn't care about CE, because it doesn't generate/compare
+     * alternatives. Since some CE implementations are expensive (sampling), we let the caller pass
+     * a different one for this phase.
+     */
+    std::unique_ptr<CardinalityEstimator> _substitutionCE;
+
+    /**
+     * Cost derivation implementation.
+     */
+    std::unique_ptr<CostEstimator> _costEstimator;
+
+    /**
+     * Path ABT node to index bounds converter implementation.
+     */
+    PathToIntervalFn _pathToInterval;
+
+    /**
+     * Constant fold an expression.
+     */
+    ConstFoldFn _constFold;
 
     /**
      * Root physical node if we have performed physical rewrites.
@@ -159,9 +223,10 @@ private:
     MemoPhysicalNodeId _physicalNodeId;
 
     /**
-     * Map from node to logical and physical properties.
+     * Best post-memo exploration phase plan (set if '_supportExplain' is set and if we have
+     * performed memo rewrites).
      */
-    NodeToGroupPropsMap _nodeToGroupPropsMap;
+    boost::optional<PlanAndProps> _postMemoPlan;
 
     /**
      * Used to optimize update and delete statements. If set will include indexing requirement with

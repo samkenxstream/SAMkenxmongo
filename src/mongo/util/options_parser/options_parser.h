@@ -46,6 +46,24 @@ class Environment;
 class OptionSection;
 class Value;
 
+
+/**
+ * Flags controlling whether or not __rest and/or __exec directives in a
+ * config file should be expanded via HttpClient/shellExec.
+ */
+struct ConfigExpand {
+    bool rest = false;
+    bool exec = false;
+    Seconds timeout = kDefaultConfigExpandTimeout;
+};
+
+/**
+ * Reads the contents of `filename` and puts the result in `outContents`.
+ */
+Status readRawFile(const std::string& filename,
+                   std::string* outContents,
+                   ConfigExpand configExpand);
+
 /** Handles parsing of the command line as well as YAML and INI config files.  Takes an
  *  OptionSection instance that describes the allowed options, parses argv (env not yet
  *  supported), and populates an Environment with the results.
@@ -66,7 +84,7 @@ class Value;
  *  Status ret = parser.run(options, argv, env, &environment);
  *  if (!ret.isOK()) {
  *      cerr << options.helpString() << std::endl;
- *      exit(EXIT_FAILURE);
+ *      exit(ExitCode::fail);
  *  }
  *
  *  bool displayHelp;
@@ -74,11 +92,11 @@ class Value;
  *  if (!ret.isOK()) {
  *      // Help is a switch, so it should always be set
  *      cout << "Should not get here" << std::endl;
- *      exit(EXIT_FAILURE);
+ *      exit(ExitCode::fail);
  *  }
  *  if (displayHelp) {
  *      cout << options.helpString() << std::endl;
- *      exit(EXIT_SUCCESS);
+ *      exit(ExitCode::clean);
  *  }
  *
  *  // Get the value of port from the environment
@@ -119,16 +137,6 @@ public:
      *  given Environment with the results but does not call validate on the Environment.
      */
     Status runConfigFile(const OptionSection& options, const std::string& config, Environment* env);
-
-    /**
-     * Flags controlling whether or not __rest and/or __exec directives in a
-     * config file should be expanded via HttpClient/shellExec.
-     */
-    struct ConfigExpand {
-        bool rest = false;
-        bool exec = false;
-        Seconds timeout = kDefaultConfigExpandTimeout;
-    };
 
 private:
     /** Handles parsing of the command line and adds the results to the given Environment */

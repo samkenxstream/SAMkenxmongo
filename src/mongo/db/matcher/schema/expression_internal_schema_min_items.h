@@ -40,7 +40,7 @@ namespace mongo {
 class InternalSchemaMinItemsMatchExpression final
     : public InternalSchemaNumArrayItemsMatchExpression {
 public:
-    InternalSchemaMinItemsMatchExpression(StringData path,
+    InternalSchemaMinItemsMatchExpression(boost::optional<StringData> path,
                                           long long numItems,
                                           clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : InternalSchemaNumArrayItemsMatchExpression(INTERNAL_SCHEMA_MIN_ITEMS,
@@ -53,7 +53,7 @@ public:
         return (anArray.nFields() >= numItems());
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<InternalSchemaMinItemsMatchExpression> minItems =
             std::make_unique<InternalSchemaMinItemsMatchExpression>(
                 path(), numItems(), _errorAnnotation);

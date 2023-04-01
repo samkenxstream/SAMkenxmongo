@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -37,9 +36,13 @@
 #include "mongo/logv2/log.h"
 #include "mongo/util/future_util.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
+
 namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(hangBeforeRunningConfigsvrCoordinatorInstance);
+MONGO_FAIL_POINT_DEFINE(hangAndEndBeforeRunningConfigsvrCoordinatorInstance);
 
 namespace {
 
@@ -48,8 +51,8 @@ const Backoff kExponentialBackoff(Seconds(1), Milliseconds::max());
 }  // namespace
 
 ConfigsvrCoordinatorMetadata extractConfigsvrCoordinatorMetadata(const BSONObj& stateDoc) {
-    return ConfigsvrCoordinatorMetadata::parse(
-        IDLParserErrorContext("ConfigsvrCoordinatorMetadata"), stateDoc);
+    return ConfigsvrCoordinatorMetadata::parse(IDLParserContext("ConfigsvrCoordinatorMetadata"),
+                                               stateDoc);
 }
 
 ConfigsvrCoordinator::ConfigsvrCoordinator(const BSONObj& stateDoc)
@@ -72,6 +75,17 @@ void ConfigsvrCoordinator::_removeStateDocument(OperationContext* opCtx) {
                  WriteConcerns::kMajorityWriteConcernNoTimeout);
 }
 
+OperationSessionInfo ConfigsvrCoordinator::_getCurrentSession() const {
+    const auto& coordinatorMetadata = metadata();
+    invariant(coordinatorMetadata.getSession());
+    ConfigsvrCoordinatorSession coordinatorSession = *coordinatorMetadata.getSession();
+
+    OperationSessionInfo osi;
+    osi.setSessionId(coordinatorSession.getLsid());
+    osi.setTxnNumber(coordinatorSession.getTxnNumber());
+    return osi;
+}
+
 void ConfigsvrCoordinator::interrupt(Status status) noexcept {
     LOGV2_DEBUG(6347303,
                 1,
@@ -88,6 +102,11 @@ void ConfigsvrCoordinator::interrupt(Status status) noexcept {
 
 SemiFuture<void> ConfigsvrCoordinator::run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                            const CancellationToken& token) noexcept {
+    if (hangAndEndBeforeRunningConfigsvrCoordinatorInstance.shouldFail()) {
+        hangAndEndBeforeRunningConfigsvrCoordinatorInstance.pauseWhileSet();
+        _completionPromise.emplaceValue();
+        return Status::OK();
+    }
     return ExecutorFuture<void>(**executor)
         .then([this, executor, token, anchor = shared_from_this()] {
             hangBeforeRunningConfigsvrCoordinatorInstance.pauseWhileSet();
@@ -99,13 +118,14 @@ SemiFuture<void> ConfigsvrCoordinator::run(std::shared_ptr<executor::ScopedTaskE
         })
         .onCompletion([this, executor, token, anchor = shared_from_this()](const Status& status) {
             if (!status.isOK()) {
-                if (!status.isA<ErrorCategory::NotPrimaryError>() &&
-                    !status.isA<ErrorCategory::ShutdownError>()) {
-                    LOGV2_ERROR(6347301,
-                                "Error executing ConfigsvrCoordinator",
-                                "error"_attr = redact(status));
-                }
+                LOGV2_ERROR(
+                    6347301, "Error executing ConfigsvrCoordinator", "error"_attr = redact(status));
 
+                // Nothing else to do, the _completionPromise will be cancelled once the coordinator
+                // is interrupted, because the only reasons to stop forward progress in this node is
+                // because of a stepdown happened or the coordinator was canceled.
+                dassert((token.isCanceled() && status.isA<ErrorCategory::CancellationError>()) ||
+                        status.isA<ErrorCategory::NotPrimaryError>());
                 return status;
             }
 
@@ -113,6 +133,15 @@ SemiFuture<void> ConfigsvrCoordinator::run(std::shared_ptr<executor::ScopedTaskE
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
                 _removeStateDocument(opCtx);
+
+                const auto session = metadata().getSession();
+                if (session && status.isOK()) {
+                    // Return lsid to the InternalSessionPool. If status is not OK, let the session
+                    // be discarded.
+                    InternalSessionPool::get(opCtx)->release(
+                        {session->getLsid(), session->getTxnNumber()});
+                }
+
             } catch (DBException& ex) {
                 LOGV2_WARNING(6347302,
                               "Failed to remove ConfigsvrCoordinator state document",

@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -36,12 +35,16 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_aggregate.h"
 #include "mongo/s/stale_shard_version_helpers.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -123,7 +126,8 @@ void PeriodicShardedIndexConsistencyChecker::_launchShardedIndexConsistencyCheck
 
             try {
                 long long numShardedCollsWithInconsistentIndexes = 0;
-                auto collections = Grid::get(opCtx)->catalogClient()->getCollections(
+                const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
+                auto collections = catalogClient->getCollections(
                     opCtx, {}, repl::ReadConcernLevel::kLocalReadConcern);
 
                 for (const auto& coll : collections) {
@@ -138,7 +142,7 @@ void PeriodicShardedIndexConsistencyChecker::_launchShardedIndexConsistencyCheck
                     }
 
                     auto request = aggregation_request_helper::parseFromBSON(
-                        nss, aggRequestBSON, boost::none, false);
+                        opCtx, nss, aggRequestBSON, boost::none, false);
 
                     auto catalogCache = Grid::get(opCtx)->catalogCache();
                     shardVersionRetry(

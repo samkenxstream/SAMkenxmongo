@@ -30,11 +30,11 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/pipeline/document_source_list_sessions.h"
 #include "mongo/db/pipeline/document_source_list_sessions_gen.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
 
 namespace mongo {
 
@@ -66,7 +66,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceListSessions::createFromBson(
     invariant(spec.getUsers() && !spec.getUsers()->empty());
 
     BSONArrayBuilder builder;
-    for (const auto& uid : listSessionsUsersToDigests(spec.getUsers().get())) {
+    for (const auto& uid : listSessionsUsersToDigests(spec.getUsers().value())) {
         ConstDataRange cdr = uid.toCDR();
         builder.append(BSONBinData(cdr.data(), cdr.length(), BinDataGeneral));
     }
@@ -74,8 +74,10 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceListSessions::createFromBson(
     return new DocumentSourceListSessions(query, pExpCtx, spec.getAllUsers(), spec.getUsers());
 }
 
-Value DocumentSourceListSessions::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceListSessions::serialize(SerializationOptions opts) const {
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484327);
+    }
     ListSessionsSpec spec;
     spec.setAllUsers(_allUsers);
     spec.setUsers(_users);

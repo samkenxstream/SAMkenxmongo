@@ -35,14 +35,14 @@ global:
 
 imports:
     - "mongo/db/catalog/commit_quorum.idl"
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 commands:
     setIndexCommitQuorum:
         command_name: setIndexCommitQuorum
         cpp_name: SetIndexCommitQuorum
         description: "Resets the commitQuorum for an index build."
-        strict: false
+        strict: true
         namespace: concatenate_with_db
         api_version: ""
         fields:
@@ -53,5 +53,6 @@ commands:
             commitQuorum:
                 type: CommitQuorum
                 description: "commitQuorum can be set to the same values as writeConcern.w and
-                              indicates how many and/or which replica set members are needed for the
-                              primary to commit the index build."
+                              indicates how many and/or which replica set members must be ready to
+                              commit the index build before the primary will proceed to commit the
+                              index build."

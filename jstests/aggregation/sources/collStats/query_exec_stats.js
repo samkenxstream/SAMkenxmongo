@@ -1,6 +1,9 @@
 // Test that queryExecStats within a $collStats stage returns the correct execution stats.
 // @tags: [
 //   assumes_no_implicit_collection_creation_after_drop,
+//   does_not_support_repeated_reads,
+//   # TODO SERVER-67640: Verify 'top' and $collStats work correctly for queries in CQF.
+//   cqf_incompatible,
 // ]
 (function() {
 "use strict";

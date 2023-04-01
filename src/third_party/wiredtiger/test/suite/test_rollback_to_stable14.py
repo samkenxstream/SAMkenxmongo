@@ -28,7 +28,7 @@
 
 import threading, time
 from helper import simulate_crash_restart
-from test_rollback_to_stable01 import test_rollback_to_stable_base
+from rollback_to_stable_util import test_rollback_to_stable_base
 from wiredtiger import stat
 from wtdataset import SimpleDataSet
 from wtscenario import make_scenarios
@@ -60,7 +60,7 @@ class test_rollback_to_stable14(test_rollback_to_stable_base):
     scenarios = make_scenarios(key_format_values, prepare_values)
 
     def conn_config(self):
-        config = 'cache_size=25MB,statistics=(all),statistics_log=(json,on_close,wait=1),timing_stress_for_test=[history_store_checkpoint_delay]'
+        config = 'cache_size=25MB,statistics=(all),statistics_log=(json,on_close,wait=1),timing_stress_for_test=[history_store_checkpoint_delay],verbose=(rts:5)'
         return config
 
     def test_rollback_to_stable(self):
@@ -114,8 +114,14 @@ class test_rollback_to_stable14(test_rollback_to_stable_base):
         try:
             self.pr("start checkpoint")
             ckpt.start()
-            # Sleep for sometime so that checkpoint starts.
-            time.sleep(2)
+            
+            # Wait for checkpoint to start before committing.
+            ckpt_started = 0
+            while not ckpt_started:
+                stat_cursor = self.session.open_cursor('statistics:', None, None)
+                ckpt_started = stat_cursor[stat.conn.txn_checkpoint_running][2]
+                stat_cursor.close()
+                time.sleep(1)
 
             # Perform several modifies in parallel with checkpoint.
             # Rollbacks may occur when checkpoint is running, so retry as needed.
@@ -170,9 +176,6 @@ class test_rollback_to_stable14(test_rollback_to_stable_base):
         self.check(value_modR, uri, nrows, None, 40)
         self.check(value_modS, uri, nrows, None, 50)
 
-        # The test may output the following message in eviction under cache pressure. Ignore that.
-        self.ignoreStdoutPatternIfExists("oldest pinned transaction ID rolled back for eviction")
-
     def test_rollback_to_stable_same_ts(self):
         nrows = 100
 
@@ -224,8 +227,14 @@ class test_rollback_to_stable14(test_rollback_to_stable_base):
         try:
             self.pr("start checkpoint")
             ckpt.start()
-            # Sleep for sometime so that checkpoint starts.
-            time.sleep(2)
+
+            # Wait for checkpoint to start before committing.
+            ckpt_started = 0
+            while not ckpt_started:
+                stat_cursor = self.session.open_cursor('statistics:', None, None)
+                ckpt_started = stat_cursor[stat.conn.txn_checkpoint_running][2]
+                stat_cursor.close()
+                time.sleep(1)
 
             # Perform several modifies in parallel with checkpoint.
             # Rollbacks may occur when checkpoint is running, so retry as needed.
@@ -278,9 +287,6 @@ class test_rollback_to_stable14(test_rollback_to_stable_base):
         self.check(value_a, uri, nrows, None, 20)
         self.check(value_modQ, uri, nrows, None, 30)
 
-        # The test may output the following message in eviction under cache pressure. Ignore that.
-        self.ignoreStdoutPatternIfExists("oldest pinned transaction ID rolled back for eviction")
-
     def test_rollback_to_stable_same_ts_append(self):
         nrows = 100
 
@@ -332,8 +338,14 @@ class test_rollback_to_stable14(test_rollback_to_stable_base):
         try:
             self.pr("start checkpoint")
             ckpt.start()
-            # Sleep for sometime so that checkpoint starts.
-            time.sleep(2)
+            
+            # Wait for checkpoint to start before committing.
+            ckpt_started = 0
+            while not ckpt_started:
+                stat_cursor = self.session.open_cursor('statistics:', None, None)
+                ckpt_started = stat_cursor[stat.conn.txn_checkpoint_running][2]
+                stat_cursor.close()
+                time.sleep(1)
 
             # Perform several modifies in parallel with checkpoint.
             # Rollbacks may occur when checkpoint is running, so retry as needed.
@@ -383,9 +395,6 @@ class test_rollback_to_stable14(test_rollback_to_stable_base):
         # Check that the correct data is seen at and after the stable timestamp.
         self.check(value_a, uri, nrows, None, 20)
         self.check(value_modQ, uri, nrows, None, 30)
-
-        # The test may output the following message in eviction under cache pressure. Ignore that.
-        self.ignoreStdoutPatternIfExists("oldest pinned transaction ID rolled back for eviction")
 
 if __name__ == '__main__':
     wttest.run()

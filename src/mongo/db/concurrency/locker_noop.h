@@ -120,7 +120,10 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    virtual void lockRSTLComplete(OperationContext* opCtx, LockMode mode, Date_t deadline) {
+    virtual void lockRSTLComplete(OperationContext* opCtx,
+                                  LockMode mode,
+                                  Date_t deadline,
+                                  const LockTimeoutCallback& onTimeout) {
         MONGO_UNREACHABLE;
     }
 
@@ -148,7 +151,7 @@ public:
         return true;
     }
 
-    virtual bool isDbLockedForMode(StringData dbName, LockMode mode) const {
+    virtual bool isDbLockedForMode(const DatabaseName& dbName, LockMode mode) const {
         return true;
     }
 

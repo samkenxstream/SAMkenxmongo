@@ -29,26 +29,22 @@
 
 #pragma once
 
-#include <list>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
 
-#include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
-#include "mongo/stdx/condition_variable.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/logv2/log_severity_suppressor.h"
 #include "mongo/stdx/variant.h"
 #include "mongo/transport/service_entry_point.h"
-#include "mongo/transport/service_executor_fixed.h"
-#include "mongo/transport/service_executor_reserved.h"
-#include "mongo/transport/service_executor_synchronous.h"
-#include "mongo/transport/service_state_machine.h"
-#include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/transport/session.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/net/cidr.h"
 
 namespace mongo {
 class ServiceContext;
-
-namespace transport {
-class Session;
-}  // namespace transport
 
 /**
  * A basic entry point from the TransportLayer into a server.
@@ -58,13 +54,16 @@ class Session;
  * (transport::Session).
  */
 class ServiceEntryPointImpl : public ServiceEntryPoint {
+public:
+    static constexpr Seconds kSlowSessionWorkflowLogSuppresionPeriod{5};
+
+    explicit ServiceEntryPointImpl(ServiceContext* svcCtx);
+    ~ServiceEntryPointImpl();
+
     ServiceEntryPointImpl(const ServiceEntryPointImpl&) = delete;
     ServiceEntryPointImpl& operator=(const ServiceEntryPointImpl&) = delete;
 
-public:
-    explicit ServiceEntryPointImpl(ServiceContext* svcCtx);
-
-    void startSession(transport::SessionHandle session) override;
+    void startSession(std::shared_ptr<transport::Session> session) override;
 
     void endAllSessions(transport::Session::TagMask tags) final;
     void endAllSessionsNoTagMask();
@@ -76,38 +75,42 @@ public:
 
     void appendStats(BSONObjBuilder* bob) const override;
 
-    size_t numOpenSessions() const final {
-        return _currentConnections.load();
-    }
+    size_t numOpenSessions() const final;
 
-    size_t maxOpenSessions() const final {
-        return _maxNumConnections;
-    }
+    size_t maxOpenSessions() const final;
+
+    logv2::LogSeverity slowSessionWorkflowLogSeverity() final;
+
+    void onClientDisconnect(Client* client) final;
+
+    /** `onClientDisconnect` calls this before doing anything else. */
+    virtual void derivedOnClientDisconnect(Client* client) {}
+
+protected:
+    /** Imbue the new Client with a ServiceExecutorContext. */
+    virtual void configureServiceExecutorContext(ServiceContext::UniqueClient& client,
+                                                 bool isPrivilegedSession);
 
 private:
-    void _terminateAll(WithLock);
-    bool _waitForNoSessions(stdx::unique_lock<Mutex>& lk, Date_t deadline);
-
-    using SSMList = std::list<transport::ServiceStateMachine>;
-    using SSMListIterator = SSMList::iterator;
+    class Sessions;
 
     ServiceContext* const _svcCtx;
-    AtomicWord<std::size_t> _nWorkers;
 
-    mutable Mutex _sessionsMutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "ServiceEntryPointImpl::_sessionsMutex");
-    stdx::condition_variable _sessionsCV;
-    SSMList _sessions;
+    const size_t _maxSessions;
+    size_t _rejectedSessions;
 
-    const size_t _maxNumConnections{DEFAULT_MAX_CONN};
-    AtomicWord<size_t> _currentConnections{0};
-    AtomicWord<size_t> _createdConnections{0};
+    std::unique_ptr<Sessions> _sessions;
+
+    logv2::SeveritySuppressor _slowSessionWorkflowLogSuppressor{
+        kSlowSessionWorkflowLogSuppresionPeriod,
+        logv2::LogSeverity::Info(),
+        logv2::LogSeverity::Debug(2)};
 };
 
 /*
  * Returns true if a session with remote/local addresses should be exempted from maxConns
  */
-bool shouldOverrideMaxConns(const transport::SessionHandle& session,
+bool shouldOverrideMaxConns(const std::shared_ptr<transport::Session>& session,
                             const std::vector<stdx::variant<CIDR, std::string>>& exemptions);
 
 }  // namespace mongo

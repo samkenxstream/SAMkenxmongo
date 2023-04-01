@@ -18,11 +18,8 @@ env.Library(
         "socket_utils.cpp",
         'hostandport.idl',
     ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/server_options_core',
+        '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/util/concurrency/spin_lock',
         '$BUILD_DIR/mongo/util/winutil',
     ],
@@ -31,15 +28,12 @@ env.Library(
 env.Library(
     target='ssl_options',
     source=[
-        "ssl_options.cpp",
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
+        'ssl_options.cpp',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/server_options_core',
+        '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
-    ]
+    ],
 )
 
 env.Library(
@@ -54,7 +48,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
-    ]
+    ],
 )
 
 env.Library(
@@ -64,28 +58,25 @@ env.Library(
         'ssl_options_server.idl',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
         'ssl_options',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/auth/auth_options',
         '$BUILD_DIR/mongo/db/auth/cluster_auth_mode',
-        '$BUILD_DIR/mongo/db/server_options_core',
+        '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
-    ]
+    ],
 )
 
 env.Library(
     target='ssl_types',
     source=[
-        "ssl_types.cpp",
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
+        'ssl_types.cpp',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
         'ssl_options',
-    ]
+    ],
 )
 
 if not get_option('ssl') == 'off':
@@ -99,10 +90,8 @@ if not get_option('ssl') == 'off':
                 '$BUILD_DIR/mongo/base',
                 'ssl_options',
             ],
-            LIBDEPS_PRIVATE=[
-                '$BUILD_DIR/mongo/crypto/symmetric_crypto'
-            ]
-        );
+            LIBDEPS_PRIVATE=['$BUILD_DIR/mongo/crypto/symmetric_crypto'],
+        )
 
     env.Library(
         target='ssl_manager',
@@ -134,9 +123,9 @@ if not get_option('ssl') == 'off':
             '$BUILD_DIR/mongo/base/secure_allocator',
             '$BUILD_DIR/mongo/crypto/sha_block_${MONGO_CRYPTO}',
             '$BUILD_DIR/mongo/db/auth/cluster_auth_mode',
-            '$BUILD_DIR/mongo/db/server_options_core',
+            '$BUILD_DIR/mongo/db/connection_health_metrics_parameter',
+            '$BUILD_DIR/mongo/db/server_base',
             '$BUILD_DIR/mongo/db/service_context',
-            '$BUILD_DIR/mongo/idl/server_parameter',
             '$BUILD_DIR/mongo/util/background_job',
             '$BUILD_DIR/mongo/util/icu',
             '$BUILD_DIR/mongo/util/winutil',
@@ -153,8 +142,7 @@ if not get_option('ssl') == 'off':
         LIBDEPS_PRIVATE=[
             '$BUILD_DIR/mongo/client/authentication',
             '$BUILD_DIR/mongo/db/auth/cluster_auth_mode',
-            '$BUILD_DIR/mongo/db/server_options_core',
-            '$BUILD_DIR/mongo/idl/server_parameter',
+            '$BUILD_DIR/mongo/db/server_base',
             'ssl_options',
         ],
     )
@@ -193,7 +181,6 @@ env.Library(
     ],
 )
 
-
 if http_client == "off":
     env.Library(
         target='http_client_impl',
@@ -202,6 +189,7 @@ if http_client == "off":
         ],
         LIBDEPS=[
             '$BUILD_DIR/mongo/base',
+            'http_client',
         ],
     )
 else:
@@ -224,6 +212,16 @@ else:
             'winhttp' if env.TargetOSIs('windows') else 'curl',
         ],
     )
+
+env.Library(
+    target='mock_http_client',
+    source=[
+        'http_client_mock.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
 
 env.CppUnitTest(
     target='util_net_test',
@@ -286,5 +284,4 @@ if get_option('ssl') == 'on':
             '$BUILD_DIR/mongo/util/concurrency/thread_pool',
             '$BUILD_DIR/mongo/util/version_impl',
         ],
-)
-
+    )

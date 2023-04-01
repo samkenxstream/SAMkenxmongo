@@ -27,75 +27,41 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/catalog/collection.h"
 
 #include <sstream>
 
+#include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 namespace mongo {
-
-//
-// CappedInsertNotifier
-//
-
-void CappedInsertNotifier::notifyAll() const {
-    stdx::lock_guard<Latch> lk(_mutex);
-    ++_version;
-    _notifier.notify_all();
-}
-
-void CappedInsertNotifier::waitUntil(uint64_t prevVersion, Date_t deadline) const {
-    stdx::unique_lock<Latch> lk(_mutex);
-    while (!_dead && prevVersion == _version) {
-        if (stdx::cv_status::timeout == _notifier.wait_until(lk, deadline.toSystemTimePoint())) {
-            return;
-        }
-    }
-}
-
-void CappedInsertNotifier::kill() {
-    stdx::lock_guard<Latch> lk(_mutex);
-    _dead = true;
-    _notifier.notify_all();
-}
-
-bool CappedInsertNotifier::isDead() {
-    stdx::lock_guard<Latch> lk(_mutex);
-    return _dead;
-}
 
 CollectionPtr CollectionPtr::null;
 
-CollectionPtr::CollectionPtr() : _collection(nullptr), _opCtx(nullptr) {}
-CollectionPtr::CollectionPtr(OperationContext* opCtx,
-                             const Collection* collection,
-                             RestoreFn restoreFn)
-    : _collection(collection), _opCtx(opCtx), _restoreFn(std::move(restoreFn)) {}
-CollectionPtr::CollectionPtr(const Collection* collection, NoYieldTag)
-    : CollectionPtr(nullptr, collection, nullptr) {}
-CollectionPtr::CollectionPtr(Collection* collection) : CollectionPtr(collection, NoYieldTag{}) {}
+CollectionPtr::CollectionPtr(const Collection* collection) : _collection(collection) {}
+
 CollectionPtr::CollectionPtr(CollectionPtr&&) = default;
 CollectionPtr::~CollectionPtr() {}
 CollectionPtr& CollectionPtr::operator=(CollectionPtr&&) = default;
 
-bool CollectionPtr::_canYield() const {
-    // We only set the opCtx when we use a constructor that allows yielding.
-    return _opCtx;
+bool CollectionPtr::yieldable() const {
+    // We only set the opCtx when this CollectionPtr is yieldable.
+    return _opCtx || !_collection;
 }
 
 void CollectionPtr::yield() const {
     // Yield if we are yieldable and have a valid collection
-    if (_canYield() && _collection) {
+    if (_collection) {
+        invariant(_opCtx);
         _yieldedUUID = _collection->uuid();
         _collection = nullptr;
     }
 }
 void CollectionPtr::restore() const {
     // Restore from yield if we are yieldable and if uuid was set in a previous yield.
-    if (_canYield() && _yieldedUUID) {
+    invariant(_opCtx);
+    if (_yieldedUUID) {
         // We may only do yield restore when we were holding locks that was yielded so we need to
         // refresh from the catalog to make sure we have a valid collection pointer.
         _collection = _restoreFn(_opCtx, *_yieldedUUID);
@@ -103,16 +69,20 @@ void CollectionPtr::restore() const {
     }
 }
 
-const BSONObj& CollectionPtr::getShardKeyPattern() const {
-    dassert(_shardKeyPattern);
-    return _shardKeyPattern.get();
+void CollectionPtr::setShardKeyPattern(const BSONObj& shardKeyPattern) {
+    _shardKeyPattern.emplace(shardKeyPattern.getOwned());
+}
+
+const ShardKeyPattern& CollectionPtr::getShardKeyPattern() const {
+    invariant(_shardKeyPattern);
+    return *_shardKeyPattern;
 }
 
 // ----
 
 namespace {
 const auto getFactory = ServiceContext::declareDecoration<std::unique_ptr<Collection::Factory>>();
-}
+}  // namespace
 
 Collection::Factory* Collection::Factory::get(ServiceContext* service) {
     return getFactory(service).get();
@@ -120,11 +90,12 @@ Collection::Factory* Collection::Factory::get(ServiceContext* service) {
 
 Collection::Factory* Collection::Factory::get(OperationContext* opCtx) {
     return getFactory(opCtx->getServiceContext()).get();
-};
+}
 
 void Collection::Factory::set(ServiceContext* service,
                               std::unique_ptr<Collection::Factory> newFactory) {
     auto& factory = getFactory(service);
     factory = std::move(newFactory);
 }
+
 }  // namespace mongo

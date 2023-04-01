@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -47,6 +46,9 @@
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/hostandport.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 #define ASSERT_REASON_CONTAINS(STATUS, PATTERN)                      \
     do {                                                             \
@@ -203,7 +205,7 @@ TEST_F(CheckQuorumForInitiate, QuorumCheckFailedDueToSeveralDownNodes) {
     ASSERT_REASON_CONTAINS(status, "h5:1");
 }
 
-const BSONObj makeHeartbeatRequest(const ReplSetConfig& rsConfig, int myConfigIndex) {
+BSONObj makeHeartbeatRequest(const ReplSetConfig& rsConfig, int myConfigIndex) {
     const MemberConfig& myConfig = rsConfig.getMemberAt(myConfigIndex);
     ReplSetHeartbeatArgsV1 hbArgs;
     hbArgs.setHeartbeatVersion(1);

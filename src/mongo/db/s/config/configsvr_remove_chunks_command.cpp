@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -36,12 +35,16 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/remove_chunks_gen.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/grid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -57,11 +60,11 @@ public:
         void typedRun(OperationContext* opCtx) {
             const UUID& collectionUUID = request().getCollectionUUID();
 
-            opCtx->setAlwaysInterruptAtStepDownOrUp();
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrRemoveChunks can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
@@ -92,19 +95,19 @@ public:
                 // Write with localWriteConcern because we cannot wait for replication with a
                 // session checked out. The command will wait for majority WC on the epilogue after
                 // the session has been checked in.
-                uassertStatusOK(
-                    Grid::get(newOpCtxPtr.get())
-                        ->catalogClient()
-                        ->removeConfigDocuments(newOpCtxPtr.get(),
-                                                ChunkType::ConfigNS,
-                                                BSON(ChunkType::collectionUUID << collectionUUID),
-                                                ShardingCatalogClient::kLocalWriteConcern));
+                const auto catalogClient =
+                    ShardingCatalogManager::get(newOpCtxPtr.get())->localCatalogClient();
+                uassertStatusOK(catalogClient->removeConfigDocuments(
+                    newOpCtxPtr.get(),
+                    ChunkType::ConfigNS,
+                    BSON(ChunkType::collectionUUID << collectionUUID),
+                    ShardingCatalogClient::kLocalWriteConcern));
             }
 
             // Since we no write happened on this txnNumber, we need to make a dummy write so that
             // secondaries can be aware of this txn.
             DBDirectClient client(opCtx);
-            client.update(NamespaceString::kServerConfigurationNamespace.ns(),
+            client.update(NamespaceString::kServerConfigurationNamespace,
                           BSON("_id"
                                << "RemoveChunksMetadataStats"),
                           BSON("$inc" << BSON("count" << 1)),
@@ -114,7 +117,7 @@ public:
 
     private:
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
 
         bool supportsWriteConcern() const override {
@@ -146,6 +149,10 @@ public:
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
+    }
+
+    bool supportsRetryableWrite() const final {
+        return true;
     }
 } configsvrRemoveChunksCmd;
 

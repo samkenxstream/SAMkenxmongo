@@ -32,30 +32,45 @@ global:
     cpp_namespace: "mongo"
     cpp_includes:
         - "mongo/db/s/forwardable_operation_metadata.h"
+        - "mongo/db/s/sharding_ddl_util.h"
         - "mongo/s/database_version.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
-    - "mongo/db/logical_session_id.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/session/logical_session_id.idl"
 
 enums:
     DDLCoordinatorType:
         description: "Type of the sharding DDL Operation."
         type: string
         values:
+            # TODO (SERVER-71309): Remove once 7.0 becomes last LTS.
+            kMovePrimaryNoResilient: "movePrimaryNoResilient"
             kMovePrimary: "movePrimary"
-            kDropDatabase: "dropDatabase"
-            kDropCollection: "dropCollection"
-            kRenameCollection: "renameCollection"
-            # TODO SERVER-64720 remove once 6.0 becomes last LTS
-            kCreateCollectionPre60Compatible: "createCollection"
-            kCreateCollection: "createCollection_V2"
+            kDropDatabase: "dropDatabase_V2"
+            # TODO SERVER-73627: Remove once 7.0 becomes last LTS.
+            kDropDatabasePre70Compatible: "dropDatabase"
+            kDropCollection: "dropCollection_V2"
+            # TODO SERVER-73627: Remove once 7.0 becomes last LTS.
+            kDropCollectionPre70Compatible: "dropCollection"
+            kRenameCollection: "renameCollection_V2"
+            # TODO SERVER-72796: Remove once gGlobalIndexesShardingCatalog is enabled.
+            kRenameCollectionPre63Compatible: "renameCollection"
+            kCreateCollection: "createCollection_V3"
+            # TODO SERVER-68008: Remove once 7.0 becomes last LTS
+            kCreateCollectionPre61Compatible: "createCollection_V2"
             kRefineCollectionShardKey: "refineCollectionShardKey"
-            kRefineCollectionShardKeyNoResilient: "refineCollectionShardKeyNoResilient"
             kSetAllowMigrations: "setAllowMigrations"
-            kCollMod: "collMod"
+            kCollMod: "collMod_V3"
+            # TODO SERVER-68008: Remove once 7.0 becomes last LTS
+            kCollModPre61Compatible: "collMod_V2"
             kReshardCollection: "reshardCollection"
-            kReshardCollectionNoResilient: "reshardCollectionNoResilient"
+            # Note: the V3 refers to the coordinator version, not the FLE2 protocol version
+            kCompactStructuredEncryptionData: "compactStructuredEncryptionData_V3"
+            # TODO SERVER-68373: Remove once 7.0 becomes last LTS
+            kCompactStructuredEncryptionDataPre70Compatible: "compactStructuredEncryptionData_V2"
+            # TODO SERVER-68373 remove once 7.0 becomes last LTS
+            kCompactStructuredEncryptionDataPre61Compatible: "compactStructuredEncryptionData"
 
 types:
     ForwardableOperationMetadata:
@@ -64,12 +79,20 @@ types:
         bson_serialization_type: object
         serializer: "mongo::ForwardableOperationMetadata::toBSON"
         deserializer: "mongo::ForwardableOperationMetadata"
+
     DatabaseVersion:
         description: ""
         cpp_type: DatabaseVersion
         bson_serialization_type: object
         serializer: "mongo::DatabaseVersion::toBSON"
         deserializer: "mongo::DatabaseVersion"
+
+    ErrorStatus:
+        bson_serialization_type: any
+        description: "Status representing an error state"
+        cpp_type: "::mongo::Status"
+        serializer: "::mongo::sharding_ddl_util_serializeErrorStatusToBSON"
+        deserializer: "::mongo::sharding_ddl_util_deserializeErrorStatusFromBSON"
 
 structs:
     ShardingDDLCoordinatorId:
@@ -93,7 +116,7 @@ structs:
                 type: LogicalSessionId
             txnNumber:
                 type: TxnNumber
-    
+
     ShardingDDLCoordinatorMetadata:
         description: "Commong metadata for all sharding DDL coordinator."
         generate_comparison_operators: false
@@ -113,4 +136,12 @@ structs:
                 optional: true
             session:
                 type: ShardingDDLSession
+                optional: true
+            bucketNss:
+                description: "In case of sharded timeseries this variable will hold the underlying bucket namespace"
+                type: namespacestring
+                optional: true
+            abortReason:
+                description: "Error triggering the cleanup pipeline"
+                type: ErrorStatus
                 optional: true

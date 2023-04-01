@@ -37,7 +37,7 @@ namespace mongo {
 
 InternalSchemaStrLengthMatchExpression::InternalSchemaStrLengthMatchExpression(
     MatchType type,
-    StringData path,
+    boost::optional<StringData> path,
     long long strLen,
     StringData name,
     clonable_ptr<ErrorAnnotation> annotation)
@@ -46,19 +46,18 @@ InternalSchemaStrLengthMatchExpression::InternalSchemaStrLengthMatchExpression(
 void InternalSchemaStrLengthMatchExpression::debugString(StringBuilder& debug,
                                                          int indentationLevel) const {
     _debugAddSpace(debug, indentationLevel);
-    debug << path() << " " << _name << " " << _strLen << "\n";
-
-    MatchExpression::TagData* td = getTag();
-    if (nullptr != td) {
-        debug << " ";
-        td->debugString(&debug);
-    }
-    debug << "\n";
+    debug << path() << " " << _name << " " << _strLen;
+    _debugStringAttachTagInfo(&debug);
 }
 
-BSONObj InternalSchemaStrLengthMatchExpression::getSerializedRightHandSide() const {
+BSONObj InternalSchemaStrLengthMatchExpression::getSerializedRightHandSide(
+    SerializationOptions opts) const {
     BSONObjBuilder objBuilder;
-    objBuilder.append(_name, _strLen);
+    if (opts.replacementForLiteralArgs) {
+        objBuilder.append(opts.serializeFieldName(_name), opts.replacementForLiteralArgs.get());
+    } else {
+        objBuilder.append(opts.serializeFieldName(_name), _strLen);
+    }
     return objBuilder.obj();
 }
 

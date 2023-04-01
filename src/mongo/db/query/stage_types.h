@@ -52,7 +52,7 @@ enum StageType {
     STAGE_BATCHED_DELETE,
     STAGE_CACHED_PLAN,
     STAGE_COLLSCAN,
-    STAGE_COLUMN_IXSCAN,
+    STAGE_COLUMN_SCAN,
 
     // A virtual scan stage that simulates a collection scan and doesn't depend on underlying
     // storage.
@@ -111,11 +111,17 @@ enum StageType {
     STAGE_SORT_KEY_GENERATOR,
 
     STAGE_SORT_MERGE,
+
+    STAGE_SPOOL,
+
     STAGE_SUBPLAN,
 
     // Stages for running text search.
     STAGE_TEXT_OR,
     STAGE_TEXT_MATCH,
+
+    // Stage for modifying bucket documents in a time-series bucket collection.
+    STAGE_TIMESERIES_MODIFY,
 
     // Stage for choosing between two alternate plans based on an initial trial period.
     STAGE_TRIAL,

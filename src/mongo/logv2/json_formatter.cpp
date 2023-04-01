@@ -168,16 +168,27 @@ private:
     void storeQuoted(StringData name, const T& value) {
         format_to(std::back_inserter(_buffer), FMT_COMPILE(R"({}"{}":")"), _separator, name);
         std::size_t before = _buffer.size();
-        str::escapeForJSON(_buffer, value);
-        if (_attributeMaxSize != 0) {
+        std::size_t wouldWrite = 0;
+        std::size_t written = 0;
+        str::escapeForJSON(
+            _buffer, value, _attributeMaxSize ? _attributeMaxSize : std::string::npos, &wouldWrite);
+        written = _buffer.size() - before;
+
+        if (wouldWrite > written) {
+            // The bounded escape may have reached the limit and
+            // stopped writing while in the middle of a UTF-8 sequence,
+            // in which case the incomplete UTF-8 octets at the tail of the
+            // buffer have to be trimmed.
+            // Push a dummy byte so that the UTF-8 safe truncation
+            // will truncate back down to the correct size.
+            _buffer.push_back('x');
             auto truncatedEnd =
-                str::UTF8SafeTruncation(_buffer.begin() + before, _buffer.end(), _attributeMaxSize);
-            if (truncatedEnd != _buffer.end()) {
-                BSONObjBuilder truncationInfo = _truncated.subobjStart(name);
-                truncationInfo.append("type"_sd, typeName(BSONType::String));
-                truncationInfo.append("size"_sd, static_cast<int64_t>(_buffer.size() - before));
-                truncationInfo.done();
-            }
+                str::UTF8SafeTruncation(_buffer.begin() + before, _buffer.end(), written);
+
+            BSONObjBuilder truncationInfo = _truncated.subobjStart(name);
+            truncationInfo.append("type"_sd, typeName(BSONType::String));
+            truncationInfo.append("size"_sd, static_cast<int64_t>(wouldWrite));
+            truncationInfo.done();
 
             _buffer.resize(truncatedEnd - _buffer.begin());
         }
@@ -228,7 +239,9 @@ void JSONFormatter::format(fmt::memory_buffer& buffer,
         ? 0
         : (_maxAttributeSizeKB != 0 ? _maxAttributeSizeKB->loadRelaxed() * 1024
                                     : c::kDefaultMaxAttributeOutputSizeKB * 1024);
-    auto write = [&](StringData s) { buffer.append(s.rawData(), s.rawData() + s.size()); };
+    auto write = [&](StringData s) {
+        buffer.append(s.rawData(), s.rawData() + s.size());
+    };
 
     struct CommaTracker {
         StringData comma;
@@ -262,8 +275,16 @@ void JSONFormatter::format(fmt::memory_buffer& buffer,
         };
     };
 
-    auto strFn = [&](StringData s) { return [&, s] { write(s); }; };
-    auto escFn = [&](StringData s) { return [&, s] { str::escapeForJSON(buffer, s); }; };
+    auto strFn = [&](StringData s) {
+        return [&, s] {
+            write(s);
+        };
+    };
+    auto escFn = [&](StringData s) {
+        return [&, s] {
+            str::escapeForJSON(buffer, s);
+        };
+    };
     auto intFn = [&](auto x) {
         return [&, x] {
             fmt::format_int s{x};
@@ -295,18 +316,22 @@ void JSONFormatter::format(fmt::memory_buffer& buffer,
         };
     };
 
-    auto dateFn = [&](Date_t date) {
-        return jsobj([&, date](CommaTracker& tracker) {
-            field(tracker, "$date", quote([&, date] {
-                      write(StringData{DateStringBuffer{}.iso8601(date, local)});
+    auto dateFn = [&](Date_t dateToPrint) {
+        return jsobj([&, dateToPrint](CommaTracker& tracker) {
+            field(tracker, "$date", quote([&, dateToPrint] {
+                      write(StringData{DateStringBuffer{}.iso8601(dateToPrint, local)});
                   }));
         });
     };
     auto bsonObjFn = [&](BSONObj o) {
-        return [&, o] { o.jsonStringBuffer(kFmt, 0, false, buffer, 0); };
+        return [&, o] {
+            o.jsonStringBuffer(kFmt, 0, false, buffer, 0);
+        };
     };
     auto bsonArrFn = [&](BSONArray a) {
-        return [&, a] { a.jsonStringBuffer(kFmt, 0, true, buffer, 0); };
+        return [&, a] {
+            a.jsonStringBuffer(kFmt, 0, true, buffer, 0);
+        };
     };
 
     jsobj([&](CommaTracker& top) {

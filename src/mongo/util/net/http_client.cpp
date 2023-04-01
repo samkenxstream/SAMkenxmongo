@@ -43,6 +43,13 @@ void registerHTTPClientProvider(HttpClientProvider* factory) {
     _factory = factory;
 }
 
+Status HttpClient::endpointIsHTTPS(StringData url) {
+    if (url.startsWith("https://")) {
+        return Status::OK();
+    }
+    return Status(ErrorCodes::IllegalOperation, "Endpoint is not HTTPS");
+}
+
 std::unique_ptr<HttpClient> HttpClient::create() {
     invariant(_factory != nullptr);
     return _factory->create();

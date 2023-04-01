@@ -32,14 +32,14 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/s/resharding/common_types.idl"
 
 commands:
   reshardCollection:
     description: "The public reshardCollection command on mongos."
     command_name: reshardCollection
-    strict: false
+    strict: true
     namespace: type
     api_version: ""
     type: namespacestring

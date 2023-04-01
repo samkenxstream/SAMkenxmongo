@@ -127,11 +127,6 @@ public:
     /**
      * The minValid value is the earliest (minimum) OpTime that must be applied in order to
      * consider the dataset consistent.
-     *   - This is set to the end of a batch before we begin applying a batch of oplog entries
-     *     since the oplog entries can be applied out of order.
-     *   - This is also set during rollback so we do not exit RECOVERING until we are consistent.
-     * If we crash while applying a batch, we apply from appliedThrough to minValid in order
-     * to be consistent. We may re-apply operations, but this is safe.
      *
      * Returns the minValid OpTime.
      */
@@ -146,9 +141,7 @@ public:
      * ignore the storage engine's rollback method by setting the 'alwaysAllowUntimestampedWrite'
      * parameter to true.
      */
-    virtual void setMinValid(OperationContext* opCtx,
-                             const OpTime& minValid,
-                             bool alwaysAllowUntimestampedWrite = false) = 0;
+    virtual void setMinValid(OperationContext* opCtx, const OpTime& minValid) = 0;
 
     // -------- Oplog Truncate After Point ----------
 

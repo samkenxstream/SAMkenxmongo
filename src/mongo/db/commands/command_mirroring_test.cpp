@@ -32,9 +32,9 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -61,7 +61,7 @@ public:
         bob << commandName() << coll;
         bob << "lsid" << _lsid.toBSON();
 
-        for (auto arg : args) {
+        for (const auto& arg : args) {
             bob << arg.firstElement();
         }
 
@@ -117,7 +117,7 @@ public:
     OpMsgRequest makeCommand(std::string coll, std::vector<BSONObj> updates) override {
         std::vector<BSONObj> args;
         if (shardVersion) {
-            args.push_back(shardVersion.get());
+            args.push_back(shardVersion.value());
         }
         auto request = CommandMirroringTest::makeCommand(coll, args);
 
@@ -233,7 +233,7 @@ public:
 
     void checkFieldNamesAreAllowed(BSONObj& mirroredObj) {
         const auto possibleKeys = getAllowedKeys();
-        for (auto key : mirroredObj.getFieldNames<std::set<std::string>>()) {
+        for (const auto& key : mirroredObj.getFieldNames<std::set<std::string>>()) {
             ASSERT(std::find(possibleKeys.begin(), possibleKeys.end(), key) != possibleKeys.end());
         }
     }

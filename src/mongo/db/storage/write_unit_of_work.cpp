@@ -27,17 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/write_unit_of_work.h"
 
-#include "mongo/db/batched_write_context.h"
-#include "mongo/db/catalog/uncommitted_collections.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/time_support.h"
 
@@ -48,21 +44,19 @@ MONGO_FAIL_POINT_DEFINE(sleepBeforeCommit);
 WriteUnitOfWork::WriteUnitOfWork(OperationContext* opCtx, bool groupOplogEntries)
     : _opCtx(opCtx),
       _toplevel(opCtx->_ruState == RecoveryUnitState::kNotInUnitOfWork),
-      _groupOplogEntries(groupOplogEntries) {
-    uassert(ErrorCodes::IllegalOperation,
-            "Cannot execute a write operation in read-only mode",
-            !storageGlobalParams.readOnly);
-    // Grouping oplog entries doesn't support WUOW nesting (e.g. multi-doc transactions).
+      _groupOplogEntries(groupOplogEntries) {  // Grouping oplog entries doesn't support WUOW
+                                               // nesting (e.g. multi-doc transactions).
     invariant(_toplevel || !_groupOplogEntries);
 
     if (_groupOplogEntries) {
-        auto& batchedWriteContext = BatchedWriteContext::get(_opCtx);
-        batchedWriteContext.setWritesAreBatched(true);
+        const auto opObserver = _opCtx->getServiceContext()->getOpObserver();
+        invariant(opObserver);
+        opObserver->onBatchedWriteStart(_opCtx);
     }
 
     _opCtx->lockState()->beginWriteUnitOfWork();
     if (_toplevel) {
-        _opCtx->recoveryUnit()->beginUnitOfWork(_opCtx);
+        _opCtx->recoveryUnit()->beginUnitOfWork(_opCtx->readOnly());
         _opCtx->_ruState = RecoveryUnitState::kActiveUnitOfWork;
     }
     // Make sure we don't silently proceed after a previous WriteUnitOfWork under the same parent
@@ -71,22 +65,28 @@ WriteUnitOfWork::WriteUnitOfWork(OperationContext* opCtx, bool groupOplogEntries
 }
 
 WriteUnitOfWork::~WriteUnitOfWork() {
-    dassert(!storageGlobalParams.readOnly);
     if (!_released && !_committed) {
         invariant(_opCtx->_ruState != RecoveryUnitState::kNotInUnitOfWork);
-        if (_toplevel) {
-            _opCtx->recoveryUnit()->abortUnitOfWork();
-            _opCtx->_ruState = RecoveryUnitState::kNotInUnitOfWork;
+        if (!_opCtx->readOnly()) {
+            if (_toplevel) {
+                // Abort unit of work and execute rollback handlers
+                _opCtx->recoveryUnit()->abortUnitOfWork();
+                _opCtx->_ruState = RecoveryUnitState::kNotInUnitOfWork;
+            } else {
+                _opCtx->_ruState = RecoveryUnitState::kFailedUnitOfWork;
+            }
         } else {
-            _opCtx->_ruState = RecoveryUnitState::kFailedUnitOfWork;
+            // Clear the readOnly state and execute rollback handlers in readOnly mode.
+            _opCtx->recoveryUnit()->endReadOnlyUnitOfWork();
+            _opCtx->recoveryUnit()->abortRegisteredChanges();
         }
         _opCtx->lockState()->endWriteUnitOfWork();
     }
 
     if (_groupOplogEntries) {
-        auto& batchedWriteContext = BatchedWriteContext::get(_opCtx);
-        batchedWriteContext.clearBatchedOperations(_opCtx);
-        batchedWriteContext.setWritesAreBatched(false);
+        const auto opObserver = _opCtx->getServiceContext()->getOpObserver();
+        invariant(opObserver);
+        opObserver->onBatchedWriteAbort(_opCtx);
     }
 }
 
@@ -136,8 +136,18 @@ void WriteUnitOfWork::commit() {
             sleepFor(Milliseconds(100));
         }
 
+        // Execute preCommit hooks before committing the transaction. This is an opportunity to
+        // throw or do any last changes before committing.
         _opCtx->recoveryUnit()->runPreCommitHooks(_opCtx);
-        _opCtx->recoveryUnit()->commitUnitOfWork();
+        if (!_opCtx->readOnly()) {
+            // Commit unit of work and execute commit or rollback handlers depending on whether the
+            // commit was successful.
+            _opCtx->recoveryUnit()->commitUnitOfWork();
+        } else {
+            // Just execute commit handlers in readOnly mode
+            _opCtx->recoveryUnit()->commitRegisteredChanges(boost::none);
+        }
+
         _opCtx->_ruState = RecoveryUnitState::kNotInUnitOfWork;
     }
     _opCtx->lockState()->endWriteUnitOfWork();

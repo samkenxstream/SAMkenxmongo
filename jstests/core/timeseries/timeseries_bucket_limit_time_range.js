@@ -1,10 +1,11 @@
 /**
  * Tests maximum time-range of measurements held in each bucket in a time-series buckets collection.
  * @tags: [
+ *   # This test depends on certain writes ending up in the same bucket. Stepdowns may result in
+ *   # writes splitting between two primaries, and thus different buckets.
  *   does_not_support_stepdowns,
- *   does_not_support_transactions,
- *   requires_getmore,
- *   requires_fcv_52,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 (function() {
@@ -13,8 +14,8 @@
 load("jstests/core/timeseries/libs/timeseries.js");  // For 'TimeseriesTest'.
 
 TimeseriesTest.run((insert) => {
-    const isTimeseriesBucketCompressionEnabled =
-        TimeseriesTest.timeseriesBucketCompressionEnabled(db);
+    const isTimeseriesScalabilityImprovementsEnabled =
+        TimeseriesTest.timeseriesScalabilityImprovementsEnabled(db);
 
     const collNamePrefix = 'timeseries_bucket_limit_time_range_';
 
@@ -86,9 +87,14 @@ TimeseriesTest.run((insert) => {
         assert.eq(docTimes[2],
                   bucketDocs[0].control.max[timeFieldName],
                   'invalid control.max for time in first bucket: ' + tojson(bucketDocs[0].control));
-        assert.eq(isTimeseriesBucketCompressionEnabled ? 2 : 1,
-                  bucketDocs[0].control.version,
-                  'unexpected control.version in first bucket: ' + tojson(bucketDocs));
+        if (!isTimeseriesScalabilityImprovementsEnabled) {  // If enabled, we will archive instead
+                                                            // of closing, but another simultaneous
+                                                            // operation may close it in the
+                                                            // background.
+            assert.eq(2,
+                      bucketDocs[0].control.version,
+                      'unexpected control.version in first bucket: ' + tojson(bucketDocs));
+        }
 
         // Second bucket should contain the remaining document.
         assert.eq(numDocs - 1,

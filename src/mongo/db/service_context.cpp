@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -40,7 +39,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/client.h"
 #include "mongo/db/default_baton.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
 #include "mongo/logv2/log.h"
@@ -53,6 +52,9 @@
 #include "mongo/util/system_clock_source.h"
 #include "mongo/util/system_tick_source.h"
 #include <iostream>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 namespace {
@@ -98,7 +100,7 @@ void setGlobalServiceContext(ServiceContext::UniqueServiceContext&& serviceConte
 
 ServiceContext::ServiceContext()
     : _opIdRegistry(UniqueOperationIdRegistry::create()),
-      _tickSource(std::make_unique<SystemTickSource>()),
+      _tickSource(makeSystemTickSource()),
       _fastClockSource(std::make_unique<SystemClockSource>()),
       _preciseClockSource(std::make_unique<SystemClockSource>()) {}
 
@@ -167,8 +169,8 @@ void onCreate(T* object, const ObserversContainer& observers) {
 
 }  // namespace
 
-ServiceContext::UniqueClient ServiceContext::makeClient(std::string desc,
-                                                        transport::SessionHandle session) {
+ServiceContext::UniqueClient ServiceContext::makeClient(
+    std::string desc, std::shared_ptr<transport::Session> session) {
     std::unique_ptr<Client> client(new Client(std::move(desc), this, std::move(session)));
     onCreate(client.get(), _clientObservers);
     {
@@ -488,7 +490,8 @@ ServiceContext::ConstructorActionRegisterer::ConstructorActionRegisterer(
     ConstructorAction constructor,
     DestructorAction destructor) {
     if (!destructor)
-        destructor = [](ServiceContext*) {};
+        destructor = [](ServiceContext*) {
+        };
     _registerer.emplace(
         std::move(name),
         [this, constructor, destructor](InitializerContext*) {

@@ -1,11 +1,14 @@
 // Tests of $changeStream notifications for metadata operations.
 // Do not run in whole-cluster passthrough since this test assumes that the change stream will be
 // invalidated by a database drop.
-// @tags: [do_not_run_in_whole_cluster_passthrough]
+// @tags: [
+//   do_not_run_in_whole_cluster_passthrough,
+//   requires_fcv_63,
+// ]
 (function() {
 "use strict";
 
-load("jstests/libs/change_stream_util.js");        // For isChangeStreamsOptimizationEnabled.
+load("jstests/libs/change_stream_util.js");        // For ChangeStreamTest.
 load('jstests/replsets/libs/two_phase_drops.js');  // For 'TwoPhaseDropCollectionTest'.
 load("jstests/libs/collection_drop_recreate.js");  // For assert[Drop|Create]Collection.
 load("jstests/libs/fixture_helpers.js");           // For isSharded.
@@ -78,15 +81,9 @@ const resumeToken = changes[0]._id;
 const resumeTokenDrop = changes[3]._id;
 const resumeTokenInvalidate = changes[4]._id;
 
-// Verify we can startAfter the invalidate. We should see one drop event for every other shard
-// that the collection was present on, or nothing if the collection was not sharded. This test
+// Verify we can startAfter the invalidate, but no new events may be retrieved. This test
 // exercises the bug described in SERVER-41196.
 const restartedStream = coll.watch([], {startAfter: resumeTokenInvalidate});
-for (let i = 0; i < numShards - 1; ++i) {
-    assert.soon(() => restartedStream.hasNext());
-    const nextEvent = restartedStream.next();
-    assert.eq(nextEvent.operationType, "drop", () => tojson(nextEvent));
-}
 assert(!restartedStream.hasNext(), () => tojson(restartedStream.next()));
 
 // Verify that we can resume a stream after a collection drop without an explicit collation.
@@ -124,17 +121,15 @@ assert.commandFailedWithCode(db.runCommand({
 }),
                              ErrorCodes.InvalidResumeToken);
 
-// Test that if change stream optimization is enabled, then even after the 'invalidate' event has
-// been filtered out, the cursor should hold the resume token of the 'invalidate' event.
-if (isChangeStreamsOptimizationEnabled(db)) {
-    const resumeStream =
-        coll.watch([{$match: {operationType: "DummyOperationType"}}], {resumeAfter: resumeToken});
-    assert.soon(() => {
-        assert(!resumeStream.hasNext());
-        return resumeStream.isExhausted();
-    });
-    assert.eq(resumeStream.getResumeToken(), resumeTokenInvalidate);
-}
+// Even after the 'invalidate' event has been filtered out, the cursor should hold the resume token
+// of the 'invalidate' event.
+const resumeStream =
+    coll.watch([{$match: {operationType: "DummyOperationType"}}], {resumeAfter: resumeToken});
+assert.soon(() => {
+    assert(!resumeStream.hasNext());
+    return resumeStream.isExhausted();
+});
+assert.eq(resumeStream.getResumeToken(), resumeTokenInvalidate);
 
 // Test resuming the change stream from the collection drop using 'startAfter'.
 assertResumeExpected({

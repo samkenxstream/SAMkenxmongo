@@ -27,15 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/resharding/resharding_donor_recipient_common.h"
 
 #include <fmt/format.h>
 
 #include "mongo/db/persistent_task_store.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
@@ -44,6 +41,8 @@
 #include "mongo/s/grid.h"
 #include "mongo/stdx/unordered_set.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
+
 namespace mongo {
 namespace resharding {
 
@@ -51,9 +50,34 @@ using DonorStateMachine = ReshardingDonorService::DonorStateMachine;
 using RecipientStateMachine = ReshardingRecipientService::RecipientStateMachine;
 
 namespace {
+MONGO_FAIL_POINT_DEFINE(reshardingInterruptAfterInsertStateMachineDocument);
+
 using namespace fmt::literals;
 
 const Backoff kExponentialBackoff(Seconds(1), Milliseconds::max());
+
+template <class StateMachine, class ReshardingDocument>
+void ensureStateDocumentInserted(OperationContext* opCtx, const ReshardingDocument& doc) {
+    try {
+        StateMachine::insertStateDocument(opCtx, doc);
+    } catch (const ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
+        // It's possible that the state document was already previously inserted in the following
+        // cases:
+        // 1. The document was inserted previously, but the opCtx was interrupted before the
+        // state machine was started in-memory with getOrCreate(), e.g. due to a chunk migration
+        // (see SERVER-74647)
+        // 2. Similar to the ErrorCategory::NotPrimaryError clause below, it is
+        // theoretically possible for a series of stepdowns and step-ups to lead a scenario where a
+        // stale but now re-elected primary attempts to insert the state document when another node
+        // which was primary had already done so. Again, rather than attempt to prevent replica set
+        // member state transitions during the shard version refresh, we instead swallow the
+        // DuplicateKey exception. This is safe because PrimaryOnlyService::onStepUp() will have
+        // constructed a new instance of the resharding state machine.
+        auto dupeKeyInfo = ex.extraInfo<DuplicateKeyErrorInfo>();
+        invariant(dupeKeyInfo->getDuplicatedKeyValue().binaryEqual(
+            BSON("_id" << doc.getReshardingUUID())));
+    }
+}
 
 /*
  * Creates a ReshardingStateMachine if this node is primary and the ReshardingStateMachine doesn't
@@ -67,7 +91,10 @@ void createReshardingStateMachine(OperationContext* opCtx, const ReshardingDocum
         // Inserting the resharding state document must happen synchronously with the shard version
         // refresh for the w:majority wait from the resharding coordinator to mean that this replica
         // set shard cannot forget about being a participant.
-        StateMachine::insertStateDocument(opCtx, doc);
+        ensureStateDocumentInserted<StateMachine>(opCtx, doc);
+
+        reshardingInterruptAfterInsertStateMachineDocument.execute(
+            [&opCtx](const BSONObj& data) { opCtx->markKilled(); });
 
         auto registry = repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext());
         auto service = registry->lookupServiceByName(Service::kServiceName);
@@ -82,17 +109,6 @@ void createReshardingStateMachine(OperationContext* opCtx, const ReshardingDocum
         // secondary (or primary which stepped down) must do for an active resharding operation upon
         // refreshing its shard version. The primary is solely responsible for advancing the
         // participant state as a result of the shard version refresh.
-    } catch (const ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
-        // Similar to the ErrorCategory::NotPrimaryError clause above, it is theoretically possible
-        // for a series of stepdowns and step-ups to lead a scenario where a stale but now
-        // re-elected primary attempts to insert the state document when another node which was
-        // primary had already done so. Again, rather than attempt to prevent replica set member
-        // state transitions during the shard version refresh, we instead swallow the DuplicateKey
-        // exception. This is safe because PrimaryOnlyService::onStepUp() will have constructed a
-        // new instance of the resharding state machine.
-        auto dupeKeyInfo = ex.extraInfo<DuplicateKeyErrorInfo>();
-        invariant(dupeKeyInfo->getDuplicatedKeyValue().binaryEqual(
-            BSON("_id" << doc.getReshardingUUID())));
     }
 }
 
@@ -137,6 +153,13 @@ void processReshardingFieldsForDonorCollection(OperationContext* opCtx,
     if (!metadata.currentShardHasAnyChunks()) {
         return;
     }
+
+    // We clear the routing information for the temporary resharding namespace to ensure this donor
+    // shard primary will refresh from the config server and see the chunk distribution for the new
+    // resharding operation.
+    auto* catalogCache = Grid::get(opCtx)->catalogCache();
+    catalogCache->invalidateCollectionEntry_LINEARIZABLE(
+        reshardingFields.getDonorFields()->getTempReshardingNss());
 
     auto donorDoc = constructDonorDocumentFromReshardingFields(nss, metadata, reshardingFields);
     createReshardingStateMachine<ReshardingDonorService,
@@ -250,9 +273,7 @@ ReshardingDonorDocument constructDonorDocumentFromReshardingFields(
                                  sourceUUID,
                                  reshardingFields.getDonorFields()->getTempReshardingNss(),
                                  reshardingFields.getDonorFields()->getReshardingKey().toBSON());
-    if (ShardingDataTransformMetrics::isEnabled()) {
-        commonMetadata.setStartTime(reshardingFields.getStartTime());
-    }
+    commonMetadata.setStartTime(reshardingFields.getStartTime());
     donorDoc.setCommonReshardingMetadata(std::move(commonMetadata));
 
     return donorDoc;
@@ -263,28 +284,33 @@ ReshardingRecipientDocument constructRecipientDocumentFromReshardingFields(
     const NamespaceString& nss,
     const CollectionMetadata& metadata,
     const ReshardingFields& reshardingFields) {
+    const auto& recipientFields = reshardingFields.getRecipientFields();
     // The recipient state machines are created before the donor shards are prepared to donate but
     // will remain idle until the donor shards are prepared to donate.
-    invariant(!reshardingFields.getRecipientFields()->getCloneTimestamp());
+    invariant(!recipientFields->getCloneTimestamp());
 
     RecipientShardContext recipientCtx;
     recipientCtx.setState(RecipientStateEnum::kAwaitingFetchTimestamp);
 
-    auto recipientDoc = ReshardingRecipientDocument{
-        std::move(recipientCtx),
-        reshardingFields.getRecipientFields()->getDonorShards(),
-        reshardingFields.getRecipientFields()->getMinimumOperationDurationMillis()};
+    auto recipientDoc =
+        ReshardingRecipientDocument{std::move(recipientCtx),
+                                    recipientFields->getDonorShards(),
+                                    recipientFields->getMinimumOperationDurationMillis()};
 
-    auto sourceNss = reshardingFields.getRecipientFields()->getSourceNss();
-    auto sourceUUID = reshardingFields.getRecipientFields()->getSourceUUID();
+    auto sourceNss = recipientFields->getSourceNss();
+    auto sourceUUID = recipientFields->getSourceUUID();
     auto commonMetadata = CommonReshardingMetadata(reshardingFields.getReshardingUUID(),
                                                    sourceNss,
                                                    sourceUUID,
                                                    nss,
                                                    metadata.getShardKeyPattern().toBSON());
-    if (ShardingDataTransformMetrics::isEnabled()) {
-        commonMetadata.setStartTime(reshardingFields.getStartTime());
-    }
+    commonMetadata.setStartTime(reshardingFields.getStartTime());
+
+    ReshardingRecipientMetrics metrics;
+    metrics.setApproxDocumentsToCopy(recipientFields->getApproxDocumentsToCopy());
+    metrics.setApproxBytesToCopy(recipientFields->getApproxBytesToCopy());
+    recipientDoc.setMetrics(std::move(metrics));
+
     recipientDoc.setCommonReshardingMetadata(std::move(commonMetadata));
 
     return recipientDoc;
@@ -327,10 +353,26 @@ void clearFilteringMetadata(OperationContext* opCtx, bool scheduleAsyncRefresh) 
             return true;
         });
     }
+    clearFilteringMetadata(opCtx, namespacesToRefresh, scheduleAsyncRefresh);
+}
+
+void clearFilteringMetadata(OperationContext* opCtx,
+                            stdx::unordered_set<NamespaceString> namespacesToRefresh,
+                            bool scheduleAsyncRefresh) {
+    auto* catalogCache = Grid::get(opCtx)->catalogCache();
 
     for (const auto& nss : namespacesToRefresh) {
+        if (nss.isTemporaryReshardingCollection()) {
+            // We clear the routing information for the temporary resharding namespace to ensure all
+            // new donor shard primaries will refresh from the config server and see the chunk
+            // distribution for the ongoing resharding operation.
+            catalogCache->invalidateCollectionEntry_LINEARIZABLE(nss);
+            catalogCache->invalidateIndexEntry_LINEARIZABLE(nss);
+        }
+
         AutoGetCollection autoColl(opCtx, nss, MODE_IX);
-        CollectionShardingRuntime::get(opCtx, nss)->clearFilteringMetadata(opCtx);
+        CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(opCtx, nss)
+            ->clearFilteringMetadata(opCtx);
 
         if (!scheduleAsyncRefresh) {
             continue;
@@ -344,7 +386,8 @@ void clearFilteringMetadata(OperationContext* opCtx, bool scheduleAsyncRefresh) 
             }
 
             auto opCtx = tc->makeOperationContext();
-            onShardVersionMismatch(opCtx.get(), nss, boost::none /* shardVersionReceived */);
+            onCollectionPlacementVersionMismatch(
+                opCtx.get(), nss, boost::none /* chunkVersionReceived */);
         })
             .until([](const Status& status) {
                 if (!status.isOK()) {

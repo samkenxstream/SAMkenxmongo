@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -38,13 +37,16 @@
 #include "mongo/db/service_context.h"
 #include "mongo/util/str.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+
 namespace mongo {
 
 void IndexBuildsCoordinatorEmbedded::shutdown(OperationContext* opCtx) {}
 
 StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>
 IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
-                                                std::string dbName,
+                                                const DatabaseName& dbName,
                                                 const UUID& collectionUUID,
                                                 const std::vector<BSONObj>& specs,
                                                 const UUID& buildUUID,
@@ -62,7 +64,7 @@ IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
         invariant(statusWithOptionalResult.getValue()->isReady());
         // The requested index (specs) are already built or are being built. Return success early
         // (this is v4.0 behavior compatible).
-        return statusWithOptionalResult.getValue().get();
+        return statusWithOptionalResult.getValue().value();
     }
 
     auto status = _setUpIndexBuild(opCtx, buildUUID, Timestamp(), indexBuildOptions);
@@ -77,13 +79,16 @@ IndexBuildsCoordinatorEmbedded::startIndexBuild(OperationContext* opCtx,
 
 StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>>
 IndexBuildsCoordinatorEmbedded::resumeIndexBuild(OperationContext* opCtx,
-                                                 std::string dbName,
+                                                 const DatabaseName& dbName,
                                                  const UUID& collectionUUID,
                                                  const std::vector<BSONObj>& specs,
                                                  const UUID& buildUUID,
                                                  const ResumeIndexInfo& resumeInfo) {
     MONGO_UNREACHABLE;
 }
+
+void IndexBuildsCoordinatorEmbedded::_signalPrimaryForAbortAndWaitForExternalAbort(
+    OperationContext* opCtx, ReplIndexBuildState* replState, const Status& abortStatus) {}
 
 void IndexBuildsCoordinatorEmbedded::_signalPrimaryForCommitReadiness(
     OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {}
@@ -92,6 +97,13 @@ void IndexBuildsCoordinatorEmbedded::_waitForNextIndexBuildActionAndCommit(
     OperationContext* opCtx,
     std::shared_ptr<ReplIndexBuildState> replState,
     const IndexBuildOptions& indexBuildOptions) {}
+
+Status IndexBuildsCoordinatorEmbedded::voteAbortIndexBuild(OperationContext* opCtx,
+                                                           const UUID& buildUUID,
+                                                           const HostAndPort& hostAndPort,
+                                                           const StringData& reason) {
+    MONGO_UNREACHABLE;
+}
 
 Status IndexBuildsCoordinatorEmbedded::voteCommitIndexBuild(OperationContext* opCtx,
                                                             const UUID& buildUUID,

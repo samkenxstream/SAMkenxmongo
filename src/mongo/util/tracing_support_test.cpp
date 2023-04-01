@@ -26,17 +26,21 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include <memory>
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/logv2/log.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/clock_source_mock.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/tick_source_mock.h"
 #include "mongo/util/tracing_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 /*
  * We use `NOLINT` throughout this file since usages of `TracerProvider` aren't meant to be used in
@@ -45,26 +49,29 @@
 
 namespace mongo {
 namespace {
-std::unique_ptr<ClockSource> makeClockSource() {
-    return std::make_unique<ClockSourceMock>();
+
+using TickSourceMockMicros = TickSourceMock<Microseconds>;
+
+std::unique_ptr<TickSource> makeTickSource() {
+    return std::make_unique<TickSourceMockMicros>();
 }
 
-void advanceTime(std::shared_ptr<Tracer>& tracer, Milliseconds duration) {
-    ClockSourceMock* clk = dynamic_cast<ClockSourceMock*>(tracer->getClockSource());
+void advanceTime(std::shared_ptr<Tracer>& tracer, Microseconds duration) {
+    TickSourceMockMicros* clk = dynamic_cast<TickSourceMockMicros*>(tracer->getTickSource());
     clk->advance(duration);
 }
 
 // Uses the mocked clock source to initialize the trace provider.
 MONGO_INITIALIZER_GENERAL(InitializeTraceProviderForTest, (), ("InitializeTraceProvider"))
 (InitializerContext*) {
-    TracerProvider::initialize(makeClockSource());  // NOLINT
+    TracerProvider::initialize(makeTickSource());  // NOLINT
 }
 
 static constexpr auto kTracerName = "MyTracer";
 }  // namespace
 
 DEATH_TEST(TracingSupportTest, CannotInitializeTwice, "invariant") {
-    TracerProvider::initialize(makeClockSource());  // NOLINT
+    TracerProvider::initialize(makeTickSource());  // NOLINT
 }
 
 DEATH_TEST(TracingSupportTest, SpansMustCloseInOrder, "invariant") {
@@ -88,7 +95,7 @@ TEST(TracingSupportTest, TraceIsEmptyWithActiveSpans) {
 TEST(TracingSupportTest, BasicUsage) {
     const auto kSpanDuration = Seconds(5);
     auto tracer = TracerProvider::get().getTracer(kTracerName);  // NOLINT
-    const auto startTime = tracer->getClockSource()->now();
+    const auto startTicks = tracer->getTickSource()->getTicks();
 
     {
         auto rootSpan = tracer->startSpan("root");
@@ -112,23 +119,85 @@ TEST(TracingSupportTest, BasicUsage) {
     const auto trace = tracer->getLatestTrace();
     ASSERT_TRUE(trace);
 
+    const auto kSpanDurationMicros = durationCount<Microseconds>(kSpanDuration);
+
     const auto expected = BSON(
-        "tracer"
-        << kTracerName << "root"
-        << BSON("started"
-                << startTime << "spans"
-                << BSON("child" << BSON(
-                            "started"
-                            << startTime + kSpanDuration << "spans"
-                            << BSON("grand child #1"
-                                    << BSON("started" << startTime + 2 * kSpanDuration << "stopped"
-                                                      << startTime + 3 * kSpanDuration)
-                                    << "grand child #2"
-                                    << BSON("started" << startTime + 3 * kSpanDuration << "stopped"
-                                                      << startTime + 4 * kSpanDuration))
-                            << "stopped" << startTime + 4 * kSpanDuration))
-                << "stopped" << startTime + 4 * kSpanDuration));
-    ASSERT_BSONOBJ_EQ(expected, trace.get());
+        "tracer" << kTracerName << "root"
+                 << BSON("startedMicros"
+                         << startTicks << "spans"
+                         << BSON("child" << BSON(
+                                     "startedMicros"
+                                     << startTicks + kSpanDurationMicros << "spans"
+                                     << BSON("grand child #1"
+                                             << BSON("startedMicros"
+                                                     << startTicks + 2 * kSpanDurationMicros
+                                                     << "stoppedMicros"
+                                                     << startTicks + 3 * kSpanDurationMicros)
+                                             << "grand child #2"
+                                             << BSON("startedMicros"
+                                                     << startTicks + 3 * kSpanDurationMicros
+                                                     << "stoppedMicros"
+                                                     << startTicks + 4 * kSpanDurationMicros))
+                                     << "stoppedMicros" << startTicks + 4 * kSpanDurationMicros))
+                         << "stoppedMicros" << startTicks + 4 * kSpanDurationMicros));
+    ASSERT_BSONOBJ_EQ(expected, trace.value());
+}
+
+BSONObj beginEvent(StringData name, int64_t time) {
+    return BSON("name" << name << "ph"
+                       << "B"
+                       << "ts" << time << "pid" << 1 << "tid" << 1);
+}
+
+BSONObj endEvent(int64_t time) {
+    return BSON("ph"
+                << "E"
+                << "ts" << time << "pid" << 1 << "tid" << 1);
+}
+
+TEST(TracingSupportTest, BasicEventUsage) {
+    const auto kSpanDuration = Seconds(5);
+    auto tracer = TracerProvider::get().getEventTracer(kTracerName);  // NOLINT
+
+    {
+        auto rootSpan = tracer->startSpan("root");
+        advanceTime(tracer, kSpanDuration);
+        {
+            auto childSpan = tracer->startSpan("child");
+            advanceTime(tracer, kSpanDuration);
+            {
+                {
+                    auto grandChildOne = tracer->startSpan("grand child #1");
+                    advanceTime(tracer, kSpanDuration);
+                }
+                {
+                    auto grandChildTwo = tracer->startSpan("grand child #2");
+                    advanceTime(tracer, kSpanDuration);
+                }
+            }
+        }
+    }
+
+    const auto trace = tracer->getLatestTrace();
+    ASSERT_TRUE(trace);
+
+    const auto kSpanDurationMillis = durationCount<Milliseconds>(kSpanDuration);
+
+    const auto expected =
+        BSON("traceEvents" << BSON_ARRAY(beginEvent("root", 0)
+                                         << beginEvent("child", 1 * kSpanDurationMillis) <<
+
+                                         beginEvent("grand child #1", 2 * kSpanDurationMillis)
+                                         << endEvent(3 * kSpanDurationMillis) <<
+
+                                         beginEvent("grand child #2", 3 * kSpanDurationMillis)
+                                         << endEvent(4 * kSpanDurationMillis) <<
+
+                                         endEvent(4 * kSpanDurationMillis)
+                                         << endEvent(4 * kSpanDurationMillis))
+                           << "displayTimeUnit"
+                           << "ms");
+    ASSERT_BSONOBJ_EQ(expected, trace.value());
 }
 
 }  // namespace mongo

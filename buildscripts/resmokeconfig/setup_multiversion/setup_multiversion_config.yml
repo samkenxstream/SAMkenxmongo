@@ -190,16 +190,6 @@ evergreen_buildvariants:
     platform: suse15
     architecture: x86_64
 
-  - name: debian92
-    edition: targeted
-    platform: debian92
-    architecture: x86_64
-
-  - name: enterprise-debian92-64
-    edition: enterprise
-    platform: debian92
-    architecture: x86_64
-
   - name: debian10
     edition: targeted
     platform: debian10
@@ -208,6 +198,16 @@ evergreen_buildvariants:
   - name: enterprise-debian10-64
     edition: enterprise
     platform: debian10
+    architecture: x86_64
+
+  - name: debian11
+    edition: targeted
+    platform: debian11
+    architecture: x86_64
+
+  - name: enterprise-debian11-64
+    edition: enterprise
+    platform: debian11
     architecture: x86_64
 
   - name: windows

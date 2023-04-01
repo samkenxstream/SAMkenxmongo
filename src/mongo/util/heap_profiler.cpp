@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
-
 #include "mongo/platform/basic.h"
 
 #include <algorithm>
@@ -42,14 +40,18 @@
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/tcmalloc_parameters_gen.h"
 
+#include <MurmurHash3.h>
 #include <gperftools/malloc_hook.h>
-#include <third_party/murmurhash3/MurmurHash3.h>
+
+#if defined(_POSIX_VERSION) && defined(MONGO_CONFIG_HAVE_EXECINFO_BACKTRACE)
+#include <dlfcn.h>
+#include <execinfo.h>
+#endif
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 // for dlfcn.h and backtrace
 #if defined(_POSIX_VERSION) && defined(MONGO_CONFIG_HAVE_EXECINFO_BACKTRACE)
-
-#include <dlfcn.h>
-#include <execinfo.h>
 
 //
 // Sampling heap profiler
@@ -627,7 +629,9 @@ private:
         // Sort the stacks and find enough stacks to account for at least 99% of the active bytes
         // deem any stack that has ever met this criterion as "important".
         // Using heap structure to avoid comparing elements that won't make the cut anyway.
-        auto heapCompare = [](auto&& a, auto&& b) { return a.activeBytes > b.activeBytes; };
+        auto heapCompare = [](auto&& a, auto&& b) {
+            return a.activeBytes > b.activeBytes;
+        };
         std::make_heap(heap.begin(), heapEnd, heapCompare);
 
         size_t threshold = totalActiveBytes * 0.99;

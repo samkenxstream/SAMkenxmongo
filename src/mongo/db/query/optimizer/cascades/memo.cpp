@@ -27,111 +27,78 @@
  *    it in the license file.
  */
 
+#include "mongo/db/query/optimizer/cascades/memo.h"
+
 #include <set>
 
-#include "mongo/db/query/optimizer/cascades/memo.h"
 #include "mongo/db/query/optimizer/explain.h"
+#include "mongo/db/query/optimizer/reference_tracker.h"
 #include "mongo/db/query/optimizer/utils/abt_hash.h"
 #include "mongo/db/query/optimizer/utils/utils.h"
 
+
 namespace mongo::optimizer::cascades {
 
-size_t MemoNodeRefHash::operator()(const ABT::reference_type& nodeRef) const {
-    // Compare delegator as well.
-    return ABTHashGenerator::generate(nodeRef);
+PhysOptimizationResult& PhysNodes::addOptimizationResult(properties::PhysProps properties,
+                                                         CostType costLimit) {
+    const size_t index = _physicalNodes.size();
+    _physPropsToPhysNodeMap.emplace(properties, index);
+    _physicalQueues.emplace_back(std::make_unique<PhysQueueAndImplPos>());
+    return *_physicalNodes.emplace_back(std::make_unique<PhysOptimizationResult>(
+        index, std::move(properties), std::move(costLimit)));
 }
 
-bool MemoNodeRefCompare::operator()(const ABT::reference_type& left,
-                                    const ABT::reference_type& right) const {
-    // Deep comparison.
-    return left.follow() == right.follow();
+const PhysOptimizationResult& PhysNodes::at(const size_t index) const {
+    return *_physicalNodes.at(index);
 }
 
-ABT::reference_type OrderPreservingABTSet::at(const size_t index) const {
-    return _vector.at(index).ref();
+PhysOptimizationResult& PhysNodes::at(const size_t index) {
+    return *_physicalNodes.at(index);
 }
 
-std::pair<size_t, bool> OrderPreservingABTSet::emplace_back(ABT node) {
-    auto [index, found] = find(node.ref());
-    if (found) {
-        return {index, false};
+boost::optional<size_t> PhysNodes::find(const properties::PhysProps& props) const {
+    auto it = _physPropsToPhysNodeMap.find(props);
+    if (it == _physPropsToPhysNodeMap.cend()) {
+        return boost::none;
     }
-
-    const size_t id = _vector.size();
-    _vector.emplace_back(std::move(node));
-    _map.emplace(_vector.back().ref(), id);
-    return {id, true};
+    return it->second;
 }
 
-std::pair<size_t, bool> OrderPreservingABTSet::find(ABT::reference_type node) const {
-    auto it = _map.find(node);
-    if (it == _map.end()) {
-        return {0, false};
-    }
-
-    return {it->second, true};
+const PhysNodeVector& PhysNodes::getNodes() const {
+    return _physicalNodes;
 }
 
-void OrderPreservingABTSet::clear() {
-    _map.clear();
-    _vector.clear();
+const PhysQueueAndImplPos& PhysNodes::getQueue(size_t index) const {
+    return *_physicalQueues.at(index);
 }
 
-size_t OrderPreservingABTSet::size() const {
-    return _vector.size();
+PhysQueueAndImplPos& PhysNodes::getQueue(const size_t index) {
+    return *_physicalQueues.at(index);
 }
 
-const ABTVector& OrderPreservingABTSet::getVector() const {
-    return _vector;
+bool PhysNodes::isOptimized(const size_t index) const {
+    return getQueue(index)._queue.empty();
 }
 
-PhysRewriteEntry::PhysRewriteEntry(const double priority,
-                                   ABT node,
-                                   std::vector<std::pair<ABT*, properties::PhysProps>> childProps,
-                                   NodeCEMap nodeCEMap)
-    : _priority(priority),
-      _node(std::move(node)),
-      _childProps(std::move(childProps)),
-      _nodeCEMap(std::move(nodeCEMap)) {}
-
-PhysOptimizationResult::PhysOptimizationResult()
-    : PhysOptimizationResult(0, {}, CostType::kInfinity) {}
-
-PhysOptimizationResult::PhysOptimizationResult(size_t index,
-                                               properties::PhysProps physProps,
-                                               CostType costLimit)
-    : _index(index),
-      _physProps(std::move(physProps)),
-      _costLimit(std::move(costLimit)),
-      _nodeInfo(),
-      _rejectedNodeInfo(),
-      _lastImplementedNodePos(0),
-      _queue() {}
-
-bool PhysOptimizationResult::isOptimized() const {
-    return _queue.empty();
-}
-
-void PhysOptimizationResult::raiseCostLimit(CostType costLimit) {
-    _costLimit = costLimit;
+void PhysNodes::raiseCostLimit(const size_t index, CostType costLimit) {
+    at(index)._costLimit = costLimit;
     // Allow for re-optimization under the higher cost limit.
-    _lastImplementedNodePos = 0;
+    getQueue(index)._lastImplementedNodePos = 0;
 }
 
-bool PhysRewriteEntryComparator::operator()(const std::unique_ptr<PhysRewriteEntry>& x,
-                                            const std::unique_ptr<PhysRewriteEntry>& y) const {
-    // Lower numerical priority is considered last (and thus de-queued first).
-    return x->_priority > y->_priority;
+size_t PhysNodes::PhysPropsHasher::operator()(const properties::PhysProps& physProps) const {
+    return ABTHashGenerator::generateForPhysProps(physProps);
 }
 
 static ABT createBinderMap(const properties::LogicalProps& logicalProperties) {
-    const properties::ProjectionAvailability& projSet =
-        properties::getPropertyConst<properties::ProjectionAvailability>(logicalProperties);
-
     ProjectionNameVector projectionVector;
     ABTVector expressions;
 
-    ProjectionNameOrderedSet ordered = convertToOrderedSet(projSet.getProjections());
+    const auto& projSet =
+        properties::getPropertyConst<properties::ProjectionAvailability>(logicalProperties)
+            .getProjections();
+    ProjectionNameOrderedSet ordered{projSet.cbegin(), projSet.cend()};
+
     for (const ProjectionName& projection : ordered) {
         projectionVector.push_back(projection);
         expressions.emplace_back(make<Source>());
@@ -155,48 +122,29 @@ const ExpressionBinder& Group::binder() const {
     return *pointer;
 }
 
-PhysOptimizationResult& PhysNodes::addOptimizationResult(properties::PhysProps properties,
-                                                         CostType costLimit) {
-    const size_t index = _physicalNodes.size();
-    _physPropsToPhysNodeMap.emplace(properties, index);
-    return *_physicalNodes.emplace_back(std::make_unique<PhysOptimizationResult>(
-        index, std::move(properties), std::move(costLimit)));
-}
-
-const PhysOptimizationResult& PhysNodes::at(const size_t index) const {
-    return *_physicalNodes.at(index);
-}
-
-PhysOptimizationResult& PhysNodes::at(const size_t index) {
-    return *_physicalNodes.at(index);
-}
-
-std::pair<size_t, bool> PhysNodes::find(const properties::PhysProps& props) const {
-    auto it = _physPropsToPhysNodeMap.find(props);
-    if (it == _physPropsToPhysNodeMap.cend()) {
-        return {0, false};
-    }
-    return {it->second, true};
-}
-
-const PhysNodes::PhysNodeVector& PhysNodes::getNodes() const {
-    return _physicalNodes;
-}
-
-size_t PhysNodes::PhysPropsHasher::operator()(const properties::PhysProps& physProps) const {
-    return ABTHashGenerator::generateForPhysProps(physProps);
-}
-
+/**
+ * TODO SERVER-70407: Improve documentation around the Memo and related classes.
+ */
 class MemoIntegrator {
 public:
-    explicit MemoIntegrator(Memo& memo,
+    explicit MemoIntegrator(Memo::Context ctx,
+                            Memo& memo,
                             Memo::NodeTargetGroupMap targetGroupMap,
                             NodeIdSet& insertedNodeIds,
+                            const LogicalRewriteType rule,
                             const bool addExistingNodeWithNewChild)
-        : _memo(memo),
+        : _ctx(std::move(ctx)),
+          _memo(memo),
           _insertedNodeIds(insertedNodeIds),
           _targetGroupMap(std::move(targetGroupMap)),
+          _rule(rule),
           _addExistingNodeWithNewChild(addExistingNodeWithNewChild) {}
+
+    // This is a transient structure. We do not allow copying or moving.
+    MemoIntegrator(const MemoIntegrator& /*other*/) = delete;
+    MemoIntegrator(MemoIntegrator&& /*other*/) = delete;
+    MemoIntegrator& operator=(const MemoIntegrator& /*other*/) = delete;
+    MemoIntegrator& operator=(MemoIntegrator&& /*other*/) = delete;
 
     /**
      * Nodes
@@ -229,10 +177,14 @@ public:
         // noop
     }
 
-    GroupIdType transport(const ABT& /*n*/,
+    GroupIdType transport(const ABT& n,
                           const MemoLogicalDelegatorNode& node,
-                          const VariableEnvironment& /*env*/) {
-        return node.getGroupId();
+                          const VariableEnvironment& env) {
+        if (_targetGroupMap.count(n.ref()) == 0) {
+            return node.getGroupId();
+        }
+
+        return addNodes(n, node, n, env, {});
     }
 
     void prepare(const ABT& n, const FilterNode& node, const VariableEnvironment& /*env*/) {
@@ -276,8 +228,20 @@ public:
         // noop.
     }
 
+    void prepare(const ABT& n, const RIDUnionNode& node, const VariableEnvironment& /*env*/) {
+        // noop.
+    }
+
     GroupIdType transport(const ABT& n,
                           const RIDIntersectNode& node,
+                          const VariableEnvironment& env,
+                          GroupIdType leftChild,
+                          GroupIdType rightChild) {
+        return addNodes(n, node, env, leftChild, rightChild);
+    }
+
+    GroupIdType transport(const ABT& n,
+                          const RIDUnionNode& node,
                           const VariableEnvironment& env,
                           GroupIdType leftChild,
                           GroupIdType rightChild) {
@@ -414,11 +378,13 @@ private:
                          Memo::GroupIdVector childGroupIds) {
         auto it = _targetGroupMap.find(n.ref());
         const GroupIdType targetGroupId = (it == _targetGroupMap.cend()) ? -1 : it->second;
-        const auto result = _memo.addNode(std::move(childGroupIds),
-                                          env.getProjections(&node),
+        const auto result = _memo.addNode(_ctx,
+                                          std::move(childGroupIds),
+                                          env.getProjections(node),
                                           targetGroupId,
                                           _insertedNodeIds,
-                                          std::move(forMemo));
+                                          std::move(forMemo),
+                                          _rule);
         return result._groupId;
     }
 
@@ -470,14 +436,12 @@ private:
         if (it == _targetGroupMap.cend()) {
             return nullptr;
         }
-        const auto [index, found] = _memo.findNodeInGroup(it->second, n.ref());
-        if (!found) {
-            return nullptr;
+        if (const auto index = _memo.findNodeInGroup(it->second, n.ref())) {
+            ABT::reference_type result = _memo.getNode({it->second, *index});
+            uassert(6624049, "Node type in memo does not match target type", result.is<T>());
+            return result;
         }
-
-        ABT::reference_type result = _memo.getNode({it->second, index});
-        uassert(6624049, "Node type in memo does not match target type", result.is<T>());
-        return result;
+        return nullptr;
     }
 
     void updateTargetGroupRefs(
@@ -549,6 +513,7 @@ private:
     /**
      * We do not own any of these.
      */
+    Memo::Context _ctx;
     Memo& _memo;
     NodeIdSet& _insertedNodeIds;
 
@@ -557,11 +522,28 @@ private:
      */
     Memo::NodeTargetGroupMap _targetGroupMap;
 
+    // Rewrite rule that triggered this node to be created.
+    const LogicalRewriteType _rule;
+
     // If set we enable modification of target group based on existing nodes. In practical terms, we
     // would not assume that if F(x) = F(y) then x = y. This is currently used in conjunction with
     // $elemMatch rewrite (PathTraverse over PathCompose).
     bool _addExistingNodeWithNewChild;
 };
+
+Memo::Context::Context(const Metadata* metadata,
+                       const DebugInfo* debugInfo,
+                       const LogicalPropsInterface* logicalPropsDerivation,
+                       const CardinalityEstimator* cardinalityEstimator)
+    : _metadata(metadata),
+      _debugInfo(debugInfo),
+      _logicalPropsDerivation(logicalPropsDerivation),
+      _cardinalityEstimator(cardinalityEstimator) {
+    invariant(_metadata != nullptr);
+    invariant(_debugInfo != nullptr);
+    invariant(_logicalPropsDerivation != nullptr);
+    invariant(_cardinalityEstimator != nullptr);
+}
 
 size_t Memo::GroupIdVectorHash::operator()(const Memo::GroupIdVector& v) const {
     size_t result = 17;
@@ -575,22 +557,6 @@ size_t Memo::NodeTargetGroupHash::operator()(const ABT::reference_type& nodeRef)
     return std::hash<const Node*>()(nodeRef.cast<Node>());
 }
 
-Memo::Memo(DebugInfo debugInfo,
-           const Metadata& metadata,
-           std::unique_ptr<LogicalPropsInterface> logicalPropsDerivation,
-           std::unique_ptr<CEInterface> ceDerivation)
-    : _groups(),
-      _inputGroupsToNodeIdMap(),
-      _nodeIdToInputGroupsMap(),
-      _metadata(metadata),
-      _logicalPropsDerivation(std::move(logicalPropsDerivation)),
-      _ceDerivation(std::move(ceDerivation)),
-      _debugInfo(std::move(debugInfo)),
-      _stats() {
-    uassert(6624125, "Empty logical properties derivation", _logicalPropsDerivation.get());
-    uassert(6624126, "Empty CE derivation", _ceDerivation.get());
-}
-
 const Group& Memo::getGroup(const GroupIdType groupId) const {
     return *_groups.at(groupId);
 }
@@ -599,7 +565,7 @@ Group& Memo::getGroup(const GroupIdType groupId) {
     return *_groups.at(groupId);
 }
 
-std::pair<size_t, bool> Memo::findNodeInGroup(GroupIdType groupId, ABT::reference_type node) const {
+boost::optional<size_t> Memo::findNodeInGroup(GroupIdType groupId, ABT::reference_type node) const {
     return getGroup(groupId)._logicalNodes.find(node);
 }
 
@@ -608,14 +574,18 @@ GroupIdType Memo::addGroup(ProjectionNameSet projections) {
     return _groups.size() - 1;
 }
 
-std::pair<MemoLogicalNodeId, bool> Memo::addNode(GroupIdType groupId, ABT n) {
-    uassert(6624052, "Attempting to insert a physical node", !n.is<PhysicalNode>());
-    uassert(6624053,
-            "Attempting to insert a logical delegator node",
-            !n.is<MemoLogicalDelegatorNode>());
+std::pair<MemoLogicalNodeId, bool> Memo::addNode(GroupIdType groupId,
+                                                 ABT n,
+                                                 LogicalRewriteType rule) {
+    uassert(6624052, "Attempting to insert a physical node", !n.is<ExclusivelyPhysicalNode>());
 
-    OrderPreservingABTSet& nodes = _groups.at(groupId)->_logicalNodes;
-    auto [index, inserted] = nodes.emplace_back(std::move(n));
+    Group& group = *_groups.at(groupId);
+    OrderPreservingABTSet& nodes = group._logicalNodes;
+
+    const auto [index, inserted] = nodes.emplace_back(std::move(n));
+    if (inserted) {
+        group._rules.push_back(rule);
+    }
     return {{groupId, index}, inserted};
 }
 
@@ -623,19 +593,44 @@ ABT::reference_type Memo::getNode(const MemoLogicalNodeId nodeMemoId) const {
     return getGroup(nodeMemoId._groupId)._logicalNodes.at(nodeMemoId._index);
 }
 
-std::pair<MemoLogicalNodeId, bool> Memo::findNode(const GroupIdVector& groups, const ABT& node) {
+boost::optional<MemoLogicalNodeId> Memo::findNode(const GroupIdVector& groups, const ABT& node) {
     const auto it = _inputGroupsToNodeIdMap.find(groups);
     if (it != _inputGroupsToNodeIdMap.cend()) {
         for (const MemoLogicalNodeId& nodeMemoId : it->second) {
             if (getNode(nodeMemoId) == node) {
-                return {nodeMemoId, true};
+                return nodeMemoId;
             }
         }
     }
-    return {{0, 0}, false};
+    return boost::none;
 }
 
-void Memo::estimateCE(const GroupIdType groupId) {
+// Returns true if n is a sargable node with exactly one predicate on _id.
+static bool isSimpleIdLookup(ABT::reference_type n) {
+    const SargableNode* node = n.cast<SargableNode>();
+    if (!node || PSRExpr::numLeaves(node->getReqMap().getRoot()) != 1) {
+        return false;
+    }
+
+    bool isIdLookup = false;
+    PSRExpr::visitAnyShape(node->getReqMap().getRoot(), [&](const PartialSchemaEntry& entry) {
+        if (const auto interval = IntervalReqExpr::getSingularDNF(entry.second.getIntervals());
+            !interval || !interval->isEquality()) {
+            return;
+        }
+        if (const PathGet* getPtr = entry.first._path.cast<PathGet>();
+            getPtr && getPtr->name() == "_id") {
+            if (getPtr->getPath().is<PathIdentity>()) {
+                isIdLookup = true;
+            } else if (const PathTraverse* traversePtr = getPtr->getPath().cast<PathTraverse>()) {
+                isIdLookup = traversePtr->getPath().is<PathIdentity>();
+            }
+        }
+    });
+    return isIdLookup;
+}
+
+void Memo::estimateCE(const Context& ctx, const GroupIdType groupId) {
     // If inserted into a new group, derive logical properties, and cardinality estimation
     // for the new group.
     Group& group = getGroup(groupId);
@@ -643,68 +638,80 @@ void Memo::estimateCE(const GroupIdType groupId) {
 
     const ABT::reference_type nodeRef = group._logicalNodes.at(0);
     properties::LogicalProps logicalProps =
-        _logicalPropsDerivation->deriveProps(_metadata, nodeRef, nullptr, this, groupId);
+        ctx._logicalPropsDerivation->deriveProps(*ctx._metadata, nodeRef, nullptr, this, groupId);
     props.merge(logicalProps);
 
-    const CEType estimate = _ceDerivation->deriveCE(*this, props, nodeRef);
+    const bool simpleIdLookup = isSimpleIdLookup(nodeRef);
+    const CEType estimate = simpleIdLookup
+        ? CEType{1.0}
+        : ctx._cardinalityEstimator->deriveCE(*ctx._metadata, *this, props, nodeRef);
+
     auto ceProp = properties::CardinalityEstimate(estimate);
 
     if (auto sargablePtr = nodeRef.cast<SargableNode>(); sargablePtr != nullptr) {
-        auto& partialSchemaKeyCEMap = ceProp.getPartialSchemaKeyCEMap();
-        for (const auto& [key, req] : sargablePtr->getReqMap()) {
-            ABT singularReq = make<SargableNode>(PartialSchemaRequirements{{key, req}},
-                                                 CandidateIndexMap{},
-                                                 sargablePtr->getTarget(),
-                                                 sargablePtr->getChild());
-            const CEType singularEst = _ceDerivation->deriveCE(*this, props, singularReq.ref());
-            partialSchemaKeyCEMap.emplace(key, singularEst);
-        }
+        auto& partialSchemaKeyCE = ceProp.getPartialSchemaKeyCE();
+        invariant(partialSchemaKeyCE.empty());
+
+        // Cache estimation for each individual requirement.
+        PSRExpr::visitDNF(sargablePtr->getReqMap().getRoot(), [&](const PartialSchemaEntry& e) {
+            ABT singularReq =
+                make<SargableNode>(PartialSchemaRequirements{PSRExpr::makeSingularDNF(e)},
+                                   CandidateIndexes{},
+                                   ScanParams{},
+                                   sargablePtr->getTarget(),
+                                   sargablePtr->getChild());
+            const CEType singularEst = simpleIdLookup
+                ? CEType{1.0}
+                : ctx._cardinalityEstimator->deriveCE(
+                      *ctx._metadata, *this, props, singularReq.ref());
+            partialSchemaKeyCE.emplace_back(e.first, singularEst);
+        });
     }
 
     properties::setPropertyOverwrite(props, std::move(ceProp));
-    if (_debugInfo.hasDebugLevel(2)) {
+    if (ctx._debugInfo->hasDebugLevel(2)) {
         std::cout << "Group " << groupId << ": "
                   << ExplainGenerator::explainLogicalProps("Logical properties", props);
     }
 }
 
-MemoLogicalNodeId Memo::addNode(GroupIdVector groupVector,
+MemoLogicalNodeId Memo::addNode(const Context& ctx,
+                                GroupIdVector groupVector,
                                 ProjectionNameSet projections,
                                 const GroupIdType targetGroupId,
                                 NodeIdSet& insertedNodeIds,
-                                ABT n) {
+                                ABT n,
+                                const LogicalRewriteType rule) {
     for (const GroupIdType groupId : groupVector) {
         // Invalid tree: node is its own child.
         uassert(6624127, "Target group appears inside group vector", groupId != targetGroupId);
     }
 
-    auto [existingId, foundNode] = findNode(groupVector, n);
-
-    if (foundNode) {
+    if (const auto existingId = findNode(groupVector, n)) {
         uassert(6624054,
                 "Found node outside target group",
-                targetGroupId < 0 || targetGroupId == existingId._groupId);
-        return existingId;
+                targetGroupId < 0 || targetGroupId == existingId->_groupId);
+        return *existingId;
     }
 
     const bool noTargetGroup = targetGroupId < 0;
     // Only for debugging.
     ProjectionNameSet projectionsCopy;
-    if (!noTargetGroup && _debugInfo.isDebugMode()) {
+    if (!noTargetGroup && ctx._debugInfo->isDebugMode()) {
         projectionsCopy = projections;
     }
 
     // Current node is not in the memo. Insert unchanged.
     const GroupIdType groupId = noTargetGroup ? addGroup(std::move(projections)) : targetGroupId;
-    auto [newId, inserted] = addNode(groupId, std::move(n));
+    auto [newId, inserted] = addNode(groupId, std::move(n), rule);
     if (inserted || noTargetGroup) {
         insertedNodeIds.insert(newId);
         _inputGroupsToNodeIdMap[groupVector].insert(newId);
         _nodeIdToInputGroupsMap[newId] = groupVector;
 
         if (noTargetGroup) {
-            estimateCE(groupId);
-        } else if (_debugInfo.isDebugMode()) {
+            estimateCE(ctx, groupId);
+        } else if (ctx._debugInfo->isDebugMode()) {
             const Group& group = getGroup(groupId);
             // If inserted into an existing group, verify we deliver all expected projections.
             for (const ProjectionName& groupProjection : group.binder().names()) {
@@ -720,18 +727,44 @@ MemoLogicalNodeId Memo::addNode(GroupIdVector groupVector,
     return newId;
 }
 
-GroupIdType Memo::integrate(const ABT& node,
+GroupIdType Memo::integrate(const Memo::Context& ctx,
+                            const ABT& node,
                             NodeTargetGroupMap targetGroupMap,
                             NodeIdSet& insertedNodeIds,
+                            const LogicalRewriteType rule,
                             const bool addExistingNodeWithNewChild) {
     _stats._numIntegrations++;
     MemoIntegrator integrator(
-        *this, std::move(targetGroupMap), insertedNodeIds, addExistingNodeWithNewChild);
+        ctx, *this, std::move(targetGroupMap), insertedNodeIds, rule, addExistingNodeWithNewChild);
     return integrator.integrate(node);
 }
 
 size_t Memo::getGroupCount() const {
     return _groups.size();
+}
+
+const ExpressionBinder& Memo::getBinderForGroup(const GroupIdType groupId) const {
+    return getGroup(groupId).binder();
+}
+
+const properties::LogicalProps& Memo::getLogicalProps(GroupIdType groupId) const {
+    return getGroup(groupId)._logicalProperties;
+}
+
+const ABTVector& Memo::getLogicalNodes(GroupIdType groupId) const {
+    return getGroup(groupId)._logicalNodes.getVector();
+}
+
+const PhysNodeVector& Memo::getPhysicalNodes(GroupIdType groupId) const {
+    return getGroup(groupId)._physicalNodes.getNodes();
+}
+
+const std::vector<LogicalRewriteType>& Memo::getRules(GroupIdType groupId) const {
+    return getGroup(groupId)._rules;
+}
+
+LogicalRewriteQueue& Memo::getLogicalRewriteQueue(GroupIdType groupId) {
+    return getGroup(groupId)._logicalRewriteQueue;
 }
 
 void Memo::clearLogicalNodes(const GroupIdType groupId) {
@@ -747,14 +780,11 @@ void Memo::clearLogicalNodes(const GroupIdType groupId) {
 
     logicalNodes.clear();
     group._logicalRewriteQueue = {};
+    group._rules.clear();
 }
 
 const Memo::InputGroupsToNodeIdMap& Memo::getInputGroupsToNodeIdMap() const {
     return _inputGroupsToNodeIdMap;
-}
-
-const DebugInfo& Memo::getDebugInfo() const {
-    return _debugInfo;
 }
 
 void Memo::clear() {
@@ -782,14 +812,6 @@ size_t Memo::getPhysicalNodeCount() const {
         result += group->_physicalNodes.getNodes().size();
     }
     return result;
-}
-
-const Metadata& Memo::getMetadata() const {
-    return _metadata;
-}
-
-const CEInterface& Memo::getCEDerivation() const {
-    return *_ceDerivation;
 }
 
 }  // namespace mongo::optimizer::cascades

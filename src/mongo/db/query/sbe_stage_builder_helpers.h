@@ -35,14 +35,24 @@
 #include <utility>
 
 #include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/match_path.h"
 #include "mongo/db/exec/sbe/stages/filter.h"
+#include "mongo/db/exec/sbe/stages/hash_agg.h"
 #include "mongo/db/exec/sbe/stages/makeobj.h"
 #include "mongo/db/exec/sbe/stages/project.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/query/optimizer/comparison_op.h"
+#include "mongo/db/query/projection_ast.h"
 #include "mongo/db/query/sbe_stage_builder_eval_frame.h"
 #include "mongo/db/query/stage_types.h"
 
+namespace mongo::projection_ast {
+class Projection;
+}
+
 namespace mongo::stage_builder {
+
+class PlanStageSlots;
 
 std::unique_ptr<sbe::EExpression> makeUnaryOp(sbe::EPrimUnary::Op unaryOp,
                                               std::unique_ptr<sbe::EExpression> operand);
@@ -79,12 +89,14 @@ std::unique_ptr<sbe::EExpression> generateNullOrMissing(sbe::FrameId frameId,
                                                         sbe::value::SlotId slotId);
 
 std::unique_ptr<sbe::EExpression> generateNullOrMissing(std::unique_ptr<sbe::EExpression> arg);
+std::unique_ptr<sbe::EExpression> generateNullOrMissing(EvalExpr arg, StageBuilderState& state);
 
 /**
  * Generates an EExpression that checks if the input expression is a non-numeric type _assuming
  * that_ it has already been verified to be neither null nor missing.
  */
 std::unique_ptr<sbe::EExpression> generateNonNumericCheck(const sbe::EVariable& var);
+std::unique_ptr<sbe::EExpression> generateNonNumericCheck(EvalExpr expr, StageBuilderState& state);
 
 /**
  * Generates an EExpression that checks if the input expression is the value NumberLong(-2^64).
@@ -96,11 +108,13 @@ std::unique_ptr<sbe::EExpression> generateLongLongMinCheck(const sbe::EVariable&
  * already been verified to be numeric.
  */
 std::unique_ptr<sbe::EExpression> generateNaNCheck(const sbe::EVariable& var);
+std::unique_ptr<sbe::EExpression> generateNaNCheck(EvalExpr expr, StageBuilderState& state);
 
 /**
  * Generates an EExpression that checks if the input expression is a numeric Infinity.
  */
 std::unique_ptr<sbe::EExpression> generateInfinityCheck(const sbe::EVariable& var);
+std::unique_ptr<sbe::EExpression> generateInfinityCheck(EvalExpr expr, StageBuilderState& state);
 
 /**
  * Generates an EExpression that checks if the input expression is a non-positive number (i.e. <= 0)
@@ -112,7 +126,7 @@ std::unique_ptr<sbe::EExpression> generateNonPositiveCheck(const sbe::EVariable&
  * Generates an EExpression that checks if the input expression is a positive number (i.e. > 0)
  * _assuming that_ it has already been verified to be numeric.
  */
-std::unique_ptr<sbe::EExpression> generatePositiveCheck(const sbe::EVariable& var);
+std::unique_ptr<sbe::EExpression> generatePositiveCheck(const sbe::EExpression& expr);
 
 /**
  * Generates an EExpression that checks if the input expression is a negative (i.e., < 0) number
@@ -130,7 +144,7 @@ std::unique_ptr<sbe::EExpression> generateNonObjectCheck(const sbe::EVariable& v
  * Generates an EExpression that checks if the input expression is not a string, _assuming that
  * it has already been verified to be neither null nor missing.
  */
-std::unique_ptr<sbe::EExpression> generateNonStringCheck(const sbe::EVariable& var);
+std::unique_ptr<sbe::EExpression> generateNonStringCheck(const sbe::EExpression& expr);
 
 /**
  * Generates an EExpression that checks whether the input expression is null, missing, or
@@ -191,11 +205,6 @@ std::unique_ptr<sbe::PlanStage> makeLimitCoScanTree(PlanNodeId planNodeId, long 
 EvalStage makeLimitCoScanStage(PlanNodeId planNodeId, long long limit = 1);
 
 /**
- * If 'stage.stage' is 'nullptr', return limit-1/coscan tree. Otherwise, return stage.
- */
-EvalStage stageOrLimitCoScan(EvalStage stage, PlanNodeId planNodeId, long long limit = 1);
-
-/**
  * Check if expression returns Nothing and return boolean false if so. Otherwise, return the
  * expression.
  */
@@ -223,6 +232,8 @@ std::unique_ptr<sbe::EExpression> makeVariable(sbe::value::SlotId slotId);
 
 std::unique_ptr<sbe::EExpression> makeVariable(sbe::FrameId frameId, sbe::value::SlotId slotId);
 
+std::unique_ptr<sbe::EExpression> makeMoveVariable(sbe::FrameId frameId, sbe::value::SlotId slotId);
+
 inline auto makeFail(int code, StringData errorMessage) {
     return sbe::makeE<sbe::EFail>(ErrorCodes::Error{code}, errorMessage);
 }
@@ -237,12 +248,6 @@ std::unique_ptr<sbe::EExpression> makeFillEmptyNull(std::unique_ptr<sbe::EExpres
  * expression.
  */
 std::unique_ptr<sbe::EExpression> makeFillEmptyUndefined(std::unique_ptr<sbe::EExpression> e);
-
-/**
- * Check if expression returns an array and return Nothing if so. Otherwise, return the expression.
- */
-std::unique_ptr<sbe::EExpression> makeNothingArrayCheck(
-    std::unique_ptr<sbe::EExpression> isArrayInput, std::unique_ptr<sbe::EExpression> otherwise);
 
 /**
  * Makes "newObj" function from variadic parameter pack of 'FieldPair' which is a pair of a field
@@ -309,17 +314,17 @@ std::unique_ptr<sbe::EExpression> makeNewObjFunction(FieldPair field, Ts... fiel
 /**
  * Creates an expression to extract a shard key part from inputExpr. The generated expression is a
  * let binding that binds a getField expression to extract the shard key part value from the
- * inputExpr. The entire let binding evaluates to a constant expression carrying the Nothing value
- * if the binding is an array. Otherwise, it evaluates to a fillEmpty null expression. Here is an
- * example expression generated from this function for a shard key pattern {'a.b': 1}:
+ * inputExpr. If the binding is an array, the array is returned. This is done so caller can check
+ * for array and generate an empty shard key. Here is an example expression generated from this
+ * function for a shard key pattern {'a.b.c': 1}:
  *
- * let [l1.0 = getField (s1, "a")]
- *   if (isArray (l1.0), NOTHING,
- *     let [l2.0 = getField (l1.0, "b")]
- *       if (isArray (l2.0), NOTHING, fillEmpty (l2.0, null)))
+ * let [l1.0 = getField (s1, "a") ?: null]
+ *   if (isArray (l1.0), l1.0,
+ *     let [l2.0 = getField (l1.0, "b") ?: null]
+ *       if (isArray (l2.0), l2.0, getField (l2.0, "c") ?: null))
  */
 std::unique_ptr<sbe::EExpression> generateShardKeyBinding(
-    const FieldRef& keyPatternField,
+    const sbe::MatchPath& keyPatternField,
     sbe::value::FrameIdGenerator& frameIdGenerator,
     std::unique_ptr<sbe::EExpression> inputExpr,
     int level);
@@ -333,17 +338,16 @@ std::pair<sbe::value::SlotId, EvalStage> projectEvalExpr(
     EvalExpr expr,
     EvalStage stage,
     PlanNodeId planNodeId,
-    sbe::value::SlotIdGenerator* slotIdGenerator);
+    sbe::value::SlotIdGenerator* slotIdGenerator,
+    StageBuilderState& state);
 
 template <bool IsConst, bool IsEof = false>
 EvalStage makeFilter(EvalStage stage,
                      std::unique_ptr<sbe::EExpression> filter,
                      PlanNodeId planNodeId) {
-    stage = stageOrLimitCoScan(std::move(stage), planNodeId);
-
     return {sbe::makeS<sbe::FilterStage<IsConst, IsEof>>(
-                std::move(stage.stage), std::move(filter), planNodeId),
-            std::move(stage.outSlots)};
+                stage.extractStage(planNodeId), std::move(filter), planNodeId),
+            stage.extractOutSlots()};
 }
 
 EvalStage makeProject(EvalStage stage,
@@ -415,9 +419,10 @@ EvalStage makeUnion(std::vector<EvalStage> inputStages,
 
 EvalStage makeHashAgg(EvalStage stage,
                       sbe::value::SlotVector gbs,
-                      sbe::value::SlotMap<std::unique_ptr<sbe::EExpression>> aggs,
+                      sbe::SlotExprPairVector aggs,
                       boost::optional<sbe::value::SlotId> collatorSlot,
                       bool allowDiskUse,
+                      sbe::SlotExprPairVector mergingExprs,
                       PlanNodeId planNodeId);
 
 EvalStage makeMkBsonObj(EvalStage stage,
@@ -431,28 +436,13 @@ EvalStage makeMkBsonObj(EvalStage stage,
                         bool returnOldObject,
                         PlanNodeId planNodeId);
 
-using BranchFn = std::function<std::pair<sbe::value::SlotId, EvalStage>(
-    EvalExpr expr,
-    EvalStage stage,
-    PlanNodeId planNodeId,
-    sbe::value::SlotIdGenerator* slotIdGenerator)>;
-
 /**
- * Creates a union stage with specified branches. Each branch is passed to 'branchFn' first. If
- * 'branchFn' is not set, expression from branch is simply projected to a slot.
+ * Creates a chain of EIf expressions that will inspect each arg in order and return the first
+ * arg that is not null or missing.
  */
-EvalExprStagePair generateUnion(std::vector<EvalExprStagePair> branches,
-                                BranchFn branchFn,
-                                PlanNodeId planNodeId,
-                                sbe::value::SlotIdGenerator* slotIdGenerator);
-/**
- * Creates limit-1/union stage with specified branches. Each branch is passed to 'branchFn' first.
- * If 'branchFn' is not set, expression from branch is simply projected to a slot.
- */
-EvalExprStagePair generateSingleResultUnion(std::vector<EvalExprStagePair> branches,
-                                            BranchFn branchFn,
-                                            PlanNodeId planNodeId,
-                                            sbe::value::SlotIdGenerator* slotIdGenerator);
+std::unique_ptr<sbe::EExpression> makeIfNullExpr(
+    std::vector<std::unique_ptr<sbe::EExpression>> values,
+    sbe::value::FrameIdGenerator* frameIdGenerator);
 
 /** This helper takes an SBE SlotIdGenerator and an SBE Array and returns an output slot and a
  * unwind/project/limit/coscan subtree that streams out the elements of the array one at a time via
@@ -462,7 +452,8 @@ EvalExprStagePair generateSingleResultUnion(std::vector<EvalExprStagePair> branc
 std::pair<sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>> generateVirtualScan(
     sbe::value::SlotIdGenerator* slotIdGenerator,
     sbe::value::TypeTags arrTag,
-    sbe::value::Value arrVal);
+    sbe::value::Value arrVal,
+    PlanYieldPolicy* yieldPolicy = nullptr);
 
 /**
  * Make a mock scan with multiple output slots from an BSON array. This method does NOT assume
@@ -472,7 +463,8 @@ std::pair<sbe::value::SlotVector, std::unique_ptr<sbe::PlanStage>> generateVirtu
     sbe::value::SlotIdGenerator* slotIdGenerator,
     int numSlots,
     sbe::value::TypeTags arrTag,
-    sbe::value::Value arrVal);
+    sbe::value::Value arrVal,
+    PlanYieldPolicy* yieldPolicy = nullptr);
 
 /**
  * Helper functions for converting from BSONObj/BSONArray to SBE Object/Array. Caller owns the SBE
@@ -480,12 +472,6 @@ std::pair<sbe::value::SlotVector, std::unique_ptr<sbe::PlanStage>> generateVirtu
  */
 std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const BSONObj& bo);
 std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const BSONArray& ba);
-
-/**
- * Helper function for converting mongo::Value to SBE Value. Caller owns the SBE Value returned.
- * This helper function does not assume ownership of the mongo::Value.
- */
-std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const Value& val);
 
 /**
  * Returns a BSON type mask of all data types coercible to date.
@@ -527,328 +513,20 @@ std::unique_ptr<sbe::EExpression> makeLocalBind(sbe::value::FrameIdGenerator* fr
     return sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(innerExpr));
 }
 
-
-std::tuple<sbe::value::SlotId, sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>>
-makeLoopJoinForFetch(std::unique_ptr<sbe::PlanStage> inputStage,
-                     sbe::value::SlotId seekKeySlot,
-                     sbe::value::SlotId snapshotIdSlot,
-                     sbe::value::SlotId indexIdSlot,
-                     sbe::value::SlotId indexKeySlot,
-                     sbe::value::SlotId indexKeyPatternSlot,
-                     const CollectionPtr& collToFetch,
-                     StringMap<const IndexAccessMethod*> iamMap,
-                     PlanNodeId planNodeId,
-                     sbe::value::SlotVector slotsToForward,
-                     sbe::value::SlotIdGenerator& slotIdGenerator);
-
-/**
- * Trees generated by 'generateFilter' maintain state during execution. There are two types of state
- * that can be maintained:
- *  - Boolean. The state is just boolean value, indicating if the document matches the predicate.
- *  - Index. The state stores a tuple of (boolean, optional int32).
- *
- * Depending on the query type, one of state types can be selected to use in the tree.
- * 'FilterStateHelper' class and it's descendants aim to provide unified interface to operate with
- * this two types of states.
- */
-class FilterStateHelper {
-public:
-    using Expression = std::unique_ptr<sbe::EExpression>;
-
-    virtual ~FilterStateHelper() = default;
-
-    /**
-     * Returns true if state contains a value along with boolean and false otherwise.
-     */
-    virtual bool stateContainsValue() const = 0;
-
-    /**
-     * Creates a constant holding state with given boolean 'value'. Index part of the constructed
-     * state is empty.
-     */
-    virtual Expression makeState(bool value) const = 0;
-
-    /**
-     * Creates an expression that constructs state from 'expr'. 'expr' must evaluate to a boolean
-     * value. Index part of the constructed state is empty.
-     */
-    virtual Expression makeState(Expression expr) const = 0;
-
-    /**
-     * Creates an expression that constructs an initial state from 'expr'. 'expr' must evaluate to a
-     * boolean value.
-     * Initial state is used as an output value for the inner branch passed to
-     * 'makeTraverseCombinator'.
-     */
-    virtual Expression makeInitialState(Expression expr) const = 0;
-
-    /**
-     * Creates an expression that extracts boolean value from the state evaluated from 'expr'.
-     */
-    virtual Expression getBool(Expression expr) const = 0;
-
-    Expression getBool(sbe::value::SlotId slotId) const {
-        return getBool(sbe::makeE<sbe::EVariable>(slotId));
-    }
-
-    /**
-     * Implements Elvis operator. If state from 'left' expression represents true boolean value,
-     * returns 'left'. Otherwise, returns 'right'.
-     */
-    virtual Expression mergeStates(Expression left,
-                                   Expression right,
-                                   sbe::value::FrameIdGenerator* frameIdGenerator) const = 0;
-
-    /**
-     * Extracts index value from the state and projects it into a separate slot. If state does not
-     * contain index value, slot contains Nothing.
-     * If state does not support storing index value, this function does nothing.
-     */
-    virtual std::pair<boost::optional<sbe::value::SlotId>, EvalStage> projectValueCombinator(
-        sbe::value::SlotId stateSlot,
-        EvalStage stage,
-        PlanNodeId planNodeId,
-        sbe::value::SlotIdGenerator* slotIdGenerator,
-        sbe::value::FrameIdGenerator* frameIdGenerator) const = 0;
-
-    /**
-     * Uses an expression from 'EvalExprStagePair' to construct state. Expresion must evaluate to
-     * boolean value.
-     */
-    virtual EvalExprStagePair makePredicateCombinator(EvalExprStagePair pair) const = 0;
-
-    /**
-     * Creates traverse stage with fold and final expressions tuned to maintain consistent state.
-     * If state does support index value, records the index of a first array element for which inner
-     * branch returns true value.
-     */
-    virtual EvalStage makeTraverseCombinator(
-        EvalStage outer,
-        EvalStage inner,
-        sbe::value::SlotId inputSlot,
-        sbe::value::SlotId outputSlot,
-        sbe::value::SlotId innerOutputSlot,
-        PlanNodeId planNodeId,
-        sbe::value::FrameIdGenerator* frameIdGenerator) const = 0;
-};
-
-/**
- * This class implements 'FilterStateHelper' interface for a state which can be represented as a
- * tuple of (boolean, optional int32). Such tuple is encoded as a single int64 value.
- *
- * While we could represent such tuple as an SBE array, this approach would cost us additional
- * allocations and the need to call expensive builtins such as 'getElement'. Integer operations are
- * much simpler, faster and do not require any allocations.
- *
- * The following encoding is implemented:
- *  - [False, Nothing] -> -1
- *  - [True, Nothing]  -> 0
- *  - [False, value]   -> - value - 2
- *  - [True, value]    -> value + 1
- *
- * Such encoding allows us to easily extract boolean value (just compare resulting int64 with 0) and
- * requires only a few arithmetical operations to extract the index value. Furthemore, we can
- * increment/decrement index value simply by incrementing/decrementing the decoded value.
- */
-class IndexStateHelper : public FilterStateHelper {
-public:
-    static constexpr sbe::value::TypeTags ValueType = sbe::value::TypeTags::NumberInt64;
-
-    bool stateContainsValue() const override {
-        return true;
-    }
-
-    Expression makeState(bool value) const override {
-        return makeConstant(ValueType, value ? 0 : -1);
-    }
-
-    Expression makeState(Expression expr) const override {
-        return sbe::makeE<sbe::EIf>(std::move(expr), makeState(true), makeState(false));
-    }
-
-    Expression makeInitialState(Expression expr) const override {
-        return sbe::makeE<sbe::EIf>(
-            std::move(expr), makeConstant(ValueType, 1), makeConstant(ValueType, -2));
-    }
-
-    Expression getBool(Expression expr) const override {
-        return sbe::makeE<sbe::EPrimBinary>(
-            sbe::EPrimBinary::greaterEq, std::move(expr), makeConstant(ValueType, 0));
-    }
-
-    Expression mergeStates(Expression left,
-                           Expression right,
-                           sbe::value::FrameIdGenerator* frameIdGenerator) const override {
-        return makeLocalBind(frameIdGenerator,
-                             [&](sbe::EVariable left) {
-                                 return sbe::makeE<sbe::EIf>(
-                                     getBool(left.clone()), left.clone(), std::move(right));
-                             },
-                             std::move(left));
-    }
-
-    std::pair<boost::optional<sbe::value::SlotId>, EvalStage> projectValueCombinator(
-        sbe::value::SlotId stateSlot,
-        EvalStage stage,
-        PlanNodeId planNodeId,
-        sbe::value::SlotIdGenerator* slotIdGenerator,
-        sbe::value::FrameIdGenerator* frameIdGenerator) const override {
-        sbe::EVariable stateVar{stateSlot};
-        auto indexSlot = slotIdGenerator->generate();
-
-        auto indexInt64 = sbe::makeE<sbe::EPrimBinary>(
-            sbe::EPrimBinary::sub, stateVar.clone(), makeConstant(ValueType, 1));
-
-        auto indexInt32 = makeLocalBind(
-            frameIdGenerator,
-            [&](sbe::EVariable convertedIndex) {
-                return sbe::makeE<sbe::EIf>(
-                    makeFunction("exists", convertedIndex.clone()),
-                    convertedIndex.clone(),
-                    sbe::makeE<sbe::EFail>(ErrorCodes::Error{5291403},
-                                           "Cannot convert array index into int32 number"));
-            },
-            sbe::makeE<sbe::ENumericConvert>(std::move(indexInt64),
-                                             sbe::value::TypeTags::NumberInt32));
-
-        auto resultStage = makeProject(
-            std::move(stage),
-            planNodeId,
-            indexSlot,
-            sbe::makeE<sbe::EIf>(sbe::makeE<sbe::EPrimBinary>(sbe::EPrimBinary::greater,
-                                                              stateVar.clone(),
-                                                              makeConstant(ValueType, 0)),
-                                 std::move(indexInt32),
-                                 makeConstant(sbe::value::TypeTags::Nothing, 0)));
-        return {indexSlot, std::move(resultStage)};
-    }
-
-    EvalExprStagePair makePredicateCombinator(EvalExprStagePair pair) const override {
-        auto [expr, stage] = std::move(pair);
-        return {makeState(expr.extractExpr()), std::move(stage)};
-    }
-
-    EvalStage makeTraverseCombinator(EvalStage outer,
-                                     EvalStage inner,
-                                     sbe::value::SlotId inputSlot,
-                                     sbe::value::SlotId outputSlot,
-                                     sbe::value::SlotId innerOutputSlot,
-                                     PlanNodeId planNodeId,
-                                     sbe::value::FrameIdGenerator* frameIdGenerator) const override;
-};
-
-/**
- * This class implements 'FilterStateHelper' interface for a plain boolean state, without index
- * part.
- */
-class BooleanStateHelper : public FilterStateHelper {
-public:
-    bool stateContainsValue() const override {
-        return false;
-    }
-
-    Expression makeState(bool value) const override {
-        return makeConstant(sbe::value::TypeTags::Boolean, value);
-    }
-
-    Expression makeState(Expression expr) const override {
-        return expr;
-    }
-
-    Expression makeInitialState(Expression expr) const override {
-        return expr;
-    }
-
-    Expression getBool(Expression expr) const override {
-        return expr;
-    }
-
-    Expression mergeStates(Expression left,
-                           Expression right,
-                           sbe::value::FrameIdGenerator* frameIdGenerator) const override {
-        return sbe::makeE<sbe::EPrimBinary>(
-            sbe::EPrimBinary::logicOr, std::move(left), std::move(right));
-    }
-
-    std::pair<boost::optional<sbe::value::SlotId>, EvalStage> projectValueCombinator(
-        sbe::value::SlotId stateSlot,
-        EvalStage stage,
-        PlanNodeId planNodeId,
-        sbe::value::SlotIdGenerator* slotIdGenerator,
-        sbe::value::FrameIdGenerator* frameIdGenerator) const override {
-        return {stateSlot, std::move(stage)};
-    }
-
-    EvalExprStagePair makePredicateCombinator(EvalExprStagePair pair) const override {
-        return pair;
-    }
-
-    EvalStage makeTraverseCombinator(
-        EvalStage outer,
-        EvalStage inner,
-        sbe::value::SlotId inputSlot,
-        sbe::value::SlotId outputSlot,
-        sbe::value::SlotId innerOutputSlot,
-        PlanNodeId planNodeId,
-        sbe::value::FrameIdGenerator* frameIdGenerator) const override {
-        return makeTraverse(
-            std::move(outer),
-            std::move(inner),
-            inputSlot,
-            outputSlot,
-            innerOutputSlot,
-            sbe::makeE<sbe::EPrimBinary>(sbe::EPrimBinary::logicOr,
-                                         sbe::makeE<sbe::EVariable>(outputSlot),
-                                         sbe::makeE<sbe::EVariable>(innerOutputSlot)),
-            sbe::makeE<sbe::EVariable>(outputSlot),
-            planNodeId,
-            1);
-    }
-};
-
-/**
- * Helper function to create respective 'FilterStateHelper' implementation. If 'trackIndex' is true,
- * returns 'IndexStateHelper'. Otherwise, returns 'BooleanStateHelper'.
- */
-std::unique_ptr<FilterStateHelper> makeFilterStateHelper(bool trackIndex);
-
-/**
- * Creates tree with short-circuiting for OR and AND. Each element in 'braches' argument represents
- * logical expression and sub-tree generated for it.
- */
-EvalExprStagePair generateShortCircuitingLogicalOp(sbe::EPrimBinary::Op logicOp,
-                                                   std::vector<EvalExprStagePair> branches,
-                                                   PlanNodeId planNodeId,
-                                                   sbe::value::SlotIdGenerator* slotIdGenerator,
-                                                   const FilterStateHelper& stateHelper);
-
-/**
- * Imagine that we have some parent QuerySolutionNode X and child QSN Y which both participate in a
- * covered plan. Stage X requests some slots to be constructed out of the index keys using
- * 'parentIndexKeyReqs'. Stage Y requests it's own slots, and adds those to the set requested by X,
- * resulting in 'childIndexKeyReqs'. Note the invariant that 'childIndexKeyReqs' is a superset of
- * 'parentIndexKeyReqs'. Let's notate the number of slots requested by 'childIndexKeyReqs' as |Y|
- * and the set of slots requested by 'parentIndexKeyReqs' as |X|.
- *
- * The underlying SBE plan is constructed, and returns a vector of |Y| slots. However, the parent
- * stage expects a vector of just |X| slots. The purpose of this function is to calculate and return
- * the appropriate subset of the slot vector so that the parent stage X receives its expected |X|
- * slots.
- *
- * As a concrete example, let's say the QSN tree is X => Y => IXSCAN and the index key pattern is
- * {a: 1, b: 1, c: 1, d: 1}. X requests "a" and "d" using the bit vector 1001. Y additionally
- * requires "c" so it requests three slots with the bit vector 1011. As a result, Y receives a
- * 3-element slot vector, <s1, s2, s3>. Here, s1 will contain the value of "a", s2 contains "c", and
- * s3 contain s"d".
- *
- * Parent QSN X expects just a two element slot vector where the first slot is for "a" and the
- * second is for "d". This function would therefore return the slot vector <s1, s3>.
- */
-sbe::value::SlotVector makeIndexKeyOutputSlotsMatchingParentReqs(
-    const BSONObj& indexKeyPattern,
-    sbe::IndexKeysInclusionSet parentIndexKeyReqs,
-    sbe::IndexKeysInclusionSet childIndexKeyReqs,
-    sbe::value::SlotVector childOutputSlots);
+std::unique_ptr<sbe::PlanStage> makeLoopJoinForFetch(std::unique_ptr<sbe::PlanStage> inputStage,
+                                                     sbe::value::SlotId resultSlot,
+                                                     sbe::value::SlotId recordIdSlot,
+                                                     std::vector<std::string> fields,
+                                                     sbe::value::SlotVector fieldSlots,
+                                                     sbe::value::SlotId seekKeySlot,
+                                                     sbe::value::SlotId snapshotIdSlot,
+                                                     sbe::value::SlotId indexIdSlot,
+                                                     sbe::value::SlotId indexKeySlot,
+                                                     sbe::value::SlotId indexKeyPatternSlot,
+                                                     const CollectionPtr& collToFetch,
+                                                     StringMap<const IndexAccessMethod*> iamMap,
+                                                     PlanNodeId planNodeId,
+                                                     sbe::value::SlotVector slotsToForward);
 
 /**
  * Given an index key pattern, and a subset of the fields of the index key pattern that are depended
@@ -935,7 +613,6 @@ struct StageBuilderState {
     PlanStageData* const data;
 
     const Variables& variables;
-    stdx::unordered_map<Variables::Id, sbe::value::SlotId> globalVariables;
     // When the mongos splits $group stage and sends it to shards, it adds 'needsMerge'/'fromMongs'
     // flags to true so that shards can sends special partial aggregation results to the mongos.
     bool needsMerge;
@@ -943,10 +620,548 @@ struct StageBuilderState {
     // A flag to indicate the user allows disk use for spilling.
     bool allowDiskUse;
 
-    // This map is used to plumb through pre-generated field expressions ('EvalExpr')
-    // corresponding to field paths to 'generateExpression' to avoid repeated expression generation.
-    // Key is expected to represent field paths in form CURRENT.<field_name>[.<field_name>]*.
-    stdx::unordered_map<std::string /*field path*/, EvalExpr> preGeneratedExprs;
+    // Holds the mapping between the custom ABT variable names and the slot id they are referencing.
+    optimizer::SlotVarMap slotVarMap;
+
+    StringMap<sbe::value::SlotId> stringConstantToSlotMap;
+    SimpleBSONObjMap<sbe::value::SlotId> keyPatternToSlotMap;
 };
+
+/**
+ * A tree of nodes arranged based on field path. PathTreeNode can be used to represent index key
+ * patterns, projections, etc. A PathTreeNode can also optionally hold a value of type T.
+ *
+ * For example, the key pattern {a.b: 1, x: 1, a.c: 1} in tree form would look like:
+ *
+ *         <root>
+ *         /   |
+ *        a    x
+ *       / \
+ *      b   c
+ */
+template <typename T>
+struct PathTreeNode {
+    PathTreeNode() = default;
+    explicit PathTreeNode(StringData name) : name(name) {}
+
+    // Aside from the root node, it is very common for a node to have no children or only 1 child.
+    using ChildrenVector = absl::InlinedVector<std::unique_ptr<PathTreeNode<T>>, 1>;
+
+    PathTreeNode<T>* emplace(StringData fieldComponent) {
+        auto newNode = std::make_unique<PathTreeNode<T>>(fieldComponent);
+        const auto newNodeRaw = newNode.get();
+        children.emplace_back(std::move(newNode));
+
+        if (childrenMap) {
+            childrenMap->emplace(fieldComponent, newNodeRaw);
+        } else if (children.size() >= 3) {
+            // If 'childrenMap' is null and there are 3 or more children, build 'childrenMap' now.
+            buildChildrenMap();
+        }
+
+        return newNodeRaw;
+    }
+
+    bool isLeaf() const {
+        return children.empty();
+    }
+
+    PathTreeNode<T>* findChild(StringData fieldComponent) {
+        if (childrenMap) {
+            auto it = childrenMap->find(fieldComponent);
+            return it != childrenMap->end() ? it->second : nullptr;
+        }
+        for (auto&& child : children) {
+            if (child->name == fieldComponent) {
+                return child.get();
+            }
+        }
+        return nullptr;
+    }
+
+    PathTreeNode<T>* findNode(const sbe::MatchPath& fieldRef, size_t currentIndex = 0) {
+        if (currentIndex == fieldRef.numParts()) {
+            return this;
+        }
+
+        auto currentPart = fieldRef.getPart(currentIndex);
+        if (auto child = findChild(currentPart)) {
+            return child->findNode(fieldRef, currentIndex + 1);
+        } else {
+            return nullptr;
+        }
+    }
+
+    /**
+     * Returns leaf node matching field path. If the field path provided resolves to a non-leaf
+     * node, null will be returned. For example, if tree was built for key pattern {a.b: 1}, this
+     * method will return nullptr for field path "a".
+     */
+    PathTreeNode<T>* findLeafNode(const sbe::MatchPath& fieldRef, size_t currentIndex = 0) {
+        auto* node = findNode(fieldRef, currentIndex);
+        return (node && node->isLeaf() ? node : nullptr);
+    }
+
+    void clearChildren() {
+        children.clear();
+        childrenMap.reset();
+    }
+
+    void buildChildrenMap() {
+        if (!childrenMap) {
+            childrenMap = std::make_unique<StringDataMap<PathTreeNode<T>*>>();
+            for (auto&& child : children) {
+                childrenMap->insert_or_assign(child->name, child.get());
+            }
+        }
+    }
+
+    std::string name;
+
+    ChildrenVector children;
+
+    // We only build a hash map when there are 3 or more children. The vast majority of nodes
+    // will have 2 children or less, so we dynamically allocate 'childrenMap' to save space.
+    std::unique_ptr<StringDataMap<PathTreeNode<T>*>> childrenMap;
+
+    T value = {};
+};
+
+using SlotTreeNode = PathTreeNode<boost::optional<sbe::value::SlotId>>;
+
+std::unique_ptr<SlotTreeNode> buildKeyPatternTree(const BSONObj& keyPattern,
+                                                  const sbe::value::SlotVector& slots);
+
+std::unique_ptr<sbe::EExpression> buildNewObjExpr(const SlotTreeNode* slotTree);
+
+std::unique_ptr<sbe::PlanStage> rehydrateIndexKey(std::unique_ptr<sbe::PlanStage> stage,
+                                                  const BSONObj& indexKeyPattern,
+                                                  PlanNodeId nodeId,
+                                                  const sbe::value::SlotVector& indexKeySlots,
+                                                  sbe::value::SlotId resultSlot);
+
+std::unique_ptr<SlotTreeNode> buildSlotTreeForProjection(const projection_ast::Projection& proj);
+
+template <typename T>
+inline const char* getRawStringData(const T& str) {
+    if constexpr (std::is_same_v<T, StringData>) {
+        return str.rawData();
+    } else {
+        return str.data();
+    }
+}
+
+template <typename T, typename IterT, typename StringT>
+inline auto buildPathTreeImpl(const std::vector<StringT>& paths,
+                              boost::optional<IterT> valsBegin,
+                              boost::optional<IterT> valsEnd,
+                              bool removeConflictingPaths) {
+    auto tree = std::make_unique<PathTreeNode<T>>();
+    auto valsIt = std::move(valsBegin);
+
+    for (auto&& pathStr : paths) {
+        auto path = sbe::MatchPath{pathStr};
+
+        size_t numParts = path.numParts();
+        size_t i = 0;
+
+        auto* node = tree.get();
+        StringData part;
+        for (; i < numParts; ++i) {
+            part = path.getPart(i);
+            auto child = node->findChild(part);
+            if (!child) {
+                break;
+            }
+            node = child;
+        }
+
+        // When 'removeConflictingPaths' is true, if we're processing a sub-path of another path
+        // that's already been processed, then we should ignore the sub-path.
+        const bool ignorePath = (removeConflictingPaths && node->isLeaf() && node != tree.get());
+        if (!ignorePath) {
+            if (i < numParts) {
+                node = node->emplace(part);
+                for (++i; i < numParts; ++i) {
+                    node = node->emplace(path.getPart(i));
+                }
+            } else if (removeConflictingPaths && !node->isLeaf()) {
+                // If 'removeConflictingPaths' is true, delete any children that 'node' has.
+                node->clearChildren();
+            }
+            if (valsIt) {
+                tassert(7182003,
+                        "buildPathTreeImpl() did not expect iterator 'valsIt' to reach the end",
+                        !valsEnd || *valsIt != *valsEnd);
+
+                node->value = **valsIt;
+            }
+        }
+
+        if (valsIt) {
+            ++(*valsIt);
+        }
+    }
+
+    return tree;
+}
+
+/**
+ * Builds a path tree from a set of paths and returns the root node of the tree.
+ *
+ * If 'removeConflictingPaths' is false, this function will build a tree that contains all paths
+ * specified in 'paths' (regardless of whether there are any paths that conflict).
+ *
+ * If 'removeConflictingPaths' is true, when there are two conflicting paths (ex. "a" and "a.b")
+ * the conflict is resolved by removing the longer path ("a.b") and keeping the shorter path ("a").
+ */
+template <typename T, typename StringT>
+auto buildPathTree(const std::vector<StringT>& paths, bool removeConflictingPaths) {
+    return buildPathTreeImpl<T, std::move_iterator<typename std::vector<T>::iterator>, StringT>(
+        paths, boost::none, boost::none, removeConflictingPaths);
+}
+
+/**
+ * Builds a path tree from a set of paths, assigns a sequence of values to the sequence of nodes
+ * corresponding to each path, and returns the root node of the tree.
+ *
+ * The 'values' sequence/vector and the 'paths' vector are expected to have the same number of
+ * elements. The nth value in the the 'values' sequence will be assigned to the node corresponding
+ * to the nth path in 'paths'.
+ *
+ * If 'removeConflictingPaths' is false, this function will build a tree that contains all paths
+ * specified in 'paths' (regardless of whether there are any paths that conflict).
+ *
+ * If 'removeConflictingPaths' is true, when there are two conflicting paths (ex. "a" and "a.b")
+ * the conflict is resolved by removing the longer path ("a.b") and keeping the shorter path ("a").
+ * Note that when a path from 'paths' is removed due to a conflict, the corresponding value in
+ * 'values' will be ignored.
+ */
+template <typename T, typename IterT, typename StringT>
+auto buildPathTree(const std::vector<StringT>& paths,
+                   IterT valuesBegin,
+                   IterT valuesEnd,
+                   bool removeConflictingPaths) {
+    return buildPathTreeImpl<T, IterT, StringT>(
+        paths, std::move(valuesBegin), std::move(valuesEnd), removeConflictingPaths);
+}
+
+template <typename T, typename U>
+auto buildPathTree(const std::vector<std::string>& paths,
+                   const std::vector<U>& values,
+                   bool removeConflictingPaths) {
+    tassert(7182004,
+            "buildPathTreeImpl() expects 'paths' and 'values' to be the same size",
+            paths.size() == values.size());
+
+    return buildPathTree<T>(paths, values.begin(), values.end(), removeConflictingPaths);
+}
+
+template <typename T, typename U>
+auto buildPathTree(const std::vector<std::string>& paths,
+                   std::vector<U>&& values,
+                   bool removeConflictingPaths) {
+    tassert(7182005,
+            "buildPathTreeImpl() expects 'paths' and 'values' to be the same size",
+            paths.size() == values.size());
+
+    return buildPathTree<T>(paths,
+                            std::make_move_iterator(values.begin()),
+                            std::make_move_iterator(values.end()),
+                            removeConflictingPaths);
+}
+
+/**
+ * If a boolean can be constructed from type T, this function will construct a boolean from 'value'
+ * and then return the negation. If a boolean cannot be constructed from type T, then this function
+ * returns false.
+ */
+template <typename T>
+bool convertsToFalse(const T& value) {
+    if constexpr (std::is_constructible_v<bool, T>) {
+        return !bool(value);
+    } else {
+        return false;
+    }
+}
+
+template <typename T>
+struct InvokeAndReturnBoolHelper {
+    template <typename FuncT, typename... Args>
+    static bool invoke(FuncT&& fn, bool defaultReturnValue, Args&&... args) {
+        (std::forward<FuncT>(fn))(std::forward<Args>(args)...);
+        return defaultReturnValue;
+    }
+};
+template <>
+struct InvokeAndReturnBoolHelper<bool> {
+    template <typename FuncT, typename... Args>
+    static bool invoke(FuncT&& fn, bool, Args&&... args) {
+        return (std::forward<FuncT>(fn))(std::forward<Args>(args)...);
+    }
+};
+
+/**
+ * This function will invoke an invocable object ('fn') with the specified arguments ('args'). If
+ * 'fn' returns bool, this function will return fn's return value. If 'fn' returns void or some type
+ * other than bool, this function will return 'defaultReturnValue'.
+ *
+ * As a special case, this function alows fn's type (FuncT) to be nullptr_t. In such cases, this
+ * function will do nothing and it will return 'defaultReturnValue'.
+ *
+ * If 'fn' is not invocable with the specified arguments and fn's type is not nullptr_t, this
+ * function will raise a static assertion.
+ *
+ * Note that when a bool can be constructed from 'fn' (for example, if FuncT is a function pointer
+ * type), this method will always invoke 'fn' regardless of whether "!bool(fn)" is true or false.
+ * It is the caller's responsibility to do any necessary checks (ex. null checks) before calling
+ * this function.
+ */
+template <typename FuncT, typename... Args>
+inline bool invokeAndReturnBool(FuncT&& fn, bool defaultReturnValue, Args&&... args) {
+    if constexpr (std::is_invocable_v<FuncT, Args...>) {
+        return InvokeAndReturnBoolHelper<typename std::invoke_result<FuncT, Args...>::type>::invoke(
+            std::forward<FuncT>(fn), defaultReturnValue, std::forward<Args>(args)...);
+    } else {
+        static_assert(std::is_null_pointer_v<std::remove_reference_t<FuncT>>);
+        return defaultReturnValue;
+    }
+}
+
+/**
+ * This is a helper function used by visitPathTreeNodes() to invoke preVisit and postVisit callback
+ * functions. This helper function will check if 'fn' supports invocation with the following args:
+ *   (1) Node* node, const std::string& path, const DfsState& dfsState
+ *   (2) Node* node, const DfsState& dfsState
+ *   (3) Node* node, const std::string& path
+ *   (4) Node* node
+ *
+ * After checking what 'fn' supports, this helper function will then use invokeAndReturnBool() to
+ * invoke 'fn' accordingly and it will return invokeAndReturnBool()'s return value. If 'fn' supports
+ * multiple signatures, whichever signature that appears first in the list above will be used.
+ */
+template <typename NodeT, typename FuncT>
+inline bool invokeVisitPathTreeNodesCallback(
+    FuncT&& fn,
+    NodeT* node,
+    const std::string& path,
+    const std::vector<std::pair<NodeT*, size_t>>& dfsState) {
+    using DfsState = std::vector<std::pair<NodeT*, size_t>>;
+
+    if constexpr (std::is_invocable_v<FuncT, NodeT*, const std::string&, const DfsState&>) {
+        return invokeAndReturnBool(std::forward<FuncT>(fn), true, node, path, dfsState);
+    } else if constexpr (std::is_invocable_v<FuncT, NodeT*, const DfsState&>) {
+        return invokeAndReturnBool(std::forward<FuncT>(fn), true, node, dfsState);
+    } else if constexpr (std::is_invocable_v<FuncT, NodeT*, const std::string&>) {
+        return invokeAndReturnBool(std::forward<FuncT>(fn), true, node, path);
+    } else {
+        return invokeAndReturnBool(std::forward<FuncT>(fn), true, node);
+    }
+}
+
+/**
+ * This function performs a DFS traversal on a path tree (as given by 'treeRoot') and it invokes
+ * the specified preVisit and postVisit callbacks at the appropriate times.
+ *
+ * The caller may pass nullptr for 'preVisit' if they do not wish to perform any pre-visit actions,
+ * and likewise the caller may pass nullptr for 'postVisit' if they do not wish to perform any
+ * post-visit actions.
+ *
+ * Assuming 'preVisit' is not null, the 'preVisit' callback must support one of the following
+ * signatures:
+ *   (1) Node* node, const std::string& path, const DfsState& dfsState
+ *   (2) Node* node, const DfsState& dfsState
+ *   (3) Node* node, const std::string& path
+ *   (4) Node* node
+ *
+ * Likewise, assuming 'postVisit' is not null, the 'postVisit' callback must support one of the
+ * signatures listed above. For details, see invokeVisitPathTreeNodesCallback().
+ *
+ * The 'preVisit' callback can return any type. If preVisit's return type is not bool or if
+ * 'preVisit' returns boolean true, then preVisit's return value is ignored. If preVisit's return
+ * type is bool _and_ preVisit returns boolean false, then the node that was just pre-visited will
+ * be "skipped" and its descendents will not be visited (i.e. instead of the DFS descending, it will
+ * backtrack), and likewise the 'postVisit' callback will be "skipped" as well and won't be invoked
+ * for the node.
+ *
+ * The 'postVisit' callback can return any type. postVisit's return value (if any) is ignored.
+ *
+ * If 'invokeCallbacksForRootNode' is false (which is the default), the preVisit and postVisit
+ * callbacks won't be invoked for the root node of the tree. If 'invokeCallbacksForRootNode' is
+ * true, the preVisit and postVisit callbacks will be invoked for the root node of the tree at
+ * the appropriate times.
+ *
+ * The 'rootPath' parameter allows the caller to specify the absolute path of 'treeRoot', which
+ * will be used as the base/prefix to determine the paths of all the other nodes in the tree. If
+ * no 'rootPath' argument is provided, then 'rootPath' defaults to boost::none.
+ */
+template <typename T, typename PreVisitFn, typename PostVisitFn>
+void visitPathTreeNodes(PathTreeNode<T>* treeRoot,
+                        const PreVisitFn& preVisit,
+                        const PostVisitFn& postVisit,
+                        bool invokeCallbacksForRootNode = false,
+                        boost::optional<std::string> rootPath = boost::none) {
+    using Node = PathTreeNode<T>;
+    using DfsState = std::vector<std::pair<Node*, size_t>>;
+    constexpr bool isPathNeeded =
+        std::is_invocable_v<PreVisitFn, Node*, const std::string&, const DfsState&> ||
+        std::is_invocable_v<PreVisitFn, Node*, const std::string&> ||
+        std::is_invocable_v<PostVisitFn, Node*, const std::string&, const DfsState&> ||
+        std::is_invocable_v<PostVisitFn, Node*, const std::string&>;
+
+    if (!treeRoot || treeRoot->children.empty()) {
+        return;
+    }
+
+    const bool hasPreVisit = !convertsToFalse(preVisit);
+    const bool hasPostVisit = !convertsToFalse(postVisit);
+
+    // Perform a depth-first traversal using 'dfs' to keep track of where we are.
+    DfsState dfs;
+    dfs.emplace_back(treeRoot, std::numeric_limits<size_t>::max());
+    boost::optional<std::string> path = std::move(rootPath);
+    const std::string emptyPath;
+
+    auto getPath = [&]() -> const std::string& {
+        return path ? *path : emptyPath;
+    };
+    auto dfsPop = [&] {
+        dfs.pop_back();
+        if (isPathNeeded && path) {
+            if (auto pos = path->find_last_of('.'); pos != std::string::npos) {
+                path->resize(pos);
+            } else {
+                path = boost::none;
+            }
+        }
+    };
+
+    if (hasPreVisit && invokeCallbacksForRootNode) {
+        // Invoke the pre-visit callback on the root node if appropriate.
+        if (!invokeVisitPathTreeNodesCallback(preVisit, treeRoot, getPath(), dfs)) {
+            dfsPop();
+        }
+    }
+
+    while (!dfs.empty()) {
+        ++dfs.back().second;
+        auto [node, idx] = dfs.back();
+        const bool isRootNode = dfs.size() == 1;
+
+        if (idx < node->children.size()) {
+            auto child = node->children[idx].get();
+            dfs.emplace_back(child, std::numeric_limits<size_t>::max());
+            if (isPathNeeded) {
+                if (path) {
+                    path->append(1, '.');
+                    *path += child->name;
+                } else {
+                    path = child->name;
+                }
+            }
+
+            if (hasPreVisit) {
+                // Invoke the pre-visit callback.
+                if (!invokeVisitPathTreeNodesCallback(preVisit, child, getPath(), dfs)) {
+                    dfsPop();
+                }
+            }
+        } else {
+            if (hasPostVisit && (invokeCallbacksForRootNode || !isRootNode)) {
+                // Invoke the post-visit callback.
+                invokeVisitPathTreeNodesCallback(postVisit, node, getPath(), dfs);
+            }
+            dfsPop();
+        }
+    }
+}
+
+/**
+ * This function extracts the dependencies for expressions that appear inside a projection. Note
+ * that this function only looks at ExpressionASTNodes in the projection and ignores all other kinds
+ * of projection AST nodes.
+ *
+ * For example, for the projection {a: 1, b: "$c"}, this function will only extract the dependencies
+ * needed by the expression "$c".
+ */
+void addProjectionExprDependencies(const projection_ast::Projection& projection, DepsTracker* deps);
+
+/**
+ * This method retrieves the values of the specified field paths ('fields') from 'resultSlot'
+ * and stores the values into slots.
+ *
+ * This method returns a pair containing: (1) the updated SBE plan stage tree and; (2) a vector of
+ * the slots ('outSlots') containing the field path values.
+ *
+ * The order of slots in 'outSlots' will match the order of field paths in 'fields'.
+ */
+std::pair<std::unique_ptr<sbe::PlanStage>, sbe::value::SlotVector> projectFieldsToSlots(
+    std::unique_ptr<sbe::PlanStage> stage,
+    const std::vector<std::string>& fields,
+    sbe::value::SlotId resultSlot,
+    PlanNodeId nodeId,
+    sbe::value::SlotIdGenerator* slotIdGenerator,
+    StageBuilderState& state,
+    const PlanStageSlots* slots = nullptr);
+
+template <typename T>
+inline StringData getTopLevelField(const T& path) {
+    auto idx = path.find('.');
+    return StringData(getRawStringData(path), idx != std::string::npos ? idx : path.size());
+}
+
+template <typename T>
+inline std::vector<std::string> getTopLevelFields(const T& setOfPaths) {
+    std::vector<std::string> topLevelFields;
+    if (!setOfPaths.empty()) {
+        StringSet topLevelFieldsSet;
+
+        for (const auto& path : setOfPaths) {
+            auto field = getTopLevelField(path);
+            if (!topLevelFieldsSet.count(field)) {
+                topLevelFields.emplace_back(std::string(field));
+                topLevelFieldsSet.emplace(std::string(field));
+            }
+        }
+    }
+
+    return topLevelFields;
+}
+
+template <typename T, typename FuncT>
+inline std::vector<T> filterVector(std::vector<T> vec, FuncT fn) {
+    std::vector<T> result;
+    std::copy_if(std::make_move_iterator(vec.begin()),
+                 std::make_move_iterator(vec.end()),
+                 std::back_inserter(result),
+                 fn);
+    return result;
+}
+
+template <typename T, typename FuncT>
+inline std::pair<std::vector<T>, std::vector<T>> splitVector(std::vector<T> vec, FuncT fn) {
+    std::pair<std::vector<T>, std::vector<T>> result;
+    for (size_t i = 0; i < vec.size(); ++i) {
+        if (fn(vec[i])) {
+            result.first.emplace_back(std::move(vec[i]));
+        } else {
+            result.second.emplace_back(std::move(vec[i]));
+        }
+    }
+    return result;
+}
+
+template <typename T>
+inline std::vector<T> appendVectorUnique(std::vector<T> lhs, std::vector<T> rhs) {
+    if (!rhs.empty()) {
+        auto valueSet = std::set<T>{lhs.begin(), lhs.end()};
+        for (size_t i = 0; i < rhs.size(); ++i) {
+            if (valueSet.emplace(rhs[i]).second) {
+                lhs.emplace_back(std::move(rhs[i]));
+            }
+        }
+    }
+    return lhs;
+}
 
 }  // namespace mongo::stage_builder

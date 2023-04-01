@@ -3,6 +3,7 @@ test_kind: fsm_workload_test
 selector:
   roots:
   - jstests/concurrency/fsm_workloads/**/*.js
+  - src/mongo/db/modules/*/jstests/concurrency/fsm_workloads/*.js
   exclude_files:
   ##
   # Disabled due to MongoDB restrictions and/or workload restrictions
@@ -11,8 +12,10 @@ selector:
   - jstests/concurrency/fsm_workloads/agg_group_external.js
   - jstests/concurrency/fsm_workloads/agg_sort_external.js
 
-  # The findAndModify_update_grow.js workload can cause OOM kills on test hosts.
+  # The findAndModify_update_grow.js and schema_validator_with_expr_variables.js workload can cause
+  # OOM kills on test hosts.
   - jstests/concurrency/fsm_workloads/findAndModify_update_grow.js
+  - jstests/concurrency/fsm_workloads/schema_validator_with_expr_variables.js
 
   # These workloads run the reIndex command, which is only allowed on a standalone node.
   - jstests/concurrency/fsm_workloads/reindex.js
@@ -54,6 +57,9 @@ executor:
       oplogSize: 1024
       set_parameters:
         enableTestCommands: 1
+        # TODO (SERVER-75503): Avoid setting query sampling server parameters in multiversion
+        # concurrency suites.
+        # queryAnalysisSamplerConfigurationRefreshSecs: 1
+        # queryAnalysisWriterIntervalSecs: 1
         roleGraphInvalidationIsFatal: 1
-
     num_nodes: 3

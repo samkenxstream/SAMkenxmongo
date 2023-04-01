@@ -10,6 +10,7 @@
 (function() {
 
 load("jstests/sharding/libs/sharded_transactions_helpers.js");
+load("jstests/sharding/updateOne_without_shard_key/libs/write_without_shard_key_test_util.js");
 
 const s = new ShardingTest({name: "auto1", shards: 2, mongos: 1});
 
@@ -90,20 +91,35 @@ for (let i = 0; i < 2; i++) {
     assert.commandWorked(coll.update({$and: [{_id: ObjectId()}]}, {$set: {x: 1}}, {multi: false}));
     assert.commandWorked(coll.update({_id: {$in: [ObjectId()]}}, {$set: {x: 1}}, {multi: false}));
 
-    // Invalid extraction of exact _id from query
-    assert.commandFailedWithCode(coll.update({}, {$set: {x: 1}}, {multi: false}),
-                                 ErrorCodes.InvalidOptions);
-    assert.commandFailedWithCode(
-        coll.update({_id: {$gt: ObjectId()}}, {$set: {x: 1}}, {multi: false}),
-        ErrorCodes.InvalidOptions);
-    assert.commandFailedWithCode(
-        coll.update({$or: [{_id: ObjectId()}, {_id: ObjectId()}]}, {$set: {x: 1}}, {multi: false}),
-        ErrorCodes.InvalidOptions);
-    assert.commandFailedWithCode(
-        coll.update({$and: [{_id: ObjectId()}, {_id: ObjectId()}]}, {$set: {x: 1}}, {multi: false}),
-        ErrorCodes.InvalidOptions);
-    assert.commandFailedWithCode(coll.update({'_id.x': ObjectId()}, {$set: {x: 1}}, {multi: false}),
-                                 ErrorCodes.InvalidOptions);
+    // Run the two phase broadcast write protocol for multi: false writes without a proper _id or
+    // shard key to target by.
+    if (WriteWithoutShardKeyTestUtil.isWriteWithoutShardKeyFeatureEnabled(sessionDb)) {
+        assert.commandWorked(coll.update({}, {$set: {x: 1}}, {multi: false}));
+        assert.commandWorked(coll.update({_id: {$gt: ObjectId()}}, {$set: {x: 1}}, {multi: false}));
+        assert.commandWorked(coll.update(
+            {$or: [{_id: ObjectId()}, {_id: ObjectId()}]}, {$set: {x: 1}}, {multi: false}));
+        assert.commandWorked(coll.update(
+            {$and: [{_id: ObjectId()}, {_id: ObjectId()}]}, {$set: {x: 1}}, {multi: false}));
+        assert.commandWorked(coll.update({'_id.x': ObjectId()}, {$set: {x: 1}}, {multi: false}));
+    } else {
+        // Invalid extraction of exact _id from query
+        assert.commandFailedWithCode(coll.update({}, {$set: {x: 1}}, {multi: false}),
+                                     ErrorCodes.InvalidOptions);
+        assert.commandFailedWithCode(
+            coll.update({_id: {$gt: ObjectId()}}, {$set: {x: 1}}, {multi: false}),
+            ErrorCodes.InvalidOptions);
+        assert.commandFailedWithCode(
+            coll.update(
+                {$or: [{_id: ObjectId()}, {_id: ObjectId()}]}, {$set: {x: 1}}, {multi: false}),
+            ErrorCodes.InvalidOptions);
+        assert.commandFailedWithCode(
+            coll.update(
+                {$and: [{_id: ObjectId()}, {_id: ObjectId()}]}, {$set: {x: 1}}, {multi: false}),
+            ErrorCodes.InvalidOptions);
+        assert.commandFailedWithCode(
+            coll.update({'_id.x': ObjectId()}, {$set: {x: 1}}, {multi: false}),
+            ErrorCodes.InvalidOptions);
+    }
 
     // Make sure we can extract exact shard key from certain queries
     assert.commandWorked(coll.update({key: ObjectId()}, {$set: {x: 1}}, {multi: false}));
@@ -113,19 +129,34 @@ for (let i = 0; i < 2; i++) {
     assert.commandWorked(coll.update({$or: [{key: ObjectId()}]}, {$set: {x: 1}}, {multi: false}));
     assert.commandWorked(coll.update({$and: [{key: ObjectId()}]}, {$set: {x: 1}}, {multi: false}));
 
-    // Invalid extraction of exact key from query
-    assert.commandFailedWithCode(coll.update({}, {$set: {x: 1}}, {multi: false}),
-                                 ErrorCodes.InvalidOptions);
-    assert.commandFailedWithCode(coll.update({'key.x': ObjectId()}, {$set: {x: 1}}, {multi: false}),
-                                 ErrorCodes.InvalidOptions);
-
-    // Inexact queries may target a single shard. Range queries may target a single shard as
-    // long as the collection is not hashed.
-    if (hashedKey) {
-        assert.commandFailedWithCode(coll.update({key: {$gt: 0}}, {$set: {x: 1}}, {multi: false}),
-                                     ErrorCodes.InvalidOptions);
+    // Run the two phase broadcast write protocol for multi: false writes without a proper _id or
+    // shard key to target by.
+    if (WriteWithoutShardKeyTestUtil.isWriteWithoutShardKeyFeatureEnabled(sessionDb)) {
+        assert.commandWorked(coll.update({}, {$set: {x: 1}}, {multi: false}));
+        assert.commandWorked(coll.update({'key.x': ObjectId()}, {$set: {x: 1}}, {multi: false}));
     } else {
+        // Invalid extraction of exact key from query
+        assert.commandFailedWithCode(coll.update({}, {$set: {x: 1}}, {multi: false}),
+                                     ErrorCodes.InvalidOptions);
+        assert.commandFailedWithCode(
+            coll.update({'key.x': ObjectId()}, {$set: {x: 1}}, {multi: false}),
+            ErrorCodes.InvalidOptions);
+    }
+
+    // Run the two phase broadcast write protocol for multi: false writes without a proper _id or
+    // shard key to target by.
+    if (WriteWithoutShardKeyTestUtil.isWriteWithoutShardKeyFeatureEnabled(sessionDb)) {
         assert.commandWorked(coll.update({key: {$gt: 0}}, {$set: {x: 1}}, {multi: false}));
+    } else {
+        // Inexact queries may target a single shard. Range queries may target a single shard as
+        // long as the collection is not hashed.
+        if (hashedKey) {
+            assert.commandFailedWithCode(
+                coll.update({key: {$gt: 0}}, {$set: {x: 1}}, {multi: false}),
+                ErrorCodes.InvalidOptions);
+        } else {
+            assert.commandWorked(coll.update({key: {$gt: 0}}, {$set: {x: 1}}, {multi: false}));
+        }
     }
     // Note: {key:-1} and {key:-2} fall on shard0 for both hashed and ascending shardkeys.
     assert.commandWorked(
@@ -133,12 +164,21 @@ for (let i = 0; i < 2; i++) {
     assert.commandWorked(
         coll.update({$and: [{key: -1}, {key: -2}]}, {$set: {x: 1}}, {multi: false}));
 
-    // In cases where an inexact query does target multiple shards, single update is rejected.
-    assert.commandFailedWithCode(coll.update({key: {$gt: MinKey}}, {$set: {x: 1}}, {multi: false}),
-                                 ErrorCodes.InvalidOptions);
-    assert.commandFailedWithCode(
-        coll.update({$or: [{key: -10}, {key: 10}]}, {$set: {x: 1}}, {multi: false}),
-        ErrorCodes.InvalidOptions);
+    // Run the two phase broadcast write protocol for multi: false writes without a proper _id or
+    // shard key to target by.
+    if (WriteWithoutShardKeyTestUtil.isWriteWithoutShardKeyFeatureEnabled(sessionDb)) {
+        assert.commandWorked(coll.update({key: {$gt: MinKey}}, {$set: {x: 1}}, {multi: false}));
+        assert.commandWorked(
+            coll.update({$or: [{key: -10}, {key: 10}]}, {$set: {x: 1}}, {multi: false}));
+    } else {
+        // In cases where an inexact query does target multiple shards, single update is rejected.
+        assert.commandFailedWithCode(
+            coll.update({key: {$gt: MinKey}}, {$set: {x: 1}}, {multi: false}),
+            ErrorCodes.InvalidOptions);
+        assert.commandFailedWithCode(
+            coll.update({$or: [{key: -10}, {key: 10}]}, {$set: {x: 1}}, {multi: false}),
+            ErrorCodes.InvalidOptions);
+    }
 
     // Make sure failed shard key or _id extraction doesn't affect the other
     assert.commandWorked(
@@ -149,22 +189,22 @@ for (let i = 0; i < 2; i++) {
     // Can unset shard key with op style update.
     assert.commandWorked(coll.insert({_id: 11, key: 1}));
     assert.commandWorked(sessionColl.update({_id: 11, key: 1}, {$unset: {key: 1}}));
-    assert.docEq(sessionColl.findOne({_id: 11}), {_id: 11});
+    assert.docEq({_id: 11}, sessionColl.findOne({_id: 11}));
 
     // Can unset shard key with replacement style update.
     assert.commandWorked(coll.insert({_id: 12, key: 1}));
     assert.commandWorked(sessionColl.update({_id: 12, key: 1}, {_id: 12}));
-    assert.docEq(sessionColl.findOne({_id: 12}), {_id: 12});
+    assert.docEq({_id: 12}, sessionColl.findOne({_id: 12}));
 
     // Can unset shard key with pipeline style update.
     assert.commandWorked(coll.insert({_id: 13, key: 1}));
     assert.commandWorked(sessionColl.update({_id: 13, key: 1}, [{$unset: "key"}, {$set: {x: 1}}]));
-    assert.docEq(sessionColl.findOne({_id: 13}), {_id: 13, x: 1});
+    assert.docEq({_id: 13, x: 1}, sessionColl.findOne({_id: 13}));
 
     // Can unset nested fields in the shard key.
     assert.commandWorked(coll.insert({_id: 14, key: {a: 1, b: 1}}));
     assert.commandWorked(sessionColl.update({_id: 14, key: {a: 1, b: 1}}, {$unset: {"key.a": 1}}));
-    assert.docEq(sessionColl.findOne({_id: 14}), {_id: 14, key: {b: 1}});
+    assert.docEq({_id: 14, key: {b: 1}}, sessionColl.findOne({_id: 14}));
 }
 
 // Tests for nested shard keys.
@@ -181,18 +221,18 @@ function testNestedShardKeys(collName, keyPattern) {
     // Can unset shard key with op style update.
     assert.commandWorked(coll.insert({_id: 11, skey: {skey: 1}}));
     assert.commandWorked(sessionColl.update({_id: 11, "skey.skey": 1}, {$unset: {skey: 1}}));
-    assert.docEq(sessionColl.findOne({_id: 11}), {_id: 11});
+    assert.docEq({_id: 11}, sessionColl.findOne({_id: 11}));
 
     // Can unset shard key with replacement style update.
     assert.commandWorked(coll.insert({_id: 12, skey: {skey: 1}}));
     assert.commandWorked(sessionColl.update({_id: 12, "skey.skey": 1}, {_id: 12}));
-    assert.docEq(sessionColl.findOne({_id: 12}), {_id: 12});
+    assert.docEq({_id: 12}, sessionColl.findOne({_id: 12}));
 
     // Can unset shard key with pipeline style update.
     assert.commandWorked(coll.insert({_id: 13, skey: {skey: 1}}));
     assert.commandWorked(
         sessionColl.update({_id: 13, "skey.skey": 1}, [{$unset: "skey"}, {$set: {x: 1}}]));
-    assert.docEq(sessionColl.findOne({_id: 13}), {_id: 13, x: 1});
+    assert.docEq({_id: 13, x: 1}, sessionColl.findOne({_id: 13}));
 
     //
     // Verify each field in a nested shard key can be unset.
@@ -201,25 +241,25 @@ function testNestedShardKeys(collName, keyPattern) {
     // For op-style.
     assert.commandWorked(coll.insert({_id: 14, skey: {skey: 1}}));
     assert.commandWorked(sessionColl.update({_id: 14, "skey.skey": 1}, {$unset: {"skey.skey": 1}}));
-    assert.docEq(sessionColl.findOne({_id: 14}), {_id: 14, skey: {}});
+    assert.docEq({_id: 14, skey: {}}, sessionColl.findOne({_id: 14}));
     assert.commandWorked(sessionColl.update({_id: 14, skey: {}}, {$unset: {skey: 1}}));
-    assert.docEq(sessionColl.findOne({_id: 14}), {_id: 14});
+    assert.docEq({_id: 14}, sessionColl.findOne({_id: 14}));
 
     // For replacement style.
     assert.commandWorked(coll.insert({_id: 15, skey: {skey: 1}}));
     assert.commandWorked(sessionColl.update({_id: 15, "skey.skey": 1}, {skey: 1}));
-    assert.docEq(sessionColl.findOne({_id: 15}), {_id: 15, skey: 1});
+    assert.docEq({_id: 15, skey: 1}, sessionColl.findOne({_id: 15}));
     assert.commandWorked(sessionColl.update({_id: 15, skey: 1}, {$unset: {skey: 1}}));
-    assert.docEq(sessionColl.findOne({_id: 15}), {_id: 15});
+    assert.docEq({_id: 15}, sessionColl.findOne({_id: 15}));
 
     // This can be used to make sure pipeline-based updates generate delta oplog entries.
     const largeStr = '*'.repeat(128);
     // For pipeline style.
     assert.commandWorked(coll.insert({_id: 16, skey: {skey: 1}, largeStr: largeStr}));
     assert.commandWorked(sessionColl.update({_id: 16, "skey.skey": 1}, [{$unset: "skey.skey"}]));
-    assert.docEq(sessionColl.findOne({_id: 16}), {_id: 16, skey: {}, largeStr: largeStr});
+    assert.docEq({_id: 16, skey: {}, largeStr: largeStr}, sessionColl.findOne({_id: 16}));
     assert.commandWorked(sessionColl.update({_id: 16, skey: {}}, [{$unset: "skey"}]));
-    assert.docEq(sessionColl.findOne({_id: 16}), {_id: 16, largeStr: largeStr});
+    assert.docEq({_id: 16, largeStr: largeStr}, sessionColl.findOne({_id: 16}));
 }
 
 testNestedShardKeys("update_nested", {"skey.skey": 1});

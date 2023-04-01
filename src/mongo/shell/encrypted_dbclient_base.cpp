@@ -58,7 +58,6 @@
 #include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
-#include "mongo/shell/encrypted_shell_options.h"
 #include "mongo/shell/kms.h"
 #include "mongo/shell/kms_gen.h"
 #include "mongo/shell/shell_options.h"
@@ -66,11 +65,10 @@
 
 namespace mongo {
 
-EncryptedShellGlobalParams encryptedShellGlobalParams;
-
 namespace {
 constexpr Duration kCacheInvalidationTime = Minutes(1);
-
+constexpr StringData compactCmdName = "compact"_sd;
+constexpr StringData cleanupCmdName = "cleanup"_sd;
 
 ImplicitEncryptedDBClientCallback* implicitEncryptedDBClientCallback{nullptr};
 
@@ -100,26 +98,24 @@ EncryptedDBClientBase::EncryptedDBClientBase(std::unique_ptr<DBClientBase> conn,
     : _conn(std::move(conn)), _encryptionOptions(std::move(encryptionOptions)), _cx(cx) {
     validateCollection(cx, collection);
     _collection = JS::Heap<JS::Value>(collection);
+    _conn->setAlwaysAppendDollarTenant_forTest();
 };
 
 std::string EncryptedDBClientBase::getServerAddress() const {
     return _conn->getServerAddress();
 }
 
-bool EncryptedDBClientBase::call(Message& toSend,
-                                 Message& response,
-                                 bool assertOk,
-                                 std::string* actualServer) {
-    return _conn->call(toSend, response, assertOk, actualServer);
+void EncryptedDBClientBase::_call(Message& toSend, Message& response, std::string* actualServer) {
+    _conn->call(toSend, response, actualServer);
 }
 
 void EncryptedDBClientBase::say(Message& toSend, bool isRetry, std::string* actualServer) {
-    MONGO_UNREACHABLE;
+    return _conn->say(toSend, isRetry, actualServer);
 }
 
 BSONObj EncryptedDBClientBase::encryptDecryptCommand(const BSONObj& object,
                                                      bool encrypt,
-                                                     const StringData databaseName) {
+                                                     const DatabaseName& dbName) {
     std::stack<std::pair<BSONObjIterator, BSONObjBuilder>> frameStack;
 
     // The encryptDecryptCommand frameStack requires a guard because  if encryptMarking or
@@ -170,7 +166,12 @@ BSONObj EncryptedDBClientBase::encryptDecryptCommand(const BSONObj& object,
         }
     }
     invariant(frameStack.size() == 1);
-    frameStack.top().second.append("$db", databaseName);
+    // Append '$db' which shouldn't contain tenantid.
+    frameStack.top().second.append("$db", dbName.toString());
+    // If encrypt request, append '$tenant' which contains tenantid.
+    if (encrypt && dbName.tenantId() && !object.hasField("$tenant")) {
+        dbName.tenantId()->serializeToBSON("$tenant", &frameStack.top().second);
+    }
     return frameStack.top().second.obj();
 }
 
@@ -199,22 +200,20 @@ void EncryptedDBClientBase::decryptPayload(ConstDataRange data,
     }
 }
 
-std::pair<rpc::UniqueReply, DBClientBase*> EncryptedDBClientBase::processResponseFLE1(
-    rpc::UniqueReply result, const StringData databaseName) {
-    auto rawReply = result->getCommandReply();
-    return prepareReply(
-        std::move(result), databaseName, encryptDecryptCommand(rawReply, false, databaseName));
+EncryptedDBClientBase::RunCommandReturn EncryptedDBClientBase::processResponseFLE1(
+    EncryptedDBClientBase::RunCommandReturn result, const DatabaseName& dbName) {
+    auto rawReply = result.returnReply->getCommandReply();
+    return prepareReply(std::move(result), encryptDecryptCommand(rawReply, false, dbName));
 }
 
-std::pair<rpc::UniqueReply, DBClientBase*> EncryptedDBClientBase::processResponseFLE2(
-    rpc::UniqueReply result, const StringData databaseName) {
-    auto rawReply = result->getCommandReply();
-    return prepareReply(
-        std::move(result), databaseName, FLEClientCrypto::decryptDocument(rawReply, this));
+EncryptedDBClientBase::RunCommandReturn EncryptedDBClientBase::processResponseFLE2(
+    EncryptedDBClientBase::RunCommandReturn result) {
+    auto rawReply = result.returnReply->getCommandReply();
+    return prepareReply(std::move(result), FLEClientCrypto::decryptDocument(rawReply, this));
 }
 
-std::pair<rpc::UniqueReply, DBClientBase*> EncryptedDBClientBase::prepareReply(
-    rpc::UniqueReply result, const StringData databaseName, BSONObj decryptedDoc) {
+EncryptedDBClientBase::RunCommandReturn EncryptedDBClientBase::prepareReply(
+    EncryptedDBClientBase::RunCommandReturn result, BSONObj decryptedDoc) {
     rpc::OpMsgReplyBuilder replyBuilder;
     replyBuilder.setCommandReply(StatusWith<BSONObj>(decryptedDoc));
     auto msg = replyBuilder.done();
@@ -222,22 +221,52 @@ std::pair<rpc::UniqueReply, DBClientBase*> EncryptedDBClientBase::prepareReply(
     auto host = _conn->getServerAddress();
     auto reply = _conn->parseCommandReplyMessage(host, msg);
 
-    return {std::move(reply), this};
+    return EncryptedDBClientBase::RunCommandReturn({std::move(reply), result});
+}
+
+EncryptedDBClientBase::RunCommandReturn EncryptedDBClientBase::doRunCommand(
+    EncryptedDBClientBase::RunCommandParams params) {
+    if (params.type == EncryptedDBClientBase::RunCommandConnectionType::rawPtr) {
+        return EncryptedDBClientBase::RunCommandReturn(
+            _conn->runCommandWithTarget(std::move(params.request)));
+    }
+    invariant(params.conn);
+    return EncryptedDBClientBase::RunCommandReturn(
+        _conn->runCommandWithTarget(std::move(params.request), params.conn));
+}
+
+EncryptedDBClientBase::RunCommandReturn EncryptedDBClientBase::handleEncryptionRequest(
+    EncryptedDBClientBase::RunCommandParams params) {
+    auto& request = params.request;
+    auto commandName = request.getCommandName().toString();
+    const DatabaseName dbName = request.body.hasField("$tenant")
+        ? DatabaseName(TenantId(request.body["$tenant"].OID()), request.getDatabase())
+        : DatabaseName(boost::none, request.getDatabase());
+
+    if (std::find(kEncryptedCommands.begin(), kEncryptedCommands.end(), StringData(commandName)) ==
+        std::end(kEncryptedCommands)) {
+        return doRunCommand(std::move(params));
+    }
+
+    EncryptedDBClientBase::RunCommandReturn result(doRunCommand(std::move(params)));
+    return processResponseFLE1(processResponseFLE2(std::move(result)), dbName);
 }
 
 std::pair<rpc::UniqueReply, DBClientBase*> EncryptedDBClientBase::runCommandWithTarget(
     OpMsgRequest request) {
-    std::string commandName = request.getCommandName().toString();
-    std::string databaseName = request.getDatabase().toString();
+    EncryptedDBClientBase::RunCommandParams params(request);
+    auto result = handleEncryptionRequest(std::move(params));
+    auto returnConn = stdx::get<DBClientBase*>(result.returnConn);
+    return {std::move(result.returnReply), returnConn};
+}
 
-    if (std::find(kEncryptedCommands.begin(), kEncryptedCommands.end(), StringData(commandName)) ==
-        std::end(kEncryptedCommands)) {
-        return _conn->runCommandWithTarget(std::move(request));
-    }
-
-    auto result = _conn->runCommandWithTarget(std::move(request)).first;
-    return processResponseFLE1(processResponseFLE2(std::move(result), databaseName).first,
-                               databaseName);
+std::pair<rpc::UniqueReply, std::shared_ptr<DBClientBase>>
+EncryptedDBClientBase::runCommandWithTarget(OpMsgRequest request,
+                                            std::shared_ptr<DBClientBase> conn) {
+    EncryptedDBClientBase::RunCommandParams params(request, conn);
+    auto result = handleEncryptionRequest(std::move(params));
+    auto returnConn = stdx::get<std::shared_ptr<DBClientBase>>(result.returnConn);
+    return {std::move(result.returnReply), returnConn};
 }
 
 /**
@@ -517,7 +546,7 @@ void EncryptedDBClientBase::decrypt(mozjs::MozJSImplScope* scope,
 
 boost::optional<EncryptedFieldConfig> EncryptedDBClientBase::getEncryptedFieldConfig(
     const NamespaceString& nss) {
-    auto collsList = _conn->getCollectionInfos(nss.db().toString(), BSON("name" << nss.coll()));
+    auto collsList = _conn->getCollectionInfos(nss.dbName(), BSON("name" << nss.coll()));
     uassert(ErrorCodes::BadValue,
             str::stream() << "Namespace not found: " << nss.toString(),
             !collsList.empty());
@@ -530,31 +559,57 @@ boost::optional<EncryptedFieldConfig> EncryptedDBClientBase::getEncryptedFieldCo
     if (efc.eoo() || !efc.isABSONObj()) {
         return boost::none;
     }
-    return EncryptedFieldConfig::parse(IDLParserErrorContext("encryptedFields"), efc.Obj());
+    return EncryptedFieldConfig::parse(IDLParserContext("encryptedFields"), efc.Obj());
 }
 
-void EncryptedDBClientBase::compact(JSContext* cx, JS::CallArgs args) {
+NamespaceString validateStructuredEncryptionParams(JSContext* cx,
+                                                   JS::CallArgs args,
+                                                   StringData cmdName) {
     if (args.length() != 1) {
-        uasserted(ErrorCodes::BadValue, "compact requires 1 arg");
+        uasserted(ErrorCodes::BadValue, str::stream() << cmdName << " requires 1 arg");
     }
     if (!args.get(0).isString()) {
-        uasserted(ErrorCodes::BadValue, "1st param to compact has to be a string");
+        uasserted(ErrorCodes::BadValue,
+                  str::stream() << "1st param to " << cmdName << " has to be a string");
     }
     std::string fullName = mozjs::ValueWriter(cx, args.get(0)).toString();
     NamespaceString nss(fullName);
+
     uassert(
         ErrorCodes::BadValue, str::stream() << "Invalid namespace: " << fullName, nss.isValid());
 
-    auto efc = getEncryptedFieldConfig(nss);
+    return nss;
+}
+
+void EncryptedDBClientBase::compact(JSContext* cx, JS::CallArgs args) {
+    auto nss = validateStructuredEncryptionParams(cx, args, compactCmdName);
+
     BSONObjBuilder builder;
+    auto efc = getEncryptedFieldConfig(nss);
+
     builder.append("compactStructuredEncryptionData", nss.coll());
     builder.append("compactionTokens",
                    efc ? FLEClientCrypto::generateCompactionTokens(*efc, this) : BSONObj());
 
     BSONObj reply;
-    runCommand(nss.db().toString(), builder.obj(), reply, 0);
+    runCommand(nss.dbName(), builder.obj(), reply, 0);
     reply = reply.getOwned();
     mozjs::ValueReader(cx, args.rval()).fromBSON(reply, nullptr, false);
+}
+
+void EncryptedDBClientBase::cleanup(JSContext* cx, JS::CallArgs args) {
+    auto nss = validateStructuredEncryptionParams(cx, args, cleanupCmdName);
+
+    BSONObjBuilder builder;
+    auto efc = getEncryptedFieldConfig(nss);
+
+    builder.append("cleanupStructuredEncryptionData", nss.coll());
+    builder.append("cleanupTokens",
+                   efc ? FLEClientCrypto::generateCompactionTokens(*efc, this) : BSONObj());
+
+    // TODO SERVER-72937: Add call to cleanup function
+    mozjs::ValueReader(cx, args.rval()).fromBSON(BSONObj(), nullptr, false);
+    return;
 }
 
 void EncryptedDBClientBase::trace(JSTracer* trc) {
@@ -566,29 +621,9 @@ JS::Value EncryptedDBClientBase::getCollection() const {
 }
 
 std::unique_ptr<DBClientCursor> EncryptedDBClientBase::find(FindCommandRequest findRequest,
-                                                            const ReadPreferenceSetting& readPref) {
-    return _conn->find(std::move(findRequest), readPref);
-}
-
-std::unique_ptr<DBClientCursor> EncryptedDBClientBase::query_DEPRECATED(
-    const NamespaceStringOrUUID& nsOrUuid,
-    const BSONObj& filter,
-    const Query& querySettings,
-    int limit,
-    int nToSkip,
-    const BSONObj* fieldsToReturn,
-    int queryOptions,
-    int batchSize,
-    boost::optional<BSONObj> readConcernObj) {
-    return _conn->query_DEPRECATED(nsOrUuid,
-                                   filter,
-                                   querySettings,
-                                   limit,
-                                   nToSkip,
-                                   fieldsToReturn,
-                                   queryOptions,
-                                   batchSize,
-                                   readConcernObj);
+                                                            const ReadPreferenceSetting& readPref,
+                                                            ExhaustMode exhaustMode) {
+    return _conn->find(std::move(findRequest), readPref, exhaustMode);
 }
 
 bool EncryptedDBClientBase::isFailed() const {
@@ -686,7 +721,11 @@ std::shared_ptr<SymmetricKey> EncryptedDBClientBase::getDataKey(const UUID& uuid
     return key;
 }
 
-SecureVector<uint8_t> EncryptedDBClientBase::getKeyMaterialFromDisk(const UUID& uuid) {
+DBClientBase* EncryptedDBClientBase::getRawConnection() {
+    return _conn.get();
+}
+
+BSONObj EncryptedDBClientBase::getEncryptedKey(const UUID& uuid) {
     NamespaceString fullNameNS = getCollectionNS();
     FindCommandRequest findCmd{fullNameNS};
     findCmd.setFilter(BSON("_id" << uuid));
@@ -697,7 +736,7 @@ SecureVector<uint8_t> EncryptedDBClientBase::getKeyMaterialFromDisk(const UUID& 
         uasserted(ErrorCodes::BadValue, "Invalid keyID.");
     }
 
-    auto keyStoreRecord = KeyStoreRecord::parse(IDLParserErrorContext("root"), dataKeyObj);
+    auto keyStoreRecord = KeyStoreRecord::parse(IDLParserContext("root"), dataKeyObj);
     if (dataKeyObj.hasField("version"_sd)) {
         uassert(ErrorCodes::BadValue,
                 "Invalid version, must be either 0 or undefined",
@@ -712,6 +751,15 @@ SecureVector<uint8_t> EncryptedDBClientBase::getKeyMaterialFromDisk(const UUID& 
 
     auto dataKey = keyStoreRecord.getKeyMaterial();
     uassert(ErrorCodes::BadValue, "Invalid data key.", dataKey.length() != 0);
+
+    return keyStoreRecord.toBSON();
+}
+
+SecureVector<uint8_t> EncryptedDBClientBase::getKeyMaterialFromDisk(const UUID& uuid) {
+    auto rawKey = getEncryptedKey(uuid);
+    auto keyStoreRecord = KeyStoreRecord::parse(IDLParserContext("root"), rawKey);
+
+    auto dataKey = keyStoreRecord.getKeyMaterial();
 
     std::unique_ptr<KMSService> kmsService = KMSServiceController::createFromDisk(
         _encryptionOptions.getKmsProviders().toBSON(), keyStoreRecord.getMasterKey());
@@ -733,6 +781,18 @@ KeyMaterial EncryptedDBClientBase::getKey(const UUID& uuid) {
     km->resize(decryptedKey->size());
     std::copy(decryptedKey->data(), decryptedKey->data() + decryptedKey->size(), km->data());
     return km;
+}
+
+SymmetricKey& EncryptedDBClientBase::getKMSLocalKey() {
+    if (!_localKey.has_value()) {
+        std::unique_ptr<KMSService> kmsService =
+            KMSServiceController::createFromDisk(_encryptionOptions.getKmsProviders().toBSON(),
+                                                 BSON("provider"
+                                                      << "local"));
+        _localKey = std::move(kmsService->getMasterKey());
+    }
+
+    return _localKey.get();
 }
 
 #ifdef MONGO_CONFIG_SSL
@@ -797,7 +857,7 @@ std::unique_ptr<DBClientBase> createEncryptedDBClientBase(std::unique_ptr<DBClie
 
     static constexpr auto keyVaultClientFieldId = "keyVaultClient";
 
-    if (!arg.isObject() && encryptedShellGlobalParams.awsAccessKeyId.empty()) {
+    if (!arg.isObject()) {
         return conn;
     }
 
@@ -805,43 +865,18 @@ std::unique_ptr<DBClientBase> createEncryptedDBClientBase(std::unique_ptr<DBClie
     JS::RootedValue client(cx);
     JS::RootedValue collection(cx);
 
-    if (!arg.isObject()) {
-        // If arg is not an object, but one of the required encryptedShellGlobalParams
-        // is defined, the user is trying to start an encrypted client with command line
-        // parameters.
-
-        AwsKMS awsKms = AwsKMS(encryptedShellGlobalParams.awsAccessKeyId,
-                               encryptedShellGlobalParams.awsSecretAccessKey);
-
-        awsKms.setUrl(StringData(encryptedShellGlobalParams.awsKmsURL));
-
-        awsKms.setSessionToken(StringData(encryptedShellGlobalParams.awsSessionToken));
-
-        KmsProviders kmsProviders;
-        kmsProviders.setAws(awsKms);
-
-        // The mongoConnection object will never be null.
-        // If the encrypted shell is started through command line parameters, then the user must
-        // default to the implicit connection for the keyvault collection.
-        client.setObjectOrNull(mongoConnection.get());
-
-        // Because we cannot add a schemaMap object through the command line, we set the
-        // schemaMap object in ClientSideFLEOptions to be null so we know to always use
-        // remote schemas.
-        encryptionOptions = ClientSideFLEOptions(encryptedShellGlobalParams.keyVaultNamespace,
-                                                 std::move(kmsProviders));
-    } else {
+    {
         uassert(ErrorCodes::BadValue,
                 "Collection object must be passed to Field Level Encryption Options",
                 arg.isObject());
 
         const BSONObj obj = mozjs::ValueWriter(cx, arg).toBSON();
-        encryptionOptions = encryptionOptions.parse(IDLParserErrorContext("root"), obj);
+        encryptionOptions = encryptionOptions.parse(IDLParserContext("root"), obj);
 
         // IDL does not perform a deep copy of BSONObjs when parsing, so we must get an
         // owned copy of the schemaMap.
         if (encryptionOptions.getSchemaMap()) {
-            encryptionOptions.setSchemaMap(encryptionOptions.getSchemaMap().get().getOwned());
+            encryptionOptions.setSchemaMap(encryptionOptions.getSchemaMap().value().getOwned());
         }
 
         // This logic tries to extract the client from the args. If the connection object is defined
@@ -866,8 +901,16 @@ std::unique_ptr<DBClientBase> createEncryptedDBClientBase(std::unique_ptr<DBClie
     return std::move(base);
 }
 
+DBClientBase* getNestedConnection(DBClientBase* conn) {
+    auto* encryptedConn = dynamic_cast<EncryptedDBClientBase*>(conn);
+    if (!encryptedConn) {
+        return nullptr;
+    }
+    return encryptedConn->getRawConnection();
+}
+
 MONGO_INITIALIZER(setCallbacksForEncryptedDBClientBase)(InitializerContext*) {
-    mongo::mozjs::setEncryptedDBClientCallback(createEncryptedDBClientBase);
+    mongo::mozjs::setEncryptedDBClientCallbacks(createEncryptedDBClientBase, getNestedConnection);
 }
 
 }  // namespace

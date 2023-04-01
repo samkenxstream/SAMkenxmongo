@@ -2,7 +2,6 @@
  * Tests that in tenant migration, the collection recreated on a dropped view namespace is handled
  * correctly on resuming the logical tenant collection cloning phase due to recipient failover.
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
@@ -12,19 +11,18 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {makeX509OptionsForTest} from "jstests/replsets/libs/tenant_migration_util.js";
+
+load("jstests/libs/fail_point_util.js");
+load("jstests/libs/uuid_util.js");  // for 'extractUUIDFromObject'
 
 const tenantMigrationFailoverTest = function(isTimeSeries, createCollFn) {
-    load("jstests/libs/fail_point_util.js");
-    load("jstests/libs/uuid_util.js");  // for 'extractUUIDFromObject'
-    load("jstests/replsets/libs/tenant_migration_test.js");
-    load("jstests/replsets/libs/tenant_migration_util.js");
-
     const recipientRst = new ReplSetTest({
         nodes: 2,
         name: jsTestName() + "_recipient",
-        nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().recipient, {
+        serverless: true,
+        nodeOptions: Object.assign(makeX509OptionsForTest().recipient, {
             setParameter: {
                 // Allow reads on recipient before migration completes for testing.
                 'failpoint.tenantMigrationRecipientNotRejectReads': tojson({mode: 'alwaysOn'}),
@@ -41,7 +39,7 @@ const tenantMigrationFailoverTest = function(isTimeSeries, createCollFn) {
     const donorRst = tenantMigrationTest.getDonorRst();
     const donorPrimary = donorRst.getPrimary();
 
-    const tenantId = "testTenantId";
+    const tenantId = ObjectId().str;
     const dbName = tenantMigrationTest.tenantDB(tenantId, "testDB");
     const donorDB = donorPrimary.getDB(dbName);
     const collName = "testColl";
@@ -62,7 +60,7 @@ const tenantMigrationFailoverTest = function(isTimeSeries, createCollFn) {
     const migrationOpts = {
         migrationIdString: migrationIdString,
         recipientConnString: tenantMigrationTest.getRecipientConnString(),
-        tenantId: tenantId,
+        tenantId,
     };
 
     const recipientPrimary = recipientRst.getPrimary();
@@ -70,14 +68,14 @@ const tenantMigrationFailoverTest = function(isTimeSeries, createCollFn) {
     const recipientSystemViewsColl = recipientDb.getCollection("system.views");
 
     // Configure a fail point to have the recipient primary hang after cloning
-    // "testTenantId_testDB.system.views" collection.
+    // "<OID>_testDB.system.views" collection.
     const hangDuringCollectionClone =
         configureFailPoint(recipientPrimary,
                            "tenantMigrationHangCollectionClonerAfterHandlingBatchResponse",
                            {nss: recipientSystemViewsColl.getFullName()});
 
     // Start the migration and wait for the migration to hang after cloning
-    // "testTenantId_testDB.system.views" collection.
+    // "<OID>_testDB.system.views" collection.
     assert.commandWorked(tenantMigrationTest.startMigration(migrationOpts));
     hangDuringCollectionClone.wait();
 
@@ -85,7 +83,7 @@ const tenantMigrationFailoverTest = function(isTimeSeries, createCollFn) {
     recipientRst.awaitLastOpCommitted();
     const newRecipientPrimary = recipientRst.getSecondaries()[0];
 
-    // Verify that a view has been registered for "testTenantId_testDB.testColl" on the new
+    // Verify that a view has been registered for "<OID>_testDB.testColl" on the new
     // recipient primary.
     let collectionInfo = getCollectionInfo(newRecipientPrimary);
     assert.eq(1, collectionInfo.length);
@@ -133,4 +131,3 @@ tenantMigrationFailoverTest(true,
 jsTestLog("Running tenant migration test for regular view");
 tenantMigrationFailoverTest(false,
                             (db, collName) => db.createView(collName, "sourceCollection", []));
-})();

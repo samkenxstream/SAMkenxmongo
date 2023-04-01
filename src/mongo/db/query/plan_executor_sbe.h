@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/util/duration.h"
 #include <queue>
 
 #include "mongo/db/exec/sbe/stages/stages.h"
@@ -50,7 +51,8 @@ public:
                     bool returnOwnedBson,
                     NamespaceString nss,
                     bool isOpen,
-                    std::unique_ptr<PlanYieldPolicySBE> yieldPolicy);
+                    std::unique_ptr<PlanYieldPolicySBE> yieldPolicy,
+                    bool generatedByBonsai);
 
     CanonicalQuery* getCanonicalQuery() const override {
         return _cq.get();
@@ -100,11 +102,16 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    BatchedDeleteStats getBatchedDeleteStats() override {
+        // Using SBE to execute a batched delete command is not yet supported.
+        MONGO_UNREACHABLE;
+    }
+
     void markAsKilled(Status killStatus);
 
     void dispose(OperationContext* opCtx);
 
-    void enqueue(const BSONObj& obj);
+    void stashResult(const BSONObj& obj);
 
     bool isMarkedAsKilled() const override {
         return !_killStatus.isOK();
@@ -123,9 +130,8 @@ public:
     BSONObj getPostBatchResumeToken() const override;
 
     /**
-     * Even though the leaves of '_root' will acquire AutoGet objects, the caller must acquire a top
-     * level AutoGet object outside of this PlanExecutor in order to open a storage transaction and
-     * establish a consistent view of the catalog.
+     * The caller must acquire a top level AutoGet object outside of this PlanExecutor in order to
+     * open a storage transaction and establish a consistent view of the catalog.
      */
     LockPolicy lockPolicy() const override {
         return LockPolicy::kLockExternally;
@@ -143,7 +149,19 @@ public:
         return _isSaveRecoveryUnitAcrossCommandsEnabled;
     }
 
+    PlanExecutor::QueryFramework getQueryFramework() const override final {
+        return _generatedByBonsai ? PlanExecutor::QueryFramework::kCQF
+                                  : PlanExecutor::QueryFramework::kSBEOnly;
+    }
+
+    void setReturnOwnedData(bool returnOwnedData) override final {
+        _mustReturnOwnedBson = returnOwnedData;
+    }
+
 private:
+    template <typename ObjectType>
+    ExecState getNextImpl(ObjectType* out, RecordId* dlOut);
+
     enum class State { kClosed, kOpened };
 
     State _state{State::kClosed};
@@ -154,7 +172,7 @@ private:
 
     // Vector of secondary namespaces.
     std::vector<NamespaceStringOrUUID> _secondaryNssVector{};
-    const bool _mustReturnOwnedBson;
+    bool _mustReturnOwnedBson;
 
     // CompileCtx owns the instance pointed by _env, so we must keep it around.
     const std::unique_ptr<sbe::PlanStage> _root;
@@ -169,7 +187,18 @@ private:
 
     boost::optional<sbe::value::SlotId> _resumeRecordIdSlot;
 
-    std::queue<std::pair<BSONObj, boost::optional<RecordId>>> _stash;
+    // NOTE: '_stash' stores documents as BSON. Currently, one of the '_stash' is usages is to store
+    // documents received from the plan during multiplanning. This means that the documents
+    // generated during multiplanning cannot exceed maximum BSON size. $group and $lookup CAN
+    // produce documents larger than maximum BSON size. But $group and $lookup never participate in
+    // multiplanning. This is why maximum BSON size limitation in '_stash' is not an issue for such
+    // operators.
+    // Another usage of '_stash' is when the 'find' command cannot fit the last returned document
+    // into the result batch. But in this case each document is already requried to fit into the
+    // maximum BSON size, because all results are encoded into BSON before returning to client. So
+    // using BSON in '_stash' does not introduce any additional limitations.
+    std::deque<std::pair<BSONObj, boost::optional<RecordId>>> _stash;
+
     // If we are returning owned result (i.e. value is moved out of the result accessor) then its
     // lifetime must extend up to the next getNext (or saveState).
     BSONObj _lastGetNext;
@@ -187,6 +216,9 @@ private:
     bool _isDisposed{false};
 
     bool _isSaveRecoveryUnitAcrossCommandsEnabled = false;
+
+    // Indicates whether this executor was constructed via Bonsai/CQF.
+    bool _generatedByBonsai{false};
 };
 
 /**

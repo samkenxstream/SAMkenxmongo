@@ -1,4 +1,5 @@
 var defragmentationUtil = (function() {
+    load("jstests/libs/feature_flag_util.js");
     load("jstests/sharding/libs/find_chunks_util.js");
 
     let createFragmentedCollection = function(mongos,
@@ -15,12 +16,18 @@ var defragmentationUtil = (function() {
         assert.commandWorked(mongos.adminCommand({shardCollection: ns, key: {key: 1}}));
         // Turn off balancer for this collection
         if (disableCollectionBalancing) {
+            // Use 'retryWrites' when writing to the configsvr because mongos does not automatically
+            // retry those.
+            const mongosSession = mongos.startSession({retryWrites: true});
+            const sessionConfigDB = mongosSession.getDatabase('config');
             assert.commandWorked(
-                mongos.getDB('config').collections.update({_id: ns}, {$set: {"noBalance": true}}));
+                sessionConfigDB.collections.update({_id: ns}, {$set: {"noBalance": true}}));
         }
 
         createAndDistributeChunks(mongos, ns, numChunks, chunkSpacing);
-        createRandomZones(mongos, ns, numZones, chunkSpacing);
+        // Created zones will line up exactly with existing chunks so as not to trigger zone
+        // violations in the balancer.
+        createRandomZones(mongos, ns, numZones);
         fillChunksToRandomSize(mongos, ns, docSizeBytes, maxChunkFillMB);
 
         const beginningNumberChunks = findChunksUtil.countChunksForNs(mongos.getDB('config'), ns);
@@ -48,19 +55,18 @@ var defragmentationUtil = (function() {
         }
     };
 
-    let createRandomZones = function(mongos, ns, numZones, chunkSpacing) {
-        for (let i = -Math.floor(numZones / 2); i < Math.ceil(numZones / 2); i++) {
+    let createRandomZones = function(mongos, ns, numZones) {
+        let existingChunks = findChunksUtil.findChunksByNs(mongos.getDB('config'), ns);
+        existingChunks = Array.shuffle(existingChunks.toArray());
+        for (let i = 0; i < numZones; i++) {
             let zoneName = "Zone" + i;
-            let shardForZone =
-                findChunksUtil
-                    .findOneChunkByNs(mongos.getDB('config'), ns, {min: {key: i * chunkSpacing}})
-                    .shard;
+            let shardForZone = existingChunks[i].shard;
             assert.commandWorked(
                 mongos.adminCommand({addShardToZone: shardForZone, zone: zoneName}));
             assert.commandWorked(mongos.adminCommand({
                 updateZoneKeyRange: ns,
-                min: {key: i * chunkSpacing},
-                max: {key: i * chunkSpacing + chunkSpacing},
+                min: existingChunks[i].min,
+                max: existingChunks[i].max,
                 zone: zoneName
             }));
         }
@@ -93,7 +99,7 @@ var defragmentationUtil = (function() {
         assert.commandWorked(bulk.execute());
     };
 
-    let checkPostDefragmentationState = function(mongos, ns, maxChunkSizeMB, shardKey) {
+    let checkPostDefragmentationState = function(configSvr, mongos, ns, maxChunkSizeMB, shardKey) {
         const oversizedChunkThreshold = maxChunkSizeMB * 1024 * 1024 * 4 / 3;
         const chunks = findChunksUtil.findChunksByNs(mongos.getDB('config'), ns)
                            .sort({[shardKey]: 1})
@@ -111,55 +117,21 @@ var defragmentationUtil = (function() {
                 ? 0
                 : storageStat['storageStats']['avgObjSize'];
         });
-        let checkForOversizedChunk = function(
-            coll, chunk, shardKey, avgObjSize, oversizedChunkThreshold) {
-            let chunkSize =
-                coll.countDocuments(
-                    {[shardKey]: {$gte: chunk.min[shardKey], $lt: chunk.max[shardKey]}}) *
-                avgObjSize;
-            assert.lte(
-                chunkSize,
-                oversizedChunkThreshold,
-                `Chunk ${tojson(chunk)} has size ${
-                    chunkSize} which is greater than max chunk size of ${oversizedChunkThreshold}`);
-        };
         for (let i = 1; i < chunks.length; i++) {
-            let chunk1 = chunks[i - 1];
-            let chunk2 = chunks[i];
+            let leftChunk = chunks[i - 1];
+            let rightChunk = chunks[i];
             // Check for mergeable chunks with combined size less than maxChunkSize
-            if (chunk1["shard"] === chunk2["shard"] &&
-                bsonWoCompare(chunk1["max"], chunk2["min"]) === 0) {
-                let chunk1Zone = getZoneForRange(mongos, ns, chunk1.min, chunk1.max);
-                let chunk2Zone = getZoneForRange(mongos, ns, chunk2.min, chunk2.max);
-                if (bsonWoCompare(chunk1Zone, chunk2Zone) === 0) {
-                    let combinedDataSize =
-                        coll.countDocuments(
-                            {[shardKey]: {$gte: chunk1.min[shardKey], $lt: chunk2.max[shardKey]}}) *
-                        avgObjSizeByShard[chunk1['shard']];
-                    // The autosplitter should not split chunks whose combined size is < 133% of
-                    // maxChunkSize but this threshold may be off by a few documents depending on
-                    // rounding of avgObjSize.
-                    const autosplitRoundingTolerance = 3 * avgObjSizeByShard[chunk1['shard']];
-                    assert.gte(
-                        combinedDataSize,
-                        oversizedChunkThreshold - autosplitRoundingTolerance,
-                        `Chunks ${tojson(chunk1)} and ${
-                            tojson(chunk2)} are mergeable with combined size ${combinedDataSize}`);
+            if (leftChunk["shard"] === rightChunk["shard"] &&
+                bsonWoCompare(leftChunk["max"], rightChunk["min"]) === 0) {
+                let leftChunkZone = getZoneForRange(mongos, ns, leftChunk.min, leftChunk.max);
+                let rightChunkZone = getZoneForRange(mongos, ns, rightChunk.min, rightChunk.max);
+                if (bsonWoCompare(leftChunkZone, rightChunkZone) === 0) {
+                    assert(false,
+                           `Chunks ${tojson(leftChunk)} and ${
+                               tojson(rightChunk)} should have been merged`);
                 }
             }
-            // Check for oversized chunks
-            checkForOversizedChunk(coll,
-                                   chunk1,
-                                   shardKey,
-                                   avgObjSizeByShard[chunk1['shard']],
-                                   oversizedChunkThreshold);
         }
-        const lastChunk = chunks[chunks.length - 1];
-        checkForOversizedChunk(coll,
-                               lastChunk,
-                               shardKey,
-                               avgObjSizeByShard[lastChunk['shard']],
-                               oversizedChunkThreshold);
     };
 
     let getZoneForRange = function(mongos, ns, minKey, maxKey) {

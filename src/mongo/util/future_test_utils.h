@@ -71,12 +71,6 @@ class DummyInterruptible final : public Interruptible {
         // Must be implemented because it's called by Interruptible::waitForConditionOrInterrupt.
         return Status::OK();
     }
-    IgnoreInterruptsState pushIgnoreInterrupts() override {
-        MONGO_UNREACHABLE;
-    }
-    void popIgnoreInterrupts(IgnoreInterruptsState iis) override {
-        MONGO_UNREACHABLE;
-    }
     DeadlineState pushArtificialDeadline(Date_t deadline, ErrorCodes::Error error) override {
         MONGO_UNREACHABLE;
     }
@@ -119,8 +113,7 @@ Future<Result> async(Func&& func) {
         } catch (const DBException& ex) {
             promise.setError(ex.toStatus());
         }
-    })
-        .detach();
+    }).detach();
 
     return std::move(pf.future);
 }

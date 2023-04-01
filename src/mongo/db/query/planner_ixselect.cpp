@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/query/planner_ixselect.h"
 
@@ -50,6 +49,9 @@
 #include "mongo/db/query/planner_wildcard_helpers.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
@@ -178,7 +180,9 @@ bool QueryPlannerIXSelect::notEqualsNullCanUseIndex(const IndexEntry& index,
 
 bool QueryPlannerIXSelect::canUseIndexForNin(const InMatchExpression* ime) {
     const std::vector<BSONElement>& inList = ime->getEqualities();
-    auto containsNull = [](const BSONElement& elt) { return elt.type() == jstNULL; };
+    auto containsNull = [](const BSONElement& elt) {
+        return elt.type() == jstNULL;
+    };
     auto containsEmptyArray = [](const BSONElement& elt) {
         return elt.type() == Array && elt.embeddedObject().isEmpty();
     };
@@ -245,7 +249,7 @@ static bool boundsGeneratingNodeContainsComparisonToType(MatchExpression* node, 
 // static
 void QueryPlannerIXSelect::getFields(const MatchExpression* node,
                                      string prefix,
-                                     stdx::unordered_set<string>* out) {
+                                     RelevantFieldIndexMap* out) {
     // Do not traverse tree beyond a NOR negation node
     MatchExpression::MatchType exprtype = node->matchType();
     if (exprtype == MatchExpression::NOR) {
@@ -254,16 +258,13 @@ void QueryPlannerIXSelect::getFields(const MatchExpression* node,
 
     // Leaf nodes with a path and some array operators.
     if (Indexability::nodeCanUseIndexOnOwnField(node)) {
-        out->insert(prefix + node->path().toString());
-    } else if (Indexability::arrayUsesIndexOnChildren(node)) {
+        bool supportSparse = Indexability::nodeSupportedBySparseIndex(node);
+        (*out)[prefix + node->path().toString()] = {supportSparse};
+    } else if (Indexability::arrayUsesIndexOnChildren(node) && !node->path().empty()) {
         // If the array uses an index on its children, it's something like
         // {foo : {$elemMatch: {bar: 1}}}, in which case the predicate is really over foo.bar.
-        //
-        // When we have {foo: {$all: [{$elemMatch: {a: 1}}], the path of the embedded elemMatch
-        // is empty. We don't want to append a dot in that case as the field would be foo..a.
-        if (!node->path().empty()) {
-            prefix += node->path().toString() + ".";
-        }
+        // Note we skip empty path components since they are not allowed in index key patterns.
+        prefix += node->path().toString() + ".";
 
         for (size_t i = 0; i < node->numChildren(); ++i) {
             getFields(node->getChild(i), prefix, out);
@@ -275,8 +276,7 @@ void QueryPlannerIXSelect::getFields(const MatchExpression* node,
     }
 }
 
-void QueryPlannerIXSelect::getFields(const MatchExpression* node,
-                                     stdx::unordered_set<string>* out) {
+void QueryPlannerIXSelect::getFields(const MatchExpression* node, RelevantFieldIndexMap* out) {
     getFields(node, "", out);
 }
 
@@ -316,26 +316,40 @@ std::vector<IndexEntry> QueryPlannerIXSelect::findIndexesByHint(
 
 // static
 std::vector<IndexEntry> QueryPlannerIXSelect::findRelevantIndices(
-    const stdx::unordered_set<std::string>& fields, const std::vector<IndexEntry>& allIndices) {
+    const RelevantFieldIndexMap& fields, const std::vector<IndexEntry>& allIndices) {
 
     std::vector<IndexEntry> out;
-    for (auto&& entry : allIndices) {
-        BSONObjIterator it(entry.keyPattern);
+    for (auto&& index : allIndices) {
+        BSONObjIterator it(index.keyPattern);
         BSONElement elt = it.next();
-        if (fields.end() != fields.find(elt.fieldName())) {
-            out.push_back(entry);
+        const std::string fieldName = elt.fieldNameStringData().toString();
+
+        // If the index is non-sparse we can use the field regardless its sparsity, otherwise we
+        // should find the field that can be answered by a sparse index.
+        if (fields.contains(fieldName) &&
+            (!index.sparse || fields.find(fieldName)->second.isSparse)) {
+            out.push_back(index);
         }
     }
 
     return out;
 }
 
-std::vector<IndexEntry> QueryPlannerIXSelect::expandIndexes(
-    const stdx::unordered_set<std::string>& fields, std::vector<IndexEntry> relevantIndices) {
+std::vector<IndexEntry> QueryPlannerIXSelect::expandIndexes(const RelevantFieldIndexMap& fields,
+                                                            std::vector<IndexEntry> relevantIndices,
+                                                            bool indexHinted) {
     std::vector<IndexEntry> out;
+    // Filter out fields that cannot be answered by any sparse index. We know wildcard indexes are
+    // sparse, so we don't want to expand the wildcard index based on such fields.
+    stdx::unordered_set<std::string> sparseIncompatibleFields;
+    for (auto&& [fieldName, idxProperty] : fields) {
+        if (idxProperty.isSparse || indexHinted) {
+            sparseIncompatibleFields.insert(fieldName);
+        }
+    }
     for (auto&& entry : relevantIndices) {
         if (entry.type == IndexType::INDEX_WILDCARD) {
-            wcp::expandWildcardIndexEntry(entry, fields, &out);
+            wcp::expandWildcardIndexEntry(entry, sparseIncompatibleFields, &out);
         } else {
             out.push_back(std::move(entry));
         }
@@ -364,6 +378,22 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
          boundsGeneratingNodeContainsComparisonToType(node, BSONType::Object)) &&
         !CollatorInterface::collatorsMatch(collator, index.collator)) {
         return false;
+    }
+
+    // Fields after "$_path" of a compound wildcard index should not be used to answer any query,
+    // because wildcard IndexEntry with reserved field, "$_path", present is used only to answer
+    // query on non-wildcard prefix.
+    if (index.type == IndexType::INDEX_WILDCARD) {
+        size_t idx = 0;
+        for (auto&& elt : index.keyPattern) {
+            if (elt.fieldNameStringData() == "$_path") {
+                return false;
+            }
+            if (idx == keyPatternIdx) {
+                break;
+            }
+            idx++;
+        }
     }
 
     // Historically one could create indices with any particular value for the index spec,
@@ -577,7 +607,7 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
             const InternalBucketGeoWithinMatchExpression* ibgwme =
                 static_cast<InternalBucketGeoWithinMatchExpression*>(node);
             auto gc = ibgwme->getGeoContainer();
-            return gc->hasS2Region();
+            return gc.hasS2Region();
         }
         return false;
     } else if (IndexNames::GEO_2D == indexedFieldType) {
@@ -625,6 +655,7 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
                       "field"_attr = keyPatternElt.toString());
         verify(0);
     }
+    MONGO_UNREACHABLE;
 }
 
 bool QueryPlannerIXSelect::nodeIsSupportedBySparseIndex(const MatchExpression* queryExpr,
@@ -780,7 +811,8 @@ void QueryPlannerIXSelect::_rateIndices(MatchExpression* node,
             childRt->path = rt->path;
             node->getChild(0)->setTag(childRt);
         }
-    } else if (Indexability::arrayUsesIndexOnChildren(node)) {
+    } else if (Indexability::arrayUsesIndexOnChildren(node) && !node->path().empty()) {
+        // Note we skip empty path components since they are not allowed in index key patterns.
         const auto newPath = prefix + node->path().toString();
         ElemMatchContext newContext;
         // Note this StringData is unowned and references the string declared on the stack here.
@@ -791,12 +823,7 @@ void QueryPlannerIXSelect::_rateIndices(MatchExpression* node,
 
         // If the array uses an index on its children, it's something like
         // {foo: {$elemMatch: {bar: 1}}}, in which case the predicate is really over foo.bar.
-        //
-        // When we have {foo: {$all: [{$elemMatch: {a: 1}}], the path of the embedded elemMatch
-        // is empty. We don't want to append a dot in that case as the field would be foo..a.
-        if (!node->path().empty()) {
-            prefix += node->path().toString() + ".";
-        }
+        prefix += node->path().toString() + ".";
         for (size_t i = 0; i < node->numChildren(); ++i) {
             _rateIndices(node->getChild(i), prefix, indices, collator, newContext);
         }

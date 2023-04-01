@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -43,6 +42,9 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 
 namespace mongo {
 
@@ -60,9 +62,11 @@ bool OplogCapMaintainerThread::_deleteExcessDocuments() {
 
     const ServiceContext::UniqueOperationContext opCtx = cc().makeOperationContext();
 
-    // Non-replicated writes will not contribute to replication lag and can be safely excluded from
-    // Flow Control.
-    opCtx->setShouldParticipateInFlowControl(false);
+    // Maintaining the Oplog cap is crucial to the stability of the server so that we don't let the
+    // oplog grow unbounded. We mark the operation as having immediate priority to skip ticket
+    // acquisition and flow control.
+    ScopedAdmissionPriorityForLock priority(opCtx->lockState(),
+                                            AdmissionContext::Priority::kImmediate);
 
     try {
         // A Global IX lock should be good enough to protect the oplog truncation from
@@ -85,15 +89,16 @@ bool OplogCapMaintainerThread::_deleteExcessDocuments() {
                     "Caught an InterruptedDueToStorageChange exception, "
                     "but this thread can safely continue",
                     "error"_attr = e.toStatus());
-    } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
-        return false;
+    } catch (const DBException& ex) {
+        if (!opCtx->checkForInterruptNoAssert().isOK()) {
+            return false;
+        }
+
+        LOGV2_FATAL_NOTRACE(6761100, "Error in OplogCapMaintainerThread", "error"_attr = ex);
     } catch (const std::exception& e) {
-        LOGV2_FATAL_NOTRACE(22243,
-                            "error in OplogCapMaintainerThread: {error}",
-                            "Error in OplogCapMaintainerThread",
-                            "error"_attr = e.what());
+        LOGV2_FATAL_NOTRACE(22243, "Error in OplogCapMaintainerThread", "error"_attr = e.what());
     } catch (...) {
-        fassertFailedNoTrace(!"unknown error in OplogCapMaintainerThread");
+        LOGV2_FATAL_NOTRACE(5184100, "Unknown error in OplogCapMaintainerThread");
     }
     return true;
 }

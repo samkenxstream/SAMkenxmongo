@@ -33,12 +33,13 @@ namespace mongo::optimizer {
 
 ExpressionAlgebrizerContext::ExpressionAlgebrizerContext(const bool assertExprSort,
                                                          const bool assertPathSort,
-                                                         const std::string& rootProjection,
-                                                         const std::string& uniqueIdPrefix)
+                                                         const ProjectionName& rootProjection,
+                                                         PrefixId& prefixId)
     : _assertExprSort(assertExprSort),
       _assertPathSort(assertPathSort),
       _rootProjection(rootProjection),
-      _uniqueIdPrefix(uniqueIdPrefix) {}
+      _rootProjVar(make<Variable>(_rootProjection)),
+      _prefixId(prefixId) {}
 
 void ExpressionAlgebrizerContext::push(ABT node) {
     if (_assertExprSort) {
@@ -62,12 +63,16 @@ void ExpressionAlgebrizerContext::ensureArity(const size_t arity) {
     uassert(6624429, "Arity violation", _stack.size() >= arity);
 }
 
-const std::string& ExpressionAlgebrizerContext::getRootProjection() const {
+const ProjectionName& ExpressionAlgebrizerContext::getRootProjection() const {
     return _rootProjection;
 }
 
-const std::string& ExpressionAlgebrizerContext::getUniqueIdPrefix() const {
-    return _uniqueIdPrefix;
+const ABT& ExpressionAlgebrizerContext::getRootProjVar() const {
+    return _rootProjVar;
+}
+
+PrefixId& ExpressionAlgebrizerContext::getPrefixId() {
+    return _prefixId;
 }
 
 }  // namespace mongo::optimizer

@@ -27,18 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
-
-#include "mongo/db/jsobj.h"
-
-#include <boost/lexical_cast.hpp>
-
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/logv2/log.h"
 
-namespace mongo {
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
-using std::string;
+namespace mongo {
 
 template <class Derived, class B>
 Derived& BSONObjBuilderBase<Derived, B>::appendMinForType(StringData fieldName, int t) {

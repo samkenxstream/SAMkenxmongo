@@ -3,6 +3,7 @@ test_kind: fsm_workload_test
 selector:
   roots:
   - jstests/concurrency/fsm_workloads/**/*.js
+  - src/mongo/db/modules/*/jstests/concurrency/fsm_workloads/*.js
   exclude_files:
   ##
   # Disabled due to MongoDB restrictions and/or workload restrictions
@@ -18,6 +19,12 @@ selector:
   - jstests/concurrency/fsm_workloads/reindex.js
   - jstests/concurrency/fsm_workloads/reindex_background.js
   - jstests/concurrency/fsm_workloads/reindex_writeconflict.js
+
+  # These workloads depend on transactions which may be blocked by cursor sweeps.
+  - jstests/concurrency/fsm_workloads/auth_drop_role.js
+  - jstests/concurrency/fsm_workloads/auth_privilege_cache_miss.js
+  - jstests/concurrency/fsm_workloads/auth_privilege_consistency.js
+  - jstests/concurrency/fsm_workloads/auth_role_consistency.js
 
   exclude_with_any_tags:
   - requires_sharding

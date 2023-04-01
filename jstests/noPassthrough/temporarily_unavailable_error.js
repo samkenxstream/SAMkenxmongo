@@ -3,8 +3,7 @@
  * with TemporarilyUnavailable error.
  *
  * @tags: [
- *   // Exclude in-memory engine, rollbacks due to pinned cache content rely on eviction.
- *   requires_journaling,
+ *   # Exclude in-memory engine, rollbacks due to pinned cache content rely on eviction.
  *   requires_persistence,
  *   requires_replication,
  *   requires_wiredtiger,
@@ -19,6 +18,7 @@ const replSet = new ReplSetTest({
         wiredTigerCacheSizeGB: 0.256,
         setParameter: {
             logComponentVerbosity: tojson({control: 1, write: 1}),
+            enableTemporarilyUnavailableExceptions: true,
             // Lower these values from the defaults to speed up the test.
             temporarilyUnavailableMaxRetries: 3,
             temporarilyUnavailableBackoffBaseMs: 10,
@@ -77,7 +77,7 @@ for (let j = 0; j < 50000; j++)
         print("temporarilyUnavailableInTransactionIsConvertedToWriteConflict attempt " + attempts);
         const session = db.getMongo().startSession();
         session.startTransaction();
-        const sessionDB = session.getDatabase('test');
+        const sessionDB = session.getDatabase("test");
         ret = sessionDB.c.insert(doc);
 
         if (ret["nInserted"] === 1) {
@@ -85,12 +85,9 @@ for (let j = 0; j < 50000; j++)
             session.commitTransaction();
             continue;
         }
-        assert.commandFailedWithCode(
-            ret, ErrorCodes.WriteConflict, "Did not get WriteConflict. Result: " + tojson(ret));
-        assert(ret.hasOwnProperty("errorLabels"), "missing errorLabels. Result: " + tojson(ret));
-        assert.contains("TransientTransactionError",
-                        ret.errorLabels,
-                        "did not find TransientTransaction error label. Result: " + tojson(ret));
+        assert.commandFailedWithCode(ret, ErrorCodes.WriteConflict, ret);
+        assert(ret.hasOwnProperty("errorLabels"), ret);
+        assert.contains("TransientTransactionError", ret.errorLabels, ret);
         caughtWriteConflict = true;
         jsTestLog("returned the expected WriteConflict code at attempt " + attempts);
         session.abortTransaction();

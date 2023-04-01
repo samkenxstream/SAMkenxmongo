@@ -204,7 +204,7 @@ TEST(QueryPlannerAnalysis, GeoSkipValidation) {
 
     std::unique_ptr<FetchNode> fetchNodePtr = std::make_unique<FetchNode>();
     std::unique_ptr<GeoMatchExpression> exprPtr =
-        std::make_unique<GeoMatchExpression>("geometry.field", nullptr, BSONObj());
+        std::make_unique<GeoMatchExpression>("geometry.field"_sd, nullptr, BSONObj());
 
     GeoMatchExpression* expr = exprPtr.get();
 
@@ -214,7 +214,7 @@ TEST(QueryPlannerAnalysis, GeoSkipValidation) {
 
     OrNode orNode;
     // Takes ownership.
-    orNode.children.push_back(fetchNodePtr.release());
+    orNode.children.push_back(std::move(fetchNodePtr));
 
     // We should not skip validation if there are no indices.
     QueryPlannerAnalysis::analyzeGeo(params, fetchNode);

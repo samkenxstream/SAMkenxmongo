@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -43,6 +42,9 @@
 #include "mongo/s/request_types/commit_reshard_collection_gen.h"
 #include "mongo/s/resharding/resharding_feature_flag_gen.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+
 namespace mongo {
 namespace {
 
@@ -56,11 +58,11 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            opCtx->setAlwaysInterruptAtStepDownOrUp();
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             uassert(ErrorCodes::IllegalOperation,
                     "_shardsvrCommitReshardCollection can only be run on shard servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
@@ -98,14 +100,14 @@ public:
                 }
             }
 
-            for (auto doneFuture : futuresToWait) {
-                doneFuture.wait(opCtx);
+            for (const auto& doneFuture : futuresToWait) {
+                doneFuture.get(opCtx);
             }
 
             // If commit actually went through, the resharding documents will be cleaned up. If
             // documents still exist, it could be because that commit was interrupted or that the
             // underlying replica set node is no longer primary.
-            doNoopWrite(opCtx, "_shardsvrCommitReshardCollection no-op", ns());
+            resharding::doNoopWrite(opCtx, "_shardsvrCommitReshardCollection no-op", ns());
             PersistentTaskStore<CommonReshardingMetadata> donorReshardingOpStore(
                 NamespaceString::kDonorReshardingOperationsNamespace);
             uassert(5795302,

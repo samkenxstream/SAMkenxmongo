@@ -33,6 +33,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/profile_common.h"
 #include "mongo/db/commands/profile_gen.h"
+#include "mongo/db/commands/set_profiling_filter_globally_cmd.h"
 #include "mongo/db/profile_filter_impl.h"
 
 namespace mongo {
@@ -51,7 +52,7 @@ public:
 protected:
     CollectionCatalog::ProfileSettings _applyProfilingLevel(
         OperationContext* opCtx,
-        const std::string& dbName,
+        const DatabaseName& dbName,
         const ProfileCmdRequest& request) const final {
         invariant(!opCtx->lockState()->isW());
 
@@ -84,6 +85,8 @@ protected:
     }
 
 } profileCmd;
+
+SetProfilingFilterGloballyCmd setProfilingFilterGloballyCmd;
 
 }  // namespace
 }  // namespace mongo

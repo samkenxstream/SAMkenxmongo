@@ -7,19 +7,16 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {isShardMergeEnabled} from "jstests/replsets/libs/tenant_migration_util.js";
+load("jstests/libs/fail_point_util.js");
+load("jstests/libs/uuid_util.js");       // for 'extractUUIDFromObject'
+load("jstests/libs/parallelTester.js");  // for 'Thread'
 
 function runTest(downgradeFCV) {
-    load("jstests/libs/fail_point_util.js");
-    load("jstests/libs/uuid_util.js");       // for 'extractUUIDFromObject'
-    load("jstests/libs/parallelTester.js");  // for 'Thread'
-    load("jstests/replsets/libs/tenant_migration_test.js");
-    load("jstests/replsets/libs/tenant_migration_util.js");
-
     const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
-    const tenantId = "testTenantId";
+    const tenantId = ObjectId().str;
     const dbName = tenantMigrationTest.tenantDB(tenantId, "testDB");
     const collName = "testColl";
 
@@ -50,7 +47,11 @@ function runTest(downgradeFCV) {
     hangAfterSavingFCV.off();
 
     // Make sure we see the FCV mismatch detection message on the recipient.
-    checkLog.containsJson(recipientPrimary, 5382300);
+    if (isShardMergeEnabled(recipientDB)) {
+        checkLog.containsJson(recipientPrimary, 7339749);
+    } else {
+        checkLog.containsJson(recipientPrimary, 5382300);
+    }
 
     // Upgrade again to check on the status of the migration from the donor's point of view.
     assert.commandWorked(donorPrimary.adminCommand({setFeatureCompatibilityVersion: latestFCV}));
@@ -64,4 +65,3 @@ runTest(lastContinuousFCV);
 if (lastContinuousFCV != lastLTSFCV) {
     runTest(lastLTSFCV);
 }
-})();

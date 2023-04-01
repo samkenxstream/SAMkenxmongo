@@ -51,8 +51,11 @@ const runCommandInLoop = function(
         ErrorCodes.ConflictingOperationInProgress,
         ErrorCodes.BackgroundOperationInProgressForNamespace,
         ErrorCodes.ReshardCollectionInProgress,
-        ErrorCodes.StaleShardVersion,
         ErrorCodes.QueryPlanKilled,
+        // StaleConfig is usually retried by the mongos, but in situations where multiple errors
+        // have ocurred on the same batch and MultipleErrorsOcurred is returned, one of the errors
+        // could be StaleConfig and the other could be one that mongos does not retry the batch on.
+        ErrorCodes.StaleConfig,
     ];
 
     let iteration = 0;
@@ -181,7 +184,8 @@ var $config = (function() {
             const namespace = db.getName() + "." + collName;
 
             // Find
-            const findCmd = {find: namespace, collectionUUID: this.collUUID};
+            // Use 'singleBatch: true' to avoid leaving open cursors.
+            const findCmd = {find: namespace, collectionUUID: this.collUUID, singleBatch: true};
             testCommand(db, namespace, "find", findCmd, this);
 
             // Update
@@ -228,7 +232,10 @@ var $config = (function() {
                 index: {[indexField]: 1},
                 collectionUUID: this.collUUID
             };
-            testCommand(db, namespace, "dropIndexes", dropIndexCmd, this);
+            // Consecutive drop commands can results in 'IndexNotFound' error, so on retry some
+            // shards can fail while others succeed.
+            testCommand(
+                db, namespace, "dropIndexes", dropIndexCmd, this, [ErrorCodes.IndexNotFound]);
         }
 
         return {init: init, rename: rename, crud: crud, indexCommands: indexCommands};

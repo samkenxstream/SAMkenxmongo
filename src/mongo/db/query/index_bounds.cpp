@@ -244,6 +244,14 @@ bool OrderedIntervalList::isMinToMax() const {
     return intervals.size() == 1 && intervals[0].isMinToMax();
 }
 
+bool OrderedIntervalList::isMaxToMin() const {
+    return intervals.size() == 1 && intervals[0].isMaxToMin();
+}
+
+bool OrderedIntervalList::isPoint() const {
+    return intervals.size() == 1 && intervals[0].isPoint();
+}
+
 // static
 void OrderedIntervalList::complement() {
     BSONObjBuilder minBob;
@@ -412,6 +420,12 @@ IndexBounds IndexBounds::reverse() const {
     return reversed;
 }
 
+bool IndexBounds::isUnbounded() const {
+    return std::all_of(fields.begin(), fields.end(), [](const auto& field) {
+        return field.isMinToMax() || field.isMaxToMin();
+    });
+}
+
 //
 // Validity checking for bounds
 //
@@ -501,16 +515,17 @@ IndexBoundsChecker::IndexBoundsChecker(const IndexBounds* bounds,
 
 bool IndexBoundsChecker::getStartSeekPoint(IndexSeekPoint* out) {
     out->prefixLen = 0;
-    out->prefixExclusive = false;
+    out->firstExclusive = -1;
     out->keySuffix.resize(_bounds->fields.size());
-    out->suffixInclusive.resize(_bounds->fields.size());
 
-    for (size_t i = 0; i < _bounds->fields.size(); ++i) {
+    for (int i = _bounds->fields.size() - 1; i >= out->prefixLen; --i) {
         if (0 == _bounds->fields[i].intervals.size()) {
             return false;
         }
         out->keySuffix[i] = &_bounds->fields[i].intervals[0].start;
-        out->suffixInclusive[i] = _bounds->fields[i].intervals[0].startInclusive;
+        if (!_bounds->fields[i].intervals[0].startInclusive) {
+            out->firstExclusive = i;
+        }
     }
 
     return true;
@@ -586,7 +601,6 @@ bool IndexBoundsChecker::isValidKey(const BSONObj& key) {
 IndexBoundsChecker::KeyState IndexBoundsChecker::checkKey(const BSONObj& key, IndexSeekPoint* out) {
     verify(_curInterval.size() > 0);
     out->keySuffix.resize(_curInterval.size());
-    out->suffixInclusive.resize(_curInterval.size());
 
     // It's useful later to go from a field number to the value for that field.  Store these.
     size_t i = 0;
@@ -628,12 +642,14 @@ IndexBoundsChecker::KeyState IndexBoundsChecker::checkKey(const BSONObj& key, In
         // Tell the caller to move forward to the start of the current interval.
         out->keyPrefix = key.getOwned();
         out->prefixLen = firstNonContainedField;
-        out->prefixExclusive = false;
+        out->firstExclusive = -1;
 
-        for (size_t j = firstNonContainedField; j < _curInterval.size(); ++j) {
+        for (int j = _curInterval.size() - 1; j >= out->prefixLen; --j) {
             const OrderedIntervalList& oil = _bounds->fields[j];
             out->keySuffix[j] = &oil.intervals[_curInterval[j]].start;
-            out->suffixInclusive[j] = oil.intervals[_curInterval[j]].startInclusive;
+            if (!oil.intervals[_curInterval[j]].startInclusive) {
+                out->firstExclusive = j;
+            }
         }
 
         return MUST_ADVANCE;
@@ -672,11 +688,13 @@ IndexBoundsChecker::KeyState IndexBoundsChecker::checkKey(const BSONObj& key, In
 
             out->keyPrefix = key.getOwned();
             out->prefixLen = firstNonContainedField;
-            out->prefixExclusive = false;
-            for (size_t i = firstNonContainedField; i < _curInterval.size(); ++i) {
+            out->firstExclusive = -1;
+            for (int i = _curInterval.size() - 1; i >= out->prefixLen; --i) {
                 const OrderedIntervalList& oil = _bounds->fields[i];
                 out->keySuffix[i] = &oil.intervals[_curInterval[i]].start;
-                out->suffixInclusive[i] = oil.intervals[_curInterval[i]].startInclusive;
+                if (!oil.intervals[_curInterval[i]].startInclusive) {
+                    out->firstExclusive = i;
+                }
             }
 
             return MUST_ADVANCE;
@@ -694,7 +712,7 @@ IndexBoundsChecker::KeyState IndexBoundsChecker::checkKey(const BSONObj& key, In
 
             out->keyPrefix = key.getOwned();
             out->prefixLen = firstNonContainedField;
-            out->prefixExclusive = true;
+            out->firstExclusive = firstNonContainedField - 1;
 
             for (size_t i = firstNonContainedField; i < _curInterval.size(); ++i) {
                 _curInterval[i] = 0;

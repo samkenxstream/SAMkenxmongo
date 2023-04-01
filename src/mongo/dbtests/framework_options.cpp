@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -48,6 +47,9 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/password.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 
 namespace mongo {
 
@@ -153,7 +155,7 @@ Status storeTestFrameworkOptions(const moe::Environment& params,
                         str::stream() << "Cannot use --setParameter to set \"" << it.first
                                       << "\" at startup"};
             }
-            Status status = parameter->setFromString(it.second);
+            Status status = parameter->setFromString(it.second, boost::none);
             if (!status.isOK()) {
                 return {ErrorCodes::BadValue,
                         str::stream() << "Bad value for parameter \"" << it.first

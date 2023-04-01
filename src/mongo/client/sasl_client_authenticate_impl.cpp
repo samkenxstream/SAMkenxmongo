@@ -34,7 +34,6 @@
  * The primary entry point at runtime is saslClientAuthenticateImpl().
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -53,6 +52,9 @@
 #include "mongo/util/base64.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/password_digest.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
 
 namespace mongo {
 
@@ -145,11 +147,13 @@ Status saslConfigureSession(SaslClientSession* session,
     status = bsonExtractStringField(saslParameters, saslCommandUserFieldName, &value);
     if (status.isOK()) {
         session->setParameter(SaslClientSession::parameterUser, value);
-    } else if ((targetDatabase != "$external") || (mechanism != "MONGODB-AWS")) {
+    } else if ((targetDatabase != NamespaceString::kExternalDb) ||
+               ((mechanism != auth::kMechanismMongoAWS) &&
+                (mechanism != auth::kMechanismMongoOIDC))) {
         return status;
     }
 
-    const bool digestPasswordDefault = (mechanism == "SCRAM-SHA-1");
+    const bool digestPasswordDefault = (mechanism == auth::kMechanismScramSha1);
     bool digestPassword;
     status = bsonExtractBooleanFieldWithDefault(
         saslParameters, saslCommandDigestPasswordFieldName, digestPasswordDefault, &digestPassword);
@@ -159,7 +163,8 @@ Status saslConfigureSession(SaslClientSession* session,
     status = extractPassword(saslParameters, digestPassword, &value);
     if (status.isOK()) {
         session->setParameter(SaslClientSession::parameterPassword, value);
-    } else if (!(status == ErrorCodes::NoSuchKey && targetDatabase == "$external")) {
+    } else if (!(status == ErrorCodes::NoSuchKey &&
+                 targetDatabase == NamespaceString::kExternalDb)) {
         // $external users do not have passwords, hence NoSuchKey is expected
         return status;
     }
@@ -167,6 +172,11 @@ Status saslConfigureSession(SaslClientSession* session,
     status = bsonExtractStringField(saslParameters, saslCommandIamSessionToken, &value);
     if (status.isOK()) {
         session->setParameter(SaslClientSession::parameterAWSSessionToken, value);
+    }
+
+    status = bsonExtractStringField(saslParameters, saslCommandOIDCAccessToken, &value);
+    if (status.isOK()) {
+        session->setParameter(SaslClientSession::parameterOIDCAccessToken, value);
     }
 
     return session->initialize();

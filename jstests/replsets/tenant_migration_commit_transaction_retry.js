@@ -2,7 +2,6 @@
  * Tests that the client can retry commitTransaction on the tenant migration recipient.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
@@ -11,27 +10,14 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/replsets/rslib.js");
 load("jstests/libs/uuid_util.js");
-
-const kGarbageCollectionParams = {
-    // Set the delay before a donor state doc is garbage collected to be short to speed up
-    // the test.
-    tenantMigrationGarbageCollectionDelayMS: 3 * 1000,
-
-    // Set the TTL monitor to run at a smaller interval to speed up the test.
-    ttlMonitorSleepSecs: 1,
-};
 
 const tenantMigrationTest = new TenantMigrationTest(
     {name: jsTestName(), sharedOptions: {nodes: 1}, quickGarbageCollection: true});
 
-const kTenantId = "testTenantId";
+const kTenantId = ObjectId().str;
 const kDbName = tenantMigrationTest.tenantDB(kTenantId, "testDB");
 const kCollName = "testColl";
 const kNs = `${kDbName}.${kCollName}`;
@@ -56,8 +42,8 @@ assert.commandWorked(donorPrimary.getCollection(kNs).insert(
     session.endSession();
 }
 
-const waitAfterStartingOplogApplier = configureFailPoint(
-    recipientPrimary, "fpAfterStartingOplogApplierMigrationRecipientInstance", {action: "hang"});
+const pauseTenantMigrationBeforeLeavingDataSyncState =
+    configureFailPoint(donorPrimary, "pauseTenantMigrationBeforeLeavingDataSyncState");
 
 jsTestLog("Run a migration to completion");
 const migrationId = UUID();
@@ -69,7 +55,7 @@ tenantMigrationTest.startMigration(migrationOpts);
 
 // Hang the recipient during oplog application before we continue to run more transactions on the
 // donor. This is to test applying multiple transactions on multiple sessions in the same batch.
-waitAfterStartingOplogApplier.wait();
+pauseTenantMigrationBeforeLeavingDataSyncState.wait();
 const waitInOplogApplier = configureFailPoint(recipientPrimary, "hangInTenantOplogApplication");
 tenantMigrationTest.insertDonorDB(kDbName, kCollName, [{_id: 3, x: 3}, {_id: 4, x: 4}]);
 
@@ -92,11 +78,15 @@ for (let i = 0; i < 5; i++) {
     session.endSession();
 }
 
-waitAfterStartingOplogApplier.off();
+pauseTenantMigrationBeforeLeavingDataSyncState.off();
 waitInOplogApplier.off();
 
 TenantMigrationTest.assertCommitted(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
-assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
+// With `quickGarbageCollection` it's likely that forgetting the migration will race with its
+// natural destruction.
+assert.commandWorkedOrFailedWithCode(
+    tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString),
+    [ErrorCodes.NoSuchTenantMigration]);
 tenantMigrationTest.waitForMigrationGarbageCollection(migrationId, kTenantId);
 
 // Test the client can retry commitTransaction against the recipient for transactions that committed
@@ -115,14 +105,16 @@ jsTestLog("Running a back-to-back migration");
 const tenantMigrationTest2 = new TenantMigrationTest({
     name: jsTestName() + "2",
     donorRst: tenantMigrationTest.getRecipientRst(),
-    sharedOptions: {nodes: 1, setParameter: kGarbageCollectionParams}
+    sharedOptions: {nodes: 1},
+    quickGarbageCollection: true,
 });
 const migrationId2 = UUID();
 const migrationOpts2 = {
     migrationIdString: extractUUIDFromObject(migrationId2),
     tenantId: kTenantId,
 };
-TenantMigrationTest.assertCommitted(tenantMigrationTest2.runMigration(migrationOpts2));
+TenantMigrationTest.assertCommitted(
+    tenantMigrationTest2.runMigration(migrationOpts2, {enableDonorStartMigrationFsync: true}));
 const recipientPrimary2 = tenantMigrationTest2.getRecipientPrimary();
 const recipientTxnEntries2 = recipientPrimary2.getDB("config")["transactions"].find().toArray();
 jsTestLog(`Recipient2 config.transactions: ${tojson(recipientTxnEntries2)}`);
@@ -131,9 +123,12 @@ donorTxnEntries.forEach((txnEntry) => {
     assert.commandWorked(recipientPrimary2.adminCommand(
         {commitTransaction: 1, lsid: txnEntry._id, txnNumber: txnEntry.txnNum, autocommit: false}));
 });
-assert.commandWorked(tenantMigrationTest2.forgetMigration(migrationOpts2.migrationIdString));
+// With `quickGarbageCollection` it's likely that forgetting the migration will race with its
+// natural destruction.
+assert.commandWorkedOrFailedWithCode(
+    tenantMigrationTest2.forgetMigration(migrationOpts2.migrationIdString),
+    [ErrorCodes.NoSuchTenantMigration]);
 tenantMigrationTest2.waitForMigrationGarbageCollection(migrationId2, kTenantId);
 
 tenantMigrationTest2.stop();
 tenantMigrationTest.stop();
-})();

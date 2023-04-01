@@ -27,9 +27,7 @@
  *    it in the license file.
  */
 
-#include <kms_message/kms_message.h>
-
-#include <stdlib.h>
+#include <cstdlib>
 
 #include "mongo/base/init.h"
 #include "mongo/base/secure_allocator.h"
@@ -63,6 +61,10 @@ public:
     SecureVector<uint8_t> decrypt(ConstDataRange cdr, BSONObj masterKey) final;
 
     BSONObj encryptDataKeyByString(ConstDataRange cdr, StringData keyId) final;
+
+    SymmetricKey& getMasterKey() final {
+        return _key;
+    }
 
 private:
     std::vector<uint8_t> encrypt(ConstDataRange cdr, StringData kmsKeyId);
@@ -130,7 +132,7 @@ public:
         }
 
         auto obj = field.Obj();
-        return LocalKMSService::create(LocalKMS::parse(IDLParserErrorContext("root"), obj));
+        return LocalKMSService::create(LocalKMS::parse(IDLParserContext("root"), obj));
     }
 };
 

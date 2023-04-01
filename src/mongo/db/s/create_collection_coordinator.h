@@ -39,21 +39,26 @@
 
 namespace mongo {
 
-class CreateCollectionCoordinator : public ShardingDDLCoordinator {
+class CreateCollectionCoordinator
+    : public RecoverableShardingDDLCoordinator<CreateCollectionCoordinatorDocument,
+                                               CreateCollectionCoordinatorPhaseEnum> {
 public:
     using CoordDoc = CreateCollectionCoordinatorDocument;
     using Phase = CreateCollectionCoordinatorPhaseEnum;
 
-    CreateCollectionCoordinator(ShardingDDLCoordinatorService* service,
-                                const BSONObj& initialState);
+    CreateCollectionCoordinator(ShardingDDLCoordinatorService* service, const BSONObj& initialState)
+        : RecoverableShardingDDLCoordinator(service, "CreateCollectionCoordinator", initialState),
+          _request(_doc.getCreateCollectionRequest()),
+          _critSecReason(BSON("command"
+                              << "createCollection"
+                              << "ns" << originalNss().toString())) {}
+
     ~CreateCollectionCoordinator() = default;
 
 
     void checkIfOptionsConflict(const BSONObj& coorDoc) const override;
 
-    boost::optional<BSONObj> reportForCurrentOp(
-        MongoProcessInterface::CurrentOpConnectionsMode connMode,
-        MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override;
+    void appendCommandInfo(BSONObjBuilder* cmdInfoBuilder) const override;
 
     /**
      * Waits for the termination of the parent DDLCoordinator (so all the resources are liberated)
@@ -66,78 +71,67 @@ public:
     }
 
 protected:
-    CoordDoc _doc;
+    const NamespaceString& nss() const override;
 
 private:
-    ShardingDDLCoordinatorMetadata const& metadata() const override {
-        return _doc.getShardingDDLCoordinatorMetadata();
+    StringData serializePhase(const Phase& phase) const override {
+        return CreateCollectionCoordinatorPhase_serializer(phase);
     }
 
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                   const CancellationToken& token) noexcept override;
-
-    template <typename Func>
-    auto _executePhase(const Phase& newPhase, Func&& func) {
-        return [=] {
-            const auto& currPhase = _doc.getPhase();
-
-            if (currPhase > newPhase) {
-                // Do not execute this phase if we already reached a subsequent one.
-                return;
-            }
-            if (currPhase < newPhase) {
-                // Persist the new phase if this is the first time we are executing it.
-                _enterPhase(newPhase);
-            }
-            return func();
-        };
-    };
-
-    void _enterPhase(Phase newState);
 
     /**
      * Performs all required checks before holding the critical sections.
      */
     void _checkCommandArguments(OperationContext* opCtx);
 
-    /**
-     * Checks that the collection has UUID matching the collectionUUID parameter, if provided.
-     */
-    void _checkCollectionUUIDMismatch(OperationContext* opCtx) const;
+    boost::optional<CreateCollectionResponse> _checkIfCollectionAlreadyShardedWithSameOptions(
+        OperationContext* opCtx);
+
+    TranslatedRequestParams _translateRequestParameters(OperationContext* opCtx);
+
+    // TODO SERVER-68008 Remove once 7.0 becomes last LTS; when the function appears in if clauses,
+    // modify the code assuming that a "false" value gets returned
+    bool _timeseriesNssResolvedByCommandHandler() const;
+
+    void _acquireCriticalSections(OperationContext* opCtx);
+
+    void _promoteCriticalSectionsToBlockReads(OperationContext* opCtx) const;
+
+    void _releaseCriticalSections(OperationContext* opCt, bool throwIfReasonDiffers = true);
 
     /**
      * Ensures the collection is created locally and has the appropiate shard index.
      */
-    void _createCollectionAndIndexes(OperationContext* opCtx);
+    void _createCollectionAndIndexes(OperationContext* opCtx,
+                                     const ShardKeyPattern& shardKeyPattern);
 
     /**
      * Creates the appropiate split policy.
      */
-    void _createPolicy(OperationContext* opCtx);
+    void _createPolicy(OperationContext* opCtx, const ShardKeyPattern& shardKeyPattern);
 
     /**
      * Given the appropiate split policy, create the initial chunks.
      */
-    void _createChunks(OperationContext* opCtx);
+    void _createChunks(OperationContext* opCtx, const ShardKeyPattern& shardKeyPattern);
 
     /**
      * If the optimized path can be taken, ensure the collection is already created in all the
      * participant shards.
      */
     void _createCollectionOnNonPrimaryShards(OperationContext* opCtx,
-                                             const boost::optional<OperationSessionInfo>& osi);
+                                             const OperationSessionInfo& osi);
 
     /**
      * Does the following writes:
      * 1. Updates the config.collections entry for the new sharded collection
      * 2. Updates config.chunks entries for the new sharded collection
+     * 3. Inserts an entry into config.placementHistory with the sublist of shards that will host
+     * one or more chunks of the new collections at creation time
      */
-    void _commit(OperationContext* opCtx);
-
-    /**
-     * Refresh all participant shards and log creation.
-     */
-    void _finalize(OperationContext* opCtx);
+    void _commit(OperationContext* opCtx, const std::shared_ptr<executor::TaskExecutor>& executor);
 
     /**
      * Helper function to audit and log the shard collection event.
@@ -149,55 +143,21 @@ private:
      */
     void _logEndCreateCollection(OperationContext* opCtx);
 
-    /**
-     * Returns the BSONObj used as critical section reason
-     *
-     * TODO SERVER-64720 remove this function, directly access _critSecReason
-     *
-     */
-    virtual const BSONObj& _getCriticalSectionReason() const {
-        return _critSecReason;
-    };
+    mongo::CreateCollectionRequest _request;
 
     const BSONObj _critSecReason;
 
-    // Objects generated on each execution.
-    boost::optional<ShardKeyPattern> _shardKeyPattern;
-    boost::optional<BSONObj> _collationBSON;
-    boost::optional<UUID> _collectionUUID;
-    std::unique_ptr<InitialSplitPolicy> _splitPolicy;
-    InitialSplitPolicy::ShardCollectionConfig _initialChunks;
+    // Set on successful completion of the coordinator
     boost::optional<CreateCollectionResponse> _result;
+
+    // The fields below are only populated if the coordinator enters in the branch where the
+    // collection is not already sharded (i.e., they will not be present on early return)
+
+    boost::optional<UUID> _collectionUUID;
+
+    std::unique_ptr<InitialSplitPolicy> _splitPolicy;
+    boost::optional<InitialSplitPolicy::ShardCollectionConfig> _initialChunks;
     boost::optional<bool> _collectionEmpty;
-    boost::optional<size_t> _numChunks;
-};
-
-class CreateCollectionCoordinatorDocumentPre60Compatible final
-    : public CreateCollectionCoordinatorDocument {
-    // TODO SERVER-64720 remove once 6.0 becomes last LTS
-public:
-    using CreateCollectionCoordinatorDocument::CreateCollectionCoordinatorDocument;
-
-    static const BSONObj kPre60IncompatibleFields;
-    void serialize(BSONObjBuilder* builder) const;
-    BSONObj toBSON() const;
-};
-
-class CreateCollectionCoordinatorPre60Compatible final : public CreateCollectionCoordinator {
-    // TODO SERVER-64720 remove once 6.0 becomes last LTS
-public:
-    using CreateCollectionCoordinator::CreateCollectionCoordinator;
-    using CoordDoc = CreateCollectionCoordinatorDocumentPre60Compatible;
-
-    CreateCollectionCoordinatorPre60Compatible(ShardingDDLCoordinatorService* service,
-                                               const BSONObj& initialState);
-
-    virtual const BSONObj& _getCriticalSectionReason() const override {
-        return _critSecReason;
-    };
-
-private:
-    const BSONObj _critSecReason;
 };
 
 }  // namespace mongo

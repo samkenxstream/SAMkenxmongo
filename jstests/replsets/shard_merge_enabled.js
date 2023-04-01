@@ -1,24 +1,35 @@
 /**
  * Tests that the "shard merge" protocol is enabled only in the proper FCV.
- * @tags: [requires_fcv_52, featureFlagShardMerge]
+ * @tags: [featureFlagShardMerge]
  */
 
-(function() {
-"use strict";
-
-load("jstests/replsets/libs/tenant_migration_util.js");
+import {
+    isShardMergeEnabled,
+    makeMigrationCertificatesForTest
+} from "jstests/replsets/libs/tenant_migration_util.js";
 load("jstests/libs/fail_point_util.js");
 
 function runTest(downgradeFCV) {
-    let rst = new ReplSetTest({nodes: 1});
+    const rst = new ReplSetTest({nodes: 1});
     rst.startSet();
     rst.initiate();
 
-    let primary = rst.getPrimary();
-    let adminDB = primary.getDB("admin");
+    const primary = rst.getPrimary();
+
+    // Note: including this explicit early return here due to the fact that multiversion
+    // suites will execute this test without featureFlagShardMerge enabled (despite the
+    // presence of the featureFlagShardMerge tag above), which means the test will attempt
+    // to run a multi-tenant migration and fail.
+    if (!isShardMergeEnabled(primary.getDB("admin"))) {
+        rst.stopSet();
+        jsTestLog("Skipping Shard Merge-specific test");
+        return;
+    }
+
+    const adminDB = primary.getDB("admin");
     const kDummyConnStr = "mongodb://localhost/?replicaSet=foo";
     const readPreference = {mode: 'primary'};
-    const migrationCertificates = TenantMigrationUtil.makeMigrationCertificatesForTest();
+    const migrationCertificates = makeMigrationCertificatesForTest();
 
     // A function, not a constant, to ensure unique UUIDs.
     function donorStartMigrationCmd() {
@@ -29,7 +40,8 @@ function runTest(downgradeFCV) {
             recipientConnectionString: kDummyConnStr,
             readPreference: readPreference,
             donorCertificateForRecipient: migrationCertificates.donorCertificateForRecipient,
-            recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor
+            recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
+            tenantIds: [ObjectId()]
         };
     }
 
@@ -38,6 +50,7 @@ function runTest(downgradeFCV) {
             recipientSyncData: 1,
             protocol: "shard merge",
             migrationId: UUID(),
+            tenantIds: [ObjectId()],
             donorConnectionString: kDummyConnStr,
             readPreference: readPreference,
             startMigrationDonorTimestamp: Timestamp(1, 1),
@@ -50,9 +63,11 @@ function runTest(downgradeFCV) {
             recipientForgetMigration: 1,
             protocol: "shard merge",
             migrationId: UUID(),
+            tenantIds: [ObjectId()],
             donorConnectionString: kDummyConnStr,
             readPreference: readPreference,
-            recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor
+            recipientCertificateForDonor: migrationCertificates.recipientCertificateForDonor,
+            decision: "committed"
         };
     }
 
@@ -95,7 +110,7 @@ function runTest(downgradeFCV) {
     configureFailPoint(primary, "returnResponseOkForRecipientForgetMigrationCmd");
 
     // Preconditions: the shard merge feature is enabled and our fresh RS is on the latest FCV.
-    assert(TenantMigrationUtil.isShardMergeEnabled(adminDB));
+    assert(isShardMergeEnabled(adminDB));
     assert.eq(getFCVConstants().latest,
               adminDB.system.version.findOne({_id: 'featureCompatibilityVersion'}).version);
 
@@ -121,4 +136,3 @@ function runTest(downgradeFCV) {
 }
 
 runFeatureFlagMultiversionTest('featureFlagShardMerge', runTest);
-})();

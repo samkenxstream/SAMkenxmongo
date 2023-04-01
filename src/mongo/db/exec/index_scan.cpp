@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -36,12 +35,16 @@
 #include <memory>
 
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/query/index_bounds_builder.h"
+#include "mongo/db/query/plan_executor_impl.h"
+#include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace {
 
@@ -73,8 +76,9 @@ IndexScan::IndexScan(ExpressionContext* expCtx,
       _forward(params.direction == 1),
       _shouldDedup(params.shouldDedup),
       _addKeyMetadata(params.addKeyMetadata),
-      _startKeyInclusive(IndexBounds::isStartIncludedInBound(params.bounds.boundInclusion)),
-      _endKeyInclusive(IndexBounds::isEndIncludedInBound(params.bounds.boundInclusion)) {
+      _startKeyInclusive(IndexBounds::isStartIncludedInBound(_bounds.boundInclusion)),
+      _endKeyInclusive(IndexBounds::isEndIncludedInBound(_bounds.boundInclusion)),
+      _lowPriority(params.lowPriority) {
     _specificStats.indexName = params.name;
     _specificStats.keyPattern = _keyPattern;
     _specificStats.isMultiKey = params.isMultiKey;
@@ -89,6 +93,11 @@ IndexScan::IndexScan(ExpressionContext* expCtx,
 }
 
 boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
+    if (_lowPriority && opCtx()->getClient()->isFromUserConnection() &&
+        opCtx()->lockState()->shouldWaitForTicket()) {
+        _priority.emplace(opCtx()->lockState(), AdmissionContext::Priority::kLow);
+    }
+
     // Perform the possibly heavy-duty initialization of the underlying index cursor.
     _indexCursor = indexAccessMethod()->newCursor(opCtx(), _forward);
 
@@ -140,28 +149,40 @@ boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
 PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
     // Get the next kv pair from the index, if any.
     boost::optional<IndexKeyEntry> kv;
-    try {
-        switch (_scanState) {
-            case INITIALIZING:
-                kv = initIndexScan();
-                break;
-            case GETTING_NEXT:
-                kv = _indexCursor->next();
-                break;
-            case NEED_SEEK:
-                ++_specificStats.seeks;
-                kv = _indexCursor->seek(IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
-                    _seekPoint,
-                    indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
-                    indexAccessMethod()->getSortedDataInterface()->getOrdering(),
-                    _forward));
-                break;
-            case HIT_END:
-                return PlanStage::IS_EOF;
-        }
-    } catch (const WriteConflictException&) {
-        *out = WorkingSet::INVALID_ID;
-        return PlanStage::NEED_YIELD;
+
+    const auto ret = handlePlanStageYield(
+        expCtx(),
+        "IndexScan",
+        collection()->ns().ns(),
+        [&] {
+            switch (_scanState) {
+                case INITIALIZING:
+                    kv = initIndexScan();
+                    break;
+                case GETTING_NEXT:
+                    kv = _indexCursor->next();
+                    break;
+                case NEED_SEEK:
+                    ++_specificStats.seeks;
+                    kv = _indexCursor->seek(IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                        _seekPoint,
+                        indexAccessMethod()->getSortedDataInterface()->getKeyStringVersion(),
+                        indexAccessMethod()->getSortedDataInterface()->getOrdering(),
+                        _forward));
+                    break;
+                case HIT_END:
+                    _priority.reset();
+                    return PlanStage::IS_EOF;
+            }
+            return PlanStage::ADVANCED;
+        },
+        [&] {
+            // yieldHandler
+            *out = WorkingSet::INVALID_ID;
+        });
+
+    if (ret != PlanStage::ADVANCED) {
+        return ret;
     }
 
     if (kv) {
@@ -206,6 +227,7 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
         _scanState = HIT_END;
         _commonStats.isEOF = true;
         _indexCursor.reset();
+        _priority.reset();
         return PlanStage::IS_EOF;
     }
 
@@ -230,7 +252,7 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
     // We found something to return, so fill out the WSM.
     WorkingSetID id = _workingSet->allocate();
     WorkingSetMember* member = _workingSet->get(id);
-    member->recordId = kv->loc;
+    member->recordId = std::move(kv->loc);
     member->keyData.push_back(IndexKeyDatum(
         _keyPattern, kv->key, workingSetIndexId(), opCtx()->recoveryUnit()->getSnapshotId()));
     _workingSet->transitionToRecordIdAndIdx(id);
@@ -267,9 +289,15 @@ void IndexScan::doRestoreStateRequiresIndex() {
 void IndexScan::doDetachFromOperationContext() {
     if (_indexCursor)
         _indexCursor->detachFromOperationContext();
+
+    _priority.reset();
 }
 
 void IndexScan::doReattachToOperationContext() {
+    if (_lowPriority && opCtx()->getClient()->isFromUserConnection() &&
+        opCtx()->lockState()->shouldWaitForTicket()) {
+        _priority.emplace(opCtx()->lockState(), AdmissionContext::Priority::kLow);
+    }
     if (_indexCursor)
         _indexCursor->reattachToOperationContext(opCtx());
 }
@@ -280,9 +308,7 @@ std::unique_ptr<PlanStageStats> IndexScan::getStats() {
 
     // Add a BSON representation of the filter to the stats tree, if there is one.
     if (nullptr != _filter) {
-        BSONObjBuilder bob;
-        _filter->serialize(&bob);
-        _commonStats.filter = bob.obj();
+        _commonStats.filter = _filter->serialize();
     }
 
     // These specific stats fields never change.
@@ -298,10 +324,6 @@ std::unique_ptr<PlanStageStats> IndexScan::getStats() {
         std::make_unique<PlanStageStats>(_commonStats, STAGE_IXSCAN);
     ret->specific = std::make_unique<IndexScanStats>(_specificStats);
     return ret;
-}
-
-const SpecificStats* IndexScan::getSpecificStats() const {
-    return &_specificStats;
 }
 
 }  // namespace mongo

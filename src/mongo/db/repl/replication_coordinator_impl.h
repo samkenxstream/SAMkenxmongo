@@ -36,8 +36,8 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/timestamp.h"
-#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
+#include "mongo/db/repl/delayable_timeout_callback.h"
 #include "mongo/db/repl/initial_syncer.h"
 #include "mongo/db/repl/initial_syncer_interface.h"
 #include "mongo/db/repl/member_state.h"
@@ -274,6 +274,8 @@ public:
 
     virtual bool getMaintenanceMode() override;
 
+    virtual bool shouldDropSyncSourceAfterShardSplit(OID replicaSetId) const override;
+
     virtual Status processReplSetSyncFrom(OperationContext* opCtx,
                                           const HostAndPort& target,
                                           BSONObjBuilder* resultObj) override;
@@ -291,7 +293,8 @@ public:
     virtual Status doOptimizedReconfig(OperationContext* opCtx, GetNewConfigFn) override;
 
     virtual Status awaitConfigCommitment(OperationContext* opCtx,
-                                         bool waitForOplogCommitment) override;
+                                         bool waitForOplogCommitment,
+                                         long long term) override;
 
     virtual Status processReplSetInitiate(OperationContext* opCtx,
                                           const BSONObj& configObj,
@@ -406,8 +409,8 @@ public:
         boost::optional<TopologyVersion> clientTopologyVersion,
         boost::optional<Date_t> deadline) override;
 
-    virtual StatusWith<OpTime> getLatestWriteOpTime(OperationContext* opCtx) const
-        noexcept override;
+    virtual StatusWith<OpTime> getLatestWriteOpTime(
+        OperationContext* opCtx) const noexcept override;
 
     virtual HostAndPort getCurrentPrimaryHostAndPort() const override;
 
@@ -422,6 +425,8 @@ public:
     virtual void restartScheduledHeartbeats_forTest() override;
 
     virtual void recordIfCWWCIsSetOnConfigServerOnStartup(OperationContext* opCtx) final;
+
+    virtual SplitPrepareSessionManager* getSplitPrepareSessionManager() override;
 
     // ================== Test support API ===================
 
@@ -466,7 +471,7 @@ public:
     executor::TaskExecutor::CallbackHandle getCatchupTakeoverCbh_forTest() const;
 
     /**
-     * Simple wrappers around _setLastOptime to make it easier to test.
+     * Simple wrappers around _setLastOptimeForMember to make it easier to test.
      */
     Status setLastAppliedOptime_forTest(long long cfgVer,
                                         long long memberId,
@@ -517,6 +522,76 @@ public:
      * kCanceled.
      */
     void cancelElection_forTest();
+
+    /**
+     * Implementation of an interface used to synchronize changes to custom write concern tags in
+     * the config and custom default write concern settings.
+     * See base class fore more information.
+     */
+    class WriteConcernTagChangesImpl : public WriteConcernTagChanges {
+    public:
+        WriteConcernTagChangesImpl() = default;
+        virtual ~WriteConcernTagChangesImpl() = default;
+
+        bool reserveDefaultWriteConcernChange() override {
+            stdx::lock_guard lock(_mutex);
+            if (_configWriteConcernTagChanges > 0) {
+                return false;
+            }
+            _defaultWriteConcernChanges++;
+            return true;
+        }
+
+        void releaseDefaultWriteConcernChange() override {
+            stdx::lock_guard lock(_mutex);
+            invariant(_defaultWriteConcernChanges > 0);
+            _defaultWriteConcernChanges--;
+        }
+
+        bool reserveConfigWriteConcernTagChange() override {
+            stdx::lock_guard lock(_mutex);
+            if (_defaultWriteConcernChanges > 0) {
+                return false;
+            }
+            _configWriteConcernTagChanges++;
+            return true;
+        }
+
+        void releaseConfigWriteConcernTagChange() override {
+            stdx::lock_guard lock(_mutex);
+            invariant(_configWriteConcernTagChanges > 0);
+            _configWriteConcernTagChanges--;
+        }
+
+    private:
+        //
+        // All member variables are labeled with one of the following codes indicating the
+        // synchronization rules for accessing them.
+        //
+        // (R)  Read-only in concurrent operation; no synchronization required.
+        // (S)  Self-synchronizing; access in any way from any context.
+        // (PS) Pointer is read-only in concurrent operation, item pointed to is self-synchronizing;
+        //      Access in any context.
+        // (M)  Reads and writes guarded by _mutex
+        // (I)  Independently synchronized, see member variable comment.
+
+        // The number of config write concern tag changes currently underway.
+        size_t _configWriteConcernTagChanges{0};  // (M)
+
+        // The number of default write concern changes currently underway.
+        size_t _defaultWriteConcernChanges{0};  // (M)
+
+        // Used to synchronize access to the above variables.
+        Mutex _mutex = MONGO_MAKE_LATCH(
+            "ReplicationCoordinatorImpl::PendingWriteConcernTagChangesImpl::_mutex");  // (S)
+    };
+
+    /**
+     * Returns a pointer to the WriteConcernTagChanges used by this instance.
+     */
+    WriteConcernTagChanges* getWriteConcernTagChanges() override;
+
+    bool isRetryableWrite(OperationContext* opCtx) const override;
 
 private:
     using CallbackFn = executor::TaskExecutor::CallbackFn;
@@ -1028,8 +1103,19 @@ private:
      * This is only valid to call on replica sets.
      * "configVersion" will be populated with our config version if it and the configVersion
      * of "args" differ.
+     *
+     * If either applied or durable optime has changed, returns the later of the two (even if
+     * that's not the one which changed).  Otherwise returns a null optime.
      */
-    Status _setLastOptime(WithLock lk, const UpdatePositionArgs::UpdateInfo& args);
+    StatusWith<OpTime> _setLastOptimeForMember(WithLock lk,
+                                               const UpdatePositionArgs::UpdateInfo& args);
+
+    /**
+     * Helper for processReplSetUpdatePosition, companion to _setLastOptimeForMember above.  Updates
+     * replication coordinator state and notifies waiters after remote optime updates.  Must be
+     * called within the same critical section as _setLastOptimeForMember.
+     */
+    void _updateStateAfterRemoteOpTimeUpdates(WithLock lk, const OpTime& maxRemoteOpTime);
 
     /**
      * This function will report our position externally (like upstream) if necessary.
@@ -1077,6 +1163,13 @@ private:
      * _electionTimeoutPeriod. Used to add randomization to an election timeout.
      */
     Milliseconds _getRandomizedElectionOffset_inlock();
+
+    /*
+     * Return the upper bound of the offset amount returned by _getRandomizedElectionOffset
+     * This is actually off by one, that is, the election offset is in the half-open range
+     * [0, electionOffsetUpperBound)
+     */
+    long long _getElectionOffsetUpperBound_inlock();
 
     /**
      * Starts a heartbeat for each member in the current config.  Called while holding _mutex.
@@ -1271,20 +1364,18 @@ private:
     void _scheduleHeartbeatReconfig(WithLock lk, const ReplSetConfig& newConfig);
 
     /**
-     * Check if the node should use the recipientConfig contained within newConfig.
+     * Accepts a ReplSetConfig and resolves it either to itself, or the embedded shard split
+     * recipient config if it's present and self is a shard split recipient. Returns a tuple of the
+     * resolved config and a boolean indicating whether a recipient config was found.
      */
-    bool _shouldUseRecipientConfig(WithLock lk, const ReplSetConfig& newConfig);
-
-    /**
-     * Check if the recipient config provided can be applied to the current node.
-     */
-    Status _isRecipientConfigValid(WithLock lk, const ReplSetConfig& newConfig);
+    std::tuple<StatusWith<ReplSetConfig>, bool> _resolveConfigToApply(const ReplSetConfig& config);
 
     /**
      * Method to write a configuration transmitted via heartbeat message to stable storage.
      */
     void _heartbeatReconfigStore(const executor::TaskExecutor::CallbackArgs& cbd,
-                                 const ReplSetConfig& newConfig);
+                                 const ReplSetConfig& newConfig,
+                                 bool isSplitRecipientConfig = false);
 
     /**
      * Conclusion actions of a heartbeat-triggered reconfiguration.
@@ -1361,6 +1452,13 @@ private:
      */
     void _updateLastCommittedOpTimeAndWallTime(WithLock lk);
 
+    /** Terms only increase, so if an incoming term is less than or equal to our
+     * current term (_termShadow), there is no need to take the mutex and call _updateTerm_inlock.
+     * Since _termShadow may be lagged, this may return true when the term does not need to be
+     * updated, which is harmless because _updateTerm_inlock will do nothing in that case.
+     */
+    bool _needToUpdateTerm(long long term);
+
     /**
      * Callback that attempts to set the current term in topology coordinator and
      * relinquishes primary if the term actually changes and we are primary.
@@ -1381,17 +1479,6 @@ private:
      * Returns the finish event which is invalid if the process has already finished.
      */
     EventHandle _processReplSetMetadata_inlock(const rpc::ReplSetMetadata& replMetadata);
-
-    /**
-     * Prepares a metadata object for ReplSetMetadata.
-     */
-    void _prepareReplSetMetadata_inlock(const OpTime& lastOpTimeFromClient,
-                                        BSONObjBuilder* builder) const;
-
-    /**
-     * Prepares a metadata object for OplogQueryMetadata.
-     */
-    void _prepareOplogQueryMetadata_inlock(int rbid, BSONObjBuilder* builder) const;
 
     /**
      * Blesses a snapshot to be used for new committed reads.
@@ -1418,8 +1505,10 @@ private:
     /**
      * Bottom half of _scheduleNextLivenessUpdate.
      * Must be called with _mutex held.
+     * If reschedule is true, will recompute the liveness update even if a timeout is
+     * already pending.
      */
-    void _scheduleNextLivenessUpdate_inlock();
+    void _scheduleNextLivenessUpdate_inlock(bool reschedule);
 
     /**
      * Callback which marks downed nodes as down, triggers a stepdown if a majority of nodes are no
@@ -1428,11 +1517,11 @@ private:
     void _handleLivenessTimeout(const executor::TaskExecutor::CallbackArgs& cbData);
 
     /**
-     * If "updatedMemberId" is the current _earliestMemberId, cancels the current
-     * _handleLivenessTimeout callback and calls _scheduleNextLivenessUpdate to schedule a new one.
+     * If "updatedMemberId" is the current _earliestMemberId, calls _scheduleNextLivenessUpdate to
+     * schedule a new one.
      * Returns immediately otherwise.
      */
-    void _cancelAndRescheduleLivenessUpdate_inlock(int updatedMemberId);
+    void _rescheduleLivenessUpdate_inlock(int updatedMemberId);
 
     /**
      * Cancels all outstanding _priorityTakeover callbacks.
@@ -1481,6 +1570,12 @@ private:
      * Finish catch-up mode and start drain mode.
      */
     void _enterDrainMode_inlock();
+
+    /**
+     * Enter drain mode which does not result in a primary stepup. Returns a future which becomes
+     * ready when the oplog buffers have completed draining.
+     */
+    Future<void> _drainForShardSplit();
 
     /**
      * Waits for the config state to leave kConfigStartingUp, which indicates that start() has
@@ -1547,7 +1642,7 @@ private:
     /*
      * Calculates and returns the read preference for the node.
      */
-    const ReadPreference _getSyncSourceReadPreference(WithLock) const;
+    ReadPreference _getSyncSourceReadPreference(WithLock) const;
 
     /*
      * Performs the replica set reconfig procedure. Certain consensus safety checks are omitted when
@@ -1637,9 +1732,6 @@ private:
     // Current ReplicaSet state.
     MemberState _memberState;  // (M)
 
-    // Used to signal threads waiting for changes to _memberState.
-    stdx::condition_variable _drainFinishedCond;  // (M)
-
     ReplicationCoordinator::ApplierState _applierState = ApplierState::Running;  // (M)
 
     // Used to signal threads waiting for changes to _rsConfigState.
@@ -1684,15 +1776,10 @@ private:
     stdx::condition_variable _currentCommittedSnapshotCond;  // (M)
 
     // Callback Handle used to cancel a scheduled LivenessTimeout callback.
-    executor::TaskExecutor::CallbackHandle _handleLivenessTimeoutCbh;  // (M)
+    DelayableTimeoutCallback _handleLivenessTimeoutCallback;  // (S)
 
-    // Callback Handle used to cancel a scheduled ElectionTimeout callback.
-    executor::TaskExecutor::CallbackHandle _handleElectionTimeoutCbh;  // (M)
-
-    // Election timeout callback will not run before this time.
-    // If this date is Date_t(), the callback is either unscheduled or canceled.
-    // Used for testing only.
-    Date_t _handleElectionTimeoutWhen;  // (M)
+    // Used to manage scheduling and canceling election timeouts.
+    DelayableTimeoutCallbackWithJitter _handleElectionTimeoutCallback;  // (M)
 
     // Callback Handle used to cancel a scheduled PriorityTakeover callback.
     executor::TaskExecutor::CallbackHandle _priorityTakeoverCbh;  // (M)
@@ -1762,10 +1849,20 @@ private:
     // The cached value of the 'counter' field in the server's TopologyVersion.
     AtomicWord<int64_t> _cachedTopologyVersionCounter;  // (S)
 
-    // This should be set during sharding initialization.
+    // This should be set during sharding initialization except on catalog shard.
     boost::optional<bool> _wasCWWCSetOnConfigServerOnStartup;
 
     InitialSyncerInterface::OnCompletionFn _onCompletion;
+
+    // Construct used to synchronize default write concern changes with config write concern
+    // changes.
+    WriteConcernTagChangesImpl _writeConcernTagChanges;
+
+    // An optional promise created when entering drain mode for shard split.
+    boost::optional<Promise<void>> _finishedDrainingPromise;  // (M)
+
+    // Pointer to the SplitPrepareSessionManager owned by this ReplicationCoordinator.
+    SplitPrepareSessionManager _splitSessionManager;  // (S)
 };
 
 }  // namespace repl

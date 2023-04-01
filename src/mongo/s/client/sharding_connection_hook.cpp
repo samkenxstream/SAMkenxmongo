@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -40,6 +39,9 @@
 #include "mongo/db/client.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 
@@ -74,7 +76,8 @@ void ShardingConnectionHook::onCreate(DBClientBase* conn) {
 
     if (conn->type() == ConnectionString::ConnectionType::kStandalone) {
         BSONObj isMasterResponse;
-        if (!conn->runCommand("admin", BSON("ismaster" << 1), isMasterResponse)) {
+        if (!conn->runCommand(
+                DatabaseName(boost::none, "admin"), BSON("ismaster" << 1), isMasterResponse)) {
             uassertStatusOK(getStatusFromCommandResult(isMasterResponse));
         }
 

@@ -12,9 +12,8 @@ class JSRunnerFileTestCase(interface.ProcessTestCase):
 
     REGISTERED_NAME = registry.LEAVE_UNREGISTERED
 
-    def __init__(  # pylint: disable=too-many-arguments
-            self, logger, test_kind, test_name, test_runner_file, shell_executable=None,
-            shell_options=None):
+    def __init__(self, logger, test_kind, test_name, test_runner_file, shell_executable=None,
+                 shell_options=None):
         """Initialize the JSRunnerFileTestCase with the 'test_name' file."""
 
         interface.ProcessTestCase.__init__(self, logger, test_kind, test_name)
@@ -47,6 +46,6 @@ class JSRunnerFileTestCase(interface.ProcessTestCase):
 
     def _make_process(self):
         return core.programs.mongo_shell_program(
-            self.logger, self.fixture.job_num, test_id=self._id, executable=self.shell_executable,
+            self.logger, executable=self.shell_executable,
             connection_string=self.fixture.get_driver_connection_url(),
             filename=self.test_runner_file, test_filename=self.test_name, **self.shell_options)

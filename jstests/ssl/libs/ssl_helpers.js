@@ -1,4 +1,5 @@
 load('jstests/multiVersion/libs/multi_rs.js');
+load('jstests/libs/os_helpers.js');
 
 // Do not fail if this test leaves unterminated processes because this file expects replset1.js to
 // throw for invalid SSL options.
@@ -114,15 +115,9 @@ function testShardedLookup(shardingTest) {
 function mixedShardTest(options1, options2, shouldSucceed) {
     let authSucceeded = false;
     try {
+        // TODO SERVER-14017 is fixed the "enableBalancer" line can be removed.
         // Start ShardingTest with enableBalancer because ShardingTest attempts to turn
         // off the balancer otherwise, which it will not be authorized to do if auth is enabled.
-        //
-        // Also, the autosplitter will be turned on automatically with 'enableBalancer: true'. We
-        // then want to disable the autosplitter, but cannot do so here with 'enableAutoSplit:
-        // false' because ShardingTest will attempt to call disableAutoSplit(), which it will not be
-        // authorized to do if auth is enabled.
-        //
-        // Once SERVER-14017 is fixed the "enableBalancer" line can be removed.
 
         // The mongo shell cannot authenticate as the internal __system user in tests that use x509
         // for cluster authentication. Choosing the default value for wcMajorityJournalDefault in
@@ -130,8 +125,7 @@ function mixedShardTest(options1, options2, shouldSucceed) {
         // authentication, so in this test we must make the choice explicitly, based on the global
         // test options.
         let wcMajorityJournalDefault;
-        if (jsTestOptions().noJournal || jsTestOptions().storageEngine == "ephemeralForTest" ||
-            jsTestOptions().storageEngine == "inMemory") {
+        if (jsTestOptions().storageEngine == "inMemory") {
             wcMajorityJournalDefault = false;
         } else {
             wcMajorityJournalDefault = true;
@@ -155,7 +149,6 @@ function mixedShardTest(options1, options2, shouldSucceed) {
         authSucceeded = true;
 
         st.stopBalancer();
-        st.disableAutoSplit();
 
         // Test that $lookup works because it causes outgoing connections to be opened
         testShardedLookup(st);
@@ -319,95 +312,16 @@ function detectDefaultTLSProtocol() {
     }
 }
 
-function isRHEL8() {
-    if (_isWindows()) {
-        return false;
-    }
-
-    // RHEL 8 disables TLS 1.0 and TLS 1.1 as part their default crypto policy
-    // We skip tests on RHEL 8 that require these versions as a result.
-    const grep_result = runProgram('grep', 'Ootpa', '/etc/redhat-release');
-    if (grep_result == 0) {
-        return true;
-    }
-
-    return false;
-}
-
-function isSUSE15SP1() {
-    if (_isWindows()) {
-        return false;
-    }
-
-    // SUSE 15 SP1 FIPS module does not work. SP2 does work.
-    // The FIPS code returns FIPS_R_IN_ERROR_STATE in what is likely a race condition
-    // since it only happens in sharded clusters.
-    const grep_result = runProgram('grep', '15-SP1', '/etc/os-release');
-    if (grep_result == 0) {
-        return true;
-    }
-
-    return false;
-}
-
-function isUbuntu2004() {
-    if (_isWindows()) {
-        return false;
-    }
-
-    // Ubuntu 20.04 disables TLS 1.0 and TLS 1.1 as part their default crypto policy
-    // We skip tests on Ubuntu 20.04 that require these versions as a result.
-    const grep_result = runProgram('grep', 'focal', '/etc/os-release');
-    if (grep_result == 0) {
-        return true;
-    }
-
-    return false;
-}
-
-function isUbuntu1804() {
-    if (_isWindows()) {
-        return false;
-    }
-
-    // Ubuntu 18.04's TLS 1.3 implementation has an issue with OCSP stapling. We have disabled
-    // stapling on this build variant, so we need to ensure that tests that require stapling
-    // do not run on this machine.
-    const grep_result = runProgram('grep', 'bionic', '/etc/os-release');
-    if (grep_result === 0) {
-        return true;
-    }
-
-    return false;
-}
-
-function isDebian10() {
-    if (_isWindows()) {
-        return false;
-    }
-
-    // Debian 10 disables TLS 1.0 and TLS 1.1 as part their default crypto policy
-    // We skip tests on Debian 10 that require these versions as a result.
-    try {
-        // this file exists on systemd-based systems, necessary to avoid mischaracterizing debian
-        // derivatives as stock debian
-        const releaseFile = cat("/etc/os-release").toLowerCase();
-        const prettyName = releaseFile.split('\n').find(function(line) {
-            return line.startsWith("pretty_name");
-        });
-        return prettyName.includes("debian") &&
-            (prettyName.includes("10") || prettyName.includes("buster") ||
-             prettyName.includes("bullseye"));
-    } catch (e) {
-        return false;
-    }
-}
-
 function sslProviderSupportsTLS1_0() {
     if (isRHEL8()) {
         const cryptoPolicy = cat("/etc/crypto-policies/config");
         return cryptoPolicy.includes("LEGACY");
     }
+
+    if (isOpenSSL3orGreater()) {
+        return false;
+    }
+
     return !isDebian10() && !isUbuntu2004();
 }
 
@@ -416,7 +330,22 @@ function sslProviderSupportsTLS1_1() {
         const cryptoPolicy = cat("/etc/crypto-policies/config");
         return cryptoPolicy.includes("LEGACY");
     }
+
+    if (isOpenSSL3orGreater()) {
+        return false;
+    }
+
     return !isDebian10() && !isUbuntu2004();
+}
+
+function isOpenSSL3orGreater() {
+    // Windows and macOS do not have "openssl.compiled" in buildInfo but they do have "running"
+    const opensslCompiledIn = getBuildInfo().openssl.compiled !== undefined;
+    if (!opensslCompiledIn) {
+        return false;
+    }
+
+    return opensslVersionAsInt() >= 0x3000000;
 }
 
 function opensslVersionAsInt() {

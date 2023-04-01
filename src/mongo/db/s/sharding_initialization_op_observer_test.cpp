@@ -27,14 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/op_observer_impl.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/s/config_server_op_observer.h"
 #include "mongo/db/s/shard_server_catalog_cache_loader.h"
@@ -95,7 +94,8 @@ TEST_F(ShardingInitializationOpObserverTest, GlobalInitGetsCalledAfterWriteCommi
     shardIdentity.setClusterId(OID::gen());
 
     DBDirectClient client(operationContext());
-    client.insert("admin.system.version", shardIdentity.toShardIdentityDocument());
+    client.insert(NamespaceString::createNamespaceString_forTest("admin.system.version"),
+                  shardIdentity.toShardIdentityDocument());
     ASSERT_EQ(1, getInitCallCount());
 }
 
@@ -109,16 +109,20 @@ TEST_F(ShardingInitializationOpObserverTest, GlobalInitDoesntGetCalledIfWriteAbo
     // This part of the test ensures that the collection exists for the AutoGetCollection below to
     // find and also validates that the initializer does not get called for non-sharding documents
     DBDirectClient client(operationContext());
-    client.insert("admin.system.version", BSON("_id" << 1));
+    client.insert(NamespaceString::createNamespaceString_forTest("admin.system.version"),
+                  BSON("_id" << 1));
     ASSERT_EQ(0, getInitCallCount());
 
     {
         AutoGetCollection autoColl(
-            operationContext(), NamespaceString("admin.system.version"), MODE_IX);
+            operationContext(),
+            NamespaceString::createNamespaceString_forTest("admin.system.version"),
+            MODE_IX);
 
         WriteUnitOfWork wuow(operationContext());
         InsertStatement stmt(shardIdentity.toShardIdentityDocument());
-        ASSERT_OK(autoColl.getCollection()->insertDocument(operationContext(), stmt, nullptr));
+        ASSERT_OK(
+            collection_internal::insertDocument(operationContext(), *autoColl, stmt, nullptr));
         ASSERT_EQ(0, getInitCallCount());
     }
 
@@ -133,7 +137,8 @@ TEST_F(ShardingInitializationOpObserverTest, GlobalInitDoesntGetsCalledIfNSIsNot
     shardIdentity.setClusterId(OID::gen());
 
     DBDirectClient client(operationContext());
-    client.insert("admin.user", shardIdentity.toShardIdentityDocument());
+    client.insert(NamespaceString::createNamespaceString_forTest("admin.user"),
+                  shardIdentity.toShardIdentityDocument());
     ASSERT_EQ(0, getInitCallCount());
 }
 
@@ -141,7 +146,7 @@ TEST_F(ShardingInitializationOpObserverTest, OnInsertOpThrowWithIncompleteShardI
     DBDirectClient client(operationContext());
 
     auto response = client.insertAcknowledged(
-        "admin.system.version",
+        NamespaceString::createNamespaceString_forTest("admin.system.version"),
         {BSON("_id" << ShardIdentityType::IdName << ShardIdentity::kShardNameFieldName
                     << kShardName)});
 

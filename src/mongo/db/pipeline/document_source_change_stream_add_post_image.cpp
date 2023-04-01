@@ -48,6 +48,8 @@ REGISTER_INTERNAL_DOCUMENT_SOURCE(_internalChangeStreamAddPostImage,
                                   DocumentSourceChangeStreamAddPostImage::createFromBson,
                                   true);
 
+constexpr auto makePostImageNotFoundErrorMsg =
+    &DocumentSourceChangeStreamAddPreImage::makePreImageNotFoundErrorMsg;
 
 Value assertFieldHasType(const Document& fullDoc, StringData fieldName, BSONType expectedType) {
     auto val = fullDoc[fieldName];
@@ -68,7 +70,7 @@ DocumentSourceChangeStreamAddPostImage::createFromBson(
             str::stream() << "the '" << kStageName << "' stage spec must be an object",
             elem.type() == BSONType::Object);
     auto parsedSpec = DocumentSourceChangeStreamAddPostImageSpec::parse(
-        IDLParserErrorContext("DocumentSourceChangeStreamAddPostImageSpec"), elem.Obj());
+        IDLParserContext("DocumentSourceChangeStreamAddPostImageSpec"), elem.Obj());
     return new DocumentSourceChangeStreamAddPostImage(expCtx, parsedSpec.getFullDocument());
 }
 
@@ -83,26 +85,16 @@ DocumentSource::GetNextResult DocumentSourceChangeStreamAddPostImage::doGetNext(
         return input;
     }
 
-    // TODO SERVER-58584: remove the feature flag.
-    if (_fullDocumentMode != FullDocumentModeEnum::kUpdateLookup) {
-        tassert(5869000,
-                str::stream() << "Feature flag must be enabled for fullDocument: "
-                              << FullDocumentMode_serializer(_fullDocumentMode),
-                feature_flags::gFeatureFlagChangeStreamPreAndPostImages.isEnabled(
-                    serverGlobalParams.featureCompatibility));
-    }
-
     // Create a mutable output document from the input document.
     MutableDocument output(input.releaseDocument());
     const auto postImageDoc = (_fullDocumentMode == FullDocumentModeEnum::kUpdateLookup
                                    ? lookupLatestPostImage(output.peek())
                                    : generatePostImage(output.peek()));
-    uassert(
-        ErrorCodes::NoMatchingDocument,
-        str::stream() << "Change stream was configured to require a post-image for all update, "
-                         "delete and replace events, but the post-image was not found for event: "
-                      << output.peek().toString(),
-        postImageDoc || _fullDocumentMode != FullDocumentModeEnum::kRequired);
+    uassert(ErrorCodes::NoMatchingDocument,
+            str::stream() << "Change stream was configured to require a post-image for all update "
+                             "events, but the post-image was not found for event: "
+                          << makePostImageNotFoundErrorMsg(output.peek()),
+            postImageDoc || _fullDocumentMode != FullDocumentModeEnum::kRequired);
 
     // Even if no post-image was found, we have to populate the 'fullDocument' field.
     output[kFullDocumentFieldName] = (postImageDoc ? Value(*postImageDoc) : Value(BSONNULL));
@@ -120,7 +112,8 @@ NamespaceString DocumentSourceChangeStreamAddPostImage::assertValidNamespace(
             .getDocument();
     auto dbName = assertFieldHasType(namespaceObject, "db"_sd, BSONType::String);
     auto collectionName = assertFieldHasType(namespaceObject, "coll"_sd, BSONType::String);
-    NamespaceString nss(dbName.getString(), collectionName.getString());
+    NamespaceString nss(NamespaceStringUtil::parseNamespaceFromDoc(
+        pExpCtx->ns.tenantId(), dbName.getString(), collectionName.getString()));
 
     // Change streams on an entire database only need to verify that the database names match. If
     // the database is 'admin', then this is a cluster-wide $changeStream and we are permitted to
@@ -216,15 +209,24 @@ boost::optional<Document> DocumentSourceChangeStreamAddPostImage::lookupLatestPo
         pExpCtx, nss, *resumeTokenData.uuid, documentKey, std::move(readConcern));
 }
 
-Value DocumentSourceChangeStreamAddPostImage::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    return explain
-        ? Value(Document{
-              {DocumentSourceChangeStream::kStageName,
-               Document{{"stage"_sd, kStageName},
-                        {kFullDocumentFieldName, FullDocumentMode_serializer(_fullDocumentMode)}}}})
-        : Value(Document{{kStageName,
-                          DocumentSourceChangeStreamAddPostImageSpec(_fullDocumentMode).toBSON()}});
+Value DocumentSourceChangeStreamAddPostImage::serialize(SerializationOptions opts) const {
+    BSONObjBuilder builder;
+    if (opts.verbosity) {
+        BSONObjBuilder sub(builder.subobjStart(DocumentSourceChangeStream::kStageName));
+        sub.append("stage"_sd, kStageName);
+        opts.serializeLiteralValue(FullDocumentMode_serializer(_fullDocumentMode))
+            .addToBsonObj(&sub, kFullDocumentFieldName);
+        sub.done();
+    } else {
+        BSONObjBuilder sub(builder.subobjStart(kStageName));
+        if (opts.replacementForLiteralArgs) {
+            sub.append(DocumentSourceChangeStreamAddPostImageSpec::kFullDocumentFieldName,
+                       *opts.replacementForLiteralArgs);
+        } else {
+            DocumentSourceChangeStreamAddPostImageSpec(_fullDocumentMode).serialize(&sub);
+        }
+        sub.done();
+    }
+    return Value(builder.obj());
 }
-
 }  // namespace mongo

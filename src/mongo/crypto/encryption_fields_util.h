@@ -33,7 +33,7 @@
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsontypes.h"
-#include "mongo/crypto/encryption_fields_gen.h"
+#include "mongo/crypto/fle_field_schema_gen.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/util/assert_util.h"
 
@@ -52,14 +52,13 @@ inline bool isFLE2EqualityIndexedSupportedType(BSONType type) {
         case bsonTimestamp:
         case Date:
         case jstOID:
+
+        case Symbol:
+        case DBRef:
             return true;
 
-        // Deprecated
-        case Symbol:
-        case CodeWScope:
-        case DBRef:
-
         // Non-deterministic
+        case CodeWScope:
         case Array:
         case Object:
         case NumberDecimal:
@@ -77,9 +76,95 @@ inline bool isFLE2EqualityIndexedSupportedType(BSONType type) {
     }
 }
 
-// Unindexed is the same as equality
+
+inline bool isFLE2RangeIndexedSupportedType(BSONType type) {
+    switch (type) {
+        case NumberInt:
+        case NumberLong:
+        case NumberDecimal:
+        case NumberDouble:
+        case Date:
+            return true;
+
+        // Valid for FLE Equality but not for Range.
+        case bsonTimestamp:
+        case Bool:
+        case BinData:
+        case Code:
+        case RegEx:
+        case String:
+        case jstOID:
+        case Symbol:
+        case DBRef:
+
+        // Non-deterministic
+        case CodeWScope:
+        case Array:
+        case Object:
+
+        // Singletons
+        case EOO:
+        case jstNULL:
+        case MaxKey:
+        case MinKey:
+        case Undefined:
+            return false;
+    }
+    MONGO_UNREACHABLE;
+}
+
 inline bool isFLE2UnindexedSupportedType(BSONType type) {
-    return isFLE2EqualityIndexedSupportedType(type);
+    switch (type) {
+        case BinData:
+        case Code:
+        case RegEx:
+        case String:
+
+        case NumberInt:
+        case NumberLong:
+        case Bool:
+        case bsonTimestamp:
+        case Date:
+        case jstOID:
+
+        case Array:
+        case Object:
+        case NumberDecimal:
+        case NumberDouble:
+
+        // Deprecated
+        case Symbol:
+        case CodeWScope:
+        case DBRef:
+            return true;
+
+        // Singletons
+        case EOO:
+        case jstNULL:
+        case MaxKey:
+        case MinKey:
+        case Undefined:
+            return false;
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+// Wrapper of the three helper functions above. Should be used on FLE type 6, 7, and 9, 14, and 15.
+inline bool isFLE2SupportedType(EncryptedBinDataType fleType, BSONType bsonType) {
+    switch (fleType) {
+        case EncryptedBinDataType::kFLE2UnindexedEncryptedValue:
+        case EncryptedBinDataType::kFLE2UnindexedEncryptedValueV2:
+            return isFLE2UnindexedSupportedType(bsonType);
+        case EncryptedBinDataType::kFLE2EqualityIndexedValue:
+        case EncryptedBinDataType::kFLE2EqualityIndexedValueV2:
+            return isFLE2EqualityIndexedSupportedType(bsonType);
+        case EncryptedBinDataType::kFLE2RangeIndexedValue:
+        case EncryptedBinDataType::kFLE2RangeIndexedValueV2:
+            return isFLE2RangeIndexedSupportedType(bsonType);
+        default:
+            MONGO_UNREACHABLE;
+    }
 }
 
 struct EncryptedFieldMatchResult {

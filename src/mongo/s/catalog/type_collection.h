@@ -30,6 +30,8 @@
 #pragma once
 
 #include "mongo/s/catalog/type_collection_gen.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/index_version.h"
 
 namespace mongo {
 
@@ -84,6 +86,8 @@ public:
     using CollectionTypeBase::kDefaultCollationFieldName;
     using CollectionTypeBase::kDefragmentationPhaseFieldName;
     using CollectionTypeBase::kDefragmentCollectionFieldName;
+    using CollectionTypeBase::kEnableAutoMergeFieldName;
+    using CollectionTypeBase::kIndexVersionFieldName;
     using CollectionTypeBase::kKeyPatternFieldName;
     using CollectionTypeBase::kMaxChunkSizeBytesFieldName;
     using CollectionTypeBase::kNoAutoSplitFieldName;
@@ -143,16 +147,13 @@ public:
     BSONObj getDefaultCollation() const {
         return CollectionTypeBase::getDefaultCollation().get_value_or(BSONObj());
     }
-    void setDefaultCollation(const BSONObj& defaultCollation);
 
     void setMaxChunkSizeBytes(int64_t value);
 
+    void setDefaultCollation(const BSONObj& defaultCollation);
+
     bool getDefragmentCollection() const {
         return CollectionTypeBase::getDefragmentCollection().get_value_or(false);
-    }
-
-    bool getAllowAutoSplit() const {
-        return !getNoAutoSplit().get_value_or(false);
     }
 
     bool getAllowBalance() const {
@@ -168,6 +169,20 @@ public:
             CollectionTypeBase::setAllowMigrations(boost::none);
         else
             CollectionTypeBase::setAllowMigrations(false);
+    }
+
+    boost::optional<CollectionIndexes> getIndexVersion() const {
+        return CollectionTypeBase::getIndexVersion()
+            ? CollectionIndexes(getUuid(), *CollectionTypeBase::getIndexVersion())
+            : boost::optional<CollectionIndexes>(boost::none);
+    }
+
+    void setIndexVersion(CollectionIndexes indexVersion) {
+        tassert(7000500,
+                str::stream() << "Cannot set collection indexes to " << indexVersion
+                              << " since collection uuid is " << getUuid(),
+                indexVersion.uuid() == getUuid());
+        CollectionTypeBase::setIndexVersion(indexVersion.indexVersion());
     }
 
     // TODO SERVER-61033: remove after permitMigrations have been merge with allowMigrations.

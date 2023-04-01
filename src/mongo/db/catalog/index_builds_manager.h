@@ -60,6 +60,8 @@ class IndexBuildsManager {
     IndexBuildsManager& operator=(const IndexBuildsManager&) = delete;
 
 public:
+    using RetrySkippedRecordMode = MultiIndexBlock::RetrySkippedRecordMode;
+
     /**
      * Indicates whether or not to ignore indexing constraints.
      */
@@ -73,6 +75,7 @@ public:
         IndexConstraints indexConstraints = IndexConstraints::kEnforce;
         IndexBuildProtocol protocol = IndexBuildProtocol::kSinglePhase;
         IndexBuildMethod method = IndexBuildMethod::kHybrid;
+        bool forRecovery = false;
     };
 
     IndexBuildsManager() = default;
@@ -91,9 +94,10 @@ public:
                            const boost::optional<ResumeIndexInfo>& resumeInfo = boost::none);
 
     /**
-     * Unregisters the builder associated with the given buildUUID from the _builders map.
+     * Unregisters the builder associated with the given buildUUID from the _builders map, causing
+     * the index build in-memory state to be destroyed.
      */
-    void unregisterIndexBuild(const UUID& buildUUID);
+    void tearDownAndUnregisterIndexBuild(const UUID& buildUUID);
 
     /**
      * Runs the scanning/insertion phase of the index build..
@@ -101,7 +105,7 @@ public:
     Status startBuildingIndex(OperationContext* opCtx,
                               const CollectionPtr& collection,
                               const UUID& buildUUID,
-                              boost::optional<RecordId> resumeAfterRecordId = boost::none);
+                              const boost::optional<RecordId>& resumeAfterRecordId = boost::none);
 
     Status resumeBuildingIndexFromBulkLoadPhase(OperationContext* opCtx,
                                                 const CollectionPtr& collection,
@@ -129,12 +133,14 @@ public:
                                  IndexBuildInterceptor::DrainYieldPolicy drainYieldPolicy);
 
     /**
-     * Retries the key generation and insertion of records that were skipped during the scanning
-     * phase due to error suppression.
+     * By default, retries the key generation and insertion of records that were skipped during the
+     * scanning phase due to error suppression.
      */
-    Status retrySkippedRecords(OperationContext* opCtx,
-                               const UUID& buildUUID,
-                               const CollectionPtr& collection);
+    Status retrySkippedRecords(
+        OperationContext* opCtx,
+        const UUID& buildUUID,
+        const CollectionPtr& collection,
+        RetrySkippedRecordMode mode = RetrySkippedRecordMode::kKeyGenerationAndInsertion);
 
     /**
      * Runs the index constraint violation checking phase of the index build..
@@ -185,6 +191,12 @@ public:
      * true for the kHybrid method.
      */
     bool isBackgroundBuilding(const UUID& buildUUID);
+
+    /**
+     * Provides passthrough access to MultiIndexBlock for index build info.
+     * Does nothing if build UUID does not refer to an active index build.
+     */
+    void appendBuildInfo(const UUID& buildUUID, BSONObjBuilder* builder) const;
 
     /**
      * Checks via invariant that the manager has no index builds presently.

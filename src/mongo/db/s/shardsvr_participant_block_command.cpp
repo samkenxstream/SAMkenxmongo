@@ -27,17 +27,22 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/cancelable_operation_context.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/s/participant_block_gen.h"
-#include "mongo/db/s/recoverable_critical_section_service.h"
+#include "mongo/db/s/sharding_recovery_service.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/s/chunk_manager_targeter.h"
+#include "mongo/s/grid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -47,8 +52,8 @@ public:
     using Request = ShardsvrParticipantBlock;
 
     std::string help() const override {
-        return "Internal command, which is exported by the shards. Do not call "
-               "directly. Blocks CRUD operations.";
+        return "Internal command, which is exported by the shards. Do not call directly. Blocks "
+               "CRUD operations.";
     }
 
     bool skipApiVersionCheck() const override {
@@ -60,6 +65,10 @@ public:
         return Command::AllowedOnSecondary::kNever;
     }
 
+    bool supportsRetryableWrite() const final {
+        return true;
+    }
+
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
@@ -69,16 +78,84 @@ public:
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
-            opCtx->setAlwaysInterruptAtStepDownOrUp();
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
-            auto service = RecoverableCriticalSectionService::get(opCtx);
-            const auto reason = BSON("command"
-                                     << "ShardSvrParticipantBlockCommand"
-                                     << "ns" << ns().toString());
-            service->acquireRecoverableCriticalSectionBlockWrites(
-                opCtx, ns(), reason, ShardingCatalogClient::kLocalWriteConcern);
-            service->promoteRecoverableCriticalSectionToBlockAlsoReads(
-                opCtx, ns(), reason, ShardingCatalogClient::kLocalWriteConcern);
+            auto handleRecoverableCriticalSection = [this](auto opCtx) {
+                const auto reason =
+                    request().getReason().get_value_or(BSON("command"
+                                                            << "ShardSvrParticipantBlockCommand"
+                                                            << "ns" << ns().toString()));
+                auto blockType = request().getBlockType().get_value_or(
+                    CriticalSectionBlockTypeEnum::kReadsAndWrites);
+
+                bool allowViews = request().getAllowViews();
+                auto service = ShardingRecoveryService::get(opCtx);
+                switch (blockType) {
+                    case CriticalSectionBlockTypeEnum::kUnblock:
+                        service->releaseRecoverableCriticalSection(
+                            opCtx,
+                            ns(),
+                            reason,
+                            ShardingCatalogClient::kLocalWriteConcern,
+                            /* throwIfReasonDiffers */ true,
+                            allowViews);
+                        break;
+                    case CriticalSectionBlockTypeEnum::kWrites:
+                        service->acquireRecoverableCriticalSectionBlockWrites(
+                            opCtx,
+                            ns(),
+                            reason,
+                            ShardingCatalogClient::kLocalWriteConcern,
+                            allowViews);
+                        break;
+                    default:
+                        service->acquireRecoverableCriticalSectionBlockWrites(
+                            opCtx,
+                            ns(),
+                            reason,
+                            ShardingCatalogClient::kLocalWriteConcern,
+                            allowViews);
+                        service->promoteRecoverableCriticalSectionToBlockAlsoReads(
+                            opCtx,
+                            ns(),
+                            reason,
+                            ShardingCatalogClient::kLocalWriteConcern,
+                            allowViews);
+                };
+            };
+
+            auto txnParticipant = TransactionParticipant::get(opCtx);
+            if (txnParticipant) {
+                auto newClient =
+                    getGlobalServiceContext()->makeClient("ShardSvrParticipantBlockCmdClient");
+                {
+                    stdx::lock_guard<Client> lk(*newClient);
+                    newClient->setSystemOperationKillableByStepdown(lk);
+                }
+                AlternativeClientRegion acr(newClient);
+                auto cancelableOperationContext = CancelableOperationContext(
+                    cc().makeOperationContext(),
+                    opCtx->getCancellationToken(),
+                    Grid::get(opCtx->getServiceContext())->getExecutorPool()->getFixedExecutor());
+
+                cancelableOperationContext->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+                handleRecoverableCriticalSection(cancelableOperationContext.get());
+            } else {
+                handleRecoverableCriticalSection(opCtx);
+            }
+
+            if (txnParticipant) {
+                // Since no write that generated a retryable write oplog entry with this sessionId
+                // and txnNumber happened, we need to make a dummy write so that the session gets
+                // durably persisted on the oplog. This must be the last operation done on this
+                // command.
+                DBDirectClient client(opCtx);
+                client.update(NamespaceString::kServerConfigurationNamespace,
+                              BSON("_id" << Request::kCommandName),
+                              BSON("$inc" << BSON("count" << 1)),
+                              true /* upsert */,
+                              false /* multi */);
+            }
         }
 
     private:

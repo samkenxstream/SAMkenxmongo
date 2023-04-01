@@ -3,11 +3,8 @@
  * is persisted over restarts.
  *
  * @tags: [
- *  # TODO(SERVER-61181): Fix validation errors under ephemeralForTest.
- *  incompatible_with_eft,
+ *  requires_fcv_60,
  *  requires_persistence,
- *  # Replication requires journaling support so this tag also implies exclusion from
- *  # --nojournal test configurations.
  *  requires_replication,
  * ]
  */

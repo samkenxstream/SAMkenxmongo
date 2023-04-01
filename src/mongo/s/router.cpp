@@ -27,13 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/s/router.h"
 
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace sharding {
@@ -60,7 +62,7 @@ void DBPrimaryRouter::appendCRUDUnshardedRoutingTokenToCommand(const ShardId& sh
         BSONObjBuilder dbvBuilder(builder->subobjStart(DatabaseVersion::kDatabaseVersionField));
         dbVersion.serialize(&dbvBuilder);
     }
-    ChunkVersion::UNSHARDED().serializeToBSON(ChunkVersion::kShardVersionField, builder);
+    ShardVersion::UNSHARDED().serialize(ShardVersion::kShardVersionField, builder);
 }
 
 CachedDatabaseInfo DBPrimaryRouter::_getRoutingInfo(OperationContext* opCtx) const {
@@ -101,22 +103,20 @@ CollectionRouter::CollectionRouter(ServiceContext* service, NamespaceString nss)
     : RouterBase(service), _nss(std::move(nss)) {}
 
 void CollectionRouter::appendCRUDRoutingTokenToCommand(const ShardId& shardId,
-                                                       const ChunkManager& cm,
+                                                       const CollectionRoutingInfo& cri,
                                                        BSONObjBuilder* builder) {
-    auto chunkVersion(cm.getVersion(shardId));
-
-    if (chunkVersion == ChunkVersion::UNSHARDED()) {
+    if (cri.cm.getVersion(shardId) == ChunkVersion::UNSHARDED()) {
         // Need to add the database version as well
-        const auto& dbVersion = cm.dbVersion();
+        const auto& dbVersion = cri.cm.dbVersion();
         if (!dbVersion.isFixed()) {
             BSONObjBuilder dbvBuilder(builder->subobjStart(DatabaseVersion::kDatabaseVersionField));
             dbVersion.serialize(&dbvBuilder);
         }
     }
-    chunkVersion.serializeToBSON(ChunkVersion::kShardVersionField, builder);
+    cri.getShardVersion(shardId).serialize(ShardVersion::kShardVersionField, builder);
 }
 
-ChunkManager CollectionRouter::_getRoutingInfo(OperationContext* opCtx) const {
+CollectionRoutingInfo CollectionRouter::_getRoutingInfo(OperationContext* opCtx) const {
     auto catalogCache = Grid::get(_service)->catalogCache();
     return uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, _nss));
 }

@@ -41,15 +41,15 @@
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/s/resharding/resharding_metrics_new.h"
+#include "mongo/db/s/resharding/resharding_oplog_applier_metrics.h"
 #include "mongo/s/chunk_manager.h"
+#include "mongo/s/sharding_index_catalog_cache.h"
 
 namespace mongo {
 class Collection;
 class CollectionPtr;
 class NamespaceString;
 class OperationContext;
-class ReshardingMetrics;
 
 /**
  * Applies an operation from an oplog entry using special rules that apply to resharding.
@@ -61,8 +61,7 @@ public:
                                     size_t myStashIdx,
                                     ShardId donorShardId,
                                     ChunkManager sourceChunkMgr,
-                                    ReshardingMetrics* metrics,
-                                    ReshardingMetricsNew* metricsNew);
+                                    ReshardingOplogApplierMetrics* applierMetrics);
 
     const NamespaceString& getOutputNss() const {
         return _outputNss;
@@ -72,7 +71,9 @@ public:
      * Wraps the op application in a writeConflictRetry loop and is responsible for creating and
      * committing the WUOW.
      */
-    Status applyOperation(OperationContext* opCtx, const repl::OplogEntry& op) const;
+    Status applyOperation(OperationContext* opCtx,
+                          const boost::optional<ShardingIndexesCatalogCache>& gii,
+                          const repl::OplogEntry& op) const;
 
 private:
     // Applies an insert operation
@@ -94,11 +95,11 @@ private:
                              Database* db,
                              const CollectionPtr& outputColl,
                              const CollectionPtr& stashColl,
+                             const boost::optional<ShardingIndexesCatalogCache>& gii,
                              const repl::OplogEntry& op) const;
 
     // Queries '_stashNss' using 'idQuery'.
     BSONObj _queryStashCollById(OperationContext* opCtx,
-                                Database* db,
                                 const CollectionPtr& coll,
                                 const BSONObj& idQuery) const;
 
@@ -121,8 +122,7 @@ private:
     // The chunk manager for the source namespace and original shard key.
     const ChunkManager _sourceChunkMgr;
 
-    ReshardingMetrics* _metrics;
-    ReshardingMetricsNew* _metricsNew;
+    ReshardingOplogApplierMetrics* _applierMetrics;
 };
 
 }  // namespace mongo

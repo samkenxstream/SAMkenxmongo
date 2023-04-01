@@ -70,6 +70,26 @@ class IDLSpec(object):
         self.feature_flags = []  # type: List[FeatureFlag]
 
 
+def parse_array_variant_types(name):
+    # type: (str) -> List[str]
+    """Parse a type name of the form 'array<variant<type1, type2, ...>>' and extract types."""
+    if not name.startswith("array<variant<") and not name.endswith(">>"):
+        return None
+
+    name = name[len("array<variant<"):]
+    name = name[:-2]
+
+    variant_types = []
+    for variant_type in name.split(','):
+        variant_type = variant_type.strip()
+        # Ban array<variant<..., array<...>, ...>> types.
+        if variant_type.startswith("array<") and variant_type.endswith(">"):
+            return None
+        variant_types.append(variant_type)
+
+    return variant_types
+
+
 def parse_array_type(name):
     # type: (str) -> str
     """Parse a type name of the form 'array<type>' and extract type."""
@@ -113,8 +133,8 @@ class SymbolTable(object):
         self.enums = []  # type: List[Enum]
         self.structs = []  # type: List[Struct]
         self.types = []  # type: List[Type]
-        self.generic_argument_lists = []  # type: List[GenericArgumentList]
-        self.generic_reply_field_lists = []  # type: List[GenericReplyFieldList]
+        self.generic_argument_lists = []  # type: List[Struct]
+        self.generic_reply_field_lists = []  # type: List[Struct]
 
     def _is_duplicate(self, ctxt, location, name, duplicate_class_name):
         # type: (errors.ParserContext, common.SourceLocation, str, str) -> bool
@@ -124,8 +144,6 @@ class SymbolTable(object):
                 "enum": self.enums,
                 "struct": self.structs,
                 "type": self.types,
-                "generic_argument_list": self.generic_argument_lists,
-                "generic_reply_field_list": self.generic_reply_field_lists,
         }):
             if item.name == name:
                 ctxt.add_duplicate_symbol_error(location, name, duplicate_class_name, entity_type)
@@ -163,17 +181,15 @@ class SymbolTable(object):
                 and not self._is_duplicate(ctxt, command, command.command_alias, "command")):
             self.commands.append(command)
 
-    def add_generic_argument_list(self, ctxt, field_list):
-        # type: (errors.ParserContext, GenericArgumentList) -> None
-        """Add an IDL generic argument list to the symbol table and check for duplicates."""
-        if not self._is_duplicate(ctxt, field_list, field_list.name, "generic_argument_list"):
-            self.generic_argument_lists.append(field_list)
+    def add_generic_argument_list(self, field_list):
+        # type: (Struct) -> None
+        """Add an IDL generic argument list to the symbol table."""
+        self.generic_argument_lists.append(field_list)
 
-    def add_generic_reply_field_list(self, ctxt, field_list):
-        # type: (errors.ParserContext, GenericReplyFieldList) -> None
-        """Add an IDL generic reply field list to the symbol table and check for duplicates."""
-        if not self._is_duplicate(ctxt, field_list, field_list.name, "generic_reply_field_list"):
-            self.generic_reply_field_lists.append(field_list)
+    def add_generic_reply_field_list(self, field_list):
+        # type: (Struct) -> None
+        """Add an IDL generic reply field list to the symbol table."""
+        self.generic_reply_field_lists.append(field_list)
 
     def add_imported_symbol_table(self, ctxt, imported_symbols):
         # type: (errors.ParserContext, SymbolTable) -> None
@@ -209,7 +225,7 @@ class SymbolTable(object):
         return None
 
     def get_generic_argument_list(self, name):
-        # type: (str) -> GenericArgumentList
+        # type: (str) -> Struct
         """Get a generic argument list from the SymbolTable based on the list name."""
         for gen_arg_list in self.generic_argument_lists:
             if gen_arg_list.name == name:
@@ -217,7 +233,7 @@ class SymbolTable(object):
         return None
 
     def get_generic_reply_field_list(self, name):
-        # type: (str) -> GenericReplyFieldList
+        # type: (str) -> Struct
         """Get a generic reply field list from the SymbolTable based on the list name."""
         for gen_reply_field_list in self.generic_reply_field_lists:
             if gen_reply_field_list.name == name:
@@ -234,7 +250,6 @@ class SymbolTable(object):
     def resolve_field_type(self, ctxt, location, field_name, field_type):
         # type: (errors.ParserContext, common.SourceLocation, str, FieldType) -> Optional[Union[Enum, Struct, Type]]
         """Find the type or struct a field refers to or log an error."""
-        # pylint: disable=too-many-return-statements,too-many-branches,too-many-locals
 
         if isinstance(field_type, FieldTypeVariant):
             variant = VariantType(field_type.file_name, field_type.line, field_type.column)
@@ -250,11 +265,16 @@ class SymbolTable(object):
                     return None
 
                 if isinstance(alternative_type, Struct):
-                    if variant.variant_struct_type:
-                        ctxt.add_variant_structs_error(location, field_name)
-                        continue
-
-                    variant.variant_struct_type = alternative_type
+                    if len(variant.variant_struct_types) > 0:
+                        # Check if we are adding a duplicate first field name since that would
+                        # cause parsing ambiguity.
+                        first_element = alternative_type.fields[0].name
+                        if first_element in [
+                                elem.fields[0].name for elem in variant.variant_struct_types
+                        ]:
+                            ctxt.add_variant_structs_error(location, field_name)
+                            continue
+                    variant.variant_struct_types.append(alternative_type)
                     bson_serialization_type = ["object"]
                 else:
                     variant.variant_types.append(alternative_type)
@@ -276,7 +296,8 @@ class SymbolTable(object):
             element_type = self.resolve_field_type(ctxt, location, field_name,
                                                    field_type.element_type)
             if not element_type:
-                ctxt.add_unknown_type_error(location, field_name, field_type.element_type.type_name)
+                ctxt.add_unknown_type_error(location, field_name,
+                                            field_type.element_type.debug_string())
                 return None
 
             if isinstance(element_type, Enum):
@@ -358,8 +379,6 @@ class Type(common.SourceLocation):
     populated.
     """
 
-    # pylint: disable=too-many-instance-attributes
-
     def __init__(self, file_name, line, column):
         # type: (str, int, int) -> None
         """Construct a Type."""
@@ -370,7 +389,9 @@ class Type(common.SourceLocation):
         self.serializer = None  # type: str
         self.deserializer = None  # type: str
         self.description = None  # type: str
+        self.deserialize_with_tenant = False  # type: bool
         self.default = None  # type: str
+        self.internal_only = False  # type: bool
 
         super(Type, self).__init__(file_name, line, column)
 
@@ -386,8 +407,11 @@ class ArrayType(Type):
         self.name = f'array<{element_type.name}>'
         self.element_type = element_type
         if isinstance(element_type, Type):
-            assert element_type.cpp_type
-            self.cpp_type = f'std::vector<{element_type.cpp_type}>'
+            if element_type.cpp_type:
+                self.cpp_type = f'std::vector<{element_type.cpp_type}>'
+            else:
+                assert isinstance(element_type, VariantType)
+                # cpp_type can't be set here for array of variants as element_type.cpp_type is not set yet.
 
 
 class VariantType(Type):
@@ -399,9 +423,7 @@ class VariantType(Type):
         super(VariantType, self).__init__(file_name, line, column)
         self.name = 'variant'
         self.variant_types = []  # type: List[Type]
-        # A variant can have at most one alternative type which is a struct. Otherwise, if we see
-        # a sub-object while parsing BSON, we don't know which struct to interpret it as.
-        self.variant_struct_type = None  # type: Struct
+        self.variant_struct_types = []  # type: List[Struct]
 
 
 class Validator(common.SourceLocation):
@@ -411,8 +433,6 @@ class Validator(common.SourceLocation):
     The validator must include at least one of the defined validation predicates.
     If more than one is included, they must ALL evaluate to true.
     """
-
-    # pylint: disable=too-many-instance-attributes
 
     def __init__(self, file_name, line, column):
         # type: (str, int, int) -> None
@@ -448,8 +468,6 @@ class Field(common.SourceLocation):
     populated.
     """
 
-    # pylint: disable=too-many-instance-attributes
-
     def __init__(self, file_name, line, column):
         # type: (str, int, int) -> None
         """Construct a Field."""
@@ -465,7 +483,10 @@ class Field(common.SourceLocation):
         self.validator = None  # type: Validator
         self.non_const_getter = False  # type: bool
         self.unstable = None  # type: Optional[bool]
+        self.stability = None  # type: Optional[str]
         self.always_serialize = False  # type: bool
+        self.forward_to_shards = None  # type: Optional[bool]
+        self.forward_from_shards = None  # type: Optional[bool]
 
         # Internal fields - not generated by parser
         self.serialize_op_msg_request_only = False  # type: bool
@@ -513,8 +534,6 @@ class Struct(common.SourceLocation):
     All fields are either required or have a non-None default.
     """
 
-    # pylint: disable=too-many-instance-attributes
-
     def __init__(self, file_name, line, column):
         # type: (str, int, int) -> None
         """Construct a Struct."""
@@ -530,6 +549,8 @@ class Struct(common.SourceLocation):
         self.allow_global_collection_name = False  # type: bool
         self.non_const_getter = False  # type: bool
         self.cpp_validator_func = None  # type: str
+        self.is_command_reply = False  # type: bool
+        self.is_generic_cmd_list = None  # type: Optional[str]
 
         # Command only property
         self.cpp_name = None  # type: str
@@ -631,8 +652,6 @@ class Command(Struct):
     Namespace is required.
     """
 
-    # pylint: disable=too-many-instance-attributes
-
     def __init__(self, file_name, line, column):
         # type: (str, int, int) -> None
         """Construct a Command."""
@@ -645,27 +664,6 @@ class Command(Struct):
         self.is_deprecated = False  # type: bool
         self.access_check = None  # type: AccessChecks
         super(Command, self).__init__(file_name, line, column)
-
-
-class FieldListBase(common.SourceLocation):
-    """IDL field list information."""
-
-    def __init__(self, file_name, line, column):
-        # type: (str, int, int) -> None
-        """Construct a FieldList."""
-        self.name = None  # type: str
-        self.cpp_name = None  # type: str
-        self.description = None  # type: str
-        self.fields = None  # type: List[FieldListEntry]
-        super(FieldListBase, self).__init__(file_name, line, column)
-
-
-class GenericArgumentList(FieldListBase):
-    """IDL generic argument list."""
-
-
-class GenericReplyFieldList(FieldListBase):
-    """IDL generic reply field list."""
 
 
 class FieldListEntry(common.SourceLocation):
@@ -742,6 +740,8 @@ class Condition(common.SourceLocation):
         self.expr = None  # type: str
         self.constexpr = None  # type: str
         self.preprocessor = None  # type: str
+        self.feature_flag = None  # type: str
+        self.min_fcv = None  # type: str
 
         super(Condition, self).__init__(file_name, line, column)
 
@@ -773,9 +773,9 @@ class FieldTypeArray(FieldType):
     """An array field's type, before it is resolved to a Type instance."""
 
     def __init__(self, element_type):
-        # type: (FieldTypeSingle) -> None
+        # type: (Union[FieldTypeSingle, FieldTypeVariant]) -> None
         """Construct a FieldTypeArray."""
-        self.element_type = element_type  # type: FieldTypeSingle
+        self.element_type = element_type  # type: Union[FieldTypeSingle, FieldTypeVariant]
 
         super(FieldTypeArray, self).__init__(element_type.file_name, element_type.line,
                                              element_type.column)
@@ -843,8 +843,6 @@ class ServerParameterClass(common.SourceLocation):
 class ServerParameter(common.SourceLocation):
     """IDL ServerParameter information."""
 
-    # pylint: disable=too-many-instance-attributes
-
     def __init__(self, file_name, line, column):
         # type: (str, int, int) -> None
         """Construct a ServerParameter."""
@@ -869,8 +867,6 @@ class ServerParameter(common.SourceLocation):
 
 class FeatureFlag(common.SourceLocation):
     """IDL FeatureFlag information."""
-
-    # pylint: disable=too-many-instance-attributes
 
     def __init__(self, file_name, line, column):
         # type: (str, int, int) -> None
@@ -913,8 +909,6 @@ class ConfigGlobal(common.SourceLocation):
 
 class ConfigOption(common.SourceLocation):
     """Runtime configuration setting definition."""
-
-    # pylint: disable=too-many-instance-attributes
 
     def __init__(self, file_name, line, column):
         # type: (str, int, int) -> None

@@ -62,9 +62,7 @@ class test_checkpoint_snapshot03(wttest.WiredTigerTestCase):
         session = self.session
         cursor = session.open_cursor(uri)
         for i in range(1, nrows + 1):
-            session.begin_transaction()
             cursor[ds.key(i)] = value
-            session.commit_transaction()
         cursor.close()
 
     def check(self, check_value, uri, nrows):

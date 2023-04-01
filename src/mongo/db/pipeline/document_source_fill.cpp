@@ -29,13 +29,16 @@
 
 #include "mongo/db/pipeline/document_source_fill.h"
 
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/pipeline/document_source_add_fields.h"
 #include "mongo/db/pipeline/document_source_set_window_fields.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
+#include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/visit_helper.h"
+#include "mongo/util/overloaded_visitor.h"
+#include <string>
 
 namespace mongo {
 
@@ -44,8 +47,8 @@ REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(fill,
                                        document_source_fill::createFromBson,
                                        AllowedWithApiStrict::kNeverInVersion1,
                                        AllowedWithClientType::kAny,
-                                       feature_flags::gFeatureFlagFill.getVersion(),
-                                       feature_flags::gFeatureFlagFill.isEnabledAndIgnoreFCV());
+                                       boost::none,
+                                       true);
 namespace document_source_fill {
 
 std::list<boost::intrusive_ptr<DocumentSource>> createFromBson(
@@ -56,7 +59,7 @@ std::list<boost::intrusive_ptr<DocumentSource>> createFromBson(
                           << typeName(elem.type()),
             elem.type() == BSONType::Object);
 
-    auto spec = FillSpec::parse(IDLParserErrorContext(kStageName), elem.embeddedObject());
+    auto spec = FillSpec::parse(IDLParserContext(kStageName), elem.embeddedObject());
     std::list<boost::intrusive_ptr<DocumentSource>> outputPipeline;
     BSONObjBuilder setWindowFieldsSpec;
 
@@ -78,7 +81,7 @@ std::list<boost::intrusive_ptr<DocumentSource>> createFromBson(
                 "Each fill output specification must be an object with exactly one field",
                 fieldSpec.type() == BSONType::Object);
         auto parsedSpec =
-            FillOutputSpec::parse(IDLParserErrorContext(kStageName), fieldSpec.embeddedObject());
+            FillOutputSpec::parse(IDLParserContext(kStageName), fieldSpec.embeddedObject());
         if (auto&& method = parsedSpec.getMethod()) {
             uassert(6050201,
                     "Each fill output specification must have exactly one of 'method' or 'value' "
@@ -113,15 +116,19 @@ std::list<boost::intrusive_ptr<DocumentSource>> createFromBson(
         uassert(6050204,
                 "Maximum one of 'partitionBy' and 'partitionByFields can be specified in '$fill'",
                 !spec.getPartitionByFields());
-        setWindowFieldsSpec.append("partitionBy", partitionByUnparsedExpr.value());
+        auto partitionByField = partitionByUnparsedExpr.value();
+        if (std::string* partitionByString = stdx::get_if<std::string>(&partitionByField)) {
+            setWindowFieldsSpec.append("partitionBy", *partitionByString);
+        } else
+            setWindowFieldsSpec.append("partitionBy", stdx::get<BSONObj>(partitionByField));
     }
 
     if (auto&& partitionByFields = spec.getPartitionByFields()) {
-        BSONObjBuilder partitionBySpec;
+        MutableDocument partitionBySpec;
         for (const auto& fieldName : partitionByFields.value()) {
-            partitionBySpec.append(fieldName, "$" + fieldName);
+            partitionBySpec.setNestedField(fieldName, Value("$" + fieldName));
         }
-        setWindowFieldsSpec.append("partitionBy", partitionBySpec.obj());
+        setWindowFieldsSpec.append("partitionBy", partitionBySpec.freeze().toBson());
     }
 
     std::list<boost::intrusive_ptr<DocumentSource>> finalSources;

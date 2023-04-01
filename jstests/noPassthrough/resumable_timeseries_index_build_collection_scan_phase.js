@@ -7,12 +7,12 @@
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   requires_replication,
- *   requires_wiredtiger,
  * ]
  */
 (function() {
 "use strict";
 
+load("jstests/core/timeseries/libs/timeseries.js");
 load("jstests/noPassthrough/libs/index_build.js");
 
 const rst = new ReplSetTest({nodes: 1});
@@ -28,6 +28,13 @@ const timeFieldName = "time";
 const metaFieldName = 'meta';
 assert.commandWorked(db.createCollection(
     coll.getName(), {timeseries: {timeField: timeFieldName, metaField: metaFieldName}}));
+
+if (TimeseriesTest.timeseriesScalabilityImprovementsEnabled(db)) {
+    // When enabled, the {meta: 1, time: 1} index gets built by default on the time-series
+    // bucket collection. This test assumes that all of the indexes in the collection are not
+    // finished to ensure they are resumed when the node is restarted. Drop this index.
+    assert.commandWorked(coll.dropIndex({[metaFieldName]: 1, [timeFieldName]: 1}));
+}
 
 // Use different metadata fields to guarantee creating three individual buckets in the buckets
 // collection.
@@ -47,7 +54,7 @@ ResumableIndexBuildTest.run(
     bucketColl.getName(),
     [[{"control.min.time": 1}, {"control.max.time": 1}]],
     [{name: "hangIndexBuildDuringCollectionScanPhaseAfterInsertion", logIdWithBuildUUID: 20386}],
-    /*iteration=*/0,
+    /*iteration=*/ 0,
     ["collection scan"],
     [{numScannedAfterResume: 2}]);
 

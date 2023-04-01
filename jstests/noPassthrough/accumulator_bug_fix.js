@@ -1,15 +1,12 @@
 /**
- * Tests whether $sum accumulator incorrect result bug is fixed on both engines under FCV 6.0.
+ * Tests whether $sum/$avg accumulator incorrect result bug is fixed on both engines.
  *
  * @tags: [
- *  requires_fcv_60,
  *  requires_sharding,
  * ]
  */
 (function() {
 'use strict';
-
-load('jstests/multiVersion/libs/multi_cluster.js');  // For upgradeCluster()
 
 (function testAccumulatorWhenSpillingOnClassicEngine() {
     const verifyAccumulatorSpillingResult = (testDesc, accSpec) => {
@@ -28,8 +25,8 @@ load('jstests/multiVersion/libs/multi_cluster.js');  // For upgradeCluster()
         }
 
         // Turns on the classical engine.
-        assert.commandWorked(
-            db.adminCommand({setParameter: 1, internalQueryForceClassicEngine: true}));
+        assert.commandWorked(db.adminCommand(
+            {setParameter: 1, internalQueryFrameworkControl: "forceClassicEngine"}));
 
         const pipeline = [{$group: {_id: "$k", o: accSpec}}, {$group: {_id: "$o"}}];
 
@@ -77,14 +74,14 @@ load('jstests/multiVersion/libs/multi_cluster.js');  // For upgradeCluster()
         };
 
         // Turns on the classical engine.
-        assert.commandWorked(
-            db.adminCommand({setParameter: 1, internalQueryForceClassicEngine: true}));
+        assert.commandWorked(db.adminCommand(
+            {setParameter: 1, internalQueryFrameworkControl: "forceClassicEngine"}));
         const classicRes = assert.commandWorked(db.runCommand(aggCmd)).cursor.firstBatch;
         assert.eq(classicRes, expectedRes, testDesc);
 
         // Turns off the classical engine.
         assert.commandWorked(
-            db.adminCommand({setParameter: 1, internalQueryForceClassicEngine: false}));
+            db.adminCommand({setParameter: 1, internalQueryFrameworkControl: "tryBonsai"}));
         const sbeRes = assert.commandWorked(db.runCommand(aggCmd)).cursor.firstBatch;
         assert.eq(sbeRes, expectedRes, testDesc);
     };
@@ -102,10 +99,9 @@ load('jstests/multiVersion/libs/multi_cluster.js');  // For upgradeCluster()
         verifyOverTheWireDataFormatOnBothEngines(
             "Partial sum of an int", pipelineWithSum, [{_id: null, o: expectedPartialSum}]);
         verifyOverTheWireDataFormatOnBothEngines(
-            "Partial avg of an int", pipelineWithAvg, [{
-                _id: null,
-                o: {subTotal: 1.0, count: NumberLong(1), subTotalError: 0.0, ps: expectedPartialSum}
-            }]);
+            "Partial avg of an int",
+            pipelineWithAvg,
+            [{_id: null, o: {count: NumberLong(1), ps: expectedPartialSum}}]);
 
         assert.commandWorked(coll.insert({n: NumberLong(1)}));
         expectedPartialSum = [
@@ -117,10 +113,9 @@ load('jstests/multiVersion/libs/multi_cluster.js');  // For upgradeCluster()
                                                  pipelineWithSum,
                                                  [{_id: null, o: expectedPartialSum}]);
         verifyOverTheWireDataFormatOnBothEngines(
-            "Partial avg of an int and a long", pipelineWithAvg, [{
-                _id: null,
-                o: {subTotal: 2.0, count: NumberLong(2), subTotalError: 0.0, ps: expectedPartialSum}
-            }]);
+            "Partial avg of an int and a long",
+            pipelineWithAvg,
+            [{_id: null, o: {count: NumberLong(2), ps: expectedPartialSum}}]);
 
         assert.commandWorked(coll.insert({n: NumberLong("9223372036854775807")}));
         expectedPartialSum = [
@@ -132,15 +127,9 @@ load('jstests/multiVersion/libs/multi_cluster.js');  // For upgradeCluster()
                                                  pipelineWithSum,
                                                  [{_id: null, o: expectedPartialSum}]);
         verifyOverTheWireDataFormatOnBothEngines(
-            "Partial avg of an int/a long/the long max", pipelineWithAvg, [{
-                _id: null,
-                o: {
-                    subTotal: 9223372036854775808.0,
-                    count: NumberLong(3),
-                    subTotalError: 1.0,
-                    ps: expectedPartialSum
-                }
-            }]);
+            "Partial avg of an int/a long/the long max",
+            pipelineWithAvg,
+            [{_id: null, o: {count: NumberLong(3), ps: expectedPartialSum}}]);
 
         // A double can always expresses 15 digits precisely. So, 1.0 + 0.00000000000001 is
         // precisely expressed by the 'addend' element.
@@ -157,15 +146,7 @@ load('jstests/multiVersion/libs/multi_cluster.js');  // For upgradeCluster()
         verifyOverTheWireDataFormatOnBothEngines(
             "Partial avg of mixed data leading to a number that a double can't express",
             pipelineWithAvg,
-            [{
-                _id: null,
-                o: {
-                    subTotal: 9223372036854775808.0,
-                    count: NumberLong(4),
-                    subTotalError: 1.00000000000001,
-                    ps: expectedPartialSum
-                }
-            }]);
+            [{_id: null, o: {count: NumberLong(4), ps: expectedPartialSum}}]);
 
         assert.commandWorked(coll.insert({n: NumberDecimal("1.0")}));
         expectedPartialSum = [
@@ -178,14 +159,9 @@ load('jstests/multiVersion/libs/multi_cluster.js');  // For upgradeCluster()
                                                  pipelineWithSum,
                                                  [{_id: null, o: expectedPartialSum}]);
         verifyOverTheWireDataFormatOnBothEngines(
-            "Partial avg of mixed data which has a decimal", pipelineWithAvg, [{
-                _id: null,
-                o: {
-                    subTotal: NumberDecimal("9223372036854775810.000000000000010"),
-                    count: NumberLong(5),
-                    ps: expectedPartialSum
-                }
-            }]);
+            "Partial avg of mixed data which has a decimal",
+            pipelineWithAvg,
+            [{_id: null, o: {count: NumberLong(5), ps: expectedPartialSum}}]);
 
         assert(coll.drop());
 
@@ -198,15 +174,9 @@ load('jstests/multiVersion/libs/multi_cluster.js');  // For upgradeCluster()
         verifyOverTheWireDataFormatOnBothEngines(
             "Partial sum of two double max", pipelineWithSum, [{_id: null, o: expectedPartialSum}]);
         verifyOverTheWireDataFormatOnBothEngines(
-            "Partial avg of two double max", pipelineWithAvg, [{
-                _id: null,
-                o: {
-                    subTotal: Infinity,
-                    count: NumberLong(2),
-                    subTotalError: NaN,
-                    ps: expectedPartialSum
-                }
-            }]);
+            "Partial avg of two double max",
+            pipelineWithAvg,
+            [{_id: null, o: {count: NumberLong(2), ps: expectedPartialSum}}]);
 
         assert(coll.drop());
 
@@ -221,10 +191,9 @@ load('jstests/multiVersion/libs/multi_cluster.js');  // For upgradeCluster()
                                                  pipelineWithSum,
                                                  [{_id: null, o: expectedPartialSum}]);
         verifyOverTheWireDataFormatOnBothEngines(
-            "Partial avg of a decimal and a double", pipelineWithAvg, [{
-                _id: null,
-                o: {subTotal: NumberDecimal("2.0"), count: NumberLong(2), ps: expectedPartialSum}
-            }]);
+            "Partial avg of a decimal and a double",
+            pipelineWithAvg,
+            [{_id: null, o: {count: NumberLong(2), ps: expectedPartialSum}}]);
     }());
 
     MongoRunner.stopMongod(conn);
@@ -242,10 +211,10 @@ load('jstests/multiVersion/libs/multi_cluster.js');  // For upgradeCluster()
 
     let verifyShardedAccumulatorResultsOnBothEngine = (testDesc, coll, pipeline, expectedRes) => {
         // Turns to the classic engine at the shards.
-        assert.commandWorked(
-            dbAtShard0.adminCommand({setParameter: 1, internalQueryForceClassicEngine: true}));
-        assert.commandWorked(
-            dbAtShard1.adminCommand({setParameter: 1, internalQueryForceClassicEngine: true}));
+        assert.commandWorked(dbAtShard0.adminCommand(
+            {setParameter: 1, internalQueryFrameworkControl: "forceClassicEngine"}));
+        assert.commandWorked(dbAtShard1.adminCommand(
+            {setParameter: 1, internalQueryFrameworkControl: "forceClassicEngine"}));
 
         // Verifies that the classic engine's results are same as the expected results.
         const classicRes = coll.aggregate(pipeline).toArray();
@@ -253,9 +222,9 @@ load('jstests/multiVersion/libs/multi_cluster.js');  // For upgradeCluster()
 
         // Turns to the SBE engine at the shards.
         assert.commandWorked(
-            dbAtShard0.adminCommand({setParameter: 1, internalQueryForceClassicEngine: false}));
+            dbAtShard0.adminCommand({setParameter: 1, internalQueryFrameworkControl: "tryBonsai"}));
         assert.commandWorked(
-            dbAtShard1.adminCommand({setParameter: 1, internalQueryForceClassicEngine: false}));
+            dbAtShard1.adminCommand({setParameter: 1, internalQueryFrameworkControl: "tryBonsai"}));
 
         // Verifies that the SBE engine's results are same as the expected results.
         const sbeRes = coll.aggregate(pipeline).toArray();
@@ -614,153 +583,5 @@ load('jstests/multiVersion/libs/multi_cluster.js');  // For upgradeCluster()
     });
 
     st.stop();
-}());
-
-// TODO SERVER-64227 Remove this test case since this test case is unnecessary after we branch
-// for 6.1.
-(function testUpgradeFromLastContinuousToLatest() {
-    ["last-lts", "last-continuous"].forEach(version => {
-        const st = new ShardingTest({
-            shards: 2,
-            rs: {nodes: 2, binVersion: version},
-            other: {mongosOptions: {binVersion: version}}
-        });
-
-        let db = st.getDB(jsTestName());
-        let dbAtShard0 = st.shard0.getDB(jsTestName());
-        let dbAtShard1 = st.shard1.getDB(jsTestName());
-
-        // Makes sure that the test db is sharded.
-        assert.commandWorked(st.s0.adminCommand({enableSharding: db.getName()}));
-
-        let verifyShardedAccumulatorResultsOnBothEngine = (coll, pipeline, verifyThis) => {
-            // In the last-lts, we don't have the 'internalQueryForceClassicEngine' query knob.
-            if (version == "last-continuous") {
-                // Turns to the classic engine at the shards.
-                assert.commandWorked(dbAtShard0.adminCommand(
-                    {setParameter: 1, internalQueryForceClassicEngine: true}));
-                assert.commandWorked(dbAtShard1.adminCommand(
-                    {setParameter: 1, internalQueryForceClassicEngine: true}));
-            }
-
-            // Verifies that the classic engine's results are same as the expected results.
-            const classicRes = coll.aggregate(pipeline).toArray();
-            verifyThis(classicRes);
-
-            // In the last-lts, we have neither the 'internalQueryForceClassicEngine' query knob
-            // nor the SBE $group pushdown feature.
-            if (version == "last-continuous") {
-                // Turns to the SBE engine at the shards.
-                assert.commandWorked(dbAtShard0.adminCommand(
-                    {setParameter: 1, internalQueryForceClassicEngine: false}));
-                assert.commandWorked(dbAtShard1.adminCommand(
-                    {setParameter: 1, internalQueryForceClassicEngine: false}));
-
-                // Verifies that the SBE engine's results are same as the expected results.
-                const sbeRes = coll.aggregate(pipeline).toArray();
-                verifyThis(sbeRes);
-            }
-        };
-
-        let shardCollectionByHashing = coll => {
-            coll.drop();
-
-            // Makes sure that the collection is sharded.
-            assert.commandWorked(
-                st.s0.adminCommand({shardCollection: coll.getFullName(), key: {_id: "hashed"}}));
-
-            return coll;
-        };
-
-        let hashShardedColl = shardCollectionByHashing(db.partial_sum);
-        let unshardedColl = db.partial_sum2;
-
-        for (let i = 0; i < 10; ++i) {
-            const docs = [
-                {k: i, n: 1e+34},
-                {k: i, n: NumberDecimal("0.1")},
-                {k: i, n: NumberDecimal("0.01")},
-                {k: i, n: -1e+34}
-            ];
-            assert.commandWorked(hashShardedColl.insert(docs));
-            assert.commandWorked(unshardedColl.insert(docs));
-        }
-
-        const pipelineWithSum = [{$group: {_id: "$k", s: {$sum: "$n"}}}, {$group: {_id: "$s"}}];
-        const pipelineWithAvg = [{$group: {_id: "$k", s: {$avg: "$n"}}}, {$group: {_id: "$s"}}];
-
-        // The results on an unsharded collection is the expected results.
-        let expectedRes = unshardedColl.aggregate(pipelineWithSum).toArray();
-        verifyShardedAccumulatorResultsOnBothEngine(
-            hashShardedColl,
-            pipelineWithSum,
-            (actualRes) => assert.neq(
-                actualRes,
-                expectedRes,
-                `Sharded sum for mixed data by which only decimal sum survive on ${version}`));
-
-        expectedRes = unshardedColl.aggregate(pipelineWithAvg).toArray();
-        verifyShardedAccumulatorResultsOnBothEngine(
-            hashShardedColl,
-            pipelineWithAvg,
-            (actualRes) => assert.neq(
-                actualRes,
-                expectedRes,
-                `Sharded avg for mixed data by which only decimal sum survive on ${version}`));
-
-        // Upgrade the cluster to the latest.
-        st.upgradeCluster("latest", {
-            upgradeShards: true,
-            upgradeConfigs: true,
-            upgradeMongos: true,
-            waitUntilStable: true
-        });
-
-        db = st.getDB(jsTestName());
-        if (version == "last-continuous") {
-            checkFCV(st.rs0.getPrimary().getDB("admin"), lastContinuousFCV);
-        } else {
-            checkFCV(st.rs0.getPrimary().getDB("admin"), lastLTSFCV);
-        }
-        dbAtShard0 = st.shard0.getDB(jsTestName());
-        dbAtShard1 = st.shard1.getDB(jsTestName());
-
-        hashShardedColl = db.partial_sum;
-        unshardedColl = db.partial_sum2;
-
-        // $sum fix is FCV-gated. So, it's not applied after binary upgrade.
-        expectedRes = unshardedColl.aggregate(pipelineWithSum).toArray();
-        verifyShardedAccumulatorResultsOnBothEngine(
-            hashShardedColl,
-            pipelineWithSum,
-            (actualRes) => assert.neq(
-                actualRes,
-                expectedRes,
-                "Sharded sum for mixed data by which only decimal sum survive on latest after binary upgrade"));
-
-        // On the other hand, $avg fix is not FCV-gated. So, it's applied after binary upgrade.
-        expectedRes = unshardedColl.aggregate(pipelineWithAvg).toArray();
-        verifyShardedAccumulatorResultsOnBothEngine(
-            hashShardedColl,
-            pipelineWithAvg,
-            (actualRes) => assert.eq(
-                actualRes,
-                expectedRes,
-                "Sharded avg for mixed data by which only decimal sum survive on latest after binary upgrade"));
-
-        assert.commandWorked(st.s.adminCommand({setFeatureCompatibilityVersion: latestFCV}));
-
-        // The FCV is upgraded to the 'latestFCV' and $sum fix must be applied now.
-        expectedRes = unshardedColl.aggregate(pipelineWithSum).toArray();
-        verifyShardedAccumulatorResultsOnBothEngine(
-            hashShardedColl,
-            pipelineWithSum,
-            (actualRes) => assert.eq(
-                actualRes,
-                expectedRes,
-                "Sharded sum for mixed data by which only decimal sum survive on latest after FCV upgrade"));
-
-        st.stop();
-    });
 }());
 }());

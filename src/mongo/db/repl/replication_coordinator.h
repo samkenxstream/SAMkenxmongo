@@ -40,6 +40,7 @@
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/split_horizon.h"
+#include "mongo/db/repl/split_prepare_session_manager.h"
 #include "mongo/db/repl/sync_source_selector.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/executor/task_executor.h"
@@ -380,6 +381,11 @@ public:
      * necessarily commit in sequential order. It is also used when we finish oplog batch
      * application on secondaries, to avoid any potential race conditions around setting the
      * applied optime from more than one thread.
+     *
+     * Since the last applied op time and wall time might not be visible (i.e. there may be
+     * "oplog holes" from oplog entries with earlier timestamps which commit after this one)
+     * this method does not notify oplog waiters.  Callers which know the new lastApplied is at
+     * a no-holes point should call signalOplogWaiters after calling this method.
      */
     virtual void setMyLastAppliedOpTimeAndWallTimeForward(
         const OpTimeAndWallTime& opTimeAndWallTime) = 0;
@@ -563,8 +569,11 @@ public:
      *
      * When a node steps down during catchup mode, the states remain the same (producer: Running,
      * applier: Running).
+     *
+     * DrainingForShardSplit follows the same state diagram as Draining, it only exists to hint the
+     * signalDrainModeComplete method that it should not follow the primary step-up logic.
      */
-    enum class ApplierState { Running, Draining, Stopped };
+    enum class ApplierState { Running, Draining, DrainingForShardSplit, Stopped };
 
     /**
      * In normal cases: Running -> Draining -> Stopped -> Running.
@@ -754,6 +763,13 @@ public:
     virtual bool getMaintenanceMode() = 0;
 
     /**
+     * Returns true if serverless mode is enabled and the replicaSetId differs from the current
+     * replicaSetId. It signals the sync source should be dropped and the new batch of oplogs should
+     * be discarded.
+     */
+    virtual bool shouldDropSyncSourceAfterShardSplit(OID replicaSetId) const = 0;
+
+    /**
      * Handles an incoming replSetSyncFrom command. Adds BSON to 'result'
      * returns Status::OK if the sync target could be set and an ErrorCode indicating why it
      * couldn't otherwise.
@@ -816,10 +832,12 @@ public:
 
     /**
      * Waits until the following two conditions are satisfied:
-     *  (1) The current config has propagated to a majority of nodes.
+     *  (1) The current config with config term 'term' has propagated to a majority of nodes.
      *  (2) Any operations committed in the previous config are committed in the current config.
      */
-    virtual Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment) = 0;
+    virtual Status awaitConfigCommitment(OperationContext* opCtx,
+                                         bool waitForOplogCommitment,
+                                         long long term) = 0;
 
     /*
      * Handles an incoming replSetInitiate command. If "configObj" is empty, generates a default
@@ -1018,7 +1036,6 @@ public:
      */
     static bool isOplogDisabledForNS(const NamespaceString& nss);
 
-
     /**
      * Returns the stable timestamp that the storage engine recovered to on startup. If the
      * recovery point was not stable, returns "none".
@@ -1123,9 +1140,9 @@ public:
     using OnRemoteCmdCompleteFn = std::function<void(executor::TaskExecutor::CallbackHandle)>;
     /**
      * Runs the given command 'cmdObj' on primary and waits till the response for that command is
-     * received. If the node is primary, then the command will be executed using DBDirectClient to
-     * avoid tcp network calls. Otherwise, the node will execute the remote command using the repl
-     * task executor (AsyncDBClient).
+     * received. The node will execute the remote command using the repl task executor
+     * (AsyncDBClient), even if it is primary itself.
+     *
      * - 'OnRemoteCmdScheduled' will be called once the remote command is scheduled.
      * - 'OnRemoteCmdComplete' will be called once the response for the remote command is received.
      */
@@ -1146,6 +1163,40 @@ public:
      * This function will assert if the shard can't talk to config server.
      */
     virtual void recordIfCWWCIsSetOnConfigServerOnStartup(OperationContext* opCtx) = 0;
+
+    /**
+     * Interface used to synchronize changes to custom write concern tags in the config and
+     * custom default write concern settings.
+     *
+     * Use [reserve|release]DefaultWriteConcernChanges when making changes to the current
+     * default read/write concern.
+     * Use [reserve|release]ConfigWriteConcernTagChanges when executing a reconfig that
+     * could potentially change read/write concern tags.
+     */
+    class WriteConcernTagChanges {
+    public:
+        WriteConcernTagChanges() = default;
+        virtual ~WriteConcernTagChanges() = default;
+        virtual bool reserveDefaultWriteConcernChange() = 0;
+        virtual void releaseDefaultWriteConcernChange() = 0;
+
+        virtual bool reserveConfigWriteConcernTagChange() = 0;
+        virtual void releaseConfigWriteConcernTagChange() = 0;
+    };
+
+    virtual WriteConcernTagChanges* getWriteConcernTagChanges() = 0;
+
+    /**
+     * Returns a SplitPrepareSessionManager that manages the sessions for split
+     * prepared transactions.
+     */
+    virtual SplitPrepareSessionManager* getSplitPrepareSessionManager() = 0;
+
+    /**
+     * Returns true if we are running retryable write or retryable internal multi-document
+     * transaction.
+     */
+    virtual bool isRetryableWrite(OperationContext* opCtx) const = 0;
 
 protected:
     ReplicationCoordinator();

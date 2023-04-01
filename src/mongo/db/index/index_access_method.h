@@ -51,6 +51,7 @@ class MatchExpression;
 struct UpdateTicket;
 struct InsertDeleteOptions;
 class SortedDataIndexAccessMethod;
+struct CollectionOptions;
 
 /**
  * An IndexAccessMethod is the interface through which all the mutation, lookup, and
@@ -67,11 +68,24 @@ class IndexAccessMethod {
     IndexAccessMethod& operator=(const IndexAccessMethod&) = delete;
 
 public:
+    using ShouldRelaxConstraintsFn =
+        std::function<bool(OperationContext* opCtx, const CollectionPtr& collection)>;
+    using OnSuppressedErrorFn = std::function<void(OperationContext* opCtx,
+                                                   const IndexCatalogEntry* entry,
+                                                   Status status,
+                                                   const BSONObj& obj,
+                                                   const boost::optional<RecordId>& loc)>;
     using KeyHandlerFn = std::function<Status(const KeyString::Value&)>;
     using RecordIdHandlerFn = std::function<Status(const RecordId&)>;
 
     IndexAccessMethod() = default;
     virtual ~IndexAccessMethod() = default;
+
+    static std::unique_ptr<IndexAccessMethod> make(OperationContext* opCtx,
+                                                   const NamespaceString& nss,
+                                                   const CollectionOptions& collectionOptions,
+                                                   IndexCatalogEntry* entry,
+                                                   StringData ident);
 
     /**
      * Equivalent to (but shorter and faster than): dynamic_cast<SortedDataIndexAccessMethod*>(this)
@@ -128,12 +142,16 @@ public:
     virtual Status initializeAsEmpty(OperationContext* opCtx) = 0;
 
     /**
-     * Walk the entire index, checking the internal structure for consistency.
-     * Set numKeys to the number of keys in the index.
+     * Validates the index. If 'full' is false, only performs checks which do not traverse the
+     * index. If 'full' is true, additionally traverses the index and validates its internal
+     * structure.
      */
-    virtual void validate(OperationContext* opCtx,
-                          int64_t* numKeys,
-                          IndexValidateResults* fullResults) const = 0;
+    virtual IndexValidateResults validate(OperationContext* opCtx, bool full) const = 0;
+
+    /**
+     * Returns the number of keys in the index, traversing the index to do so.
+     */
+    virtual int64_t numKeys(OperationContext* opCtx) const = 0;
 
     /**
      * Add custom statistics about this index to BSON object builder, for display.
@@ -163,7 +181,23 @@ public:
      */
     virtual Status compact(OperationContext* opCtx) = 0;
 
-    virtual Ident* getIdentPtr() const = 0;
+    /**
+     * Fetches the Ident for this index.
+     */
+    virtual std::shared_ptr<Ident> getSharedIdent() const = 0;
+
+    /**
+     * Sets the Ident for this index.
+     */
+    virtual void setIdent(std::shared_ptr<Ident> newIdent) = 0;
+
+    virtual Status applyIndexBuildSideWrite(OperationContext* opCtx,
+                                            const CollectionPtr& coll,
+                                            const BSONObj& operation,
+                                            const InsertDeleteOptions& options,
+                                            KeyHandlerFn&& onDuplicateKey,
+                                            int64_t* keysInserted,
+                                            int64_t* keysDeleted) = 0;
 
     //
     // Bulk operations support
@@ -175,23 +209,14 @@ public:
 
         /**
          * Insert into the BulkBuilder as-if inserting into an IndexAccessMethod.
-         *
-         * 'saveCursorBeforeWrite' and 'restoreCursorAfterWrite' will be used to save and restore
-         * the cursor around any constraint violation side table write that may occur, in case a WCE
-         * occurs internally that would otherwise unposition the cursor.
-         *
-         * Note: we pass the cursor down into this insert function so we can limit cursor
-         * save/restore to around constraints violation side table writes only. Otherwise, we would
-         * have to save/restore around each insert() call just in case there is a side table write.
          */
         virtual Status insert(OperationContext* opCtx,
                               const CollectionPtr& collection,
-                              SharedBufferFragmentBuilder& pooledBuilder,
                               const BSONObj& obj,
                               const RecordId& loc,
                               const InsertDeleteOptions& options,
-                              const std::function<void()>& saveCursorBeforeWrite,
-                              const std::function<void()>& restoreCursorAfterWrite) = 0;
+                              const OnSuppressedErrorFn& onSuppressedError = nullptr,
+                              const ShouldRelaxConstraintsFn& shouldRelaxConstraints = nullptr) = 0;
 
         /**
          * Call this when you are ready to finish your bulk work.
@@ -219,6 +244,20 @@ public:
          * Persists on disk the keys that have been inserted using this BulkBuilder.
          */
         virtual IndexStateInfo persistDataForShutdown() = 0;
+
+    protected:
+        static void countNewBuildInStats();
+        static void countResumedBuildInStats();
+        static SorterFileStats* bulkBuilderFileStats();
+        static SorterTracker* bulkBuilderTracker();
+
+        /**
+         * Abandon the current snapshot and release then reacquire locks. Tests that target the
+         * behavior of bulk index builds that yield can use failpoints to stall this yield.
+         */
+        static void yield(OperationContext* opCtx,
+                          const Yieldable* yieldable,
+                          const NamespaceString& ns);
     };
 
     /**
@@ -238,23 +277,6 @@ public:
         size_t maxMemoryUsageBytes,
         const boost::optional<IndexStateInfo>& stateInfo,
         StringData dbName) = 0;
-};
-
-/**
- * Factory class that constructs an IndexAccessMethod depending on the type of index.
- */
-class IndexAccessMethodFactory {
-public:
-    IndexAccessMethodFactory() = default;
-    virtual ~IndexAccessMethodFactory() = default;
-
-    static IndexAccessMethodFactory* get(ServiceContext* service);
-    static IndexAccessMethodFactory* get(OperationContext* opCtx);
-    static void set(ServiceContext* service,
-                    std::unique_ptr<IndexAccessMethodFactory> collectionFactory);
-
-    virtual std::unique_ptr<IndexAccessMethod> make(
-        IndexCatalogEntry* entry, std::unique_ptr<SortedDataInterface> sortedDataInterface) = 0;
 };
 
 /**
@@ -285,15 +307,8 @@ struct UpdateTicket {
  * Flags we can set for inserts and deletes (and updates, which are kind of both).
  */
 struct InsertDeleteOptions {
-    // If there's an error, log() it.
-    bool logIfError = false;
-
     // Are duplicate keys allowed in the index?
     bool dupsAllowed = false;
-
-    // Only an index builder is allowed to insert into the index while it is building, so only the
-    // index builder should set this to 'true'.
-    bool fromIndexBuilder = false;
 
     /**
      * Specifies whether getKeys should relax the index constraints or not, in order of most
@@ -302,6 +317,8 @@ struct InsertDeleteOptions {
     enum class ConstraintEnforcementMode {
         // Relax all constraints.
         kRelaxConstraints,
+        // Relax constraints only if shouldRelaxConstraintsFn callback returns true.
+        kRelaxConstraintsCallback,
         // Relax all constraints on documents that don't apply to a partial index.
         kRelaxConstraintsUnfiltered,
         // Enforce all constraints.
@@ -366,11 +383,11 @@ public:
      * keys are not associated with the document itself, but instead represent multi-key path
      * information that must be stored in a reserved keyspace within the index.
      *
-     * If any key generation errors are encountered and suppressed due to the provided GetKeysMode,
-     * 'onSuppressedErrorFn' is called.
+     * If any key generation errors which should be suppressed due to the provided GetKeysMode are
+     * encountered, 'onSuppressedErrorFn' is called if provided. The 'onSuppressedErrorFn'
+     * return value indicates whether the error should finally suppressed. If not provided, it is as
+     * if it returned true, and all suppressible errors are suppressed.
      */
-    using OnSuppressedErrorFn =
-        std::function<void(Status status, const BSONObj& obj, boost::optional<RecordId> loc)>;
     void getKeys(OperationContext* opCtx,
                  const CollectionPtr& collection,
                  SharedBufferFragmentBuilder& pooledBufferBuilder,
@@ -380,8 +397,9 @@ public:
                  KeyStringSet* keys,
                  KeyStringSet* multikeyMetadataKeys,
                  MultikeyPaths* multikeyPaths,
-                 boost::optional<RecordId> id,
-                 OnSuppressedErrorFn&& onSuppressedError = nullptr) const;
+                 const boost::optional<RecordId>& id,
+                 const OnSuppressedErrorFn& onSuppressedError = nullptr,
+                 const ShouldRelaxConstraintsFn& shouldRelaxConstraints = nullptr) const;
 
     /**
      * Inserts the specified keys into the index. Does not attempt to determine whether the
@@ -389,26 +407,30 @@ public:
      * parameter, if non-nullptr, will be reset to the number of keys inserted by this function
      * call, or to zero in the case of either a non-OK return Status or an empty 'keys' argument.
      */
-    Status insertKeys(OperationContext* opCtx,
-                      const CollectionPtr& coll,
-                      const KeyStringSet& keys,
-                      const InsertDeleteOptions& options,
-                      KeyHandlerFn&& onDuplicateKey,
-                      int64_t* numInserted);
+    Status insertKeys(
+        OperationContext* opCtx,
+        const CollectionPtr& coll,
+        const KeyStringSet& keys,
+        const InsertDeleteOptions& options,
+        KeyHandlerFn&& onDuplicateKey,
+        int64_t* numInserted,
+        IncludeDuplicateRecordId includeDuplicateRecordId = IncludeDuplicateRecordId::kOff);
 
     /**
      * Inserts the specified keys into the index. and determines whether these keys should cause the
      * index to become multikey. If so, this method also handles the task of marking the index as
      * multikey in the catalog, and sets the path-level multikey information if applicable.
      */
-    Status insertKeysAndUpdateMultikeyPaths(OperationContext* opCtx,
-                                            const CollectionPtr& coll,
-                                            const KeyStringSet& keys,
-                                            const KeyStringSet& multikeyMetadataKeys,
-                                            const MultikeyPaths& multikeyPaths,
-                                            const InsertDeleteOptions& options,
-                                            KeyHandlerFn&& onDuplicateKey,
-                                            int64_t* numInserted);
+    Status insertKeysAndUpdateMultikeyPaths(
+        OperationContext* opCtx,
+        const CollectionPtr& coll,
+        const KeyStringSet& keys,
+        const KeyStringSet& multikeyMetadataKeys,
+        const MultikeyPaths& multikeyPaths,
+        const InsertDeleteOptions& options,
+        KeyHandlerFn&& onDuplicateKey,
+        int64_t* numInserted,
+        IncludeDuplicateRecordId includeDuplicateRecordId = IncludeDuplicateRecordId::kOff);
 
     /**
      * Analogous to insertKeys above, but remove the keys instead of inserting them.
@@ -516,9 +538,9 @@ public:
 
     Status initializeAsEmpty(OperationContext* opCtx) final;
 
-    void validate(OperationContext* opCtx,
-                  int64_t* numKeys,
-                  IndexValidateResults* fullResults) const final;
+    IndexValidateResults validate(OperationContext* opCtx, bool full) const final;
+
+    int64_t numKeys(OperationContext* opCtx) const final;
 
     bool appendCustomStats(OperationContext* opCtx,
                            BSONObjBuilder* result,
@@ -530,7 +552,17 @@ public:
 
     Status compact(OperationContext* opCtx) final;
 
-    Ident* getIdentPtr() const final;
+    std::shared_ptr<Ident> getSharedIdent() const final;
+
+    void setIdent(std::shared_ptr<Ident> newIdent) final;
+
+    Status applyIndexBuildSideWrite(OperationContext* opCtx,
+                                    const CollectionPtr& coll,
+                                    const BSONObj& operation,
+                                    const InsertDeleteOptions& options,
+                                    KeyHandlerFn&& onDuplicateKey,
+                                    int64_t* keysInserted,
+                                    int64_t* keysDeleted) final;
 
     std::unique_ptr<BulkBuilder> initiateBulk(size_t maxMemoryUsageBytes,
                                               const boost::optional<IndexStateInfo>& stateInfo,
@@ -567,7 +599,7 @@ protected:
                            KeyStringSet* keys,
                            KeyStringSet* multikeyMetadataKeys,
                            MultikeyPaths* multikeyPaths,
-                           boost::optional<RecordId> id) const = 0;
+                           const boost::optional<RecordId>& id) const = 0;
 
     const IndexCatalogEntry* const _indexCatalogEntry;  // owned by IndexCatalog
     const IndexDescriptor* const _descriptor;

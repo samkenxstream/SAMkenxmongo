@@ -39,7 +39,9 @@ namespace mongo {
 class LockStatsTest : public ServiceContextTest {};
 
 TEST_F(LockStatsTest, NoWait) {
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("LockStats.NoWait"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "LockStats.NoWait"));
 
     resetGlobalLockStats();
 
@@ -58,7 +60,9 @@ TEST_F(LockStatsTest, NoWait) {
 }
 
 TEST_F(LockStatsTest, Wait) {
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("LockStats.Wait"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "LockStats.Wait"));
 
     resetGlobalLockStats();
 
@@ -92,7 +96,9 @@ TEST_F(LockStatsTest, Wait) {
 }
 
 TEST_F(LockStatsTest, Reporting) {
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("LockStats.Reporting"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "LockStats.Reporting"));
 
     resetGlobalLockStats();
 
@@ -110,7 +116,9 @@ TEST_F(LockStatsTest, Reporting) {
 }
 
 TEST_F(LockStatsTest, Subtraction) {
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("LockStats.Subtraction"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "LockStats.Subtraction"));
 
     resetGlobalLockStats();
 
@@ -165,7 +173,7 @@ void assertGlobalAcquisitionStats(OperationContext* opCtx, ResourceId rid) {
     reportGlobalLockingStats(&stats);
     ASSERT_EQUALS(0, stats.get(rid, LockMode::MODE_IX).numAcquisitions);
 
-    LockerImpl locker;
+    LockerImpl locker(opCtx->getServiceContext());
     if (rid == resourceIdGlobal) {
         locker.lockGlobal(opCtx, LockMode::MODE_IX);
     } else {
@@ -205,8 +213,8 @@ TEST_F(LockStatsTest, ServerStatus) {
     ASSERT_EQUALS(0, builder.done().nFields());
 
     // Take the global, PBWM and RSTL locks in MODE_IX to create acquisition stats for them.
-    LockerImpl locker;
     auto opCtx = makeOperationContext();
+    LockerImpl locker(opCtx->getServiceContext());
     locker.lockGlobal(opCtx.get(), LockMode::MODE_IX);
     locker.lock(resourceIdParallelBatchWriterMode, LockMode::MODE_IX);
     locker.lock(resourceIdReplicationStateTransitionLock, LockMode::MODE_IX);

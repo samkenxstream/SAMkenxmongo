@@ -66,7 +66,7 @@ public:
 
     DocumentSource::GetModPathsReturn getModifiedPaths() const final;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final;
 
@@ -77,6 +77,8 @@ public:
     const char* getSourceName() const {
         return DocumentSourceReshardingIterateTransaction::kStageName.rawData();
     }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
 protected:
     DocumentSource::GetNextResult doGetNext() override;

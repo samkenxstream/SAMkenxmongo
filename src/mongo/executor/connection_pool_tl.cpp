@@ -27,29 +27,68 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/executor/connection_pool_tl.h"
 
+#include "mongo/base/error_codes.h"
 #include "mongo/client/authenticate.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/executor/network_interface_tl_gen.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_severity_suppressor.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/net/hostandport.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kASIO
+
 
 namespace mongo {
 namespace executor {
 namespace connection_pool_tl {
 namespace {
 const auto kMaxTimerDuration = Milliseconds::max();
-
 struct TimeoutHandler {
     AtomicWord<bool> done;
     Promise<void> promise;
 
     explicit TimeoutHandler(Promise<void> p) : promise(std::move(p)) {}
 };
+
+auto makeSeveritySuppressor() {
+    return std::make_unique<logv2::KeyedSeveritySuppressor<HostAndPort>>(
+        Seconds{1}, logv2::LogSeverity::Log(), logv2::LogSeverity::Debug(2));
+}
+
+bool connHealthMetricsEnabled() {
+    return gFeatureFlagConnHealthMetrics.isEnabledAndIgnoreFCV();
+}
+
+bool connHealthMetricsLoggingEnabled() {
+    return gEnableDetailedConnectionHealthMetricLogLines;
+}
+
+void logSlowConnection(const HostAndPort& peer, const ConnectionMetrics& connMetrics) {
+    static auto& severitySuppressor = *makeSeveritySuppressor().release();
+    LOGV2_DEBUG(6496400,
+                severitySuppressor(peer).toInt(),
+                "Slow connection establishment",
+                "hostAndPort"_attr = peer,
+                "dnsResolutionTime"_attr = connMetrics.dnsResolution(),
+                "tcpConnectionTime"_attr = connMetrics.tcpConnection(),
+                "tlsHandshakeTime"_attr = connMetrics.tlsHandshake(),
+                "authTime"_attr = connMetrics.auth(),
+                "hookTime"_attr = connMetrics.connectionHook(),
+                "totalTime"_attr = connMetrics.total());
+}
+
+CounterMetric totalConnectionEstablishmentTime(
+    "network.totalEgressConnectionEstablishmentTimeMillis", connHealthMetricsEnabled);
 
 }  // namespace
 
@@ -296,6 +335,11 @@ private:
 void TLConnection::setup(Milliseconds timeout, SetupCallback cb, std::string instanceName) {
     auto anchor = shared_from_this();
 
+    // Create a shared_ptr to _connMetrics that shares the ownership information with the
+    // anchor. We want to keep this TLConnection instance alive as long as the shared_ptr
+    // to _connMetrics is in use.
+    std::shared_ptr<ConnectionMetrics> connMetricsAnchor{anchor, &_connMetrics};
+
     auto pf = makePromiseFuture<void>();
     auto handler = std::make_shared<TimeoutHandler>(std::move(pf.promise));
     std::move(pf.future).thenRunOn(_reactor).getAsync(
@@ -328,11 +372,21 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb, std::string ins
     // For transient connections, only use X.509 auth.
     auto isMasterHook = std::make_shared<TLConnectionSetupHook>(_onConnectHook, x509AuthOnly);
 
-    AsyncDBClient::connect(
-        _peer, _sslMode, _serviceContext, _reactor, timeout, _transientSSLContext)
+    AsyncDBClient::connect(_peer,
+                           _sslMode,
+                           _serviceContext,
+                           _reactor,
+                           timeout,
+                           connMetricsAnchor,
+                           _transientSSLContext)
         .thenRunOn(_reactor)
         .onError([](StatusWith<AsyncDBClient::Handle> swc) -> StatusWith<AsyncDBClient::Handle> {
-            return Status(ErrorCodes::HostUnreachable, swc.getStatus().reason());
+            if (const Status& status = swc.getStatus();
+                status.code() == ErrorCodes::ConnectionError) {
+                return status;
+            } else {
+                return Status(ErrorCodes::HostUnreachable, status.reason());
+            }
         })
         .then([this, isMasterHook, instanceName = std::move(instanceName)](
                   AsyncDBClient::Handle client) {
@@ -360,6 +414,7 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb, std::string ins
             return _client->authenticateInternal(std::move(mechanism), authParametersProvider);
         })
         .then([this] {
+            _connMetrics.onAuthFinished();
             if (!_onConnectHook) {
                 return Future<void>::makeReady();
             }
@@ -369,7 +424,9 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb, std::string ins
             }
             return _client->runCommandRequest(*connectHookRequest)
                 .then([this](RemoteCommandResponse response) {
-                    return _onConnectHook->handleReply(_peer, std::move(response));
+                    auto status = _onConnectHook->handleReply(_peer, std::move(response));
+                    _connMetrics.onConnectionHookFinished();
+                    return status;
                 });
         })
         .getAsync([this, handler, anchor](Status status) {
@@ -380,8 +437,20 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb, std::string ins
             cancelTimeout();
 
             if (status.isOK()) {
+                if (connHealthMetricsEnabled()) {
+                    totalConnectionEstablishmentTime.increment(_connMetrics.total().count());
+                    if (connHealthMetricsLoggingEnabled() &&
+                        _connMetrics.total() >=
+                            Milliseconds(gSlowConnectionThresholdMillis.load())) {
+                        logSlowConnection(_peer, _connMetrics);
+                    }
+                }
                 handler->promise.emplaceValue();
             } else {
+                if (ErrorCodes::isNetworkTimeoutError(status) && connHealthMetricsEnabled() &&
+                    connHealthMetricsLoggingEnabled()) {
+                    logSlowConnection(_peer, _connMetrics);
+                }
                 LOGV2_DEBUG(22584,
                             2,
                             "Failed to connect to {hostAndPort} - {error}",
@@ -443,6 +512,15 @@ Date_t TLConnection::now() {
 void TLConnection::cancelAsync() {
     if (_client)
         _client->cancel();
+}
+
+void TLConnection::startConnAcquiredTimer() {
+    _connMetrics.startConnAcquiredTimer();
+}
+
+std::shared_ptr<Timer> TLConnection::getConnAcquiredTimer() {
+    auto anchor = shared_from_this();
+    return std::shared_ptr<Timer>{anchor, _connMetrics.getConnAcquiredTimer()};
 }
 
 auto TLTypeFactory::reactor() {

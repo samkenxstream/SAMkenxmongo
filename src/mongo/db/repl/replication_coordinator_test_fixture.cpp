@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -57,6 +56,9 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/fail_point.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
+
 namespace mongo {
 namespace repl {
 
@@ -81,7 +83,7 @@ BSONObj ReplCoordTest::addProtocolVersion(const BSONObj& configDoc, int protocol
     return builder.obj();
 }
 
-ReplCoordTest::ReplCoordTest() {
+ReplCoordTest::ReplCoordTest(Options options) : ServiceContextMongoDTest(std::move(options)) {
     _settings.setReplSetString("mySet/node1:12345,node2:54321");
 }
 
@@ -124,7 +126,9 @@ void ReplCoordTest::init() {
     _storageInterface->insertDocumentFn = [this](OperationContext* opCtx,
                                                  const NamespaceStringOrUUID& nsOrUUID,
                                                  const TimestampedBSONObj& doc,
-                                                 long long term) { return Status::OK(); };
+                                                 long long term) {
+        return Status::OK();
+    };
 
     _storageInterface->createCollFn = [this](OperationContext* opCtx,
                                              const NamespaceString& nss,
@@ -154,7 +158,9 @@ void ReplCoordTest::init() {
     auto externalState = std::make_unique<ReplicationCoordinatorExternalStateMock>();
     _externalState = externalState.get();
     executor::ThreadPoolMock::Options tpOptions;
-    tpOptions.onCreateThread = []() { Client::initThread("replexec"); };
+    tpOptions.onCreateThread = []() {
+        Client::initThread("replexec");
+    };
     auto pool = std::make_unique<executor::ThreadPoolMock>(_net, seed, tpOptions);
     auto replExec =
         std::make_unique<executor::ThreadPoolTaskExecutor>(std::move(pool), std::move(net));
@@ -167,8 +173,6 @@ void ReplCoordTest::init() {
                                                          replicationProcess,
                                                          _storageInterface,
                                                          seed);
-    service->setFastClockSource(std::make_unique<ClockSourceMock>());
-    service->setPreciseClockSource(std::make_unique<ClockSourceMock>());
 }
 
 void ReplCoordTest::init(const ReplSettings& settings) {
@@ -192,6 +196,8 @@ void ReplCoordTest::start() {
     // Skip recovering user writes critical sections for the same reason as the above.
     FailPointEnableBlock skipRecoverUserWriteCriticalSections(
         "skipRecoverUserWriteCriticalSections");
+    // Skip recovering of serverless mutual exclusion locks for the same reason as the above.
+    FailPointEnableBlock skipRecoverServerlessOperationLock("skipRecoverServerlessOperationLock");
     invariant(!_callShutdown);
     // if we haven't initialized yet, do that first.
     if (!_repl) {
@@ -337,7 +343,8 @@ void ReplCoordTest::simulateSuccessfulDryRun(
 }
 
 void ReplCoordTest::simulateSuccessfulDryRun() {
-    auto onDryRunRequest = [](const RemoteCommandRequest& request) {};
+    auto onDryRunRequest = [](const RemoteCommandRequest& request) {
+    };
     simulateSuccessfulDryRun(onDryRunRequest);
 }
 
@@ -433,9 +440,10 @@ void ReplCoordTest::simulateSuccessfulV1ElectionAt(Date_t electionTime) {
 }
 
 void ReplCoordTest::signalDrainComplete(OperationContext* opCtx) noexcept {
-    // Writes that occur in code paths that call signalDrainComplete are expected to be excluded
-    // from Flow Control.
-    opCtx->setShouldParticipateInFlowControl(false);
+    // Writes that occur in code paths that call signalDrainComplete are expected to have Immediate
+    // priority.
+    ScopedAdmissionPriorityForLock priority(opCtx->lockState(),
+                                            AdmissionContext::Priority::kImmediate);
     getExternalState()->setFirstOpTimeOfMyTerm(OpTime(Timestamp(1, 1), getReplCoord()->getTerm()));
     getReplCoord()->signalDrainComplete(opCtx, getReplCoord()->getTerm());
 }

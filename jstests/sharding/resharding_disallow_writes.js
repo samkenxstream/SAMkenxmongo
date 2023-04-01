@@ -2,6 +2,7 @@
  * Tests that writes are disallowed while in kCommitted.
  *
  * @tags: [
+ *   multiversion_incompatible,
  * ]
  */
 (function() {
@@ -28,6 +29,8 @@ const sourceCollection = reshardingTest.createShardedCollection({
 });
 
 assert.commandWorked(sourceCollection.insert({_id: 0, oldKey: -20, newKey: 20, yak: 50}));
+assert.commandWorked(sourceCollection.createIndexes(
+    [{indexToDropDuringResharding: 1}, {indexToDropAfterResharding: 1}]));
 
 const recipientShardNames = reshardingTest.recipientShardNames;
 reshardingTest.withReshardingInBackground(
@@ -71,17 +74,16 @@ reshardingTest.withReshardingInBackground(
             assert(ErrorCodes.isExceededTimeLimitError(res.code));
 
             jsTestLog("Attempting collMod");
-
-            assert.commandFailedWithCode(
-                // The collMod is serialized with the resharding command, so we explicitly add an
-                // timeout to the command so that it doesn't get blocked and timeout the test.
-                sourceCollection.runCommand({collMod: sourceCollection.getName(), maxTimeMS: 5000}),
-                [ErrorCodes.ReshardCollectionInProgress, ErrorCodes.MaxTimeMSExpired]);
+            // The collMod is serialized with the resharding command, so we explicitly add an
+            // timeout to the command so that it doesn't get blocked and timeout the test.
+            res =
+                sourceCollection.runCommand({collMod: sourceCollection.getName(), maxTimeMS: 5000});
+            assert(ErrorCodes.isExceededTimeLimitError(res.code));
 
             jsTestLog("Attempting drop index");
-            assert.commandFailedWithCode(
-                sourceCollection.runCommand({dropIndexes: collName, index: {oldKey: 1}}),
-                ErrorCodes.ReshardCollectionInProgress);
+            res = sourceCollection.runCommand(
+                {dropIndexes: collName, index: {indexToDropDuringResharding: 1}, maxTimeMS: 5000});
+            assert(ErrorCodes.isExceededTimeLimitError(res.code));
 
             jsTestLog("Completed operations");
         },
@@ -107,7 +109,8 @@ assert.commandWorked(sourceCollection.runCommand(
 
 assert.commandWorked(sourceCollection.runCommand({collMod: sourceCollection.getName()}));
 
-assert.commandWorked(sourceCollection.runCommand({dropIndexes: collName, index: {oldKey: 1}}));
+assert.commandWorked(
+    sourceCollection.runCommand({dropIndexes: collName, index: {indexToDropAfterResharding: 1}}));
 
 assert.commandWorked(sourceCollection.runCommand({drop: collName}));
 

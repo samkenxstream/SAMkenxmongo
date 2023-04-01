@@ -51,7 +51,7 @@ namespace mongo {
  * @throws AssertionException if parsing fails.  The message included with
  * this assertion includes the character offset where parsing failed.
  */
-BSONObj fromjson(const std::string& str);
+BSONObj fromjson(StringData str);
 
 /** @param len will be size of JSON object in text chars. */
 BSONObj fromjson(const char* str, int* len = nullptr);
@@ -317,6 +317,12 @@ private:
      *     ObjectId( <24 character hex std::string> )
      */
     Status objectId(StringData fieldName, BSONObjBuilder&);
+
+    /*
+     * UUID :
+     *     UUID( <36 character [<hex>, '-'] std::string> )
+     */
+    Status uuid(StringData fieldName, BSONObjBuilder& builder);
 
     /*
      * NUMBERLONG :

@@ -33,7 +33,6 @@
 #include <vector>
 
 #include "mongo/client/connection_string.h"
-#include "mongo/client/query.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/find_command_gen.h"
 #include "mongo/rpc/unique_message.h"
@@ -45,7 +44,7 @@ namespace projection_executor {
 class ProjectionExecutor;
 }  // namespace projection_executor
 
-const std::string IdentityNS("local.me");
+const NamespaceString IdentityNS = NamespaceString::createNamespaceString_forTest("local.me");
 const BSONField<std::string> HostField("host");
 
 /**
@@ -137,18 +136,18 @@ public:
     /**
      * Inserts a single document to this server.
      *
-     * @param ns the namespace to insert the document to.
+     * @param nss the namespace to insert the document to.
      * @param obj the document to insert.
      */
-    void insert(const std::string& ns, BSONObj obj);
+    void insert(const NamespaceString& nss, BSONObj obj);
 
     /**
      * Removes documents from this server.
      *
-     * @param ns the namespace to remove documents from.
+     * @param nss the namespace to remove documents from.
      * @param filter ignored.
      */
-    void remove(const std::string& ns, const BSONObj& filter);
+    void remove(const NamespaceString& nss, const BSONObj& filter);
 
     /**
      * Assign a UUID to a collection
@@ -167,20 +166,6 @@ public:
      * Finds documents from this mock server according to 'findRequest'.
      */
     mongo::BSONArray find(InstanceID id, const FindCommandRequest& findRequest);
-
-    /**
-     * Legacy query API: New callers should use 'find()' rather than this method.
-     */
-    mongo::BSONArray query(InstanceID id,
-                           const NamespaceStringOrUUID& nsOrUuid,
-                           const BSONObj& filter,
-                           const Query& querySettings,
-                           int limit = 0,
-                           int nToSkip = 0,
-                           const mongo::BSONObj* fieldsToReturn = nullptr,
-                           int queryOptions = 0,
-                           int batchSize = 0,
-                           boost::optional<BSONObj> readConcernObj = boost::none);
 
     //
     // Getters

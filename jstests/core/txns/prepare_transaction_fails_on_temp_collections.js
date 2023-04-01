@@ -4,11 +4,15 @@
  * Transactions should not operate on temporary collections because they are for internal use only
  * and are deleted on both repl stepup and server startup.
  *
+ * The test runs commands that are not allowed with security token: applyOps, prepareTransaction.
  * @tags: [
+ *   not_allowed_with_security_token,
  *   uses_transactions,
  *   uses_prepare_transaction,
  *   # applyOps is not supported on mongos
  *   assumes_against_mongod_not_mongos,
+ *   # Tenant migrations don't support applyOps.
+ *   tenant_migration_incompatible,
  * ]
  */
 

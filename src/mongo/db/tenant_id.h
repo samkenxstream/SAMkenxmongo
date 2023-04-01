@@ -46,21 +46,24 @@ namespace mongo {
  */
 class TenantId {
 public:
-    /**
-     * kSystemTenantId must be unique across all possible tenant IDs.
-     * Since the first four bytes of an OID are a unix epoch timestamp,
-     * we can simply select a value prior to the inception of MongoDB,
-     * and be guaranteed to never have a collision with a value
-     * produced by OID::gen().
-     */
-    static const TenantId kSystemTenantId;
+    static const boost::optional<TenantId>& systemTenantId() {
+        static StaticImmortal<boost::optional<TenantId>> systemTenantId{};
+        return *systemTenantId;
+    }
 
-    explicit TenantId(const OID& oid) : _oid(oid), _idStr(oid.toString()) {}
+    /**
+     * Parse a tenantId from a StringData. This method asserts if the tenantId is empty or not in an
+     * OID format.
+     * Returns a TenantId object from the parsed string.
+     */
+    static TenantId parseFromString(StringData tenantId);
+
+    explicit TenantId(const OID& oid) : _oid(oid) {}
 
     TenantId() = delete;
 
-    const std::string& toString() const {
-        return _idStr;
+    std::string toString() const {
+        return _oid.toString();
     }
 
     /**
@@ -89,7 +92,7 @@ public:
      */
     template <typename H>
     friend H AbslHashValue(H h, const TenantId& tenantId) {
-        return H::combine(std::move(h), tenantId.hash());
+        return H::combine(std::move(h), tenantId._oid);
     }
 
     /**
@@ -105,7 +108,6 @@ public:
 
 private:
     OID _oid;
-    std::string _idStr;
 };
 
 inline bool operator==(const TenantId& lhs, const TenantId& rhs) {

@@ -31,7 +31,7 @@ global:
   cpp_includes: "mongo/db/commands/profile_common.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 types:
   ObjectOrUnset:
@@ -47,7 +47,7 @@ commands:
     description: "Parser for the 'profile' command."
     command_name: "profile"
     cpp_name: ProfileCmdRequest
-    strict: false
+    strict: true
     namespace: type
     api_version: ""
     type: safeInt64
@@ -66,3 +66,16 @@ commands:
                       an alternative to slowms and sampleRate. The special value 'unset' removes
                       the filter."
         optional: true
+
+  setProfilingFilterGlobally:
+    description: "Parser for the 'setProfilingFilterGlobally' command."
+    command_name: "setProfilingFilterGlobally"
+    cpp_name: SetProfilingFilterGloballyCmdRequest
+    strict: true
+    namespace: ignored
+    api_version: ""
+    fields:
+      filter:
+        type: ObjectOrUnset
+        description: "A query predicate that determines which ops are logged/profiled on a global
+                      level. The special value 'unset' removes the filter."

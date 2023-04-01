@@ -36,7 +36,7 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/update/document_diff_serialization.h"
 #include "mongo/stdx/variant.h"
-#include "mongo/util/visit_helper.h"
+#include "mongo/util/overloaded_visitor.h"
 
 namespace mongo {
 namespace write_ops {
@@ -89,29 +89,39 @@ public:
     struct DiffOptions {
         bool mustCheckExistenceForInsertOperations = true;
     };
-    struct ClassicTag {};
+
+    /**
+     * Tags used to disambiguate between the constructors for different update types.
+     */
+    struct ModifierUpdateTag {};
+    struct ReplacementTag {};
+    struct DeltaTag {};
 
     // Given the 'o' field of an update oplog entry, will return an UpdateModification that can be
     // applied. The `options` parameter will be applied only in the case a Delta update is parsed.
     static UpdateModification parseFromOplogEntry(const BSONObj& oField,
                                                   const DiffOptions& options);
     static UpdateModification parseFromClassicUpdate(const BSONObj& modifiers) {
-        return UpdateModification(modifiers, ClassicTag{});
+        return UpdateModification(modifiers);
     }
     static UpdateModification parseFromV2Delta(const doc_diff::Diff& diff,
                                                DiffOptions const& options) {
-        return UpdateModification(diff, options);
+        return UpdateModification(diff, DeltaTag{}, options);
     }
 
     UpdateModification() = default;
     UpdateModification(BSONElement update);
     UpdateModification(std::vector<BSONObj> pipeline);
-    UpdateModification(doc_diff::Diff, DiffOptions);
+    UpdateModification(doc_diff::Diff, DeltaTag, DiffOptions);
     // Creates an transform-style update. The transform function MUST preserve the _id element.
     UpdateModification(TransformFunc transform);
-    // This constructor exists only to provide a fast-path for constructing classic-style updates.
-    UpdateModification(const BSONObj& update, ClassicTag, bool isReplacement);
-    UpdateModification(const BSONObj& update, ClassicTag);
+    // These constructors exists only to provide a fast-path.
+    UpdateModification(const BSONObj& update, ModifierUpdateTag);
+    UpdateModification(const BSONObj& update, ReplacementTag);
+    // If we don't know whether the update is a replacement or a modifier style update, for example
+    // while we are parsing a user request, we infer this by checking whether the first element is a
+    // $-field to distinguish modifier style updates.
+    UpdateModification(const BSONObj& update);
 
     /**
      * These methods support IDL parsing of the "u" field from the update command and OP_UPDATE.
@@ -164,22 +174,23 @@ public:
     std::string toString() const {
         StringBuilder sb;
 
-        stdx::visit(
-            visit_helper::Overloaded{
-                [&sb](const ReplacementUpdate& replacement) {
-                    sb << "{type: Replacement, update: " << replacement.bson << "}";
-                },
-                [&sb](const ModifierUpdate& modifier) {
-                    sb << "{type: Modifier, update: " << modifier.bson << "}";
-                },
-                [&sb](const PipelineUpdate& pipeline) {
-                    sb << "{type: Pipeline, update: " << Value(pipeline).toString() << "}";
-                },
-                [&sb](const DeltaUpdate& delta) {
-                    sb << "{type: Delta, update: " << delta.diff << "}";
-                },
-                [&sb](const TransformUpdate& transform) { sb << "{type: Transform}"; }},
-            _update);
+        stdx::visit(OverloadedVisitor{
+                        [&sb](const ReplacementUpdate& replacement) {
+                            sb << "{type: Replacement, update: " << replacement.bson << "}";
+                        },
+                        [&sb](const ModifierUpdate& modifier) {
+                            sb << "{type: Modifier, update: " << modifier.bson << "}";
+                        },
+                        [&sb](const PipelineUpdate& pipeline) {
+                            sb << "{type: Pipeline, update: " << Value(pipeline).toString() << "}";
+                        },
+                        [&sb](const DeltaUpdate& delta) {
+                            sb << "{type: Delta, update: " << delta.diff << "}";
+                        },
+                        [&sb](const TransformUpdate& transform) {
+                            sb << "{type: Transform}";
+                        }},
+                    _update);
 
         return sb.str();
     }
@@ -205,13 +216,13 @@ private:
 };
 
 /**
- * Class to abstract the vagaries of how write errors are reported in write commands, which is not
- * consistent between the different errors. Specifically, errors such as StaleShardVersion report
- * their extraInfo in a field called errInfo, which is not consistent with how Status(es) are
- * serialised and parsed.
+ * This class is IDL-looking and it abstracts the vagaries of how write errors are reported in write
+ * commands, which is not consistent across different errors.
  *
- * TODO (SERVER-63327): The purpose of this class is to unify that reporting in subsequent versions
- * after which it can become a proper IDL type.
+ * Specifically, certain errors (such as DuplicateKey, StaleConfig) store the error information
+ * inline with the write error object's BSON, whereas others place it under an errInfo field. This
+ * model doesn't fit with IDL, which does not have support for placing fields at the same level as
+ * the owning object.
  */
 class WriteError {
 public:

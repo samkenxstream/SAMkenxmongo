@@ -37,7 +37,7 @@
 namespace mongo {
 namespace {
 
-const NamespaceString kNss{"test.foo"};
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test.foo");
 
 struct TestTask {
     std::string key;
@@ -52,7 +52,7 @@ struct TestTask {
           min(bson.getField("min").Int()),
           max(bson.getField("max").Int()) {}
 
-    static TestTask parse(IDLParserErrorContext, BSONObj bson) {
+    static TestTask parse(IDLParserContext, BSONObj bson) {
         return TestTask{bson};
     }
 
@@ -74,7 +74,7 @@ class PersistentTaskStoreTest : public CatalogTestFixture {
         CatalogTestFixture::setUp();
         auto opCtx = operationContext();
 
-        AutoGetDb autoDb(opCtx, kNss.db(), MODE_IX);
+        AutoGetDb autoDb(opCtx, kNss.dbName(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, kNss, MODE_IX);
     }
 };

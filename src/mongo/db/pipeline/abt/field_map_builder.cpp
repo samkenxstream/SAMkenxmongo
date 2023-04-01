@@ -28,13 +28,15 @@
  */
 
 #include "mongo/db/pipeline/abt/field_map_builder.h"
+#include "mongo/db/query/optimizer/utils/path_utils.h"
+
 
 namespace mongo::optimizer {
 
 void FieldMapBuilder::integrateFieldPath(
     const FieldPath& fieldPath, const std::function<void(const bool, FieldMapEntry&)>& fn) {
     std::string path = kRootElement;
-    auto it = _fieldMap.emplace(path, kRootElement);
+    auto it = _fieldMap.emplace(path, FieldNameType{kRootElement});
     const size_t fieldPathLength = fieldPath.getPathLength();
 
     for (size_t i = 0; i < fieldPathLength; i++) {
@@ -42,7 +44,7 @@ void FieldMapBuilder::integrateFieldPath(
         path += '.' + fieldName;
 
         it.first->second._childPaths.insert(path);
-        it = _fieldMap.emplace(path, fieldName);
+        it = _fieldMap.emplace(path, FieldNameType{fieldName});
         fn(i == fieldPathLength - 1, it.first->second);
     }
 }
@@ -56,23 +58,23 @@ boost::optional<ABT> FieldMapBuilder::generateABT() const {
 }
 
 ABT FieldMapBuilder::generateABTForField(const FieldMapEntry& entry) const {
-    const bool isRootEntry = entry._fieldName == kRootElement;
+    const bool isRootEntry = entry._fieldName.value() == kRootElement;
 
     bool hasLeadingObj = false;
     bool hasTrailingDefault = false;
-    std::set<std::string> keepSet;
-    std::set<std::string> dropSet;
-    std::map<std::string, std::string> varMap;
+    FieldNameOrderedSet keepSet;
+    FieldNameOrderedSet dropSet;
+    std::map<FieldNameType, ProjectionName> varMap;
 
     for (const std::string& childField : entry._childPaths) {
         const FieldMapEntry& childEntry = _fieldMap.at(childField);
-        const std::string& childFieldName = childEntry._fieldName;
+        const FieldNameType childFieldName = childEntry._fieldName;
 
         if (childEntry._hasKeep) {
-            keepSet.insert(childFieldName);
+            keepSet.insert(FieldNameType{childFieldName});
         }
         if (childEntry._hasDrop) {
-            dropSet.insert(childFieldName);
+            dropSet.insert(FieldNameType{childFieldName});
         }
         if (childEntry._hasLeadingObj) {
             hasLeadingObj = true;
@@ -80,8 +82,8 @@ ABT FieldMapBuilder::generateABTForField(const FieldMapEntry& entry) const {
         if (childEntry._hasTrailingDefault) {
             hasTrailingDefault = true;
         }
-        if (!childEntry._constVarName.empty()) {
-            varMap.emplace(childFieldName, childEntry._constVarName);
+        if (const auto& constVarName = childEntry._constVarName) {
+            varMap.emplace(childFieldName, *constVarName);
         }
     }
 
@@ -92,10 +94,10 @@ ABT FieldMapBuilder::generateABTForField(const FieldMapEntry& entry) const {
         maybeComposePath(result, make<PathObj>());
     }
     if (!keepSet.empty()) {
-        maybeComposePath(result, make<PathKeep>(toUnorderedFieldNameSet(std::move(keepSet))));
+        maybeComposePath(result, make<PathKeep>(std::move(keepSet)));
     }
     if (!dropSet.empty()) {
-        maybeComposePath(result, make<PathDrop>(toUnorderedFieldNameSet(std::move(dropSet))));
+        maybeComposePath(result, make<PathDrop>(std::move(dropSet)));
     }
 
     for (const auto& varMapEntry : varMap) {
@@ -104,14 +106,19 @@ ABT FieldMapBuilder::generateABTForField(const FieldMapEntry& entry) const {
                                          make<PathConstant>(make<Variable>(varMapEntry.second))));
     }
 
+    // By this point we have constructed an ABT which contains the appropriate keep/drop logic up to
+    // and including the child paths of 'entry'. For example, if 'entry' represents path 'a' with
+    // children 'b' and 'c', paths 'a.b' and 'a.c' are appropriately kept or dropped.
     for (const std::string& childPath : entry._childPaths) {
         const FieldMapEntry& childEntry = _fieldMap.at(childPath);
 
+        // Recursively construct ABTs for the paths below each child entry.
         ABT childResult = generateABTForField(childEntry);
         if (!childResult.is<PathIdentity>()) {
-            maybeComposePath(
-                result,
-                make<PathField>(childEntry._fieldName, make<PathTraverse>(std::move(childResult))));
+            maybeComposePath(result,
+                             make<PathField>(FieldNameType{childEntry._fieldName},
+                                             make<PathTraverse>(PathTraverse::kUnlimited,
+                                                                std::move(childResult))));
         }
     }
 

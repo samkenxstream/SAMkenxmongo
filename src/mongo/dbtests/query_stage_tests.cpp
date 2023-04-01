@@ -65,7 +65,7 @@ public:
             bob.append("foo", i);
             bob.append("baz", i);
             bob.append("bar", numObj() - i);
-            _client.insert(ns(), bob.obj());
+            _client.insert(nss(), bob.obj());
         }
 
         addIndex(BSON("foo" << 1));
@@ -74,7 +74,7 @@ public:
 
     virtual ~IndexScanBase() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        _client.dropCollection(ns());
+        _client.dropCollection(nss());
     }
 
     void addIndex(const BSONObj& obj) {
@@ -114,20 +114,11 @@ public:
         return count;
     }
 
-    void makeGeoData() {
-        dbtests::WriteContextForTests ctx(&_opCtx, ns());
-
-        for (int i = 0; i < numObj(); ++i) {
-            double lat = double(rand()) / RAND_MAX;
-            double lng = double(rand()) / RAND_MAX;
-            _client.insert(ns(), BSON("geo" << BSON_ARRAY(lng << lat)));
-        }
-    }
-
     const IndexDescriptor* getIndex(const BSONObj& obj) {
         AutoGetCollectionForReadCommand collection(&_opCtx, NamespaceString(ns()));
         std::vector<const IndexDescriptor*> indexes;
-        collection->getIndexCatalog()->findIndexesByKeyPattern(&_opCtx, obj, false, &indexes);
+        collection->getIndexCatalog()->findIndexesByKeyPattern(
+            &_opCtx, obj, IndexCatalog::InclusionPolicy::kReady, &indexes);
         return indexes.empty() ? nullptr : indexes[0];
     }
 
@@ -147,6 +138,9 @@ public:
     }
     static const char* ns() {
         return "unittests.IndexScan";
+    }
+    static NamespaceString nss() {
+        return NamespaceString(ns());
     }
 
 protected:

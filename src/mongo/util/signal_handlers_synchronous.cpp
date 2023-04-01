@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -61,9 +60,14 @@
 #include "mongo/util/static_immortal.h"
 #include "mongo/util/text.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
+
+
 namespace mongo {
 
 namespace {
+
+using namespace fmt::literals;
 
 #if defined(_WIN32)
 const char* strsignal(int signalNum) {
@@ -99,7 +103,7 @@ void endProcessWithSignal(int signalNum) {
         RaiseException(STATUS_EXIT_ABRUPT, EXCEPTION_NONCONTINUABLE, 0, nullptr);
     } __except (sehExceptionFilter(GetExceptionCode(), GetExceptionInformation())) {
         // The exception filter exits the process
-        quickExit(EXIT_ABRUPT);
+        quickExit(ExitCode::abrupt);
     }
 }
 
@@ -177,7 +181,7 @@ class MallocFreeOStreamGuard {
 public:
     explicit MallocFreeOStreamGuard() : _lk(_streamMutex, stdx::defer_lock) {
         if (terminateDepth++) {
-            quickExit(EXIT_ABRUPT);
+            quickExit(ExitCode::abrupt);
         }
         _lk.lock();
     }
@@ -191,22 +195,51 @@ private:
 stdx::mutex MallocFreeOStreamGuard::_streamMutex;  // NOLINT
 thread_local int MallocFreeOStreamGuard::terminateDepth = 0;
 
+void logNoRecursion(StringData message) {
+    // If we were within a log call when we hit a signal, don't call back into the logging
+    // subsystem.
+    if (logv2::loggingInProgress()) {
+        logv2::signalSafeWriteToStderr(message);
+    } else {
+        LOGV2_FATAL_CONTINUE(6384300, "Writing fatal message", "message"_attr = message);
+    }
+}
+
 // must hold MallocFreeOStreamGuard to call
 void writeMallocFreeStreamToLog() {
-    LOGV2_FATAL_OPTIONS(
-        4757800,
-        logv2::LogOptions(logv2::FatalMode::kContinue, logv2::LogTruncation::Disabled),
-        "{message}",
-        "Writing fatal message",
-        "message"_attr = mallocFreeOStream.str());
+    mallocFreeOStream << "\n";
+    logNoRecursion(mallocFreeOStream.str());
     mallocFreeOStream.rewind();
 }
 
 // must hold MallocFreeOStreamGuard to call
+void printStackTraceNoRecursion() {
+    if (logv2::loggingInProgress()) {
+        printStackTrace(mallocFreeOStream);
+        writeMallocFreeStreamToLog();
+    } else {
+        printStackTrace();
+    }
+}
+
+// must hold MallocFreeOStreamGuard to call
 void printSignalAndBacktrace(int signalNum) {
-    mallocFreeOStream << "Got signal: " << signalNum << " (" << strsignal(signalNum) << ").\n";
+    mallocFreeOStream << "Got signal: " << signalNum << " (" << strsignal(signalNum) << ").";
     writeMallocFreeStreamToLog();
-    printStackTrace();
+    printStackTraceNoRecursion();
+}
+
+void dumpScopedDebugInfo(std::ostream& os) {
+    auto diagStack = scopedDebugInfoStack().getAll();
+    if (diagStack.empty())
+        return;
+    os << "ScopedDebugInfo: [";
+    StringData sep;
+    for (const auto& s : diagStack) {
+        os << sep << "(" << s << ")";
+        sep = ", "_sd;
+    }
+    os << "]\n";
 }
 
 // this will be called in certain c++ error cases, for example if there are two active
@@ -222,13 +255,17 @@ void myTerminate() {
         mallocFreeOStream << " No exception is active";
     }
     writeMallocFreeStreamToLog();
-    printStackTrace();
+    dumpScopedDebugInfo(mallocFreeOStream);
+    writeMallocFreeStreamToLog();
+    printStackTraceNoRecursion();
     breakpoint();
     endProcessWithSignal(SIGABRT);
 }
 
 extern "C" void abruptQuit(int signalNum) {
     MallocFreeOStreamGuard lk{};
+    dumpScopedDebugInfo(mallocFreeOStream);
+    writeMallocFreeStreamToLog();
     printSignalAndBacktrace(signalNum);
     breakpoint();
     endProcessWithSignal(signalNum);
@@ -241,22 +278,16 @@ void myInvalidParameterHandler(const wchar_t* expression,
                                const wchar_t* file,
                                unsigned int line,
                                uintptr_t pReserved) {
-    LOGV2_FATAL_CONTINUE(
-        23815,
-        "Invalid parameter detected in function {function} in {file} at line {line} "
-        "with expression '{expression}'",
-        "Invalid parameter detected",
-        "function"_attr = toUtf8String(function),
-        "file"_attr = toUtf8String(file),
-        "line"_attr = line,
-        "expression"_attr = toUtf8String(expression));
+
+    logNoRecursion(
+        "Invalid parameter detected in function {} in {} at line {} with expression '{}'\n"_format(
+            toUtf8String(function), toUtf8String(file), line, toUtf8String(expression)));
 
     abruptQuit(SIGABRT);
 }
 
 void myPureCallHandler() {
-    LOGV2_FATAL_CONTINUE(23818,
-                         "Pure call handler invoked. Immediate exit due to invalid pure call");
+    logNoRecursion("Pure call handler invoked. Immediate exit due to invalid pure call\n");
     abruptQuit(SIGABRT);
 }
 
@@ -345,10 +376,10 @@ void setupSynchronousSignalHandlers() {
 
 void reportOutOfMemoryErrorAndExit() {
     MallocFreeOStreamGuard lk{};
-    mallocFreeOStream << "out of memory.\n";
+    mallocFreeOStream << "out of memory.";
     writeMallocFreeStreamToLog();
-    printStackTrace();
-    quickExit(EXIT_ABRUPT);
+    printStackTraceNoRecursion();
+    quickExit(ExitCode::abrupt);
 }
 
 void clearSignalMask() {

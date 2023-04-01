@@ -31,6 +31,7 @@
 
 #include "mongo/db/exec/sbe/stages/sorted_merge.h"
 
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/size_estimator.h"
 
@@ -41,8 +42,9 @@ SortedMergeStage::SortedMergeStage(PlanStage::Vector inputStages,
                                    std::vector<value::SortDirection> dirs,
                                    std::vector<value::SlotVector> inputVals,
                                    value::SlotVector outputVals,
-                                   PlanNodeId planNodeId)
-    : PlanStage("smerge"_sd, planNodeId),
+                                   PlanNodeId planNodeId,
+                                   bool participateInTrialRunTracking)
+    : PlanStage("smerge"_sd, planNodeId, participateInTrialRunTracking),
       _inputKeys(std::move(inputKeys)),
       _dirs(std::move(dirs)),
       _inputVals(std::move(inputVals)),
@@ -69,8 +71,13 @@ std::unique_ptr<PlanStage> SortedMergeStage::clone() const {
     for (auto& child : _children) {
         inputStages.emplace_back(child->clone());
     }
-    return std::make_unique<SortedMergeStage>(
-        std::move(inputStages), _inputKeys, _dirs, _inputVals, _outputVals, _commonStats.nodeId);
+    return std::make_unique<SortedMergeStage>(std::move(inputStages),
+                                              _inputKeys,
+                                              _dirs,
+                                              _inputVals,
+                                              _outputVals,
+                                              _commonStats.nodeId,
+                                              _participateInTrialRunTracking);
 }
 
 void SortedMergeStage::prepare(CompileCtx& ctx) {

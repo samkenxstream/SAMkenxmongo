@@ -13,7 +13,7 @@ const testDB = conn.getDB('test');
 const coll = testDB.explain_group_stage_exec_stats;
 coll.drop();
 
-if (checkSBEEnabled(testDB, ["featureFlagSBEGroupPushdown"])) {
+if (checkSBEEnabled(testDB)) {
     // When the SBE $group pushdown feature is enabled, a $group alone is pushed down and the
     // memory usage tracking isn't on a per-accumulator basis so this test is exercising
     // spilling behavior of the classic DocumentSourceGroup stage.
@@ -67,6 +67,10 @@ function checkGroupStages(stage, expectedAccumMemUsages, isExecExplain, expected
 
     if (isExecExplain) {
         assert(stage.hasOwnProperty("maxAccumulatorMemoryUsageBytes"), stage);
+        assert(stage.hasOwnProperty("spilledDataStorageSize"), stage);
+        assert(stage.hasOwnProperty("numBytesSpilledEstimate"), stage);
+        assert(stage.hasOwnProperty("spilledRecords"), stage);
+
         const maxAccmMemUsages = stage["maxAccumulatorMemoryUsageBytes"];
         for (const field of Object.keys(maxAccmMemUsages)) {
             totalAccumMemoryUsageBytes += maxAccmMemUsages[field];
@@ -80,6 +84,24 @@ function checkGroupStages(stage, expectedAccumMemUsages, isExecExplain, expected
             }
         }
 
+        const spilledDataStorageSize = stage["spilledDataStorageSize"];
+        const numBytesSpilledEstimate = stage["numBytesSpilledEstimate"];
+        const spilledRecords = stage["spilledRecords"];
+        if (stage.usedDisk) {
+            // We cannot compute the size of the spill file, so assert that it is non-zero if we
+            // have spilled.
+            assert.gt(spilledDataStorageSize, 0, stage);
+
+            // The number of bytes spilled, on the other hand, is at least as much as the
+            // accumulator memory usage.
+            assert.gt(numBytesSpilledEstimate, totalAccumMemoryUsageBytes);
+            assert.gt(spilledRecords, 0, stage);
+        } else {
+            assert.eq(spilledDataStorageSize, 0, stage);
+            assert.eq(numBytesSpilledEstimate, 0, stage);
+            assert.eq(spilledRecords, 0, stage);
+        }
+
         // Don't verify spill count for debug builds, since for debug builds a spill occurs on every
         // duplicate id in a group.
         if (!debugBuild) {
@@ -91,6 +113,9 @@ function checkGroupStages(stage, expectedAccumMemUsages, isExecExplain, expected
         assert(!stage.hasOwnProperty("usedDisk"), stage);
         assert(!stage.hasOwnProperty("spills"), stage);
         assert(!stage.hasOwnProperty("maxAccumulatorMemoryUsageBytes"), stage);
+        assert(!stage.hasOwnProperty("spilledDataStorageSize"), stage);
+        assert(!stage.hasOwnProperty("numBytesSpilledEstimate"), stage);
+        assert(!stage.hasOwnProperty("spilledRecords"), stage);
     }
 
     // Add some wiggle room to the total memory used compared to the limit parameter since the check

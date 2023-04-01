@@ -9,7 +9,6 @@
  * TODO SERVER-61231: shard merge can't handle restart, adapt this test.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
@@ -19,17 +18,14 @@
  * ]
  */
 
-(function() {
-"use strict";
-
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/aggregation/extras/utils.js");
 load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
 load("jstests/libs/uuid_util.js");
 
 let tenantMigrationTest = new TenantMigrationTest({name: jsTestName(), sharedOptions: {nodes: 1}});
 
-const tenantId = "testTenantId";
+const tenantId = ObjectId().str;
 const collName = "testColl";
 const transactionsNS = "config.transactions";
 
@@ -103,10 +99,10 @@ const assertTransactionEntries = (donorTxnEntries, recipientTxnEntries) => {
     donorRst.restart(donorPrimary);
 
     // Let the migration restart and hang before it tries to re-fetch committed transactions.
-    const fpAfterCollectionClonerDone =
-        configureFailPoint(recipientPrimary, "fpAfterCollectionClonerDone", {action: "hang"});
+    const fpBeforeFetchingTransactions = configureFailPoint(
+        recipientPrimary, "fpBeforeFetchingCommittedTransactions", {action: "hang"});
     fpAfterFetchingCommittedTransactions.off();
-    fpAfterCollectionClonerDone.wait();
+    fpBeforeFetchingTransactions.wait();
 
     // The recipient should indicate that the migration has restarted.
     let recipientDoc;
@@ -117,7 +113,7 @@ const assertTransactionEntries = (donorTxnEntries, recipientTxnEntries) => {
     // The state doc should indicate that the migration has already updated 'config.transaction'
     // entries.
     assert.eq(true, recipientDoc[0].completedUpdatingTransactionsBeforeStartOpTime);
-    fpAfterCollectionClonerDone.off();
+    fpBeforeFetchingTransactions.off();
 
     // Verify that the migration completes successfully.
     TenantMigrationTest.assertCommitted(
@@ -171,10 +167,10 @@ const assertTransactionEntries = (donorTxnEntries, recipientTxnEntries) => {
     donorRst.restart(donorPrimary);
 
     // Let the migration restart and hang before it tries to re-fetch committed transactions.
-    const fpAfterCollectionClonerDone =
-        configureFailPoint(recipientPrimary, "fpAfterCollectionClonerDone", {action: "hang"});
+    const fpBeforeFetchingTransactions = configureFailPoint(
+        recipientPrimary, "fpBeforeFetchingCommittedTransactions", {action: "hang"});
     hangAfterUpdatingTransactionEntry.off();
-    fpAfterCollectionClonerDone.wait();
+    fpBeforeFetchingTransactions.wait();
 
     // The recipient should indicate that the migration has restarted.
     let recipientDoc;
@@ -185,7 +181,7 @@ const assertTransactionEntries = (donorTxnEntries, recipientTxnEntries) => {
     // Verify that the 'completedUpdatingTransactionsBeforeStartOpTime' flag is false since the
     // migration was forced to restart before it fully completed fetching.
     assert.eq(false, recipientDoc[0].completedUpdatingTransactionsBeforeStartOpTime);
-    fpAfterCollectionClonerDone.off();
+    fpBeforeFetchingTransactions.off();
 
     // Verify that the migration completes successfully.
     TenantMigrationTest.assertCommitted(
@@ -250,10 +246,10 @@ const assertTransactionEntries = (donorTxnEntries, recipientTxnEntries) => {
     donorRst.restart(donorPrimary);
 
     // Let the migration restart and hang before it tries to re-fetch committed transactions.
-    const fpAfterCollectionClonerDone =
-        configureFailPoint(recipientPrimary, "fpAfterCollectionClonerDone", {action: "hang"});
+    const fpBeforeFetchingTransactions = configureFailPoint(
+        recipientPrimary, "fpBeforeFetchingCommittedTransactions", {action: "hang"});
     hangAfterUpdatingTransactionEntry.off();
-    fpAfterCollectionClonerDone.wait();
+    fpBeforeFetchingTransactions.wait();
 
     // The recipient should indicate that the migration has restarted.
     let recipientDoc;
@@ -264,7 +260,7 @@ const assertTransactionEntries = (donorTxnEntries, recipientTxnEntries) => {
     // Verify that the 'completedUpdatingTransactionsBeforeStartOpTime' flag is false since the
     // migration was forced to restart before it fully completed fetching.
     assert.eq(false, recipientDoc[0].completedUpdatingTransactionsBeforeStartOpTime);
-    fpAfterCollectionClonerDone.off();
+    fpBeforeFetchingTransactions.off();
 
     // Verify that the migration completes successfully.
     TenantMigrationTest.assertCommitted(
@@ -274,5 +270,4 @@ const assertTransactionEntries = (donorTxnEntries, recipientTxnEntries) => {
     assertTransactionEntries(updatedDonorTxnEntries, recipientTxnEntries);
 
     tenantMigrationTest.stop();
-})();
 })();

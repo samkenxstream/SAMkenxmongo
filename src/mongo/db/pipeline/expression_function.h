@@ -69,7 +69,7 @@ public:
 
     Value evaluate(const Document& root, Variables* variables) const final;
 
-    Value serialize(bool explain) const final;
+    Value serialize(SerializationOptions options) const final;
 
     void acceptVisitor(ExpressionMutableVisitor* visitor) final {
         return visitor->visit(this);
@@ -88,7 +88,6 @@ private:
                        bool assignFirstArgToThis,
                        std::string funcSourceString,
                        std::string lang);
-    void _doAddDependencies(DepsTracker* deps) const final override;
 
     const boost::intrusive_ptr<Expression>& _passedArgs;
     bool _assignFirstArgToThis;

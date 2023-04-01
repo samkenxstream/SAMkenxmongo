@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -47,6 +46,9 @@
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 
 namespace mongo {
 namespace {
@@ -88,10 +90,13 @@ const uint64_t ChunkSizeSettingsType::kDefaultMaxChunkSizeBytes{128 * 1024 * 102
 
 const char AutoSplitSettingsType::kKey[] = "autosplit";
 
+const char AutoMergeSettingsType::kKey[] = "automerge";
+
 BalancerConfiguration::BalancerConfiguration()
     : _balancerSettings(BalancerSettingsType::createDefault()),
       _maxChunkSizeBytes(ChunkSizeSettingsType::kDefaultMaxChunkSizeBytes),
-      _shouldAutoSplit(true) {}
+      _shouldAutoSplit(true),
+      _shouldAutoMerge(true) {}
 
 BalancerConfiguration::~BalancerConfiguration() = default;
 
@@ -147,10 +152,31 @@ Status BalancerConfiguration::enableAutoSplit(OperationContext* opCtx, bool enab
     return Status::OK();
 }
 
+Status BalancerConfiguration::changeAutoMergeSettings(OperationContext* opCtx, bool enable) {
+    auto updateStatus = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
+        opCtx,
+        NamespaceString::kConfigSettingsNamespace,
+        BSON("_id" << AutoMergeSettingsType::kKey),
+        BSON("$set" << BSON(kEnabled << enable)),
+        true,
+        ShardingCatalogClient::kMajorityWriteConcern);
+
+    Status refreshStatus = refreshAndCheck(opCtx);
+    if (!refreshStatus.isOK()) {
+        return refreshStatus;
+    }
+
+    if (!updateStatus.isOK() && (shouldAutoMerge() != enable)) {
+        return updateStatus.getStatus().withContext(
+            str::stream() << "Failed to " << (enable ? "enable" : "disable") << " auto merge");
+    }
+
+    return Status::OK();
+}
+
 bool BalancerConfiguration::shouldBalance() const {
     stdx::lock_guard<Latch> lk(_balancerSettingsMutex);
-    if (_balancerSettings.getMode() == BalancerSettingsType::kOff ||
-        _balancerSettings.getMode() == BalancerSettingsType::kAutoSplitOnly) {
+    if (_balancerSettings.getMode() != BalancerSettingsType::kFull) {
         return false;
     }
 
@@ -160,6 +186,15 @@ bool BalancerConfiguration::shouldBalance() const {
 bool BalancerConfiguration::shouldBalanceForAutoSplit() const {
     stdx::lock_guard<Latch> lk(_balancerSettingsMutex);
     if (_balancerSettings.getMode() == BalancerSettingsType::kOff) {
+        return false;
+    }
+
+    return _balancerSettings.isTimeInBalancingWindow(boost::posix_time::second_clock::local_time());
+}
+
+bool BalancerConfiguration::shouldBalanceForAutoMerge() const {
+    stdx::lock_guard<Latch> lk(_balancerSettingsMutex);
+    if (_balancerSettings.getMode() == BalancerSettingsType::kOff || !shouldAutoMerge()) {
         return false;
     }
 
@@ -198,6 +233,12 @@ Status BalancerConfiguration::refreshAndCheck(OperationContext* opCtx) {
     Status autoSplitStatus = _refreshAutoSplitSettings(opCtx);
     if (!autoSplitStatus.isOK()) {
         return autoSplitStatus.withContext("Failed to refresh the autoSplit settings");
+    }
+
+    // Global auto merge settings
+    Status autoMergeStatus = _refreshAutoMergeSettings(opCtx);
+    if (!autoMergeStatus.isOK()) {
+        return autoMergeStatus.withContext("Failed to refresh the autoMerge settings");
     }
 
     return Status::OK();
@@ -278,6 +319,31 @@ Status BalancerConfiguration::_refreshAutoSplitSettings(OperationContext* opCtx)
               "oldShouldAutoSplit"_attr = getShouldAutoSplit());
 
         _shouldAutoSplit.store(settings.getShouldAutoSplit());
+    }
+
+    return Status::OK();
+}
+
+Status BalancerConfiguration::_refreshAutoMergeSettings(OperationContext* opCtx) {
+    AutoMergeSettingsType settings = AutoMergeSettingsType::createDefault();
+
+    auto settingsObjStatus =
+        Grid::get(opCtx)->catalogClient()->getGlobalSettings(opCtx, AutoMergeSettingsType::kKey);
+    if (settingsObjStatus.isOK()) {
+        auto settingsStatus = AutoMergeSettingsType::fromBSON(settingsObjStatus.getValue());
+        if (!settingsStatus.isOK()) {
+            return settingsStatus.getStatus();
+        }
+
+        settings = std::move(settingsStatus.getValue());
+    } else if (settingsObjStatus != ErrorCodes::NoMatchingDocument) {
+        return settingsObjStatus.getStatus();
+    }
+
+    if (settings.isEnabled() != shouldAutoMerge()) {
+        LOGV2(7351300, "Changing auto merge settings", "enabled"_attr = settings.isEnabled());
+
+        _shouldAutoMerge.store(settings.isEnabled());
     }
 
     return Status::OK();
@@ -471,6 +537,18 @@ StatusWith<AutoSplitSettingsType> AutoSplitSettingsType::fromBSON(const BSONObj&
 
     AutoSplitSettingsType settings;
     settings._shouldAutoSplit = shouldAutoSplit;
+
+    return settings;
+}
+
+StatusWith<AutoMergeSettingsType> AutoMergeSettingsType::fromBSON(const BSONObj& obj) {
+    bool isEnabled;
+    Status status = bsonExtractBooleanField(obj, kEnabled, &isEnabled);
+    if (!status.isOK())
+        return status;
+
+    AutoMergeSettingsType settings;
+    settings._isEnabled = isEnabled;
 
     return settings;
 }

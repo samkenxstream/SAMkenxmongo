@@ -33,8 +33,8 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/db/logical_session_id.idl"
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/session/logical_session_id.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/s/resharding/common_types.idl"
     - "mongo/s/sharding_types.idl"
 

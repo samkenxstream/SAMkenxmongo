@@ -27,7 +27,8 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+#include "mongo/util/duration.h"
+#include <iostream>
 
 #include "mongo/platform/basic.h"
 
@@ -41,13 +42,16 @@
 #include "mongo/db/query/util/make_data_structure.h"
 #include "mongo/logv2/log.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+
 namespace mongo::plan_executor_factory {
 
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     std::unique_ptr<CanonicalQuery> cq,
     std::unique_ptr<WorkingSet> ws,
     std::unique_ptr<PlanStage> rt,
-    const CollectionPtr* collection,
+    stdx::variant<const CollectionPtr*, const ScopedCollectionAcquisition*> collection,
     PlanYieldPolicy::YieldPolicy yieldPolicy,
     size_t plannerOptions,
     NamespaceString nss,
@@ -65,15 +69,17 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
                 yieldPolicy);
 }
 
+
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     std::unique_ptr<WorkingSet> ws,
     std::unique_ptr<PlanStage> rt,
-    const CollectionPtr* collection,
+    stdx::variant<const CollectionPtr*, const ScopedCollectionAcquisition*> collection,
     PlanYieldPolicy::YieldPolicy yieldPolicy,
     size_t plannerOptions,
     NamespaceString nss,
     std::unique_ptr<QuerySolution> qs) {
+
     return make(expCtx->opCtx,
                 std::move(ws),
                 std::move(rt),
@@ -93,11 +99,12 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     std::unique_ptr<QuerySolution> qs,
     std::unique_ptr<CanonicalQuery> cq,
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const CollectionPtr* collection,
+    stdx::variant<const CollectionPtr*, const ScopedCollectionAcquisition*> collection,
     size_t plannerOptions,
     NamespaceString nss,
     PlanYieldPolicy::YieldPolicy yieldPolicy) {
-    dassert(collection);
+    stdx::visit([](const auto& ptr) { dassert(ptr); }, collection);
+
     try {
         auto execImpl = new PlanExecutorImpl(opCtx,
                                              std::move(ws),
@@ -105,7 +112,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
                                              std::move(qs),
                                              std::move(cq),
                                              expCtx,
-                                             *collection,
+                                             collection,
                                              plannerOptions & QueryPlannerParams::RETURN_OWNED_DATA,
                                              std::move(nss),
                                              yieldPolicy);
@@ -123,12 +130,12 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     std::unique_ptr<QuerySolution> solution,
     std::pair<std::unique_ptr<sbe::PlanStage>, stage_builder::PlanStageData> root,
     std::unique_ptr<optimizer::AbstractABTPrinter> optimizerData,
-    const MultipleCollectionAccessor& collections,
     size_t plannerOptions,
     NamespaceString nss,
-    std::unique_ptr<PlanYieldPolicySBE> yieldPolicy) {
+    std::unique_ptr<PlanYieldPolicySBE> yieldPolicy,
+    bool planIsFromCache,
+    bool generatedByBonsai) {
     auto&& [rootStage, data] = root;
-
     LOGV2_DEBUG(4822860,
                 5,
                 "SBE plan",
@@ -140,12 +147,18 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
                  std::move(cq),
                  std::move(optimizerData),
                  {makeVector<sbe::plan_ranker::CandidatePlan>(sbe::plan_ranker::CandidatePlan{
-                      std::move(solution), std::move(rootStage), std::move(data)}),
+                      std::move(solution),
+                      std::move(rootStage),
+                      sbe::plan_ranker::CandidatePlanData{std::move(data)},
+                      false /*exitedEarly*/,
+                      Status::OK(),
+                      planIsFromCache}),
                   0},
                  plannerOptions & QueryPlannerParams::RETURN_OWNED_DATA,
                  std::move(nss),
-                 false,
-                 std::move(yieldPolicy)),
+                 false /*isOpen*/,
+                 std::move(yieldPolicy),
+                 generatedByBonsai),
              PlanExecutor::Deleter{opCtx}}};
 }
 
@@ -157,11 +170,10 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     size_t plannerOptions,
     NamespaceString nss,
     std::unique_ptr<PlanYieldPolicySBE> yieldPolicy) {
-
     LOGV2_DEBUG(4822861,
                 5,
                 "SBE plan",
-                "slots"_attr = candidates.winner().data.debugString(),
+                "slots"_attr = candidates.winner().data.stageData.debugString(),
                 "stages"_attr = sbe::DebugPrinter{}.print(*candidates.winner().root));
 
     return {{new PlanExecutorSBE(opCtx,
@@ -171,7 +183,8 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
                                  plannerOptions & QueryPlannerParams::RETURN_OWNED_DATA,
                                  std::move(nss),
                                  true,
-                                 std::move(yieldPolicy)),
+                                 std::move(yieldPolicy),
+                                 false),
              PlanExecutor::Deleter{opCtx}}};
 }
 

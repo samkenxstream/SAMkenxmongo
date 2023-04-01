@@ -27,27 +27,34 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/query/planner_analysis.h"
 
 #include <set>
 #include <vector>
 
+#include "mongo/base/simple_string_data_comparator.h"
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/index/expression_params.h"
 #include "mongo/db/index/s2_common.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_geo.h"
+#include "mongo/db/matcher/match_expression_dependencies.h"
 #include "mongo/db/query/planner_ixselect.h"
+#include "mongo/db/query/projection.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/db/query/query_solution.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 
 using std::endl;
+using std::pair;
 using std::string;
 using std::unique_ptr;
 using std::vector;
@@ -68,7 +75,7 @@ void getLeafNodes(QuerySolutionNode* root, vector<QuerySolutionNode*>* leafNodes
         leafNodes->push_back(root);
     } else {
         for (size_t i = 0; i < root->children.size(); ++i) {
-            getLeafNodes(root->children[i], leafNodes);
+            getLeafNodes(root->children[i].get(), leafNodes);
         }
     }
 }
@@ -91,7 +98,7 @@ void getExplodableNodes(QuerySolutionNode* root, vector<QuerySolutionNode*>* exp
         explodableNodes->push_back(root);
     } else {
         for (auto&& childNode : root->children) {
-            getExplodableNodes(childNode, explodableNodes);
+            getExplodableNodes(childNode.get(), explodableNodes);
         }
     }
 }
@@ -104,7 +111,7 @@ const IndexScanNode* getIndexScanNode(const QuerySolutionNode* node) {
     if (STAGE_IXSCAN == node->getType()) {
         return static_cast<const IndexScanNode*>(node);
     } else if (isFetchNodeWithIndexScanChild(node)) {
-        return static_cast<const IndexScanNode*>(node->children[0]);
+        return static_cast<const IndexScanNode*>(node->children[0].get());
     }
     MONGO_UNREACHABLE;
     return nullptr;
@@ -130,12 +137,42 @@ bool isUnionOfPoints(const OrderedIntervalList& oil) {
 }
 
 /**
+ * Returns true if we are safe to explode the 'oil' with the corresponding 'iet' that will be
+ * evaluated on different input parameters.
+ */
+bool isOilExplodable(const OrderedIntervalList& oil,
+                     const boost::optional<interval_evaluation_tree::IET>& iet) {
+    if (!isUnionOfPoints(oil)) {
+        return false;
+    }
+
+    if (iet) {
+        // In order for the IET to be evaluated to the same number of point intervals given any set
+        // of input parameters, the IET needs to be either a const node, or an $eq/$in eval node.
+        // Having union or intersection may result in different number of point intervals when the
+        // IET is evaluated.
+        if (const auto* ietEval = iet->cast<interval_evaluation_tree::EvalNode>(); ietEval) {
+            return ietEval->matchType() == MatchExpression::EQ ||
+                ietEval->matchType() == MatchExpression::MATCH_IN;
+        } else if (iet->is<interval_evaluation_tree::ConstNode>()) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
  * Should we try to expand the index scan(s) in 'solnRoot' to pull out an indexed sort?
  *
- * Returns the node which should be replaced by the merge sort of exploded scans
- * in the out-parameter 'toReplace'.
+ * Returns the node which should be replaced by the merge sort of exploded scans, or nullptr
+ * if there is no such node. The result is a pointer to a unique_ptr so that the caller
+ * can replace the unique_ptr.
  */
-bool structureOKForExplode(QuerySolutionNode* solnRoot, QuerySolutionNode** toReplace) {
+std::unique_ptr<QuerySolutionNode>* structureOKForExplode(
+    std::unique_ptr<QuerySolutionNode>* solnRoot) {
     // For now we only explode if we *know* we will pull the sort out.  We can look at
     // more structure (or just explode and recalculate properties and see what happens)
     // but for now we just explode if it's a sure bet.
@@ -144,37 +181,43 @@ bool structureOKForExplode(QuerySolutionNode* solnRoot, QuerySolutionNode** toRe
     // or other less obvious cases...
 
     // Skip over a sharding filter stage.
-    if (STAGE_SHARDING_FILTER == solnRoot->getType()) {
-        solnRoot = solnRoot->children[0];
+    if (STAGE_SHARDING_FILTER == (*solnRoot)->getType()) {
+        solnRoot = &(*solnRoot)->children[0];
     }
 
-    if (STAGE_IXSCAN == solnRoot->getType()) {
-        *toReplace = solnRoot;
-        return true;
+    if (STAGE_IXSCAN == (*solnRoot)->getType()) {
+        return solnRoot;
     }
 
-    if (isFetchNodeWithIndexScanChild(solnRoot)) {
-        *toReplace = solnRoot->children[0];
-        return true;
+    if (isFetchNodeWithIndexScanChild(solnRoot->get())) {
+        return &(*solnRoot)->children[0];
     }
 
     // If we have a STAGE_OR, we can explode only when all children are either IXSCANs or FETCHes
     // that have an IXSCAN as a child.
-    if (STAGE_OR == solnRoot->getType()) {
-        for (auto&& child : solnRoot->children) {
-            if (STAGE_IXSCAN != child->getType() && !isFetchNodeWithIndexScanChild(child)) {
-                return false;
+    if (STAGE_OR == (*solnRoot)->getType()) {
+        for (auto&& child : (*solnRoot)->children) {
+            if (STAGE_IXSCAN != child->getType() && !isFetchNodeWithIndexScanChild(child.get())) {
+                return nullptr;
             }
         }
-        *toReplace = solnRoot;
-        return true;
+        return solnRoot;
     }
 
-    return false;
+    return nullptr;
 }
 
-// vectors of vectors can be > > annoying.
+/**
+ * A pair of <PointPrefix, PrefixIndices> are returned from the Cartesian product function,
+ * where PointPrefix is the list of point intervals that has been exploded, and the PrefixIndices is
+ * the list of indices of each point interval in the original union of points OIL.
+ *
+ * For example, if the index bounds is {a: [[1, 1], [2, 2]], b: [[3, 3], c: [[MinKey, MaxKey]]},
+ * then the two PointPrefix are: [[1, 1], [3, 3]] and [[2, 2], [3, 3]].
+ * The two PrefixIndices are [0, 0] and [1, 0].
+ */
 typedef vector<Interval> PointPrefix;
+typedef vector<size_t> PrefixIndices;
 
 /**
  * The first 'fieldsToExplode' fields of 'bounds' are points.  Compute the Cartesian product
@@ -182,36 +225,41 @@ typedef vector<Interval> PointPrefix;
  */
 void makeCartesianProduct(const IndexBounds& bounds,
                           size_t fieldsToExplode,
-                          vector<PointPrefix>* prefixOut) {
-    vector<PointPrefix> prefixForScans;
+                          vector<pair<PointPrefix, PrefixIndices>>* prefixOut) {
+    vector<pair<PointPrefix, PrefixIndices>> prefixForScans;
 
     // We dump the Cartesian product of bounds into prefixForScans, starting w/the first
     // field's points.
-    verify(fieldsToExplode >= 1);
+    invariant(fieldsToExplode >= 1);
     const OrderedIntervalList& firstOil = bounds.fields[0];
-    verify(firstOil.intervals.size() >= 1);
+    invariant(firstOil.intervals.size() >= 1);
     for (size_t i = 0; i < firstOil.intervals.size(); ++i) {
         const Interval& ival = firstOil.intervals[i];
-        verify(ival.isPoint());
+        invariant(ival.isPoint());
         PointPrefix pfix;
         pfix.push_back(ival);
-        prefixForScans.push_back(pfix);
+        PrefixIndices pfixIndices;
+        pfixIndices.push_back(i);
+        prefixForScans.emplace_back(std::make_pair(std::move(pfix), std::move(pfixIndices)));
     }
 
     // For each subsequent field...
     for (size_t i = 1; i < fieldsToExplode; ++i) {
-        vector<PointPrefix> newPrefixForScans;
+        vector<pair<PointPrefix, PrefixIndices>> newPrefixForScans;
         const OrderedIntervalList& oil = bounds.fields[i];
-        verify(oil.intervals.size() >= 1);
+        invariant(oil.intervals.size() >= 1);
         // For each point interval in that field (all ivals must be points)...
         for (size_t j = 0; j < oil.intervals.size(); ++j) {
             const Interval& ival = oil.intervals[j];
-            verify(ival.isPoint());
+            invariant(ival.isPoint());
             // Make a new scan by appending it to all scans in prefixForScans.
             for (size_t k = 0; k < prefixForScans.size(); ++k) {
-                PointPrefix pfix = prefixForScans[k];
+                auto pfix = prefixForScans[k].first;
                 pfix.push_back(ival);
-                newPrefixForScans.push_back(pfix);
+                auto pfixIndicies = prefixForScans[k].second;
+                pfixIndicies.push_back(j);
+                newPrefixForScans.emplace_back(
+                    std::make_pair(std::move(pfix), std::move(pfixIndicies)));
             }
         }
         // And update prefixForScans.
@@ -222,11 +270,12 @@ void makeCartesianProduct(const IndexBounds& bounds,
 }
 
 /**
- * Takes the provided 'node', either an IndexScanNode or FetchNode with a direct child that is an
- * IndexScanNode. Returns a list of nodes which are logically equivalent to 'node' if joined by a
- * MergeSort through the out-parameter 'explosionResult'. These nodes are owned by the caller.
+ * Takes the provided 'node' (identified by 'nodeIndex'), either an IndexScanNode or FetchNode with
+ * a direct child that is an IndexScanNode. Produces a list of new nodes, which are logically
+ * equivalent to 'node' if joined by a MergeSort. Inserts these new nodes at the end of
+ * 'explosionResult'.
  *
- * fieldsToExplode is a count of how many fields in the scan's bounds are the union of point
+ * 'fieldsToExplode' is a count of how many fields in the scan's bounds are the union of point
  * intervals.  This is computed beforehand and provided as a small optimization.
  *
  * Example:
@@ -236,34 +285,75 @@ void makeCartesianProduct(const IndexBounds& bounds,
  * 'sort' will be {b: 1}
  * 'fieldsToExplode' will be 1 (as only one field isUnionOfPoints).
  *
+ * The return value is whether the original index scan needs to be deduplicated.
+ *
  * On return, 'explosionResult' will contain the following two scans:
  * a: [[1, 1]], b: [MinKey, MaxKey]
  * a: [[2, 2]], b: [MinKey, MaxKey]
  */
-void explodeNode(const QuerySolutionNode* node,
+bool explodeNode(const QuerySolutionNode* node,
+                 const size_t nodeIndex,
                  const BSONObj& sort,
                  size_t fieldsToExplode,
-                 vector<QuerySolutionNode*>* explosionResult) {
+                 vector<std::unique_ptr<QuerySolutionNode>>* explosionResult) {
     // Get the 'isn' from either the FetchNode or IndexScanNode.
     const IndexScanNode* isn = getIndexScanNode(node);
 
     // Turn the compact bounds in 'isn' into a bunch of points...
-    vector<PointPrefix> prefixForScans;
+    vector<pair<PointPrefix, PrefixIndices>> prefixForScans;
     makeCartesianProduct(isn->bounds, fieldsToExplode, &prefixForScans);
 
     for (size_t i = 0; i < prefixForScans.size(); ++i) {
-        const PointPrefix& prefix = prefixForScans[i];
-        verify(prefix.size() == fieldsToExplode);
+        const PointPrefix& prefix = prefixForScans[i].first;
+        const PrefixIndices& prefixIndices = prefixForScans[i].second;
+        invariant(prefix.size() == fieldsToExplode);
+        invariant(prefixIndices.size() == fieldsToExplode);
 
         // Copy boring fields into new child.
-        IndexScanNode* child = new IndexScanNode(isn->index);
+        auto child = std::make_unique<IndexScanNode>(isn->index);
         child->direction = isn->direction;
         child->addKeyMetadata = isn->addKeyMetadata;
         child->queryCollator = isn->queryCollator;
 
+        // Set up the IET of children when the original index scan has IET.
+        if (!isn->iets.empty()) {
+            // Set the explosion index for the exploded IET so that they can be evaluated to the
+            // correct point interval. When present, the caller should already have verified that
+            // the IETs are the correct shape (i.e. derived from an $in or $eq predicate) so that
+            // they are safe to explode.
+            for (size_t pidx = 0; pidx < prefixIndices.size(); pidx++) {
+                invariant(pidx < isn->iets.size());
+                const auto& iet = isn->iets[pidx];
+                auto needsExplodeNode = [&]() {
+                    if (const auto* ietEval = iet.cast<interval_evaluation_tree::EvalNode>();
+                        ietEval) {
+                        return ietEval->matchType() == MatchExpression::MATCH_IN;
+                    } else if (const auto* ietConst =
+                                   iet.cast<interval_evaluation_tree::ConstNode>();
+                               ietConst) {
+                        return ietConst->oil.intervals.size() > 1;
+                    }
+                    MONGO_UNREACHABLE;
+                }();
+
+                if (needsExplodeNode) {
+                    auto ietExplode =
+                        interval_evaluation_tree::IET::make<interval_evaluation_tree::ExplodeNode>(
+                            iet, std::make_pair(nodeIndex, pidx), prefixIndices[pidx]);
+                    child->iets.push_back(std::move(ietExplode));
+                } else {
+                    child->iets.push_back(std::move(iet));
+                }
+            }
+            // Copy the rest of the unexploded IETs directly into the new child.
+            for (size_t pidx = prefixIndices.size(); pidx < isn->iets.size(); pidx++) {
+                child->iets.push_back(isn->iets[pidx]);
+            }
+        }
+
         // Copy the filter, if there is one.
         if (isn->filter.get()) {
-            child->filter = isn->filter->shallowClone();
+            child->filter = isn->filter->clone();
         }
 
         // Create child bounds.
@@ -283,31 +373,18 @@ void explodeNode(const QuerySolutionNode* node,
 
             // Copy the FETCH's filter, if it exists.
             if (origFetchNode->filter.get()) {
-                newFetchNode->filter = origFetchNode->filter->shallowClone();
+                newFetchNode->filter = origFetchNode->filter->clone();
             }
 
             // Add the 'child' IXSCAN under the FETCH stage, and the FETCH stage to the result set.
-            newFetchNode->children.push_back(child);
-            explosionResult->push_back(newFetchNode.release());
+            newFetchNode->children.push_back(std::move(child));
+            explosionResult->push_back(std::move(newFetchNode));
         } else {
-            explosionResult->push_back(child);
+            explosionResult->push_back(std::move(child));
         }
     }
-}
 
-/**
- * In the tree '*root', replace 'oldNode' with 'newNode'.
- */
-void replaceNodeInTree(QuerySolutionNode** root,
-                       QuerySolutionNode* oldNode,
-                       QuerySolutionNode* newNode) {
-    if (*root == oldNode) {
-        *root = newNode;
-    } else {
-        for (size_t i = 0; i < (*root)->children.size(); ++i) {
-            replaceNodeInTree(&(*root)->children[i], oldNode, newNode);
-        }
-    }
+    return isn->shouldDedup;
 }
 
 void geoSkipValidationOn(const std::set<StringData>& twoDSphereFields,
@@ -328,17 +405,17 @@ void geoSkipValidationOn(const std::set<StringData>& twoDSphereFields,
         }
     }
 
-    for (QuerySolutionNode* child : solnRoot->children) {
-        geoSkipValidationOn(twoDSphereFields, child);
+    for (auto&& child : solnRoot->children) {
+        geoSkipValidationOn(twoDSphereFields, child.get());
     }
 }
 
 /**
  * If any field is missing from the list of fields the projection wants, we are not covered.
  */
-auto providesAllFields(const vector<std::string>& fields, const QuerySolutionNode& solnRoot) {
-    for (size_t i = 0; i < fields.size(); ++i) {
-        if (!solnRoot.hasField(fields[i]))
+auto providesAllFields(const OrderedPathSet& fields, const QuerySolutionNode& solnRoot) {
+    for (auto&& field : fields) {
+        if (!solnRoot.hasField(field))
             return false;
     }
     return true;
@@ -374,64 +451,108 @@ std::unique_ptr<QuerySolutionNode> addSortKeyGeneratorStageIfNeeded(
     if (!hasSortStage && query.metadataDeps()[DocumentMetadataFields::kSortKey]) {
         auto keyGenNode = std::make_unique<SortKeyGeneratorNode>();
         keyGenNode->sortSpec = query.getFindCommandRequest().getSort();
-        keyGenNode->children.push_back(solnRoot.release());
+        keyGenNode->children.push_back(std::move(solnRoot));
         return keyGenNode;
     }
     return solnRoot;
 }
 
 /**
- * When projection needs to be added to the solution tree, this function chooses between the default
- * implementation and one of the fast paths.
+ * Returns a pointer to a COLUMN_SCAN node if there is one. Returns nullptr if it cannot be found or
+ * if there is any branching in the tree that would lead to more than one leaf node.
  */
-std::unique_ptr<ProjectionNode> analyzeProjection(const CanonicalQuery& query,
-                                                  std::unique_ptr<QuerySolutionNode> solnRoot,
-                                                  const bool hasSortStage) {
+const ColumnIndexScanNode* treeSourceIsColumnScan(const QuerySolutionNode* root) {
+    if (root->getType() == StageType::STAGE_COLUMN_SCAN) {
+        return static_cast<const ColumnIndexScanNode*>(root);
+    }
+
+    // Non-branching trees only, intentionally ignore >1 child.
+    if (root->children.size() == 1) {
+        return treeSourceIsColumnScan(root->children[0].get());
+    }
+    return nullptr;
+}
+
+/**
+ * When a projection needs to be added to the solution tree, this function chooses between the
+ * default implementation and one of the fast paths.
+ */
+std::unique_ptr<QuerySolutionNode> analyzeProjection(const CanonicalQuery& query,
+                                                     std::unique_ptr<QuerySolutionNode> solnRoot,
+                                                     const bool hasSortStage) {
     LOGV2_DEBUG(20949, 5, "PROJECTION: Current plan", "plan"_attr = redact(solnRoot->toString()));
+
+    const auto& projection = *query.getProj();
 
     // If the projection requires the entire document we add a fetch stage if not present. Otherwise
     // we add a fetch stage if we are not covered.
     if (!solnRoot->fetched() &&
-        (query.getProj()->requiresDocument() ||
-         (!providesAllFields(query.getProj()->getRequiredFields(), *solnRoot)))) {
+        (projection.requiresDocument() ||
+         !providesAllFields(projection.getRequiredFields(), *solnRoot))) {
         auto fetch = std::make_unique<FetchNode>();
-        fetch->children.push_back(solnRoot.release());
+        fetch->children.push_back(std::move(solnRoot));
         solnRoot = std::move(fetch);
     }
 
-    // There are two projection fast paths available for simple inclusion projections that don't
-    // need a sort key, don't have any dotted-path inclusions, don't have a positional projection,
-    // and don't have the 'requiresDocument' property: the ProjectionNodeSimple fast-path for plans
-    // that have a fetch stage and the ProjectionNodeCovered for plans with an index scan that the
-    // projection can cover. Plans that don't meet all the requirements for these fast path
-    // projections will all use ProjectionNodeDefault, which is able to handle all projections,
-    // covered or otherwise.
-    if (query.getProj()->isSimple()) {
-        // If the projection is simple, but not covered, use 'ProjectionNodeSimple'.
-        if (solnRoot->fetched()) {
+    // With the previous fetch analysis we know we have all the required fields. We know we have a
+    // projection specified, so we may need a projection node in the tree for any or multiple of the
+    // following reasons:
+    // - We have provided too many fields. Maybe we have the full document from a FETCH, or the
+    //   index scan is compound and has an extra field or two, or maybe some fields were needed
+    //   internally that the client didn't request.
+    // - We have a projection which computes new values using expressions - a "computed projection".
+    // - Finally, we could have the right data, but not in the format required to return to the
+    //   client. As one example: The format of data returned in index keys is meant for internal
+    //   consumers and is not returnable to a user.
+
+    // A generic "ProjectionNodeDefault" will take care of any of the three, but is slower due to
+    // its generic nature. We will attempt to avoid that for some "fast paths" first.
+    // All fast paths can only apply to "simple" projections - see the implementation for details.
+    if (projection.isSimple()) {
+        const bool isInclusionOnly = projection.isInclusionOnly();
+        // First fast path: We have a COLUMN_SCAN providing the data, there are no computed
+        // expressions, and the requested fields are provided exactly. For 'simple' projections
+        // which must have only top-level fields, A COLUMN_SCAN can provide data in a format safe to
+        // return to the client, so it is safe to elide any projection if the COLUMN_SCAN is
+        // outputting exactly the set of fields that the user required. This may not be the case all
+        // the time if say we needed an extra field for a sort or for shard filtering.
+        const auto* columnScan = treeSourceIsColumnScan(solnRoot.get());
+        if (columnScan && isInclusionOnly &&
+            columnScan->outputFields.size() == projection.getRequiredFields().size()) {
+            // No projection needed. We already checked that all necessary fields are provided, so
+            // if the set sizes match, they match exactly.
+            return solnRoot;
+        }
+
+        // Next fast path: A ProjectionNodeSimple fast-path for plans that have a materialized
+        // object from a FETCH or COLUMN_SCAN stage.
+        if (solnRoot->fetched() || columnScan != nullptr) {
+            // COLUMN_SCAN may fall into this case if it provided all the necessary data but had
+            // too many fields output, so we need to trim them down.
             return std::make_unique<ProjectionNodeSimple>(
                 addSortKeyGeneratorStageIfNeeded(query, hasSortStage, std::move(solnRoot)),
                 *query.root(),
-                *query.getProj());
-        } else {
-            // If we're here we're not fetched so we're covered. Let's see if we can get out of
-            // using the default projType. If 'solnRoot' is an index scan we can use the faster
-            // covered impl.
-            BSONObj coveredKeyObj = produceCoveredKeyObj(solnRoot.get());
+                projection);
+        }
+        if (isInclusionOnly) {
+            auto coveredKeyObj = produceCoveredKeyObj(solnRoot.get());
             if (!coveredKeyObj.isEmpty()) {
+                // Final fast path: ProjectionNodeCovered for plans with an index scan that the
+                // projection can cover.
                 return std::make_unique<ProjectionNodeCovered>(
                     addSortKeyGeneratorStageIfNeeded(query, hasSortStage, std::move(solnRoot)),
                     *query.root(),
-                    *query.getProj(),
+                    projection,
                     std::move(coveredKeyObj));
             }
         }
     }
 
+    // No fast path available, we need to add this generic projection node.
     return std::make_unique<ProjectionNodeDefault>(
         addSortKeyGeneratorStageIfNeeded(query, hasSortStage, std::move(solnRoot)),
         *query.root(),
-        *query.getProj());
+        projection);
 }
 
 /**
@@ -461,10 +582,10 @@ std::unique_ptr<QuerySolutionNode> tryPushdownProjectBeneathSort(
     //   PROJECT => SKIP => SORT
     // In this case we still want to push PROJECT beneath SORT.
     bool hasSkipBetween = false;
-    auto sortNodeCandidate = projectNode->children[0];
+    QuerySolutionNode* sortNodeCandidate = projectNode->children[0].get();
     if (sortNodeCandidate->getType() == STAGE_SKIP) {
         hasSkipBetween = true;
-        sortNodeCandidate = sortNodeCandidate->children[0];
+        sortNodeCandidate = sortNodeCandidate->children[0].get();
     }
 
     if (!isSortStageType(sortNodeCandidate->getType())) {
@@ -498,7 +619,7 @@ std::unique_ptr<QuerySolutionNode> tryPushdownProjectBeneathSort(
     //   SKIP => SORT => PROJECT => CHILD
     //
     // First, detach the bottom of the tree. This part is CHILD in the comment above.
-    std::unique_ptr<QuerySolutionNode> restOfTree{sortNode->children[0]};
+    std::unique_ptr<QuerySolutionNode> restOfTree = std::move(sortNode->children[0]);
     invariant(sortNode->children.size() == 1u);
     sortNode->children.clear();
 
@@ -507,7 +628,7 @@ std::unique_ptr<QuerySolutionNode> tryPushdownProjectBeneathSort(
     //   SORT
     // Or this if we have SKIP:
     //   SKIP => SORT
-    std::unique_ptr<QuerySolutionNode> ownedProjectionInput{projectNode->children[0]};
+    std::unique_ptr<QuerySolutionNode> ownedProjectionInput = std::move(projectNode->children[0]);
     sortNode = nullptr;
     invariant(projectNode->children.size() == 1u);
     projectNode->children.clear();
@@ -516,19 +637,19 @@ std::unique_ptr<QuerySolutionNode> tryPushdownProjectBeneathSort(
     // We want to get the following structure:
     //   PROJECT => CHILD
     std::unique_ptr<QuerySolutionNode> ownedProjectionNode = std::move(root);
-    ownedProjectionNode->children.push_back(restOfTree.release());
+    ownedProjectionNode->children.push_back(std::move(restOfTree));
 
     // Attach the projection as the child of the sort stage.
     if (hasSkipBetween) {
         // In this case 'ownedProjectionInput' points to the structure:
         //   SKIP => SORT
         // And to attach PROJECT => CHILD to it, we need to access children of SORT stage.
-        ownedProjectionInput->children[0]->children.push_back(ownedProjectionNode.release());
+        ownedProjectionInput->children[0]->children.push_back(std::move(ownedProjectionNode));
     } else {
         // In this case 'ownedProjectionInput' points to the structure:
         //   SORT
         // And we can just add PROJECT => CHILD to its children.
-        ownedProjectionInput->children.push_back(ownedProjectionNode.release());
+        ownedProjectionInput->children.push_back(std::move(ownedProjectionNode));
     }
 
     // Re-compute properties so that they reflect the new structure of the tree.
@@ -551,10 +672,36 @@ bool canUseSimpleSort(const QuerySolutionNode& solnRoot,
         // record ids along through the sorting process is wasted work when these ids will never be
         // consumed later in the execution of the query. If the record ids are needed, however, then
         // we can't use the simple sort stage.
-        !(plannerParams.options & QueryPlannerParams::PRESERVE_RECORD_ID);
+        !cq.getForceGenerateRecordId();
 }
 
-void removeProjectSimpleBelowGroupRecursive(QuerySolutionNode* solnRoot) {
+boost::optional<const projection_ast::Projection*> attemptToGetProjectionFromQuerySolution(
+    const QuerySolutionNode& projectNodeCandidate) {
+    switch (projectNodeCandidate.getType()) {
+        case StageType::STAGE_PROJECTION_DEFAULT:
+            return &static_cast<const ProjectionNodeDefault*>(&projectNodeCandidate)->proj;
+        case StageType::STAGE_PROJECTION_SIMPLE:
+            return &static_cast<const ProjectionNodeSimple*>(&projectNodeCandidate)->proj;
+        default:
+            return boost::none;
+    }
+}
+
+/**
+ * Returns true if 'setL' is a non-strict subset of 'setR'.
+ *
+ * The types of the sets are permitted to be different to allow checking something with compatible
+ * but different types e.g. std::set<std::string> and StringDataUnorderedMap.
+ */
+template <typename SetL, typename SetR>
+bool isSubset(const SetL& setL, const SetR& setR) {
+    return setL.size() <= setR.size() &&
+        std::all_of(setL.begin(), setL.end(), [&setR](auto&& lElem) {
+               return setR.find(lElem) != setR.end();
+           });
+}
+
+void removeInclusionProjectionBelowGroupRecursive(QuerySolutionNode* solnRoot) {
     if (solnRoot == nullptr) {
         return;
     }
@@ -565,77 +712,128 @@ void removeProjectSimpleBelowGroupRecursive(QuerySolutionNode* solnRoot) {
     if (solnRoot->getType() == StageType::STAGE_GROUP) {
         auto groupNode = static_cast<GroupNode*>(solnRoot);
 
-        auto projectNodeCandidate = groupNode->children[0];
-        if (projectNodeCandidate->getType() == StageType::STAGE_GROUP) {
-            // Multiple $group stages may be pushed down. So, if the child is a GROUP, then recurse.
-            removeProjectSimpleBelowGroupRecursive(projectNodeCandidate);
-            return;
-        } else if (projectNodeCandidate->getType() != StageType::STAGE_PROJECTION_SIMPLE) {
-            // There's no PROJECTION_SIMPLE sitting below root and we don't expect another pattern
-            // in the sub-tree, so bail out of the recursion. If we ran into a case of a computed
-            // projection, it would have type PROJECTION_DEFAULT.
-            return;
-        }
-
-        // Check to see if the projectNode's field set is a super set of the groupNodes.
-        auto projectNode = static_cast<ProjectionNodeSimple*>(projectNodeCandidate);
-        auto projectFields = projectNode->proj.getRequiredFields();
-        if (!std::any_of(projectFields.begin(), projectFields.end(), [groupNode](auto&& fld) {
-                return groupNode->requiredFields.contains(fld);
-            })) {
-            // The dependency set of the GROUP stage is wider than the projectNode field set.
-            return;
-        };
-
-        // Attach the projectNode's child to the groupNode's child.
-        groupNode->children[0] = projectNode->children[0];
-        projectNode->children[0] = nullptr;
-
-        // Get rid of the project simple node.
-        delete projectNode;
-    } else {
-        // Keep traversing the tree in search of a GROUP stage.
-        for (size_t i = 0; i < solnRoot->children.size(); ++i) {
-            removeProjectSimpleBelowGroupRecursive(solnRoot->children[i]);
+        QuerySolutionNode* projectNodeCandidate = groupNode->children[0].get();
+        if (auto projection = attemptToGetProjectionFromQuerySolution(*projectNodeCandidate);
+            // only eliminate inclusion projections
+            projection && projection.value()->isInclusionOnly() &&
+            // only eliminate projections which preserve all fields used by the group
+            isSubset(groupNode->requiredFields, projection.value()->getRequiredFields())) {
+            // Attach the projectNode's child directly as the groupNode's child, eliminating the
+            // project node.
+            groupNode->children[0] = std::move(projectNodeCandidate->children[0]);
         }
     }
+
+    // Keep traversing the tree in search of GROUP stages.
+    for (size_t i = 0; i < solnRoot->children.size(); ++i) {
+        removeInclusionProjectionBelowGroupRecursive(solnRoot->children[i].get());
+    }
+}
+
+// Determines whether 'index' is eligible for executing the right side of a pushed down $lookup over
+// 'foreignField'.
+bool isIndexEligibleForRightSideOfLookupPushdown(const IndexEntry& index,
+                                                 const CollatorInterface* collator,
+                                                 const std::string& foreignField) {
+    return (index.type == INDEX_BTREE || index.type == INDEX_HASHED) &&
+        index.keyPattern.firstElement().fieldName() == foreignField && !index.filterExpr &&
+        !index.sparse && CollatorInterface::collatorsMatch(collator, index.collator);
+}
+
+/**
+ * Sets the lowPriority parameter on the given node if it is an unbounded collection scan.
+ */
+void deprioritizeUnboundedCollectionScan(QuerySolutionNode* solnRoot,
+                                         const FindCommandRequest& findCommand) {
+    if (solnRoot->getType() != StageType::STAGE_COLLSCAN) {
+        return;
+    }
+
+    auto sort = findCommand.getSort();
+    if (findCommand.getLimit() &&
+        (sort.isEmpty() || sort[query_request_helper::kNaturalSortField])) {
+        // There is a limit with either no sort or the natural sort.
+        return;
+    }
+
+    auto collScan = checked_cast<CollectionScanNode*>(solnRoot);
+    if (collScan->minRecord || collScan->maxRecord) {
+        // This scan is not unbounded.
+        return;
+    }
+
+    collScan->lowPriority = true;
 }
 }  // namespace
 
+bool QueryPlannerAnalysis::isEligibleForHashJoin(const SecondaryCollectionInfo& foreignCollInfo) {
+    return !internalQueryDisableLookupExecutionUsingHashJoin.load() && foreignCollInfo.exists &&
+        foreignCollInfo.stats.noOfRecords <=
+        internalQueryCollectionMaxNoOfDocumentsToChooseHashJoin.load() &&
+        foreignCollInfo.stats.approximateDataSizeBytes <=
+        internalQueryCollectionMaxDataSizeBytesToChooseHashJoin.load() &&
+        foreignCollInfo.stats.storageSizeBytes <=
+        internalQueryCollectionMaxStorageSizeBytesToChooseHashJoin.load();
+}
+
 // static
-std::unique_ptr<QuerySolution> QueryPlannerAnalysis::removeProjectSimpleBelowGroup(
+std::unique_ptr<QuerySolution> QueryPlannerAnalysis::removeInclusionProjectionBelowGroup(
     std::unique_ptr<QuerySolution> soln) {
     auto root = soln->extractRoot();
 
-    removeProjectSimpleBelowGroupRecursive(root.get());
+    removeInclusionProjectionBelowGroupRecursive(root.get());
 
     soln->setRoot(std::move(root));
     return soln;
 }
 
-// Checks if the foreign collection is eligible for the hash join algorithm. We conservatively
-// choose the hash join algorithm for cases when the hash table is unlikely to spill data.
-bool isEligibleForHashJoin(const SecondaryCollectionInfo& foreignCollInfo) {
-    return !internalQueryDisableLookupExecutionUsingHashJoin.load() &&
-        foreignCollInfo.noOfRecords <=
-        internalQueryCollectionMaxNoOfDocumentsToChooseHashJoin.load() &&
-        foreignCollInfo.approximateDataSizeBytes <=
-        internalQueryCollectionMaxDataSizeBytesToChooseHashJoin.load() &&
-        foreignCollInfo.storageSizeBytes <=
-        internalQueryCollectionMaxStorageSizeBytesToChooseHashJoin.load();
-}
+// static
+void QueryPlannerAnalysis::removeUselessColumnScanRowStoreExpression(QuerySolutionNode& root) {
+    // If a group or projection's child is a COLUMN_SCAN node, try to eliminate the
+    // expression that projects documents retrieved from row store fallback. In other words, the
+    // COLUMN_SCAN's rowStoreExpression can be removed if it does not affect the group or
+    // project above.
+    for (auto& child : root.children) {
+        if (child->getType() == STAGE_COLUMN_SCAN) {
+            auto childColumnScan = static_cast<ColumnIndexScanNode*>(child.get());
 
-bool isEligibleForIndexedLoopJoin() {
-    return feature_flags::gFeatureFlagSBELookupPushdownIndexJoin.isEnabledAndIgnoreFCV();
+            // Look for group above column scan.
+            if (root.getType() == STAGE_GROUP) {
+                auto& parentGroup = static_cast<GroupNode&>(root);
+                // A row store expression that preserves all fields used by the parent $group is
+                // redundant and can be removed.
+                if (!childColumnScan->extraFieldsPermitted &&
+                    isSubset(parentGroup.requiredFields, childColumnScan->outputFields)) {
+                    childColumnScan->extraFieldsPermitted = true;
+                }
+            }
+            // Look for projection above column scan.
+            else if (root.getType() == STAGE_PROJECTION_SIMPLE ||
+                     root.getType() == STAGE_PROJECTION_DEFAULT) {
+                auto& parentProjection = static_cast<ProjectionNode&>(root);
+                // A row store expression that preserves all fields used by the parent projection is
+                // redundant and can be removed.
+                if (!childColumnScan->extraFieldsPermitted &&
+                    isSubset(parentProjection.proj.getRequiredFields(),
+                             childColumnScan->outputFields)) {
+                    childColumnScan->extraFieldsPermitted = true;
+                }
+            }
+        }
+        // Recur on child.
+        removeUselessColumnScanRowStoreExpression(*child);
+    }
 }
 
 // static
-void QueryPlannerAnalysis::determineLookupStrategy(
-    EqLookupNode* eqLookupNode,
+std::pair<EqLookupNode::LookupStrategy, boost::optional<IndexEntry>>
+QueryPlannerAnalysis::determineLookupStrategy(
+    const NamespaceString& foreignCollName,
+    const std::string& foreignField,
     const std::map<NamespaceString, SecondaryCollectionInfo>& collectionsInfo,
-    bool allowDiskUse) {
-    const auto& foreignCollName = eqLookupNode->foreignCollection;
-    auto foreignCollItr = collectionsInfo.find(NamespaceString(foreignCollName));
+    bool allowDiskUse,
+    const CollatorInterface* collator) {
+    auto foreignCollItr = collectionsInfo.find(foreignCollName);
     tassert(5842600,
             str::stream() << "Expected collection info, but found none; target collection: "
                           << foreignCollName,
@@ -662,9 +860,7 @@ void QueryPlannerAnalysis::determineLookupStrategy(
             });
 
         for (const auto& index : indexes) {
-            if ((index.type == INDEX_BTREE || index.type == INDEX_HASHED) &&
-                index.keyPattern.firstElement().fieldName() ==
-                    eqLookupNode->joinFieldForeign.fullPath()) {
+            if (isIndexEligibleForRightSideOfLookupPushdown(index, collator, foreignField)) {
                 return index;
             }
         }
@@ -672,13 +868,14 @@ void QueryPlannerAnalysis::determineLookupStrategy(
         return boost::none;
     }();
 
-    if (foreignIndex && isEligibleForIndexedLoopJoin()) {
-        eqLookupNode->lookupStrategy = EqLookupNode::LookupStrategy::kIndexedLoopJoin;
-        eqLookupNode->idxEntry = foreignIndex;
+    if (!foreignCollItr->second.exists) {
+        return {EqLookupNode::LookupStrategy::kNonExistentForeignCollection, boost::none};
+    } else if (foreignIndex) {
+        return {EqLookupNode::LookupStrategy::kIndexedLoopJoin, std::move(foreignIndex)};
     } else if (allowDiskUse && isEligibleForHashJoin(foreignCollItr->second)) {
-        eqLookupNode->lookupStrategy = EqLookupNode::LookupStrategy::kHashJoin;
+        return {EqLookupNode::LookupStrategy::kHashJoin, boost::none};
     } else {
-        eqLookupNode->lookupStrategy = EqLookupNode::LookupStrategy::kNestedLoopJoin;
+        return {EqLookupNode::LookupStrategy::kNestedLoopJoin, boost::none};
     }
 }
 
@@ -700,7 +897,7 @@ void QueryPlannerAnalysis::analyzeGeo(const QueryPlannerParams& params,
             continue;
         }
 
-        for (auto elt : indexEntry.keyPattern) {
+        for (auto& elt : indexEntry.keyPattern) {
             if (elt.type() == BSONType::String && elt.String() == "2dsphere") {
                 twoDSphereFields.insert(elt.fieldName());
             }
@@ -730,16 +927,15 @@ BSONObj QueryPlannerAnalysis::getSortPattern(const BSONObj& indexKeyPattern) {
 // static
 bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
                                           const QueryPlannerParams& params,
-                                          QuerySolutionNode** solnRoot) {
+                                          std::unique_ptr<QuerySolutionNode>* solnRoot) {
     vector<QuerySolutionNode*> explodableNodes;
 
-    QuerySolutionNode* toReplace;
-    if (!structureOKForExplode(*solnRoot, &toReplace)) {
+    std::unique_ptr<QuerySolutionNode>* toReplace = structureOKForExplode(solnRoot);
+    if (!toReplace)
         return false;
-    }
 
     // Find explodable nodes in the subtree rooted at 'toReplace'.
-    getExplodableNodes(toReplace, &explodableNodes);
+    getExplodableNodes(toReplace->get(), &explodableNodes);
 
     const BSONObj& desiredSort = query.getFindCommandRequest().getSort();
 
@@ -772,13 +968,21 @@ bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
         // How many scans will we create if we blow up this ixscan?
         size_t numScans = 1;
 
-        // Skip every field that is a union of point intervals and build the resulting sort
-        // order from the remaining fields.
+        // Skip every field that is a union of point intervals. When the index scan is
+        // parameterized, we need to check IET instead of the index bounds alone because we need to
+        // make sure the same number of exploded index scans will result given any set of input
+        // parameters. So that when the plan is recovered from cache and parameterized, we will be
+        // sure to have the same number of sort merge branches.
         BSONObjIterator kpIt(isn->index.keyPattern);
         size_t boundsIdx = 0;
         while (kpIt.more()) {
-            const OrderedIntervalList& oil = bounds.fields[boundsIdx];
-            if (!isUnionOfPoints(oil)) {
+            const auto& oil = bounds.fields[boundsIdx];
+            boost::optional<interval_evaluation_tree::IET> iet;
+            if (!isn->iets.empty()) {
+                invariant(boundsIdx < isn->iets.size());
+                iet = isn->iets[boundsIdx];
+            }
+            if (!isOilExplodable(oil, iet)) {
                 break;
             }
             numScans *= oil.intervals.size();
@@ -860,33 +1064,90 @@ bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
 
     // If we're here, we can (probably?  depends on how restrictive the structure check is)
     // get our sort order via ixscan blow-up.
-    MergeSortNode* merge = new MergeSortNode();
+    auto merge = std::make_unique<MergeSortNode>();
     merge->sort = desiredSort;
+
+    // Exploded nodes all take different point prefix so they should produce disjoint results.
+    // We only deduplicate if some original index scans need to deduplicate.
+    merge->dedup = false;
     for (size_t i = 0; i < explodableNodes.size(); ++i) {
-        explodeNode(explodableNodes[i], desiredSort, fieldsToExplode[i], &merge->children);
+        if (explodeNode(explodableNodes[i], i, desiredSort, fieldsToExplode[i], &merge->children)) {
+            merge->dedup = true;
+        }
     }
 
     merge->computeProperties();
 
-    // Replace 'toReplace' with the new merge sort node.
-    replaceNodeInTree(solnRoot, toReplace, merge);
-    // And get rid of the node that got replaced.
-    delete toReplace;
+    *toReplace = std::move(merge);
 
     return true;
 }
 
+// This function is used to check if the given index pattern and direction in the traversal
+// preference can be used to satisfy the given sort pattern (specifically for time series
+// collections).
+bool sortMatchesTraversalPreference(const TraversalPreference& traversalPreference,
+                                    const BSONObj& indexPattern) {
+    BSONObjIterator sortIter(traversalPreference.sortPattern);
+    BSONObjIterator indexIter(indexPattern);
+    while (sortIter.more() && indexIter.more()) {
+        BSONElement sortPart = sortIter.next();
+        BSONElement indexPart = indexIter.next();
+
+        if (!sortPart.isNumber() || !indexPart.isNumber()) {
+            return false;
+        }
+
+        // If the field doesn't match or the directions don't match, we return false.
+        if (strcmp(sortPart.fieldName(), indexPart.fieldName()) != 0 ||
+            (sortPart.safeNumberInt() > 0) != (indexPart.safeNumberInt() > 0)) {
+            return false;
+        }
+    }
+
+    if (!indexIter.more() && sortIter.more()) {
+        // The sort still has more, so it cannot be a prefix of the index.
+        return false;
+    }
+    return true;
+}
+
+bool isShardedCollScan(QuerySolutionNode* solnRoot) {
+    return solnRoot->getType() == StageType::STAGE_SHARDING_FILTER &&
+        solnRoot->children.size() == 1 &&
+        solnRoot->children[0]->getType() == StageType::STAGE_COLLSCAN;
+}
+
 // static
-QuerySolutionNode* QueryPlannerAnalysis::analyzeSort(const CanonicalQuery& query,
-                                                     const QueryPlannerParams& params,
-                                                     QuerySolutionNode* solnRoot,
-                                                     bool* blockingSortOut) {
+std::unique_ptr<QuerySolutionNode> QueryPlannerAnalysis::analyzeSort(
+    const CanonicalQuery& query,
+    const QueryPlannerParams& params,
+    std::unique_ptr<QuerySolutionNode> solnRoot,
+    bool* blockingSortOut) {
     *blockingSortOut = false;
 
     const FindCommandRequest& findCommand = query.getFindCommandRequest();
-    tassert(5746105,
-            "ntoreturn on the find command should not be set",
-            findCommand.getNtoreturn() == boost::none);
+    if (params.traversalPreference) {
+        // If we've been passed a traversal preference, we might want to reverse the order we scan
+        // the data to avoid a blocking sort later in the pipeline.
+        auto providedSorts = solnRoot->providedSorts();
+
+        BSONObj solnSortPattern;
+        if (solnRoot->getType() == StageType::STAGE_COLLSCAN || isShardedCollScan(solnRoot.get())) {
+            BSONObjBuilder builder;
+            builder.append(params.traversalPreference->clusterField, 1);
+            solnSortPattern = builder.obj();
+        } else {
+            solnSortPattern = providedSorts.getBaseSortPattern();
+        }
+
+        if (sortMatchesTraversalPreference(params.traversalPreference.value(), solnSortPattern) &&
+            QueryPlannerCommon::scanDirectionsEqual(solnRoot.get(),
+                                                    -params.traversalPreference->direction)) {
+            QueryPlannerCommon::reverseScans(solnRoot.get(), true);
+            return solnRoot;
+        }
+    }
 
     const BSONObj& sortObj = findCommand.getSort();
 
@@ -913,7 +1174,7 @@ QuerySolutionNode* QueryPlannerAnalysis::analyzeSort(const CanonicalQuery& query
     // If so, we can reverse the scan direction(s).
     BSONObj reverseSort = QueryPlannerCommon::reverseSortObj(sortObj);
     if (providedSorts.contains(reverseSort)) {
-        QueryPlannerCommon::reverseScans(solnRoot);
+        QueryPlannerCommon::reverseScans(solnRoot.get());
         LOGV2_DEBUG(20951,
                     5,
                     "Reversing ixscan to provide sort",
@@ -931,19 +1192,18 @@ QuerySolutionNode* QueryPlannerAnalysis::analyzeSort(const CanonicalQuery& query
     // If we're here, we need to add a sort stage.
 
     if (!solnRoot->fetched()) {
-        const bool sortIsCovered =
-            std::all_of(sortObj.begin(), sortObj.end(), [solnRoot](BSONElement e) {
-                // Note that hasField() will return 'false' in the case that this field is a string
-                // and there is a non-simple collation on the index. This will lead to encoding of
-                // the field from the document on fetch, despite having read the encoded value from
-                // the index.
-                return solnRoot->hasField(e.fieldName());
-            });
+        const bool sortIsCovered = std::all_of(sortObj.begin(), sortObj.end(), [&](BSONElement e) {
+            // Note that hasField() will return 'false' in the case that this field is a string
+            // and there is a non-simple collation on the index. This will lead to encoding of
+            // the field from the document on fetch, despite having read the encoded value from
+            // the index.
+            return solnRoot->hasField(e.fieldName());
+        });
 
         if (!sortIsCovered) {
-            FetchNode* fetch = new FetchNode();
-            fetch->children.push_back(solnRoot);
-            solnRoot = fetch;
+            auto fetch = std::make_unique<FetchNode>();
+            fetch->children.push_back(std::move(solnRoot));
+            solnRoot = std::move(fetch);
         }
     }
 
@@ -954,20 +1214,19 @@ QuerySolutionNode* QueryPlannerAnalysis::analyzeSort(const CanonicalQuery& query
         sortNode = std::make_unique<SortNodeDefault>();
     }
     sortNode->pattern = sortObj;
-    sortNode->children.push_back(solnRoot);
+    sortNode->children.push_back(std::move(solnRoot));
     sortNode->addSortKeyMetadata = query.metadataDeps()[DocumentMetadataFields::kSortKey];
-    solnRoot = sortNode.release();
-    auto sortNodeRaw = static_cast<SortNode*>(solnRoot);
     // When setting the limit on the sort, we need to consider both
     // the limit N and skip count M. The sort should return an ordered list
     // N + M items so that the skip stage can discard the first M results.
     if (findCommand.getLimit()) {
         // The limit can be combined with the SORT stage.
-        sortNodeRaw->limit = static_cast<size_t>(*findCommand.getLimit()) +
+        sortNode->limit = static_cast<size_t>(*findCommand.getLimit()) +
             static_cast<size_t>(findCommand.getSkip().value_or(0));
     } else {
-        sortNodeRaw->limit = 0;
+        sortNode->limit = 0;
     }
+    solnRoot = std::move(sortNode);
 
     *blockingSortOut = true;
 
@@ -984,6 +1243,10 @@ std::unique_ptr<QuerySolution> QueryPlannerAnalysis::analyzeDataAccess(
     solnRoot->computeProperties();
 
     analyzeGeo(params, solnRoot.get());
+
+    const FindCommandRequest& findCommand = query.getFindCommandRequest();
+
+    deprioritizeUnboundedCollectionScan(solnRoot.get(), findCommand);
 
     // solnRoot finds all our results.  Let's see what transformations we must perform to the
     // data.
@@ -1015,19 +1278,19 @@ std::unique_ptr<QuerySolution> QueryPlannerAnalysis::analyzeDataAccess(
             }
 
             if (fetch) {
-                FetchNode* fetchNode = new FetchNode();
-                fetchNode->children.push_back(solnRoot.release());
-                solnRoot.reset(fetchNode);
+                auto fetchNode = std::make_unique<FetchNode>();
+                fetchNode->children.push_back(std::move(solnRoot));
+                solnRoot = std::move(fetchNode);
             }
         }
 
-        ShardingFilterNode* sfn = new ShardingFilterNode();
-        sfn->children.push_back(solnRoot.release());
-        solnRoot.reset(sfn);
+        auto sfn = std::make_unique<ShardingFilterNode>();
+        sfn->children.push_back(std::move(solnRoot));
+        solnRoot = std::move(sfn);
     }
 
     bool hasSortStage = false;
-    solnRoot.reset(analyzeSort(query, params, solnRoot.release(), &hasSortStage));
+    solnRoot = analyzeSort(query, params, std::move(solnRoot), &hasSortStage);
 
     // This can happen if we need to create a blocking sort stage and we're not allowed to.
     if (!solnRoot) {
@@ -1039,12 +1302,10 @@ std::unique_ptr<QuerySolution> QueryPlannerAnalysis::analyzeDataAccess(
     bool hasAndHashStage = solnRoot->hasNode(STAGE_AND_HASH);
     soln->hasBlockingStage = hasSortStage || hasAndHashStage;
 
-    const FindCommandRequest& findCommand = query.getFindCommandRequest();
-
     if (findCommand.getSkip()) {
         auto skip = std::make_unique<SkipNode>();
         skip->skip = *findCommand.getSkip();
-        skip->children.push_back(solnRoot.release());
+        skip->children.push_back(std::move(solnRoot));
         solnRoot = std::move(skip);
     }
 
@@ -1064,10 +1325,10 @@ std::unique_ptr<QuerySolution> QueryPlannerAnalysis::analyzeDataAccess(
         solnRoot = addSortKeyGeneratorStageIfNeeded(query, hasSortStage, std::move(solnRoot));
 
         // If there's no projection, we must fetch, as the user wants the entire doc.
-        if (!solnRoot->fetched() && !(params.options & QueryPlannerParams::IS_COUNT)) {
-            FetchNode* fetch = new FetchNode();
-            fetch->children.push_back(solnRoot.release());
-            solnRoot.reset(fetch);
+        if (!solnRoot->fetched() && !query.isCountLike()) {
+            auto fetch = std::make_unique<FetchNode>();
+            fetch->children.push_back(std::move(solnRoot));
+            solnRoot = std::move(fetch);
         }
     }
 
@@ -1075,13 +1336,15 @@ std::unique_ptr<QuerySolution> QueryPlannerAnalysis::analyzeDataAccess(
     // sort. Otherwise, we will have to enforce the limit ourselves since it's not handled inside
     // SORT.
     if (!hasSortStage && findCommand.getLimit()) {
-        LimitNode* limit = new LimitNode();
+        auto limit = std::make_unique<LimitNode>();
         limit->limit = *findCommand.getLimit();
-        limit->children.push_back(solnRoot.release());
-        solnRoot.reset(limit);
+        limit->children.push_back(std::move(solnRoot));
+        solnRoot = std::move(limit);
     }
 
     solnRoot = tryPushdownProjectBeneathSort(std::move(solnRoot));
+
+    QueryPlannerAnalysis::removeUselessColumnScanRowStoreExpression(*solnRoot);
 
     soln->setRoot(std::move(solnRoot));
     return soln;

@@ -1,59 +1,66 @@
 // Helper functions for testing time-series collections.
+// The test runs commands that are not allowed with security token: movechunk, split.
+// @tags: [not_allowed_with_security_token]
 
 load("jstests/libs/feature_flag_util.js");
+load("jstests/aggregation/extras/utils.js");
 
 var TimeseriesTest = class {
-    /**
-     * Returns whether time-series bucket compression are supported.
-     */
-    static timeseriesBucketCompressionEnabled(conn) {
-        return FeatureFlagUtil.isEnabled(conn, "TimeseriesBucketCompression");
+    static getBucketMaxSpanSecondsFromGranularity(granularity) {
+        switch (granularity) {
+            case 'seconds':
+                return 60 * 60;
+            case 'minutes':
+                return 60 * 60 * 24;
+            case 'hours':
+                return 60 * 60 * 24 * 30;
+            default:
+                assert(false, 'Invalid granularity: ' + granularity);
+        }
+    }
+
+    static getBucketRoundingSecondsFromGranularity(granularity) {
+        switch (granularity) {
+            case 'seconds':
+                return 60;
+            case 'minutes':
+                return 60 * 60;
+            case 'hours':
+                return 60 * 60 * 24;
+            default:
+                assert(false, 'Invalid granularity: ' + granularity);
+        }
     }
 
     /**
-     * Returns whether time-series updates and deletes are supported.
+     * Returns whether time-series scalability improvements (like bucket reopening) are enabled.
+     * TODO SERVER-66438 remove this helper.
      */
-    static timeseriesUpdatesAndDeletesEnabled(conn) {
-        return assert
-            .commandWorked(
-                conn.adminCommand({getParameter: 1, featureFlagTimeseriesUpdatesAndDeletes: 1}))
-            .featureFlagTimeseriesUpdatesAndDeletes.value;
+    static timeseriesScalabilityImprovementsEnabled(conn) {
+        return FeatureFlagUtil.isPresentAndEnabled(conn, "TimeseriesScalabilityImprovements");
     }
 
     /**
      * Returns whether sharded time-series updates and deletes are supported.
+     * TODO SERVER-69320 remove this helper.
      */
     static shardedTimeseriesUpdatesAndDeletesEnabled(conn) {
-        return assert
-            .commandWorked(
-                conn.adminCommand({getParameter: 1, featureFlagShardedTimeSeriesUpdateDelete: 1}))
-            .featureFlagShardedTimeSeriesUpdateDelete.value;
+        return FeatureFlagUtil.isPresentAndEnabled(conn, "ShardedTimeSeriesUpdateDelete");
     }
 
+    // TODO SERVER-69320 remove this helper.
     static shardedtimeseriesCollectionsEnabled(conn) {
-        return assert
-            .commandWorked(conn.adminCommand({getParameter: 1, featureFlagShardedTimeSeries: 1}))
-            .featureFlagShardedTimeSeries.value;
+        return FeatureFlagUtil.isPresentAndEnabled(conn, "ShardedTimeSeries");
     }
 
-    static shardedTimeseriesUpdatesAndDeletesEnabled(conn) {
-        return assert
-            .commandWorked(
-                conn.adminCommand({getParameter: 1, featureFlagShardedTimeSeriesUpdateDelete: 1}))
-            .featureFlagShardedTimeSeriesUpdateDelete.value;
-    }
-
+    // TODO SERVER-65082 remove this helper.
     static timeseriesMetricIndexesEnabled(conn) {
-        return assert
-            .commandWorked(
-                conn.adminCommand({getParameter: 1, featureFlagTimeseriesMetricIndexes: 1}))
-            .featureFlagTimeseriesMetricIndexes.value;
+        return FeatureFlagUtil.isPresentAndEnabled(conn, "TimeseriesMetricIndexes");
     }
 
+    // TODO SERVER-69324 remove this helper.
     static bucketUnpackWithSortEnabled(conn) {
-        return assert
-            .commandWorked(conn.adminCommand({getParameter: 1, featureFlagBucketUnpackWithSort: 1}))
-            .featureFlagBucketUnpackWithSort.value;
+        return FeatureFlagUtil.isPresentAndEnabled(conn, "BucketUnpackWithSort");
     }
 
     /**
@@ -194,5 +201,61 @@ var TimeseriesTest = class {
 
         testFn(insert(true));
         testFn(insert(false));
+    }
+
+    static ensureDataIsDistributedIfSharded(coll, splitPointDate) {
+        const db = coll.getDB();
+        const buckets = db[this.getBucketsCollName(coll.getName())];
+        if (FixtureHelpers.isSharded(buckets)) {
+            const timeFieldName =
+                db.getCollectionInfos({name: coll.getName()})[0].options.timeseries.timeField;
+
+            const splitPoint = {[`control.min.${timeFieldName}`]: splitPointDate};
+            assert.commandWorked(db.adminCommand(
+                {split: `${db.getName()}.${buckets.getName()}`, middle: splitPoint}));
+
+            const allShards = db.getSiblingDB("config").shards.find().sort({_id: 1}).toArray().map(
+                doc => doc._id);
+            const currentShards = buckets
+                                      .aggregate([
+                                          {"$collStats": {storageStats: {}}},
+                                          {$project: {shard: 1}},
+                                          {$sort: {shard: 1}}
+                                      ])
+                                      .toArray()
+                                      .map(doc => doc.shard);
+
+            if (!documentEq(allShards, currentShards)) {
+                let otherShard;
+                for (let i in allShards) {
+                    if (!currentShards.includes(allShards[i])) {
+                        otherShard = allShards[i];
+                        break;
+                    }
+                }
+                assert(otherShard);
+
+                assert.commandWorked(db.adminCommand({
+                    movechunk: `${db.getName()}.${buckets.getName()}`,
+                    find: splitPoint,
+                    to: otherShard,
+                    _waitForDelete: true
+                }));
+
+                const updatedShards = buckets
+                                          .aggregate([
+                                              {"$collStats": {storageStats: {}}},
+                                              {$project: {shard: 1}},
+                                              {$sort: {shard: 1}}
+                                          ])
+                                          .toArray()
+                                          .map(doc => doc.shard);
+                assert.eq(updatedShards.length, currentShards.length + 1);
+            }
+        }
+    }
+
+    static getBucketsCollName(collName) {
+        return `system.buckets.${collName}`;
     }
 };

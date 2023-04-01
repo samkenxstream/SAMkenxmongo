@@ -1,11 +1,13 @@
 // replica set as solo shard
 // TODO: Add assertion code that catches hang
+// @tags: [temporary_catalog_shard_incompatible]
 
 // The UUID and index check must be able to contact the shard primaries, but this test manually
 // stops 2/3 nodes of a replica set.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
 (function() {
 "use strict";

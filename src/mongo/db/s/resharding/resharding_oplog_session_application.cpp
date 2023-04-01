@@ -32,13 +32,13 @@
 #include "mongo/db/s/resharding/resharding_oplog_session_application.h"
 
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/s/resharding/resharding_data_copy_util.h"
 #include "mongo/db/storage/write_unit_of_work.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/logv2/redaction.h"
 
 namespace mongo {
@@ -138,7 +138,7 @@ boost::optional<SharedSemiFuture<void>> ReshardingOplogSessionApplication::tryAp
         isRetryableWrite ? op.getStatementIds() : std::vector<StmtId>{kIncompleteHistoryStmtId};
     invariant(!stmtIds.empty());
 
-    auto opId = ReshardingDonorOplogId::parse({"ReshardingOplogSessionApplication"},
+    auto opId = ReshardingDonorOplogId::parse(IDLParserContext{"ReshardingOplogSessionApplication"},
                                               op.get_id()->getDocument().toBson());
 
     boost::optional<repl::OpTime> preImageOpTime;

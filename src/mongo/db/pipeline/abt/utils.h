@@ -30,25 +30,40 @@
 #pragma once
 
 #include "mongo/db/exec/document_value/value.h"
-#include "mongo/db/exec/sbe/values/bson.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/query/optimizer/node.h"
 
+
 namespace mongo::optimizer {
 
-/**
- * Generate an AST to compute "coerceToBool" on the input. Expects a variable name to use as a let
- * variable.
- */
-ABT generateCoerceToBool(ABT input, const std::string& varName);
-
-std::pair<sbe::value::TypeTags, sbe::value::Value> convertFrom(Value val);
-
 using ABTFieldNameFn =
-    std::function<ABT(const std::string& fieldName, const bool isLastElement, ABT input)>;
+    std::function<ABT(FieldNameType fieldName, const bool isLastElement, ABT input)>;
+
+/**
+ * Translates an aggregation FieldPath by invoking the `fieldNameFn` for each path component.
+ */
 ABT translateFieldPath(const FieldPath& fieldPath,
                        ABT initial,
                        const ABTFieldNameFn& fieldNameFn,
                        size_t skipFromStart = 0);
+
+/**
+ * Translates a given FieldRef (typically used in a MatchExpression) with 'initial' as the input
+ * ABT.
+ */
+ABT translateFieldRef(const FieldRef& fieldRef, ABT initial);
+
+/**
+ * Return the minimum or maximum value for the "class" of values represented by the input
+ * constant. Used to support type bracketing.
+ * Return format is <min/max value, bool inclusive>
+ */
+std::pair<boost::optional<ABT>, bool> getMinMaxBoundForType(bool isMin,
+                                                            const sbe::value::TypeTags& tag);
+
+/**
+ * Used by the optimizer to optionally convert path elements (e.g. PathArr) directly into intervals.
+ */
+boost::optional<IntervalReqExpr::Node> defaultConvertPathToInterval(const ABT& node);
 
 }  // namespace mongo::optimizer

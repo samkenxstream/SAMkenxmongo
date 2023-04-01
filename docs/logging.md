@@ -148,8 +148,11 @@ The log system is made available with the following header:
 
     #include "mongo/logv2/log.h"
 
-To be able to include it a default log component needs to be defined in the cpp
-file before including `log.h`:
+The macro `MONGO_LOGV2_DEFAULT_COMPONENT` is expanded by all logging macros.
+This configuration macro must expand at their point of use to a `LogComponent`
+expression, which is implicitly attached to the emitted message.  It is
+conventionally defined near the top of a `.cpp` file before any logging macros
+are invoked. Example:
 
     #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
@@ -383,44 +386,38 @@ Many basic types have built in support:
   * `BSONObjBuilder::append` overload available
 * `boost::optional<T>` of any loggable type `T`
 
-### User defined types
+### User-defined types
 
-To make a user defined type loggable it needs a serialization member function
+To make a user-defined type loggable it needs a serialization member function
 that the log system can bind to.
 
 The system binds and uses serialization functions by looking for functions in
 the following priority order:
 
-##### Structured serialization function signatures
+- Structured serialization functions
+    - `void x.serialize(BSONObjBuilder*) const` (member)
+    - `BSONObj x.toBSON() const` (member)
+    - `BSONArray x.toBSONArray() const` (member)
+    - `toBSON(x)` (non-member)
+- Stringification functions
+    - `toStringForLogging(x)` (non-member)
+    - `x.serialize(&fmtMemoryBuffer)` (member)
+    - `x.toString() ` (member)
+    - `toString(x)` (non-member)
 
-Member functions:
-
-- `void serialize(BSONObjBuilder*) const`
-- `BSONObj toBSON() const`
-- `BSONArray toBSONArray() const`
-
-Non-member functions:
-
-- `toBSON(const T& val)` (non-member function)
-
-##### Stringification function signatures
-
-Member functions:
-
-- `void serialize(fmt::memory_buffer&) const`
-- `std::string toString() const`
-
-Non-member functions:
-
-- `toString(const T& val)` (non-member function)
-
-Enums will only try to bind a `toString(const T& val)` non-member function. If
-one is not available the enum value will be logged as its underlying integral
-type.
+Enums cannot have member functions, but they will still try to bind to the
+`toStringForLogging(e)` or `toString(e)` non-members. If neither is available,
+the enum value will be logged as its underlying integral type.
 
 In order to offer structured serialization and output, a type would need to
-supply a structured serialization function (functions 1 to 4 above), otherwise
-if only stringification is provided the output will be an escaped string.
+supply a structured serialization function. Otherwise, if only stringification
+is provided, the output will be an escaped string.
+
+The `toStringForLogging` non-member is an ADL customization hook used to
+override `toString` for very rare cases where `toString` is inappropriate for
+logging perhaps because it's needed for other non-logging formatting. Usually a
+`toString` (member or nonmember) is a sufficient customization point and should
+be preferred as a canonical stringification of the object.
 
 *NOTE: No `operator<<` overload is used even if available*
 

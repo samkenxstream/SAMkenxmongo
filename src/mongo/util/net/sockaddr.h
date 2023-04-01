@@ -34,7 +34,7 @@
 
 #ifndef _WIN32
 
-#include <errno.h>
+#include <cerrno>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -62,9 +62,6 @@ struct sockaddr_un {
 };
 
 #endif  // _WIN32
-
-// Generate a string representation for getaddrinfo return codes
-std::string getAddrInfoStrError(int code);
 
 /**
  * Wrapper around os representation of network address.
@@ -130,6 +127,7 @@ struct SockAddr {
     sa_family_t getType() const;
 
     unsigned getPort() const;
+    void setPort(int port);
 
     std::string getAddr() const;
 

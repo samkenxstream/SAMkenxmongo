@@ -26,7 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -42,8 +41,12 @@
 #include "mongo/base/status.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 
@@ -218,7 +221,7 @@ Status runGlobalDeinitializers() {
 void runGlobalInitializersOrDie(const std::vector<std::string>& argv) {
     if (Status status = runGlobalInitializers(argv); !status.isOK()) {
         std::cerr << "Failed global initialization: " << status << std::endl;
-        quickExit(1);
+        quickExit(ExitCode::fail);
     }
 }
 

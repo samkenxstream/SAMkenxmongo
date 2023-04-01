@@ -50,8 +50,7 @@ PrimaryOnlyServiceOpObserver::~PrimaryOnlyServiceOpObserver() = default;
 
 
 void PrimaryOnlyServiceOpObserver::aboutToDelete(OperationContext* opCtx,
-                                                 NamespaceString const& nss,
-                                                 const UUID& uuid,
+                                                 const CollectionPtr& coll,
                                                  BSONObj const& doc) {
     // Extract the _id field from the document. If it does not have an _id, use the
     // document itself as the _id.
@@ -59,10 +58,10 @@ void PrimaryOnlyServiceOpObserver::aboutToDelete(OperationContext* opCtx,
 }
 
 void PrimaryOnlyServiceOpObserver::onDelete(OperationContext* opCtx,
-                                            const NamespaceString& nss,
-                                            const UUID& uuid,
+                                            const CollectionPtr& coll,
                                             StmtId stmtId,
                                             const OplogDeleteEntryArgs& args) {
+    const auto& nss = coll->ns();
     auto& documentId = documentIdDecoration(opCtx);
     invariant(!documentId.isEmpty());
 
@@ -71,7 +70,7 @@ void PrimaryOnlyServiceOpObserver::onDelete(OperationContext* opCtx,
         return;
     }
     opCtx->recoveryUnit()->onCommit(
-        [service, documentId, nss](boost::optional<Timestamp> unusedCommitTime) {
+        [service, documentId, nss](OperationContext*, boost::optional<Timestamp>) {
             // Release the instance without interrupting it since for some primary-only services
             // there is still work to be done after the state document is removed.
             service->releaseInstance(documentId, Status::OK());
@@ -86,13 +85,13 @@ repl::OpTime PrimaryOnlyServiceOpObserver::onDropCollection(OperationContext* op
                                                             const CollectionDropType dropType) {
     auto service = _registry->lookupServiceByNamespace(collectionName);
     if (service) {
-        opCtx->recoveryUnit()->onCommit(
-            [service, collectionName](boost::optional<Timestamp> unusedCommitTime) {
-                // Release and interrupt all the instances since the state document collection is
-                // not supposed to be dropped.
-                service->releaseAllInstances(Status(
-                    ErrorCodes::Interrupted, str::stream() << collectionName << " is dropped"));
-            });
+        opCtx->recoveryUnit()->onCommit([service, collectionName](OperationContext*,
+                                                                  boost::optional<Timestamp>) {
+            // Release and interrupt all the instances since the state document collection is
+            // not supposed to be dropped.
+            service->releaseAllInstances(
+                Status(ErrorCodes::Interrupted, str::stream() << collectionName << " is dropped"));
+        });
     }
     return {};
 }

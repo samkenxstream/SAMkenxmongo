@@ -2,27 +2,31 @@
  * Tests that tenant migrations resume successfully on recipient stepup and restart.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   incompatible_with_shard_merge,
+ *   # Some tenant migration statistics field names were changed in 6.1.
+ *   requires_fcv_61,
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    forgetMigrationAsync,
+    makeX509OptionsForTest,
+    runMigrationAsync,
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+load('jstests/replsets/rslib.js');  // 'createRstArgs'
 
 const kMaxSleepTimeMS = 100;
-const kTenantId = "testTenantId";
+const kTenantId = ObjectId().str;
 
 // Set the delay before a state doc is garbage collected to be short to speed up the test but long
 // enough for the state doc to still be around after stepup or restart.
@@ -31,7 +35,7 @@ const kGarbageCollectionDelayMS = 30 * 1000;
 // Set the TTL monitor to run at a smaller interval to speed up the test.
 const kTTLMonitorSleepSecs = 1;
 
-const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
+const migrationX509Options = makeX509OptionsForTest();
 
 /**
  * Runs the donorStartMigration command to start a migration, and interrupts the migration on the
@@ -40,8 +44,12 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
  * @param {recipientRestarted} bool is needed to properly assert the tenant migrations stat count.
  */
 function testRecipientSyncDataInterrupt(interruptFunc, recipientRestarted) {
-    const recipientRst = new ReplSetTest(
-        {nodes: 3, name: "recipientRst", nodeOptions: migrationX509Options.recipient});
+    const recipientRst = new ReplSetTest({
+        nodes: 3,
+        name: "recipientRst",
+        serverless: true,
+        nodeOptions: migrationX509Options.recipient
+    });
     recipientRst.startSet();
     recipientRst.initiate();
 
@@ -57,10 +65,9 @@ function testRecipientSyncDataInterrupt(interruptFunc, recipientRestarted) {
         tenantId: kTenantId,
         recipientConnString: tenantMigrationTest.getRecipientConnString(),
     };
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(donorRst);
+    const donorRstArgs = createRstArgs(donorRst);
 
-    const runMigrationThread =
-        new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
+    const runMigrationThread = new Thread(runMigrationAsync, migrationOpts, donorRstArgs);
     runMigrationThread.start();
 
     // Wait for recipientSyncData command to start.
@@ -78,18 +85,8 @@ function testRecipientSyncDataInterrupt(interruptFunc, recipientRestarted) {
                                                       TenantMigrationTest.DonorState.kCommitted);
     assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 
-    tenantMigrationTest.awaitTenantMigrationStatsCounts(donorPrimary,
-                                                        {totalSuccessfulMigrationsDonated: 1});
-    recipientPrimary = tenantMigrationTest.getRecipientPrimary();  // Could change after interrupt.
-    if (!recipientRestarted) {
-        tenantMigrationTest.awaitTenantMigrationStatsCounts(recipientPrimary,
-                                                            {totalSuccessfulMigrationsReceived: 1});
-    } else {
-        // In full restart the count could be lost completely.
-        const stats = tenantMigrationTest.getTenantMigrationStats(recipientPrimary);
-        assert(1 == stats.totalSuccessfulMigrationsReceived ||
-               0 == stats.totalSuccessfulMigrationsReceived);
-    }
+    const donorStats = tenantMigrationTest.getTenantMigrationStats(donorPrimary);
+    assert.eq(1, donorStats.totalMigrationDonationsCommitted);
 
     tenantMigrationTest.stop();
     recipientRst.stopSet();
@@ -104,6 +101,7 @@ function testRecipientForgetMigrationInterrupt(interruptFunc) {
     const donorRst = new ReplSetTest({
         nodes: 1,
         name: "donorRst",
+        serverless: true,
         nodeOptions: Object.assign({}, migrationX509Options.donor, {
             setParameter: {
                 tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
@@ -114,6 +112,7 @@ function testRecipientForgetMigrationInterrupt(interruptFunc) {
     const recipientRst = new ReplSetTest({
         nodes: 3,
         name: "recipientRst",
+        serverless: true,
         nodeOptions: Object.assign({}, migrationX509Options.recipient, {
             setParameter: {
                 tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
@@ -138,11 +137,11 @@ function testRecipientForgetMigrationInterrupt(interruptFunc) {
         tenantId: kTenantId,
         recipientConnString: recipientRst.getURL(),
     };
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(donorRst);
+    const donorRstArgs = createRstArgs(donorRst);
 
     TenantMigrationTest.assertCommitted(
         tenantMigrationTest.runMigration(migrationOpts, {automaticForgetMigration: false}));
-    const forgetMigrationThread = new Thread(TenantMigrationUtil.forgetMigrationAsync,
+    const forgetMigrationThread = new Thread(forgetMigrationAsync,
                                              migrationOpts.migrationIdString,
                                              donorRstArgs,
                                              false /* retryOnRetryableErrors */);
@@ -209,5 +208,4 @@ function testRecipientForgetMigrationInterrupt(interruptFunc) {
         recipientRst.awaitSecondaryNodes();
         recipientRst.getPrimary();
     });
-})();
 })();

@@ -40,6 +40,7 @@
 
 #include "mongo/base/initializer.h"
 #include "mongo/db/traffic_reader.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/signal_handlers.h"
 #include "mongo/util/text.h"
 
@@ -55,7 +56,7 @@ int main(int argc, char* argv[]) {
     Status status = mongo::runGlobalInitializers(std::vector<std::string>(argv, argv + argc));
     if (!status.isOK()) {
         std::cerr << "Failed global initialization: " << status << std::endl;
-        return EXIT_FAILURE;
+        return static_cast<int>(ExitCode::fail);
     }
 
     startSignalProcessingThread();
@@ -86,7 +87,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Mongo Traffic Reader Help: \n\n\t./mongotrafficreader "
                          "-i trafficinput.txt -o mongotrafficreader_dump.bson \n\n"
                       << desc << std::endl;
-            return EXIT_SUCCESS;
+            return static_cast<int>(ExitCode::clean);
         }
 
         // User can specify a --input param and it must point to a valid file
@@ -95,7 +96,7 @@ int main(int argc, char* argv[]) {
             if (!boost::filesystem::exists(inputFile.c_str())) {
                 std::cout << "Error: Specified file does not exist (" << inputFile.c_str() << ")"
                           << std::endl;
-                return EXIT_FAILURE;
+                return static_cast<int>(ExitCode::fail);
             }
 
 // Open the connection to the input file
@@ -104,6 +105,11 @@ int main(int argc, char* argv[]) {
 #else
             inputFd = open(inputFile.c_str(), O_RDONLY);
 #endif
+
+            if (inputFd < 0) {
+                std::cerr << "Error opening file: " << strerror(errno) << std::endl;
+                return static_cast<int>(ExitCode::fail);
+            }
         }
 
         // User must specify a --output param and it does not need to point to a valid file
@@ -114,7 +120,7 @@ int main(int argc, char* argv[]) {
             outputStream.open(outputFile, std::ios::out | std::ios::trunc | std::ios::binary);
             if (!outputStream.is_open()) {
                 std::cerr << "Error writing to file: " << outputFile << std::endl;
-                return EXIT_FAILURE;
+                return static_cast<int>(ExitCode::fail);
             }
         } else {
             // output to std::cout
@@ -124,7 +130,7 @@ int main(int argc, char* argv[]) {
         }
     } catch (const boost::program_options::error& ex) {
         std::cerr << ex.what() << '\n';
-        return EXIT_FAILURE;
+        return static_cast<int>(ExitCode::fail);
     }
 
     mongo::trafficRecordingFileToMongoReplayFile(inputFd, outputStream);

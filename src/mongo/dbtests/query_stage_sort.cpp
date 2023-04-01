@@ -34,6 +34,8 @@
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_write_path.h"
+#include "mongo/db/catalog/collection_yield_restore.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
@@ -70,11 +72,11 @@ public:
     }
 
     virtual ~QueryStageSortTestBase() {
-        _client.dropCollection(ns());
+        _client.dropCollection(nss());
     }
 
     void insert(const BSONObj& obj) {
-        _client.insert(ns(), obj);
+        _client.insert(nss(), obj);
     }
 
     void getRecordIds(set<RecordId>* out, const CollectionPtr& coll) {
@@ -266,11 +268,11 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
 
@@ -289,11 +291,11 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
 
@@ -321,11 +323,11 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
 
@@ -347,13 +349,14 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
+        coll.makeYieldable(&_opCtx, LockedCollectionYieldRestore(&_opCtx, coll));
 
         fillData();
 
@@ -396,10 +399,17 @@ public:
         auto newDoc = [&](const Snapshotted<BSONObj>& oldDoc) {
             return BSON("_id" << oldDoc.value()["_id"] << "foo" << limit() + 10);
         };
-        CollectionUpdateArgs args;
+        CollectionUpdateArgs args{oldDoc.value()};
         {
             WriteUnitOfWork wuow(&_opCtx);
-            coll->updateDocument(&_opCtx, *it, oldDoc, newDoc(oldDoc), false, nullptr, &args);
+            collection_internal::updateDocument(&_opCtx,
+                                                coll,
+                                                *it,
+                                                oldDoc,
+                                                newDoc(oldDoc),
+                                                collection_internal::kUpdateNoIndexes,
+                                                nullptr,
+                                                &args);
             wuow.commit();
         }
         exec->restoreState(&coll);
@@ -417,7 +427,14 @@ public:
             oldDoc = coll->docFor(&_opCtx, *it);
             {
                 WriteUnitOfWork wuow(&_opCtx);
-                coll->updateDocument(&_opCtx, *it++, oldDoc, newDoc(oldDoc), false, nullptr, &args);
+                collection_internal::updateDocument(&_opCtx,
+                                                    coll,
+                                                    *it++,
+                                                    oldDoc,
+                                                    newDoc(oldDoc),
+                                                    collection_internal::kUpdateNoIndexes,
+                                                    nullptr,
+                                                    &args);
                 wuow.commit();
             }
         }
@@ -462,13 +479,14 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
+        coll.makeYieldable(&_opCtx, LockedCollectionYieldRestore(&_opCtx, coll));
 
         fillData();
 
@@ -503,7 +521,8 @@ public:
         set<RecordId>::iterator it = recordIds.begin();
         {
             WriteUnitOfWork wuow(&_opCtx);
-            coll->deleteDocument(&_opCtx, kUninitializedStmtId, *it++, nullOpDebug);
+            collection_internal::deleteDocument(
+                &_opCtx, coll, kUninitializedStmtId, *it++, nullOpDebug);
             wuow.commit();
         }
         exec->restoreState(&coll);
@@ -519,7 +538,8 @@ public:
         while (it != recordIds.end()) {
             {
                 WriteUnitOfWork wuow(&_opCtx);
-                coll->deleteDocument(&_opCtx, kUninitializedStmtId, *it++, nullOpDebug);
+                collection_internal::deleteDocument(
+                    &_opCtx, coll, kUninitializedStmtId, *it++, nullOpDebug);
                 wuow.commit();
             }
         }
@@ -566,13 +586,14 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        CollectionPtr coll =
-            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss());
+        CollectionPtr coll(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, nss()));
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
+        coll.makeYieldable(&_opCtx, LockedCollectionYieldRestore(&_opCtx, coll));
 
         auto ws = std::make_unique<WorkingSet>();
         auto queuedDataStage = std::make_unique<QueuedDataStage>(_expCtx.get(), ws.get());

@@ -2,8 +2,10 @@
  * Test that tenant migration recipient rejects conflicting recipientSyncData commands.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
+ *   # Shard merge protocol will be tested by
+ *   # tenant_migration_shard_merge_conflicting_recipient_sync_data_cmds.js.
+ *   incompatible_with_shard_merge,
  *   requires_fcv_52,
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
@@ -11,16 +13,19 @@
  *   serverless,
  * ]
  */
-(function() {
 
-"use strict";
+import {
+    getCertificateAndPrivateKey,
+    makeX509OptionsForTest
+} from "jstests/replsets/libs/tenant_migration_util.js";
+
+load("jstests/libs/fail_point_util.js");
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
 var rst =
-    new ReplSetTest({nodes: 1, nodeOptions: TenantMigrationUtil.makeX509OptionsForTest().donor});
+    new ReplSetTest({nodes: 1, serverless: true, nodeOptions: makeX509OptionsForTest().donor});
 rst.startSet();
 rst.initiate();
 const primary = rst.getPrimary();
@@ -36,9 +41,9 @@ const kSecondaryReadPreference = {
     mode: "secondary"
 };
 const kRecipientCertificateForDonor =
-    TenantMigrationUtil.getCertificateAndPrivateKey("jstests/libs/tenant_migration_recipient.pem");
-const kExpiredRecipientCertificateForDonor = TenantMigrationUtil.getCertificateAndPrivateKey(
-    "jstests/libs/tenant_migration_recipient_expired.pem");
+    getCertificateAndPrivateKey("jstests/libs/tenant_migration_recipient.pem");
+const kExpiredRecipientCertificateForDonor =
+    getCertificateAndPrivateKey("jstests/libs/tenant_migration_recipient_expired.pem");
 
 TestData.stopFailPointErrorCode = 4880402;
 
@@ -84,16 +89,6 @@ function assertNoCertificateOrPrivateKey(string) {
     assert(!string.includes("PRIVATE KEY"), "found private key");
 }
 
-const kTenantIdPrefix = "testTenantId";
-let tenantCounter = 0;
-
-/**
- * Returns a tenantId that will not match any existing prefix.
- */
-function generateUniqueTenantId() {
-    return kTenantIdPrefix + tenantCounter++;
-}
-
 // Enable the failpoint to stop the tenant migration after persisting the state doc.
 assert.commandWorked(primary.adminCommand({
     configureFailPoint: "fpAfterPersistingTenantMigrationRecipientInstanceStateDoc",
@@ -103,7 +98,7 @@ assert.commandWorked(primary.adminCommand({
 
 // Test migrations with different migrationIds but identical settings.
 (() => {
-    const tenantId = generateUniqueTenantId() + "DiffMigrationId";
+    const tenantId = ObjectId().str;
     // Enable failPoint to pause the migration just as it starts.
     const fpPauseBeforeRunTenantMigrationRecipientInstance =
         configureFailPoint(primary, "pauseBeforeRunTenantMigrationRecipientInstance");
@@ -164,7 +159,7 @@ assert.commandWorked(primary.adminCommand({
 
     // Only one instance should have succeeded in persisting the state doc, other should have failed
     // with ErrorCodes.ConflictingOperationInProgress.
-    assert.eq(1, configRecipientsColl.count({tenantId: tenantId}));
+    assert.eq(1, configRecipientsColl.count({}));
 
     // Run another recipientSyncData cmd for the tenant. Since the previous migration hasn't been
     // garbage collected, the migration is considered as active. So this command should fail with
@@ -177,7 +172,7 @@ assert.commandWorked(primary.adminCommand({
     assert.commandFailedWithCode(res2, ErrorCodes.ConflictingOperationInProgress);
 
     // Collection count should remain the same.
-    assert.eq(1, configRecipientsColl.count({tenantId: tenantId}));
+    assert.eq(1, configRecipientsColl.count({}));
     fpPauseBeforeRunTenantMigrationRecipientInstance.off();
 })();
 
@@ -244,13 +239,13 @@ function testConcurrentConflictingMigration(migrationOpts0, migrationOpts1) {
 (() => {
     const migrationOpts0 = {
         migrationIdString: extractUUIDFromObject(UUID()),
-        tenantId: generateUniqueTenantId() + "DiffTenantId",
+        tenantId: ObjectId().str,
         donorConnectionString: kDonorConnectionString0,
         readPreference: kPrimaryReadPreference,
         recipientCertificateForDonor: kRecipientCertificateForDonor
     };
     const migrationOpts1 = Object.extend({}, migrationOpts0, true);
-    migrationOpts1.tenantId = generateUniqueTenantId() + "DiffTenantId";
+    migrationOpts1.tenantId = ObjectId().str;
     testConcurrentConflictingMigration(migrationOpts0, migrationOpts1);
 })();
 
@@ -258,7 +253,7 @@ function testConcurrentConflictingMigration(migrationOpts0, migrationOpts1) {
 (() => {
     const migrationOpts0 = {
         migrationIdString: extractUUIDFromObject(UUID()),
-        tenantId: generateUniqueTenantId() + "DiffDonorConnString",
+        tenantId: ObjectId().str,
         donorConnectionString: kDonorConnectionString0,
         readPreference: kPrimaryReadPreference,
         recipientCertificateForDonor: kRecipientCertificateForDonor
@@ -272,7 +267,7 @@ function testConcurrentConflictingMigration(migrationOpts0, migrationOpts1) {
 (() => {
     const migrationOpts0 = {
         migrationIdString: extractUUIDFromObject(UUID()),
-        tenantId: generateUniqueTenantId() + "DiffReadPreference",
+        tenantId: ObjectId().str,
         donorConnectionString: kDonorConnectionString0,
         readPreference: kPrimaryReadPreference,
         recipientCertificateForDonor: kRecipientCertificateForDonor
@@ -286,7 +281,7 @@ function testConcurrentConflictingMigration(migrationOpts0, migrationOpts1) {
 (() => {
     const migrationOpts0 = {
         migrationIdString: extractUUIDFromObject(UUID()),
-        tenantId: generateUniqueTenantId() + "DiffCertificate",
+        tenantId: ObjectId().str,
         donorConnectionString: kDonorConnectionString0,
         readPreference: kPrimaryReadPreference,
         recipientCertificateForDonor: kRecipientCertificateForDonor
@@ -297,4 +292,3 @@ function testConcurrentConflictingMigration(migrationOpts0, migrationOpts1) {
 })();
 
 rst.stopSet();
-})();

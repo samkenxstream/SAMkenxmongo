@@ -60,7 +60,7 @@ assert.eq(res[0], res[1]);
 //
 assert(coll.drop());
 assert.commandWorked(coll.insert([
-    {date: new Date("January 14, 2011"), timezone: "UTC"},
+    {date: ISODate("2011-01-14"), timezone: "UTC"},
     {date: ISODate("1998-11-07T00:00:00Z"), timezone: "-0400"},
 ]));
 
@@ -77,6 +77,24 @@ assertArrayEq({
     actual: res,
     expected: [
         {dayOfYear: 14, dayOfMonth: 14, dayOfWeek: 6},
+        {dayOfYear: 310, dayOfMonth: 6, dayOfWeek: 6},
+    ]
+});
+
+// Test with constant timezone
+res = coll.aggregate({
+              $project: {
+                  _id: 0,
+                  dayOfYear: {$dayOfYear: {date: "$date", timezone: "-0400"}},
+                  dayOfMonth: {$dayOfMonth: {date: "$date", timezone: "-0400"}},
+                  dayOfWeek: {$dayOfWeek: {date: "$date", timezone: "-0400"}},
+              }
+          })
+          .toArray();
+assertArrayEq({
+    actual: res,
+    expected: [
+        {dayOfYear: 13, dayOfMonth: 13, dayOfWeek: 5},
         {dayOfYear: 310, dayOfMonth: 6, dayOfWeek: 6},
     ]
 });

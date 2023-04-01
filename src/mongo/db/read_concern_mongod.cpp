@@ -27,15 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/base/shim.h"
 #include "mongo/base/status.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/read_concern.h"
 #include "mongo/db/read_concern_mongod_gen.h"
@@ -51,6 +50,9 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/concurrency/notification.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
@@ -108,7 +110,9 @@ private:
 /**
  *  Schedule a write via appendOplogNote command to the primary of this replica set.
  */
-Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime, StringData dbName) {
+Status makeNoopWriteIfNeeded(OperationContext* opCtx,
+                             LogicalTime clusterTime,
+                             const DatabaseName& dbName) {
     repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
     invariant(replCoord->isReplEnabled());
 
@@ -143,7 +147,7 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime, S
         // Standalone replica set, so there is no need to advance the OpLog on the primary. The only
         // exception is after a tenant migration because the target time may be from the other
         // replica set and is not guaranteed to be in the oplog of this node's set.
-        if (serverGlobalParams.clusterRole == ClusterRole::None &&
+        if (serverGlobalParams.clusterRole.has(ClusterRole::None) &&
             !tenant_migration_access_blocker::hasActiveTenantMigration(opCtx, dbName)) {
             return Status::OK();
         }
@@ -166,16 +170,18 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime, S
                             "clusterTime"_attr = clusterTime.toString(),
                             "remainingAttempts"_attr = remainingAttempts);
 
-                auto onRemoteCmdScheduled = [](executor::TaskExecutor::CallbackHandle handle) {};
-                auto onRemoteCmdComplete = [](executor::TaskExecutor::CallbackHandle handle) {};
+                auto onRemoteCmdScheduled = [](executor::TaskExecutor::CallbackHandle handle) {
+                };
+                auto onRemoteCmdComplete = [](executor::TaskExecutor::CallbackHandle handle) {
+                };
                 auto appendOplogNoteResponse = replCoord->runCmdOnPrimaryAndAwaitResponse(
                     opCtx,
-                    NamespaceString::kAdminDb.toString(),
+                    DatabaseName::kAdmin.toString(),
                     BSON("appendOplogNote"
                          << 1 << "maxClusterTime" << clusterTime.asTimestamp() << "data"
                          << BSON("noop write for afterClusterTime read concern" << 1)
                          << WriteConcernOptions::kWriteConcernField
-                         << WriteConcernOptions::kInternalWriteDefault),
+                         << WriteConcernOptions::Acknowledged),
                     onRemoteCmdScheduled,
                     onRemoteCmdComplete);
 
@@ -279,7 +285,7 @@ void setPrepareConflictBehaviorForReadConcernImpl(OperationContext* opCtx,
 
 Status waitForReadConcernImpl(OperationContext* opCtx,
                               const repl::ReadConcernArgs& readConcernArgs,
-                              StringData dbName,
+                              const DatabaseName& dbName,
                               bool allowAfterClusterTime) {
     // If we are in a direct client within a transaction, then we may be holding locks, so it is
     // illegal to wait for read concern. This is fine, since the outer operation should have handled
@@ -422,7 +428,8 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
             return Status::OK();
         }
 
-        const int debugLevel = serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 1 : 2;
+        const int debugLevel =
+            serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer) ? 1 : 2;
 
         LOGV2_DEBUG(
             20991,

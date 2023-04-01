@@ -1,10 +1,13 @@
 /**
  * Tests running the update command on a time-series collection.
  * @tags: [
+ *   # This test depends on certain writes ending up in the same bucket. Stepdowns may result in
+ *   # writes splitting between two primaries, and thus different buckets.
  *   does_not_support_stepdowns,
- *   does_not_support_transactions,
- *   requires_getmore,
- *   requires_fcv_51,
+ *   # Specifically testing multi-updates.
+ *   requires_multi_updates,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 (function() {
@@ -12,11 +15,6 @@
 
 load("jstests/core/timeseries/libs/timeseries.js");
 load("jstests/libs/fixture_helpers.js");
-
-if (!TimeseriesTest.timeseriesUpdatesAndDeletesEnabled(db.getMongo())) {
-    jsTestLog("Skipping test because the time-series updates and deletes feature flag is disabled");
-    return;
-}
 
 if (FixtureHelpers.isMongos(db) &&
     !TimeseriesTest.shardedtimeseriesCollectionsEnabled(db.getMongo())) {

@@ -40,7 +40,7 @@ namespace {
 using unittest::assertGet;
 
 ChunkRange chunkRange(BSON("a" << 1), BSON("a" << 10));
-IDLParserErrorContext ctx("_configsvrCommitChunksMerge");
+IDLParserContext ctx("_configsvrCommitChunksMerge");
 
 TEST(ConfigSvrMergeChunks, BasicValidConfigCommand) {
     auto collUUID = UUID::gen();
@@ -52,7 +52,8 @@ TEST(ConfigSvrMergeChunks, BasicValidConfigCommand) {
              << "shard0000"
              << "$db"
              << "admin"));
-    ASSERT_EQ(NamespaceString("TestDB", "TestColl"), request.getCommandParameter());
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl"),
+              request.getCommandParameter());
     ASSERT_TRUE(collUUID == request.getCollectionUUID());
     ASSERT_TRUE(chunkRange == request.getChunkRange());
     ASSERT_EQ("shard0000", request.getShard().toString());
@@ -60,12 +61,12 @@ TEST(ConfigSvrMergeChunks, BasicValidConfigCommand) {
 
 TEST(ConfigSvrMergeChunks, ConfigCommandtoBSON) {
     auto collUUID = UUID::gen();
-    BSONObj serializedRequest = BSON("_configsvrCommitChunksMerge"
-                                     << "TestDB.TestColl"
-                                     << "shard"
-                                     << "shard0000"
-                                     << "collUUID" << collUUID.toBSON() << "chunkRange"
-                                     << chunkRange.toBSON() << "validAfter" << Timestamp{100});
+    BSONObj serializedRequest =
+        BSON("_configsvrCommitChunksMerge"
+             << "TestDB.TestColl"
+             << "shard"
+             << "shard0000"
+             << "collUUID" << collUUID.toBSON() << "chunkRange" << chunkRange.toBSON());
     BSONObj writeConcernObj = BSON("w"
                                    << "majority");
 
@@ -83,8 +84,7 @@ TEST(ConfigSvrMergeChunks, ConfigCommandtoBSON) {
     };
 
     auto request = ConfigSvrMergeChunks::parse(ctx, appendDB(serializedRequest));
-    request.setWriteConcern(writeConcernObj);
-    auto requestToBSON = request.toBSON(BSONObj());
+    auto requestToBSON = request.toBSON(BSON("writeConcern" << writeConcernObj));
 
     ASSERT_BSONOBJ_EQ(cmdBuilder.obj(), requestToBSON);
 }
@@ -197,17 +197,6 @@ TEST(ConfigSvrMergeChunks, WrongShardIdTypeErrors) {
         DBException,
         ErrorCodes::TypeMismatch);
 }
-
-//// IDL validators do not work on command value
-// TEST(ConfigSvrMergeChunks, InvalidNamespaceErrors) {
-//             ASSERT_THROWS_CODE({
-//                 auto collUUID = UUID::gen();
-// ConfigSvrMergeChunks::parse(ctx,
-//         BSON("_configsvrCommitChunksMerge" << ""
-//              << "collUUID" << collUUID.toBSON() << "chunkRange" << chunkRange.toBSON() << "shard"
-//              << "shard0000" << "$db" << "admin"));
-//         }, DBException, ErrorCodes::InvalidNamespace);
-// }
 
 }  // namespace
 }  // namespace mongo

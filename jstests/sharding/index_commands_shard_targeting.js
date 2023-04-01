@@ -15,6 +15,13 @@ load("jstests/libs/parallelTester.js");  // For Thread.
 // Test deliberately inserts orphans outside of migration.
 TestData.skipCheckOrphans = true;
 
+// This test connects directly to shards and creates collections.
+TestData.skipCheckShardFilteringMetadata = true;
+
+// Do not check metadata consistency as collections on non-primary shards are created for testing
+// purposes.
+TestData.skipCheckMetadataConsistency = true;
+
 /*
  * Runs the command after performing chunk operations to make the primary shard (shard0) not own
  * any chunks for the collection, and the subset of non-primary shards (shard1 and shard2) that
@@ -67,7 +74,7 @@ function assertCommandChecksShardVersions(st, dbName, collName, testCase) {
  * the given command function. Asserts that the command is blocked behind the critical section.
  */
 function assertCommandBlocksIfCriticalSectionInProgress(
-    st, staticMongod, dbName, collName, testCase) {
+    st, staticMongod, dbName, collName, allShards, testCase) {
     const ns = dbName + "." + collName;
     const fromShard = st.shard0;
     const toShard = st.shard1;
@@ -94,6 +101,10 @@ function assertCommandBlocksIfCriticalSectionInProgress(
     // It could be possible that the following check fails on slow clusters because the request
     // expired its maxTimeMS on the mongos before to reach the shard.
     checkLog.checkContainsOnceJsonStringMatch(st.shard0, 22062, "error", "MaxTimeMSExpired");
+
+    allShards.forEach(function(shard) {
+        testCase.assertCommandDidNotRunOnShard(shard);
+    });
 
     // Turn off the fail point and wait for moveChunk to complete.
     unpauseMoveChunkAtStep(fromShard, moveChunkStepNames.chunkDataCommitted);
@@ -219,11 +230,8 @@ for (const command of Object.keys(testCases)) {
     let testCase = testCases[command](collName);
 
     assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: shardKey}));
-    assertCommandBlocksIfCriticalSectionInProgress(st, staticMongod, dbName, collName, testCase);
-
-    allShards.forEach(function(shard) {
-        testCase.assertCommandDidNotRunOnShard(shard);
-    });
+    assertCommandBlocksIfCriticalSectionInProgress(
+        st, staticMongod, dbName, collName, allShards, testCase);
 }
 
 st.stop();

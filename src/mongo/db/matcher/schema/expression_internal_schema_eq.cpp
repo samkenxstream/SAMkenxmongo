@@ -40,7 +40,7 @@ namespace mongo {
 constexpr StringData InternalSchemaEqMatchExpression::kName;
 
 InternalSchemaEqMatchExpression::InternalSchemaEqMatchExpression(
-    StringData path, BSONElement rhs, clonable_ptr<ErrorAnnotation> annotation)
+    boost::optional<StringData> path, BSONElement rhs, clonable_ptr<ErrorAnnotation> annotation)
     : LeafMatchExpression(MatchType::INTERNAL_SCHEMA_EQ,
                           path,
                           ElementPath::LeafArrayBehavior::kNoTraversal,
@@ -59,18 +59,23 @@ void InternalSchemaEqMatchExpression::debugString(StringBuilder& debug,
                                                   int indentationLevel) const {
     _debugAddSpace(debug, indentationLevel);
     debug << path() << " " << kName << " " << _rhsElem.toString(false);
-
-    auto td = getTag();
-    if (td) {
-        debug << " ";
-        td->debugString(&debug);
-    }
-
-    debug << "\n";
+    _debugStringAttachTagInfo(&debug);
 }
 
-BSONObj InternalSchemaEqMatchExpression::getSerializedRightHandSide() const {
+BSONObj InternalSchemaEqMatchExpression::getSerializedRightHandSide(
+    SerializationOptions opts) const {
     BSONObjBuilder eqObj;
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        if (_rhsElem.isABSONObj()) {
+            BSONObjBuilder exprSpec(eqObj.subobjStart(kName));
+            opts.redactObjToBuilder(&exprSpec, _rhsElem.Obj());
+            exprSpec.done();
+            return eqObj.obj();
+        } else if (opts.replacementForLiteralArgs) {
+            // If the element is not an object it must be a literal.
+            return BSON(kName << opts.replacementForLiteralArgs.get());
+        }
+    }
     eqObj.appendAs(_rhsElem, kName);
     return eqObj.obj();
 }
@@ -84,7 +89,7 @@ bool InternalSchemaEqMatchExpression::equivalent(const MatchExpression* other) c
     return path() == realOther->path() && _eltCmp.evaluate(_rhsElem == realOther->_rhsElem);
 }
 
-std::unique_ptr<MatchExpression> InternalSchemaEqMatchExpression::shallowClone() const {
+std::unique_ptr<MatchExpression> InternalSchemaEqMatchExpression::clone() const {
     auto clone =
         std::make_unique<InternalSchemaEqMatchExpression>(path(), _rhsElem, _errorAnnotation);
     if (getTag()) {

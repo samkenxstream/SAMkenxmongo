@@ -34,9 +34,9 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/sessions_commands_gen.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_cache.h"
-#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
 
 namespace mongo {
 namespace {
@@ -72,9 +72,7 @@ public:
         void doCheckAuthorization(OperationContext* opCtx) const final {
             // It is always ok to run this command, as long as you are authenticated
             // as some user, if auth is enabled.
-            uassert(ErrorCodes::Unauthorized,
-                    "Not authorized to run refreshSessions command",
-                    AuthorizationSession::get(opCtx->getClient())->getSingleUser());
+            // requiresAuth() => true covers this for us.
         }
 
         Reply typedRun(OperationContext* opCtx) final {

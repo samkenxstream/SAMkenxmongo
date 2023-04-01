@@ -3,7 +3,8 @@
 //
 // @tags: [
 //   assumes_against_mongod_not_mongos,
-//   requires_fcv_51,
+//   # The SBE plan cache was first enabled in 6.3.
+//   requires_fcv_63,
 // ]
 
 (function() {
@@ -14,7 +15,7 @@ load("jstests/libs/sbe_util.js");      // For checkSBEEnabled.
 
 const isSBEEnabled = checkSBEEnabled(db);
 if (!isSBEEnabled) {
-    jsTestLog("Skipping test because the SBE feature flag is disabled");
+    jsTestLog("Skipping test because SBE is disabled");
     return;
 }
 
@@ -35,8 +36,13 @@ assert.commandWorked(coll.insertMany([
 ]));
 
 let explain = coll.find({a: 3}).hint({a: 1}).explain("executionStats");
-let ixscanStage = getPlanStage(explain.executionStats.executionStages, "ixseek");
-
 assert(isIxscan(db, getWinningPlan(explain.queryPlanner)));
-assertStageContainsIndexName(ixscanStage);
+// Ensure the query is run on sbe engine.
+assert('slotBasedPlan' in explain.queryPlanner.winningPlan);
+
+let ixscanStages = getPlanStages(explain.executionStats.executionStages, "ixseek");
+assert(ixscanStages.length !== 0);
+for (let ixscanStage of ixscanStages) {
+    assertStageContainsIndexName(ixscanStage);
+}
 }());

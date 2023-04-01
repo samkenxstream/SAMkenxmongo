@@ -4,8 +4,11 @@
  * from plan cache entries when a certain threshold is reached. We need to make sure that when the
  * threshold is reached by adding entries to the SBE plan cache, the classic cache will start
  * stripping debug info even though the size of the classic cache may be below the threshold.
+ * @tags: [
+ *   # TODO SERVER-67607: Test plan cache with CQF enabled.
+ *   cqf_incompatible,
+ * ]
  */
-
 (function() {
 "use strict";
 
@@ -16,8 +19,8 @@ const conn = MongoRunner.runMongod({});
 assert.neq(conn, null, "mongod failed to start");
 const db = conn.getDB("sbe_plan_cache_memory_debug_info");
 
-if (!checkSBEEnabled(db, ["featureFlagSbePlanCache"])) {
-    jsTest.log("Skipping test because SBE plan cache is not enabled.");
+if (!checkSBEEnabled(db)) {
+    jsTest.log("Skipping test because SBE is not enabled");
     MongoRunner.stopMongod(conn);
     return;
 }
@@ -75,7 +78,8 @@ const planCacheSizeAfterSbeStep = getPlanCacheSize();
 assert.lt(initialPlanCacheSize, planCacheSizeAfterSbeStep);
 
 // Force classic plan cache.
-assert.commandWorked(db.adminCommand({setParameter: 1, internalQueryForceClassicEngine: true}));
+assert.commandWorked(
+    db.adminCommand({setParameter: 1, internalQueryFrameworkControl: "forceClassicEngine"}));
 
 // Create a new collection for classic queries so we can easily assess its plan cache.
 const classicColl = createTestCollection("classic");

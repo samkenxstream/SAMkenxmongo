@@ -8,10 +8,16 @@
 (function() {
 "use strict";
 
+load("jstests/core/timeseries/libs/timeseries.js");
+
 const conn = MongoRunner.runMongod();
 
 const dbName = jsTestName();
+const testDB = conn.getDB(dbName);
 let collCount = 0;
+
+const bucketGranularityError = ErrorCodes.InvalidOptions;
+const bucketMaxSpanSecondsError = ErrorCodes.InvalidOptions;
 
 const testOptions = function(allowed,
                              createOptions,
@@ -26,7 +32,6 @@ const testOptions = function(allowed,
                                  // passing all the test assertions.
                                  tearDown: (testDB, collName) => {},
                              }) {
-    const testDB = conn.getDB(dbName);
     const collName = 'timeseries_' + collCount++;
     const bucketsCollName = 'system.buckets.' + collName;
 
@@ -92,21 +97,59 @@ testValidTimeseriesOptions({timeField: "time"});
 testValidTimeseriesOptions({timeField: "time", metaField: "meta"});
 testValidTimeseriesOptions({timeField: "time", metaField: "meta", granularity: "seconds"});
 
-// A bucketMaxSpanSeconds may be provided, but only if they are the default for the granularity.
-testValidTimeseriesOptions(
-    {timeField: "time", metaField: "meta", granularity: "seconds", bucketMaxSpanSeconds: 60 * 60});
-testValidTimeseriesOptions({
-    timeField: "time",
-    metaField: "meta",
-    granularity: "minutes",
-    bucketMaxSpanSeconds: 60 * 60 * 24
-});
-testValidTimeseriesOptions({
-    timeField: "time",
-    metaField: "meta",
-    granularity: "hours",
-    bucketMaxSpanSeconds: 60 * 60 * 24 * 30
-});
+if (!TimeseriesTest.timeseriesScalabilityImprovementsEnabled(testDB)) {
+    // A bucketMaxSpanSeconds may be provided, but only if they are the default for the granularity.
+    testValidTimeseriesOptions({
+        timeField: "time",
+        metaField: "meta",
+        granularity: "seconds",
+        bucketMaxSpanSeconds: 60 * 60
+    });
+    testValidTimeseriesOptions({
+        timeField: "time",
+        metaField: "meta",
+        granularity: "minutes",
+        bucketMaxSpanSeconds: 60 * 60 * 24
+    });
+    testValidTimeseriesOptions({
+        timeField: "time",
+        metaField: "meta",
+        granularity: "hours",
+        bucketMaxSpanSeconds: 60 * 60 * 24 * 30
+    });
+} else {
+    // Granularity can include a corresponding bucketMaxSpanSeconds value, but not a
+    // bucketRoundingSeconds value (even if the value corresponds to the granularity).
+    testInvalidTimeseriesOptions({
+        timeField: "time",
+        metaField: "meta",
+        granularity: "seconds",
+        bucketMaxSpanSeconds: 60 * 60,
+        bucketRoundingSeconds: 60
+    },
+                                 ErrorCodes.InvalidOptions);
+
+    // Granularity may be provided with bucketMaxSpanSeconds as long as it corresponds to the
+    // granularity.
+    testValidTimeseriesOptions({
+        timeField: "time",
+        metaField: "meta",
+        granularity: "seconds",
+        bucketMaxSpanSeconds: 60 * 60
+    });
+    testValidTimeseriesOptions({
+        timeField: "time",
+        metaField: "meta",
+        granularity: "minutes",
+        bucketMaxSpanSeconds: 60 * 60 * 24
+    });
+    testValidTimeseriesOptions({
+        timeField: "time",
+        metaField: "meta",
+        granularity: "hours",
+        bucketMaxSpanSeconds: 60 * 60 * 24 * 30
+    });
+}
 
 testValidTimeseriesOptions({timeField: "time", metaField: "meta", granularity: "minutes"});
 testValidTimeseriesOptions({timeField: "time", metaField: "meta", granularity: "hours"});
@@ -121,10 +164,10 @@ testInvalidTimeseriesOptions({timeField: "time", metaField: "sub.meta"}, ErrorCo
 testInvalidTimeseriesOptions({timeField: "time", metaField: "time"}, ErrorCodes.InvalidOptions);
 
 testInvalidTimeseriesOptions({timeField: "time", metaField: "meta", bucketMaxSpanSeconds: 10},
-                             5510500);
+                             bucketMaxSpanSecondsError);
 testInvalidTimeseriesOptions(
     {timeField: "time", metaField: "meta", granularity: 'minutes', bucketMaxSpanSeconds: 3600},
-    5510500);
+    bucketMaxSpanSecondsError);
 
 testCompatibleCreateOptions({expireAfterSeconds: NumberLong(100)});
 testCompatibleCreateOptions({storageEngine: {}});
@@ -158,7 +201,6 @@ testTimeseriesNamespaceExists((testDB, collName) => {
 
 // Tests that schema validation is enabled on the bucket collection.
 {
-    const testDB = conn.getDB(dbName);
     const coll = testDB.getCollection('timeseries_' + collCount++);
     coll.drop();
     assert.commandWorked(

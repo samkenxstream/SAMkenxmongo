@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -67,6 +66,9 @@
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/timeseries/timeseries_constants.h"
 #include "mongo/logv2/log.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 
@@ -167,9 +169,7 @@ BSONObj buildViewBson(const ViewDefinition& view, bool nameOnly) {
     return b.obj();
 }
 
-BSONObj buildTimeseriesBson(OperationContext* opCtx,
-                            const CollectionPtr& collection,
-                            bool nameOnly) {
+BSONObj buildTimeseriesBson(const Collection* collection, bool nameOnly) {
     invariant(collection);
 
     BSONObjBuilder builder;
@@ -207,7 +207,7 @@ BSONObj buildTimeseriesBson(StringData collName, bool nameOnly) {
  * Return an object describing the collection. Takes a collection lock if nameOnly is false.
  */
 BSONObj buildCollectionBson(OperationContext* opCtx,
-                            const CollectionPtr& collection,
+                            const Collection* collection,
                             bool includePendingDrops,
                             bool nameOnly) {
     if (!collection) {
@@ -239,7 +239,7 @@ BSONObj buildCollectionBson(OperationContext* opCtx,
     b.append("options", options.toBSON(false));
 
     BSONObjBuilder infoBuilder;
-    infoBuilder.append("readOnly", storageGlobalParams.readOnly);
+    infoBuilder.append("readOnly", opCtx->readOnly());
     if (options.uuid)
         infoBuilder.appendElements(options.uuid->toBSON());
     b.append("info", infoBuilder.obj());
@@ -264,6 +264,10 @@ class CmdListCollections : public ListCollectionsCmdVersion1Gen<CmdListCollectio
 public:
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kOptIn;
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
     }
 
     bool maintenanceOk() const final {
@@ -294,7 +298,8 @@ public:
 
             auto dbName = request().getDbName();
             auto cmdObj = request().toBSON({});
-            uassertStatusOK(authzSession->checkAuthorizedToListCollections(dbName, cmdObj));
+            uassertStatusOK(authzSession->checkAuthorizedToListCollections(
+                dbName.toStringWithTenantId(), cmdObj));
         }
 
         NamespaceString ns() const final {
@@ -308,13 +313,12 @@ public:
 
             const auto listCollRequest = request();
             const auto dbName = listCollRequest.getDbName();
-            const TenantDatabaseName tenantDbName(getActiveTenant(opCtx), dbName);
             const bool nameOnly = listCollRequest.getNameOnly();
             const bool authorizedCollections = listCollRequest.getAuthorizedCollections();
 
             // The collator is null because collection objects are compared using binary comparison.
             auto expCtx = make_intrusive<ExpressionContext>(
-                opCtx, std::unique_ptr<CollatorInterface>(nullptr), NamespaceString(dbName));
+                opCtx, std::unique_ptr<CollatorInterface>(nullptr), ns());
 
             if (listCollRequest.getFilter()) {
                 matcher = uassertStatusOK(
@@ -334,20 +338,21 @@ public:
                 AutoGetDbForReadMaybeLockFree lockFreeReadBlock(opCtx, dbName);
                 auto catalog = CollectionCatalog::get(opCtx);
 
-                CurOpFailpointHelpers::waitWhileFailPointEnabled(&hangBeforeListCollections,
-                                                                 opCtx,
-                                                                 "hangBeforeListCollections",
-                                                                 []() {},
-                                                                 cursorNss);
+                CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                    &hangBeforeListCollections,
+                    opCtx,
+                    "hangBeforeListCollections",
+                    []() {},
+                    cursorNss);
 
                 auto ws = std::make_unique<WorkingSet>();
                 auto root = std::make_unique<QueuedDataStage>(expCtx.get(), ws.get());
 
-                if (DatabaseHolder::get(opCtx)->dbExists(opCtx,
-                                                         TenantDatabaseName(boost::none, dbName))) {
+                if (DatabaseHolder::get(opCtx)->dbExists(opCtx, dbName)) {
                     if (auto collNames = _getExactNameMatches(matcher.get())) {
                         for (auto&& collName : *collNames) {
-                            auto nss = NamespaceString(dbName, collName);
+                            auto nss =
+                                NamespaceStringUtil::parseNamespaceFromRequest(dbName, collName);
 
                             // Only validate on a per-collection basis if the user requested
                             // a list of authorized collections
@@ -377,8 +382,7 @@ public:
                                     if (auto bucketsCollection = CollectionCatalog::get(opCtx)
                                                                      ->lookupCollectionByNamespace(
                                                                          opCtx, view->viewOn())) {
-                                        return buildTimeseriesBson(
-                                            opCtx, bucketsCollection, nameOnly);
+                                        return buildTimeseriesBson(bucketsCollection, nameOnly);
                                     } else {
                                         // The buckets collection does not exist, so the time-series
                                         // view will be appended when we iterate through the view
@@ -395,23 +399,24 @@ public:
                             }
                         }
                     } else {
-                        auto perCollectionWork = [&](const CollectionPtr& collection) {
+                        auto perCollectionWork = [&](const Collection* collection) {
                             if (collection && collection->getTimeseriesOptions() &&
-                                !collection->ns().isDropPendingNamespace() &&
-                                catalog->lookupViewWithoutValidatingDurable(
-                                    opCtx, collection->ns().getTimeseriesViewNamespace()) &&
-                                (!authorizedCollections ||
-                                 as->isAuthorizedForAnyActionOnResource(
-                                     ResourcePattern::forExactNamespace(
-                                         collection->ns().getTimeseriesViewNamespace())))) {
-                                // The time-series view for this buckets namespace exists, so add it
-                                // here while we have the collection options.
-                                _addWorkingSetMember(
-                                    opCtx,
-                                    buildTimeseriesBson(opCtx, collection, nameOnly),
-                                    matcher.get(),
-                                    ws.get(),
-                                    root.get());
+                                !collection->ns().isDropPendingNamespace()) {
+                                auto viewNss = collection->ns().getTimeseriesViewNamespace();
+                                auto view =
+                                    catalog->lookupViewWithoutValidatingDurable(opCtx, viewNss);
+                                if (view && view->timeseries() &&
+                                    (!authorizedCollections ||
+                                     as->isAuthorizedForAnyActionOnResource(
+                                         ResourcePattern::forExactNamespace(viewNss)))) {
+                                    // The time-series view for this buckets namespace exists, so
+                                    // add it here while we have the collection options.
+                                    _addWorkingSetMember(opCtx,
+                                                         buildTimeseriesBson(collection, nameOnly),
+                                                         matcher.get(),
+                                                         ws.get(),
+                                                         root.get());
+                                }
                             }
 
                             if (authorizedCollections &&
@@ -435,14 +440,14 @@ public:
                         // needing to yield as we don't take any locks.
                         if (opCtx->isLockFreeReadsOp()) {
                             auto collectionCatalog = CollectionCatalog::get(opCtx);
-                            for (auto it = collectionCatalog->begin(opCtx, tenantDbName);
+                            for (auto it = collectionCatalog->begin(opCtx, dbName);
                                  it != collectionCatalog->end(opCtx);
                                  ++it) {
                                 perCollectionWork(*it);
                             }
                         } else {
                             mongo::catalog::forEachCollectionFromDb(
-                                opCtx, tenantDbName, MODE_IS, perCollectionWork);
+                                opCtx, dbName, MODE_IS, perCollectionWork);
                         }
                     }
 
@@ -461,9 +466,7 @@ public:
                             }
 
                             if (view.timeseries()) {
-                                if (!CollectionCatalog::get(opCtx)
-                                         ->lookupCollectionByNamespaceForRead(opCtx,
-                                                                              view.viewOn())) {
+                                if (!catalog->lookupCollectionByNamespace(opCtx, view.viewOn())) {
                                     // There is no buckets collection backing this time-series view,
                                     // which means that it was not already added along with the
                                     // buckets collection above.
@@ -501,7 +504,7 @@ public:
                     batchSize = *listCollRequest.getCursor()->getBatchSize();
                 }
 
-                size_t bytesBuffered = 0;
+                FindCommon::BSONArrayResponseSizeTracker responseSizeTracker;
                 for (long long objCount = 0; objCount < batchSize; objCount++) {
                     BSONObj nextDoc;
                     PlanExecutor::ExecState state = exec->getNext(&nextDoc, nullptr);
@@ -512,14 +515,18 @@ public:
 
                     // If we can't fit this result inside the current batch, then we stash it for
                     // later.
-                    if (!FindCommon::haveSpaceForNext(nextDoc, objCount, bytesBuffered)) {
-                        exec->enqueue(nextDoc);
+                    if (!responseSizeTracker.haveSpaceForNext(nextDoc)) {
+                        exec->stashResult(nextDoc);
                         break;
                     }
 
                     try {
                         firstBatch.push_back(ListCollectionsReplyItem::parse(
-                            IDLParserErrorContext("ListCollectionsReplyItem"), nextDoc));
+                            IDLParserContext("ListCollectionsReplyItem",
+                                             false /* apiStrict*/,
+                                             cursorNss.tenantId(),
+                                             SerializationContext::stateCommandReply()),
+                            nextDoc));
                     } catch (const DBException& exc) {
                         LOGV2_ERROR(
                             5254300,
@@ -528,7 +535,7 @@ public:
                             "error"_attr = exc);
                         fassertFailed(5254301);
                     }
-                    bytesBuffered += nextDoc.objsize();
+                    responseSizeTracker.add(nextDoc);
                 }
                 if (exec->isEOF()) {
                     return createListCollectionsCursorReply(
@@ -543,15 +550,15 @@ public:
                 opCtx,
                 {std::move(exec),
                  cursorNss,
-                 AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                 AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserName(),
                  APIParameters::get(opCtx),
                  opCtx->getWriteConcern(),
                  repl::ReadConcernArgs::get(opCtx),
                  ReadPreferenceSetting::get(opCtx),
                  cmdObj,
                  uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
-                                     ->checkAuthorizedToListCollections(dbName, cmdObj))});
-
+                                     ->checkAuthorizedToListCollections(
+                                         dbName.toStringWithTenantId(), cmdObj))});
             pinnedCursor->incNBatches();
             pinnedCursor->incNReturnedSoFar(firstBatch.size());
 

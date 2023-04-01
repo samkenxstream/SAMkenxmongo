@@ -35,7 +35,7 @@ global:
         - "mongo/s/catalog/type_collection.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/db/coll_mod.idl"
     - "mongo/db/s/sharding_ddl_coordinator.idl"
     - "mongo/s/sharding_types.idl"
@@ -46,33 +46,12 @@ enums:
         type: string
         values:
             kUnset: "unset"
+            kFreezeMigrations: "FreezeMigrations"
             kBlockShards: "BlockShards"
             kUpdateConfig: "UpdateConfig"
             kUpdateShards: "UpdateShards"
 
 structs:
-    CollModCollectionInfo:
-        description: "Collection information that may affect collMod processing"
-        generate_comparison_operators: false
-        strict: false
-        fields:
-            timeSeriesOptions:
-                type: TimeseriesOptions
-                optional: true
-            nsForTargetting:
-                type: namespacestring
-                description: "The targeting namespace that may be different from the original namespace in some cases, like time-series collections"
-            isSharded:
-                type: bool
-            primaryShard:
-                type: shard_id
-                optional: true
-                description: "The primary shard for the collection, only set if the collection is sharded"
-            shardsOwningChunks:
-                type: array<shard_id>
-                optional: true
-                description: "The shards owning chunks for the collection, only set if the collection is sharded"
-
     CollModCoordinatorDocument:
         description: "Represents a collMod operation on the coordinator shard."
         generate_comparison_operators: false
@@ -90,7 +69,8 @@ structs:
                 type: uuid
                 description: "Collection uuid."
                 optional: true
-            info:
-                type: CollModCollectionInfo
-                description: "Collection information that may affect collMod processing"
+            # TODO SERVER-68008 remove once 7.0 becomes last LTS
+            migrationsAlreadyBlockedForBucketNss:
+                type: safeBool
+                description: "Flag set by the coordinator before acquiring critical section on bucket namespace"
                 optional: true

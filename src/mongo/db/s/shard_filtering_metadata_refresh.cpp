@@ -27,16 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 
-#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/database_sharding_state.h"
+#include "mongo/db/s/forwardable_operation_metadata.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/operation_sharding_state.h"
@@ -48,6 +47,8 @@
 #include "mongo/s/grid.h"
 #include "mongo/util/fail_point.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 namespace mongo {
 namespace {
 
@@ -55,69 +56,48 @@ MONGO_FAIL_POINT_DEFINE(skipDatabaseVersionMetadataRefresh);
 MONGO_FAIL_POINT_DEFINE(skipShardFilteringMetadataRefresh);
 MONGO_FAIL_POINT_DEFINE(hangInRecoverRefreshThread);
 
-void onDbVersionMismatch(OperationContext* opCtx,
-                         const StringData dbName,
-                         boost::optional<DatabaseVersion> clientDbVersion) {
-    invariant(!opCtx->lockState()->isLocked());
-    invariant(!opCtx->getClient()->isInDirectClient());
-    invariant(ShardingState::get(opCtx)->canAcceptShardedCommands());
+/**
+ * Blocking method, which will wait for any concurrent operations that could change the database
+ * version to complete (namely critical section and concurrent onDbVersionMismatch invocations).
+ *
+ * Returns 'true' if there were concurrent operations that had to be joined (in which case all locks
+ * will be dropped). If there were none, returns false and the locks continue to be held.
+ */
+template <typename ScopedDatabaseShardingState>
+bool joinDbVersionOperation(OperationContext* opCtx,
+                            boost::optional<Lock::DBLock>* dbLock,
+                            boost::optional<ScopedDatabaseShardingState>* scopedDss) {
+    invariant(dbLock->has_value());
+    invariant(scopedDss->has_value());
 
-    {
-        // Take the DBLock directly rather than using AutoGetDb, to prevent a recursive call into
-        // checkDbVersion().
-        //
-        // TODO: It is not safe here to read the DB version without checking for critical section
-        //
-        if (clientDbVersion) {
-            Lock::DBLock dbLock(opCtx, dbName, MODE_IS);
-            auto dss = DatabaseShardingState::get(opCtx, dbName);
-            auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
-            const auto serverDbVersion = dss->getDbVersion(opCtx, dssLock);
-            if (clientDbVersion <= serverDbVersion) {
-                // The client was stale
-                return;
-            }
-        }
-    }
+    if (auto critSect =
+            (**scopedDss)->getCriticalSectionSignal(ShardingMigrationCriticalSection::kWrite)) {
+        LOGV2_DEBUG(6697201,
+                    2,
+                    "Waiting for exit from the critical section",
+                    logAttrs((**scopedDss)->getDbName()),
+                    "reason"_attr = (**scopedDss)->getCriticalSectionReason());
 
-    if (MONGO_unlikely(skipDatabaseVersionMetadataRefresh.shouldFail())) {
-        return;
-    }
-
-    forceDatabaseRefresh(opCtx, dbName);
-}
-
-// Return true if joins a shard version update/recover/refresh (in that case, all locks are dropped)
-bool joinShardVersionOperation(OperationContext* opCtx,
-                               CollectionShardingRuntime* csr,
-                               boost::optional<Lock::DBLock>* dbLock,
-                               boost::optional<Lock::CollectionLock>* collLock,
-                               boost::optional<CollectionShardingRuntime::CSRLock>* csrLock) {
-    invariant(collLock->has_value());
-    invariant(csrLock->has_value());
-
-    // If another thread is currently holding the critical section or the shard version future, it
-    // will be necessary to wait on one of the two variables to finish the update/recover/refresh.
-    auto inRecoverOrRefresh = csr->getShardVersionRecoverRefreshFuture(opCtx);
-    auto critSecSignal =
-        csr->getCriticalSectionSignal(opCtx, ShardingMigrationCriticalSection::kWrite);
-
-    if (inRecoverOrRefresh || critSecSignal) {
-        // Drop the locks and wait for an ongoing shard version's recovery/refresh/update
-        csrLock->reset();
-        collLock->reset();
+        scopedDss->reset();
         dbLock->reset();
 
-        if (critSecSignal) {
-            uassertStatusOK(
-                OperationShardingState::waitForCriticalSectionToComplete(opCtx, *critSecSignal));
-        } else {
-            try {
-                inRecoverOrRefresh->get(opCtx);
-            } catch (const ExceptionFor<ErrorCodes::ShardVersionRefreshCanceled>&) {
-                // The ongoing refresh has finished, although it was canceled by a
-                // 'clearFilteringMetadata'.
-            }
+        uassertStatusOK(OperationShardingState::waitForCriticalSectionToComplete(opCtx, *critSect));
+        return true;
+    }
+
+    if (auto refreshVersionFuture = (**scopedDss)->getDbMetadataRefreshFuture()) {
+        LOGV2_DEBUG(6697202,
+                    2,
+                    "Waiting for completion of another database metadata refresh",
+                    logAttrs((**scopedDss)->getDbName()));
+
+        scopedDss->reset();
+        dbLock->reset();
+
+        try {
+            refreshVersionFuture->get(opCtx);
+        } catch (const ExceptionFor<ErrorCodes::DatabaseMetadataRefreshCanceled>&) {
+            // The refresh was canceled by another thread that entered the critical section.
         }
 
         return true;
@@ -126,10 +106,260 @@ bool joinShardVersionOperation(OperationContext* opCtx,
     return false;
 }
 
-SharedSemiFuture<void> recoverRefreshShardVersion(ServiceContext* serviceContext,
-                                                  const NamespaceString nss,
-                                                  bool runRecover,
-                                                  CancellationToken cancellationToken) {
+/**
+ * Unconditionally refreshes the database metadata from the config server.
+ *
+ * NOTE: Does network I/O and acquires the database lock in X mode.
+ */
+Status refreshDbMetadata(OperationContext* opCtx,
+                         const DatabaseName& dbName,
+                         CancellationToken cancellationToken) {
+    invariant(!opCtx->lockState()->isLocked());
+    invariant(!opCtx->getClient()->isInDirectClient());
+    invariant(ShardingState::get(opCtx)->canAcceptShardedCommands());
+
+    ScopeGuard resetRefreshFutureOnError([&] {
+        // TODO (SERVER-71444): Fix to be interruptible or document exception.
+        // Can be uninterruptible because the work done under it can never block.
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
+        auto scopedDss = DatabaseShardingState::acquireExclusive(opCtx, dbName);
+        scopedDss->resetDbMetadataRefreshFuture();
+    });
+
+    // Force a refresh of the cached database metadata from the config server.
+    const auto swDbMetadata =
+        Grid::get(opCtx)->catalogCache()->getDatabaseWithRefresh(opCtx, dbName.db());
+
+    // Before setting the database metadata, exit early if the database version received by the
+    // config server is not newer than the cached one. This is a best-effort optimization to reduce
+    // the number of possible threads convoying on the exclusive lock below.
+    {
+        Lock::DBLock dbLock(opCtx, dbName, MODE_IS);
+        const auto scopedDss = DatabaseShardingState::assertDbLockedAndAcquireShared(opCtx, dbName);
+
+        const auto cachedDbVersion = scopedDss->getDbVersion(opCtx);
+        if (swDbMetadata.isOK() && swDbMetadata.getValue()->getVersion() <= cachedDbVersion) {
+            LOGV2_DEBUG(7079300,
+                        2,
+                        "Skip setting cached database metadata as there are no updates",
+                        logAttrs(dbName),
+                        "cachedDbVersion"_attr = *cachedDbVersion,
+                        "refreshedDbVersion"_attr = swDbMetadata.getValue()->getVersion());
+
+            return Status::OK();
+        }
+    }
+
+    Lock::DBLock dbLock(opCtx, dbName, MODE_IX);
+    auto scopedDss = DatabaseShardingState::assertDbLockedAndAcquireExclusive(opCtx, dbName);
+    if (!cancellationToken.isCanceled()) {
+        if (swDbMetadata.isOK()) {
+            // Set the refreshed database metadata in the local catalog.
+            scopedDss->setDbInfo(opCtx, *swDbMetadata.getValue());
+        } else if (swDbMetadata == ErrorCodes::NamespaceNotFound) {
+            // The database has been dropped, so clear its metadata in the local catalog.
+            scopedDss->clearDbInfo(opCtx, false /* cancelOngoingRefresh */);
+        }
+    }
+
+    // Reset the future reference to allow any other thread to refresh the database metadata.
+    scopedDss->resetDbMetadataRefreshFuture();
+    resetRefreshFutureOnError.dismiss();
+
+    return swDbMetadata.getStatus();
+}
+
+SharedSemiFuture<void> recoverRefreshDbVersion(OperationContext* opCtx,
+                                               const DatabaseName& dbName,
+                                               const CancellationToken& cancellationToken) {
+    const auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+    return ExecutorFuture<void>(executor)
+        .then([=,
+               serviceCtx = opCtx->getServiceContext(),
+               forwardableOpMetadata = ForwardableOperationMetadata(opCtx)] {
+            ThreadClient tc("DbMetadataRefreshThread", serviceCtx);
+            {
+                stdx::lock_guard<Client> lk(*tc.get());
+                tc->setSystemOperationKillableByStepdown(lk);
+            }
+
+            const auto opCtxHolder =
+                CancelableOperationContext(tc->makeOperationContext(), cancellationToken, executor);
+            auto opCtx = opCtxHolder.get();
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+
+            // Forward `users` and `roles` attributes from the original request.
+            forwardableOpMetadata.setOn(opCtx);
+
+            LOGV2_DEBUG(6697203, 2, "Started database metadata refresh", logAttrs(dbName));
+
+            return refreshDbMetadata(opCtx, dbName, cancellationToken);
+        })
+        .onCompletion([=](Status status) {
+            uassert(ErrorCodes::DatabaseMetadataRefreshCanceled,
+                    str::stream() << "Canceled metadata refresh for database " << dbName,
+                    !cancellationToken.isCanceled());
+
+            if (status.isOK() || status == ErrorCodes::NamespaceNotFound) {
+                LOGV2(6697204, "Refreshed database metadata", logAttrs(dbName));
+            } else {
+                LOGV2_ERROR(6697205,
+                            "Failed database metadata refresh",
+                            logAttrs(dbName),
+                            "error"_attr = redact(status));
+            }
+        })
+        .semi()
+        .share();
+}
+
+void onDbVersionMismatch(OperationContext* opCtx,
+                         const StringData dbName,
+                         boost::optional<DatabaseVersion> receivedDbVersion) {
+    invariant(!opCtx->lockState()->isLocked());
+    invariant(!opCtx->getClient()->isInDirectClient());
+    invariant(ShardingState::get(opCtx)->canAcceptShardedCommands());
+
+    tassert(ErrorCodes::IllegalOperation,
+            "Can't check version of {} database"_format(dbName),
+            dbName != DatabaseName::kAdmin.db() && dbName != DatabaseName::kConfig.db());
+
+    Timer t{};
+    ScopeGuard finishTiming([&] {
+        CurOp::get(opCtx)->debug().databaseVersionRefreshMillis += Milliseconds(t.millis());
+    });
+
+    LOGV2_DEBUG(6697200,
+                2,
+                "Handle database version mismatch",
+                "db"_attr = dbName,
+                "receivedDbVersion"_attr = receivedDbVersion);
+
+    while (true) {
+        boost::optional<SharedSemiFuture<void>> dbMetadataRefreshFuture;
+
+        {
+            boost::optional<Lock::DBLock> dbLock;
+            dbLock.emplace(opCtx, dbName, MODE_IS);
+
+            if (receivedDbVersion) {
+                auto scopedDss = boost::make_optional(
+                    DatabaseShardingState::assertDbLockedAndAcquireShared(opCtx, dbName));
+
+                if (joinDbVersionOperation(opCtx, &dbLock, &scopedDss)) {
+                    // Waited for another thread to exit from the critical section or to complete an
+                    // ongoing refresh, so reacquire the locks.
+                    continue;
+                }
+
+                // From now until the end of this block [1] no thread is in the critical section or
+                // can enter it (would require to X-lock the database) and [2] no metadata refresh
+                // is in progress or can start (would require to exclusive lock the DSS).
+                // Therefore, the database version can be accessed safely.
+
+                const auto wantedVersion = (*scopedDss)->getDbVersion(opCtx);
+                if (receivedDbVersion <= wantedVersion) {
+                    // No need to refresh the database metadata as the wanted version is newer
+                    // than the one received.
+                    return;
+                }
+            }
+
+            if (MONGO_unlikely(skipDatabaseVersionMetadataRefresh.shouldFail())) {
+                return;
+            }
+
+            auto scopedDss = boost::make_optional(
+                DatabaseShardingState::assertDbLockedAndAcquireExclusive(opCtx, dbName));
+
+            if (joinDbVersionOperation(opCtx, &dbLock, &scopedDss)) {
+                // Waited for another thread to exit from the critical section or to complete an
+                // ongoing refresh, so reacquire the locks.
+                continue;
+            }
+
+            // From now until the end of this block [1] no thread is in the critical section or can
+            // enter it (would require to X-lock the database) and [2] this is the only metadata
+            // refresh in progress (holding the exclusive lock on the DSS).
+            // Therefore, the future to refresh the database metadata can be set.
+
+            CancellationSource cancellationSource;
+            CancellationToken cancellationToken = cancellationSource.token();
+            (*scopedDss)
+                ->setDbMetadataRefreshFuture(
+                    recoverRefreshDbVersion(opCtx, dbName, cancellationToken),
+                    std::move(cancellationSource));
+            dbMetadataRefreshFuture = (*scopedDss)->getDbMetadataRefreshFuture();
+        }
+
+        // No other metadata refresh for this database can run in parallel. If another thread enters
+        // the critical section, the ongoing refresh would be interrupted and subsequently
+        // re-queued.
+
+        try {
+            dbMetadataRefreshFuture->get(opCtx);
+        } catch (const ExceptionFor<ErrorCodes::DatabaseMetadataRefreshCanceled>&) {
+            // The refresh was canceled by another thread that entered the critical section.
+            continue;
+        }
+
+        break;
+    }
+}
+
+/**
+ * Blocking method, which will wait for any concurrent operations that could change the shard
+ * version to complete (namely critical section and concurrent onCollectionPlacementVersionMismatch
+ * invocations).
+ *
+ * Returns 'true' if there were concurrent operations that had to be joined (in which case all locks
+ * will be dropped). If there were none, returns false and the locks continue to be held.
+ */
+template <typename ScopedCSR>
+bool joinCollectionPlacementVersionOperation(OperationContext* opCtx,
+                                             boost::optional<Lock::DBLock>* dbLock,
+                                             boost::optional<Lock::CollectionLock>* collLock,
+                                             boost::optional<ScopedCSR>* scopedCsr) {
+    invariant(dbLock->has_value());
+    invariant(collLock->has_value());
+    invariant(scopedCsr->has_value());
+
+    if (auto critSecSignal =
+            (**scopedCsr)
+                ->getCriticalSectionSignal(opCtx, ShardingMigrationCriticalSection::kWrite)) {
+        scopedCsr->reset();
+        collLock->reset();
+        dbLock->reset();
+
+        uassertStatusOK(
+            OperationShardingState::waitForCriticalSectionToComplete(opCtx, *critSecSignal));
+
+        return true;
+    }
+
+    if (auto inRecoverOrRefresh = (**scopedCsr)->getPlacementVersionRecoverRefreshFuture(opCtx)) {
+        scopedCsr->reset();
+        collLock->reset();
+        dbLock->reset();
+
+        try {
+            inRecoverOrRefresh->get(opCtx);
+        } catch (const ExceptionFor<ErrorCodes::PlacementVersionRefreshCanceled>&) {
+            // The ongoing refresh has finished, although it was canceled by a
+            // 'clearFilteringMetadata'.
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+SharedSemiFuture<void> recoverRefreshCollectionPlacementVersion(
+    ServiceContext* serviceContext,
+    const NamespaceString& nss,
+    bool runRecover,
+    CancellationToken cancellationToken) {
     auto executor = Grid::get(serviceContext)->getExecutorPool()->getFixedExecutor();
     return ExecutorFuture<void>(executor)
         .then([=] {
@@ -146,29 +376,16 @@ SharedSemiFuture<void> recoverRefreshShardVersion(ServiceContext* serviceContext
             const auto opCtxHolder =
                 CancelableOperationContext(tc->makeOperationContext(), cancellationToken, executor);
             auto const opCtx = opCtxHolder.get();
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             boost::optional<CollectionMetadata> currentMetadataToInstall;
 
-            ON_BLOCK_EXIT([&] {
-                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-                // A view can potentially be created after spawning a thread to recover nss's shard
-                // version. It is then ok to lock views in order to clear filtering metadata.
-                //
-                // DBLock and CollectionLock must be used in order to avoid shard version checks
-                Lock::DBLock dbLock(opCtx, nss.db(), MODE_IX);
-                Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
-
-                auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
-
-                auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, csr);
-                // cancellationToken needs to be checked under the CSR lock before overwriting the
-                // filtering metadata to serialize with other threads calling
-                // 'clearFilteringMetadata'
-                if (currentMetadataToInstall && !cancellationToken.isCanceled()) {
-                    csr->setFilteringMetadata_withLock(opCtx, *currentMetadataToInstall, csrLock);
-                }
-
-                csr->resetShardVersionRecoverRefreshFuture(csrLock);
+            ScopeGuard resetRefreshFutureOnError([&] {
+                // TODO (SERVER-71444): Fix to be interruptible or document exception.
+                // Can be uninterruptible because the work done under it can never block
+                UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
+                auto scopedCsr = CollectionShardingRuntime::acquireExclusive(opCtx, nss);
+                scopedCsr->resetPlacementVersionRecoverRefreshFuture();
             });
 
             if (runRecover) {
@@ -186,14 +403,14 @@ SharedSemiFuture<void> recoverRefreshShardVersion(ServiceContext* serviceContext
                 if (!currentMetadata.allowMigrations()) {
                     boost::optional<SharedSemiFuture<void>> waitForMigrationAbort;
                     {
-                        // DBLock and CollectionLock must be used in order to avoid shard version
-                        // checks
-                        Lock::DBLock dbLock(opCtx, nss.db(), MODE_IX);
-                        Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
+                        Lock::DBLock dbLock(opCtx, nss.dbName(), MODE_IS);
+                        Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
 
-                        auto const& csr = CollectionShardingRuntime::get(opCtx, nss);
-                        auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
-                        if (auto msm = MigrationSourceManager::get(csr, csrLock)) {
+                        const auto scopedCsr =
+                            CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx,
+                                                                                              nss);
+
+                        if (auto msm = MigrationSourceManager::get(*scopedCsr)) {
                             waitForMigrationAbort.emplace(msm->abort());
                         }
                     }
@@ -212,18 +429,33 @@ SharedSemiFuture<void> recoverRefreshShardVersion(ServiceContext* serviceContext
                 }
             }
 
-            // Only if all actions taken as part of refreshing the shard version completed
+            // Only if all actions taken as part of refreshing the placement version completed
             // successfully do we want to install the current metadata.
-            currentMetadataToInstall = std::move(currentMetadata);
+            // A view can potentially be created after spawning a thread to recover nss's shard
+            // version. It is then ok to lock views in order to clear filtering metadata.
+            //
+            // DBLock and CollectionLock must be used in order to avoid placement version checks
+            Lock::DBLock dbLock(opCtx, nss.dbName(), MODE_IX);
+            Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
+            auto scopedCsr =
+                CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(opCtx, nss);
+
+            // cancellationToken needs to be checked under the CSR lock before overwriting the
+            // filtering metadata to serialize with other threads calling 'clearFilteringMetadata'.
+            if (!cancellationToken.isCanceled()) {
+                scopedCsr->setFilteringMetadata(opCtx, currentMetadata);
+            }
+
+            scopedCsr->resetPlacementVersionRecoverRefreshFuture();
+            resetRefreshFutureOnError.dismiss();
         })
         .onCompletion([=](Status status) {
-            // Check the cancellation token here to ensure we throw in all cancelation events,
-            // including those where the cancelation was noticed on the ON_BLOCK_EXIT above (where
-            // we cannot throw).
+            // Check the cancellation token here to ensure we throw in all cancelation events.
             if (cancellationToken.isCanceled() &&
                 (status.isOK() || status == ErrorCodes::Interrupted)) {
-                uasserted(ErrorCodes::ShardVersionRefreshCanceled,
-                          "Shard version refresh canceled by a 'clearFilteringMetadata'");
+                uasserted(ErrorCodes::PlacementVersionRefreshCanceled,
+                          "Collection placement version refresh canceled by an interruption, "
+                          "probably due to a 'clearFilteringMetadata'");
             }
             return status;
         })
@@ -233,12 +465,17 @@ SharedSemiFuture<void> recoverRefreshShardVersion(ServiceContext* serviceContext
 
 }  // namespace
 
-void onShardVersionMismatch(OperationContext* opCtx,
-                            const NamespaceString& nss,
-                            boost::optional<ChunkVersion> shardVersionReceived) {
+void onCollectionPlacementVersionMismatch(OperationContext* opCtx,
+                                          const NamespaceString& nss,
+                                          boost::optional<ChunkVersion> chunkVersionReceived) {
     invariant(!opCtx->lockState()->isLocked());
     invariant(!opCtx->getClient()->isInDirectClient());
     invariant(ShardingState::get(opCtx)->canAcceptShardedCommands());
+
+    Timer t{};
+    ScopeGuard finishTiming([&] {
+        CurOp::get(opCtx)->debug().placementVersionRefreshMillis += Milliseconds(t.millis());
+    });
 
     if (nss.isNamespaceAlwaysUnsharded()) {
         return;
@@ -246,65 +483,67 @@ void onShardVersionMismatch(OperationContext* opCtx,
 
     LOGV2_DEBUG(22061,
                 2,
-                "Metadata refresh requested for {namespace} at shard version "
-                "{shardVersionReceived}",
+                "Metadata refresh requested for {namespace} at chunk version "
+                "{chunkVersionReceived}",
                 "Metadata refresh requested for collection",
-                "namespace"_attr = nss,
-                "shardVersionReceived"_attr = shardVersionReceived);
+                logAttrs(nss),
+                "chunkVersionReceived"_attr = chunkVersionReceived);
 
     while (true) {
         boost::optional<SharedSemiFuture<void>> inRecoverOrRefresh;
+
         {
             boost::optional<Lock::DBLock> dbLock;
             boost::optional<Lock::CollectionLock> collLock;
-            dbLock.emplace(opCtx, nss.db(), MODE_IS);
+            dbLock.emplace(opCtx, nss.dbName(), MODE_IS);
             collLock.emplace(opCtx, nss, MODE_IS);
 
-            auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
-            boost::optional<CollectionShardingRuntime::CSRLock> csrLock =
-                CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
+            if (chunkVersionReceived) {
+                auto scopedCsr = boost::make_optional(
+                    CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, nss));
 
-            if (joinShardVersionOperation(opCtx, csr, &dbLock, &collLock, &csrLock)) {
-                continue;
-            }
+                if (joinCollectionPlacementVersionOperation(
+                        opCtx, &dbLock, &collLock, &scopedCsr)) {
+                    continue;
+                }
 
-            auto metadata = csr->getCurrentMetadataIfKnown();
-            if (metadata) {
-                // Check if the current shard version is fresh enough
-                if (shardVersionReceived) {
-                    const auto currentShardVersion = metadata->getShardVersion();
+                if (auto metadata = (*scopedCsr)->getCurrentMetadataIfKnown()) {
+                    const auto currentCollectionPlacementVersion =
+                        metadata->getShardPlacementVersion();
                     // Don't need to remotely reload if the requested version is smaller than the
                     // known one. This means that the remote side is behind.
-                    if (shardVersionReceived->isOlderOrEqualThan(currentShardVersion)) {
+                    if (chunkVersionReceived->isOlderOrEqualThan(
+                            currentCollectionPlacementVersion)) {
                         return;
                     }
                 }
             }
 
-            csrLock.reset();
-            csrLock.emplace(CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, csr));
+            auto scopedCsr = boost::make_optional(
+                CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(opCtx, nss));
 
-            // If there is no ongoing shard version operation, initialize the RecoverRefreshThread
-            // thread and associate it to the CSR.
-            if (!joinShardVersionOperation(opCtx, csr, &dbLock, &collLock, &csrLock)) {
-                // If the shard doesn't yet know its filtering metadata, recovery needs to be run
-                const bool runRecover = metadata ? false : true;
-                CancellationSource cancellationSource;
-                CancellationToken cancellationToken = cancellationSource.token();
-                csr->setShardVersionRecoverRefreshFuture(
-                    recoverRefreshShardVersion(
-                        opCtx->getServiceContext(), nss, runRecover, std::move(cancellationToken)),
-                    std::move(cancellationSource),
-                    *csrLock);
-                inRecoverOrRefresh = csr->getShardVersionRecoverRefreshFuture(opCtx);
-            } else {
+            if (joinCollectionPlacementVersionOperation(opCtx, &dbLock, &collLock, &scopedCsr)) {
                 continue;
             }
+
+            // If we reached here, there were no ongoing critical sections or recoverRefresh running
+            // and we are holding the exclusive CSR lock.
+
+            // If the shard doesn't yet know its filtering metadata, recovery needs to be run
+            const bool runRecover = (*scopedCsr)->getCurrentMetadataIfKnown() ? false : true;
+            CancellationSource cancellationSource;
+            CancellationToken cancellationToken = cancellationSource.token();
+            (*scopedCsr)
+                ->setPlacementVersionRecoverRefreshFuture(
+                    recoverRefreshCollectionPlacementVersion(
+                        opCtx->getServiceContext(), nss, runRecover, std::move(cancellationToken)),
+                    std::move(cancellationSource));
+            inRecoverOrRefresh = (*scopedCsr)->getPlacementVersionRecoverRefreshFuture(opCtx);
         }
 
         try {
             inRecoverOrRefresh->get(opCtx);
-        } catch (const ExceptionFor<ErrorCodes::ShardVersionRefreshCanceled>&) {
+        } catch (const ExceptionFor<ErrorCodes::PlacementVersionRefreshCanceled>&) {
             // The refresh was canceled by a 'clearFilteringMetadata'. Retry the refresh.
             continue;
         }
@@ -313,17 +552,18 @@ void onShardVersionMismatch(OperationContext* opCtx,
     }
 }
 
-Status onShardVersionMismatchNoExcept(OperationContext* opCtx,
-                                      const NamespaceString& nss,
-                                      boost::optional<ChunkVersion> shardVersionReceived) noexcept {
+Status onCollectionPlacementVersionMismatchNoExcept(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    boost::optional<ChunkVersion> chunkVersionReceived) noexcept {
     try {
-        onShardVersionMismatch(opCtx, nss, shardVersionReceived);
+        onCollectionPlacementVersionMismatch(opCtx, nss, chunkVersionReceived);
         return Status::OK();
     } catch (const DBException& ex) {
         LOGV2(22062,
               "Failed to refresh metadata for {namespace} due to {error}",
               "Failed to refresh metadata for collection",
-              "namespace"_attr = nss,
+              logAttrs(nss),
               "error"_attr = redact(ex));
         return ex.toStatus();
     }
@@ -341,8 +581,9 @@ CollectionMetadata forceGetCurrentMetadata(OperationContext* opCtx, const Namesp
     invariant(shardingState->canAcceptShardedCommands());
 
     try {
-        const auto cm = uassertStatusOK(
-            Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithRefresh(opCtx, nss));
+        const auto [cm, _] = uassertStatusOK(
+            Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithPlacementRefresh(opCtx,
+                                                                                           nss));
 
         if (!cm.isSharded()) {
             return CollectionMetadata();
@@ -353,7 +594,7 @@ CollectionMetadata forceGetCurrentMetadata(OperationContext* opCtx, const Namesp
         LOGV2(505070,
               "Namespace {namespace} not found, collection may have been dropped",
               "Namespace not found, collection may have been dropped",
-              "namespace"_attr = nss,
+              logAttrs(nss),
               "error"_attr = redact(ex));
         return CollectionMetadata();
     }
@@ -371,17 +612,18 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
     auto* const shardingState = ShardingState::get(opCtx);
     invariant(shardingState->canAcceptShardedCommands());
 
-    const auto cm = uassertStatusOK(
-        Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithRefresh(opCtx, nss));
+    const auto [cm, _] = uassertStatusOK(
+        Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithPlacementRefresh(opCtx, nss));
 
     if (!cm.isSharded()) {
         // DBLock and CollectionLock are used here to avoid throwing further recursive stale
         // config errors, as well as a possible InvalidViewDefinition error if an invalid view
         // is in the 'system.views' collection.
-        Lock::DBLock dbLock(opCtx, nss.db(), MODE_IX);
+        Lock::DBLock dbLock(opCtx, nss.dbName(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
-        CollectionShardingRuntime::get(opCtx, nss)
-            ->setFilteringMetadata(opCtx, CollectionMetadata());
+        auto scopedCsr =
+            CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(opCtx, nss);
+        scopedCsr->setFilteringMetadata(opCtx, CollectionMetadata());
 
         return ChunkVersion::UNSHARDED();
     }
@@ -392,26 +634,22 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
         // DBLock and CollectionLock are used here to avoid throwing further recursive stale
         // config errors, as well as a possible InvalidViewDefinition error if an invalid view
         // is in the 'system.views' collection.
-        Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
+        Lock::DBLock dbLock(opCtx, nss.dbName(), MODE_IS);
         Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
-        auto optMetadata = CollectionShardingRuntime::get(opCtx, nss)->getCurrentMetadataIfKnown();
-
-        // We already have newer version
-        if (optMetadata) {
+        const auto scopedCsr =
+            CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, nss);
+        if (auto optMetadata = scopedCsr->getCurrentMetadataIfKnown()) {
             const auto& metadata = *optMetadata;
             if (metadata.isSharded() &&
-                (cm.getVersion().isOlderOrEqualThan(metadata.getCollVersion()))) {
-                LOGV2_DEBUG(
-                    22063,
-                    1,
-                    "Skipping refresh of metadata for {namespace} {latestCollectionVersion} with "
-                    "an older {refreshedCollectionVersion}",
-                    "Skipping metadata refresh because collection already has at least as recent "
-                    "metadata",
-                    "namespace"_attr = nss,
-                    "latestCollectionVersion"_attr = metadata.getCollVersion(),
-                    "refreshedCollectionVersion"_attr = cm.getVersion());
-                return metadata.getShardVersion();
+                (cm.getVersion().isOlderOrEqualThan(metadata.getCollPlacementVersion()))) {
+                LOGV2_DEBUG(22063,
+                            1,
+                            "Skipping metadata refresh because collection already is up-to-date",
+                            logAttrs(nss),
+                            "latestCollectionPlacementVersion"_attr =
+                                metadata.getCollPlacementVersion(),
+                            "refreshedCollectionPlacementVersion"_attr = cm.getVersion());
+                return metadata.getShardPlacementVersion();
             }
         }
     }
@@ -421,38 +659,30 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
     // DBLock and CollectionLock are used here to avoid throwing further recursive stale config
     // errors, as well as a possible InvalidViewDefinition error if an invalid view is in the
     // 'system.views' collection.
-    Lock::DBLock dbLock(opCtx, nss.db(), MODE_IX);
+    Lock::DBLock dbLock(opCtx, nss.dbName(), MODE_IX);
     Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
-    auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
-
-    {
-        auto optMetadata = csr->getCurrentMetadataIfKnown();
-
-        // We already have newer version
-        if (optMetadata) {
-            const auto& metadata = *optMetadata;
-            if (metadata.isSharded() &&
-                (cm.getVersion().isOlderOrEqualThan(metadata.getCollVersion()))) {
-                LOGV2_DEBUG(
-                    22064,
-                    1,
-                    "Skipping refresh of metadata for {namespace} {latestCollectionVersion} with "
-                    "an older {refreshedCollectionVersion}",
-                    "Skipping metadata refresh because collection already has at least as recent "
-                    "metadata",
-                    "namespace"_attr = nss,
-                    "latestCollectionVersion"_attr = metadata.getCollVersion(),
-                    "refreshedCollectionVersion"_attr = cm.getVersion());
-                return metadata.getShardVersion();
-            }
+    auto scopedCsr =
+        CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(opCtx, nss);
+    if (auto optMetadata = scopedCsr->getCurrentMetadataIfKnown()) {
+        const auto& metadata = *optMetadata;
+        if (metadata.isSharded() &&
+            (cm.getVersion().isOlderOrEqualThan(metadata.getCollPlacementVersion()))) {
+            LOGV2_DEBUG(22064,
+                        1,
+                        "Skipping metadata refresh because collection already is up-to-date",
+                        logAttrs(nss),
+                        "latestCollectionPlacementVersion"_attr =
+                            metadata.getCollPlacementVersion(),
+                        "refreshedCollectionPlacementVersion"_attr = cm.getVersion());
+            return metadata.getShardPlacementVersion();
         }
     }
 
     CollectionMetadata metadata(cm, shardingState->shardId());
-    const auto newShardVersion = metadata.getShardVersion();
+    auto newPlacementVersion = metadata.getShardPlacementVersion();
 
-    csr->setFilteringMetadata(opCtx, std::move(metadata));
-    return newShardVersion;
+    scopedCsr->setFilteringMetadata(opCtx, std::move(metadata));
+    return newPlacementVersion;
 }
 
 Status onDbVersionMismatchNoExcept(OperationContext* opCtx,
@@ -469,58 +699,6 @@ Status onDbVersionMismatchNoExcept(OperationContext* opCtx,
               "error"_attr = redact(ex));
         return ex.toStatus();
     }
-}
-
-void forceDatabaseRefresh(OperationContext* opCtx, const StringData dbName) {
-    invariant(!opCtx->lockState()->isLocked());
-    invariant(!opCtx->getClient()->isInDirectClient());
-
-    auto const shardingState = ShardingState::get(opCtx);
-    invariant(shardingState->canAcceptShardedCommands());
-
-    const auto swRefreshedDbInfo =
-        Grid::get(opCtx)->catalogCache()->getDatabaseWithRefresh(opCtx, dbName);
-
-    if (swRefreshedDbInfo == ErrorCodes::NamespaceNotFound) {
-        // db has been dropped, set the db version to boost::none
-        Lock::DBLock dbLock(opCtx, dbName, MODE_X);
-        auto dss = DatabaseShardingState::get(opCtx, dbName);
-        dss->clearDatabaseInfo(opCtx);
-        return;
-    }
-
-    const auto refreshedDbInfo = uassertStatusOK(std::move(swRefreshedDbInfo));
-    const auto& refreshedDBVersion = refreshedDbInfo->getVersion();
-
-    // First, check under a shared lock if another thread already updated the cached version.
-    // This is a best-effort optimization to make as few threads as possible to convoy on the
-    // exclusive lock below.
-    {
-        // Take the DBLock directly rather than using AutoGetDb, to prevent a recursive call
-        // into checkDbVersion().
-        Lock::DBLock dbLock(opCtx, dbName, MODE_IS);
-        auto dss = DatabaseShardingState::get(opCtx, dbName);
-        auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
-
-        const auto cachedDbVersion = dss->getDbVersion(opCtx, dssLock);
-        if (cachedDbVersion && *cachedDbVersion >= refreshedDBVersion) {
-            LOGV2_DEBUG(5369130,
-                        2,
-                        "Skipping updating cached database info from refreshed version "
-                        "because the one currently cached is more recent",
-                        "db"_attr = dbName,
-                        "refreshedDbVersion"_attr = refreshedDBVersion,
-                        "cachedDbVersion"_attr = *cachedDbVersion);
-            return;
-        }
-    }
-
-    // The cached version is older than the refreshed version; update the cached version.
-    Lock::DBLock dbLock(opCtx, dbName, MODE_X);
-    auto dss = DatabaseShardingState::get(opCtx, dbName);
-    auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, dss);
-
-    dss->setDatabaseInfo(opCtx, DatabaseType(*refreshedDbInfo), dssLock);
 }
 
 }  // namespace mongo

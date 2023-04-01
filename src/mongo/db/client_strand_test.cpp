@@ -40,7 +40,6 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/executor_test_util.h"
-#include "mongo/util/thread_context.h"
 
 namespace mongo {
 namespace {
@@ -54,7 +53,7 @@ public:
      * Clean up any leftover thread_local pieces.
      */
     void releaseClient() {
-        ThreadName::release(ThreadContext::get());
+        releaseThreadNameRef();
         if (haveClient()) {
             Client::releaseCurrent();
         }
@@ -123,7 +122,7 @@ TEST_F(ClientStrandTest, BindMultipleTimes) {
     // We have no bound Client.
     assertStrandNotBound(strand);
 
-    for (auto i = 0; i < 100; ++i) {
+    for (auto i = 0; i < 10; ++i) {
         // Bind a bunch of times.
 
         {
@@ -145,7 +144,7 @@ TEST_F(ClientStrandTest, BindMultipleTimesAndDismiss) {
     assertStrandNotBound(strand);
 
     auto guard = strand->bind();
-    for (auto i = 0; i < 100; ++i) {
+    for (auto i = 0; i < 10; ++i) {
         assertStrandBound(strand);
 
         // Dismiss the current guard.
@@ -266,7 +265,7 @@ TEST_F(ClientStrandTest, BindLocalAfterWorkerThread) {
 TEST_F(ClientStrandTest, BindManyWorkerThreads) {
     auto strand = ClientStrand::make(getServiceContext()->makeClient(kClientName1));
 
-    constexpr size_t kCount = 100;
+    constexpr size_t kCount = 10;
     auto barrier = std::make_shared<unittest::Barrier>(kCount);
 
     size_t threadsBound = 0;
@@ -308,7 +307,7 @@ TEST_F(ClientStrandTest, SwapStrands) {
     assertStrandNotBound(strand1);
     assertStrandNotBound(strand2);
 
-    for (size_t i = 0; i < 100; ++i) {
+    for (size_t i = 0; i < 10; ++i) {
         // Alternate between binding strand1 and strand2. Start on strand2 so it has a different
         // thread name than the previous test.
         auto& strand = (i % 2 == 0) ? strand2 : strand1;
@@ -325,7 +324,7 @@ TEST_F(ClientStrandTest, SwapStrands) {
 }
 
 TEST_F(ClientStrandTest, Executor) {
-    constexpr size_t kCount = 100;
+    constexpr size_t kCount = 10;
 
     auto strand = ClientStrand::make(getServiceContext()->makeClient(kClientName1));
 

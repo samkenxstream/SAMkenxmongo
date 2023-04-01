@@ -45,6 +45,9 @@ public:
 
     virtual ~MongosProcessInterface() = default;
 
+    std::unique_ptr<WriteSizeEstimator> getWriteSizeEstimator(
+        OperationContext* opCtx, const NamespaceString& ns) const final;
+
     boost::optional<Document> lookupSingleDocument(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const NamespaceString& nss,
@@ -102,6 +105,11 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    boost::optional<BSONObj> getCatalogEntry(OperationContext* opCtx,
+                                             const NamespaceString& ns) const final {
+        MONGO_UNREACHABLE;
+    }
+
     void appendLatencyStats(OperationContext* opCtx,
                             const NamespaceString& nss,
                             bool includeHistograms,
@@ -112,7 +120,8 @@ public:
     Status appendStorageStats(OperationContext* opCtx,
                               const NamespaceString& nss,
                               const StorageStatsSpec& spec,
-                              BSONObjBuilder* builder) const final {
+                              BSONObjBuilder* builder,
+                              const boost::optional<BSONObj>& filterObj) const final {
         MONGO_UNREACHABLE;
     }
 
@@ -133,15 +142,17 @@ public:
     }
 
     void renameIfOptionsAndIndexesHaveNotChanged(OperationContext* opCtx,
-                                                 const BSONObj& renameCommandObj,
+                                                 const NamespaceString& sourceNs,
                                                  const NamespaceString& targetNs,
+                                                 bool dropTarget,
+                                                 bool stayTemp,
                                                  const BSONObj& originalCollectionOptions,
                                                  const std::list<BSONObj>& originalIndexes) final {
         MONGO_UNREACHABLE;
     }
 
     void createCollection(OperationContext* opCtx,
-                          const std::string& dbName,
+                          const DatabaseName& dbName,
                           const BSONObj& cmdObj) final {
         MONGO_UNREACHABLE;
     }
@@ -160,18 +171,17 @@ public:
                                       ExplainOptions::Verbosity verbosity) final;
 
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipelineForLocalRead(
-        Pipeline* pipeline) final {
+        Pipeline* pipeline, boost::optional<const AggregateCommandRequest&> aggRequest) final {
         // It is not meaningful to perform a "local read" on mongos.
         MONGO_UNREACHABLE;
     }
 
-    std::unique_ptr<ShardFilterer> getShardFilterer(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx) const override {
-        return nullptr;
-    }
-
     std::string getShardName(OperationContext* opCtx) const final {
         MONGO_UNREACHABLE;
+    }
+
+    bool inShardedEnvironment(OperationContext* opCtx) const final {
+        return true;
     }
 
     /**
@@ -230,10 +240,11 @@ public:
     }
 
     std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>>
-    ensureFieldsUniqueOrResolveDocumentKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                           boost::optional<std::set<FieldPath>> fieldPaths,
-                                           boost::optional<ChunkVersion> targetCollectionVersion,
-                                           const NamespaceString& outputNs) const override;
+    ensureFieldsUniqueOrResolveDocumentKey(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        boost::optional<std::set<FieldPath>> fieldPaths,
+        boost::optional<ChunkVersion> targetCollectionPlacementVersion,
+        const NamespaceString& outputNs) const override;
 
     /**
      * If 'allowTargetingShards' is true, splits the pipeline and dispatch half to the shards,
@@ -243,6 +254,14 @@ public:
      */
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
         Pipeline* pipeline,
+        ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
+        boost::optional<BSONObj> readConcern = boost::none) final;
+
+    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+        const AggregateCommandRequest& aggRequest,
+        Pipeline* pipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        boost::optional<BSONObj> shardCursorsSortSpec = boost::none,
         ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
         boost::optional<BSONObj> readConcern = boost::none) final;
 
@@ -292,6 +311,9 @@ protected:
                                                  CurrentOpConnectionsMode connMode,
                                                  CurrentOpSessionsMode sessionMode,
                                                  std::vector<BSONObj>* ops) const final;
+
+    void _reportCurrentOpsForQueryAnalysis(OperationContext* opCtx,
+                                           std::vector<BSONObj>* ops) const final;
 };
 
 }  // namespace mongo

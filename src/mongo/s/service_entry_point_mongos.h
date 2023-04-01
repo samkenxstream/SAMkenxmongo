@@ -44,13 +44,17 @@ class ServiceEntryPointMongos final : public ServiceEntryPointImpl {
 
 public:
     using ServiceEntryPointImpl::ServiceEntryPointImpl;
+
+    static Future<DbResponse> handleRequestImpl(OperationContext* opCtx,
+                                                const Message& request) noexcept;
+
     Future<DbResponse> handleRequest(OperationContext* opCtx,
                                      const Message& request) noexcept override;
 
     void appendStats(BSONObjBuilder* bob) const override;
 
     void onClientConnect(Client* client) override;
-    void onClientDisconnect(Client* client) override;
+    void derivedOnClientDisconnect(Client* client) override;
 
 private:
     Counter64 _loadBalancedConnections;

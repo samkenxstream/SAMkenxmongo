@@ -4,7 +4,7 @@ Import([
     'env',
     'get_option',
     'has_option',
-    'usemozjs',
+    'jsEngine',
     'version_parts',
     'version_extra',
 ])
@@ -19,11 +19,12 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/client/clientdriver_minimal',
-        '$BUILD_DIR/mongo/db/logical_session_id',
+        '$BUILD_DIR/mongo/db/session/logical_session_id',
         '$BUILD_DIR/mongo/scripting/bson_template_evaluator',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/third_party/shim_pcrecpp',
+        '$BUILD_DIR/mongo/util/pcre_util',
+        '$BUILD_DIR/mongo/util/pcre_wrapper',
     ],
 )
 
@@ -34,7 +35,8 @@ generateJSErrorCodes = env.Command(
         '$BUILD_DIR/mongo/base/error_codes.yml',
         'error_codes.tpl.js',
     ],
-    action=['$PYTHON ${SOURCES[0]} ${SOURCES[1]} ${SOURCES[2]} ${TARGETS[0]}'])
+    action=['$PYTHON ${SOURCES[0]} ${SOURCES[1]} ${SOURCES[2]} ${TARGETS[0]}'],
+)
 env.Alias('generated-sources', generateJSErrorCodes)
 
 # Files added here need to be added in scripting/engine.cpp and buildscripts/vcxproj.header as well.
@@ -57,7 +59,7 @@ js_header = env.JSHeader(
         "utils_auth.js",
         "utils.js",
         "utils_sh.js",
-    ]
+    ],
 )
 
 env.Alias('generated-sources', js_header)
@@ -118,9 +120,22 @@ env.Library(
 )
 
 env.Library(
+    target='program_runner',
+    source=[
+        'program_runner.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/base/environment_buffer',
+        '$BUILD_DIR/mongo/db/service_context',
+    ],
+)
+
+env.Library(
     target='shell_utils',
     source=[
         'mongo-server.cpp',
+        'named_pipe_test_helper.cpp',
         'shell_options.cpp',
         'shell_utils.cpp',
         'shell_utils_extended.cpp',
@@ -133,42 +148,46 @@ env.Library(
         '$BUILD_DIR/mongo/db/traffic_reader',
         '$BUILD_DIR/mongo/scripting/scripting',
         '$BUILD_DIR/mongo/transport/message_compressor',
+        '$BUILD_DIR/mongo/unittest/golden_test_base',
         '$BUILD_DIR/mongo/util/password',
         'benchrun',
         'shell_options_storage',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/bson/util/bson_column',
         '$BUILD_DIR/mongo/db/auth/security_token',
-    ]
+        '$BUILD_DIR/mongo/db/storage/record_store_base',
+        'program_runner',
+    ],
+)
+
+env.Library(
+    target='kms_idl',
+    source=[
+        'kms.idl',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/server_base',
+    ],
 )
 
 if get_option('ssl') == 'on':
     kmsEnv = env.Clone()
 
-    kmsEnv.InjectThirdParty(libraries=['kms-message'])
-
     kmsEnv.Library(
         target="kms",
         source=[
             "kms.cpp",
-            "kms_aws.cpp",
-            "kms_azure.cpp",
-            "kms_gcp.cpp",
             "kms_local.cpp",
-            "kms_network.cpp",
-            "kms.idl",
         ],
         LIBDEPS=[
             '$BUILD_DIR/mongo/base/secure_allocator',
+            'kms_idl',
         ],
         LIBDEPS_PRIVATE=[
             '$BUILD_DIR/mongo/base',
             '$BUILD_DIR/mongo/crypto/aead_encryption',
             '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
-            '$BUILD_DIR/mongo/util/net/network',
-            '$BUILD_DIR/mongo/util/net/ssl_manager',
-            '$BUILD_DIR/mongo/util/net/ssl_options',
-            '$BUILD_DIR/third_party/shim_kms_message',
         ],
     )
 
@@ -191,8 +210,7 @@ if get_option('ssl') == 'on':
                 # TODO(SERVER-59992): Remove -Wno-class-memacces where possible.
                 '-Wno-unknown-warning-option',
                 '-Wno-class-memaccess',
-            ],
-        )
+            ], )
 
         scriptingEnv.InjectMozJS()
 
@@ -200,7 +218,6 @@ if get_option('ssl') == 'on':
             target="encrypted_dbclient",
             source=[
                 "encrypted_dbclient_base.cpp",
-                "fle_shell_options.idl",
             ],
             LIBDEPS_PRIVATE=[
                 '$BUILD_DIR/mongo/client/clientdriver_minimal',
@@ -209,10 +226,10 @@ if get_option('ssl') == 'on':
                 '$BUILD_DIR/mongo/crypto/fle_crypto',
                 '$BUILD_DIR/mongo/crypto/fle_fields',
                 '$BUILD_DIR/mongo/crypto/symmetric_crypto',
-                '$BUILD_DIR/mongo/db/matcher/expressions',
+                '$BUILD_DIR/mongo/db/query_expressions',
                 '$BUILD_DIR/mongo/scripting/scripting',
                 '$BUILD_DIR/mongo/shell/shell_options_register',
-                '$BUILD_DIR/third_party/shim_mozjs',
+                '$BUILD_DIR/third_party/mozjs/mozjs',
                 'kms',
             ],
         )
@@ -228,7 +245,7 @@ env.Library(
     target="linenoise",
     source=[
         "linenoise.cpp",
-        "mk_wcwidth.cpp"
+        "mk_wcwidth.cpp",
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -238,7 +255,7 @@ env.Library(
     ],
 )
 
-if not has_option('noshell') and usemozjs:
+if not has_option('noshell') and jsEngine:
 
     env.Library(
         target="mongo_initializers",
@@ -252,15 +269,16 @@ if not has_option('noshell') and usemozjs:
             "$BUILD_DIR/mongo/client/clientdriver_network",
             "$BUILD_DIR/mongo/client/connection_string",
             "$BUILD_DIR/mongo/db/catalog/index_key_validate",
-            "$BUILD_DIR/mongo/db/logical_session_id_helpers",
             "$BUILD_DIR/mongo/db/mongohasher",
             "$BUILD_DIR/mongo/db/pipeline/change_stream_error_extra_info",
             "$BUILD_DIR/mongo/db/query/command_request_response",
             "$BUILD_DIR/mongo/db/query/query_request",
-            "$BUILD_DIR/mongo/db/server_options_core",
+            "$BUILD_DIR/mongo/db/server_base",
+            "$BUILD_DIR/mongo/db/session/logical_session_id_helpers",
             "$BUILD_DIR/mongo/db/storage/duplicate_key_error_info",
             "$BUILD_DIR/mongo/db/traffic_reader",
             "$BUILD_DIR/mongo/db/views/resolved_view",
+            "$BUILD_DIR/mongo/executor/async_rpc_error_info",
             "$BUILD_DIR/mongo/executor/network_interface_factory",
             "$BUILD_DIR/mongo/executor/network_interface_thread_pool",
             "$BUILD_DIR/mongo/executor/thread_pool_task_executor",
@@ -277,7 +295,6 @@ if not has_option('noshell') and usemozjs:
             "$BUILD_DIR/mongo/util/processinfo",
             "$BUILD_DIR/mongo/util/signal_handlers",
             "$BUILD_DIR/mongo/util/version_impl",
-            "$BUILD_DIR/third_party/shim_pcrecpp",
             "benchrun",
             "encrypted_dbclient" if get_option('ssl') == 'on' else '',
             "kms_shell" if get_option('ssl') == 'on' else '',
@@ -288,7 +305,6 @@ if not has_option('noshell') and usemozjs:
         LIBDEPS=[
             # NOTE: This list must remain empty. Please only add to LIBDEPS_PRIVATE
         ],
-
     )
 
     env.Library(
@@ -303,12 +319,14 @@ if not has_option('noshell') and usemozjs:
             # library to inject a static or mongo initializer to mongo,
             # please add that library as a private libdep of
             # mongo_initializers.
+            "$BUILD_DIR/mongo/s/write_ops/batch_write_types",
             "$BUILD_DIR/mongo/transport/transport_layer",
             "$BUILD_DIR/mongo/util/net/ssl_manager",
+            "$BUILD_DIR/mongo/util/pcre_wrapper",
             "$BUILD_DIR/mongo/util/signal_handlers",
-            "$BUILD_DIR/third_party/shim_pcrecpp",
             "linenoise",
             "mongo_initializers",
+            "program_runner",
             "shell_utils",
         ],
         LIBDEPS=[
@@ -321,14 +339,15 @@ if not has_option('noshell') and usemozjs:
         shellEnv.Append(LIBS=["winmm"])
 
         generatedMongoManifest = shellEnv.Substfile(
-                'mongo.manifest.in',
-                SUBST_DICT=[
-                    ('@mongo_version_major@', version_parts[0]),
-                    ('@mongo_version_minor@', version_parts[1]),
-                    ('@mongo_version_patch@', version_parts[2]),
-                    ('@mongo_version_extra@', version_parts[3]),
-                    ('@mongo_version_extra_str@', version_extra),
-                ])
+            'mongo.manifest.in',
+            SUBST_DICT=[
+                ('@mongo_version_major@', version_parts[0]),
+                ('@mongo_version_minor@', version_parts[1]),
+                ('@mongo_version_patch@', version_parts[2]),
+                ('@mongo_version_extra@', version_parts[3]),
+                ('@mongo_version_extra_str@', version_extra),
+            ],
+        )
         shellEnv.Alias('generated-sources', generatedMongoManifest)
         shellEnv.Depends("mongo.res", generatedMongoManifest)
 
@@ -347,24 +366,20 @@ if not has_option('noshell') and usemozjs:
             '$BUILD_DIR/mongo/base',
             'mongo_main',
         ],
-        AIB_COMPONENT="mongo",
+        AIB_COMPONENT="jstestshell",
         AIB_COMPONENTS_EXTRA=[
-            "core",
-            "default",
-            "dist",
+            "devcore",
             "dist-test",
-            "serverless-test",
-            "shell",
             "integration-tests",
+            "mongo",
+            "serverless-test",
         ],
     )
-
 
 env.CppUnitTest(
     target='shell_test',
     source=[
-        'kms_test.cpp' if get_option('ssl') == 'on' else [],
-        'shell_options_test.cpp',
+        'kms_test.cpp' if get_option('ssl') == 'on' else [], 'shell_options_test.cpp',
         'shell_utils_test.cpp'
     ],
     LIBDEPS=[

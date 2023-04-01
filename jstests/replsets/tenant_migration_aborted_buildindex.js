@@ -3,7 +3,6 @@
  *
  * @tags: [
  *   requires_majority_read_concern,
- *   incompatible_with_eft,
  *   incompatible_with_windows_tls,
  *   incompatible_with_macos,
  *   requires_persistence,
@@ -11,18 +10,19 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    runMigrationAsync,
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+load("jstests/replsets/rslib.js");  // 'createRstArgs'
 
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
-const kTenantId = "testTenantId";
+const kTenantId = ObjectId().str;
 const kDbName = tenantMigrationTest.tenantDB(kTenantId, "testDB");
 const kEmptyCollName = "testEmptyColl";
 const kNonEmptyCollName = "testNonEmptyColl";
@@ -45,7 +45,7 @@ const migrationOpts = {
     recipientConnString: tenantMigrationTest.getRecipientConnString(),
     tenantId: kTenantId,
 };
-const donorRstArgs = TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst());
+const donorRstArgs = createRstArgs(tenantMigrationTest.getDonorRst());
 
 // Put some data in the non-empty collection, and create the empty one.
 const db = donorPrimary.getDB(kDbName);
@@ -69,8 +69,7 @@ indexBuildFp.wait();
 jsTestLog("Starting a migration and pausing after majority-committing the initial state doc.");
 const dataSyncFp =
     configureFailPoint(donorPrimary, "pauseTenantMigrationBeforeLeavingDataSyncState");
-const migrationThread =
-    new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
+const migrationThread = new Thread(runMigrationAsync, migrationOpts, donorRstArgs);
 migrationThread.start();
 dataSyncFp.wait();
 
@@ -155,4 +154,3 @@ assert.commandWorked(db[kNonEmptyCollName].createIndex({a: 1, b: 1}));
 assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 
 tenantMigrationTest.stop();
-})();

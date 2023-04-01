@@ -3,7 +3,6 @@
  * fails over while fetching retryable writes oplog entries from the donor.
  *
  * @tags: [
- *   incompatible_with_eft,
  *   incompatible_with_macos,
  *   incompatible_with_shard_merge,
  *   incompatible_with_windows_tls,
@@ -13,24 +12,15 @@
  * ]
  */
 
-(function() {
-
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/libs/uuid_util.js");        // For extractUUIDFromObject().
 load("jstests/libs/fail_point_util.js");  // For configureFailPoint().
-load("jstests/libs/retryable_writes_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-
-if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
-    jsTestLog("Retryable writes are not supported, skipping test");
-    return;
-}
 
 const tenantMigrationTest =
     new TenantMigrationTest({name: jsTestName(), sharedOptions: {nodes: 2}});
 
 const kMigrationId = UUID();
-const kTenantId = 'testTenantId';
+const kTenantId = ObjectId().str;
 const kDbName = tenantMigrationTest.tenantDB(kTenantId, "testDb");
 const kCollName = "testColl";
 const migrationOpts = {
@@ -94,9 +84,7 @@ const recipientSecondary = recipientRst.getSecondary();
 const fpAfterFetchingRetryableWritesEntries = configureFailPoint(
     recipientSecondary, "fpAfterFetchingRetryableWritesEntriesBeforeStartOpTime", {action: "hang"});
 
-recipientRst.awaitLastOpCommitted();
-assert.commandWorked(
-    recipientSecondary.adminCommand({replSetStepUp: ReplSetTest.kForeverSecs, force: true}));
+recipientRst.stepUp(recipientSecondary);
 
 fpPauseAfterRetrievingRetryableWritesBatch.off();
 const newRecipientPrimary = recipientRst.getPrimary();
@@ -120,4 +108,3 @@ jsTestLog("Waiting for migration to complete.");
 TenantMigrationTest.assertCommitted(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
 
 tenantMigrationTest.stop();
-})();

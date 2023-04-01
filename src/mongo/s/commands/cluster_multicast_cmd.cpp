@@ -83,15 +83,17 @@ public:
     }
 
     // no privs because it's a test command
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {}
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();
+    }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        IDLParserErrorContext ctx("ClusterMulticast");
+        IDLParserContext ctx("ClusterMulticast");
         auto args = ClusterMulticast::parse(ctx, cmdObj);
 
         // Grab an arbitrary executor.

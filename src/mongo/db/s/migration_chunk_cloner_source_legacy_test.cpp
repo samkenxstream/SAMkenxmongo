@@ -27,18 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/migration_chunk_cloner_source_legacy.h"
+#include "mongo/db/s/migration_chunk_cloner_source.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/db/session/session_catalog_mongod.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
@@ -65,14 +64,442 @@ const ConnectionString kRecipientConnStr =
                                      HostAndPort("RecipientHost2:1234"),
                                      HostAndPort("RecipientHost3:1234")});
 
-class MigrationChunkClonerSourceLegacyTest : public ShardServerTestFixture {
+class CollectionWithFault : public Collection {
+public:
+    CollectionWithFault(const Collection* originalCollection) : _coll(originalCollection) {}
+
+    void setFindDocStatus(Status newStatus) {
+        _findDocStatus = newStatus;
+    }
+
+    //////////////////////////////////////////////////////////////////////////////////
+    // Collection overrides
+
+    std::shared_ptr<Collection> clone() const override {
+        return _coll->clone();
+    }
+
+    SharedCollectionDecorations* getSharedDecorations() const override {
+        return _coll->getSharedDecorations();
+    }
+
+    Status initFromExisting(OperationContext* opCtx,
+                            const std::shared_ptr<const Collection>& collection,
+                            const DurableCatalogEntry& catalogEntry,
+                            boost::optional<Timestamp> readTimestamp) override {
+        MONGO_UNREACHABLE;
+    }
+
+    const NamespaceString& ns() const override {
+        return _coll->ns();
+    }
+
+    Status rename(OperationContext* opCtx, const NamespaceString& nss, bool stayTemp) override {
+        MONGO_UNREACHABLE;
+    }
+
+    RecordId getCatalogId() const override {
+        return _coll->getCatalogId();
+    }
+
+    UUID uuid() const override {
+        return _coll->uuid();
+    }
+
+    const IndexCatalog* getIndexCatalog() const override {
+        return _coll->getIndexCatalog();
+    }
+
+    IndexCatalog* getIndexCatalog() override {
+        MONGO_UNREACHABLE;
+    }
+
+    RecordStore* getRecordStore() const {
+        return _coll->getRecordStore();
+    }
+
+    std::shared_ptr<Ident> getSharedIdent() const override {
+        return _coll->getSharedIdent();
+    }
+
+    void setIdent(std::shared_ptr<Ident> newIdent) override {
+        MONGO_UNREACHABLE;
+    }
+
+    BSONObj getValidatorDoc() const override {
+        return _coll->getValidatorDoc();
+    }
+
+    std::pair<SchemaValidationResult, Status> checkValidation(
+        OperationContext* opCtx, const BSONObj& document) const override {
+        return _coll->checkValidation(opCtx, document);
+    }
+
+    Status checkValidationAndParseResult(OperationContext* opCtx,
+                                         const BSONObj& document) const override {
+        return _coll->checkValidationAndParseResult(opCtx, document);
+    }
+
+    bool requiresIdIndex() const override {
+        return _coll->requiresIdIndex();
+    }
+
+    Snapshotted<BSONObj> docFor(OperationContext* opCtx, const RecordId& loc) const override {
+        return _coll->docFor(opCtx, loc);
+    }
+
+    bool findDoc(OperationContext* opCtx,
+                 const RecordId& loc,
+                 Snapshotted<BSONObj>* out) const override {
+        uassertStatusOK(_findDocStatus);
+        return _coll->findDoc(opCtx, loc, out);
+    }
+
+    std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx,
+                                                    bool forward = true) const override {
+        return _coll->getCursor(opCtx, forward);
+    }
+
+    bool updateWithDamagesSupported() const override {
+        return _coll->updateWithDamagesSupported();
+    }
+
+    Status truncate(OperationContext* opCtx) override {
+        MONGO_UNREACHABLE;
+    }
+
+    Validator parseValidator(OperationContext* opCtx,
+                             const BSONObj& validator,
+                             MatchExpressionParser::AllowedFeatureSet allowedFeatures,
+                             boost::optional<multiversion::FeatureCompatibilityVersion>
+                                 maxFeatureCompatibilityVersion) const override {
+        return _coll->parseValidator(
+            opCtx, validator, allowedFeatures, maxFeatureCompatibilityVersion);
+    }
+
+    void setValidator(OperationContext* opCtx, Validator validator) override {
+        MONGO_UNREACHABLE;
+    }
+
+    Status setValidationLevel(OperationContext* opCtx, ValidationLevelEnum newLevel) override {
+        MONGO_UNREACHABLE;
+    }
+
+    Status setValidationAction(OperationContext* opCtx, ValidationActionEnum newAction) override {
+        MONGO_UNREACHABLE;
+    }
+
+    boost::optional<ValidationLevelEnum> getValidationLevel() const override {
+        return _coll->getValidationLevel();
+    }
+
+    boost::optional<ValidationActionEnum> getValidationAction() const override {
+        return _coll->getValidationAction();
+    }
+
+    Status updateValidator(OperationContext* opCtx,
+                           BSONObj newValidator,
+                           boost::optional<ValidationLevelEnum> newLevel,
+                           boost::optional<ValidationActionEnum> newAction) override {
+        MONGO_UNREACHABLE;
+    }
+
+    Status checkValidatorAPIVersionCompatability(OperationContext* opCtx) const override {
+        return _coll->checkValidatorAPIVersionCompatability(opCtx);
+    }
+
+    bool isChangeStreamPreAndPostImagesEnabled() const override {
+        return _coll->isChangeStreamPreAndPostImagesEnabled();
+    }
+
+    void setChangeStreamPreAndPostImages(OperationContext* opCtx,
+                                         ChangeStreamPreAndPostImagesOptions val) override {
+        MONGO_UNREACHABLE;
+    }
+
+    bool isTemporary() const override {
+        return _coll->isTemporary();
+    }
+
+    boost::optional<bool> getTimeseriesBucketsMayHaveMixedSchemaData() const override {
+        return _coll->getTimeseriesBucketsMayHaveMixedSchemaData();
+    }
+
+    void setTimeseriesBucketsMayHaveMixedSchemaData(OperationContext* opCtx,
+                                                    boost::optional<bool> setting) override {
+        MONGO_UNREACHABLE;
+    }
+
+    bool doesTimeseriesBucketsDocContainMixedSchemaData(const BSONObj& bucketsDoc) const override {
+        return _coll->doesTimeseriesBucketsDocContainMixedSchemaData(bucketsDoc);
+    }
+
+    bool getRequiresTimeseriesExtendedRangeSupport() const override {
+        return _coll->getRequiresTimeseriesExtendedRangeSupport();
+    }
+
+    void setRequiresTimeseriesExtendedRangeSupport(OperationContext* opCtx) const override {
+        return _coll->setRequiresTimeseriesExtendedRangeSupport(opCtx);
+    }
+
+    bool isClustered() const override {
+        return _coll->isClustered();
+    }
+
+    boost::optional<ClusteredCollectionInfo> getClusteredInfo() const override {
+        return _coll->getClusteredInfo();
+    }
+
+    void updateClusteredIndexTTLSetting(OperationContext* opCtx,
+                                        boost::optional<int64_t> expireAfterSeconds) override {
+        MONGO_UNREACHABLE;
+    }
+
+    Status updateCappedSize(OperationContext* opCtx,
+                            boost::optional<long long> newCappedSize,
+                            boost::optional<long long> newCappedMax) override {
+        MONGO_UNREACHABLE;
+    }
+
+    StatusWith<int> checkMetaDataForIndex(const std::string& indexName,
+                                          const BSONObj& spec) const override {
+        return _coll->checkMetaDataForIndex(indexName, spec);
+    }
+
+    void updateTTLSetting(OperationContext* opCtx,
+                          StringData idxName,
+                          long long newExpireSeconds) override {
+        MONGO_UNREACHABLE;
+    }
+
+    void updateHiddenSetting(OperationContext* opCtx, StringData idxName, bool hidden) override {
+        MONGO_UNREACHABLE;
+    }
+
+    void updateUniqueSetting(OperationContext* opCtx, StringData idxName, bool unique) override {
+        MONGO_UNREACHABLE;
+    }
+
+    void updatePrepareUniqueSetting(OperationContext* opCtx,
+                                    StringData idxName,
+                                    bool prepareUnique) override {
+        MONGO_UNREACHABLE;
+    }
+
+    std::vector<std::string> repairInvalidIndexOptions(OperationContext* opCtx) override {
+        MONGO_UNREACHABLE;
+    }
+
+    void setIsTemp(OperationContext* opCtx, bool isTemp) override {
+        MONGO_UNREACHABLE;
+    }
+
+    void removeIndex(OperationContext* opCtx, StringData indexName) override {
+        MONGO_UNREACHABLE;
+    }
+
+    Status prepareForIndexBuild(OperationContext* opCtx,
+                                const IndexDescriptor* spec,
+                                boost::optional<UUID> buildUUID,
+                                bool isBackgroundSecondaryBuild) override {
+        MONGO_UNREACHABLE;
+    }
+
+    boost::optional<UUID> getIndexBuildUUID(StringData indexName) const override {
+        return _coll->getIndexBuildUUID(indexName);
+    }
+
+    bool isIndexMultikey(OperationContext* opCtx,
+                         StringData indexName,
+                         MultikeyPaths* multikeyPaths,
+                         int indexOffset = -1) const override {
+        return _coll->isIndexMultikey(opCtx, indexName, multikeyPaths, indexOffset);
+    }
+
+    bool setIndexIsMultikey(OperationContext* opCtx,
+                            StringData indexName,
+                            const MultikeyPaths& multikeyPaths,
+                            int indexOffset = -1) const override {
+        return _coll->setIndexIsMultikey(opCtx, indexName, multikeyPaths, indexOffset);
+    }
+
+    void forceSetIndexIsMultikey(OperationContext* opCtx,
+                                 const IndexDescriptor* desc,
+                                 bool isMultikey,
+                                 const MultikeyPaths& multikeyPaths) const override {
+        return _coll->forceSetIndexIsMultikey(opCtx, desc, isMultikey, multikeyPaths);
+    }
+
+    int getTotalIndexCount() const override {
+        return _coll->getTotalIndexCount();
+    }
+
+    int getCompletedIndexCount() const override {
+        return _coll->getCompletedIndexCount();
+    }
+
+    BSONObj getIndexSpec(StringData indexName) const override {
+        return _coll->getIndexSpec(indexName);
+    }
+
+    void getAllIndexes(std::vector<std::string>* names) const override {
+        return _coll->getAllIndexes(names);
+    }
+
+    void getReadyIndexes(std::vector<std::string>* names) const override {
+        return _coll->getReadyIndexes(names);
+    }
+
+    bool isIndexPresent(StringData indexName) const override {
+        return _coll->isIndexPresent(indexName);
+    }
+
+    bool isIndexReady(StringData indexName) const override {
+        return _coll->isIndexReady(indexName);
+    }
+
+    void replaceMetadata(OperationContext* opCtx,
+                         std::shared_ptr<BSONCollectionCatalogEntry::MetaData> md) override {
+        MONGO_UNREACHABLE;
+    }
+
+    bool isMetadataEqual(const BSONObj& otherMetadata) const override {
+        return _coll->isMetadataEqual(otherMetadata);
+    }
+
+    bool needsCappedLock() const override {
+        return _coll->needsCappedLock();
+    }
+
+    bool isCappedAndNeedsDelete(OperationContext* opCtx) const override {
+        return _coll->isCappedAndNeedsDelete(opCtx);
+    }
+
+    bool usesCappedSnapshots() const override {
+        return _coll->usesCappedSnapshots();
+    }
+
+    std::vector<RecordId> reserveCappedRecordIds(OperationContext* opCtx,
+                                                 size_t nIds) const override {
+        return _coll->reserveCappedRecordIds(opCtx, nIds);
+    }
+
+    void registerCappedInserts(OperationContext* opCtx,
+                               const RecordId& minRecord,
+                               const RecordId& maxRecord) const override {
+        return _coll->registerCappedInserts(opCtx, minRecord, maxRecord);
+    }
+
+    CappedVisibilityObserver* getCappedVisibilityObserver() const override {
+        return _coll->getCappedVisibilityObserver();
+    }
+
+    CappedVisibilitySnapshot takeCappedVisibilitySnapshot() const override {
+        return _coll->takeCappedVisibilitySnapshot();
+    }
+
+    bool isCapped() const override {
+        return _coll->isCapped();
+    }
+
+    long long getCappedMaxDocs() const override {
+        return _coll->getCappedMaxDocs();
+    }
+
+    long long getCappedMaxSize() const override {
+        return _coll->getCappedMaxSize();
+    }
+
+    long long numRecords(OperationContext* opCtx) const override {
+        return _coll->numRecords(opCtx);
+    }
+
+    long long dataSize(OperationContext* opCtx) const override {
+        return _coll->dataSize(opCtx);
+    }
+
+    bool isEmpty(OperationContext* opCtx) const override {
+        return _coll->isEmpty(opCtx);
+    }
+
+    int averageObjectSize(OperationContext* opCtx) const override {
+        return _coll->averageObjectSize(opCtx);
+    }
+
+    uint64_t getIndexSize(OperationContext* opCtx,
+                          BSONObjBuilder* details = nullptr,
+                          int scale = 1) const {
+        return _coll->getIndexSize(opCtx, details, scale);
+    }
+
+    uint64_t getIndexFreeStorageBytes(OperationContext* opCtx) const override {
+        return _coll->getIndexFreeStorageBytes(opCtx);
+    }
+
+    boost::optional<Timestamp> getMinimumVisibleSnapshot() const override {
+        return _coll->getMinimumVisibleSnapshot();
+    }
+
+    void setMinimumVisibleSnapshot(Timestamp name) override {
+        MONGO_UNREACHABLE;
+    }
+
+    boost::optional<Timestamp> getMinimumValidSnapshot() const override {
+        return _coll->getMinimumValidSnapshot();
+    }
+
+    void setMinimumValidSnapshot(Timestamp name) override {
+        MONGO_UNREACHABLE;
+    }
+
+    boost::optional<TimeseriesOptions> getTimeseriesOptions() const override {
+        return _coll->getTimeseriesOptions();
+    }
+
+    void setTimeseriesOptions(OperationContext* opCtx,
+                              const TimeseriesOptions& tsOptions) override {
+        MONGO_UNREACHABLE;
+    }
+
+    const CollatorInterface* getDefaultCollator() const override {
+        return _coll->getDefaultCollator();
+    }
+
+    const CollectionOptions& getCollectionOptions() const override {
+        return _coll->getCollectionOptions();
+    }
+
+    StatusWith<std::vector<BSONObj>> addCollationDefaultsToIndexSpecsForCreate(
+        OperationContext* opCtx, const std::vector<BSONObj>& indexSpecs) const {
+        return _coll->addCollationDefaultsToIndexSpecsForCreate(opCtx, indexSpecs);
+    }
+
+    void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) override {
+        MONGO_UNREACHABLE;
+    }
+
+    void onDeregisterFromCatalog(OperationContext* opCtx) override {
+        MONGO_UNREACHABLE;
+    }
+
+private:
+    const Collection* _coll;
+
+    Status _findDocStatus{Status::OK()};
+};
+
+class MigrationChunkClonerSourceTest : public ShardServerTestFixture {
 protected:
+    MigrationChunkClonerSourceTest() : ShardServerTestFixture(Options{}.useMockClock(true)) {}
+
     void setUp() override {
         ShardServerTestFixture::setUp();
 
         auto opCtx = operationContext();
         DBDirectClient client(opCtx);
-        client.createCollection(NamespaceString::kSessionTransactionsTableNamespace.ns());
+        client.createCollection(NamespaceString::kSessionTransactionsTableNamespace);
+        client.createIndexes(NamespaceString::kSessionTransactionsTableNamespace,
+                             {MongoDSessionCatalog::getConfigTxnPartialIndexSpec()});
 
         // TODO: SERVER-26919 set the flag on the mock repl coordinator just for the window where it
         // actually needs to bypass the op observer.
@@ -98,14 +525,6 @@ protected:
                 ->setFindHostReturnValue(kRecipientConnStr.getServers()[0]);
         }
 
-        auto clockSource = std::make_unique<ClockSourceMock>();
-
-        // Timestamps of "0 seconds" are not allowed, so we must advance our clock mock to the first
-        // real second.
-        clockSource->advance(Seconds(1));
-
-        operationContext()->getServiceContext()->setFastClockSource(std::move(clockSource));
-
         _lsid = makeLogicalSessionId(operationContext());
     }
 
@@ -130,19 +549,39 @@ protected:
         if (docs.empty())
             return;
 
-        auto response = client()->insertAcknowledged(kNss.ns(), docs);
-        ASSERT_OK(getStatusFromWriteCommandReply(response));
-        ASSERT_GT(response["n"].Int(), 0);
+        std::deque<BSONObj> docsToInsert;
+        std::copy(docs.cbegin(), docs.cend(), std::back_inserter(docsToInsert));
+
+        while (!docsToInsert.empty()) {
+            std::vector<BSONObj> batchToInsert;
+
+            size_t sizeInBatch = 0;
+            while (!docsToInsert.empty()) {
+                auto next = docsToInsert.front();
+                sizeInBatch += next.objsize();
+
+                if (sizeInBatch > BSONObjMaxUserSize) {
+                    break;
+                }
+
+                batchToInsert.push_back(next);
+                docsToInsert.pop_front();
+            }
+
+            auto response = client()->insertAcknowledged(kNss, batchToInsert);
+            ASSERT_OK(getStatusFromWriteCommandReply(response));
+            ASSERT_GT(response["n"].Int(), 0);
+        }
     }
 
     void deleteDocsInShardedCollection(BSONObj query) {
-        auto response = client()->removeAcknowledged(kNss.ns(), query);
+        auto response = client()->removeAcknowledged(kNss, query);
         ASSERT_OK(getStatusFromWriteCommandReply(response));
         ASSERT_GT(response["n"].Int(), 0);
     }
 
     void updateDocsInShardedCollection(BSONObj filter, BSONObj updated) {
-        auto response = client()->updateAcknowledged(kNss.ns(), filter, updated);
+        auto response = client()->updateAcknowledged(kNss, filter, updated);
         ASSERT_OK(getStatusFromWriteCommandReply(response));
         ASSERT_GT(response["n"].Int(), 0);
     }
@@ -155,8 +594,8 @@ protected:
         {
             OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
                 unsafeCreateCollection(operationContext());
-            uassertStatusOK(createCollection(
-                operationContext(), kNss.db().toString(), BSON("create" << kNss.coll())));
+            uassertStatusOK(
+                createCollection(operationContext(), kNss.dbName(), BSON("create" << kNss.coll())));
         }
 
         const auto uuid = [&] {
@@ -178,16 +617,16 @@ protected:
                 timestamp,
                 boost::none /* timeseriesFields */,
                 boost::none /* resharding Fields */,
-                boost::none /* chunkSizeBytes */,
                 true,
                 {ChunkType{uuid,
                            ChunkRange{BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)},
-                           ChunkVersion(1, 0, epoch, timestamp),
+                           ChunkVersion({epoch, timestamp}, {1, 0}),
                            ShardId("dummyShardId")}});
 
-            AutoGetDb autoDb(operationContext(), kNss.db(), MODE_IX);
+            AutoGetDb autoDb(operationContext(), kNss.dbName(), MODE_IX);
             Lock::CollectionLock collLock(operationContext(), kNss, MODE_IX);
-            CollectionShardingRuntime::get(operationContext(), kNss)
+            CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(operationContext(),
+                                                                                 kNss)
                 ->setFilteringMetadata(
                     operationContext(),
                     CollectionMetadata(
@@ -198,7 +637,7 @@ protected:
                         ShardId("dummyShardId")));
         }();
 
-        client()->createIndex(kNss.ns(), kShardKeyPattern);
+        client()->createIndex(kNss, kShardKeyPattern);
         insertDocsInShardedCollection(initialDocs);
     }
 
@@ -206,21 +645,15 @@ protected:
      * Shortcut to create BSON represenation of a moveChunk request for the specified range with
      * fixed kDonorConnStr and kRecipientConnStr, respectively.
      */
-    static MoveChunkRequest createMoveChunkRequest(const ChunkRange& chunkRange) {
-        BSONObjBuilder cmdBuilder;
-        MoveChunkRequest::appendAsCommand(
-            &cmdBuilder,
-            kNss,
-            ChunkVersion(1, 0, OID::gen(), Timestamp(1, 1)),
-            kDonorConnStr.getSetName(),
-            kRecipientConnStr.getSetName(),
-            chunkRange,
-            1024 * 1024,
-            MigrationSecondaryThrottleOptions::create(MigrationSecondaryThrottleOptions::kDefault),
-            false,
-            MoveChunkRequest::ForceJumbo::kDoNotForce);
-
-        return assertGet(MoveChunkRequest::createFromCommand(kNss, cmdBuilder.obj()));
+    static ShardsvrMoveRange createMoveRangeRequest(const ChunkRange& chunkRange) {
+        ShardsvrMoveRange req(kNss);
+        req.setEpoch(OID::gen());
+        req.setFromShard(ShardId(kDonorConnStr.getSetName()));
+        req.setMaxChunkSizeBytes(1024);
+        req.getMoveRangeRequestBase().setToShard(ShardId(kRecipientConnStr.getSetName()));
+        req.getMoveRangeRequestBase().setMin(chunkRange.getMin());
+        req.getMoveRangeRequestBase().setMax(chunkRange.getMax());
+        return req;
     }
 
     /**
@@ -276,7 +709,7 @@ private:
     boost::optional<DBDirectClient> _client;
 };
 
-TEST_F(MigrationChunkClonerSourceLegacyTest, CorrectDocumentsFetched) {
+TEST_F(MigrationChunkClonerSourceTest, CorrectDocumentsFetched) {
     const std::vector<BSONObj> contents = {createCollectionDocument(99),
                                            createCollectionDocument(100),
                                            createCollectionDocument(199),
@@ -284,11 +717,14 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, CorrectDocumentsFetched) {
 
     createShardedCollection(contents);
 
-    MigrationChunkClonerSourceLegacy cloner(
-        createMoveChunkRequest(ChunkRange(BSON("X" << 100), BSON("X" << 200))),
-        kShardKeyPattern,
-        kDonorConnStr,
-        kRecipientConnStr.getServers()[0]);
+    const ShardsvrMoveRange req =
+        createMoveRangeRequest(ChunkRange(BSON("X" << 100), BSON("X" << 200)));
+    MigrationChunkClonerSource cloner(operationContext(),
+                                      req,
+                                      WriteConcernOptions(),
+                                      kShardKeyPattern,
+                                      kDonorConnStr,
+                                      kRecipientConnStr.getServers()[0]);
 
     {
         auto futureStartClone = launchAsync([&]() {
@@ -362,7 +798,7 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, CorrectDocumentsFetched) {
 
         {
             BSONObjBuilder modsBuilder;
-            ASSERT_OK(cloner.nextModsBatch(operationContext(), autoColl.getDb(), &modsBuilder));
+            ASSERT_OK(cloner.nextModsBatch(operationContext(), &modsBuilder));
 
             const auto modsObj = modsBuilder.obj();
             ASSERT_EQ(2U, modsObj["reload"].Array().size());
@@ -382,22 +818,24 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, CorrectDocumentsFetched) {
         onCommand([&](const RemoteCommandRequest& request) { return BSON("ok" << true); });
     });
 
-    ASSERT_OK(cloner.commitClone(operationContext(), true /* acquireCSOnRecipient */));
+    ASSERT_OK(cloner.commitClone(operationContext()));
     futureCommit.default_timed_get();
 }
 
-
-TEST_F(MigrationChunkClonerSourceLegacyTest, RemoveDuplicateDocuments) {
+TEST_F(MigrationChunkClonerSourceTest, RemoveDuplicateDocuments) {
     const std::vector<BSONObj> contents = {createCollectionDocument(100),
                                            createCollectionDocument(199)};
 
     createShardedCollection(contents);
 
-    MigrationChunkClonerSourceLegacy cloner(
-        createMoveChunkRequest(ChunkRange(BSON("X" << 100), BSON("X" << 200))),
-        kShardKeyPattern,
-        kDonorConnStr,
-        kRecipientConnStr.getServers()[0]);
+    const ShardsvrMoveRange req =
+        createMoveRangeRequest(ChunkRange(BSON("X" << 100), BSON("X" << 200)));
+    MigrationChunkClonerSource cloner(operationContext(),
+                                      req,
+                                      WriteConcernOptions(),
+                                      kShardKeyPattern,
+                                      kDonorConnStr,
+                                      kRecipientConnStr.getServers()[0]);
 
     {
         auto futureStartClone = launchAsync([&]() {
@@ -460,7 +898,7 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, RemoveDuplicateDocuments) {
         AutoGetCollection autoColl(operationContext(), kNss, MODE_IS);
         {
             BSONObjBuilder modsBuilder;
-            ASSERT_OK(cloner.nextModsBatch(operationContext(), autoColl.getDb(), &modsBuilder));
+            ASSERT_OK(cloner.nextModsBatch(operationContext(), &modsBuilder));
 
             const auto modsObj = modsBuilder.obj();
             ASSERT_EQ(1U, modsObj["reload"].Array().size());
@@ -475,21 +913,24 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, RemoveDuplicateDocuments) {
         onCommand([&](const RemoteCommandRequest& request) { return BSON("ok" << true); });
     });
 
-    ASSERT_OK(cloner.commitClone(operationContext(), true /* acquireCSOnRecipient */));
+    ASSERT_OK(cloner.commitClone(operationContext()));
     futureCommit.default_timed_get();
 }
 
 
-TEST_F(MigrationChunkClonerSourceLegacyTest, OneLargeDocumentTransferMods) {
+TEST_F(MigrationChunkClonerSourceTest, OneLargeDocumentTransferMods) {
     const std::vector<BSONObj> contents = {createCollectionDocument(1)};
 
     createShardedCollection(contents);
 
-    MigrationChunkClonerSourceLegacy cloner(
-        createMoveChunkRequest(ChunkRange(BSON("X" << 1), BSON("X" << 100))),
-        kShardKeyPattern,
-        kDonorConnStr,
-        kRecipientConnStr.getServers()[0]);
+    const ShardsvrMoveRange req =
+        createMoveRangeRequest(ChunkRange(BSON("X" << 1), BSON("X" << 100)));
+    MigrationChunkClonerSource cloner(operationContext(),
+                                      req,
+                                      WriteConcernOptions(),
+                                      kShardKeyPattern,
+                                      kDonorConnStr,
+                                      kRecipientConnStr.getServers()[0]);
 
     {
         auto futureStartClone = launchAsync([&]() {
@@ -525,7 +966,7 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, OneLargeDocumentTransferMods) {
         AutoGetCollection autoColl(operationContext(), kNss, MODE_IS);
         {
             BSONObjBuilder modsBuilder;
-            ASSERT_OK(cloner.nextModsBatch(operationContext(), autoColl.getDb(), &modsBuilder));
+            ASSERT_OK(cloner.nextModsBatch(operationContext(), &modsBuilder));
 
             const auto modsObj = modsBuilder.obj();
             ASSERT_EQ(1, modsObj["reload"].Array().size());
@@ -536,20 +977,23 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, OneLargeDocumentTransferMods) {
         onCommand([&](const RemoteCommandRequest& request) { return BSON("ok" << true); });
     });
 
-    ASSERT_OK(cloner.commitClone(operationContext(), true /* acquireCSOnRecipient */));
+    ASSERT_OK(cloner.commitClone(operationContext()));
     futureCommit.default_timed_get();
 }
 
-TEST_F(MigrationChunkClonerSourceLegacyTest, ManySmallDocumentsTransferMods) {
+TEST_F(MigrationChunkClonerSourceTest, ManySmallDocumentsTransferMods) {
     const std::vector<BSONObj> contents = {createCollectionDocument(1)};
 
     createShardedCollection(contents);
 
-    MigrationChunkClonerSourceLegacy cloner(
-        createMoveChunkRequest(ChunkRange(BSON("X" << 1), BSON("X" << 1000000))),
-        kShardKeyPattern,
-        kDonorConnStr,
-        kRecipientConnStr.getServers()[0]);
+    const ShardsvrMoveRange req =
+        createMoveRangeRequest(ChunkRange(BSON("X" << 1), BSON("X" << 1000000)));
+    MigrationChunkClonerSource cloner(operationContext(),
+                                      req,
+                                      WriteConcernOptions(),
+                                      kShardKeyPattern,
+                                      kDonorConnStr,
+                                      kRecipientConnStr.getServers()[0]);
 
     {
         auto futureStartClone = launchAsync([&]() {
@@ -591,7 +1035,7 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, ManySmallDocumentsTransferMods) {
         }
 
         WriteUnitOfWork wuow(operationContext());
-        for (BSONObj add : insertDocs) {
+        for (const BSONObj& add : insertDocs) {
             cloner.onInsertOp(operationContext(), add, {});
         }
         wuow.commit();
@@ -601,7 +1045,7 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, ManySmallDocumentsTransferMods) {
         AutoGetCollection autoColl(operationContext(), kNss, MODE_IS);
         {
             BSONObjBuilder modsBuilder;
-            ASSERT_OK(cloner.nextModsBatch(operationContext(), autoColl.getDb(), &modsBuilder));
+            ASSERT_OK(cloner.nextModsBatch(operationContext(), &modsBuilder));
             const auto modsObj = modsBuilder.obj();
             ASSERT_EQ(modsObj["reload"].Array().size(), numDocuments);
         }
@@ -611,40 +1055,46 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, ManySmallDocumentsTransferMods) {
         onCommand([&](const RemoteCommandRequest& request) { return BSON("ok" << true); });
     });
 
-    ASSERT_OK(cloner.commitClone(operationContext(), true /* acquireCSOnRecipient */));
+    ASSERT_OK(cloner.commitClone(operationContext()));
     futureCommit.default_timed_get();
 }
 
-TEST_F(MigrationChunkClonerSourceLegacyTest, CollectionNotFound) {
-    MigrationChunkClonerSourceLegacy cloner(
-        createMoveChunkRequest(ChunkRange(BSON("X" << 100), BSON("X" << 200))),
-        kShardKeyPattern,
-        kDonorConnStr,
-        kRecipientConnStr.getServers()[0]);
+TEST_F(MigrationChunkClonerSourceTest, CollectionNotFound) {
+    const ShardsvrMoveRange req =
+        createMoveRangeRequest(ChunkRange(BSON("X" << 100), BSON("X" << 200)));
+    MigrationChunkClonerSource cloner(operationContext(),
+                                      req,
+                                      WriteConcernOptions(),
+                                      kShardKeyPattern,
+                                      kDonorConnStr,
+                                      kRecipientConnStr.getServers()[0]);
 
     ASSERT_NOT_OK(cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber));
     cloner.cancelClone(operationContext());
 }
 
-TEST_F(MigrationChunkClonerSourceLegacyTest, ShardKeyIndexNotFound) {
+TEST_F(MigrationChunkClonerSourceTest, ShardKeyIndexNotFound) {
     {
         OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
             operationContext());
-        uassertStatusOK(createCollection(
-            operationContext(), kNss.db().toString(), BSON("create" << kNss.coll())));
+        uassertStatusOK(
+            createCollection(operationContext(), kNss.dbName(), BSON("create" << kNss.coll())));
     }
 
-    MigrationChunkClonerSourceLegacy cloner(
-        createMoveChunkRequest(ChunkRange(BSON("X" << 100), BSON("X" << 200))),
-        kShardKeyPattern,
-        kDonorConnStr,
-        kRecipientConnStr.getServers()[0]);
+    const ShardsvrMoveRange req =
+        createMoveRangeRequest(ChunkRange(BSON("X" << 100), BSON("X" << 200)));
+    MigrationChunkClonerSource cloner(operationContext(),
+                                      req,
+                                      WriteConcernOptions(),
+                                      kShardKeyPattern,
+                                      kDonorConnStr,
+                                      kRecipientConnStr.getServers()[0]);
 
     ASSERT_NOT_OK(cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber));
     cloner.cancelClone(operationContext());
 }
 
-TEST_F(MigrationChunkClonerSourceLegacyTest, FailedToEngageRecipientShard) {
+TEST_F(MigrationChunkClonerSourceTest, FailedToEngageRecipientShard) {
     const std::vector<BSONObj> contents = {createCollectionDocument(99),
                                            createCollectionDocument(100),
                                            createCollectionDocument(199),
@@ -652,11 +1102,14 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, FailedToEngageRecipientShard) {
 
     createShardedCollection(contents);
 
-    MigrationChunkClonerSourceLegacy cloner(
-        createMoveChunkRequest(ChunkRange(BSON("X" << 100), BSON("X" << 200))),
-        kShardKeyPattern,
-        kDonorConnStr,
-        kRecipientConnStr.getServers()[0]);
+    const ShardsvrMoveRange req =
+        createMoveRangeRequest(ChunkRange(BSON("X" << 100), BSON("X" << 200)));
+    MigrationChunkClonerSource cloner(operationContext(),
+                                      req,
+                                      WriteConcernOptions(),
+                                      kShardKeyPattern,
+                                      kDonorConnStr,
+                                      kRecipientConnStr.getServers()[0]);
 
     {
         auto futureStartClone = launchAsync([&]() {
@@ -694,6 +1147,167 @@ TEST_F(MigrationChunkClonerSourceLegacyTest, FailedToEngageRecipientShard) {
     // Cancel clone should not send a cancellation request to the donor because we failed to engage
     // it (see comment in the startClone method)
     cloner.cancelClone(operationContext());
+}
+
+TEST_F(MigrationChunkClonerSourceTest, CloneFetchThatOverflows) {
+    const auto kBigSize = 10 * 1024 * 1024;
+    const std::vector<BSONObj> contents = {createSizedCollectionDocument(100, kBigSize),
+                                           createSizedCollectionDocument(120, kBigSize),
+                                           createSizedCollectionDocument(199, kBigSize)};
+
+    createShardedCollection(contents);
+
+    ShardsvrMoveRange req = createMoveRangeRequest(ChunkRange(BSON("X" << 100), BSON("X" << 200)));
+    req.setMaxChunkSizeBytes(64 * 1024 * 1024);
+
+    MigrationChunkClonerSource cloner(operationContext(),
+                                      req,
+                                      WriteConcernOptions(),
+                                      kShardKeyPattern,
+                                      kDonorConnStr,
+                                      kRecipientConnStr.getServers()[0]);
+
+    {
+        auto futureStartClone = launchAsync([&]() {
+            onCommand([&](const RemoteCommandRequest& request) { return BSON("ok" << true); });
+        });
+
+        ASSERT_OK(cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber));
+        futureStartClone.default_timed_get();
+    }
+
+    // Ensure the initial clone documents are available
+    {
+        AutoGetCollection autoColl(operationContext(), kNss, MODE_IS);
+
+        {
+            BSONArrayBuilder arrBuilder;
+            ASSERT_OK(
+                cloner.nextCloneBatch(operationContext(), autoColl.getCollection(), &arrBuilder));
+            ASSERT_EQ(1, arrBuilder.arrSize());
+
+            const auto arr = arrBuilder.arr();
+            ASSERT_BSONOBJ_EQ(contents[0], arr[0].Obj());
+        }
+
+        {
+            BSONArrayBuilder arrBuilder;
+            ASSERT_OK(
+                cloner.nextCloneBatch(operationContext(), autoColl.getCollection(), &arrBuilder));
+            ASSERT_EQ(1, arrBuilder.arrSize());
+
+            const auto arr = arrBuilder.arr();
+            ASSERT_BSONOBJ_EQ(contents[1], arr[0].Obj());
+        }
+
+        {
+            BSONArrayBuilder arrBuilder;
+            ASSERT_OK(
+                cloner.nextCloneBatch(operationContext(), autoColl.getCollection(), &arrBuilder));
+            ASSERT_EQ(1, arrBuilder.arrSize());
+
+            const auto arr = arrBuilder.arr();
+            ASSERT_BSONOBJ_EQ(contents[2], arr[0].Obj());
+        }
+
+        {
+            BSONArrayBuilder arrBuilder;
+            ASSERT_OK(
+                cloner.nextCloneBatch(operationContext(), autoColl.getCollection(), &arrBuilder));
+            ASSERT_EQ(0, arrBuilder.arrSize());
+        }
+    }
+
+    auto futureCommit = launchAsync([&]() {
+        onCommand([&](const RemoteCommandRequest& request) { return BSON("ok" << true); });
+    });
+
+    ASSERT_OK(cloner.commitClone(operationContext()));
+    futureCommit.default_timed_get();
+}
+
+TEST_F(MigrationChunkClonerSourceTest, CloneShouldNotCrashWhenNextCloneBatchThrows) {
+    const std::vector<BSONObj> contents = {createCollectionDocument(100),
+                                           createCollectionDocument(150),
+                                           createCollectionDocument(199)};
+
+    createShardedCollection(contents);
+
+    const ShardsvrMoveRange req =
+        createMoveRangeRequest(ChunkRange(BSON("X" << 100), BSON("X" << 200)));
+    MigrationChunkClonerSource cloner(operationContext(),
+                                      req,
+                                      WriteConcernOptions(),
+                                      kShardKeyPattern,
+                                      kDonorConnStr,
+                                      kRecipientConnStr.getServers()[0]);
+
+    {
+        auto futureStartClone = launchAsync([&]() {
+            onCommand([&](const RemoteCommandRequest& request) { return BSON("ok" << true); });
+        });
+
+        ASSERT_OK(cloner.startClone(operationContext(), UUID::gen(), _lsid, _txnNumber));
+        futureStartClone.default_timed_get();
+    }
+
+    {
+        AutoGetCollection autoColl(operationContext(), kNss, MODE_IS);
+
+        {
+            auto collWithFault =
+                std::make_unique<CollectionWithFault>(autoColl.getCollection().get());
+            CollectionPtr collPtrWithFault(collWithFault.get());
+
+            // Note: findDoc currently doesn't have any interruption points, this test simulates
+            // an exception being thrown while it is being called.
+            collWithFault->setFindDocStatus({ErrorCodes::Interrupted, "fake interrupt"});
+
+            BSONArrayBuilder arrBuilder;
+
+            ASSERT_THROWS_CODE(
+                cloner.nextCloneBatch(operationContext(), collPtrWithFault, &arrBuilder),
+                DBException,
+                ErrorCodes::Interrupted);
+            ASSERT_EQ(0, arrBuilder.arrSize());
+        }
+
+        // The first document was lost and returned an error during nextCloneBatch. This would
+        // cause the migration destination to abort, but it is still possible for other
+        // threads to be in the middle of calling nextCloneBatch and the next nextCloneBatch
+        // calls simulate calls from other threads after the first call threw.
+        {
+            BSONArrayBuilder arrBuilder;
+            ASSERT_OK(
+                cloner.nextCloneBatch(operationContext(), autoColl.getCollection(), &arrBuilder));
+
+            const auto arr = arrBuilder.arr();
+            ASSERT_EQ(2, arrBuilder.arrSize());
+
+            ASSERT_BSONOBJ_EQ(contents[1], arr[0].Obj());
+            ASSERT_BSONOBJ_EQ(contents[2], arr[1].Obj());
+        }
+
+        {
+            BSONArrayBuilder arrBuilder;
+            ASSERT_OK(
+                cloner.nextCloneBatch(operationContext(), autoColl.getCollection(), &arrBuilder));
+
+            const auto arr = arrBuilder.arr();
+            ASSERT_EQ(0, arrBuilder.arrSize());
+        }
+    }
+
+    auto futureCommit = launchAsync([&]() {
+        // Simulate destination returning an error.
+        onCommand([&](const RemoteCommandRequest& request) { return BSON("ok" << false); });
+
+        // This is the return response for recvChunkAbort.
+        onCommand([&](const RemoteCommandRequest& request) { return BSON("ok" << true); });
+    });
+
+    ASSERT_NOT_OK(cloner.commitClone(operationContext()));
+    futureCommit.default_timed_get();
 }
 
 }  // namespace

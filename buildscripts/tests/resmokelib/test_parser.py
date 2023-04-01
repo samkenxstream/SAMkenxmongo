@@ -5,8 +5,6 @@ import unittest
 from buildscripts.resmokelib.parser import parse, parse_command_line
 from buildscripts.resmokelib.run import to_local_args
 
-# pylint: disable=missing-docstring
-
 
 class TestLocalCommandLine(unittest.TestCase):
     """Unit tests for the to_local_args() function."""
@@ -79,21 +77,6 @@ class TestLocalCommandLine(unittest.TestCase):
             "--storageEngine=my_storage_engine",
             "--includeWithAnyTags=tag1,tag2,tag4",
             "--includeWithAnyTags=tag3,tag5",
-        ])
-
-    def test_keeps_no_journal_option(self):
-        cmdline = to_local_args([
-            "run",
-            "--suites=my_suite",
-            "--nojournal",
-            "--storageEngine=my_storage_engine",
-        ])
-
-        self.assertEqual(cmdline, [
-            "run",
-            "--suites=my_suite",
-            "--storageEngine=my_storage_engine",
-            "--nojournal",
         ])
 
     def test_keeps_num_clients_per_fixture_option(self):

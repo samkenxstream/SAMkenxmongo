@@ -114,7 +114,9 @@ public:
         return DepsTracker::State::SEE_NEXT;
     }
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     const char* getSourceName() const final {
         return kStageName.rawData();

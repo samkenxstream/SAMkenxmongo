@@ -6,25 +6,25 @@
  * error saying that the write can't be retried since it was upgraded to a transaction as part of
  * the update. This should be true whether or not a migration occurs on the chunk containing the
  * original value of the document's shard key. This file tests that behavior.
- * @tags: [uses_transactions, uses_multi_shard_transaction]
+ * @tags: [uses_transactions, uses_multi_shard_transaction,]
  */
 (function() {
 
 "use strict";
 
-load("jstests/libs/retryable_writes_util.js");
 load('jstests/sharding/libs/sharded_transactions_helpers.js');
 load('./jstests/libs/chunk_manipulation_util.js');
-
-if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
-    jsTestLog("Retryable writes are not supported, skipping test");
-    return;
-}
 
 // For startParallelOps to write its state
 let staticMongod = MongoRunner.runMongod({});
 
-let st = new ShardingTest({mongos: 2, shards: 3, rs: {nodes: 2}});
+let st = new ShardingTest({
+    mongos: 2,
+    shards: 3,
+    rs: {nodes: 2},
+    rsOptions:
+        {setParameter: {maxTransactionLockRequestTimeoutMillis: ReplSetTest.kDefaultTimeoutMS}}
+});
 
 const dbName = "test";
 const collName = "foo";
@@ -389,7 +389,7 @@ test(
              const findAndModifyUpsertCmdObj = attachTxnFields(findAndModifyUpsertCmdObjBase);
              runCommandDuringChunkMigration(findAndModifyUpsertCmdObj);
              // Retry the command. This should retry against shard2.
-             if (areInternalTransactionsEnabled(st.s0)) {
+             if (isUpdateDocumentShardKeyUsingTransactionApiEnabled(st.s0)) {
                  // If internal transactions are enabled, shard2 is expected to throw
                  // IncompleteTransactionHistory since it should have the WouldChangeOwningShard
                  // noop oplog entry copied from shard0 during the migration.

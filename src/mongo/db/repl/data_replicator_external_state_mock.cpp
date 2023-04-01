@@ -87,9 +87,9 @@ OpTimeWithTerm DataReplicatorExternalStateMock::getCurrentTermAndLastCommittedOp
 }
 
 void DataReplicatorExternalStateMock::processMetadata(const rpc::ReplSetMetadata& replMetadata,
-                                                      rpc::OplogQueryMetadata oqMetadata) {
-    replMetadataProcessed = replMetadata;
-    oqMetadataProcessed = oqMetadata;
+                                                      const rpc::OplogQueryMetadata& oqMetadata) {
+    replMetadataProcessed = rpc::ReplSetMetadata(replMetadata);
+    oqMetadataProcessed = rpc::OplogQueryMetadata(oqMetadata);
     metadataWasProcessed = true;
 }
 
@@ -145,6 +145,11 @@ Status DataReplicatorExternalStateMock::storeLocalConfigDocument(OperationContex
 
 JournalListener* DataReplicatorExternalStateMock::getReplicationJournalListener() {
     return nullptr;
+}
+
+StatusWith<LastVote> DataReplicatorExternalStateMock::loadLocalLastVoteDocument(
+    OperationContext* opCtx) const {
+    return StatusWith<LastVote>(ErrorCodes::NoMatchingDocument, "mock");
 }
 
 }  // namespace repl

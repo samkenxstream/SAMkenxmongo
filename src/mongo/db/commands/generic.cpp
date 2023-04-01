@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -44,6 +43,9 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 
 namespace mongo {
 namespace {
@@ -94,7 +96,7 @@ class EchoCommand final : public TypedCommand<EchoCommand> {
 public:
     struct Request {
         static constexpr auto kCommandName = "echo"_sd;
-        static Request parse(const IDLParserErrorContext&, const OpMsgRequest& request) {
+        static Request parse(const IDLParserContext&, const OpMsgRequest& request) {
             return Request{request};
         }
 
@@ -146,26 +148,39 @@ public:
     std::string help() const override {
         return "get a list of all db commands";
     }
+
     ListCommandsCmd() : BasicCommand("listCommands") {}
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
-    virtual bool adminOnly() const {
+
+    bool adminOnly() const override {
         return false;
     }
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {}  // No auth required
+
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();  // No auth required
+    }
+
     bool requiresAuth() const final {
         return false;
     }
-    virtual bool run(OperationContext* opCtx,
-                     const string& ns,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         // Sort the command names before building the result BSON.
         std::vector<Command*> commands;
         for (const auto& command : globalCommandRegistry()->allCommands()) {
@@ -234,7 +249,7 @@ public:
                             3,
                             "Non-debug severity levels must not pass 'debugLevel'",
                             "severity"_attr = obj[Request::kSeverityFieldName].valueStringData(),
-                            "debugLevel"_attr = optDebugLevel.get());
+                            "debugLevel"_attr = optDebugLevel.value());
             }
 
             switch (severity) {
@@ -270,7 +285,7 @@ public:
         }
 
         NamespaceString ns() const final {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 

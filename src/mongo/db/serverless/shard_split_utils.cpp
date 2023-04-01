@@ -29,12 +29,13 @@
 
 #include "mongo/db/serverless/shard_split_utils.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/repl/repl_set_config.h"
+#include "mongo/logv2/log_debug.h"
 
 namespace mongo {
 
@@ -46,7 +47,7 @@ std::vector<repl::MemberConfig> getRecipientMembers(const repl::ReplSetConfig& c
                                                     const StringData& recipientTagName) {
     std::vector<repl::MemberConfig> result;
     const auto& tagConfig = config.getTagConfig();
-    for (auto member : config.members()) {
+    for (const auto& member : config.members()) {
         auto matchesTag =
             std::any_of(member.tagsBegin(), member.tagsEnd(), [&](const repl::ReplSetTag& tag) {
                 return tagConfig.getTagKey(tag) == recipientTagName;
@@ -71,6 +72,10 @@ ConnectionString makeRecipientConnectionString(const repl::ReplSetConfig& config
                    std::back_inserter(recipientNodes),
                    [](const repl::MemberConfig& member) { return member.getHostAndPort(); });
 
+    uassert(ErrorCodes::BadValue,
+            "The recipient connection string must have exactly three members.",
+            recipientNodes.size() == kMinimumRequiredRecipientNodes);
+
     return ConnectionString::forReplicaSet(recipientSetName.toString(), recipientNodes);
 }
 
@@ -90,10 +95,15 @@ repl::ReplSetConfig makeSplitConfig(const repl::ReplSetConfig& config,
             std::any_of(member.tagsBegin(), member.tagsEnd(), [&](const repl::ReplSetTag& tag) {
                 return tagConfig.getTagKey(tag) == recipientTagName;
             });
+
         if (isRecipient) {
-            BSONObjBuilder bob(
-                member.toBSON().removeField("votes").removeField("priority").removeField("_id"));
+            auto memberBSON = member.toBSON();
+            auto recipientTags = memberBSON.getField("tags").Obj().removeField(recipientTagName);
+            BSONObjBuilder bob(memberBSON.removeFields(
+                StringDataSet{"votes", "priority", "_id", "tags", "hidden"}));
+
             bob.appendNumber("_id", recipientIndex);
+            bob.append("tags", recipientTags);
             recipientMembers.push_back(bob.obj());
             recipientIndex++;
         } else {
@@ -115,24 +125,34 @@ repl::ReplSetConfig makeSplitConfig(const repl::ReplSetConfig& config,
     recipientConfigBob.append("_id", recipientSetName)
         .append("members", recipientMembers)
         .append("version", updatedVersion);
-    if (configNoMembersBson.hasField("settings") &&
-        configNoMembersBson.getField("settings").isABSONObj()) {
-        BSONObj settings = configNoMembersBson.getField("settings").Obj();
-        if (settings.hasField("replicaSetId")) {
-            recipientConfigBob.append("settings", settings.removeField("replicaSetId"));
+
+    recipientConfigBob.append("settings", [&]() {
+        if (configNoMembersBson.hasField("settings") &&
+            configNoMembersBson.getField("settings").isABSONObj()) {
+            BSONObj settings = configNoMembersBson.getField("settings").Obj();
+            return settings.removeField("replicaSetId")
+                .addFields(BSON("replicaSetId" << OID::gen()));
         }
-    }
+
+        return BSON("replicaSetId" << OID::gen());
+    }());
 
     BSONObjBuilder splitConfigBob(configNoMembersBson);
     splitConfigBob.append("version", updatedVersion);
     splitConfigBob.append("members", donorMembers);
     splitConfigBob.append("recipientConfig", recipientConfigBob.obj());
 
-    return repl::ReplSetConfig::parse(splitConfigBob.obj());
+    auto finalConfig = repl::ReplSetConfig::parse(splitConfigBob.obj());
+
+    uassert(ErrorCodes::InvalidReplicaSetConfig,
+            "Recipient config and top level config cannot share the same replicaSetId",
+            finalConfig.getReplicaSetId() != finalConfig.getRecipientConfig()->getReplicaSetId());
+
+    return finalConfig;
 }
 
 Status insertStateDoc(OperationContext* opCtx, const ShardSplitDonorDocument& stateDoc) {
-    const auto nss = NamespaceString::kTenantSplitDonorsNamespace;
+    const auto nss = NamespaceString::kShardSplitDonorsNamespace;
     AutoGetCollection collection(opCtx, nss, MODE_IX);
 
     uassert(ErrorCodes::PrimarySteppedDown,
@@ -145,8 +165,7 @@ Status insertStateDoc(OperationContext* opCtx, const ShardSplitDonorDocument& st
                                  << stateDoc.getId() << ShardSplitDonorDocument::kExpireAtFieldName
                                  << BSON("$exists" << false));
         const auto updateMod = BSON("$setOnInsert" << stateDoc.toBSON());
-        auto updateResult =
-            Helpers::upsert(opCtx, nss.ns(), filter, updateMod, /*fromMigrate=*/false);
+        auto updateResult = Helpers::upsert(opCtx, nss, filter, updateMod, /*fromMigrate=*/false);
 
         invariant(!updateResult.numDocsModified);
         if (updateResult.upsertedId.isEmpty()) {
@@ -159,7 +178,7 @@ Status insertStateDoc(OperationContext* opCtx, const ShardSplitDonorDocument& st
 }
 
 Status updateStateDoc(OperationContext* opCtx, const ShardSplitDonorDocument& stateDoc) {
-    const auto nss = NamespaceString::kTenantSplitDonorsNamespace;
+    const auto nss = NamespaceString::kShardSplitDonorsNamespace;
     AutoGetCollection collection(opCtx, nss, MODE_IX);
 
     if (!collection) {
@@ -168,8 +187,7 @@ Status updateStateDoc(OperationContext* opCtx, const ShardSplitDonorDocument& st
     }
 
     return writeConflictRetry(opCtx, "updateShardSplitStateDoc", nss.ns(), [&]() -> Status {
-        auto updateResult =
-            Helpers::upsert(opCtx, nss.ns(), stateDoc.toBSON(), /*fromMigrate=*/false);
+        auto updateResult = Helpers::upsert(opCtx, nss, stateDoc.toBSON(), /*fromMigrate=*/false);
         if (updateResult.numMatched == 0) {
             return {ErrorCodes::NoSuchKey,
                     str::stream() << "Existing shard split state document not found for id: "
@@ -180,42 +198,8 @@ Status updateStateDoc(OperationContext* opCtx, const ShardSplitDonorDocument& st
     });
 }
 
-StatusWith<ShardSplitDonorDocument> getStateDocument(OperationContext* opCtx,
-                                                     const UUID& shardSplitId) {
-    // Read the most up to date data.
-    ReadSourceScope readSourceScope(opCtx, RecoveryUnit::ReadSource::kNoTimestamp);
-    AutoGetCollectionForRead collection(opCtx, NamespaceString::kTenantSplitDonorsNamespace);
-    if (!collection) {
-        return Status(ErrorCodes::NamespaceNotFound,
-                      str::stream() << "Collection not found looking for state document: "
-                                    << NamespaceString::kTenantSplitDonorsNamespace.ns());
-    }
-
-    BSONObj result;
-    auto foundDoc = Helpers::findOne(opCtx,
-                                     collection.getCollection(),
-                                     BSON(ShardSplitDonorDocument::kIdFieldName << shardSplitId),
-                                     result,
-                                     true);
-
-    if (!foundDoc) {
-        return Status(ErrorCodes::NoMatchingDocument,
-                      str::stream()
-                          << "No matching state doc found with shard split id: " << shardSplitId);
-    }
-
-    try {
-        return ShardSplitDonorDocument::parse(IDLParserErrorContext("shardSplitStateDocument"),
-                                              result);
-    } catch (DBException& ex) {
-        return ex.toStatus(str::stream()
-                           << "Invalid BSON found for matching document with shard split id: "
-                           << shardSplitId << " , res: " << result);
-    }
-}
-
 StatusWith<bool> deleteStateDoc(OperationContext* opCtx, const UUID& shardSplitId) {
-    const auto nss = NamespaceString::kTenantSplitDonorsNamespace;
+    const auto nss = NamespaceString::kShardSplitDonorsNamespace;
     AutoGetCollection collection(opCtx, nss, MODE_IX);
 
     if (!collection) {
@@ -243,7 +227,7 @@ bool shouldRemoveStateDocumentOnRecipient(OperationContext* opCtx,
 
 Status validateRecipientNodesForShardSplit(const ShardSplitDonorDocument& stateDocument,
                                            const repl::ReplSetConfig& localConfig) {
-    if (stateDocument.getState() == ShardSplitDonorStateEnum::kAborted) {
+    if (stateDocument.getState() > ShardSplitDonorStateEnum::kUninitialized) {
         return Status::OK();
     }
 
@@ -269,7 +253,7 @@ Status validateRecipientNodesForShardSplit(const ShardSplitDonorDocument& stateD
 
     stdx::unordered_set<std::string> uniqueTagValues;
     const auto& tagConfig = localConfig.getTagConfig();
-    for (auto member : recipientNodes) {
+    for (const auto& member : recipientNodes) {
         for (repl::MemberConfig::TagIterator it = member.tagsBegin(); it != member.tagsEnd();
              ++it) {
             if (tagConfig.getTagKey(*it) == *recipientTagName) {
@@ -285,7 +269,7 @@ Status validateRecipientNodesForShardSplit(const ShardSplitDonorDocument& stateD
         }
     }
 
-    bool allRecipientNodesNonVoting =
+    const bool allRecipientNodesNonVoting =
         std::none_of(recipientNodes.cbegin(), recipientNodes.cend(), [&](const auto& member) {
             return member.isVoter() || member.getPriority() != 0;
         });
@@ -296,6 +280,16 @@ Status validateRecipientNodesForShardSplit(const ShardSplitDonorDocument& stateD
                                     << "' must be non-voting and with a priority set to 0.");
     }
 
+    const bool allHiddenRecipientNodes =
+        std::all_of(recipientNodes.cbegin(), recipientNodes.cend(), [&](const auto& member) {
+            return member.isHidden();
+        });
+    if (!allHiddenRecipientNodes) {
+        return Status(ErrorCodes::InvalidOptions,
+                      str::stream() << "Local members tagged with '" << *recipientTagName
+                                    << "' must be hidden.");
+    }
+
     return Status::OK();
 }
 
@@ -304,31 +298,55 @@ RecipientAcceptSplitListener::RecipientAcceptSplitListener(
     : _numberOfRecipient(recipientConnectionString.getServers().size()),
       _recipientSetName(recipientConnectionString.getSetName()) {}
 
+const std::string kSetNameFieldName = "setName";
+const std::string kLastWriteFieldName = "lastWrite";
+const std::string kLastWriteOpTimeFieldName = "opTime";
 void RecipientAcceptSplitListener::onServerHeartbeatSucceededEvent(const HostAndPort& hostAndPort,
                                                                    const BSONObj reply) {
     stdx::lock_guard<Latch> lg(_mutex);
-    if (_fulfilled || !reply["setName"]) {
+    if (_fulfilled || !reply.hasField(kSetNameFieldName)) {
         return;
     }
 
-    _reportedSetNames[hostAndPort] = reply["setName"].str();
+    auto lastWriteOpTime = [&]() {
+        if (reply.hasField(kLastWriteFieldName)) {
+            auto lastWriteObj = reply[kLastWriteFieldName].Obj();
+            auto swLastWriteOpTime =
+                repl::OpTime::parseFromOplogEntry(lastWriteObj[kLastWriteOpTimeFieldName].Obj());
+            if (swLastWriteOpTime.isOK()) {
+                return swLastWriteOpTime.getValue();
+            }
+        }
 
-    if (!_hasPrimary && reply["ismaster"].booleanSafe()) {
-        _hasPrimary = true;
-    }
+        if (_reportedSetNames.contains(hostAndPort)) {
+            return _reportedSetNames[hostAndPort].opTime;
+        }
 
-    auto allReportCorrectly =
-        std::all_of(_reportedSetNames.begin(),
-                    _reportedSetNames.end(),
-                    [&](const auto& entry) { return entry.second == _recipientSetName; }) &&
+        return repl::OpTime();
+    }();
+
+    _reportedSetNames[hostAndPort] =
+        repl::OpTimeWith<std::string>(reply["setName"].str(), lastWriteOpTime);
+    auto allReportCorrectly = std::all_of(_reportedSetNames.begin(),
+                                          _reportedSetNames.end(),
+                                          [&](const auto& entry) {
+                                              return !entry.second.opTime.isNull() &&
+                                                  entry.second.value == _recipientSetName;
+                                          }) &&
         _reportedSetNames.size() == _numberOfRecipient;
-    if (allReportCorrectly && _hasPrimary) {
+
+    if (allReportCorrectly) {
         _fulfilled = true;
-        _promise.emplaceValue();
+        auto highestLastApplied = std::max_element(
+            _reportedSetNames.begin(), _reportedSetNames.end(), [](const auto& p1, const auto& p2) {
+                return p1.second.opTime < p2.second.opTime;
+            });
+
+        _promise.emplaceValue(highestLastApplied->first);
     }
 }
 
-SharedSemiFuture<void> RecipientAcceptSplitListener::getFuture() const {
+SharedSemiFuture<HostAndPort> RecipientAcceptSplitListener::getSplitAcceptedFuture() const {
     return _promise.getFuture();
 }
 

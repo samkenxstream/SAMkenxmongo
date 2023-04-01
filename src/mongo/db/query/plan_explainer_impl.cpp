@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -49,9 +48,13 @@
 #include "mongo/db/exec/trial_stage.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/query/explain.h"
+#include "mongo/db/query/plan_summary_stats_visitor.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/record_id_helpers.h"
 #include "mongo/util/assert_util.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
 namespace {
@@ -216,8 +219,9 @@ void statsToBSON(const PlanStageStats& stats,
     if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
         bob->appendNumber("nReturned", static_cast<long long>(stats.common.advanced));
         // Include executionTimeMillis if it was recorded.
-        if (stats.common.executionTimeMillis) {
-            bob->appendNumber("executionTimeMillisEstimate", *stats.common.executionTimeMillis);
+        if (stats.common.executionTime) {
+            bob->appendNumber("executionTimeMillisEstimate",
+                              durationCount<Milliseconds>(*stats.common.executionTime));
         }
 
         bob->appendNumber("works", static_cast<long long>(stats.common.works));
@@ -298,7 +302,7 @@ void statsToBSON(const PlanStageStats& stats,
         indexBoundsBob.append("startKeyInclusive", spec->startKeyInclusive);
         indexBoundsBob.append("endKey", spec->endKey);
         indexBoundsBob.append("endKeyInclusive", spec->endKeyInclusive);
-    } else if (STAGE_DELETE == stats.stageType) {
+    } else if (STAGE_DELETE == stats.stageType || STAGE_BATCHED_DELETE == stats.stageType) {
         DeleteStats* spec = static_cast<DeleteStats*>(stats.specific.get());
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
@@ -450,6 +454,8 @@ void statsToBSON(const PlanStageStats& stats,
                               static_cast<long long>(spec->totalDataSizeBytes));
             bob->appendBool("usedDisk", (spec->spills > 0));
             bob->appendNumber("spills", static_cast<long long>(spec->spills));
+            bob->appendNumber("spilledDataStorageSize",
+                              static_cast<long long>(spec->spilledDataStorageSize));
         }
     } else if (STAGE_SORT_MERGE == stats.stageType) {
         MergeSortStats* spec = static_cast<MergeSortStats*>(stats.specific.get());
@@ -476,6 +482,14 @@ void statsToBSON(const PlanStageStats& stats,
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("docsExamined", static_cast<long long>(spec->fetches));
         }
+    } else if (STAGE_TIMESERIES_MODIFY == stats.stageType) {
+        TimeseriesModifyStats* spec = static_cast<TimeseriesModifyStats*>(stats.specific.get());
+
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
+            bob->appendNumber("bucketsUnpacked", static_cast<long long>(spec->bucketsUnpacked));
+            bob->appendNumber("measurementsDeleted",
+                              static_cast<long long>(spec->measurementsDeleted));
+        }
     } else if (STAGE_UNPACK_TIMESERIES_BUCKET == stats.stageType) {
         UnpackTimeseriesBucketStats* spec =
             static_cast<UnpackTimeseriesBucketStats*>(stats.specific.get());
@@ -490,6 +504,13 @@ void statsToBSON(const PlanStageStats& stats,
             bob->appendNumber("nMatched", static_cast<long long>(spec->nMatched));
             bob->appendNumber("nWouldModify", static_cast<long long>(spec->nModified));
             bob->appendNumber("nWouldUpsert", static_cast<long long>(spec->nUpserted));
+        }
+    } else if (STAGE_SPOOL == stats.stageType) {
+        SpoolStats* spec = static_cast<SpoolStats*>(stats.specific.get());
+
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
+            bob->appendNumber("totalDataSizeSpooled",
+                              static_cast<long long>(spec->totalDataSizeBytes));
         }
     }
 
@@ -530,8 +551,9 @@ PlanSummaryStats collectExecutionStatsSummary(const PlanStageStats* stats,
     PlanSummaryStats summary;
     summary.nReturned = stats->common.advanced;
 
-    if (stats->common.executionTimeMillis) {
-        summary.executionTimeMillisEstimate = *stats->common.executionTimeMillis;
+    if (stats->common.executionTime) {
+        summary.executionTime.executionTimeEstimate = *stats->common.executionTime;
+        summary.executionTime.precision = QueryExecTimerPrecision::kMillis;
     }
 
     // Flatten the stats tree into a list.
@@ -630,7 +652,7 @@ MultiPlanStage* getMultiPlanStage(PlanStage* root) {
  * If 'root' has a MultiPlanStage returns the index of its best plan. Otherwise returns an
  * initialized value.
  */
-const boost::optional<size_t> getWinningPlanIdx(PlanStage* root) {
+boost::optional<size_t> getWinningPlanIdx(PlanStage* root) {
     if (auto mps = getMultiPlanStage(root); mps) {
         auto planIdx = mps->bestPlanIdx();
         tassert(3420008, "Trying to get stats of a MultiPlanStage without winning plan", planIdx);
@@ -655,7 +677,6 @@ boost::optional<double> getWinningPlanScore(PlanStage* root) {
 
 void PlanExplainerImpl::getSummaryStats(PlanSummaryStats* statsOut) const {
     invariant(statsOut);
-
     // We can get some of the fields we need from the common stats stored in the
     // root stage of the plan tree.
     const CommonStats* common = _root->getCommonStats();
@@ -668,6 +689,9 @@ void PlanExplainerImpl::getSummaryStats(PlanSummaryStats* statsOut) const {
 
     statsOut->totalKeysExamined = 0;
     statsOut->totalDocsExamined = 0;
+    statsOut->indexesUsed.clear();
+    statsOut->collectionScans = 0;
+    statsOut->collectionScansNonTailable = 0;
 
     for (size_t i = 0; i < stages.size(); i++) {
         statsOut->totalKeysExamined +=
@@ -676,11 +700,9 @@ void PlanExplainerImpl::getSummaryStats(PlanSummaryStats* statsOut) const {
             getDocsExamined(stages[i]->stageType(), stages[i]->getSpecificStats());
 
         if (isSortStageType(stages[i]->stageType())) {
-            statsOut->hasSortStage = true;
-
             auto sortStage = static_cast<const SortStage*>(stages[i]);
             auto sortStats = static_cast<const SortStats*>(sortStage->getSpecificStats());
-            statsOut->usedDisk = sortStats->spills > 0;
+            PlanSummaryStatsVisitor(*statsOut).visit(sortStats);
         }
 
         if (STAGE_IXSCAN == stages[i]->stageType()) {
@@ -719,6 +741,10 @@ void PlanExplainerImpl::getSummaryStats(PlanSummaryStats* statsOut) const {
             const CachedPlanStats* cachedStats =
                 static_cast<const CachedPlanStats*>(cachedPlan->getSpecificStats());
             statsOut->replanReason = cachedStats->replanReason;
+            // Nonnull replanReason indicates cached plan was less effecient than expected and an
+            // alternative plan was chosen.
+            statsOut->replanReason ? statsOut->fromPlanCache = false
+                                   : statsOut->fromPlanCache = true;
         } else if (STAGE_MULTI_PLAN == stages[i]->stageType()) {
             statsOut->fromMultiPlanner = true;
         } else if (STAGE_COLLSCAN == stages[i]->stageType()) {

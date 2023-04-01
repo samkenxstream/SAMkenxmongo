@@ -1,11 +1,3 @@
-/**
- *
- * @tags: [
- *  requires_fcv_53,
- *  featureFlagPerCollBalancingSettings,
- * ]
- */
-
 (function() {
 'use strict';
 
@@ -27,7 +19,12 @@ const st = new ShardingTest({
     shards: numShards,
     other: {
         enableBalancer: true,
-        configOptions: {setParameter: {logComponentVerbosity: tojson({sharding: {verbosity: 3}})}},
+        configOptions: {
+            setParameter: {
+                logComponentVerbosity: tojson({sharding: {verbosity: 3}}),
+                chunkDefragmentationThrottlingMS: 0
+            }
+        },
     }
 });
 
@@ -77,7 +74,8 @@ let runTest = function(numCollections, dbName) {
         const finalNumberChunks = findChunksUtil.countChunksForNs(st.s.getDB('config'), ns);
         jsTest.log("Finished defragmentation of collection " + coll + " with " + finalNumberChunks +
                    " chunks.");
-        defragmentationUtil.checkPostDefragmentationState(st.s, ns, maxChunkSizeMB, "key");
+        defragmentationUtil.checkPostDefragmentationState(
+            st.configRS.getPrimary(), st.s, ns, maxChunkSizeMB, "key");
     });
 
     st.printShardingStatus();

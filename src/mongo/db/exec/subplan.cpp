@@ -139,9 +139,7 @@ Status SubplanStage::choosePlanWholeQuery(PlanYieldPolicy* yieldPolicy) {
         MultiPlanStage* multiPlanStage = static_cast<MultiPlanStage*>(child().get());
 
         for (size_t ix = 0; ix < solutions.size(); ++ix) {
-            if (solutions[ix]->cacheData.get()) {
-                solutions[ix]->cacheData->indexFilterApplied = _plannerParams.indexFiltersApplied;
-            }
+            solutions[ix]->indexFilterApplied = _plannerParams.indexFiltersApplied;
 
             auto&& nextPlanRoot = stage_builder::buildClassicExecutableTree(
                 expCtx()->opCtx, collection(), *_query, *solutions[ix], _ws);
@@ -159,8 +157,8 @@ Status SubplanStage::choosePlanWholeQuery(PlanYieldPolicy* yieldPolicy) {
 }
 
 Status SubplanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
-    // Adds the amount of time taken by pickBestPlan() to executionTimeMillis. There's lots of
-    // work that happens here, so this is needed for the time accounting to make sense.
+    // Adds the amount of time taken by pickBestPlan() to executionTime. There's lots of work that
+    // happens here, so this is needed for the time accounting to make sense.
     auto optTimer = getOptTimer();
 
     // During plan selection, the list of indices we are using to plan must remain stable, so the

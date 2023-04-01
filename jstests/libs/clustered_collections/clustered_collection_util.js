@@ -70,7 +70,7 @@ var ClusteredCollectionUtil = class {
             assert.commandWorked(db.runCommand({listCollections: 1, filter: {name: collName}}));
         const listCollsOptions = listColls.cursor.firstBatch[0].options;
         assert(listCollsOptions.clusteredIndex);
-        assert.docEq(listCollsOptions.clusteredIndex, fullCreateOptions.clusteredIndex);
+        assert.docEq(fullCreateOptions.clusteredIndex, listCollsOptions.clusteredIndex);
     }
 
     // The clusteredIndex should appear in listIndexes with additional "clustered" field.
@@ -79,7 +79,7 @@ var ClusteredCollectionUtil = class {
         const listIndexes = assert.commandWorked(db[collName].runCommand("listIndexes"));
         const expectedListIndexesOutput =
             Object.extend({clustered: true}, fullCreateOptions.clusteredIndex);
-        assert.docEq(listIndexes.cursor.firstBatch[0], expectedListIndexesOutput);
+        assert.docEq(expectedListIndexesOutput, listIndexes.cursor.firstBatch[0]);
     }
 
     static testBasicClusteredCollection(db, collName, clusterKey) {
@@ -102,9 +102,8 @@ var ClusteredCollectionUtil = class {
         for (let len of lengths) {
             let id = 'x'.repeat(len);
 
-            // Validate the below for _id-clustered collection only until the following ticket is
-            // addressed:
-            // * TODO SERVER-60734 replacement updates should preserve the cluster key
+            // Validate the below for _id-clustered collection only given replacement updates only
+            // preserve cluster key '_id'.
             if (clusterKey == "_id") {
                 assert.commandWorked(coll.update({[clusterKey]: id}, {a: len}));
 
@@ -160,9 +159,8 @@ var ClusteredCollectionUtil = class {
         // Look up using the secondary index on {a: 1}
         assert.commandWorked(coll.createIndex({a: 1}));
 
-        // TODO remove the branch once SERVER-60734 "replacement updates should preserve the cluster
-        // key" is resolved.
         if (clusterKey == "_id") {
+            // Replacement updates only preserve the '_id' cluster key.
             assert.eq(1, coll.find({a: null}).itcount());
         } else {
             assert.eq(5, coll.find({a: null}).itcount());
@@ -176,9 +174,8 @@ var ClusteredCollectionUtil = class {
         assert.eq(1, coll.find({a: 10}).itcount());
         assert.eq(99, coll.findOne({a: 10})[clusterKeyString].length);
 
-        // TODO make it unconditional once SERVER-60734 "replacement updates should preserve the
-        // cluster key" is resolved.
         if (clusterKey == "_id") {
+            // Replacement updates only preserve the '_id' cluster key.
             for (let len of lengths) {
                 // Secondary index lookups for documents with large RecordId's.
                 assert.eq(1, coll.find({a: len}).itcount());
@@ -195,15 +192,5 @@ var ClusteredCollectionUtil = class {
         assert.eq(1, coll.find({[clusterKey]: 42}).itcount());
         assert.eq(1, coll.find({[clusterKey]: NumberLong("42")}).itcount());
         coll.drop();
-    }
-
-    static waitForTTL(db) {
-        // The 'ttl.passes' metric is incremented when the TTL monitor starts processing the
-        // indexes, so we wait for it to be incremented twice to know that the TTL monitor finished
-        // processing the indexes at least once.
-        const ttlPasses = db.serverStatus().metrics.ttl.passes;
-        assert.soon(function() {
-            return db.serverStatus().metrics.ttl.passes > ttlPasses + 1;
-        });
     }
 };

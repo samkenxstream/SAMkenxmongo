@@ -1,4 +1,3 @@
-load("jstests/libs/logv2_helpers.js");
 
 const kSnapshotErrors =
     [ErrorCodes.SnapshotTooOld, ErrorCodes.SnapshotUnavailable, ErrorCodes.StaleChunkHistory];
@@ -99,16 +98,14 @@ function assertNoSuchTransactionOnConn(conn, lsid, txnNumber) {
 
 function waitForFailpoint(hitFailpointStr, numTimes, timeout) {
     // Don't run the hang analyzer because we don't expect waitForFailpoint() to always succeed.
-    if (isJsonLogNoConn()) {
-        const hitFailpointRe = /Hit (\w+) failpoint/;
-        const hitRe = /Hit (\w+)/;
-        const matchHitFailpoint = hitFailpointStr.match(hitFailpointRe);
-        const matchHit = hitFailpointStr.match(hitRe);
-        if (matchHitFailpoint) {
-            hitFailpointStr = `(Hit .+ failpoint.*${matchHitFailpoint[1]}|${hitFailpointStr})`;
-        } else {
-            hitFailpointStr = `(Hit .+.*${matchHit[1]}|${hitFailpointStr})`;
-        }
+    const hitFailpointRe = /Hit (\w+) failpoint/;
+    const hitRe = /Hit (\w+)/;
+    const matchHitFailpoint = hitFailpointStr.match(hitFailpointRe);
+    const matchHit = hitFailpointStr.match(hitRe);
+    if (matchHitFailpoint) {
+        hitFailpointStr = `(Hit .+ failpoint.*${matchHitFailpoint[1]}|${hitFailpointStr})`;
+    } else {
+        hitFailpointStr = `(Hit .+.*${matchHit[1]}|${hitFailpointStr})`;
     }
     assert.soon(
         function() {
@@ -213,12 +210,15 @@ function getOplogEntriesForTxn(rs, lsid, txnNumber) {
     return getOplogEntriesForTxnOnNode(rs.getPrimary(), lsid, txnNumber);
 }
 
-function getTxnEntriesForSession(rs, lsid) {
-    return rs.getPrimary()
-        .getCollection("config.transactions")
+function getTxnEntriesForSessionOnNode(node, lsid) {
+    return node.getCollection("config.transactions")
         .find(makeLsidFilter(lsid, "_id"))
         .sort({_id: 1})
         .toArray();
+}
+
+function getTxnEntriesForSession(rs, lsid) {
+    return getTxnEntriesForSessionOnNode(rs.getPrimary(), lsid);
 }
 
 function getImageEntriesForTxnOnNode(node, lsid, txnNumber) {
@@ -258,10 +258,11 @@ function makePrepareTransactionCmdObj(lsid, txnNumber) {
     };
 }
 
-function areInternalTransactionsEnabled(conn) {
+function isUpdateDocumentShardKeyUsingTransactionApiEnabled(conn) {
     return jsTestOptions().mongosBinVersion !== "last-lts" &&
         jsTestOptions().mongosBinVersion !== "last-continuous" &&
         assert
-            .commandWorked(conn.adminCommand({getParameter: 1, featureFlagInternalTransactions: 1}))
-            .featureFlagInternalTransactions.value;
+            .commandWorked(conn.adminCommand(
+                {getParameter: 1, featureFlagUpdateDocumentShardKeyUsingTransactionApi: 1}))
+            .featureFlagUpdateDocumentShardKeyUsingTransactionApi.value;
 }

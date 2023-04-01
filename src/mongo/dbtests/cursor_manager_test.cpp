@@ -32,7 +32,6 @@
 #include <algorithm>
 
 #include <boost/optional/optional.hpp>
-#include <boost/optional/optional_io.hpp>
 
 #include "mongo/client/read_preference.h"
 #include "mongo/db/client.h"
@@ -54,7 +53,7 @@
 
 namespace mongo {
 namespace {
-const NamespaceString kTestNss{"test.collection"};
+const NamespaceString kTestNss = NamespaceString::createNamespaceString_forTest("test.collection");
 
 class CursorManagerTest : public unittest::Test {
 public:
@@ -215,16 +214,17 @@ TEST_F(CursorManagerTest, InactiveCursorShouldTimeout) {
     CursorManager* cursorManager = useCursorManager();
     auto clock = useClock();
 
-    cursorManager->registerCursor(_opCtx.get(),
-                                  {makeFakePlanExecutor(),
-                                   NamespaceString{"test.collection"},
-                                   {},
-                                   APIParameters(),
-                                   {},
-                                   repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
-                                   ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                                   BSONObj(),
-                                   PrivilegeVector()});
+    cursorManager->registerCursor(
+        _opCtx.get(),
+        {makeFakePlanExecutor(),
+         NamespaceString::createNamespaceString_forTest("test.collection"),
+         {},
+         APIParameters(),
+         {},
+         repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
+         ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+         BSONObj(),
+         PrivilegeVector()});
 
     ASSERT_EQ(0UL, cursorManager->timeoutCursors(_opCtx.get(), Date_t()));
 
@@ -232,16 +232,17 @@ TEST_F(CursorManagerTest, InactiveCursorShouldTimeout) {
     ASSERT_EQ(1UL, cursorManager->timeoutCursors(_opCtx.get(), clock->now()));
     ASSERT_EQ(0UL, cursorManager->numCursors());
 
-    cursorManager->registerCursor(_opCtx.get(),
-                                  {makeFakePlanExecutor(),
-                                   NamespaceString{"test.collection"},
-                                   {},
-                                   APIParameters(),
-                                   {},
-                                   repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
-                                   ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                                   BSONObj(),
-                                   PrivilegeVector()});
+    cursorManager->registerCursor(
+        _opCtx.get(),
+        {makeFakePlanExecutor(),
+         NamespaceString::createNamespaceString_forTest("test.collection"),
+         {},
+         APIParameters(),
+         {},
+         repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern),
+         ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+         BSONObj(),
+         PrivilegeVector()});
     ASSERT_EQ(1UL, cursorManager->timeoutCursors(_opCtx.get(), Date_t::max()));
     ASSERT_EQ(0UL, cursorManager->numCursors());
 }
@@ -256,7 +257,7 @@ TEST_F(CursorManagerTest, InactivePinnedCursorShouldNotTimeout) {
     auto cursorPin = cursorManager->registerCursor(
         _opCtx.get(),
         {makeFakePlanExecutor(),
-         NamespaceString{"test.collection"},
+         NamespaceString::createNamespaceString_forTest("test.collection"),
          {},
          APIParameters(),
          {},
@@ -282,7 +283,7 @@ TEST_F(CursorManagerTest, MarkedAsKilledCursorsShouldBeDeletedOnCursorPin) {
     auto cursorPin = cursorManager->registerCursor(
         _opCtx.get(),
         {makeFakePlanExecutor(),
-         NamespaceString{"test.collection"},
+         NamespaceString::createNamespaceString_forTest("test.collection"),
          {},
          APIParameters(),
          {},
@@ -317,7 +318,7 @@ TEST_F(CursorManagerTest, InactiveKilledCursorsShouldTimeout) {
     auto cursorPin = cursorManager->registerCursor(
         _opCtx.get(),
         {makeFakePlanExecutor(),
-         NamespaceString{"test.collection"},
+         NamespaceString::createNamespaceString_forTest("test.collection"),
          {},
          APIParameters(),
          {},
@@ -753,5 +754,44 @@ TEST_F(CursorManagerTestCustomOpCtx, CursorsMarkedAsKilledAreReturnedForOpKeyLoo
     auto cursors = useCursorManager()->getCursorsForOpKeys({opKey});
     ASSERT_EQ(cursors.size(), size_t(1));
 }
+
+TEST_F(CursorManagerTestCustomOpCtx,
+       GetCursorIdsForNamespaceReturnsSingleEntryForMatchingNamespace) {
+    auto opCtx = _queryServiceContext->makeOperationContext();
+    auto pinned = makeCursor(opCtx.get());
+    auto cursorId = pinned.getCursor()->cursorid();
+    auto cursorsForNamespace = useCursorManager()->getCursorIdsForNamespace(kTestNss);
+    ASSERT_EQUALS(cursorsForNamespace.size(), 1ull);
+    ASSERT_EQUALS(cursorsForNamespace[0], cursorId);
+}
+
+TEST_F(CursorManagerTestCustomOpCtx,
+       GetCursorIdsForNamespaceReturnsMultipleEntriesForMatchingNamespace) {
+    auto opCtx = _queryServiceContext->makeOperationContext();
+    auto pinned1 = makeCursor(opCtx.get());
+    auto pinned2 = makeCursor(opCtx.get());
+    auto cursorId1 = pinned1.getCursor()->cursorid();
+    auto cursorId2 = pinned2.getCursor()->cursorid();
+    auto cursorsForNamespace = useCursorManager()->getCursorIdsForNamespace(kTestNss);
+    ASSERT_EQUALS(cursorsForNamespace.size(), 2ull);
+    // The results for cursorsForNamespace won't necessarily be the same as the order of insertion.
+    std::set<CursorId> cursorsForNamespaceSet(cursorsForNamespace.begin(),
+                                              cursorsForNamespace.end());
+
+    ASSERT_EQUALS(cursorsForNamespaceSet.count(cursorId1), 1ull);
+    ASSERT_EQUALS(cursorsForNamespaceSet.count(cursorId2), 1ull);
+}
+
+TEST_F(CursorManagerTestCustomOpCtx,
+       GetCursorIdsForNamespaceDoesNotReturnEntriesForNonMatchingNamespace) {
+    auto opCtx = _queryServiceContext->makeOperationContext();
+    // Add a cursor for kTestNss.
+    auto pinned = makeCursor(opCtx.get());
+    // Get cursors for a different NamespaceString.
+    auto cursorsForNamespace =
+        useCursorManager()->getCursorIdsForNamespace(NamespaceString("somerandom.nss"));
+    ASSERT_EQUALS(cursorsForNamespace.size(), 0ull);
+}
+
 }  // namespace
 }  // namespace mongo

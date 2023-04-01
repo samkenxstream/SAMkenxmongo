@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT mongo::logv2::LogComponent::kControl
 
 #include "mongo/logv2/log_util.h"
 
@@ -38,10 +37,14 @@
 #include <string>
 #include <vector>
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT mongo::logv2::LogComponent::kControl
+
+
 namespace mongo::logv2 {
 
 namespace {
 AtomicWord<bool> redactionEnabled{false};
+AtomicWord<bool> redactBinDataEncrypt{true};
 std::map<StringData, LogRotateCallback> logRotateCallbacks;
 }  // namespace
 
@@ -67,7 +70,7 @@ Status rotateLogs(bool renameFiles,
     LOGV2(23166, "Log rotation initiated", "suffix"_attr = suffix, "logType"_attr = logType);
 
     if (logType) {
-        auto it = logRotateCallbacks.find(logType.get());
+        auto it = logRotateCallbacks.find(logType.value());
         if (it == logRotateCallbacks.end()) {
             LOGV2_WARNING(6221500, "Unknown log type for rotate", "logType"_attr = logType);
             return Status(ErrorCodes::NoSuchKey, "Unknown log type for rotate");
@@ -101,4 +104,13 @@ bool shouldRedactLogs() {
 void setShouldRedactLogs(bool enabled) {
     redactionEnabled.store(enabled);
 }
+
+bool shouldRedactBinDataEncrypt() {
+    return redactBinDataEncrypt.loadRelaxed();
+}
+
+void setShouldRedactBinDataEncrypt(bool enabled) {
+    redactBinDataEncrypt.store(enabled);
+}
+
 }  // namespace mongo::logv2

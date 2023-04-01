@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -35,6 +34,9 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 
 namespace mongo {
 namespace {
@@ -47,35 +49,37 @@ public:
         return AllowedOnSecondary::kAlways;
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(cmdObj);
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return NamespaceStringUtil::parseNamespaceFromRequest(
+            dbName.tenantId(), CommandHelpers::parseNsFullyQualified(cmdObj));
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
-                ActionType::splitVector)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forExactNamespace(parseNs(dbName, cmdObj)),
+                     ActionType::splitVector)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbName,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbName, cmdObj));
         uassert(ErrorCodes::IllegalOperation,
                 "Performing splitVector across dbs isn't supported via mongos",
-                nss.db() == dbName);
+                nss.dbName() == dbName);
 
-        const auto cm =
+        const auto [cm, _] =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
         uassert(ErrorCodes::IllegalOperation,
                 str::stream() << "can't do command: " << getName() << " on sharded collection",
@@ -86,15 +90,15 @@ public:
         BSONObj filteredCmdObj(applyReadWriteConcern(
             opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)));
         BSONObj filteredCmdObjWithVersion(
-            appendShardVersion(filteredCmdObj, ChunkVersion::UNSHARDED()));
+            appendShardVersion(filteredCmdObj, ShardVersion::UNSHARDED()));
 
         auto shard =
             uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, cm.dbPrimary()));
         auto commandResponse = uassertStatusOK(shard->runCommandWithFixedRetryAttempts(
             opCtx,
             ReadPreferenceSetting::get(opCtx),
-            dbName,
-            cm.dbPrimary() == ShardId::kConfigServerId ? filteredCmdObj : filteredCmdObjWithVersion,
+            dbName.toStringWithTenantId(),
+            cm.dbVersion().isFixed() ? filteredCmdObj : filteredCmdObjWithVersion,
             Shard::RetryPolicy::kIdempotent));
 
         uassert(ErrorCodes::IllegalOperation,

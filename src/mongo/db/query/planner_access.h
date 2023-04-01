@@ -35,6 +35,7 @@
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/index_tag.h"
 #include "mongo/db/query/interval_evaluation_tree.h"
+#include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_solution.h"
 
@@ -104,7 +105,8 @@ public:
      */
     static std::unique_ptr<QuerySolutionNode> makeCollectionScan(const CanonicalQuery& query,
                                                                  bool tailable,
-                                                                 const QueryPlannerParams& params);
+                                                                 const QueryPlannerParams& params,
+                                                                 int direction);
 
     /**
      * Return a plan that uses the provided index as a proxy for a collection scan.
@@ -143,11 +145,9 @@ private:
     struct ScanBuildingState {
         ScanBuildingState(MatchExpression* theRoot,
                           const std::vector<IndexEntry>& indexList,
-                          bool inArrayOp,
-                          bool isCoveredNull = false)
+                          bool inArrayOp)
             : root(theRoot),
               inArrayOperator(inArrayOp),
-              isCoveredNullQuery(isCoveredNull),
               indices(indexList),
               currentScan(nullptr),
               curChild(0),
@@ -165,23 +165,7 @@ private:
          * If `isQueryParameterized` is true an Interval Evaluation Tree will be built for every key
          * element.
          */
-        void resetForNextScan(IndexTag* newTag, bool isQueryParameterized) {
-            currentScan.reset(nullptr);
-            currentIndexNumber = newTag->index;
-            tightness = IndexBoundsBuilder::INEXACT_FETCH;
-            loosestBounds = IndexBoundsBuilder::EXACT;
-
-            if (isQueryParameterized) {
-                const auto& index = indices[newTag->index];
-                for (int i = 0; i < index.keyPattern.nFields(); ++i) {
-                    ietBuilders.emplace_back();
-                }
-            }
-
-            if (MatchExpression::OR == root->matchType()) {
-                curOr = std::make_unique<OrMatchExpression>();
-            }
-        }
+        void resetForNextScan(IndexTag* newTag, bool isQueryParameterized);
 
         interval_evaluation_tree::Builder* getCurrentIETBuilder() {
             if (ietBuilders.empty()) {
@@ -201,9 +185,6 @@ private:
 
         // Are we inside an array operator such as $elemMatch or $all?
         bool inArrayOperator;
-
-        // Is this a covered null query?
-        bool isCoveredNullQuery;
 
         // A list of relevant indices which 'root' may be tagged to use.
         const std::vector<IndexEntry>& indices;
@@ -408,7 +389,7 @@ private:
      */
     static void finishLeafNode(QuerySolutionNode* node,
                                const IndexEntry& index,
-                               const std::vector<interval_evaluation_tree::Builder>& ietBuilders);
+                               std::vector<interval_evaluation_tree::Builder> ietBuilders);
 
     /**
      * Fills in any missing bounds by calling finishLeafNode(...) for the scan contained in
