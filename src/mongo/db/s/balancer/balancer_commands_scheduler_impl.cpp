@@ -82,11 +82,7 @@ Status processRemoteResponse(const executor::RemoteCommandResponse& remoteRespon
         return remoteResponse.status;
     }
     auto remoteStatus = getStatusFromCommandResult(remoteResponse.data);
-    return Shard::shouldErrorBePropagated(remoteStatus.code())
-        ? remoteStatus
-        : Status(ErrorCodes::OperationFailed,
-                 str::stream() << "Command request failed on source shard. "
-                               << causedBy(remoteStatus));
+    return remoteStatus.withContext("Command request failed on source shard.");
 }
 
 }  // namespace
@@ -360,6 +356,13 @@ void BalancerCommandsSchedulerImpl::_workerThread() {
     });
 
     Client::initThread("BalancerCommandsScheduler");
+
+    // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+    {
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationUnkillableByStepdown(lk);
+    }
+
     bool stopWorkerRequested = false;
     LOGV2(5847205, "Balancer scheduler thread started");
 

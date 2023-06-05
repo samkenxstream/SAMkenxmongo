@@ -34,6 +34,7 @@
 #include <algorithm>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/base/exact_cast.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/jsobj.h"
@@ -44,6 +45,7 @@
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_merge.h"
 #include "mongo/db/pipeline/document_source_out.h"
+#include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/search_helper.h"
@@ -81,7 +83,7 @@ void validateTopLevelPipeline(const Pipeline& pipeline) {
     // Verify that the specified namespace is valid for the initial stage of this pipeline.
     const NamespaceString& nss = pipeline.getContext()->ns;
 
-    auto sources = pipeline.getSources();
+    const auto& sources = pipeline.getSources();
 
     if (sources.empty()) {
         uassert(ErrorCodes::InvalidNamespace,
@@ -182,7 +184,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::clone(
     for (auto&& stage : _sources) {
         clonedStages.push_back(stage->clone(expCtx));
     }
-    return create(clonedStages, expCtx);
+    return create(std::move(clonedStages), expCtx);
 }
 
 template <class T>
@@ -522,39 +524,11 @@ vector<Value> Pipeline::serializeContainer(const SourceContainer& container,
     return serializedSources;
 }
 
-vector<Value> Pipeline::serializeContainer(const SourceContainer& container,
-                                           boost::optional<ExplainOptions::Verbosity> explain) {
-    // TODO SERVER-75139 Remove this function once all calls have been removed.
-    vector<Value> serializedSources;
-    for (auto&& source : container) {
-        source->serializeToArray(serializedSources, explain);
-    }
-    return serializedSources;
-}
-
-vector<Value> Pipeline::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
-    // TODO SERVER-75139 Remove this function once all calls have been removed.
-    return serializeContainer(_sources, {explain});
-}
-
 vector<Value> Pipeline::serialize(boost::optional<SerializationOptions> opts) const {
     return serializeContainer(_sources, opts);
 }
 
-vector<BSONObj> Pipeline::serializeToBson(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    const auto serialized = serialize(explain);
-    std::vector<BSONObj> asBson;
-    asBson.reserve(serialized.size());
-    for (auto&& stage : serialized) {
-        invariant(stage.getType() == BSONType::Object);
-        asBson.push_back(stage.getDocument().toBson());
-    }
-    return asBson;
-}
-
 vector<BSONObj> Pipeline::serializeToBson(boost::optional<SerializationOptions> opts) const {
-    // TODO SERVER-75139 Remove this function once all calls have been removed.
     const auto serialized = serialize(opts);
     std::vector<BSONObj> asBson;
     asBson.reserve(serialized.size());
@@ -596,16 +570,16 @@ boost::optional<Document> Pipeline::getNext() {
                               : boost::optional<Document>{nextResult.releaseDocument()};
 }
 
-vector<Value> Pipeline::writeExplainOps(ExplainOptions::Verbosity verbosity) const {
+vector<Value> Pipeline::writeExplainOps(SerializationOptions opts) const {
     vector<Value> array;
     for (auto&& stage : _sources) {
         auto beforeSize = array.size();
-        stage->serializeToArray(array, verbosity);
+        stage->serializeToArray(array, opts);
         auto afterSize = array.size();
         // Append execution stats to the serialized stage if the specified verbosity is
         // 'executionStats' or 'allPlansExecution'.
         invariant(afterSize - beforeSize == 1u);
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
+        if (*opts.verbosity >= ExplainOptions::Verbosity::kExecStats) {
             auto serializedStage = array.back();
             array.back() = appendCommonExecStats(serializedStage, stage->getCommonStats());
         }
@@ -678,8 +652,18 @@ DepsTracker Pipeline::getDependenciesForContainer(
             knowAllFields = status & DepsTracker::State::EXHAUSTIVE_FIELDS;
 
             // Check if this stage modifies any fields that we should track for use by later stages.
+            // Fields which are part of exclusion projections should not be marked as generated,
+            // despite them being modified.
             auto localGeneratedPaths = source->getModifiedPaths();
-            if (localGeneratedPaths.type == DocumentSource::GetModPathsReturn::Type::kFiniteSet) {
+            auto isExclusionProjection = [&]() {
+                const auto projStage =
+                    exact_pointer_cast<DocumentSourceSingleDocumentTransformation*>(source.get());
+                return projStage &&
+                    projStage->getType() ==
+                    TransformerInterface::TransformerType::kExclusionProjection;
+            };
+            if (localGeneratedPaths.type == DocumentSource::GetModPathsReturn::Type::kFiniteSet &&
+                !isExclusionProjection()) {
                 auto newPathNames = localGeneratedPaths.getNewNames();
                 generatedPaths.insert(newPathNames.begin(), newPathNames.end());
             }

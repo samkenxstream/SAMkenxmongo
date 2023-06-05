@@ -124,12 +124,10 @@ MONGO_FAIL_POINT_DEFINE(WTSetOldestTSToStableTS);
 MONGO_FAIL_POINT_DEFINE(WTWriteConflictExceptionForImportCollection);
 MONGO_FAIL_POINT_DEFINE(WTWriteConflictExceptionForImportIndex);
 MONGO_FAIL_POINT_DEFINE(WTRollbackToStableReturnOnEBUSY);
+MONGO_FAIL_POINT_DEFINE(hangBeforeUnrecoverableRollbackError);
+MONGO_FAIL_POINT_DEFINE(WTDisableFastShutDown);
 
 const std::string kPinOldestTimestampAtStartupName = "_wt_startup";
-
-#if !defined(__has_feature)
-#define __has_feature(x) 0
-#endif
 
 #if __has_feature(address_sanitizer)
 constexpr bool kAddressSanitizerEnabled = true;
@@ -249,6 +247,13 @@ public:
 
     virtual void run() {
         ThreadClient tc(name(), getGlobalServiceContext());
+
+        // TODO(SERVER-74657): Please revisit if this thread could be made killable.
+        {
+            stdx::lock_guard<Client> lk(*tc.get());
+            tc.get()->setSystemOperationUnkillableByStepdown(lk);
+        }
+
         LOGV2_DEBUG(22303, 1, "starting {name} thread", "name"_attr = name());
 
         while (!_shuttingDown.load()) {
@@ -395,7 +400,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(OperationContext* opCtx,
         }
         ss << "),";
     }
-    if (kAddressSanitizerEnabled || kThreadSanitizerEnabled) {
+    if constexpr (kAddressSanitizerEnabled || kThreadSanitizerEnabled) {
         // For applications using WT, advancing a cursor invalidates the data/memory that cursor was
         // pointing to. WT performs the optimization of managing its own memory. The unit of memory
         // allocation is a page. Walking a cursor from one key/value to the next often lands on the
@@ -416,6 +421,11 @@ WiredTigerKVEngine::WiredTigerKVEngine(OperationContext* opCtx,
         // engine.
         ss << "debug_mode=(cursor_copy=true),";
     }
+    if constexpr (kThreadSanitizerEnabled) {
+        // TSAN builds may take longer for certain operations, increase the relevant timeouts.
+        ss << "cache_stuck_timeout_ms=600000,";
+        ss << "generation_drain_timeout_ms=480000,";
+    }
     if (TestingProctor::instance().isEnabled()) {
         // Enable debug write-ahead logging for all tables when testing is enabled.
         //
@@ -427,17 +437,18 @@ WiredTigerKVEngine::WiredTigerKVEngine(OperationContext* opCtx,
         // checkpoints more often.
         const double fourMinutesInSeconds = 240.0;
         int ckptsPerFourMinutes;
-        if (storageGlobalParams.checkpointDelaySecs <= 0.0) {
+        if (storageGlobalParams.syncdelay <= 0.0) {
             ckptsPerFourMinutes = 1;
         } else {
             ckptsPerFourMinutes =
-                static_cast<int>(fourMinutesInSeconds / storageGlobalParams.checkpointDelaySecs);
+                static_cast<int>(fourMinutesInSeconds / storageGlobalParams.syncdelay);
         }
 
         if (ckptsPerFourMinutes < 1) {
             LOGV2_WARNING(8423377,
                           "Unexpected value for checkpoint retention",
-                          "checkpointDelaySecs"_attr = storageGlobalParams.checkpointDelaySecs,
+                          "syncdelay"_attr =
+                              static_cast<std::int64_t>(storageGlobalParams.syncdelay),
                           "ckptsPerFourMinutes"_attr = ckptsPerFourMinutes);
             ckptsPerFourMinutes = 1;
         }
@@ -724,6 +735,10 @@ void WiredTigerKVEngine::cleanShutdown() {
     std::string closeConfig = "";
 
     if (RUNNING_ON_VALGRIND) {  // NOLINT
+        leak_memory = false;
+    }
+
+    if (MONGO_unlikely(WTDisableFastShutDown.shouldFail())) {
         leak_memory = false;
     }
 
@@ -1044,6 +1059,11 @@ public:
 
     ~StreamingCursorImpl() = default;
 
+    void setCatalogEntries(const stdx::unordered_map<std::string, std::pair<NamespaceString, UUID>>&
+                               identsToNsAndUUID) {
+        _identsToNsAndUUID = std::move(identsToNsAndUUID);
+    }
+
     StatusWith<std::deque<BackupBlock>> getNextBatch(OperationContext* opCtx,
                                                      const std::size_t batchSize) {
         int wtRet = 0;
@@ -1105,9 +1125,11 @@ public:
                 // to an entire file. Full backups cannot open an incremental cursor, even if they
                 // are the initial incremental backup.
                 const std::uint64_t length = options.incrementalBackup ? fileSize : 0;
+                auto nsAndUUID = _getNsAndUUID(filePath.stem().string());
                 backupBlocks.push_back(BackupBlock(opCtx,
+                                                   nsAndUUID.first,
+                                                   nsAndUUID.second,
                                                    filePath.string(),
-                                                   _wtBackup->identToNamespaceAndUUIDMap,
                                                    _checkpointTimestamp,
                                                    0 /* offset */,
                                                    length,
@@ -1123,6 +1145,15 @@ public:
     }
 
 private:
+    std::pair<boost::optional<NamespaceString>, boost::optional<UUID>> _getNsAndUUID(
+        const std::string& ident) const {
+        auto it = _identsToNsAndUUID.find(ident);
+        if (it == _identsToNsAndUUID.end()) {
+            return std::make_pair(boost::none, boost::none);
+        }
+        return it->second;
+    }
+
     Status _getNextIncrementalBatchForFile(OperationContext* opCtx,
                                            const char* filename,
                                            boost::filesystem::path filePath,
@@ -1165,9 +1196,11 @@ private:
                         "offset"_attr = offset,
                         "size"_attr = size,
                         "type"_attr = type);
+            auto nsAndUUID = _getNsAndUUID(filePath.stem().string());
             backupBlocks->push_back(BackupBlock(opCtx,
+                                                nsAndUUID.first,
+                                                nsAndUUID.second,
                                                 filePath.string(),
-                                                _wtBackup->identToNamespaceAndUUIDMap,
                                                 _checkpointTimestamp,
                                                 offset,
                                                 size,
@@ -1177,9 +1210,11 @@ private:
         // If the file is unchanged, push a BackupBlock with offset=0 and length=0. This allows us
         // to distinguish between an unchanged file and a deleted file in an incremental backup.
         if (fileUnchangedFlag) {
+            auto nsAndUUID = _getNsAndUUID(filePath.stem().string());
             backupBlocks->push_back(BackupBlock(opCtx,
+                                                nsAndUUID.first,
+                                                nsAndUUID.second,
                                                 filePath.string(),
-                                                _wtBackup->identToNamespaceAndUUIDMap,
                                                 _checkpointTimestamp,
                                                 0 /* offset */,
                                                 0 /* length */,
@@ -1202,6 +1237,7 @@ private:
 
     WT_SESSION* _session;
     std::string _path;
+    stdx::unordered_map<std::string, std::pair<NamespaceString, UUID>> _identsToNsAndUUID;
     boost::optional<Timestamp> _checkpointTimestamp;
     WiredTigerBackup* _wtBackup;  // '_wtBackup' is an out parameter.
 };
@@ -1261,34 +1297,10 @@ WiredTigerKVEngine::beginNonBlockingBackup(OperationContext* opCtx,
 
     invariant(_wtBackup.logFilePathsSeenByExtendBackupCursor.empty());
     invariant(_wtBackup.logFilePathsSeenByGetNextBatch.empty());
-    invariant(_wtBackup.identToNamespaceAndUUIDMap.empty());
-
-    // Fetching the catalog entries requires reading from the storage engine. During cache pressure,
-    // this read could be rolled back. In that case, we need to clear the map.
-    ScopeGuard clearGuard([&] { _wtBackup.identToNamespaceAndUUIDMap.clear(); });
-
-    {
-        Lock::GlobalLock lk(opCtx, MODE_IS);
-        DurableCatalog* catalog = DurableCatalog::get(opCtx);
-        std::vector<DurableCatalog::EntryIdentifier> catalogEntries =
-            catalog->getAllCatalogEntries(opCtx);
-        for (const DurableCatalog::EntryIdentifier& e : catalogEntries) {
-            // Populate the collection ident with its namespace and UUID.
-            UUID uuid = catalog->getMetaData(opCtx, e.catalogId)->options.uuid.value();
-            _wtBackup.identToNamespaceAndUUIDMap.emplace(e.ident, std::make_pair(e.nss, uuid));
-
-            // Populate the collection's index idents with the collection's namespace and UUID.
-            std::vector<std::string> idxIdents = catalog->getIndexIdents(opCtx, e.catalogId);
-            for (const std::string& idxIdent : idxIdents) {
-                _wtBackup.identToNamespaceAndUUIDMap.emplace(idxIdent, std::make_pair(e.nss, uuid));
-            }
-        }
-    }
 
     auto streamingCursor = std::make_unique<StreamingCursorImpl>(
         session, _path, checkpointTimestamp, options, &_wtBackup);
 
-    clearGuard.dismiss();
     pinOplogGuard.dismiss();
     _backupSession = std::move(sessionRaii);
     _wtBackup.cursor = cursor;
@@ -1309,7 +1321,6 @@ void WiredTigerKVEngine::endNonBlockingBackup(OperationContext* opCtx) {
     _wtBackup.dupCursor = nullptr;
     _wtBackup.logFilePathsSeenByExtendBackupCursor = {};
     _wtBackup.logFilePathsSeenByGetNextBatch = {};
-    _wtBackup.identToNamespaceAndUUIDMap = {};
 
     boost::filesystem::remove(getOngoingBackupPath());
 }
@@ -1627,7 +1638,7 @@ Status WiredTigerKVEngine::createSortedDataInterface(OperationContext* opCtx,
             dps::extractElementAtPath(*storageEngineOptions, _canonicalName + ".configString")
                 .str();
     }
-    // Some unittests use a OperationContextNoop that can't support such lookups.
+
     StatusWith<std::string> result =
         WiredTigerIndex::generateCreateString(_canonicalName,
                                               _indexOptions,
@@ -2315,6 +2326,10 @@ StatusWith<Timestamp> WiredTigerKVEngine::recoverToStableTimestamp(OperationCont
     if (!_canRecoverToStableTimestamp()) {
         Timestamp stableTS(_stableTimestamp.load());
         Timestamp initialDataTS(_initialDataTimestamp.load());
+        if (MONGO_unlikely(hangBeforeUnrecoverableRollbackError.shouldFail())) {
+            LOGV2(6718000, "Hit hangBeforeUnrecoverableRollbackError failpoint");
+            hangBeforeUnrecoverableRollbackError.pauseWhileSet(opCtx);
+        }
         return Status(ErrorCodes::UnrecoverableRollbackError,
                       str::stream()
                           << "No stable timestamp available to recover to. Initial data timestamp: "

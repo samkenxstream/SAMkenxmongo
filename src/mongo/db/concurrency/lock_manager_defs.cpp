@@ -27,15 +27,15 @@
  *    it in the license file.
  */
 
-#include "lock_manager_defs.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+
+#include "mongo/db/concurrency/resource_catalog.h"
 
 namespace mongo {
 
 // Hardcoded resource IDs.
-const ResourceId resourceIdLocalDB =
-    ResourceId(RESOURCE_DATABASE, DatabaseName(boost::none, "local"));
-const ResourceId resourceIdAdminDB =
-    ResourceId(RESOURCE_DATABASE, DatabaseName(boost::none, "admin"));
+const ResourceId resourceIdLocalDB = ResourceId(RESOURCE_DATABASE, DatabaseName::kLocal);
+const ResourceId resourceIdAdminDB = ResourceId(RESOURCE_DATABASE, DatabaseName::kAdmin);
 const ResourceId resourceIdGlobal =
     ResourceId(RESOURCE_GLOBAL, static_cast<uint8_t>(ResourceGlobalId::kGlobal));
 const ResourceId resourceIdParallelBatchWriterMode =
@@ -44,5 +44,19 @@ const ResourceId resourceIdFeatureCompatibilityVersion = ResourceId(
     RESOURCE_GLOBAL, static_cast<uint8_t>(ResourceGlobalId::kFeatureCompatibilityVersion));
 const ResourceId resourceIdReplicationStateTransitionLock = ResourceId(
     RESOURCE_GLOBAL, static_cast<uint8_t>(ResourceGlobalId::kReplicationStateTransitionLock));
+
+std::string ResourceId::toString() const {
+    StringBuilder ss;
+    ss << "{" << _fullHash << ": " << resourceTypeName(getType()) << ", " << getHashId();
+    if (getType() == RESOURCE_DATABASE || getType() == RESOURCE_COLLECTION ||
+        getType() == RESOURCE_MUTEX) {
+        if (auto resourceName = ResourceCatalog::get().name(*this)) {
+            ss << ", " << *resourceName;
+        }
+    }
+    ss << "}";
+
+    return ss.str();
+}
 
 }  // namespace mongo

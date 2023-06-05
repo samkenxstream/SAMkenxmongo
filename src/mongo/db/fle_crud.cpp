@@ -49,7 +49,7 @@
 #include "mongo/db/ops/write_ops_gen.h"
 #include "mongo/db/ops/write_ops_parsers.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
-#include "mongo/db/query/find_command_gen.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/query/fle/server_rewrite.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/service_context.h"
@@ -186,6 +186,32 @@ std::vector<QECountInfoRequestTokenSet> toTagSets(
     return nestedBlocks;
 }
 
+FLEEdgeCountInfo convertTokensToEdgeCount(const QECountInfoReplyTokens& token) {
+
+    auto edc = token.getEDCDerivedFromDataTokenAndContentionFactorToken().map([](auto& t) {
+        return FLETokenFromCDR<FLETokenType::EDCDerivedFromDataTokenAndContentionFactorToken>(t);
+    });
+
+    auto spos = token.getSearchedPositions().map([](auto& pair) {
+        EmuBinaryResult newPair;
+        newPair.cpos = pair.getCpos();
+        newPair.apos = pair.getApos();
+        return newPair;
+    });
+
+    auto npos = token.getNullAnchorPositions().map([](auto& pair) {
+        ESCCountsPair newPair;
+        newPair.cpos = pair.getCpos();
+        newPair.apos = pair.getApos();
+        return newPair;
+    });
+
+    auto esc =
+        FLETokenFromCDR<FLETokenType::ESCTwiceDerivedTagToken>(token.getESCTwiceDerivedTagToken());
+
+    return FLEEdgeCountInfo(token.getCount(), esc, spos, npos, token.getStats(), edc);
+}
+
 std::vector<std::vector<FLEEdgeCountInfo>> toEdgeCounts(
     const std::vector<QECountInfoReplyTokenSet>& tupleSet) {
 
@@ -200,16 +226,7 @@ std::vector<std::vector<FLEEdgeCountInfo>> toEdgeCounts(
         blocks.reserve(tuples.size());
 
         for (auto& tuple : tuples) {
-            blocks.emplace_back(tuple.getCount(),
-                                FLETokenFromCDR<FLETokenType::ESCTwiceDerivedTagToken>(
-                                    tuple.getESCTwiceDerivedTagToken()));
-            auto& p = blocks.back();
-
-            if (tuple.getEDCDerivedFromDataTokenAndContentionFactorToken().has_value()) {
-                p.edc =
-                    FLETokenFromCDR<FLETokenType::EDCDerivedFromDataTokenAndContentionFactorToken>(
-                        tuple.getEDCDerivedFromDataTokenAndContentionFactorToken().value());
-            }
+            blocks.emplace_back(convertTokensToEdgeCount(tuple));
         }
 
         nestedBlocks.emplace_back(std::move(blocks));
@@ -223,12 +240,12 @@ std::vector<std::vector<FLEEdgeCountInfo>> toEdgeCounts(
 std::shared_ptr<txn_api::SyncTransactionWithRetries> getTransactionWithRetriesForMongoS(
     OperationContext* opCtx) {
 
+    auto& executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
     auto fleInlineCrudExecutor = std::make_shared<executor::InlineExecutor>();
 
     return std::make_shared<txn_api::SyncTransactionWithRetries>(
         opCtx,
-        fleInlineCrudExecutor->getSleepableExecutor(
-            Grid::get(opCtx)->getExecutorPool()->getFixedExecutor()),
+        executor,
         TransactionRouterResourceYielder::makeForLocalHandoff(),
         fleInlineCrudExecutor);
 }
@@ -388,7 +405,7 @@ std::pair<FLEBatchResult, write_ops::InsertCommandReply> processInsert(
     uint32_t numDocs = 0;
     write_ops::WriteCommandReplyBase writeBase;
 
-    // TODO: Remove with SERVER-73714
+    // This is an optimization for single-document unencrypted inserts.
     if (documents.size() == 1) {
         auto serverPayload = EDCServerCollection::getEncryptedFieldInfo(documents[0]);
         if (serverPayload.size() == 0) {
@@ -889,10 +906,6 @@ write_ops::DeleteCommandReply processDelete(FLEQueryInterface* queryImpl,
 
     auto efc = EncryptionInformationHelpers::getAndValidateSchema(edcNss, ei);
 
-    if (ei.getDeleteTokens().has_value()) {
-        uasserted(7293102, "Illegal delete tokens encountered in EncryptionInformation");
-    }
-
     int32_t stmtId = getStmtIdForWriteAt(deleteRequest, 0);
 
     auto newDeleteRequest = deleteRequest;
@@ -950,10 +963,6 @@ write_ops::UpdateCommandReply processUpdate(FLEQueryInterface* queryImpl,
     auto ei = updateRequest.getEncryptionInformation().value();
 
     auto efc = EncryptionInformationHelpers::getAndValidateSchema(edcNss, ei);
-
-    if (ei.getDeleteTokens().has_value()) {
-        uasserted(7293201, "Illegal delete tokens encountered in EncryptionInformation");
-    }
 
     const auto updateOpEntry = updateRequest.getUpdates()[0];
 
@@ -1211,10 +1220,6 @@ write_ops::FindAndModifyCommandReply processFindAndModify(
 
     auto efc = EncryptionInformationHelpers::getAndValidateSchema(edcNss, ei);
 
-    if (ei.getDeleteTokens().has_value()) {
-        uasserted(7293301, "Illegal delete tokens encountered in EncryptionInformation");
-    }
-
     int32_t stmtId = findAndModifyRequest.getStmtId().value_or(0);
 
     auto newFindAndModifyRequest = findAndModifyRequest;
@@ -1451,6 +1456,13 @@ BSONObj FLEQueryInterfaceImpl::getById(const NamespaceString& nss, BSONElement e
 uint64_t FLEQueryInterfaceImpl::countDocuments(const NamespaceString& nss) {
     // Since count() does not work in a transaction, call count() by bypassing the transaction api
     auto client = _serviceContext->makeClient("SEP-int-fle-crud");
+
+    // TODO(SERVER-74660): Please revisit if this thread could be made killable.
+    {
+        stdx::lock_guard<Client> lk(*client.get());
+        client.get()->setSystemOperationUnkillableByStepdown(lk);
+    }
+
     AlternativeClientRegion clientRegion(client);
     auto opCtx = cc().makeOperationContext();
     auto as = AuthorizationSession::get(cc());
@@ -1479,6 +1491,21 @@ uint64_t FLEQueryInterfaceImpl::countDocuments(const NamespaceString& nss) {
     return static_cast<uint64_t>(signedDocCount);
 }
 
+QECountInfoQueryTypeEnum queryTypeTranslation(FLEQueryInterface::TagQueryType type) {
+    switch (type) {
+        case FLEQueryInterface::TagQueryType::kInsert:
+            return QECountInfoQueryTypeEnum::Insert;
+        case FLEQueryInterface::TagQueryType::kQuery:
+            return QECountInfoQueryTypeEnum::Query;
+        case FLEQueryInterface::TagQueryType::kCompact:
+            return QECountInfoQueryTypeEnum::Compact;
+        case FLEQueryInterface::TagQueryType::kCleanup:
+            return QECountInfoQueryTypeEnum::Cleanup;
+        default:
+            uasserted(7517101, "Invalid TagQueryType value.");
+    }
+}
+
 std::vector<std::vector<FLEEdgeCountInfo>> FLEQueryInterfaceImpl::getTags(
     const NamespaceString& nss,
     const std::vector<std::vector<FLEEdgePrfBlock>>& tokensSets,
@@ -1492,9 +1519,9 @@ std::vector<std::vector<FLEEdgeCountInfo>> FLEQueryInterfaceImpl::getTags(
     }
 
     getCountsCmd.setTokens(toTagSets(tokensSets));
-    getCountsCmd.setForInsert(type == FLEQueryInterface::TagQueryType::kInsert);
+    getCountsCmd.setQueryType(queryTypeTranslation(type));
 
-    auto response = _txnClient.runCommandSync(nss.db(), getCountsCmd.toBSON({}));
+    auto response = _txnClient.runCommandSync(nss.dbName(), getCountsCmd.toBSON({}));
 
     auto status = getStatusFromWriteCommandReply(response);
     uassertStatusOK(status);
@@ -1768,12 +1795,19 @@ uint64_t FLETagNoTXNQuery::countDocuments(const NamespaceString& nss) {
 std::vector<std::vector<FLEEdgeCountInfo>> FLETagNoTXNQuery::getTags(
     const NamespaceString& nss,
     const std::vector<std::vector<FLEEdgePrfBlock>>& tokensSets,
-    TagQueryType type) {
+    FLEQueryInterface::TagQueryType type) {
 
     invariant(!_opCtx->inMultiDocumentTransaction());
 
     // Pop off the current op context so we can get a fresh set of read concern settings
     auto client = _opCtx->getServiceContext()->makeClient("FLETagNoTXNQuery");
+
+    // TODO(SERVER-74660): Please revisit if this thread could be made killable.
+    {
+        stdx::lock_guard<Client> lk(*client.get());
+        client.get()->setSystemOperationUnkillableByStepdown(lk);
+    }
+
     AlternativeClientRegion clientRegion(client);
     auto opCtx = cc().makeOperationContext();
     auto as = AuthorizationSession::get(cc());
@@ -1787,7 +1821,7 @@ std::vector<std::vector<FLEEdgeCountInfo>> FLETagNoTXNQuery::getTags(
     }
 
     getCountsCmd.setTokens(toTagSets(tokensSets));
-    getCountsCmd.setForInsert(type == FLEQueryInterface::TagQueryType::kInsert);
+    getCountsCmd.setQueryType(queryTypeTranslation(type));
 
     DBDirectClient directClient(opCtx.get());
 

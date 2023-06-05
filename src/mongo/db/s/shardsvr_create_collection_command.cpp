@@ -59,22 +59,18 @@ void translateToTimeseriesCollection(OperationContext* opCtx,
     // If the 'system.buckets' exists or 'timeseries' parameters are passed in, we know that
     // we are trying shard a timeseries collection.
     if (bucketsColl || createCmdRequest->getTimeseries()) {
-        uassert(5731502,
-                "Sharding a timeseries collection feature is not enabled",
-                feature_flags::gFeatureFlagShardedTimeSeries.isEnabled(
-                    serverGlobalParams.featureCompatibility));
 
         if (bucketsColl) {
             uassert(6235600,
-                    str::stream() << "the collection '" << bucketsNs
+                    str::stream() << "the collection '" << bucketsNs.toStringForErrorMsg()
                                   << "' does not have 'timeseries' options",
                     bucketsColl->getTimeseriesOptions());
 
             if (createCmdRequest->getTimeseries()) {
                 uassert(6235601,
                         str::stream()
-                            << "the 'timeseries' spec provided must match that of exists '" << nss
-                            << "' collection",
+                            << "the 'timeseries' spec provided must match that of the existing '"
+                            << nss->toStringForErrorMsg() << "' collection",
                         timeseries::optionsAreEqual(*createCmdRequest->getTimeseries(),
                                                     *bucketsColl->getTimeseriesOptions()));
             } else {

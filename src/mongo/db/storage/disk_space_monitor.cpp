@@ -33,10 +33,9 @@
 
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status_metric.h"
-#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/disk_space_util.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/logv2/log.h"
-#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
@@ -44,31 +43,10 @@ CounterMetric monitorPasses("diskSpaceMonitor.passes");
 CounterMetric tookAction("diskSpaceMonitor.tookAction");
 
 namespace {
-MONGO_FAIL_POINT_DEFINE(simulateAvailableDiskSpace);
-
 static const auto _decoration = ServiceContext::declareDecoration<DiskSpaceMonitor>();
-int64_t getAvailableDiskSpaceBytes(const std::string& path) {
-    boost::filesystem::path fsPath(path);
-    boost::system::error_code ec;
-    boost::filesystem::space_info spaceInfo = boost::filesystem::space(fsPath, ec);
-    if (ec) {
-        LOGV2(7333403,
-              "Failed to query filesystem disk stats",
-              "error"_attr = ec.message(),
-              "errorCode"_attr = ec.value());
-        // We don't want callers to take any action if we can't collect stats.
-        return std::numeric_limits<int64_t>::max();
-    }
-    return static_cast<int64_t>(spaceInfo.available);
-}
 }  // namespace
 
 void DiskSpaceMonitor::start(ServiceContext* svcCtx) {
-    // (Ignore FCV check): This feature flag doesn't have any upgrade/downgrade concerns.
-    if (!feature_flags::gIndexBuildGracefulErrorHandling.isEnabledAndIgnoreFCVUnsafe()) {
-        return;
-    }
-
     auto storageEngine = svcCtx->getStorageEngine();
     const bool filesNotAllInSameDirectory =
         storageEngine->isUsingDirectoryPerDb() || storageEngine->isUsingDirectoryForIndexes();
@@ -93,8 +71,13 @@ DiskSpaceMonitor* DiskSpaceMonitor::get(ServiceContext* svcCtx) {
 void DiskSpaceMonitor::_start(ServiceContext* svcCtx) {
     LOGV2(7333401, "Starting the DiskSpaceMonitor");
     invariant(!_job, "DiskSpaceMonitor is already started");
+    _dbpath = storageGlobalParams.dbpath;
     _job = svcCtx->getPeriodicRunner()->makeJob(PeriodicRunner::PeriodicJob{
-        "DiskSpaceMonitor", [this](Client* client) { _run(client); }, Seconds(1)});
+        "DiskSpaceMonitor",
+        [this](Client* client) { _run(client); },
+        Seconds(1),
+        // TODO(SERVER-74657): Please revisit if this periodic job could be made killable.
+        false /*isKillableByStepdown*/});
     _job.start();
 }
 
@@ -125,12 +108,7 @@ void DiskSpaceMonitor::takeAction(OperationContext* opCtx, int64_t availableByte
 void DiskSpaceMonitor::_run(Client* client) try {
     auto opCtx = client->makeOperationContext();
 
-    const auto availableBytes = []() {
-        if (auto fp = simulateAvailableDiskSpace.scoped(); fp.isActive()) {
-            return static_cast<int64_t>(fp.getData()["bytes"].numberLong());
-        }
-        return getAvailableDiskSpaceBytes(storageGlobalParams.dbpath);
-    }();
+    const auto availableBytes = getAvailableDiskSpaceBytesInDbPath(_dbpath);
     LOGV2_DEBUG(7333405, 2, "Available disk space", "bytes"_attr = availableBytes);
     takeAction(opCtx.get(), availableBytes);
     monitorPasses.increment();

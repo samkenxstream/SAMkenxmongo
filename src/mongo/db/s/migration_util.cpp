@@ -171,7 +171,7 @@ void sendWriteCommandToRecipient(OperationContext* opCtx,
     auto response = recipientShard->runCommandWithFixedRetryAttempts(
         opCtx,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-        cmd.getDbName().toString(),
+        DatabaseNameUtil::serialize(cmd.getDbName()),
         cmdBSON,
         Shard::RetryPolicy::kIdempotent);
 
@@ -220,12 +220,6 @@ void retryIdempotentWorkAsPrimaryUntilSuccessOrStepdown(
 
         try {
             auto newClient = opCtx->getServiceContext()->makeClient(newClientName);
-
-            {
-                stdx::lock_guard<Client> lk(*newClient.get());
-                newClient->setSystemOperationKillableByStepdown(lk);
-            }
-
             auto newOpCtx = newClient->makeOperationContext();
             AlternativeClientRegion altClient(newClient);
 
@@ -342,7 +336,7 @@ BSONObjBuilder _makeMigrationStatusDocumentCommon(const NamespaceString& nss,
     builder.append(kDestinationShard, toShard.toString());
     builder.append(kIsDonorShard, isDonorShard);
     builder.append(kChunk, BSON(ChunkType::min(min) << ChunkType::max(max)));
-    builder.append(kCollection, nss.ns());
+    builder.append(kCollection, NamespaceStringUtil::serialize(nss));
     return builder;
 }
 
@@ -445,217 +439,6 @@ bool deletionTaskUuidMatchesFilteringMetadataUuid(
         optCollDescr->uuidMatches(deletionTask.getCollectionUuid());
 }
 
-ExecutorFuture<void> cleanUpRange(ServiceContext* serviceContext,
-                                  const std::shared_ptr<executor::ThreadPoolTaskExecutor>& executor,
-                                  const RangeDeletionTask& deletionTask) {
-    return AsyncTry([=]() mutable {
-               ThreadClient tc(kRangeDeletionThreadName, serviceContext);
-               {
-                   stdx::lock_guard<Client> lk(*tc.get());
-                   tc->setSystemOperationKillableByStepdown(lk);
-               }
-               auto uniqueOpCtx = tc->makeOperationContext();
-               auto opCtx = uniqueOpCtx.get();
-               opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
-
-               const auto dbName = deletionTask.getNss().dbName();
-               const auto collectionUuid = deletionTask.getCollectionUuid();
-
-               while (true) {
-                   boost::optional<NamespaceString> optNss;
-                   try {
-                       // Holding the locks while enqueueing the task protects against possible
-                       // concurrent cleanups of the filtering metadata, that be serialized
-                       AutoGetCollection autoColl(
-                           opCtx, NamespaceStringOrUUID{dbName, collectionUuid}, MODE_IS);
-                       optNss.emplace(autoColl.getNss());
-                       auto scopedCsr =
-                           CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(
-                               opCtx, *optNss);
-                       auto optCollDescr = scopedCsr->getCurrentMetadataIfKnown();
-
-                       if (optCollDescr) {
-                           uassert(ErrorCodes::
-                                       RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist,
-                                   str::stream() << "Filtering metadata for " << *optNss
-                                                 << (optCollDescr->isSharded()
-                                                         ? " has UUID that does not match UUID of "
-                                                           "the deletion task"
-                                                         : " is unsharded"),
-                                   deletionTaskUuidMatchesFilteringMetadataUuid(
-                                       opCtx, optCollDescr, deletionTask));
-
-                           LOGV2(6955500,
-                                 "Submitting range deletion task",
-                                 "deletionTask"_attr = redact(deletionTask.toBSON()));
-
-                           const auto whenToClean =
-                               deletionTask.getWhenToClean() == CleanWhenEnum::kNow
-                               ? CollectionShardingRuntime::kNow
-                               : CollectionShardingRuntime::kDelayed;
-
-                           return scopedCsr->cleanUpRange(deletionTask.getRange(), whenToClean);
-                       }
-                   } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-                       uasserted(
-                           ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist,
-                           str::stream() << "Collection has been dropped since enqueuing this "
-                                            "range deletion task: "
-                                         << deletionTask.toBSON());
-                   }
-
-
-                   refreshFilteringMetadataUntilSuccess(opCtx, *optNss);
-               }
-           })
-        .until([](Status status) mutable {
-            // Resubmit the range for deletion on a RangeOverlapConflict error.
-            return status != ErrorCodes::RangeOverlapConflict;
-        })
-        .withBackoffBetweenIterations(kExponentialBackoff)
-        .on(executor, CancellationToken::uncancelable());
-}
-
-ExecutorFuture<void> submitRangeDeletionTask(OperationContext* opCtx,
-                                             const RangeDeletionTask& deletionTask) {
-    const auto serviceContext = opCtx->getServiceContext();
-    auto executor = getMigrationUtilExecutor(serviceContext);
-    return ExecutorFuture<void>(executor)
-        .then([=] {
-            ThreadClient tc(kRangeDeletionThreadName, serviceContext);
-            {
-                stdx::lock_guard<Client> lk(*tc.get());
-                tc->setSystemOperationKillableByStepdown(lk);
-            }
-
-            uassert(
-                ErrorCodes::ResumableRangeDeleterDisabled,
-                str::stream()
-                    << "Not submitting range deletion task " << redact(deletionTask.toBSON())
-                    << " because the disableResumableRangeDeleter server parameter is set to true",
-                !disableResumableRangeDeleter.load());
-
-            return AsyncTry([=]() {
-                       return cleanUpRange(serviceContext, executor, deletionTask)
-                           .onError<ErrorCodes::KeyPatternShorterThanBound>([=](Status status) {
-                               ThreadClient tc(kRangeDeletionThreadName, serviceContext);
-                               {
-                                   stdx::lock_guard<Client> lk(*tc.get());
-                                   tc->setSystemOperationKillableByStepdown(lk);
-                               }
-                               auto uniqueOpCtx = tc->makeOperationContext();
-                               uniqueOpCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
-
-                               LOGV2(55557,
-                                     "cleanUpRange failed due to keyPattern shorter than range "
-                                     "deletion bounds. Refreshing collection metadata to retry.",
-                                     logAttrs(deletionTask.getNss()),
-                                     "status"_attr = redact(status));
-
-                               onCollectionPlacementVersionMismatch(
-                                   uniqueOpCtx.get(), deletionTask.getNss(), boost::none);
-
-                               return status;
-                           });
-                   })
-                .until(
-                    [](Status status) { return status != ErrorCodes::KeyPatternShorterThanBound; })
-                .on(executor, CancellationToken::uncancelable());
-        })
-        .onError([=](const Status status) {
-            ThreadClient tc(kRangeDeletionThreadName, serviceContext);
-            {
-                stdx::lock_guard<Client> lk(*tc.get());
-                tc->setSystemOperationKillableByStepdown(lk);
-            }
-            auto uniqueOpCtx = tc->makeOperationContext();
-            auto opCtx = uniqueOpCtx.get();
-
-            LOGV2(22027,
-                  "Failed to submit range deletion task",
-                  "deletionTask"_attr = redact(deletionTask.toBSON()),
-                  "error"_attr = redact(status),
-                  "migrationId"_attr = deletionTask.getId());
-
-            if (status == ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist) {
-                deleteRangeDeletionTaskLocally(opCtx,
-                                               deletionTask.getCollectionUuid(),
-                                               deletionTask.getRange(),
-                                               ShardingCatalogClient::kLocalWriteConcern);
-            }
-
-            // Note, we use onError and make it return its input status, because ExecutorFuture does
-            // not support tapError.
-            return status;
-        });
-}
-
-void submitPendingDeletions(OperationContext* opCtx) {
-    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
-
-    auto query = BSON("pending" << BSON("$exists" << false));
-
-    store.forEach(opCtx, query, [&opCtx](const RangeDeletionTask& deletionTask) {
-        migrationutil::submitRangeDeletionTask(opCtx, deletionTask).getAsync([](auto) {});
-        return true;
-    });
-}
-
-void resubmitRangeDeletionsOnStepUp(ServiceContext* serviceContext) {
-    LOGV2(22028, "Starting pending deletion submission thread.");
-
-    ExecutorFuture<void>(getMigrationUtilExecutor(serviceContext))
-        .then([serviceContext] {
-            ThreadClient tc("ResubmitRangeDeletions", serviceContext);
-            {
-                stdx::lock_guard<Client> lk(*tc.get());
-                tc->setSystemOperationKillableByStepdown(lk);
-            }
-
-            auto opCtx = tc->makeOperationContext();
-            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
-
-            DBDirectClient client(opCtx.get());
-            FindCommandRequest findCommand(NamespaceString::kRangeDeletionNamespace);
-            findCommand.setFilter(BSON(RangeDeletionTask::kProcessingFieldName << true));
-            auto cursor = client.find(std::move(findCommand));
-
-            auto retFuture = ExecutorFuture<void>(getMigrationUtilExecutor(serviceContext));
-
-            int rangeDeletionsMarkedAsProcessing = 0;
-            while (cursor->more()) {
-                retFuture = migrationutil::submitRangeDeletionTask(
-                    opCtx.get(),
-                    RangeDeletionTask::parse(IDLParserContext("rangeDeletionRecovery"),
-                                             cursor->next()));
-                rangeDeletionsMarkedAsProcessing++;
-            }
-
-            if (rangeDeletionsMarkedAsProcessing > 1) {
-                LOGV2_WARNING(
-                    6695800,
-                    "Rescheduling several range deletions marked as processing. Orphans count "
-                    "may be off while they are not drained",
-                    "numRangeDeletionsMarkedAsProcessing"_attr = rangeDeletionsMarkedAsProcessing);
-            }
-
-            return retFuture;
-        })
-        .then([serviceContext] {
-            ThreadClient tc("ResubmitRangeDeletions", serviceContext);
-            {
-                stdx::lock_guard<Client> lk(*tc.get());
-                tc->setSystemOperationKillableByStepdown(lk);
-            }
-
-            auto opCtx = tc->makeOperationContext();
-            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
-
-            submitPendingDeletions(opCtx.get());
-        })
-        .getAsync([](auto) {});
-}
-
 void persistMigrationCoordinatorLocally(OperationContext* opCtx,
                                         const MigrationCoordinatorDocument& migrationDoc) {
     PersistentTaskStore<MigrationCoordinatorDocument> store(
@@ -745,28 +528,27 @@ void notifyChangeStreamsOnRecipientFirstChunk(OperationContext* opCtx,
 
     // The message expected by change streams
     const auto o2Message =
-        BSON("migrateChunkToNewShard" << collNss.toString() << "fromShardId" << fromShardId
-                                      << "toShardId" << toShardId);
+        BSON("migrateChunkToNewShard" << NamespaceStringUtil::serialize(collNss) << "fromShardId"
+                                      << fromShardId << "toShardId" << toShardId);
 
     auto const serviceContext = opCtx->getClient()->getServiceContext();
 
     // TODO (SERVER-71444): Fix to be interruptible or document exception.
     UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
     AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
-    writeConflictRetry(
-        opCtx, "migrateChunkToNewShard", NamespaceString::kRsOplogNamespace.ns(), [&] {
-            WriteUnitOfWork uow(opCtx);
-            serviceContext->getOpObserver()->onInternalOpMessage(opCtx,
-                                                                 collNss,
-                                                                 *collUUID,
-                                                                 BSON("msg" << dbgMessage),
-                                                                 o2Message,
-                                                                 boost::none,
-                                                                 boost::none,
-                                                                 boost::none,
-                                                                 boost::none);
-            uow.commit();
-        });
+    writeConflictRetry(opCtx, "migrateChunkToNewShard", NamespaceString::kRsOplogNamespace, [&] {
+        WriteUnitOfWork uow(opCtx);
+        serviceContext->getOpObserver()->onInternalOpMessage(opCtx,
+                                                             collNss,
+                                                             *collUUID,
+                                                             BSON("msg" << dbgMessage),
+                                                             o2Message,
+                                                             boost::none,
+                                                             boost::none,
+                                                             boost::none,
+                                                             boost::none);
+        uow.commit();
+    });
 }
 
 void notifyChangeStreamsOnDonorLastChunk(OperationContext* opCtx,
@@ -775,31 +557,32 @@ void notifyChangeStreamsOnDonorLastChunk(OperationContext* opCtx,
                                          boost::optional<UUID> collUUID) {
 
     const std::string oMessage = str::stream()
-        << "Migrate the last chunk for " << collNss << " off shard " << donorShardId;
+        << "Migrate the last chunk for " << collNss.toStringForErrorMsg() << " off shard "
+        << donorShardId;
 
     // The message expected by change streams
     const auto o2Message =
-        BSON("migrateLastChunkFromShard" << collNss.toString() << "shardId" << donorShardId);
+        BSON("migrateLastChunkFromShard" << NamespaceStringUtil::serialize(collNss) << "shardId"
+                                         << donorShardId);
 
     auto const serviceContext = opCtx->getClient()->getServiceContext();
 
     // TODO (SERVER-71444): Fix to be interruptible or document exception.
     UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
     AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
-    writeConflictRetry(
-        opCtx, "migrateLastChunkFromShard", NamespaceString::kRsOplogNamespace.ns(), [&] {
-            WriteUnitOfWork uow(opCtx);
-            serviceContext->getOpObserver()->onInternalOpMessage(opCtx,
-                                                                 collNss,
-                                                                 *collUUID,
-                                                                 BSON("msg" << oMessage),
-                                                                 o2Message,
-                                                                 boost::none,
-                                                                 boost::none,
-                                                                 boost::none,
-                                                                 boost::none);
-            uow.commit();
-        });
+    writeConflictRetry(opCtx, "migrateLastChunkFromShard", NamespaceString::kRsOplogNamespace, [&] {
+        WriteUnitOfWork uow(opCtx);
+        serviceContext->getOpObserver()->onInternalOpMessage(opCtx,
+                                                             collNss,
+                                                             *collUUID,
+                                                             BSON("msg" << oMessage),
+                                                             o2Message,
+                                                             boost::none,
+                                                             boost::none,
+                                                             boost::none,
+                                                             boost::none);
+        uow.commit();
+    });
 }
 
 void persistCommitDecision(OperationContext* opCtx,
@@ -814,6 +597,7 @@ void persistCommitDecision(OperationContext* opCtx,
         store.update(opCtx,
                      BSON(MigrationCoordinatorDocument::kIdFieldName << migrationDoc.getId()),
                      migrationDoc.toBSON());
+        ShardingStatistics::get(opCtx).countDonorMoveChunkCommitted.addAndFetch(1);
     } catch (const ExceptionFor<ErrorCodes::NoMatchingDocument>&) {
         LOGV2_ERROR(6439800,
                     "No coordination doc found on disk for migration",
@@ -837,6 +621,7 @@ void persistAbortDecision(OperationContext* opCtx,
         store.update(opCtx,
                      BSON(MigrationCoordinatorDocument::kIdFieldName << migrationDoc.getId()),
                      migrationDoc.toBSON());
+        ShardingStatistics::get(opCtx).countDonorMoveChunkAborted.addAndFetch(1);
     } catch (const ExceptionFor<ErrorCodes::NoMatchingDocument>&) {
         LOGV2(6439801,
               "No coordination doc found on disk for migration",
@@ -1042,7 +827,7 @@ void recoverMigrationCoordinations(OperationContext* opCtx,
         NamespaceString::kMigrationCoordinatorsNamespace);
     store.forEach(
         opCtx,
-        BSON(MigrationCoordinatorDocument::kNssFieldName << nss.toString()),
+        BSON(MigrationCoordinatorDocument::kNssFieldName << NamespaceStringUtil::serialize(nss)),
         [&opCtx, &nss, &migrationRecoveryCount, &cancellationToken](
             const MigrationCoordinatorDocument& doc) {
             LOGV2_DEBUG(4798502,
@@ -1054,7 +839,7 @@ void recoverMigrationCoordinations(OperationContext* opCtx,
             // namespace.
             invariant(++migrationRecoveryCount == 1,
                       str::stream() << "Found more then one migration to recover for namespace '"
-                                    << nss << "'");
+                                    << nss.toStringForErrorMsg() << "'");
 
             // Create a MigrationCoordinator to complete the coordination.
             MigrationCoordinator coordinator(doc);
@@ -1124,13 +909,12 @@ void recoverMigrationCoordinations(OperationContext* opCtx,
                           "coordinatorDocumentUUID"_attr = doc.getCollectionUuid());
                 }
 
-                // TODO SERVER-71918 once the drop collection coordinator starts persisting the
-                // config time we can remove this. Since the collection has been dropped,
-                // persist config time inclusive of the drop collection event before deleting
-                // leftover migration metadata.
-                // This will ensure that in case of stepdown the new
-                // primary won't read stale data from config server and think that the sharded
-                // collection still exists.
+                // TODO SERVER-77472: remove this once we are sure all operations persist the config
+                // time after a collection drop. Since the collection has been dropped, persist
+                // config time inclusive of the drop collection event before deleting leftover
+                // migration metadata. This will ensure that in case of stepdown the new primary
+                // won't read stale data from config server and think that the sharded collection
+                // still exists.
                 VectorClockMutable::get(opCtx)->waitForDurableConfigTime().get(opCtx);
 
                 deleteRangeDeletionTaskOnRecipient(opCtx,
@@ -1175,10 +959,6 @@ ExecutorFuture<void> launchReleaseCriticalSectionOnRecipientFuture(
 
     return ExecutorFuture<void>(executor).then([=] {
         ThreadClient tc("releaseRecipientCritSec", serviceContext);
-        {
-            stdx::lock_guard<Client> lk(*tc.get());
-            tc->setSystemOperationKillableByStepdown(lk);
-        }
         auto uniqueOpCtx = tc->makeOperationContext();
         auto opCtx = uniqueOpCtx.get();
 
@@ -1186,7 +966,7 @@ ExecutorFuture<void> launchReleaseCriticalSectionOnRecipientFuture(
             uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, recipientShardId));
 
         BSONObjBuilder builder;
-        builder.append("_recvChunkReleaseCritSec", nss.ns());
+        builder.append("_recvChunkReleaseCritSec", NamespaceStringUtil::serialize(nss));
         sessionId.append(&builder);
         const auto commandObj = CommandHelpers::appendMajorityWriteConcern(builder.obj());
 
@@ -1316,10 +1096,6 @@ void asyncRecoverMigrationUntilSuccessOrStepDown(OperationContext* opCtx,
     ExecutorFuture<void>{Grid::get(opCtx)->getExecutorPool()->getFixedExecutor()}
         .then([svcCtx{opCtx->getServiceContext()}, nss] {
             ThreadClient tc{"MigrationRecovery", svcCtx};
-            {
-                stdx::lock_guard<Client> lk{*tc.get()};
-                tc->setSystemOperationKillableByStepdown(lk);
-            }
             auto uniqueOpCtx{tc->makeOperationContext()};
             auto opCtx{uniqueOpCtx.get()};
 

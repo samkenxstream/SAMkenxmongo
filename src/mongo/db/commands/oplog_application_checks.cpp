@@ -93,7 +93,7 @@ Status OplogApplicationChecks::checkOperationAuthorization(OperationContext* opC
             // renameCollection commands must be run on the 'admin' database. Its arguments are
             // fully qualified namespaces. Catalog internals don't know the op produced by running
             // renameCollection was originally run on 'admin', so we must restore this.
-            dbNameForAuthCheck = DatabaseName(nss.tenantId(), "admin");
+            dbNameForAuthCheck = DatabaseNameUtil::deserialize(nss.tenantId(), "admin");
         }
 
         // TODO reuse the parse result for when we run() later. Note that when running,
@@ -229,7 +229,7 @@ Status OplogApplicationChecks::checkAuthForOperation(OperationContext* opCtx,
 
     if (validity == OplogApplicationValidity::kNeedsSuperuser) {
         std::vector<Privilege> universalPrivileges;
-        auth::generateUniversalPrivileges(&universalPrivileges);
+        auth::generateUniversalPrivileges(&universalPrivileges, dbName.tenantId());
         if (!authSession->isAuthorizedForPrivileges(universalPrivileges)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }

@@ -3,6 +3,10 @@
 
 load('jstests/libs/feature_flag_util.js');
 
+function collectionExists(shard, dbName, collName) {
+    return Array.contains(shard.getDB(dbName).getCollectionNames(), collName);
+}
+
 var st = new ShardingTest({mongos: 1, shards: 2});
 
 var mongos = st.s0;
@@ -106,10 +110,8 @@ jsTest.log('Test that only unsharded collections are moved');
     }
 }
 
-// TODO (SERVER-71309): Remove once 7.0 becomes last LTS.
-if (FeatureFlagUtil.isPresentAndEnabled(config.admin, 'ResilientMovePrimary')) {
-    jsTest.log('Test that orphaned documents on recipient causes the operation to fail');
-
+jsTest.log('Test that orphaned documents on recipient causes the operation to fail');
+{
     // Insert an orphaned document on shard1.
     assert.commandWorked(shard1.getCollection(coll1NS).insertOne({name: 'Emma'}));
 
@@ -120,19 +122,36 @@ if (FeatureFlagUtil.isPresentAndEnabled(config.admin, 'ResilientMovePrimary')) {
     assert.commandFailedWithCode(mongos.adminCommand({movePrimary: dbName, to: shard1.shardName}),
                                  ErrorCodes.NamespaceExists);
 
-    // The documents are still on both the shards.
-    assert.eq(2, shard0.getCollection(coll1NS).find().itcount());
-    assert.eq(1, shard1.getCollection(coll1NS).find().itcount());
+    const expectDropOnFailure =
+        FeatureFlagUtil.isPresentAndEnabled(config.admin, 'OnlineMovePrimaryLifecycle');
 
-    // Remove the orphaned document on shard1 leaving an empty collection.
-    assert.commandWorked(shard1.getCollection(coll1NS).remove({name: 'Emma'}));
-    assert.eq(0, shard1.getCollection(coll1NS).find().itcount());
+    if (expectDropOnFailure) {
+        // The orphaned collection on shard1 should have been dropped due to the previous failure.
+        assert.eq(2, shard0.getCollection(coll1NS).find().itcount());
+        assert(!collectionExists(shard1, dbName, coll1Name));
+
+        // Create another empty collection.
+        shard1.getDB(dbName).createCollection(coll1Name);
+    } else {
+        // The documents are on both the shards.
+        assert.eq(2, shard0.getCollection(coll1NS).find().itcount());
+        assert.eq(1, shard1.getCollection(coll1NS).find().itcount());
+
+        // Remove the orphaned document on shard1 leaving an empty collection.
+        assert.commandWorked(shard1.getCollection(coll1NS).remove({name: 'Emma'}));
+        assert.eq(0, shard1.getCollection(coll1NS).find().itcount());
+    }
 
     assert.commandFailedWithCode(mongos.adminCommand({movePrimary: dbName, to: shard1.shardName}),
                                  ErrorCodes.NamespaceExists);
 
-    // Drop the orphaned collection on shard1.
-    shard1.getCollection(coll1NS).drop();
+    if (expectDropOnFailure) {
+        // The orphaned collection on shard1 should have been dropped due to the previous failure.
+        assert(!collectionExists(shard1, dbName, coll1Name));
+    } else {
+        // Drop the orphaned collection on shard1.
+        shard1.getCollection(coll1NS).drop();
+    }
 }
 
 jsTest.log('Test that metadata has changed');

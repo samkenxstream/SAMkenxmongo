@@ -65,10 +65,6 @@ var $config = (function() {
                 ]);
         },
         movePrimary: function(db, collName, connCache) {
-            if (this.skipMovePrimary) {
-                return;
-            }
-
             db = getRandomDb(db);
             const shardId = getRandomShard(connCache);
 
@@ -77,7 +73,10 @@ var $config = (function() {
                 db.adminCommand({movePrimary: db.getName(), to: shardId}), [
                     ErrorCodes.ConflictingOperationInProgress,
                     // The cloning phase has failed (e.g. as a result of a stepdown). When a failure
-                    // occurs at this phase, the movePrimary operation does not recover.
+                    // occurs at this phase, the movePrimary operation does not recover. Either of
+                    // the following error codes could be seen depending on if the failover was on
+                    // the donor or recipient node.
+                    ErrorCodes.MovePrimaryAborted,
                     7120202
                 ]);
         },
@@ -98,18 +97,24 @@ var $config = (function() {
             jsTestLog('Executing checkMetadataConsistency state for database: ' + db.getName());
             const inconsistencies = db.checkMetadataConsistency().toArray();
             assert.eq(0, inconsistencies.length, tojson(inconsistencies));
+        },
+        checkCollectionMetadataConsistency: function(db, collName, connCache) {
+            if (this.skipMetadataChecks) {
+                return;
+            }
+            db = getRandomDb(db);
+            const coll = getRandomCollection(db);
+            jsTestLog('Executing checkMetadataConsistency state for collection: ' +
+                      coll.getFullName());
+            const inconsistencies = coll.checkMetadataConsistency().toArray();
+            assert.eq(0, inconsistencies.length, tojson(inconsistencies));
         }
     };
 
     let setup = function(db, collName, cluster) {
-        // TODO (SERVER-71309): Remove once 7.0 becomes last LTS. Prevent non-resilient movePrimary
-        // operations from being executed in multiversion suites.
-        this.skipMovePrimary = !FeatureFlagUtil.isEnabled(db.getMongo(), 'ResilientMovePrimary');
         this.skipMetadataChecks =
             // TODO SERVER-70396: remove this flag
-            !FeatureFlagUtil.isEnabled(db.getMongo(), 'CheckMetadataConsistency') ||
-            // TODO SERVER-74445: re-enable metadata checks on catalog shard deployments
-            cluster.hasCatalogShard();
+            !FeatureFlagUtil.isEnabled(db.getMongo(), 'CheckMetadataConsistency');
 
         for (var i = 0; i < dbCount; i++) {
             const dbName = dbPrefix + i;

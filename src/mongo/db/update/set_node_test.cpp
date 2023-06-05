@@ -72,7 +72,7 @@ TEST_F(SetNodeTest, ApplyNoOp) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 5}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -91,7 +91,7 @@ TEST_F(SetNodeTest, ApplyEmptyPathToCreate) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 6}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -111,7 +111,7 @@ TEST_F(SetNodeTest, ApplyCreatePath) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {d: 5, b: {c: 6}}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 
@@ -130,7 +130,7 @@ TEST_F(SetNodeTest, ApplyCreatePathFromRoot) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{c: 5, a: {b: 6}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 
@@ -150,7 +150,7 @@ TEST_F(SetNodeTest, ApplyPositional) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"][1]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [0, 6, 2]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -188,7 +188,7 @@ TEST_F(SetNodeTest, ApplyNonViablePathToCreateFromReplicationIsNoOp) {
     setFromOplogApplication(true);
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 5}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -207,7 +207,7 @@ TEST_F(SetNodeTest, ApplyNoIndexDataNoLogBuilder) {
     setLogBuilderToNull();
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 6}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a}", getModifiedPaths());
@@ -224,7 +224,7 @@ TEST_F(SetNodeTest, ApplyDoesNotAffectIndexes) {
     addIndexedPath("b");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 6}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a}", getModifiedPaths());
@@ -241,7 +241,7 @@ TEST_F(SetNodeTest, TypeChangeIsNotANoop) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: NumberLong(2)}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a}", getModifiedPaths());
@@ -262,7 +262,7 @@ TEST_F(SetNodeTest, IdentityOpOnDeserializedIsNotANoOp) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b : NumberInt(2)}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a}", getModifiedPaths());
@@ -279,7 +279,7 @@ TEST_F(SetNodeTest, ApplyEmptyDocument) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a}", getModifiedPaths());
@@ -296,7 +296,7 @@ TEST_F(SetNodeTest, ApplyInPlace) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a}", getModifiedPaths());
@@ -313,7 +313,7 @@ TEST_F(SetNodeTest, ApplyOverridePath) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a}", getModifiedPaths());
@@ -330,7 +330,7 @@ TEST_F(SetNodeTest, ApplyChangeType) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a}", getModifiedPaths());
@@ -347,7 +347,7 @@ TEST_F(SetNodeTest, ApplyNewPath) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{b: 1, a: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a}", getModifiedPaths());
@@ -380,7 +380,7 @@ TEST_F(SetNodeTest, ApplyNoOpDottedPath) {
     addIndexedPath("a.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b : 2}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.b}", getModifiedPaths());
@@ -397,7 +397,7 @@ TEST_F(SetNodeTest, TypeChangeOnDottedPathIsNotANoOp) {
     addIndexedPath("a.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b : NumberLong(2)}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.b}", getModifiedPaths());
@@ -446,7 +446,7 @@ TEST_F(SetNodeTest, ApplyInPlaceDottedPath) {
     addIndexedPath("a.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.b}", getModifiedPaths());
@@ -463,7 +463,7 @@ TEST_F(SetNodeTest, ApplyChangeTypeDottedPath) {
     addIndexedPath("a.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.b}", getModifiedPaths());
@@ -480,7 +480,7 @@ TEST_F(SetNodeTest, ApplyChangePath) {
     addIndexedPath("a.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.b}", getModifiedPaths());
@@ -498,7 +498,7 @@ TEST_F(SetNodeTest, ApplyExtendPath) {
     addIndexedPath("a.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {c: 1, b: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.b}", getModifiedPaths());
@@ -515,7 +515,7 @@ TEST_F(SetNodeTest, ApplyNewDottedPath) {
     addIndexedPath("a.b");
     auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{c: 1, a: {b: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.b}", getModifiedPaths());
@@ -532,7 +532,7 @@ TEST_F(SetNodeTest, ApplyEmptyDoc) {
     addIndexedPath("a.b");
     auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.b}", getModifiedPaths());
@@ -549,7 +549,7 @@ TEST_F(SetNodeTest, ApplyFieldWithDot) {
     addIndexedPath("a.b");
     auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{'a.b':4, a: {b: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.b}", getModifiedPaths());
@@ -566,7 +566,7 @@ TEST_F(SetNodeTest, ApplyNoOpArrayIndex) {
     addIndexedPath("a.2.b");
     auto result = node.apply(getApplyParams(doc.root()["a"][2]["b"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{b: 0},{b: 1},{b: 2}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.2.b}", getModifiedPaths());
@@ -583,7 +583,7 @@ TEST_F(SetNodeTest, TypeChangeInArrayIsNotANoOp) {
     addIndexedPath("a.2.b");
     auto result = node.apply(getApplyParams(doc.root()["a"][2]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{b: 0},{b: 1},{b: NumberInt(2)}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.2.b}", getModifiedPaths());
@@ -616,7 +616,7 @@ TEST_F(SetNodeTest, ApplyInPlaceArrayIndex) {
     addIndexedPath("a.2.b");
     auto result = node.apply(getApplyParams(doc.root()["a"][2]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{b: 0},{b: 1},{b: 2}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.2.b}", getModifiedPaths());
@@ -634,7 +634,7 @@ TEST_F(SetNodeTest, ApplyNormalArray) {
     addIndexedPath("a.2.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{b: 0},{b: 1},{b: 2}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a}", getModifiedPaths());
@@ -652,7 +652,7 @@ TEST_F(SetNodeTest, ApplyPaddingArray) {
     addIndexedPath("a.2.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{b: 0},null,{b: 2}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a}", getModifiedPaths());
@@ -670,7 +670,7 @@ TEST_F(SetNodeTest, ApplyNumericObject) {
     addIndexedPath("a.2.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b: 0, '2': {b: 2}}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.2.b}", getModifiedPaths());
@@ -690,7 +690,7 @@ TEST_F(SetNodeTest, ApplyNumericField) {
     addIndexedPath("a.2.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]["2"]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {'2': {b: 2}}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.2.b}", getModifiedPaths());
@@ -710,7 +710,7 @@ TEST_F(SetNodeTest, ApplyExtendNumericField) {
     addIndexedPath("a.2.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]["2"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {'2': {c: 1, b: 2}}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.2.b}", getModifiedPaths());
@@ -728,7 +728,7 @@ TEST_F(SetNodeTest, ApplyEmptyObject) {
     addIndexedPath("a.2.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {'2': {b: 2}}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.2.b}", getModifiedPaths());
@@ -746,7 +746,7 @@ TEST_F(SetNodeTest, ApplyEmptyArray) {
     addIndexedPath("a.2.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [null, null, {b: 2}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a}", getModifiedPaths());
@@ -814,7 +814,7 @@ TEST_F(SetNodeTest, ApplyNoOpComplex) {
     addIndexedPath("a.1.b");
     auto result = node.apply(getApplyParams(doc.root()["a"][1]["b"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{b: {c: 0, d: 0}}, {b: {c: 1, d: 1}}]}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.1.b}", getModifiedPaths());
@@ -831,7 +831,7 @@ TEST_F(SetNodeTest, ApplySameStructure) {
     addIndexedPath("a.1.b");
     auto result = node.apply(getApplyParams(doc.root()["a"][1]["b"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{b: {c: 0, d: 0}}, {b: {c: 1, d: 1}}]}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.1.b}", getModifiedPaths());
@@ -866,7 +866,7 @@ TEST_F(SetNodeTest, SingleFieldFromReplication) {
     setFromOplogApplication(true);
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{_id:1, a: 1}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.1.b}", getModifiedPaths());
@@ -885,7 +885,7 @@ TEST_F(SetNodeTest, SingleFieldNoIdFromReplication) {
     setFromOplogApplication(true);
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 1}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.1.b}", getModifiedPaths());
@@ -904,7 +904,7 @@ TEST_F(SetNodeTest, NestedFieldFromReplication) {
     setFromOplogApplication(true);
     auto result = node.apply(getApplyParams(doc.root()["a"]["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{_id:1, a: {a: 1}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.a.1.b}", getModifiedPaths());
@@ -923,7 +923,7 @@ TEST_F(SetNodeTest, DoubleNestedFieldFromReplication) {
     setFromOplogApplication(true);
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]["c"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{_id:1, a: {b: {c: 1}}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.b.c.d}", getModifiedPaths());
@@ -942,7 +942,7 @@ TEST_F(SetNodeTest, NestedFieldNoIdFromReplication) {
     setFromOplogApplication(true);
     auto result = node.apply(getApplyParams(doc.root()["a"]["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {a: 1}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.a.1.b}", getModifiedPaths());
@@ -961,7 +961,7 @@ TEST_F(SetNodeTest, ReplayArrayFieldNotAppendedIntermediateFromReplication) {
     setFromOplogApplication(true);
     auto result = node.apply(getApplyParams(doc.root()["a"][0]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{_id: 0, a: [1, {b: [1]}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.0.b}", getModifiedPaths());
@@ -978,7 +978,7 @@ TEST_F(SetNodeTest, Set6) {
     addIndexedPath("r.a");
     auto result = node.apply(getApplyParams(doc.root()["r"]["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{_id: 1, r: {a:2, b:2}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -998,7 +998,7 @@ TEST_F(SetNodeTest, Set6FromRepl) {
     setFromOplogApplication(true);
     auto result = node.apply(getApplyParams(doc.root()["r"]["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{_id: 1, r: {a:2, b:2} }"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -1025,7 +1025,7 @@ TEST_F(SetNodeTest, ApplySetModToEphemeralDocument) {
     addIndexedPath("x");
     auto result = node.apply(getApplyParams(doc.root()["x"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{ x : { a : 100, b : 2 } }"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 }
@@ -1042,7 +1042,7 @@ TEST_F(SetNodeTest, ApplyCanCreateDollarPrefixedFieldNameWhenValidateForStorageI
     setValidateForStorage(false);
     auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{$bad: 1}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 
@@ -1078,7 +1078,7 @@ TEST_F(SetNodeTest, ApplyCanPerformNoopOnImmutablePath) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -1131,7 +1131,7 @@ TEST_F(SetNodeTest, ApplyCanPerformNoopOnPrefixOfImmutablePath) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -1151,7 +1151,7 @@ TEST_F(SetNodeTest, ApplyCanOverwritePrefixToCreateImmutablePath) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 
@@ -1171,7 +1171,7 @@ TEST_F(SetNodeTest, ApplyCanOverwritePrefixOfImmutablePathIfNoopOnImmutablePath)
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b: 2, c: 3}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 
@@ -1207,7 +1207,7 @@ TEST_F(SetNodeTest, ApplyCanPerformNoopOnSuffixOfImmutablePath) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]["c"]), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b: {c: 2}}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -1262,7 +1262,7 @@ TEST_F(SetNodeTest, ApplyCanCreateImmutablePath) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 
@@ -1282,7 +1282,7 @@ TEST_F(SetNodeTest, ApplyCanCreatePrefixOfImmutablePath) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 
@@ -1302,7 +1302,7 @@ TEST_F(SetNodeTest, ApplySetFieldInNonExistentArrayElementAffectsIndexOnSiblingF
     addIndexedPath("a.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{b: 0}, {c: 2}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 
@@ -1322,7 +1322,7 @@ TEST_F(SetNodeTest, ApplySetFieldInExistingArrayElementDoesNotAffectIndexOnSibli
     addIndexedPath("a.b");
     auto result = node.apply(getApplyParams(doc.root()["a"][0]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{b: 0, c: 2}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 
@@ -1343,7 +1343,10 @@ TEST_F(SetNodeTest, ApplySetFieldInNonExistentNumericFieldDoesNotAffectIndexOnSi
     addIndexedPath("a.1.b");
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    // TODO: SERVER-77344 anyIndexesMightBeAffected is tricked into thinking that inserting a.1 is
+    // going to affect the index on a.1.b, but it doesn't see that the inserted path is actually
+    // a.1.c.
+    // ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: {'0': {b: 0}, '1': {c: 2}}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 
@@ -1362,7 +1365,7 @@ TEST_F(SetNodeTest, ApplySetOnInsertIsNoopWhenInsertIsFalse) {
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -1383,7 +1386,6 @@ TEST_F(SetNodeTest, ApplySetOnInsertIsAppliedWhenInsertIsTrue) {
     setLogBuilderToNull();  // The log builder is null for inserts.
     auto result = node.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a}", getModifiedPaths());
@@ -1402,7 +1404,6 @@ TEST_F(SetNodeTest, ApplySetOnInsertExistingPath) {
     setLogBuilderToNull();  // The log builder is null for inserts.
     auto result = node.apply(getApplyParams(doc.root()["a"]), getUpdateNodeApplyParams());
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a}", getModifiedPaths());

@@ -28,6 +28,7 @@
  */
 
 #include "mongo/db/pipeline/abt/utils.h"
+#include "mongo/db/query/ce/test_utils.h"
 #include "mongo/db/query/optimizer/cascades/rewriter_rules.h"
 #include "mongo/db/query/optimizer/explain.h"
 #include "mongo/db/query/optimizer/metadata_factory.h"
@@ -1102,7 +1103,7 @@ TEST(PhysRewriter, FilterIndexing4) {
     const BSONObj explain = ExplainGenerator::explainMemoBSONObj(phaseManager.getMemo());
     for (const auto& pathAndCE : pathAndCEs) {
         BSONElement el = dotted_path_support::extractElementAtPath(explain, pathAndCE.first);
-        ASSERT_EQ(el.Double(), pathAndCE.second);
+        ASSERT_CE_APPROX_EQUAL(el.Double(), pathAndCE.second, ce::kMaxCEError);
     }
 
     ASSERT_EXPLAIN_V2_AUTO(
@@ -1339,18 +1340,23 @@ TEST(PhysRewriter, FilterIndexingStress) {
     ASSERT_BSON_PATH("\"Filter\"", explainNLJ, "rightChild.child.child.child.child.nodeType");
     ASSERT_BSON_PATH("\"Filter\"", explainNLJ, "rightChild.child.child.child.child.child.nodeType");
     ASSERT_BSON_PATH(
-        "\"LimitSkip\"", explainNLJ, "rightChild.child.child.child.child.child.child.nodeType");
+        "\"Filter\"", explainNLJ, "rightChild.child.child.child.child.child.child.nodeType");
     ASSERT_BSON_PATH(
-        "\"Seek\"", explainNLJ, "rightChild.child.child.child.child.child.child.child.nodeType");
+        "\"Filter\"", explainNLJ, "rightChild.child.child.child.child.child.child.child.nodeType");
+    ASSERT_BSON_PATH("\"LimitSkip\"",
+                     explainNLJ,
+                     "rightChild.child.child.child.child.child.child.child.child.nodeType");
+    ASSERT_BSON_PATH("\"Seek\"",
+                     explainNLJ,
+                     "rightChild.child.child.child.child.child.child.child.child.child.nodeType");
 
-    ASSERT_BSON_PATH("\"MergeJoin\"", explainNLJ, "leftChild.nodeType");
-    ASSERT_BSON_PATH("\"IndexScan\"", explainNLJ, "leftChild.leftChild.nodeType");
-    ASSERT_BSON_PATH("\"index1\"", explainNLJ, "leftChild.leftChild.indexDefName");
-    ASSERT_BSON_PATH("\"Union\"", explainNLJ, "leftChild.rightChild.nodeType");
-    ASSERT_BSON_PATH("\"Evaluation\"", explainNLJ, "leftChild.rightChild.children.0.nodeType");
-    ASSERT_BSON_PATH("\"IndexScan\"", explainNLJ, "leftChild.rightChild.children.0.child.nodeType");
-    ASSERT_BSON_PATH(
-        "\"index3\"", explainNLJ, "leftChild.rightChild.children.0.child.indexDefName");
+    ASSERT_BSON_PATH("\"IndexScan\"", explainNLJ, "leftChild.nodeType");
+
+    // With heuristic CE both indexes are equally preferable.
+    const auto& indexName =
+        dotted_path_support::extractElementAtPath(explainNLJ, "leftChild.indexDefName")
+            .toString(false /*includeFieldName*/);
+    ASSERT_TRUE(indexName == "\"index1\"" || indexName == "\"index3\"");
 }
 
 TEST(PhysRewriter, FilterIndexingVariable) {
@@ -1805,14 +1811,14 @@ TEST(PhysRewriter, SargableProjectionRenames) {
     // projections.
     ASSERT_EXPLAIN_V2_AUTO(
         "Root [{root}]\n"
-        "Evaluation [{pa1} = Variable [pa]]\n"
+        "Evaluation [{pa} = Variable [pa1]]\n"
         "Sargable [Complete]\n"
         "|   |   requirements: \n"
-        "|   |       {{{root, 'PathGet [a] PathIdentity []', pa, {{{=Const [1]}}}}}}\n"
+        "|   |       {{{root, 'PathGet [a] PathIdentity []', pa1, {{{=Const [1]}}}}}}\n"
         "|   scanParams: \n"
-        "|       {'a': pa}\n"
+        "|       {'a': pa1}\n"
         "|           residualReqs: \n"
-        "|               {{{pa, 'PathIdentity []', {{{=Const [1]}}}, entryIndex: 0}}}\n"
+        "|               {{{pa1, 'PathIdentity []', {{{=Const [1]}}}, entryIndex: 0}}}\n"
         "Scan [c1, {root}]\n",
         optimized);
 }
@@ -1980,7 +1986,10 @@ TEST(PhysRewriter, CoveredScan) {
 
     ABT optimized = std::move(rootNode);
     phaseManager.optimize(optimized);
-    ASSERT_EQ(5, phaseManager.getMemo().getStats()._physPlanExplorationCount);
+    ASSERT_BETWEEN_AUTO(  //
+        3,
+        6,
+        phaseManager.getMemo().getStats()._physPlanExplorationCount);
 
     // Since we do not optimize with fast null handling, we need to split the predicate between the
     // index scan and fetch in order to handle null.
@@ -1990,8 +1999,8 @@ TEST(PhysRewriter, CoveredScan) {
         "|   |   Const [true]\n"
         "|   LimitSkip [limit: 1, skip: 0]\n"
         "|   Seek [ridProjection: rid_0, {'a': pa}, c1]\n"
-        "IndexScan [{'<rid>': rid_0}, scanDefName: c1, indexDefName: index1, interval: {<Const [1"
-        "]}]\n",
+        "IndexScan [{'<rid>': rid_0}, scanDefName: c1, indexDefName: index1, interval: {<Const "
+        "[1]}]\n",
         optimized);
 }
 
@@ -2267,7 +2276,7 @@ TEST(PhysRewriter, MultiKeyIndex) {
     // TODO SERVER-71551 Follow up unit tests with overriden Cost Model.
     auto costModel = getTestCostModel();
     costModel.setEvalStartupCost(1e-6);
-    costModel.setGroupByIncrementalCost(1e-4);
+    costModel.setGroupByIncrementalCost(9e-5);
 
     auto phaseManager = makePhaseManager(
         {OptPhase::MemoSubstitutionPhase,
@@ -2764,16 +2773,15 @@ TEST(PhysRewriter, CompoundIndex5) {
 
     // Demonstrate that we create four compound {a, b} index bounds: [=0, =2], [=0, =3], [=1, =2]
     // and [=1, =3].
-    // TODO: SERVER-70298: we should be seeing merge joins instead of union+groupby.
     ASSERT_EXPLAIN_V2_AUTO(
         "Root [{root}]\n"
         "NestedLoopJoin [joinType: Inner, {rid_0}]\n"
         "|   |   Const [true]\n"
         "|   LimitSkip [limit: 1, skip: 0]\n"
         "|   Seek [ridProjection: rid_0, {'<root>': root}, c1]\n"
-        "GroupBy [{rid_0}]\n"
-        "|   aggregations: \n"
-        "Union [{rid_0}]\n"
+        "SortedMerge []\n"
+        "|   |   |   |   |   collation: \n"
+        "|   |   |   |   |       rid_0: Ascending\n"
         "|   |   |   IndexScan [{'<rid>': rid_0}, scanDefName: c1, indexDefName: index1, interval"
         ": {=Const [1 | 3]}]\n"
         "|   |   IndexScan [{'<rid>': rid_0}, scanDefName: c1, indexDefName: index1, interval: {="
@@ -3927,9 +3935,10 @@ TEST(PhysRewriter, ArrayConstantIndex) {
         "|   |   Const [true]\n"
         "|   LimitSkip [limit: 1, skip: 0]\n"
         "|   Seek [ridProjection: rid_0, {'<root>': root}, c1]\n"
-        "GroupBy [{rid_0}]\n"
-        "|   aggregations: \n"
-        "Union [{rid_0}]\n"
+        "Unique [{rid_0}]\n"
+        "SortedMerge []\n"
+        "|   |   |   collation: \n"
+        "|   |   |       rid_0: Ascending\n"
         "|   IndexScan [{'<rid>': rid_0}, scanDefName: c1, indexDefName: index1, interval: {=Cons"
         "t [0 | [1, 2, 3]]}]\n"
         "IndexScan [{'<rid>': rid_0}, scanDefName: c1, indexDefName: index1, interval: {=Const [0"
@@ -4798,7 +4807,7 @@ TEST(PhysRewriter, EqMemberSargable) {
 
         // Test sargable filter is satisfied with an index scan.
         ASSERT_EXPLAIN_PROPS_V2_AUTO(
-            "Properties [cost: 0.173038, localCost: 0, adjustedCE: 54.6819]\n"
+            "Properties [cost: 0.163045, localCost: 0, adjustedCE: 54.6819]\n"
             "|   |   Logical:\n"
             "|   |       cardinalityEstimate: \n"
             "|   |           ce: 54.6819\n"
@@ -4818,7 +4827,7 @@ TEST(PhysRewriter, EqMemberSargable) {
             "|       indexingRequirement: \n"
             "|           Complete, dedupRID\n"
             "Root [{root}]\n"
-            "Properties [cost: 0.173038, localCost: 0.0180785, adjustedCE: 54.6819]\n"
+            "Properties [cost: 0.163045, localCost: 0.0180785, adjustedCE: 54.6819]\n"
             "|   |   Logical:\n"
             "|   |       cardinalityEstimate: \n"
             "|   |           ce: 54.6819\n"
@@ -4867,7 +4876,7 @@ TEST(PhysRewriter, EqMemberSargable) {
             "|   |       repetitionEstimate: 54.6819\n"
             "|   LimitSkip [limit: 1, skip: 0]\n"
             "|   Seek [ridProjection: rid_0, {'<root>': root}, c1]\n"
-            "Properties [cost: 0.0791597, localCost: 0.0791597, adjustedCE: 18.2273]\n"
+            "Properties [cost: 0.0691671, localCost: 0.0691671, adjustedCE: 54.6819]\n"
             "|   |   Logical:\n"
             "|   |       cardinalityEstimate: \n"
             "|   |           ce: 54.6819\n"
@@ -4891,9 +4900,10 @@ TEST(PhysRewriter, EqMemberSargable) {
             "|           type: Centralized\n"
             "|       indexingRequirement: \n"
             "|           Index, dedupRID\n"
-            "GroupBy [{rid_0}]\n"
-            "|   aggregations: \n"
-            "Union [{rid_0}]\n"
+            "Unique [{rid_0}]\n"
+            "SortedMerge []\n"
+            "|   |   |   |   collation: \n"
+            "|   |   |   |       rid_0: Ascending\n"
             "|   |   IndexScan [{'<rid>': rid_0}, scanDefName: c1, indexDefName: index1, interval: "
             "{=Const [3]}]\n"
             "|   IndexScan [{'<rid>': rid_0}, scanDefName: c1, indexDefName: index1, interval: "
@@ -5274,6 +5284,201 @@ TEST(PhysRewriter, ConjunctionTraverseMultikey2) {
         "IndexScan [{'<rid>': rid_0}, scanDefName: c1, indexDefName: index1, interval: {=Const [1"
         "]}]\n",
         optimized);
+}
+
+TEST(PhysRewriter, ExplainMemoDisplayRulesForRejectedPlans) {
+    ABT rootNode = NodeBuilder{}
+                       .root("root")
+                       .filter(_evalf(_get("a", _traverse1(_cmp("Eq", "1"_cint64))), "root"_var))
+                       .finish(_scan("root", "c1"));
+
+    auto prefixId = PrefixId::createForTests();
+    auto phaseManager = makePhaseManager(
+        {OptPhase::MemoSubstitutionPhase,
+         OptPhase::MemoExplorationPhase,
+         OptPhase::MemoImplementationPhase},
+        prefixId,
+        {{{"c1",
+           createScanDef({},
+                         {{"index1",
+                           IndexDefinition{{{makeIndexPath("a"), CollationOp::Ascending}},
+                                           true /*isMultiKey*/}}})}}},
+        boost::none /*costModel*/,
+        {true /*debugMode*/, 2 /*debugLevel*/, DebugInfo::kIterationLimitForTests});
+
+    ABT optimized = rootNode;
+    phaseManager.getHints()._disableBranchAndBound = true;
+    phaseManager.getHints()._keepRejectedPlans = true;
+    phaseManager.optimize(optimized);
+    ASSERT_EQ(4, phaseManager.getMemo().getStats()._physPlanExplorationCount);
+    ASSERT_EXPLAIN_MEMO_AUTO(  // NOLINT
+        "Memo: \n"
+        "    groupId: 0\n"
+        "    |   |   Logical properties:\n"
+        "    |   |       cardinalityEstimate: \n"
+        "    |   |           ce: 1000\n"
+        "    |   |       projections: \n"
+        "    |   |           root\n"
+        "    |   |       indexingAvailability: \n"
+        "    |   |           [groupId: 0, scanProjection: root, scanDefName: c1, eqPredsOnly]\n"
+        "    |   |       collectionAvailability: \n"
+        "    |   |           c1\n"
+        "    |   |       distributionAvailability: \n"
+        "    |   |           distribution: \n"
+        "    |   |               type: Centralized\n"
+        "    |   logicalNodes: \n"
+        "    |       logicalNodeId: 0, rule: Root\n"
+        "    |           Scan [c1, {root}]\n"
+        "    physicalNodes: \n"
+        "        physicalNodeId: 0, costLimit: {Infinite cost}\n"
+        "            Physical properties:\n"
+        "                projections: \n"
+        "                    root\n"
+        "                distribution: \n"
+        "                    type: Centralized\n"
+        "                indexingRequirement: \n"
+        "                    Seek, dedupRID\n"
+        "                repetitionEstimate: 31.6228\n"
+        "            cost: 0.0472695, localCost: 0.0472695, adjustedCE: 31.6228, rule: Seek, "
+        "node: \n"
+        "                LimitSkip [limit: 1, skip: 0]\n"
+        "                    ce: 1\n"
+        "                Seek [ridProjection: rid_0, {'<root>': root}, c1]\n"
+        "                    ce: 1\n"
+        "    groupId: 1\n"
+        "    |   |   Logical properties:\n"
+        "    |   |       cardinalityEstimate: \n"
+        "    |   |           ce: 31.6228\n"
+        "    |   |           requirementCEs: \n"
+        "    |   |               refProjection: root, path: 'PathGet [a] PathTraverse [1] "
+        "PathIdentity []', ce: 31.6228\n"
+        "    |   |       projections: \n"
+        "    |   |           root\n"
+        "    |   |       indexingAvailability: \n"
+        "    |   |           [groupId: 0, scanProjection: root, scanDefName: c1, eqPredsOnly, "
+        "hasProperInterval]\n"
+        "    |   |       collectionAvailability: \n"
+        "    |   |           c1\n"
+        "    |   |       distributionAvailability: \n"
+        "    |   |           distribution: \n"
+        "    |   |               type: Centralized\n"
+        "    |   logicalNodes: \n"
+        "    |       logicalNodeId: 0, rule: Root\n"
+        "    |           Sargable [Complete]\n"
+        "    |           |   |   |   requirements: \n"
+        "    |           |   |   |       {{{root, 'PathGet [a] PathTraverse [1] PathIdentity []', "
+        "{{{=Const [1]}}}}}}\n"
+        "    |           |   |   candidateIndexes: \n"
+        "    |           |   |       candidateId: 1, index1, {}, {SimpleEquality}, {{{=Const "
+        "[1]}}}\n"
+        "    |           |   scanParams: \n"
+        "    |           |       {'a': evalTemp_0}\n"
+        "    |           |           residualReqs: \n"
+        "    |           |               {{{evalTemp_0, 'PathTraverse [1] PathIdentity []', "
+        "{{{=Const [1]}}}, entryIndex: 0}}}\n"
+        "    |           MemoLogicalDelegator [groupId: 0]\n"
+        "    |       logicalNodeId: 1, rule: SargableSplit\n"
+        "    |           RIDIntersect [root]\n"
+        "    |           |   MemoLogicalDelegator [groupId: 0]\n"
+        "    |           MemoLogicalDelegator [groupId: 3]\n"
+        "    physicalNodes: \n"
+        "        physicalNodeId: 0, costLimit: {Infinite cost}\n"
+        "            Physical properties:\n"
+        "                projections: \n"
+        "                    root\n"
+        "                distribution: \n"
+        "                    type: Centralized\n"
+        "                indexingRequirement: \n"
+        "                    Complete, dedupRID\n"
+        "            cost: 0.0847147, localCost: 0.0106248, adjustedCE: 31.6228, rule: "
+        "IndexFetch, node: \n"
+        "                NestedLoopJoin [joinType: Inner, {rid_0}]\n"
+        "                    ce: 31.6228\n"
+        "                |   |   Const [true]\n"
+        "                |   MemoPhysicalDelegator [groupId: 0, index: 0]\n"
+        "                MemoPhysicalDelegator [groupId: 3, index: 0]\n"
+        "            rejectedPlans: \n"
+        "                cost: 0.513676, localCost: 0.513676, adjustedCE: 1000, rule: "
+        "SargableToPhysicalScan, node: \n"
+        "                    Filter []\n"
+        "                        ce: 1000\n"
+        "                    |   EvalFilter []\n"
+        "                    |   |   Variable [evalTemp_0]\n"
+        "                    |   PathTraverse [1]\n"
+        "                    |   PathCompare [Eq]\n"
+        "                    |   Const [1]\n"
+        "                    PhysicalScan [{'<root>': root, 'a': evalTemp_0}, c1]\n"
+        "                        ce: 1000\n"
+        "    groupId: 2\n"
+        "    |   |   Logical properties:\n"
+        "    |   |       cardinalityEstimate: \n"
+        "    |   |           ce: 31.6228\n"
+        "    |   |       projections: \n"
+        "    |   |           root\n"
+        "    |   |       indexingAvailability: \n"
+        "    |   |           [groupId: 0, scanProjection: root, scanDefName: c1, eqPredsOnly, "
+        "hasProperInterval]\n"
+        "    |   |       collectionAvailability: \n"
+        "    |   |           c1\n"
+        "    |   |       distributionAvailability: \n"
+        "    |   |           distribution: \n"
+        "    |   |               type: Centralized\n"
+        "    |   logicalNodes: \n"
+        "    |       logicalNodeId: 0, rule: Root\n"
+        "    |           Root [{root}]\n"
+        "    |           MemoLogicalDelegator [groupId: 1]\n"
+        "    physicalNodes: \n"
+        "        physicalNodeId: 0, costLimit: {Infinite cost}\n"
+        "            Physical properties:\n"
+        "                distribution: \n"
+        "                    type: Centralized\n"
+        "                indexingRequirement: \n"
+        "                    Complete, dedupRID\n"
+        "            cost: 0.0847147, localCost: 0, adjustedCE: 31.6228, rule: Root, node: \n"
+        "                Root [{root}]\n"
+        "                    ce: 31.6228\n"
+        "                MemoPhysicalDelegator [groupId: 1, index: 0]\n"
+        "    groupId: 3\n"
+        "    |   |   Logical properties:\n"
+        "    |   |       cardinalityEstimate: \n"
+        "    |   |           ce: 31.6228\n"
+        "    |   |           requirementCEs: \n"
+        "    |   |               refProjection: root, path: 'PathGet [a] PathTraverse [1] "
+        "PathIdentity []', ce: 31.6228\n"
+        "    |   |       projections: \n"
+        "    |   |           root\n"
+        "    |   |       indexingAvailability: \n"
+        "    |   |           [groupId: 0, scanProjection: root, scanDefName: c1, eqPredsOnly, "
+        "hasProperInterval]\n"
+        "    |   |       collectionAvailability: \n"
+        "    |   |           c1\n"
+        "    |   |       distributionAvailability: \n"
+        "    |   |           distribution: \n"
+        "    |   |               type: Centralized\n"
+        "    |   logicalNodes: \n"
+        "    |       logicalNodeId: 0, rule: SargableSplit\n"
+        "    |           Sargable [Index]\n"
+        "    |           |   |   requirements: \n"
+        "    |           |   |       {{{root, 'PathGet [a] PathTraverse [1] PathIdentity []', "
+        "{{{=Const [1]}}}}}}\n"
+        "    |           |   candidateIndexes: \n"
+        "    |           |       candidateId: 1, index1, {}, {SimpleEquality}, {{{=Const [1]}}}\n"
+        "    |           MemoLogicalDelegator [groupId: 0]\n"
+        "    physicalNodes: \n"
+        "        physicalNodeId: 0, costLimit: {Infinite cost}\n"
+        "            Physical properties:\n"
+        "                projections: \n"
+        "                    rid_0\n"
+        "                distribution: \n"
+        "                    type: Centralized\n"
+        "                indexingRequirement: \n"
+        "                    Index, dedupRID\n"
+        "            cost: 0.0268205, localCost: 0.0268205, adjustedCE: 31.6228, rule: "
+        "SargableToIndex, node: \n"
+        "                IndexScan [{'<rid>': rid_0}, scanDefName: c1, indexDefName: index1, "
+        "interval: {=Const [1]}]\n"
+        "                    ce: 31.6228\n",
+        phaseManager.getMemo());
 }
 
 TEST(PhysRewriter, ExtractAllPlans) {

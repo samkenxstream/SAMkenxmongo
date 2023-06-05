@@ -1,8 +1,6 @@
 /**
  * Test basic retryable write without errors by checking that the resulting collection after the
  * retry is as expected and it does not create additional oplog entries.
- *
- * @tags: [temporary_catalog_shard_incompatible]
  */
 (function() {
 "use strict";
@@ -37,6 +35,12 @@ function verifyServerStatusChanges(
 
 function runTests(mainConn, priConn) {
     var lsid = UUID();
+
+    if (TestData.configShard) {
+        // Creating a collection updates counters on the config server, so do that before getting
+        // the initial stats.
+        assert.commandWorked(mainConn.getDB("test").createCollection("user"));
+    }
 
     ////////////////////////////////////////////////////////////////////////
     // Test insert command

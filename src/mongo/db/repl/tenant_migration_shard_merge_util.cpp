@@ -121,6 +121,36 @@ std::string _getPathRelativeTo(const std::string& path, const std::string& baseP
 }
 }  // namespace
 
+void createImportDoneMarkerLocalCollection(OperationContext* opCtx, const UUID& migrationId) {
+    UnreplicatedWritesBlock writeBlock(opCtx);
+    // Collections in 'local' db should not expect any lock or prepare conflicts.
+    AllowLockAcquisitionOnTimestampedUnitOfWork allowAcquisitionOfLocks(opCtx->lockState());
+
+    auto status = StorageInterface::get(opCtx)->createCollection(
+        opCtx, getImportDoneMarkerNs(migrationId), CollectionOptions());
+
+    if (!status.isOK()) {
+        uassertStatusOK(status.withContext(
+            str::stream() << "Failed to create import done marker local collection for migration: "
+                          << migrationId));
+    }
+}
+
+void dropImportDoneMarkerLocalCollection(OperationContext* opCtx, const UUID& migrationId) {
+    UnreplicatedWritesBlock writeBlock(opCtx);
+    // Collections in 'local' db should not expect any lock or prepare conflicts.
+    AllowLockAcquisitionOnTimestampedUnitOfWork allowAcquisitionOfLocks(opCtx->lockState());
+
+    auto status =
+        StorageInterface::get(opCtx)->dropCollection(opCtx, getImportDoneMarkerNs(migrationId));
+
+    if (!status.isOK()) {
+        uassertStatusOK(status.withContext(
+            str::stream() << "Failed to drop import done marker local collection for migration: "
+                          << migrationId));
+    }
+}
+
 void wiredTigerImportFromBackupCursor(OperationContext* opCtx,
                                       const UUID& migrationId,
                                       const std::string& importPath,
@@ -204,7 +234,7 @@ void wiredTigerImportFromBackupCursor(OperationContext* opCtx,
 
         // Import the collection and it's indexes.
         const auto nss = metadata.ns;
-        writeConflictRetry(opCtx, "importCollection", nss.ns(), [&] {
+        writeConflictRetry(opCtx, "importCollection", nss, [&] {
             LOGV2_DEBUG(6114303, 1, "Importing donor collection", "ns"_attr = nss);
             AutoGetDb autoDb(opCtx, nss.dbName(), MODE_IX);
             auto db = autoDb.ensureDbExists(opCtx);
@@ -225,6 +255,10 @@ void wiredTigerImportFromBackupCursor(OperationContext* opCtx,
                     Top::get(serviceContext).collectionDropped(nss);
                 });
 
+            uassert(ErrorCodes::NamespaceExists,
+                    str::stream() << "Collection already exists. NS: " << nss.toStringForErrorMsg(),
+                    !CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss));
+
             // Create Collection object.
             auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
             auto durableCatalog = storageEngine->getCatalog();
@@ -239,7 +273,9 @@ void wiredTigerImportFromBackupCursor(OperationContext* opCtx,
             auto importResult = uassertStatusOK(DurableCatalog::get(opCtx)->importCollection(
                 opCtx, nss, metadata.catalogObject, storageMetaObj, importOptions));
 
-            const auto md = durableCatalog->getMetaData(opCtx, importResult.catalogId);
+            const auto catalogEntry =
+                durableCatalog->getParsedCatalogEntry(opCtx, importResult.catalogId);
+            const auto md = catalogEntry->metadata;
             for (const auto& index : md->indexes) {
                 uassert(6114301, "Cannot import non-ready indexes", index.ready);
             }

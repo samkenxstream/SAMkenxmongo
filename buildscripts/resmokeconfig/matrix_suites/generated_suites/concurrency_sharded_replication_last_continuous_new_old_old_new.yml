@@ -26,11 +26,12 @@ executor:
     mongod_options:
       set_parameters:
         enableTestCommands: 1
-        receiveChunkWaitForRangeDeleterTimeoutMS: 90000
+        queryAnalysisWriterIntervalSecs: 1
         roleGraphInvalidationIsFatal: 1
     mongos_options:
       set_parameters:
         enableTestCommands: 1
+        queryAnalysisSamplerConfigurationRefreshSecs: 1
     num_mongos: 2
     num_rs_nodes_per_shard: 2
     num_shards: 2
@@ -39,12 +40,12 @@ executor:
       mongod_options:
         oplogSize: 1024
   hooks:
+  - class: CheckShardFilteringMetadata
   - class: CheckReplDBHashInBackground
   - class: CheckReplDBHash
   - class: CheckMetadataConsistencyInBackground
   - class: CheckOrphansDeleted
   - class: CheckRoutingTableConsistency
-  - class: CheckShardFilteringMetadata
   - class: ValidateCollections
   - class: CleanupConcurrencyWorkloads
 matrix_suite: true
@@ -81,11 +82,13 @@ selector:
   - jstests/concurrency/fsm_workloads/yield_and_hashed.js
   - jstests/concurrency/fsm_workloads/yield_and_sorted.js
   - jstests/concurrency/fsm_workloads/agg_out_interrupt_cleanup.js
+  - jstests/concurrency/fsm_workloads/timeseries_agg_out_interrupt_cleanup.js
   - jstests/concurrency/fsm_workloads/multi_statement_transaction_atomicity_isolation_metrics_test.js
   - jstests/concurrency/fsm_workloads/multi_statement_transaction_all_commands_same_session.js
   - jstests/concurrency/fsm_workloads/view_catalog_direct_system_writes.js
   - jstests/concurrency/fsm_workloads/create_timeseries_collection.js
   - jstests/concurrency/fsm_workloads/create_collection_and_view.js
+  - jstests/concurrency/fsm_workloads/map_reduce_drop.js
   exclude_with_any_tags:
   - requires_replication
   - assumes_balancer_on

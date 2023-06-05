@@ -160,7 +160,7 @@ StatusWith<ZoneInfo> ZoneInfo::getZonesForCollection(OperationContext* opCtx,
         ShardingCatalogManager::get(opCtx)->localCatalogClient()->getTagsForCollection(opCtx, nss);
     if (!swCollectionZones.isOK()) {
         return swCollectionZones.getStatus().withContext(
-            str::stream() << "Unable to load zones for collection " << nss);
+            str::stream() << "Unable to load zones for collection " << nss.toStringForErrorMsg());
     }
     const auto& collectionZones = swCollectionZones.getValue();
 
@@ -388,11 +388,18 @@ MigrateInfosWithReason BalancerPolicy::balance(
 
                 invariant(to != stat.shardId);
 
-                migrations.emplace_back(to,
-                                        distribution.nss(),
-                                        chunk,
-                                        ForceJumbo::kForceBalancer,
-                                        collDataSizeInfo.maxChunkSizeBytes);
+                migrations.emplace_back(
+                    to,
+                    chunk.getShard(),
+                    distribution.nss(),
+                    chunk.getCollectionUUID(),
+                    chunk.getMin(),
+                    boost::none /* max */,
+                    chunk.getVersion(),
+                    // Always force jumbo chunks to be migrated off draining shards
+                    ForceJumbo::kForceBalancer,
+                    collDataSizeInfo.maxChunkSizeBytes);
+
                 if (firstReason == MigrationReason::none) {
                     firstReason = MigrationReason::drain;
                 }
@@ -462,11 +469,16 @@ MigrateInfosWithReason BalancerPolicy::balance(
                 invariant(to != stat.shardId);
 
                 migrations.emplace_back(to,
+                                        chunk.getShard(),
                                         distribution.nss(),
-                                        chunk,
+                                        chunk.getCollectionUUID(),
+                                        chunk.getMin(),
+                                        boost::none /* max */,
+                                        chunk.getVersion(),
                                         forceJumbo ? ForceJumbo::kForceBalancer
                                                    : ForceJumbo::kDoNotForce,
                                         collDataSizeInfo.maxChunkSizeBytes);
+
                 if (firstReason == MigrationReason::none) {
                     firstReason = MigrationReason::zoneViolation;
                 }
@@ -487,17 +499,24 @@ MigrateInfosWithReason BalancerPolicy::balance(
     zonesPlusEmpty.push_back("");
 
     for (const auto& zone : zonesPlusEmpty) {
-        size_t totalNumberOfShardsWithZone = 0;
+        size_t numShardsInZone = 0;
+        int64_t totalDataSizeOfShardsWithZone = 0;
 
         for (const auto& stat : shardStats) {
             if (zone.empty() || stat.shardZones.count(zone)) {
-                totalNumberOfShardsWithZone++;
+                const auto& shardSizeIt = collDataSizeInfo.shardToDataSizeMap.find(stat.shardId);
+                if (shardSizeIt == collDataSizeInfo.shardToDataSizeMap.end()) {
+                    // Skip if stats not available (may happen if add|remove shard during a round)
+                    continue;
+                }
+                totalDataSizeOfShardsWithZone += shardSizeIt->second;
+                numShardsInZone++;
             }
         }
 
         // Skip zones which have no shards assigned to them. This situation is not harmful, but
         // should not be possible so warn the operator to correct it.
-        if (totalNumberOfShardsWithZone == 0) {
+        if (numShardsInZone == 0) {
             if (!zone.empty()) {
                 LOGV2_WARNING(
                     21893,
@@ -513,10 +532,26 @@ MigrateInfosWithReason BalancerPolicy::balance(
             continue;
         }
 
+        tassert(ErrorCodes::BadValue,
+                str::stream() << "Total data size for shards in zone " << zone << " and collection "
+                              << distribution.nss().toStringForErrorMsg()
+                              << " must be greater or equal than zero but is "
+                              << totalDataSizeOfShardsWithZone,
+                totalDataSizeOfShardsWithZone >= 0);
+
+        if (totalDataSizeOfShardsWithZone == 0) {
+            // No data to balance within this zone
+            continue;
+        }
+
+        const int64_t idealDataSizePerShardForZone =
+            totalDataSizeOfShardsWithZone / numShardsInZone;
+
         while (_singleZoneBalanceBasedOnDataSize(shardStats,
                                                  distribution,
                                                  collDataSizeInfo,
                                                  zone,
+                                                 idealDataSizePerShardForZone,
                                                  &migrations,
                                                  availableShards,
                                                  forceJumbo ? ForceJumbo::kForceBalancer
@@ -551,6 +586,7 @@ bool BalancerPolicy::_singleZoneBalanceBasedOnDataSize(
     const DistributionStatus& distribution,
     const CollectionDataSizeInfoForBalancing& collDataSizeInfo,
     const string& zone,
+    const int64_t idealDataSizePerShardForZone,
     vector<MigrateInfo>* migrations,
     stdx::unordered_set<ShardId>* availableShards,
     ForceJumbo forceJumbo) {
@@ -572,16 +608,21 @@ bool BalancerPolicy::_singleZoneBalanceBasedOnDataSize(
         return false;
     }
 
-    LOGV2_DEBUG(6581601,
+    LOGV2_DEBUG(7548100,
                 1,
                 "Balancing single zone",
                 logAttrs(distribution.nss()),
                 "zone"_attr = zone,
+                "idealDataSizePerShardForZone"_attr = idealDataSizePerShardForZone,
                 "fromShardId"_attr = from,
                 "fromShardDataSize"_attr = fromSize,
                 "toShardId"_attr = to,
                 "toShardDataSize"_attr = toSize,
                 "maxChunkSizeBytes"_attr = collDataSizeInfo.maxChunkSizeBytes);
+
+    if (fromSize <= idealDataSizePerShardForZone) {
+        return false;
+    }
 
     if (fromSize - toSize < 3 * collDataSizeInfo.maxChunkSizeBytes) {
         // Do not balance if the collection's size differs too few between the chosen shards
@@ -606,7 +647,7 @@ bool BalancerPolicy::_singleZoneBalanceBasedOnDataSize(
                                  distribution.nss(),
                                  chunk.getCollectionUUID(),
                                  chunk.getMin(),
-                                 boost::none /* call moveRange*/,
+                                 boost::none /* max */,
                                  chunk.getVersion(),
                                  forceJumbo,
                                  collDataSizeInfo.maxChunkSizeBytes);
@@ -721,7 +762,7 @@ std::string SplitInfo::toString() const {
     }
 
     return "Splitting chunk in {} [ {}, {} ), residing on {} at [ {} ] with version {} and collection placement version {}"_format(
-        nss.ns(),
+        toStringForLogging(nss),
         minKey.toString(),
         maxKey.toString(),
         shardId.toString(),
@@ -744,7 +785,7 @@ MergeInfo::MergeInfo(const ShardId& shardId,
 std::string MergeInfo::toString() const {
     return "Merging chunk range {} in {} residing on {} with collection placement version {}"_format(
         chunkRange.toString(),
-        nss.toString(),
+        NamespaceStringUtil::serialize(nss),
         shardId.toString(),
         collectionPlacementVersion.toString());
 }
@@ -755,7 +796,7 @@ MergeAllChunksOnShardInfo::MergeAllChunksOnShardInfo(const ShardId& shardId,
 
 std::string MergeAllChunksOnShardInfo::toString() const {
     return "Merging all contiguous chunks residing on shard {} for collection {}"_format(
-        shardId.toString(), nss.toString());
+        shardId.toString(), NamespaceStringUtil::serialize(nss));
 }
 
 DataSizeInfo::DataSizeInfo(const ShardId& shardId,

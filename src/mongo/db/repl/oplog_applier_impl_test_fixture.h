@@ -79,7 +79,8 @@ public:
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
                    std::vector<bool> fromMigrate,
-                   bool defaultFromMigrate) override;
+                   bool defaultFromMigrate,
+                   InsertsOpStateAccumulator* opAccumulator = nullptr) override;
 
     /**
      * This function is called whenever OplogApplierImpl deletes a document from a collection.
@@ -87,12 +88,15 @@ public:
     void onDelete(OperationContext* opCtx,
                   const CollectionPtr& coll,
                   StmtId stmtId,
-                  const OplogDeleteEntryArgs& args) override;
+                  const OplogDeleteEntryArgs& args,
+                  OpStateAccumulator* opAccumulator = nullptr) override;
 
     /**
      * This function is called whenever OplogApplierImpl updates a document in a collection.
      */
-    void onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) override;
+    void onUpdate(OperationContext* opCtx,
+                  const OplogUpdateEntryArgs& args,
+                  OpStateAccumulator* opAccumulator = nullptr) override;
 
     /**
      * Called when OplogApplierImpl creates a collection.
@@ -108,14 +112,14 @@ public:
     /**
      * Called when OplogApplierImpl renames a collection.
      */
-    using OpObserver::onRenameCollection;
     void onRenameCollection(OperationContext* opCtx,
                             const NamespaceString& fromCollection,
                             const NamespaceString& toCollection,
                             const UUID& uuid,
                             const boost::optional<UUID>& dropTargetUUID,
                             std::uint64_t numRecords,
-                            bool stayTemp) override;
+                            bool stayTemp,
+                            bool markFromMigrate) override;
 
     /**
      * Called when OplogApplierImpl creates an index.
@@ -179,6 +183,7 @@ public:
                        boost::optional<UUID>,
                        boost::optional<UUID>,
                        std::uint64_t,
+                       bool,
                        bool)>
         onRenameCollectionFn;
 

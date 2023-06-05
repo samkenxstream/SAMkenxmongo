@@ -35,7 +35,6 @@
 #include "mongo/db/exec/shard_filterer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/s/scoped_collection_metadata.h"
 
 namespace mongo {
 
@@ -93,7 +92,7 @@ public:
     }
 
     /**
-     * Checks if the 'doc' is NOT writable and additionally handles the StaleConfig exception. This
+     * Checks if the 'doc' is NOT writable and additionally handles the StaleConfig error. This
      * method should be called in a context of single update / delete.
      *
      * Returns a pair of [optional immediate StageState return code, bool fromMigrate].
@@ -148,23 +147,6 @@ private:
     NamespaceString _nss;
     const bool _skipFiltering;
     std::unique_ptr<ShardFilterer> _shardFilterer;
-};
-
-/**
- * This class represents a cached sharding collection description. When resuming from a yield, the
- * cache needs to be invalidated.
- */
-class CachedShardingDescription {
-public:
-    CachedShardingDescription(const NamespaceString& nss) : _nss(nss) {}
-
-    void restoreState();
-
-    const ScopedCollectionDescription& getCollectionDescription(OperationContext* opCtx);
-
-private:
-    const NamespaceString _nss;
-    boost::optional<ScopedCollectionDescription> _collectionDescription;
 };
 
 /**

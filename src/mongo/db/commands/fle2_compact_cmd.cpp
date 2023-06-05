@@ -43,6 +43,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/create_gen.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
@@ -56,11 +57,6 @@ MONGO_FAIL_POINT_DEFINE(fleCompactSkipECOCDropUnsharded);
 namespace mongo {
 namespace {
 
-/**
- * Ensures that only one compactStructuredEncryptionData can run at a given time.
- */
-Lock::ResourceMutex commandMutex("compactStructuredEncryptionDataCommandMutex");
-
 CompactStats compactEncryptedCompactionCollection(OperationContext* opCtx,
                                                   const CompactStructuredEncryptionData& request) {
 
@@ -71,8 +67,12 @@ CompactStats compactEncryptedCompactionCollection(OperationContext* opCtx,
                           << " must be run through mongos in a sharded cluster",
             !ShardingState::get(opCtx)->enabled());
 
-    // Only allow one instance of compactStructuredEncryptionData to run at a time.
-    Lock::ExclusiveLock fleCompactCommandLock(opCtx, commandMutex);
+    // Since this command holds an IX lock on the DB and the global lock throughout
+    // the lifetime of this operation, setFCV should not be allowed to abort the transaction
+    // performing the compaction. Otherwise, on retry, the transaction may attempt to
+    // acquire the global lock in IX mode, while setFCV is already waiting to acquire it
+    // in S mode, causing a deadlock.
+    FixedFCVRegion fixedFcv(opCtx);
 
     const auto& edcNss = request.getNamespace();
 
@@ -80,7 +80,8 @@ CompactStats compactEncryptedCompactionCollection(OperationContext* opCtx,
 
     AutoGetDb autoDb(opCtx, edcNss.dbName(), MODE_IX);
     uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "Database '" << edcNss.db() << "' does not exist",
+            str::stream() << "Database '" << edcNss.dbName().toStringForErrorMsg()
+                          << "' does not exist",
             autoDb.getDb());
 
     auto catalog = CollectionCatalog::get(opCtx);
@@ -93,7 +94,8 @@ CompactStats compactEncryptedCompactionCollection(OperationContext* opCtx,
                 "Cannot compact structured encryption data on a view",
                 !catalog->lookupView(opCtx, edcNss));
         uasserted(ErrorCodes::NamespaceNotFound,
-                  str::stream() << "Collection '" << edcNss << "' does not exist");
+                  str::stream() << "Collection '" << edcNss.toStringForErrorMsg()
+                                << "' does not exist");
     }
 
     validateCompactRequest(request, *edc);
@@ -101,7 +103,12 @@ CompactStats compactEncryptedCompactionCollection(OperationContext* opCtx,
     auto namespaces =
         uassertStatusOK(EncryptedStateCollectionsNamespaces::createFromDataCollection(*edc));
 
+    // Acquire exclusive lock on the associated 'ecoc.lock' namespace to serialize calls
+    // to cleanup and compact on the same EDC namespace
+    Lock::CollectionLock compactionLock(opCtx, namespaces.ecocLockNss, MODE_X);
+
     // Step 1: rename the ECOC collection if it exists
+    catalog = CollectionCatalog::get(opCtx);
     auto ecoc = catalog->lookupCollectionByNamespace(opCtx, namespaces.ecocNss);
     auto ecocRename = catalog->lookupCollectionByNamespace(opCtx, namespaces.ecocRenameNss);
 
@@ -168,7 +175,7 @@ CompactStats compactEncryptedCompactionCollection(OperationContext* opCtx,
 
         uassert(ErrorCodes::NamespaceNotFound,
                 str::stream() << "Renamed encrypted compaction collection "
-                              << namespaces.ecocRenameNss
+                              << namespaces.ecocRenameNss.toStringForErrorMsg()
                               << " no longer exists prior to compaction",
                 tempEcocColl.getCollection());
 

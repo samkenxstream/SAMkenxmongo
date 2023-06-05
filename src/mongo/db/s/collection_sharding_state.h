@@ -90,10 +90,14 @@ public:
 
         ScopedCollectionShardingState(Lock::ResourceLock lock, CollectionShardingState* css);
 
+        // Constructor without the ResourceLock.
+        // Important: Only for use in non-shard servers!
+        ScopedCollectionShardingState(CollectionShardingState* css);
+
         static ScopedCollectionShardingState acquireScopedCollectionShardingState(
             OperationContext* opCtx, const NamespaceString& nss, LockMode mode);
 
-        Lock::ResourceLock _lock;
+        boost::optional<Lock::ResourceLock> _lock;
         CollectionShardingState* _css;
     };
     static ScopedCollectionShardingState assertCollectionLockedAndAcquire(
@@ -112,18 +116,13 @@ public:
     static void appendInfoForShardingStateCommand(OperationContext* opCtx, BSONObjBuilder* builder);
 
     /**
-     * Attaches info for server status.
-     */
-    static void appendInfoForServerStatus(OperationContext* opCtx, BSONObjBuilder* builder);
-
-    /**
      * Returns the namespace to which this CSS corresponds.
      */
     virtual const NamespaceString& nss() const = 0;
 
     /**
      * If the shard currently doesn't know whether the collection is sharded or not, it will throw a
-     * StaleConfig exception.
+     * StaleConfig error.
      *
      * If the request doesn't have a shard version all collections will be treated as UNSHARDED.
      *
@@ -140,7 +139,7 @@ public:
      *
      * If the shard currently doesn't know whether the collection is sharded or not, or if the
      * expected shard version doesn't match with the one in the OperationShardingState, it will
-     * throw a StaleConfig exception.
+     * throw a StaleConfig error.
      *
      * If the operation context contains an 'atClusterTime', the returned filtering object will be
      * tied to a specific point in time. Otherwise, it will reference the latest cluster time
@@ -189,7 +188,7 @@ public:
 
     /**
      * Checks whether the shard version in the operation context is compatible with the shard
-     * version of the collection and if not, throws StaleConfigException populated with the received
+     * version of the collection and if not, throws StaleConfig error populated with the received
      * and wanted versions.
      *
      * If the request is not versioned all collections will be treated as UNSHARDED.
@@ -203,11 +202,6 @@ public:
      * Appends information about the shard version of the collection.
      */
     virtual void appendShardVersion(BSONObjBuilder* builder) const = 0;
-
-    /**
-     * Returns the number of ranges scheduled for deletion on the collection.
-     */
-    virtual size_t numberOfRangesScheduledForDeletion() const = 0;
 };
 
 /**

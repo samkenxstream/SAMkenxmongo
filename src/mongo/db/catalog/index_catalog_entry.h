@@ -63,9 +63,6 @@ public:
     IndexCatalogEntry() = default;
     virtual ~IndexCatalogEntry() = default;
 
-    inline IndexCatalogEntry(IndexCatalogEntry&&) = delete;
-    inline IndexCatalogEntry& operator=(IndexCatalogEntry&&) = delete;
-
     virtual const std::string& getIdent() const = 0;
     virtual std::shared_ptr<Ident> getSharedIdent() const = 0;
     virtual void setIdent(std::shared_ptr<Ident> newIdent) = 0;
@@ -156,23 +153,9 @@ public:
                                   const MultikeyPaths& multikeyPaths) const = 0;
 
     /**
-     * Returns whether this index is ready for queries. This is potentially unsafe in that it does
-     * not consider whether the index is visible or ready in the current storage snapshot. For
-     * that, use isReadyInMySnapshot() or isPresentInMySnapshot().
+     * Returns whether this index is ready for queries.
      */
-    virtual bool isReady(OperationContext* opCtx) const = 0;
-
-    /**
-     * Safely check whether this index is visible in the durable catalog in the current storage
-     * snapshot.
-     */
-    virtual bool isPresentInMySnapshot(OperationContext* opCtx) const = 0;
-
-    /**
-     * Check whether this index is ready in the durable catalog in the current storage snapshot. It
-     * is unsafe to call this if isPresentInMySnapshot() has not also been checked.
-     */
-    virtual bool isReadyInMySnapshot(OperationContext* opCtx) const = 0;
+    virtual bool isReady() const = 0;
 
     /**
      * Returns true if this index is not ready, and it is not currently in the process of being
@@ -185,21 +168,13 @@ public:
      */
     virtual bool shouldValidateDocument() const = 0;
 
-    /**
-     * If return value is not boost::none, reads with majority read concern using an older snapshot
-     * must treat this index as unfinished.
-     */
-    virtual boost::optional<Timestamp> getMinimumVisibleSnapshot() const = 0;
-
-    virtual void setMinimumVisibleSnapshot(Timestamp name) = 0;
-
     virtual const UpdateIndexData& getIndexedPaths() const = 0;
 };
 
 class IndexCatalogEntryContainer {
 public:
-    typedef std::vector<std::shared_ptr<IndexCatalogEntry>>::const_iterator const_iterator;
-    typedef std::vector<std::shared_ptr<IndexCatalogEntry>>::const_iterator iterator;
+    typedef std::vector<std::shared_ptr<const IndexCatalogEntry>>::const_iterator const_iterator;
+    typedef std::vector<std::shared_ptr<const IndexCatalogEntry>>::const_iterator iterator;
 
     const_iterator begin() const {
         return _entries.begin();
@@ -226,13 +201,13 @@ public:
     /**
      * Removes from _entries and returns the matching entry or NULL if none matches.
      */
-    std::shared_ptr<IndexCatalogEntry> release(const IndexDescriptor* desc);
+    std::shared_ptr<const IndexCatalogEntry> release(const IndexDescriptor* desc);
 
     bool remove(const IndexDescriptor* desc) {
         return static_cast<bool>(release(desc));
     }
 
-    void add(std::shared_ptr<IndexCatalogEntry>&& entry) {
+    void add(std::shared_ptr<const IndexCatalogEntry>&& entry) {
         _entries.push_back(std::move(entry));
     }
 
@@ -241,6 +216,6 @@ public:
     }
 
 private:
-    std::vector<std::shared_ptr<IndexCatalogEntry>> _entries;
+    std::vector<std::shared_ptr<const IndexCatalogEntry>> _entries;
 };
 }  // namespace mongo

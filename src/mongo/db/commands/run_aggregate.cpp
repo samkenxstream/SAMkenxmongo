@@ -63,6 +63,7 @@
 #include "mongo/db/pipeline/plan_executor_pipeline.h"
 #include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/pipeline/search_helper.h"
+#include "mongo/db/query/aggregate_request_shapifier.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/cqf_command_utils.h"
@@ -76,11 +77,12 @@
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner_common.h"
-#include "mongo/db/query/telemetry.h"
+#include "mongo/db/query/query_stats.h"
 #include "mongo/db/read_concern.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/query_analysis_writer.h"
@@ -154,11 +156,13 @@ bool handleCursorCommand(OperationContext* opCtx,
             invariant(cursors[idx]);
 
             BSONObjBuilder cursorResult;
-            appendCursorResponseObject(cursors[idx]->cursorid(),
-                                       nsForCursor,
-                                       BSONArray(),
-                                       cursors[idx]->getExecutor()->getExecutorType(),
-                                       &cursorResult);
+            appendCursorResponseObject(
+                cursors[idx]->cursorid(),
+                nsForCursor,
+                BSONArray(),
+                cursors[idx]->getExecutor()->getExecutorType(),
+                &cursorResult,
+                SerializationContext::stateCommandReply(request.getSerializationContext()));
             cursorResult.appendBool("ok", 1);
 
             cursorsBuilder.append(cursorResult.obj());
@@ -289,7 +293,10 @@ bool handleCursorCommand(OperationContext* opCtx,
     }
 
     const CursorId cursorId = cursor ? cursor->cursorid() : 0LL;
-    responseBuilder.done(cursorId, nsForCursor);
+    responseBuilder.done(
+        cursorId,
+        nsForCursor,
+        SerializationContext::stateCommandReply(request.getSerializationContext()));
 
     auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
     metricsCollector.incrementDocUnitsReturned(curOp->getNS(), docUnitsReturned);
@@ -331,8 +338,9 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
         auto resolveViewDefinition = [&](const NamespaceString& ns) -> Status {
             auto resolvedView = view_catalog_helpers::resolveView(opCtx, catalog, ns, boost::none);
             if (!resolvedView.isOK()) {
-                return resolvedView.getStatus().withContext(
-                    str::stream() << "Failed to resolve view '" << involvedNs.ns());
+                return resolvedView.getStatus().withContext(str::stream()
+                                                            << "Failed to resolve view '"
+                                                            << involvedNs.toStringForErrorMsg());
             }
 
             auto&& underlyingNs = resolvedView.getValue().getNamespace();
@@ -426,7 +434,7 @@ Status collatorCompatibleWithPipeline(OperationContext* opCtx,
         if (!CollatorInterface::collatorsMatch(view->defaultCollator(), collator)) {
             return {ErrorCodes::OptionNotSupportedOnView,
                     str::stream() << "Cannot override a view's default collation"
-                                  << potentialViewNs.ns()};
+                                  << potentialViewNs.toStringForErrorMsg()};
         }
     }
     return Status::OK();
@@ -450,18 +458,6 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
                               allowDiskUseByDefault.load());
     expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
     expCtx->collationMatchesDefault = collationMatchesDefault;
-
-    // If the request explicitly specified NOT to use v2 resume tokens for change streams, set this
-    // on the expCtx. This can happen if a the request originated from 6.0 mongos, or in test mode.
-    if (request.getGenerateV2ResumeTokens().has_value()) {
-        // We only ever expect an explicit $_generateV2ResumeTokens to be false.
-        uassert(6528200, "Invalid request for v2 tokens", !request.getGenerateV2ResumeTokens());
-        expCtx->changeStreamTokenVersion = 1;
-    }
-
-    // Set the value of $$USER_ROLES for the aggregation.
-    expCtx->setUserRoles();
-
     return expCtx;
 }
 
@@ -656,6 +652,95 @@ std::vector<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createLegacyEx
     return execs;
 }
 
+Status runAggregateOnView(OperationContext* opCtx,
+                          const NamespaceString& origNss,
+                          const AggregateCommandRequest& request,
+                          const MultipleCollectionAccessor& collections,
+                          boost::optional<std::unique_ptr<CollatorInterface>> collatorToUse,
+                          const ViewDefinition* view,
+                          const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                          std::shared_ptr<const CollectionCatalog> catalog,
+                          const PrivilegeVector& privileges,
+                          CurOp* curOp,
+                          rpc::ReplyBuilderInterface* result,
+                          const std::function<void(void)>& resetContextFn) {
+    auto nss = request.getNamespace();
+    checkCollectionUUIDMismatch(
+        opCtx, nss, collections.getMainCollection(), request.getCollectionUUID());
+
+    uassert(ErrorCodes::CommandNotSupportedOnView,
+            "mapReduce on a view is not supported",
+            !request.getIsMapReduceCommand());
+
+    // Check that the default collation of 'view' is compatible with the operation's
+    // collation. The check is skipped if the request did not specify a collation.
+    if (!request.getCollation().get_value_or(BSONObj()).isEmpty()) {
+        invariant(collatorToUse);  // Should already be resolved at this point.
+        if (!CollatorInterface::collatorsMatch(view->defaultCollator(), collatorToUse->get()) &&
+            !view->timeseries()) {
+
+            return {ErrorCodes::OptionNotSupportedOnView,
+                    "Cannot override a view's default collation"};
+        }
+    }
+
+    // Queries on timeseries views may specify non-default collation whereas queries
+    // on all other types of views must match the default collator (the collation use
+    // to originally create that collections). Thus in the case of operations on TS
+    // views, we use the request's collation.
+    auto timeSeriesCollator = view->timeseries() ? request.getCollation() : boost::none;
+
+    auto resolvedView =
+        uassertStatusOK(view_catalog_helpers::resolveView(opCtx, catalog, nss, timeSeriesCollator));
+
+    // With the view & collation resolved, we can relinquish locks.
+    resetContextFn();
+
+    // Set this operation's shard version for the underlying collection to unsharded.
+    // This is prerequisite for future shard versioning checks.
+    boost::optional<ScopedSetShardRole> scopeSetShardRole;
+    if (!serverGlobalParams.clusterRole.has(ClusterRole::None)) {
+        scopeSetShardRole.emplace(opCtx,
+                                  resolvedView.getNamespace(),
+                                  ShardVersion::UNSHARDED() /* shardVersion */,
+                                  boost::none /* databaseVersion */);
+    };
+    uassert(std::move(resolvedView),
+            "Explain of a resolved view must be executed by mongos",
+            !ShardingState::get(opCtx)->enabled() || !request.getExplain());
+
+    // Parse the resolved view into a new aggregation request.
+    auto newRequest = resolvedView.asExpandedViewAggregation(request);
+    auto newCmd = aggregation_request_helper::serializeToCommandObj(newRequest);
+
+    auto status{Status::OK()};
+    try {
+        status = runAggregate(opCtx, origNss, newRequest, newCmd, privileges, result);
+    } catch (const ExceptionForCat<ErrorCategory::StaleShardVersionError>& ex) {
+        // Since we expect the view to be UNSHARDED, if we reached to this point there are
+        // two possibilities:
+        //   1. The shard doesn't know what its shard version/state is and needs to recover
+        //      it (in which case we throw so that the shard can run recovery)
+        //   2. The collection references by the view is actually SHARDED, in which case the
+        //      router must execute it
+        if (const auto staleInfo{ex.extraInfo<StaleConfigInfo>()}) {
+            uassert(std::move(resolvedView),
+                    "Resolved views on sharded collections must be executed by mongos",
+                    !staleInfo->getVersionWanted());
+        }
+        throw;
+    }
+
+    {
+        // Set the namespace of the curop back to the view namespace so ctx records
+        // stats on this view namespace on destruction.
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        curOp->setNS_inlock(nss);
+    }
+
+    return status;
+}
+
 }  // namespace
 
 Status runAggregate(OperationContext* opCtx,
@@ -695,7 +780,10 @@ Status runAggregate(OperationContext* opCtx,
             options.isInitialResponse = true;
             CursorResponseBuilder responseBuilder(result, options);
             responseBuilder.setWasStatementExecuted(true);
-            responseBuilder.done(0LL, origNss);
+            responseBuilder.done(
+                0LL,
+                origNss,
+                SerializationContext::stateCommandReply(request.getSerializationContext()));
             return Status::OK();
         }
     }
@@ -756,15 +844,6 @@ Status runAggregate(OperationContext* opCtx,
         collections.clear();
     };
 
-    auto registerTelemetry = [&]() -> void {
-        // Register telemetry. Exclude queries against collections with encrypted fields.
-        // We still collect telemetry on collection-less aggregations.
-        if (!(ctx && ctx->getCollection() &&
-              ctx->getCollection()->getCollectionOptions().encryptedFieldConfig)) {
-            telemetry::registerAggRequest(request, opCtx);
-        }
-    };
-
     std::vector<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> execs;
     boost::intrusive_ptr<ExpressionContext> expCtx;
     auto curOp = CurOp::get(opCtx);
@@ -795,9 +874,8 @@ Status runAggregate(OperationContext* opCtx,
             nss = NamespaceString::kRsOplogNamespace;
 
             // In case of serverless the change stream will be opened on the change collection.
-            const bool changeCollectionsMode =
-                change_stream_serverless_helpers::isChangeCollectionsModeActive();
-            if (changeCollectionsMode) {
+            const bool isServerless = change_stream_serverless_helpers::isServerlessEnvironment();
+            if (isServerless) {
                 const auto tenantId =
                     change_stream_serverless_helpers::resolveTenantId(origNss.tenantId());
 
@@ -808,11 +886,11 @@ Status runAggregate(OperationContext* opCtx,
             }
 
             // Assert that a change stream on the config server is always opened on the oplog.
-            tassert(
-                6763400,
-                str::stream() << "Change stream was unexpectedly opened on the namespace: " << nss
-                              << " in the config server",
-                !serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer) || nss.isOplog());
+            tassert(6763400,
+                    str::stream() << "Change stream was unexpectedly opened on the namespace: "
+                                  << nss.toStringForErrorMsg() << " in the config server",
+                    !serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer) ||
+                        nss.isOplog());
 
             // Upgrade and wait for read concern if necessary.
             _adjustChangeStreamReadConcern(opCtx);
@@ -823,28 +901,27 @@ Status runAggregate(OperationContext* opCtx,
                 auto view = catalog->lookupView(opCtx, origNss);
                 uassert(ErrorCodes::CommandNotSupportedOnView,
                         str::stream() << "Cannot run aggregation on timeseries with namespace "
-                                      << origNss.ns(),
+                                      << origNss.toStringForErrorMsg(),
                         !view || !view->timeseries());
                 uassert(ErrorCodes::CommandNotSupportedOnView,
-                        str::stream()
-                            << "Namespace " << origNss.ns() << " is a view, not a collection",
+                        str::stream() << "Namespace " << origNss.toStringForErrorMsg()
+                                      << " is a view, not a collection",
                         !view);
             }
 
             // If the user specified an explicit collation, adopt it; otherwise, use the simple
             // collation. We do not inherit the collection's default collation or UUID, since
             // the stream may be resuming from a point before the current UUID existed.
-            auto [collator, match] = PipelineD::resolveCollator(
+            auto [collator, match] = resolveCollator(
                 opCtx, request.getCollation().get_value_or(BSONObj()), CollectionPtr());
             collatorToUse.emplace(std::move(collator));
             collatorToUseMatchesDefault = match;
 
             // Obtain collection locks on the execution namespace; that is, the oplog.
             initContext(auto_get_collection::ViewMode::kViewsForbidden);
-            registerTelemetry();
             uassert(ErrorCodes::ChangeStreamNotEnabled,
                     "Change streams must be enabled before being used",
-                    !changeCollectionsMode ||
+                    !isServerless ||
                         change_stream_serverless_helpers::isChangeStreamEnabled(opCtx,
                                                                                 *nss.tenantId()));
         } else if (nss.isCollectionlessAggregateNS() && pipelineInvolvedNamespaces.empty()) {
@@ -859,22 +936,19 @@ Status runAggregate(OperationContext* opCtx,
                                  Top::LockType::NotLocked,
                                  AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
                                  0);
-            auto [collator, match] = PipelineD::resolveCollator(
+            auto [collator, match] = resolveCollator(
                 opCtx, request.getCollation().get_value_or(BSONObj()), CollectionPtr());
             collatorToUse.emplace(std::move(collator));
             collatorToUseMatchesDefault = match;
             tassert(6235101,
                     "A collection-less aggregate should not take any locks",
                     ctx == boost::none);
-            registerTelemetry();
         } else {
             // This is a regular aggregation. Lock the collection or view.
             initContext(auto_get_collection::ViewMode::kViewsPermitted);
-            registerTelemetry();
-            auto [collator, match] =
-                PipelineD::resolveCollator(opCtx,
-                                           request.getCollation().get_value_or(BSONObj()),
-                                           collections.getMainCollection());
+            auto [collator, match] = resolveCollator(opCtx,
+                                                     request.getCollation().get_value_or(BSONObj()),
+                                                     collections.getMainCollection());
             collatorToUse.emplace(std::move(collator));
             collatorToUseMatchesDefault = match;
             if (collections.hasMainCollection()) {
@@ -887,86 +961,24 @@ Status runAggregate(OperationContext* opCtx,
         // recursively calling runAggregate(), which will re-acquire locks on the underlying
         // collection.  (The lock must be released because recursively acquiring locks on the
         // database will prohibit yielding.)
-        if (ctx && ctx->getView() && !liteParsedPipeline.startsWithCollStats()) {
-            invariant(nss != NamespaceString::kRsOplogNamespace);
-            invariant(!nss.isCollectionlessAggregateNS());
-
-            checkCollectionUUIDMismatch(
-                opCtx, nss, collections.getMainCollection(), request.getCollectionUUID());
-
-            uassert(ErrorCodes::CommandNotSupportedOnView,
-                    "mapReduce on a view is not supported",
-                    !request.getIsMapReduceCommand());
-
-            // Check that the default collation of 'view' is compatible with the operation's
-            // collation. The check is skipped if the request did not specify a collation.
-            if (!request.getCollation().get_value_or(BSONObj()).isEmpty()) {
-                invariant(collatorToUse);  // Should already be resolved at this point.
-                if (!CollatorInterface::collatorsMatch(ctx->getView()->defaultCollator(),
-                                                       collatorToUse->get()) &&
-                    !ctx->getView()->timeseries()) {
-
-                    return {ErrorCodes::OptionNotSupportedOnView,
-                            "Cannot override a view's default collation"};
-                }
-            }
-
-            // Queries on timeseries views may specify non-default collation whereas queries
-            // on all other types of views must match the default collator (the collation use
-            // to originally create that collections). Thus in the case of operations on TS
-            // views, we use the request's collation.
-            auto timeSeriesCollator =
-                ctx->getView()->timeseries() ? request.getCollation() : boost::none;
-
-            auto resolvedView = uassertStatusOK(
-                view_catalog_helpers::resolveView(opCtx, catalog, nss, timeSeriesCollator));
-
-            // With the view & collation resolved, we can relinquish locks.
-            resetContext();
-
-            // Set this operation's shard version for the underlying collection to unsharded.
-            // This is prerequisite for future shard versioning checks.
-            boost::optional<ScopedSetShardRole> scopeSetShardRole;
-            if (!serverGlobalParams.clusterRole.has(ClusterRole::None)) {
-                scopeSetShardRole.emplace(opCtx,
-                                          resolvedView.getNamespace(),
-                                          ShardVersion::UNSHARDED() /* shardVersion */,
-                                          boost::none /* databaseVersion */);
-            };
-            uassert(std::move(resolvedView),
-                    "Explain of a resolved view must be executed by mongos",
-                    !ShardingState::get(opCtx)->enabled() || !request.getExplain());
-
-            // Parse the resolved view into a new aggregation request.
-            auto newRequest = resolvedView.asExpandedViewAggregation(request);
-            auto newCmd = aggregation_request_helper::serializeToCommandObj(newRequest);
-
-            auto status{Status::OK()};
-            try {
-                status = runAggregate(opCtx, origNss, newRequest, newCmd, privileges, result);
-            } catch (const ExceptionForCat<ErrorCategory::StaleShardVersionError>& ex) {
-                // Since we expect the view to be UNSHARDED, if we reached to this point there are
-                // two possibilities:
-                //   1. The shard doesn't know what its shard version/state is and needs to recover
-                //      it (in which case we throw so that the shard can run recovery)
-                //   2. The collection references by the view is actually SHARDED, in which case the
-                //      router must execute it
-                if (const auto staleInfo{ex.extraInfo<StaleConfigInfo>()}) {
-                    uassert(std::move(resolvedView),
-                            "Resolved views on sharded collections must be executed by mongos",
-                            !staleInfo->getVersionWanted());
-                }
-                throw;
-            }
-
-            {
-                // Set the namespace of the curop back to the view namespace so ctx records
-                // stats on this view namespace on destruction.
-                stdx::lock_guard<Client> lk(*opCtx->getClient());
-                curOp->setNS_inlock(nss);
-            }
-
-            return status;
+        // We do not need to expand the view pipeline when there is a $collStats stage, as
+        // $collStats is supported on a view namespace. For a time-series collection, however, the
+        // view is abstracted out for the users, so we needed to resolve the namespace to get the
+        // underlying bucket collection.
+        if (ctx && ctx->getView() &&
+            (!liteParsedPipeline.startsWithCollStats() || ctx->getView()->timeseries())) {
+            return runAggregateOnView(opCtx,
+                                      origNss,
+                                      request,
+                                      collections,
+                                      std::move(collatorToUse),
+                                      ctx->getView(),
+                                      expCtx,
+                                      catalog,
+                                      privileges,
+                                      curOp,
+                                      result,
+                                      resetContext);
         }
 
         // If collectionUUID was provided, verify the collection exists and has the expected UUID.
@@ -995,6 +1007,33 @@ Status runAggregate(OperationContext* opCtx,
         curOp->beginQueryPlanningTimer();
         expCtx->stopExpressionCounters();
 
+        // Register query stats with the pre-optimized pipeline. Exclude queries against collections
+        // with encrypted fields. We still collect query stats on collection-less aggregations.
+        // TODO SERVER-75912 make sure query shape is unresolved for queries on views
+        if (!(ctx && ctx->getCollection() &&
+              ctx->getCollection()->getCollectionOptions().encryptedFieldConfig)) {
+            query_stats::registerRequest(expCtx, nss, [&]() {
+                return std::make_unique<query_stats::AggregateRequestShapifier>(
+                    request, *pipeline, expCtx);
+            });
+        }
+
+        // This prevents opening a new change stream in the critical section of a serverless shard
+        // split or merge operation to prevent resuming on the recipient with a resume token higher
+        // than that operation's blockTimestamp.
+        //
+        // If we do this check before picking a startTime for a change stream then the primary could
+        // go into a blocking state between the check and getting the timestamp resulting in a
+        // startTime greater than blockTimestamp. Therefore we must do this check here, after the
+        // pipeline has been parsed and startTime has been initialized.
+        if (liteParsedPipeline.hasChangeStream()) {
+            tenant_migration_access_blocker::assertCanOpenChangeStream(expCtx->opCtx, nss.dbName());
+        }
+
+        // After parsing to detect if $$USER_ROLES is referenced in the query, set the value of
+        // $$USER_ROLES for the aggregation.
+        expCtx->setUserRoles();
+
         if (!request.getAllowDiskUse().value_or(true)) {
             allowDiskUseFalseCounter.increment();
         }
@@ -1019,10 +1058,6 @@ Status runAggregate(OperationContext* opCtx,
                     opCtx, nss, request.getEncryptionInformation().value(), std::move(pipeline));
                 request.getEncryptionInformation()->setCrudProcessed(true);
             }
-
-            // Set the telemetryStoreKey to none so telemetry isn't collected when we've done a FLE
-            // rewrite.
-            CurOp::get(opCtx)->debug().telemetryStoreKey = boost::none;
         }
 
         pipeline->optimizePipeline();
@@ -1170,12 +1205,14 @@ Status runAggregate(OperationContext* opCtx,
             // appropriate collection lock must be already held. Make sure it has not been released
             // yet.
             invariant(ctx);
-            Explain::explainStages(explainExecutor,
-                                   collections,
-                                   *(expCtx->explain),
-                                   BSON("optimizedPipeline" << true),
-                                   cmdObj,
-                                   &bodyBuilder);
+            Explain::explainStages(
+                explainExecutor,
+                collections,
+                *(expCtx->explain),
+                BSON("optimizedPipeline" << true),
+                SerializationContext::stateCommandReply(request.getSerializationContext()),
+                cmdObj,
+                &bodyBuilder);
         }
     } else {
         // Cursor must be specified, if explain is not.
@@ -1189,12 +1226,9 @@ Status runAggregate(OperationContext* opCtx,
         PlanSummaryStats stats;
         planExplainer.getSummaryStats(&stats);
         curOp->debug().setPlanSummaryMetrics(stats);
+        curOp->setEndOfOpMetrics(stats.nReturned);
 
-        if (keepCursor) {
-            collectTelemetryMongod(opCtx, pins[0], stats.nReturned);
-        } else {
-            collectTelemetryMongod(opCtx, cmdObj, stats.nReturned);
-        }
+        collectQueryStatsMongod(opCtx, pins[0]);
 
         // For an optimized away pipeline, signal the cache that a query operation has completed.
         // For normal pipelines this is done in DocumentSourceCursor.

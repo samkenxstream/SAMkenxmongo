@@ -32,6 +32,7 @@
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/s/move_primary/move_primary_recipient_cmds_gen.h"
 #include "mongo/db/s/move_primary/move_primary_server_parameters_gen.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/s/grid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kMovePrimary
@@ -41,10 +42,11 @@ namespace {
 // Both of these failpoints have the same implementation. A single failpoint can't be active
 // multiple times with different arguments, but setting up more complex scenarios sometimes requires
 // multiple failpoints.
-MONGO_FAIL_POINT_DEFINE(pauseDuringMovePrimaryDonorStateEnumTransition);
-MONGO_FAIL_POINT_DEFINE(pauseDuringMovePrimaryDonorStateEnumTransitionAlternate);
+MONGO_FAIL_POINT_DEFINE(pauseDuringMovePrimaryDonorStateTransition);
+MONGO_FAIL_POINT_DEFINE(pauseDuringMovePrimaryDonorStateTransitionAlternate);
 
 MONGO_FAIL_POINT_DEFINE(pauseBeforeBeginningMovePrimaryDonorWorkflow);
+MONGO_FAIL_POINT_DEFINE(pauseBeforeMovePrimaryDonorPersistsBlockTimestamp);
 MONGO_FAIL_POINT_DEFINE(pauseBeforeBeginningMovePrimaryDonorCleanup);
 
 enum StateTransitionProgress {
@@ -72,7 +74,7 @@ boost::optional<StateTransitionProgress> readProgressArgument(const BSONObj& dat
 boost::optional<MovePrimaryDonorStateEnum> readStateArgument(const BSONObj& data) {
     try {
         auto arg = data.getStringField("state");
-        IDLParserContext ectx("pauseDuringMovePrimaryDonorStateEnumTransition::readStateArgument");
+        IDLParserContext ectx("pauseDuringMovePrimaryDonorStateTransition::readStateArgument");
         return MovePrimaryDonorState_parse(ectx, arg);
     } catch (...) {
         return boost::none;
@@ -89,7 +91,7 @@ void evaluatePauseDuringStateTransitionFailpoint(StateTransitionProgress progres
             auto desiredState = readStateArgument(data);
             if (!desiredProgress.has_value() || !desiredState.has_value()) {
                 LOGV2(7306200,
-                      "pauseDuringMovePrimaryDonorStateEnumTransition failpoint data must contain "
+                      "pauseDuringMovePrimaryDonorStateTransition failpoint data must contain "
                       "progress and state arguments",
                       "failpoint"_attr = failpoint.getName(),
                       "data"_attr = data);
@@ -101,8 +103,8 @@ void evaluatePauseDuringStateTransitionFailpoint(StateTransitionProgress progres
 
 void evaluatePauseDuringStateTransitionFailpoints(StateTransitionProgress progress,
                                                   MovePrimaryDonorStateEnum newState) {
-    const auto fps = {std::ref(pauseDuringMovePrimaryDonorStateEnumTransition),
-                      std::ref(pauseDuringMovePrimaryDonorStateEnumTransitionAlternate)};
+    const auto fps = {std::ref(pauseDuringMovePrimaryDonorStateTransition),
+                      std::ref(pauseDuringMovePrimaryDonorStateTransitionAlternate)};
     for (auto& fp : fps) {
         evaluatePauseDuringStateTransitionFailpoint(progress, newState, fp);
     }
@@ -146,7 +148,8 @@ void MovePrimaryDonorService::checkIfConflictsWithOtherInstances(
         const auto& existingMetadata = typed->getMetadata();
         uassert(ErrorCodes::ConflictingOperationInProgress,
                 str::stream() << "Existing movePrimary operation for database "
-                              << newMetadata.getDatabaseName() << " is still ongoing",
+                              << newMetadata.getDatabaseName().toStringForErrorMsg()
+                              << " is still ongoing",
                 newMetadata.getDatabaseName() != existingMetadata.getDatabaseName());
     }
 }
@@ -160,6 +163,16 @@ std::shared_ptr<repl::PrimaryOnlyService::Instance> MovePrimaryDonorService::con
                                               initialDoc,
                                               getInstanceCleanupExecutor(),
                                               _makeDependencies(initialDoc));
+}
+
+std::vector<std::shared_ptr<MovePrimaryDonor>> MovePrimaryDonorService::getAllDonorInstances(
+    OperationContext* opCtx) {
+    std::vector<std::shared_ptr<MovePrimaryDonor>> result;
+    auto instances = getAllInstances(opCtx);
+    for (const auto& instance : instances) {
+        result.push_back(checked_pointer_cast<MovePrimaryDonor>(instance));
+    }
+    return result;
 }
 
 MovePrimaryDonorDependencies MovePrimaryDonorService::_makeDependencies(
@@ -265,7 +278,7 @@ void MovePrimaryDonorExternalState::syncDataOnRecipient(OperationContext* opCtx,
                                                         boost::optional<Timestamp> timestamp) {
     MovePrimaryRecipientSyncData request;
     request.setMovePrimaryCommonMetadata(getMetadata());
-    request.setDbName(getMetadata().getDatabaseName().db());
+    request.setDbName(getMetadata().getDatabaseName().dbName());
     if (timestamp) {
         request.setReturnAfterReachingDonorTimestamp(*timestamp);
     }
@@ -275,25 +288,27 @@ void MovePrimaryDonorExternalState::syncDataOnRecipient(OperationContext* opCtx,
 void MovePrimaryDonorExternalState::abortMigrationOnRecipient(OperationContext* opCtx) {
     MovePrimaryRecipientAbortMigration request;
     request.setMovePrimaryCommonMetadata(getMetadata());
-    request.setDbName(getMetadata().getDatabaseName().db());
+    request.setDbName(getMetadata().getDatabaseName().dbName());
     _runCommandOnRecipient(opCtx, request.toBSON({}));
 }
 
 void MovePrimaryDonorExternalState::forgetMigrationOnRecipient(OperationContext* opCtx) {
     MovePrimaryRecipientForgetMigration request;
     request.setMovePrimaryCommonMetadata(getMetadata());
-    request.setDbName(getMetadata().getDatabaseName().db());
+    request.setDbName(getMetadata().getDatabaseName().dbName());
     _runCommandOnRecipient(opCtx, request.toBSON({}));
 }
 
 void MovePrimaryDonorExternalState::_runCommandOnRecipient(OperationContext* opCtx,
                                                            const BSONObj& command) {
-    uassertStatusOK(runCommand(opCtx,
+    auto response = runCommand(opCtx,
                                getRecipientShardId(),
                                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                                DatabaseName::kAdmin.toString(),
                                command,
-                               Shard::RetryPolicy::kNoRetry));
+                               Shard::RetryPolicy::kNoRetry);
+    uassertStatusOKWithContext(Shard::CommandResponse::getEffectiveStatus(response),
+                               "Received error from remote MovePrimaryRecipient");
 }
 
 MovePrimaryDonorExternalStateImpl::MovePrimaryDonorExternalStateImpl(
@@ -311,6 +326,55 @@ StatusWith<Shard::CommandResponse> MovePrimaryDonorExternalStateImpl::runCommand
     return shard->runCommand(opCtx, readPref, dbName, cmdObj, retryPolicy);
 }
 
+std::shared_ptr<MovePrimaryDonor> MovePrimaryDonor::get(OperationContext* opCtx,
+                                                        const DatabaseName& dbName,
+                                                        const ShardId& toShard) {
+    auto registry = repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext());
+    auto service = checked_cast<MovePrimaryDonorService*>(
+        registry->lookupServiceByName(MovePrimaryDonorService::kServiceName));
+    auto instances = service->getAllDonorInstances(opCtx);
+    for (const auto& instance : instances) {
+        if (_matchesArguments(instance, dbName, toShard)) {
+            return instance;
+        }
+    }
+    return nullptr;
+}
+
+std::shared_ptr<MovePrimaryDonor> MovePrimaryDonor::create(OperationContext* opCtx,
+                                                           const DatabaseName& dbName,
+                                                           const ShardId& toShard) {
+    auto registry = repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext());
+    auto service = registry->lookupServiceByName(MovePrimaryDonorService::kServiceName);
+    MovePrimaryCommonMetadata metadata;
+    metadata.setMigrationId(UUID::gen());
+    metadata.setDatabaseName(NamespaceString{dbName});
+    metadata.setFromShardName(ShardingState::get(opCtx)->shardId());
+    metadata.setToShardName(toShard.toString());
+    MovePrimaryDonorDocument document;
+    document.setId(metadata.getMigrationId());
+    document.setMetadata(std::move(metadata));
+    auto donor = MovePrimaryDonor::getOrCreate(opCtx, service, document.toBSON());
+    uassert(7309100,
+            "Unable to create MovePrimaryDonor using the following initial state: {}"_format(
+                redact(document.toBSON()).toString()),
+            donor);
+    return donor;
+}
+
+bool MovePrimaryDonor::_matchesArguments(const std::shared_ptr<MovePrimaryDonor>& instance,
+                                         const DatabaseName& dbName,
+                                         const ShardId& toShard) {
+    const auto& metadata = instance->getMetadata();
+    if (dbName != metadata.getDatabaseName().dbName()) {
+        return false;
+    }
+    if (toShard.toString() != metadata.getToShardName()) {
+        return false;
+    }
+    return true;
+}
+
 MovePrimaryDonor::MovePrimaryDonor(ServiceContext* serviceContext,
                                    MovePrimaryDonorService* donorService,
                                    MovePrimaryDonorDocument initialState,
@@ -318,8 +382,8 @@ MovePrimaryDonor::MovePrimaryDonor(ServiceContext* serviceContext,
                                    MovePrimaryDonorDependencies dependencies)
     : _serviceContext{serviceContext},
       _donorService{donorService},
-      _metadata{std::move(initialState.getMetadata())},
-      _mutableFields{std::move(initialState.getMutableFields())},
+      _metadata{initialState.getMetadata()},
+      _mutableFields{initialState.getMutableFields()},
       _metrics{MovePrimaryMetrics::initializeFrom(initialState, _serviceContext)},
       _cleanupExecutor{cleanupExecutor},
       _externalState{std::move(dependencies.externalState)} {
@@ -441,9 +505,10 @@ ExecutorFuture<void> MovePrimaryDonor::_runDonorWorkflow() {
         .then([this] { return _waitForForgetThenDoCleanup(); })
         .thenRunOn(_cleanupExecutor)
         .onCompletion([this, self = shared_from_this()](Status okOrStepdownError) {
-            invariant(okOrStepdownError.isOK() || _cancelState->isSteppingDown());
-            const auto& finalResult =
-                _cancelState->isSteppingDown() ? okOrStepdownError : _getOperationStatus();
+            bool steppingDown =
+                _cancelState->isSteppingDown() || (**_taskExecutor)->isShuttingDown();
+            invariant(okOrStepdownError.isOK() || steppingDown);
+            const auto& finalResult = steppingDown ? okOrStepdownError : _getOperationStatus();
             _ensureProgressPromisesAreFulfilled(finalResult);
             return finalResult;
         });
@@ -552,6 +617,7 @@ ExecutorFuture<void> MovePrimaryDonor::_doWaitingToBlockWrites() {
     return _waitUntilReadyToBlockWrites()
         .then([this] { return _waitUntilCurrentlyBlockingWrites(); })
         .then([this](Timestamp blockingWritesTimestamp) {
+            pauseBeforeMovePrimaryDonorPersistsBlockTimestamp.pauseWhileSet();
             return _persistBlockingWritesTimestamp(blockingWritesTimestamp);
         });
 }
@@ -577,10 +643,18 @@ ExecutorFuture<Timestamp> MovePrimaryDonor::_waitUntilCurrentlyBlockingWrites() 
 }
 
 void MovePrimaryDonor::onBeganBlockingWrites(StatusWith<Timestamp> blockingWritesTimestamp) {
+    stdx::unique_lock lock(_mutex);
+    if (_currentlyBlockingWritesPromise.getFuture().isReady()) {
+        return;
+    }
     _currentlyBlockingWritesPromise.setFrom(blockingWritesTimestamp);
 }
 
 void MovePrimaryDonor::onReadyToForget() {
+    stdx::unique_lock lock(_mutex);
+    if (_readyToForgetPromise.getFuture().isReady()) {
+        return;
+    }
     _readyToForgetPromise.setFrom(Status::OK());
 }
 

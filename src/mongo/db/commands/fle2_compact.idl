@@ -35,7 +35,7 @@ imports:
 
 structs:
     CompactStructuredEncryptionDataCommandReply:
-        description: "Reply from the {compactStructuredEncryptedData: ...} command"
+        description: "Reply from the {compactStructuredEncryptionData: ...} command"
         strict: true
         is_command_reply: true
         fields:

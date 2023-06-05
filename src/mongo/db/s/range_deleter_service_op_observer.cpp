@@ -43,7 +43,7 @@
 namespace mongo {
 namespace {
 // Small hack used to be able to retrieve the full removed document in the `onDelete` method
-const auto deletedDocumentDecoration = OperationContext::declareDecoration<BSONObj>();
+const auto deletedDocumentDecoration = OplogDeleteEntryArgs::declareDecoration<BSONObj>();
 void registerTaskWithOngoingQueriesOnOpLogEntryCommit(OperationContext* opCtx,
                                                       const RangeDeletionTask& rdt) {
 
@@ -59,10 +59,11 @@ void registerTaskWithOngoingQueriesOnOpLogEntryCommit(OperationContext* opCtx,
                 const auto openCursorsIds =
                     CursorManager::get(opCtx)->getCursorIdsForNamespace(rdt.getNss());
                 LOGV2_INFO(
-                    7179200,
+                    6180600,
                     "Range deletion will be scheduled after all possibly dependent queries finish",
                     logAttrs(rdt.getNss()),
-                    "range"_attr = rdt.getRange(),
+                    "collectionUUID"_attr = rdt.getCollectionUuid(),
+                    "range"_attr = redact(rdt.getRange().toString()),
                     "cursorsDirectlyReferringTheNamespace"_attr = openCursorsIds);
             }
             (void)RangeDeleterService::get(opCtx)->registerTask(
@@ -91,7 +92,8 @@ void RangeDeleterServiceOpObserver::onInserts(OperationContext* opCtx,
                                               std::vector<InsertStatement>::const_iterator begin,
                                               std::vector<InsertStatement>::const_iterator end,
                                               std::vector<bool> fromMigrate,
-                                              bool defaultFromMigrate) {
+                                              bool defaultFromMigrate,
+                                              InsertsOpStateAccumulator* opAccumulator) {
     if (coll->ns() == NamespaceString::kRangeDeletionNamespace) {
         for (auto it = begin; it != end; ++it) {
             auto deletionTask = RangeDeletionTask::parse(
@@ -104,7 +106,8 @@ void RangeDeleterServiceOpObserver::onInserts(OperationContext* opCtx,
 }
 
 void RangeDeleterServiceOpObserver::onUpdate(OperationContext* opCtx,
-                                             const OplogUpdateEntryArgs& args) {
+                                             const OplogUpdateEntryArgs& args,
+                                             OpStateAccumulator* opAccumulator) {
     if (args.coll->ns() == NamespaceString::kRangeDeletionNamespace) {
         const bool pendingFieldIsRemoved = [&] {
             return update_oplog_entry::isFieldRemovedByUpdate(
@@ -128,18 +131,21 @@ void RangeDeleterServiceOpObserver::onUpdate(OperationContext* opCtx,
 
 void RangeDeleterServiceOpObserver::aboutToDelete(OperationContext* opCtx,
                                                   const CollectionPtr& coll,
-                                                  BSONObj const& doc) {
+                                                  BSONObj const& doc,
+                                                  OplogDeleteEntryArgs* args,
+                                                  OpStateAccumulator* opAccumulator) {
     if (coll->ns() == NamespaceString::kRangeDeletionNamespace) {
-        deletedDocumentDecoration(opCtx) = doc;
+        deletedDocumentDecoration(args) = doc;
     }
 }
 
 void RangeDeleterServiceOpObserver::onDelete(OperationContext* opCtx,
                                              const CollectionPtr& coll,
                                              StmtId stmtId,
-                                             const OplogDeleteEntryArgs& args) {
+                                             const OplogDeleteEntryArgs& args,
+                                             OpStateAccumulator* opAccumulator) {
     if (coll->ns() == NamespaceString::kRangeDeletionNamespace) {
-        const auto& deletedDoc = deletedDocumentDecoration(opCtx);
+        const auto& deletedDoc = deletedDocumentDecoration(args);
 
         auto deletionTask =
             RangeDeletionTask::parse(IDLParserContext("RangeDeleterServiceOpObserver"), deletedDoc);

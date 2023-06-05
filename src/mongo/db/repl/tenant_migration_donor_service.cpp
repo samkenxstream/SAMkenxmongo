@@ -34,6 +34,7 @@
 #include "mongo/client/connection_string.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/config.h"
+#include "mongo/db//shard_role.h"
 #include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/commands/tenant_migration_donor_cmds_gen.h"
 #include "mongo/db/commands/tenant_migration_recipient_cmds_gen.h"
@@ -42,7 +43,7 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/persistent_task_store.h"
-#include "mongo/db/query/find_command_gen.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/tenant_migration_access_blocker_util.h"
@@ -382,17 +383,6 @@ TenantMigrationDonorService::Instance::_makeRecipientCmdExecutor() {
         Client::initThread(threadName.c_str());
         auto client = Client::getCurrent();
         AuthorizationSession::get(*client)->grantInternalAuthorization(&cc());
-
-        // Ideally, we should also associate the client created by _recipientCmdExecutor with the
-        // TenantMigrationDonorService to make the opCtxs created by the task executor get
-        // registered in the TenantMigrationDonorService, and killed on stepdown. But that would
-        // require passing the pointer to the TenantMigrationService into the Instance and making
-        // constructInstance not const so we can set the client's decoration here. Right now there
-        // is no need for that since the task executor is only used with scheduleRemoteCommand and
-        // no opCtx will be created (the cancellation token is responsible for canceling the
-        // outstanding work on the task executor).
-        stdx::lock_guard<Client> lk(*client);
-        client->setSystemOperationKillableByStepdown(lk);
     };
 
     auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
@@ -539,10 +529,17 @@ ExecutorFuture<repl::OpTime> TenantMigrationDonorService::Instance::_insertState
 
                pauseTenantMigrationBeforeInsertingDonorStateDoc.pauseWhileSet(opCtx);
 
-               AutoGetCollection collection(opCtx, _stateDocumentsNS, MODE_IX);
+               auto collection =
+                   acquireCollection(opCtx,
+                                     CollectionAcquisitionRequest(
+                                         _stateDocumentsNS,
+                                         PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                         repl::ReadConcernArgs::get(opCtx),
+                                         AcquisitionPrerequisites::kWrite),
+                                     MODE_IX);
 
                writeConflictRetry(
-                   opCtx, "TenantMigrationDonorInsertStateDoc", _stateDocumentsNS.ns(), [&] {
+                   opCtx, "TenantMigrationDonorInsertStateDoc", _stateDocumentsNS, [&] {
                        const auto filter =
                            BSON(TenantMigrationDonorDocument::kIdFieldName << _migrationUuid);
                        const auto updateMod = [&]() {
@@ -550,7 +547,7 @@ ExecutorFuture<repl::OpTime> TenantMigrationDonorService::Instance::_insertState
                            return BSON("$setOnInsert" << _stateDoc.toBSON());
                        }();
                        auto updateResult = Helpers::upsert(
-                           opCtx, _stateDocumentsNS, filter, updateMod, /*fromMigrate=*/false);
+                           opCtx, collection, filter, updateMod, /*fromMigrate=*/false);
 
                        // '$setOnInsert' update operator can never modify an existing on-disk state
                        // doc.
@@ -592,11 +589,12 @@ ExecutorFuture<repl::OpTime> TenantMigrationDonorService::Instance::_updateState
                AutoGetCollection collection(opCtx, _stateDocumentsNS, MODE_IX);
 
                uassert(ErrorCodes::NamespaceNotFound,
-                       str::stream() << _stateDocumentsNS.ns() << " does not exist",
+                       str::stream()
+                           << _stateDocumentsNS.toStringForErrorMsg() << " does not exist",
                        collection);
 
                writeConflictRetry(
-                   opCtx, "TenantMigrationDonorUpdateStateDoc", _stateDocumentsNS.ns(), [&] {
+                   opCtx, "TenantMigrationDonorUpdateStateDoc", _stateDocumentsNS, [&] {
                        WriteUnitOfWork wuow(opCtx);
 
                        const auto originalRecordId = Helpers::findOne(
@@ -674,6 +672,7 @@ ExecutorFuture<repl::OpTime> TenantMigrationDonorService::Instance::_updateState
                                                            originalSnapshot,
                                                            updatedStateDocBson,
                                                            collection_internal::kUpdateNoIndexes,
+                                                           nullptr /* indexesAffected */,
                                                            nullptr /* OpDebug* */,
                                                            &args);
 
@@ -707,12 +706,19 @@ TenantMigrationDonorService::Instance::_markStateDocAsGarbageCollectable(
 
                pauseTenantMigrationDonorBeforeMarkingStateGarbageCollectable.pauseWhileSet(opCtx);
 
-               AutoGetCollection collection(opCtx, _stateDocumentsNS, MODE_IX);
+               auto collection =
+                   acquireCollection(opCtx,
+                                     CollectionAcquisitionRequest(
+                                         _stateDocumentsNS,
+                                         PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                         repl::ReadConcernArgs::get(opCtx),
+                                         AcquisitionPrerequisites::kWrite),
+                                     MODE_IX);
 
                writeConflictRetry(
                    opCtx,
                    "TenantMigrationDonorMarkStateDocAsGarbageCollectable",
-                   _stateDocumentsNS.ns(),
+                   _stateDocumentsNS,
                    [&] {
                        const auto filter =
                            BSON(TenantMigrationDonorDocument::kIdFieldName << _migrationUuid);
@@ -721,7 +727,7 @@ TenantMigrationDonorService::Instance::_markStateDocAsGarbageCollectable(
                            return _stateDoc.toBSON();
                        }();
                        auto updateResult = Helpers::upsert(
-                           opCtx, _stateDocumentsNS, filter, updateMod, /*fromMigrate=*/false);
+                           opCtx, collection, filter, updateMod, /*fromMigrate=*/false);
 
                        invariant(updateResult.numDocsModified == 1);
                    });

@@ -81,26 +81,6 @@ TEST_F(TenantMigrationAccessBlockerRegistryTest, AddAccessBlocker) {
         ErrorCodes::ConflictingServerlessOperation);
 }
 
-TEST_F(TenantMigrationAccessBlockerRegistryTest, RemoveAccessBlocker) {
-    auto& registry = TenantMigrationAccessBlockerRegistry::get(getServiceContext());
-    const auto uuid = UUID::gen();
-    const auto tenant = TenantId{OID::gen()};
-
-    registry.add(tenant,
-                 std::make_shared<TenantMigrationDonorAccessBlocker>(getServiceContext(), uuid));
-    ASSERT(registry.getTenantMigrationAccessBlockerForTenantId(
-        tenant, TenantMigrationAccessBlocker::BlockerType::kDonor));
-
-    registry.remove(tenant, TenantMigrationAccessBlocker::BlockerType::kRecipient);
-    ASSERT(registry.getTenantMigrationAccessBlockerForTenantId(
-        tenant, TenantMigrationAccessBlocker::BlockerType::kDonor));
-
-    registry.remove(tenant, TenantMigrationAccessBlocker::BlockerType::kDonor);
-
-    ASSERT_FALSE(registry.getTenantMigrationAccessBlockerForTenantId(
-        tenant, TenantMigrationAccessBlocker::BlockerType::kDonor));
-}
-
 TEST_F(TenantMigrationAccessBlockerRegistryTest, RemoveAccessBlockersForMigration) {
     auto& registry = TenantMigrationAccessBlockerRegistry::get(getServiceContext());
     const auto uuid = UUID::gen();
@@ -139,13 +119,14 @@ TEST_F(TenantMigrationAccessBlockerRegistryTest, GetAccessBlockerForDbName) {
     const auto tenant = TenantId{OID::gen()};
     const auto uuid = UUID::gen();
 
-    ASSERT_FALSE(
-        registry.getAccessBlockersForDbName(DatabaseName{boost::none, tenant.toString() + "_foo"}));
+    ASSERT_FALSE(registry.getAccessBlockersForDbName(
+        DatabaseName::createDatabaseName_forTest(boost::none, tenant.toString() + "_foo")));
 
     // If the MTAB registry is empty (such as in non-serverless deployments) using an invalid
     // tenantId simply returns boost::none. This is required as the underscore can be present in db
     // names for non-serverless deployments.
-    ASSERT_FALSE(registry.getAccessBlockersForDbName(DatabaseName{boost::none, "tenant_foo"}));
+    ASSERT_FALSE(registry.getAccessBlockersForDbName(
+        DatabaseName::createDatabaseName_forTest(boost::none, "tenant_foo")));
 
     auto globalAccessBlocker =
         std::make_shared<TenantMigrationDonorAccessBlocker>(getServiceContext(), UUID::gen());
@@ -153,46 +134,53 @@ TEST_F(TenantMigrationAccessBlockerRegistryTest, GetAccessBlockerForDbName) {
 
     // If the MTAB registry is not empty, it implies we have a serverless deployment. In that case
     // anything before the underscore should be a valid TenantId.
-    ASSERT_THROWS_CODE(registry.getAccessBlockersForDbName(DatabaseName{boost::none, "tenant_foo"}),
+    ASSERT_THROWS_CODE(registry.getAccessBlockersForDbName(
+                           DatabaseName::createDatabaseName_forTest(boost::none, "tenant_foo")),
                        DBException,
                        ErrorCodes::BadValue);
 
-    ASSERT_EQ(
-        registry.getAccessBlockersForDbName(DatabaseName{boost::none, tenant.toString() + "_foo"})
-            ->getDonorAccessBlocker(),
-        globalAccessBlocker);
-    ASSERT_FALSE(registry.getAccessBlockersForDbName(DatabaseName{boost::none, "admin"}));
+    ASSERT_EQ(registry
+                  .getAccessBlockersForDbName(DatabaseName::createDatabaseName_forTest(
+                      boost::none, tenant.toString() + "_foo"))
+                  ->getDonorAccessBlocker(),
+              globalAccessBlocker);
+    ASSERT_FALSE(registry.getAccessBlockersForDbName(DatabaseName::kAdmin));
 
     auto recipientBlocker =
         std::make_shared<TenantMigrationRecipientAccessBlocker>(getServiceContext(), uuid);
     registry.add(tenant, recipientBlocker);
-    ASSERT_EQ(
-        registry.getAccessBlockersForDbName(DatabaseName{boost::none, tenant.toString() + "_foo"})
-            ->getDonorAccessBlocker(),
-        globalAccessBlocker);
-    ASSERT_EQ(
-        registry.getAccessBlockersForDbName(DatabaseName{boost::none, tenant.toString() + "_foo"})
-            ->getRecipientAccessBlocker(),
-        recipientBlocker);
+    ASSERT_EQ(registry
+                  .getAccessBlockersForDbName(DatabaseName::createDatabaseName_forTest(
+                      boost::none, tenant.toString() + "_foo"))
+                  ->getDonorAccessBlocker(),
+              globalAccessBlocker);
+    ASSERT_EQ(registry
+                  .getAccessBlockersForDbName(DatabaseName::createDatabaseName_forTest(
+                      boost::none, tenant.toString() + "_foo"))
+                  ->getRecipientAccessBlocker(),
+              recipientBlocker);
 
     auto donorBlocker =
         std::make_shared<TenantMigrationDonorAccessBlocker>(getServiceContext(), uuid);
     registry.add(tenant, donorBlocker);
-    ASSERT_EQ(
-        registry.getAccessBlockersForDbName(DatabaseName{boost::none, tenant.toString() + "_foo"})
-            ->getDonorAccessBlocker(),
-        donorBlocker);
-    ASSERT_EQ(
-        registry.getAccessBlockersForDbName(DatabaseName{boost::none, tenant.toString() + "_foo"})
-            ->getRecipientAccessBlocker(),
-        recipientBlocker);
+    ASSERT_EQ(registry
+                  .getAccessBlockersForDbName(DatabaseName::createDatabaseName_forTest(
+                      boost::none, tenant.toString() + "_foo"))
+                  ->getDonorAccessBlocker(),
+              donorBlocker);
+    ASSERT_EQ(registry
+                  .getAccessBlockersForDbName(DatabaseName::createDatabaseName_forTest(
+                      boost::none, tenant.toString() + "_foo"))
+                  ->getRecipientAccessBlocker(),
+              recipientBlocker);
 
     {
         RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
         // since we enabled multitenancySupport, having underscore in the dbName won't throw because
         // we have constructed a DatabaseName with a TenantId. Therefore `my` won't be identified as
         // the tenantId.
-        const DatabaseName validUnderscoreDbName = DatabaseName(tenant, "my_Db");
+        const DatabaseName validUnderscoreDbName =
+            DatabaseName::createDatabaseName_forTest(tenant, "my_Db");
         ASSERT(registry.getAccessBlockersForDbName(validUnderscoreDbName) != boost::none);
     }
 }
@@ -251,24 +239,56 @@ TEST_F(TenantMigrationAccessBlockerRegistryTest, GetDonorAccessBlockersForMigrat
         TenantId{OID::gen()},
         std::make_shared<TenantMigrationDonorAccessBlocker>(getServiceContext(), UUID::gen()));
     ASSERT(registry.getDonorAccessBlockersForMigration(uuid).empty());
-    std::cout << "1" << std::endl;
     auto donorBlocker =
         std::make_shared<TenantMigrationDonorAccessBlocker>(getServiceContext(), uuid);
     registry.add(TenantId{OID::gen()}, donorBlocker);
     assertVector(registry.getDonorAccessBlockersForMigration(uuid), {donorBlocker});
-    std::cout << "2" << std::endl;
 
     auto globalBlocker =
         std::make_shared<TenantMigrationDonorAccessBlocker>(getServiceContext(), uuid);
     registry.addGlobalDonorAccessBlocker(globalBlocker);
     assertVector(registry.getDonorAccessBlockersForMigration(uuid), {globalBlocker, donorBlocker});
-    std::cout << "3" << std::endl;
 
     ASSERT(registry.getDonorAccessBlockersForMigration(UUID::gen()).empty());
 
     registry.add(TenantId{OID::gen()},
                  std::make_shared<TenantMigrationDonorAccessBlocker>(getServiceContext(), uuid));
     ASSERT_EQ(registry.getDonorAccessBlockersForMigration(uuid).size(), 3);
+}
+
+TEST_F(TenantMigrationAccessBlockerRegistryTest, GetRecipientAccessBlockersForMigration) {
+    auto& registry = TenantMigrationAccessBlockerRegistry::get(getServiceContext());
+    const auto uuid = UUID::gen();
+
+    auto assertVector =
+        [](const std::vector<std::shared_ptr<TenantMigrationRecipientAccessBlocker>>& result,
+           const std::vector<std::shared_ptr<TenantMigrationRecipientAccessBlocker>>& expected) {
+            // Order might change. Check that vector size is equal and all expected entries are
+            // found.
+            ASSERT_EQ(result.size(), expected.size());
+            for (const auto& ptr : expected) {
+                ASSERT_NE(std::find_if(result.begin(),
+                                       result.end(),
+                                       [ptr](const auto& entry) { return entry == ptr; }),
+                          result.end());
+            }
+        };
+
+    registry.add(
+        TenantId{OID::gen()},
+        std::make_shared<TenantMigrationRecipientAccessBlocker>(getServiceContext(), UUID::gen()));
+    ASSERT(registry.getRecipientAccessBlockersForMigration(uuid).empty());
+
+    auto recipientBlocker =
+        std::make_shared<TenantMigrationRecipientAccessBlocker>(getServiceContext(), uuid);
+    registry.add(TenantId{OID::gen()}, recipientBlocker);
+    assertVector(registry.getRecipientAccessBlockersForMigration(uuid), {recipientBlocker});
+
+    auto secondBlocker =
+        std::make_shared<TenantMigrationRecipientAccessBlocker>(getServiceContext(), uuid);
+    registry.add(TenantId{OID::gen()}, secondBlocker);
+    assertVector(registry.getRecipientAccessBlockersForMigration(uuid),
+                 {recipientBlocker, secondBlocker});
 }
 
 }  // namespace mongo

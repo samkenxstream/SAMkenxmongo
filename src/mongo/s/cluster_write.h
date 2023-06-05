@@ -45,6 +45,11 @@ void write(OperationContext* opCtx,
            BatchedCommandResponse* response,
            boost::optional<OID> targetEpoch = boost::none);
 
+/**
+ * Execute a bulkWrite request as a router.
+ *
+ * Note: Caller is responsible for passing in a valid BulkWriteCommandRequest.
+ */
 std::vector<BulkWriteReplyItem> bulkWrite(OperationContext* opCtx,
                                           const BulkWriteCommandRequest& request);
 

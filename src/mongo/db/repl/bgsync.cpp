@@ -226,6 +226,11 @@ void BackgroundSync::_run() {
     Client::initThread("BackgroundSync");
     AuthorizationSession::get(cc())->grantInternalAuthorization(&cc());
 
+    {
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationUnkillableByStepdown(lk);
+    }
+
     while (!inShutdown()) {
         try {
             _runProducer();
@@ -795,10 +800,8 @@ void BackgroundSync::_runRollbackViaRecoverToCheckpoint(
     StorageInterface* storageInterface,
     OplogInterfaceRemote::GetConnectionFn getConnection) {
 
-    OplogInterfaceRemote remoteOplog(source,
-                                     getConnection,
-                                     NamespaceString::kRsOplogNamespace.ns(),
-                                     rollbackRemoteOplogQueryBatchSize.load());
+    OplogInterfaceRemote remoteOplog(
+        source, getConnection, rollbackRemoteOplogQueryBatchSize.load());
 
     {
         stdx::lock_guard<Latch> lock(_mutex);
@@ -838,10 +841,8 @@ void BackgroundSync::_fallBackOnRollbackViaRefetch(
     OplogInterface* localOplog,
     OplogInterfaceRemote::GetConnectionFn getConnection) {
 
-    RollbackSourceImpl rollbackSource(getConnection,
-                                      source,
-                                      NamespaceString::kRsOplogNamespace.ns(),
-                                      rollbackRemoteOplogQueryBatchSize.load());
+    RollbackSourceImpl rollbackSource(
+        getConnection, source, rollbackRemoteOplogQueryBatchSize.load());
 
     rollback(opCtx, *localOplog, rollbackSource, requiredRBID, _replCoord, _replicationProcess);
 }
@@ -964,7 +965,7 @@ OpTime BackgroundSync::_readLastAppliedOpTime(OperationContext* opCtx) {
     BSONObj oplogEntry;
     try {
         bool success = writeConflictRetry(
-            opCtx, "readLastAppliedOpTime", NamespaceString::kRsOplogNamespace.ns(), [&] {
+            opCtx, "readLastAppliedOpTime", NamespaceString::kRsOplogNamespace, [&] {
                 return Helpers::getLast(opCtx, NamespaceString::kRsOplogNamespace, oplogEntry);
             });
 

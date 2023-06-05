@@ -2,16 +2,13 @@
  * Tests that retrying a retryable findAndModify doesn't cause it to have multiple sampled query
  * documents.
  *
- * @tags: [requires_fcv_63, featureFlagAnalyzeShardKey]
+ * @tags: [requires_fcv_70]
  */
 (function() {
 "use strict";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/sharding/analyze_shard_key/libs/query_sampling_util.js");
-
-// Set this to allow sample ids to be set by an external client.
-TestData.enableTestCommands = true;
 
 // Make the periodic job for writing sampled queries have a period of 1 second to speed up the test.
 const queryAnalysisWriterIntervalSecs = 1;
@@ -133,6 +130,9 @@ const st = new ShardingTest({
         setParameter: {queryAnalysisWriterIntervalSecs}
     }
 });
+
+// Force samples to get persisted even though query sampling is not enabled.
+QuerySamplingUtil.skipActiveSamplingCheckWhenPersistingSamples(st);
 
 testRetryExecutedWrite(st.rs0);
 testRetryUnExecutedWrite(st.rs0);

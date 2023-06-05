@@ -233,14 +233,7 @@ commands.push({
         assert.commandWorkedIgnoringWriteConcernErrors(db.runCommand({create: collName}));
     },
     confirmFunc: function(res) {
-        // Branching is needed for multiversion tests as 'create' is only idempotent as of 7.0.
-        // TODO SERVER-74062: update this to stop branching on the server version and always
-        // assert the command worked ignoring write concern errors.
-        if (db.version().split('.')[0] >= 7) {
-            assert.commandWorkedIgnoringWriteConcernErrors(res);
-        } else {
-            assert.commandFailedWithCode(res, ErrorCodes.NamespaceExists);
-        }
+        assert.commandWorkedIgnoringWriteConcernErrors(res);
     }
 });
 
@@ -287,7 +280,8 @@ function testCommandWithWriteConcern(cmd) {
     var shell2 = new Mongo(primary.host);
 
     // We check the error code of 'res' in the 'confirmFunc'.
-    var res = shell2.getDB(dbName).runCommand(cmd.req);
+    var res = "bulkWrite" in cmd.req ? shell2.adminCommand(cmd.req)
+                                     : shell2.getDB(dbName).runCommand(cmd.req);
 
     try {
         // Tests that the command receives a write concern error. If we don't wait for write

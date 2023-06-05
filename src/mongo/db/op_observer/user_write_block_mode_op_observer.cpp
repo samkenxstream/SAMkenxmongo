@@ -38,7 +38,7 @@
 namespace mongo {
 namespace {
 
-const auto documentIdDecoration = OperationContext::declareDecoration<BSONObj>();
+const auto documentIdDecoration = OplogDeleteEntryArgs::declareDecoration<BSONObj>();
 
 bool isStandaloneOrPrimary(OperationContext* opCtx, const NamespaceString& nss) {
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
@@ -52,7 +52,8 @@ void UserWriteBlockModeOpObserver::onInserts(OperationContext* opCtx,
                                              std::vector<InsertStatement>::const_iterator first,
                                              std::vector<InsertStatement>::const_iterator last,
                                              std::vector<bool> fromMigrate,
-                                             bool defaultFromMigrate) {
+                                             bool defaultFromMigrate,
+                                             InsertsOpStateAccumulator* opAccumulator) {
     const auto& nss = coll->ns();
 
     if (!defaultFromMigrate) {
@@ -91,7 +92,8 @@ void UserWriteBlockModeOpObserver::onInserts(OperationContext* opCtx,
 }
 
 void UserWriteBlockModeOpObserver::onUpdate(OperationContext* opCtx,
-                                            const OplogUpdateEntryArgs& args) {
+                                            const OplogUpdateEntryArgs& args,
+                                            OpStateAccumulator* opAccumulator) {
     const auto& nss = args.coll->ns();
 
     if (args.updateArgs->source != OperationSource::kFromMigrate) {
@@ -132,16 +134,19 @@ void UserWriteBlockModeOpObserver::onUpdate(OperationContext* opCtx,
 
 void UserWriteBlockModeOpObserver::aboutToDelete(OperationContext* opCtx,
                                                  const CollectionPtr& coll,
-                                                 BSONObj const& doc) {
+                                                 BSONObj const& doc,
+                                                 OplogDeleteEntryArgs* args,
+                                                 OpStateAccumulator* opAccumulator) {
     if (coll->ns() == NamespaceString::kUserWritesCriticalSectionsNamespace) {
-        documentIdDecoration(opCtx) = doc;
+        documentIdDecoration(args) = doc;
     }
 }
 
 void UserWriteBlockModeOpObserver::onDelete(OperationContext* opCtx,
                                             const CollectionPtr& coll,
                                             StmtId stmtId,
-                                            const OplogDeleteEntryArgs& args) {
+                                            const OplogDeleteEntryArgs& args,
+                                            OpStateAccumulator* opAccumulator) {
     const auto& nss = coll->ns();
     if (!args.fromMigrate) {
         _checkWriteAllowed(opCtx, nss);
@@ -149,7 +154,7 @@ void UserWriteBlockModeOpObserver::onDelete(OperationContext* opCtx,
 
     if (nss == NamespaceString::kUserWritesCriticalSectionsNamespace &&
         !user_writes_recoverable_critical_section_util::inRecoveryMode(opCtx)) {
-        auto& documentId = documentIdDecoration(opCtx);
+        auto& documentId = documentIdDecoration(args);
         invariant(!documentId.isEmpty());
 
         const auto& deletedDoc = documentId;
@@ -171,8 +176,8 @@ void UserWriteBlockModeOpObserver::onDelete(OperationContext* opCtx,
     }
 }
 
-void UserWriteBlockModeOpObserver::_onReplicationRollback(OperationContext* opCtx,
-                                                          const RollbackObserverInfo& rbInfo) {
+void UserWriteBlockModeOpObserver::onReplicationRollback(OperationContext* opCtx,
+                                                         const RollbackObserverInfo& rbInfo) {
     if (rbInfo.rollbackNamespaces.find(NamespaceString::kUserWritesCriticalSectionsNamespace) !=
         rbInfo.rollbackNamespaces.end()) {
         UserWritesRecoverableCriticalSectionService::get(opCtx)->recoverRecoverableCriticalSections(
@@ -230,7 +235,8 @@ repl::OpTime UserWriteBlockModeOpObserver::onDropCollection(OperationContext* op
                                                             const NamespaceString& collectionName,
                                                             const UUID& uuid,
                                                             std::uint64_t numRecords,
-                                                            CollectionDropType dropType) {
+                                                            CollectionDropType dropType,
+                                                            bool markFromMigrate) {
     _checkWriteAllowed(opCtx, collectionName);
     return repl::OpTime();
 }
@@ -250,7 +256,8 @@ repl::OpTime UserWriteBlockModeOpObserver::preRenameCollection(
     const UUID& uuid,
     const boost::optional<UUID>& dropTargetUUID,
     std::uint64_t numRecords,
-    bool stayTemp) {
+    bool stayTemp,
+    bool markFromMigrate) {
     _checkWriteAllowed(opCtx, fromCollection);
     _checkWriteAllowed(opCtx, toCollection);
     return repl::OpTime();
@@ -262,7 +269,8 @@ void UserWriteBlockModeOpObserver::onRenameCollection(OperationContext* opCtx,
                                                       const UUID& uuid,
                                                       const boost::optional<UUID>& dropTargetUUID,
                                                       std::uint64_t numRecords,
-                                                      bool stayTemp) {
+                                                      bool stayTemp,
+                                                      bool markFromMigrate) {
     _checkWriteAllowed(opCtx, fromCollection);
     _checkWriteAllowed(opCtx, toCollection);
 }

@@ -29,7 +29,6 @@
 
 
 #include "mongo/db/pipeline/dependencies.h"
-#include "mongo/platform/basic.h"
 
 #include <boost/optional.hpp>
 #include <vector>
@@ -39,8 +38,8 @@
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/clustered_collection_util.h"
-#include "mongo/db/exec/bucket_unpacker.h"
 #include "mongo/db/exec/projection_executor_utils.h"
+#include "mongo/db/exec/timeseries/bucket_unpacker.h"
 #include "mongo/db/index/wildcard_key_generator.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/matcher/expression_algo.h"
@@ -71,7 +70,6 @@
 #include "mongo/util/assert_util_core.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
-
 
 namespace mongo {
 namespace log_detail {
@@ -828,7 +826,7 @@ StatusWith<std::unique_ptr<PlanCacheIndexTree>> QueryPlanner::cacheDataFromTagge
 // static
 Status QueryPlanner::tagAccordingToCache(MatchExpression* filter,
                                          const PlanCacheIndexTree* const indexTree,
-                                         const map<IndexEntry::Identifier, size_t>& indexMap) {
+                                         const std::map<IndexEntry::Identifier, size_t>& indexMap) {
     if (nullptr == filter) {
         return Status(ErrorCodes::NoQueryExecutionPlans, "Cannot tag tree: filter is NULL.");
     }
@@ -838,7 +836,7 @@ Status QueryPlanner::tagAccordingToCache(MatchExpression* filter,
 
     // We're tagging the tree here, so it shouldn't have
     // any tags hanging off yet.
-    verify(nullptr == filter->getTag());
+    MONGO_verify(nullptr == filter->getTag());
 
     if (filter->numChildren() != indexTree->children.size()) {
         str::stream ss;
@@ -947,7 +945,7 @@ StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::planFromCache(
         QueryPlannerIXSelect::expandIndexes(fields, params.indices, false /* indexHinted */);
 
     // Map from index name to index number.
-    map<IndexEntry::Identifier, size_t> indexMap;
+    std::map<IndexEntry::Identifier, size_t> indexMap;
     for (size_t i = 0; i < expandedIndexes.size(); ++i) {
         const IndexEntry& ie = expandedIndexes[i];
         const auto insertionRes = indexMap.insert(std::make_pair(ie.identifier, i));
@@ -978,14 +976,14 @@ StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::planFromCache(
     if (!solnRoot) {
         return Status(ErrorCodes::NoQueryExecutionPlans,
                       str::stream() << "Failed to create data access plan from cache. Query: "
-                                    << query.toStringShort());
+                                    << query.toStringShortForErrorMsg());
     }
 
     auto soln = QueryPlannerAnalysis::analyzeDataAccess(query, params, std::move(solnRoot));
     if (!soln) {
         return Status(ErrorCodes::NoQueryExecutionPlans,
-                      str::stream()
-                          << "Failed to analyze plan from cache. Query: " << query.toStringShort());
+                      str::stream() << "Failed to analyze plan from cache. Query: "
+                                    << query.toStringShortForErrorMsg());
     }
 
     LOGV2_DEBUG(20966,
@@ -1637,7 +1635,7 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
 
     invariant(out.size() > 0);
     return {std::move(out)};
-}
+}  // QueryPlanner::plan
 
 /**
  * The 'query' might contain parts of aggregation pipeline. For now, we plan those separately and

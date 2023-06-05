@@ -62,7 +62,7 @@ BSONObj createOriginalCommand(const NamespaceString& nss, BSONObj shardKey) {
     using Arr = std::vector<Value>;
     using V = Value;
 
-    return Doc{{"reshardCollection", V{StringData{nss.toString()}}},
+    return Doc{{"reshardCollection", V{StringData{NamespaceStringUtil::serialize(nss)}}},
                {"key", std::move(shardKey)},
                {"unique", V{StringData{"false"}}},
                {"collation", V{Doc{{"locale", V{StringData{"simple"}}}}}}}
@@ -100,7 +100,7 @@ ReshardingMetrics::ReshardingMetrics(UUID instanceId,
     : ReshardingMetrics{std::move(instanceId),
                         shardKey,
                         std::move(nss),
-                        std::move(role),
+                        role,
                         std::move(startTime),
                         clockSource,
                         cumulativeMetrics,

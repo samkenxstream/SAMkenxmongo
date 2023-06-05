@@ -73,10 +73,12 @@ void updatePlanCache(OperationContext* opCtx,
                      const CanonicalQuery& query,
                      const QuerySolution& solution,
                      const sbe::PlanStage& root,
-                     const stage_builder::PlanStageData& data) {
-    if (shouldCacheQuery(query) && collections.getMainCollection()) {
-        auto key = plan_cache_key_factory::make(query, collections);
-        auto plan = std::make_unique<sbe::CachedSbePlan>(root.clone(), data);
+                     stage_builder::PlanStageData& stageData) {
+    // TODO: SERVER-76815 enable caching the COUNT_SCAN queries for SBE.
+    const CollectionPtr& collection = collections.getMainCollection();
+    if (collection && shouldCacheQuery(query) && !solution.hasNode(STAGE_COUNT_SCAN)) {
+        sbe::PlanCacheKey key = plan_cache_key_factory::make(query, collections);
+        auto plan = std::make_unique<sbe::CachedSbePlan>(root.clone(), stageData);
         plan->indexFilterApplied = solution.indexFilterApplied;
 
         bool shouldOmitDiagnosticInformation =

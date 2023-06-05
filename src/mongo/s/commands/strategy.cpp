@@ -47,6 +47,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/error_labels.h"
 #include "mongo/db/initialize_api_parameters.h"
+#include "mongo/db/initialize_operation_session_info.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/namespace_string.h"
@@ -58,7 +59,6 @@
 #include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
-#include "mongo/db/session/initialize_operation_session_info.h"
 #include "mongo/db/session/logical_session_id_helpers.h"
 #include "mongo/db/stats/api_version_metrics.h"
 #include "mongo/db/stats/counters.h"
@@ -573,7 +573,7 @@ void ParseAndRunCommand::_parseCommand() {
     // Set the logical optype, command object and namespace as soon as we identify the command. If
     // the command does not define a fully-qualified namespace, set CurOp to the generic command
     // namespace db.$cmd.
-    _ns.emplace(_invocation->ns().toString());
+    _ns.emplace(NamespaceStringUtil::serialize(_invocation->ns()));
     auto nss =
         (request.getDatabase() == *_ns ? NamespaceString(*_ns, "$cmd") : NamespaceString(*_ns));
 
@@ -586,7 +586,7 @@ void ParseAndRunCommand::_parseCommand() {
                                                 command->attachLogicalSessionsToOpCtx(),
                                                 true));
 
-    auto allowTransactionsOnConfigDatabase = !isMongos();
+    auto allowTransactionsOnConfigDatabase = !isMongos() || client->isFromSystemConnection();
     validateSessionOptions(*_osi, command->getName(), nss, allowTransactionsOnConfigDatabase);
 
     _wc.emplace(uassertStatusOK(WriteConcernOptions::extractWCFromCommand(request.body)));
@@ -650,7 +650,7 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
         // Preload generic ClientMetadata ahead of our first hello request. After the first
         // request, metaElement should always be empty.
         auto metaElem = request.body[kMetadataDocumentName];
-        ClientMetadata::setFromMetadata(opCtx->getClient(), metaElem);
+        ClientMetadata::setFromMetadata(opCtx->getClient(), metaElem, false);
     }
 
     enforceRequireAPIVersion(opCtx, command);
@@ -915,7 +915,7 @@ void ParseAndRunCommand::RunAndRetry::_setup() {
         // Re-parse before retrying in case the process of run()-ning the invocation could
         // affect the parsed result.
         _parc->_invocation = command->parse(opCtx, request);
-        invariant(_parc->_invocation->ns().toString() == _parc->_ns,
+        invariant(NamespaceStringUtil::serialize(_parc->_invocation->ns()) == _parc->_ns,
                   "unexpected change of namespace when retrying");
     }
 
@@ -1171,6 +1171,13 @@ public:
     Future<DbResponse> run();
 
 private:
+    std::string _getDatabaseStringForLogging() const try {
+        // `getDatabase` throws if the request doesn't have a '$db' field.
+        return _rec->getRequest().getDatabase().toString();
+    } catch (const DBException& ex) {
+        return ex.toString();
+    }
+
     void _parseMessage();
 
     Future<void> _execute();
@@ -1214,7 +1221,7 @@ Future<void> ClientCommand::_execute() {
                 3,
                 "Command begin db: {db} msg id: {headerId}",
                 "Command begin",
-                "db"_attr = _rec->getRequest().getDatabase().toString(),
+                "db"_attr = _getDatabaseStringForLogging(),
                 "headerId"_attr = _rec->getMessage().header().getId());
 
     return future_util::makeState<ParseAndRunCommand>(_rec, _errorBuilder)
@@ -1224,7 +1231,7 @@ Future<void> ClientCommand::_execute() {
                         3,
                         "Command end db: {db} msg id: {headerId}",
                         "Command end",
-                        "db"_attr = _rec->getRequest().getDatabase().toString(),
+                        "db"_attr = _getDatabaseStringForLogging(),
                         "headerId"_attr = _rec->getMessage().header().getId());
         })
         .tapError([this](Status status) {
@@ -1233,7 +1240,7 @@ Future<void> ClientCommand::_execute() {
                 1,
                 "Exception thrown while processing command on {db} msg id: {headerId} {error}",
                 "Exception thrown while processing command",
-                "db"_attr = _rec->getRequest().getDatabase().toString(),
+                "db"_attr = _getDatabaseStringForLogging(),
                 "headerId"_attr = _rec->getMessage().header().getId(),
                 "error"_attr = redact(status));
 

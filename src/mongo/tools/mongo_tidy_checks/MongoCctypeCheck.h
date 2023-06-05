@@ -36,7 +36,7 @@ namespace mongo::tidy {
 /**
     Overrides the default PPCallback class to primarly override
     the InclusionDirective call which is called for each include. This
-    allows the chance to check whether <cctype> or <ctyhe.h> included or not
+    allows the chance to check whether <cctype> or <ctype.h> included or not
 */
 class MongoCctypeCheck : public clang::tidy::ClangTidyCheck {
 public:

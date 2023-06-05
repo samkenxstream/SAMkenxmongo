@@ -29,6 +29,9 @@
 
 #include "mongo/db/s/resharding/resharding_util.h"
 
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/stdx/unordered_set.h"
 #include <fmt/format.h>
 
 #include "mongo/bson/bsonobj.h"
@@ -43,6 +46,7 @@
 #include "mongo/db/pipeline/document_source_find_and_modify_image_lookup.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/resharding/document_source_resharding_add_resume_id.h"
 #include "mongo/db/s/resharding/document_source_resharding_iterate_transaction.h"
 #include "mongo/db/s/resharding/resharding_metrics.h"
@@ -143,7 +147,8 @@ std::set<ShardId> getRecipientShards(OperationContext* opCtx,
     auto [cm, _] = uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, tempNss));
 
     uassert(ErrorCodes::NamespaceNotSharded,
-            str::stream() << "Expected collection " << tempNss << " to be sharded",
+            str::stream() << "Expected collection " << tempNss.toStringForErrorMsg()
+                          << " to be sharded",
             cm.isSharded());
 
     std::set<ShardId> recipients;
@@ -224,16 +229,33 @@ void checkForOverlappingZones(std::vector<ReshardingZoneType>& zones) {
 }
 
 std::vector<BSONObj> buildTagsDocsFromZones(const NamespaceString& tempNss,
-                                            const std::vector<ReshardingZoneType>& zones) {
+                                            std::vector<ReshardingZoneType>& zones,
+                                            const ShardKeyPattern& shardKey) {
     std::vector<BSONObj> tags;
     tags.reserve(zones.size());
-    for (const auto& zone : zones) {
+    for (auto& zone : zones) {
+        zone.setMin(shardKey.getKeyPattern().extendRangeBound(zone.getMin(), false));
+        zone.setMax(shardKey.getKeyPattern().extendRangeBound(zone.getMax(), false));
         ChunkRange range(zone.getMin(), zone.getMax());
         TagsType tag(tempNss, zone.getZone().toString(), range);
         tags.push_back(tag.toBSON());
     }
 
     return tags;
+}
+
+std::vector<ReshardingZoneType> getZonesFromExistingCollection(OperationContext* opCtx,
+                                                               const NamespaceString& sourceNss) {
+    std::vector<ReshardingZoneType> zones;
+    const auto collectionZones = uassertStatusOK(
+        ShardingCatalogManager::get(opCtx)->localCatalogClient()->getTagsForCollection(opCtx,
+                                                                                       sourceNss));
+
+    for (const auto& zone : collectionZones) {
+        ReshardingZoneType newZone(zone.getTag(), zone.getMinKey(), zone.getMaxKey());
+        zones.push_back(newZone);
+    }
+    return zones;
 }
 
 std::unique_ptr<Pipeline, PipelineDeleter> createOplogFetchingPipelineForResharding(
@@ -358,10 +380,10 @@ NamespaceString getLocalConflictStashNamespace(UUID existingUUID, ShardId donorS
 }
 
 void doNoopWrite(OperationContext* opCtx, StringData opStr, const NamespaceString& nss) {
-    writeConflictRetry(opCtx, opStr, NamespaceString::kRsOplogNamespace.ns(), [&] {
+    writeConflictRetry(opCtx, opStr, NamespaceString::kRsOplogNamespace, [&] {
         AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
 
-        const std::string msg = str::stream() << opStr << " on " << nss;
+        const std::string msg = str::stream() << opStr << " on " << nss.toStringForErrorMsg();
         WriteUnitOfWork wuow(opCtx);
         opCtx->getClient()->getServiceContext()->getOpObserver()->onInternalOpMessage(
             opCtx,
@@ -397,6 +419,73 @@ boost::optional<Milliseconds> estimateRemainingRecipientTime(bool applyingBegan,
         return estimateRemainingTime(timeSpentCopying, bytesCopied, 2 * bytesToCopy);
     }
     return {};
+}
+
+void validateShardDistribution(const std::vector<ShardKeyRange>& shardDistribution,
+                               OperationContext* opCtx,
+                               const ShardKeyPattern& keyPattern) {
+    boost::optional<bool> hasMinMax = boost::none;
+    std::vector<ShardKeyRange> validShards;
+    stdx::unordered_set<ShardId> shardIds;
+    for (const auto& shard : shardDistribution) {
+        uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shard.getShard()));
+        uassert(ErrorCodes::InvalidOptions,
+                "ShardKeyRange should have a pair of min/max or none of them",
+                !(shard.getMax().has_value() ^ shard.getMin().has_value()));
+        uassert(ErrorCodes::InvalidOptions,
+                "ShardKeyRange min should follow shard key's keyPattern",
+                (!shard.getMin().has_value()) || keyPattern.isShardKey(*shard.getMin()));
+        uassert(ErrorCodes::InvalidOptions,
+                "ShardKeyRange max should follow shard key's keyPattern",
+                (!shard.getMax().has_value()) || keyPattern.isShardKey(*shard.getMax()));
+        if (hasMinMax && !(*hasMinMax)) {
+            uassert(ErrorCodes::InvalidOptions,
+                    "Non-explicit shardDistribution should have unique shardIds",
+                    shardIds.find(shard.getShard()) == shardIds.end());
+        }
+
+        // Check all shardKeyRanges have min/max or none of them has min/max.
+        if (hasMinMax.has_value()) {
+            uassert(ErrorCodes::InvalidOptions,
+                    "All ShardKeyRanges should have the same min/max pattern",
+                    !(*hasMinMax ^ shard.getMax().has_value()));
+        } else {
+            hasMinMax = shard.getMax().has_value();
+        }
+
+        validShards.push_back(shard);
+        shardIds.insert(shard.getShard());
+    }
+
+    // If the shardDistribution contains min/max, validate whether they are continuous and complete.
+    if (hasMinMax && *hasMinMax) {
+        std::sort(validShards.begin(),
+                  validShards.end(),
+                  [](const ShardKeyRange& a, const ShardKeyRange& b) {
+                      return SimpleBSONObjComparator::kInstance.evaluate(*a.getMin() < *b.getMin());
+                  });
+
+        uassert(
+            ErrorCodes::InvalidOptions,
+            "ShardKeyRange must start at global min for the new shard key",
+            SimpleBSONObjComparator::kInstance.evaluate(validShards.front().getMin().value() ==
+                                                        keyPattern.getKeyPattern().globalMin()));
+        uassert(ErrorCodes::InvalidOptions,
+                "ShardKeyRange must end at global max for the new shard key",
+                SimpleBSONObjComparator::kInstance.evaluate(
+                    validShards.back().getMax().value() == keyPattern.getKeyPattern().globalMax()));
+
+        boost::optional<BSONObj> prevMax = boost::none;
+        for (const auto& shard : validShards) {
+            if (prevMax) {
+                uassert(ErrorCodes::InvalidOptions,
+                        "ShardKeyRanges must be continuous",
+                        SimpleBSONObjComparator::kInstance.evaluate(prevMax.value() ==
+                                                                    *shard.getMin()));
+            }
+            prevMax = *shard.getMax();
+        }
+    }
 }
 
 }  // namespace resharding

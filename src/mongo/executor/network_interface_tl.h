@@ -395,8 +395,6 @@ private:
     std::unique_ptr<transport::TransportLayer> _ownedTransportLayer;
     transport::ReactorHandle _reactor;
 
-    mutable Mutex _mutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(3), "NetworkInterfaceTL::_mutex");
     const ConnectionPool::Options _connPoolOpts;
     std::unique_ptr<NetworkConnectionHook> _onConnectHook;
     std::shared_ptr<ConnectionPool> _pool;

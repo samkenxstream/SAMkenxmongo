@@ -32,28 +32,65 @@
 #include "mongo/db/query/plan_yield_policy.h"
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_uuid_mismatch_info.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
-PlanYieldPolicy::PlanYieldPolicy(YieldPolicy policy,
-                                 ClockSource* cs,
-                                 int yieldIterations,
-                                 Milliseconds yieldPeriod,
-                                 const Yieldable* yieldable,
-                                 std::unique_ptr<const YieldPolicyCallbacks> callbacks)
-    : _policy(policy),
+PlanYieldPolicy::PlanYieldPolicy(
+    OperationContext* opCtx,
+    YieldPolicy policy,
+    ClockSource* cs,
+    int yieldIterations,
+    Milliseconds yieldPeriod,
+    stdx::variant<const Yieldable*, YieldThroughAcquisitions> yieldable,
+    std::unique_ptr<const YieldPolicyCallbacks> callbacks)
+    : _policy(getPolicyOverrideForOperation(opCtx, policy)),
       _yieldable(yieldable),
       _callbacks(std::move(callbacks)),
       _elapsedTracker(cs, yieldIterations, yieldPeriod) {
-    invariant(!_yieldable || _yieldable->yieldable() ||
-              policy == YieldPolicy::WRITE_CONFLICT_RETRY_ONLY || policy == YieldPolicy::NO_YIELD ||
-              policy == YieldPolicy::INTERRUPT_ONLY || policy == YieldPolicy::ALWAYS_TIME_OUT ||
-              policy == YieldPolicy::ALWAYS_MARK_KILLED);
+    stdx::visit(OverloadedVisitor{[&](const Yieldable* collectionPtr) {
+                                      invariant(!collectionPtr || collectionPtr->yieldable() ||
+                                                policy == YieldPolicy::WRITE_CONFLICT_RETRY_ONLY ||
+                                                policy == YieldPolicy::NO_YIELD ||
+                                                policy == YieldPolicy::INTERRUPT_ONLY ||
+                                                policy == YieldPolicy::ALWAYS_TIME_OUT ||
+                                                policy == YieldPolicy::ALWAYS_MARK_KILLED);
+                                  },
+                                  [&](const YieldThroughAcquisitions& yieldThroughAcquisitions) {
+                                      // CollectionAcquisitions are always yieldable.
+                                  }},
+                _yieldable);
+}
+
+PlanYieldPolicy::YieldPolicy PlanYieldPolicy::getPolicyOverrideForOperation(
+    OperationContext* opCtx, PlanYieldPolicy::YieldPolicy desired) {
+    // We may have a null opCtx in testing.
+    if (MONGO_unlikely(!opCtx)) {
+        return desired;
+    }
+    // Multi-document transactions cannot yield locks or snapshots. We convert to a non-yielding
+    // interruptible plan.
+    if (opCtx->inMultiDocumentTransaction() &&
+        (desired == YieldPolicy::YIELD_AUTO || desired == YieldPolicy::YIELD_MANUAL ||
+         desired == YieldPolicy::WRITE_CONFLICT_RETRY_ONLY)) {
+        return YieldPolicy::INTERRUPT_ONLY;
+    }
+
+    // If the state of our locks held is not yieldable at all, we will assume this is an internal
+    // operation that should not be interrupted or yielded.
+    // TODO: SERVER-76238 Evaluate if we can make everything INTERRUPT_ONLY instead.
+    if (!opCtx->lockState()->canSaveLockState() &&
+        (desired == YieldPolicy::YIELD_AUTO || desired == YieldPolicy::YIELD_MANUAL)) {
+        return YieldPolicy::NO_YIELD;
+    }
+
+    return desired;
 }
 
 bool PlanYieldPolicy::shouldYieldOrInterrupt(OperationContext* opCtx) {
@@ -96,7 +133,7 @@ Status PlanYieldPolicy::yieldOrInterrupt(OperationContext* opCtx,
     for (int attempt = 1; true; attempt++) {
         try {
             // Saving and restoring can modify '_yieldable', so we make a copy before we start.
-            const Yieldable* yieldable = _yieldable;
+            const auto yieldable = _yieldable;
 
             try {
                 saveState(opCtx);
@@ -127,17 +164,26 @@ Status PlanYieldPolicy::yieldOrInterrupt(OperationContext* opCtx,
                 invariant(!opCtx->isLockFreeReadsOp());
                 opCtx->recoveryUnit()->abandonSnapshot();
             } else {
-                invariant(yieldable);
-                performYield(opCtx, *yieldable, whileYieldingFn);
+                if (usesCollectionAcquisitions()) {
+                    performYieldWithAcquisitions(opCtx, whileYieldingFn);
+                } else {
+                    const Yieldable* yieldablePtr = stdx::get<const Yieldable*>(yieldable);
+                    invariant(yieldablePtr);
+                    performYield(opCtx, *yieldablePtr, whileYieldingFn);
+                }
             }
 
-            restoreState(opCtx, yieldable);
+            restoreState(opCtx,
+                         stdx::holds_alternative<const Yieldable*>(yieldable)
+                             ? stdx::get<const Yieldable*>(yieldable)
+                             : nullptr);
             return Status::OK();
-        } catch (const WriteConflictException&) {
+        } catch (const WriteConflictException& e) {
             if (_callbacks) {
                 _callbacks->handledWriteConflict(opCtx);
             }
-            logWriteConflictAndBackoff(attempt, "query yield", ""_sd);
+            logWriteConflictAndBackoff(
+                attempt, "query yield", e.reason(), NamespaceStringOrUUID(NamespaceString()));
             // Retry the yielding process.
         } catch (...) {
             // Errors other than write conflicts don't get retried, and should instead result in
@@ -154,42 +200,32 @@ void PlanYieldPolicy::performYield(OperationContext* opCtx,
                                    std::function<void()> whileYieldingFn) {
     // Things have to happen here in a specific order:
     //   * Release 'yieldable'.
-    //   * Release lock mgr locks.
+    //   * Abandon the current storage engine snapshot.
     //   * Check for interrupt if the yield policy requires.
-    //   * Abondon the query's current storage engine snapshot.
-    //   * Reacquire lock mgr locks.
+    //   * Release lock manager locks.
+    //   * Reacquire lock manager locks.
     //   * Restore 'yieldable'.
-    Locker* locker = opCtx->lockState();
+    invariant(_policy == YieldPolicy::YIELD_AUTO || _policy == YieldPolicy::YIELD_MANUAL);
 
-    if (locker->isGlobalLockedRecursively()) {
-        // No purpose in yielding if the locks are recursively held and cannot be released.
-        return;
-    }
-
-    // Since the locks are not recursively held, this is a top level operation and we can safely
-    // clear the 'yieldable' state before unlocking and then re-establish it after re-locking.
+    // If we are here, the caller has guaranteed locks are not recursively held. This is a top level
+    // operation and we can safely clear the 'yieldable' state before unlocking and then
+    // re-establish it after re-locking.
     yieldable.yield();
 
-    Locker::LockSnapshot snapshot;
-    auto unlocked = locker->saveLockStateAndUnlock(&snapshot);
+    // Release any storage engine resources. This requires holding a global lock to correctly
+    // synchronize with states such as shutdown and rollback.
+    opCtx->recoveryUnit()->abandonSnapshot();
 
-    // After all steps to relinquish locks and save the execution plan have been taken, check
-    // for interrupt. This is the main interrupt check during query execution. Yield points and
-    // interrupt points are one and the same.
+    // Check for interrupt before releasing locks. This avoids the complexities of having to
+    // re-acquire locks to clean up when we are interrupted. This is the main interrupt check during
+    // query execution. Yield points and interrupt points are one and the same.
     if (getPolicy() == PlanYieldPolicy::YieldPolicy::YIELD_AUTO) {
         opCtx->checkForInterrupt();  // throws
     }
 
-    if (!unlocked) {
-        // Nothing was unlocked. Recursively held locks are not the only reason locks cannot be
-        // released. Restore the 'yieldable' state before returning.
-        yieldable.restore();
-        return;
-    }
-
-    // Top-level locks are freed, release any potential low-level (storage engine-specific
-    // locks). If we are yielding, we are at a safe place to do so.
-    opCtx->recoveryUnit()->abandonSnapshot();
+    Locker* locker = opCtx->lockState();
+    Locker::LockSnapshot snapshot;
+    locker->saveLockStateAndUnlock(&snapshot);
 
     if (_callbacks) {
         _callbacks->duringYield(opCtx);
@@ -205,6 +241,54 @@ void PlanYieldPolicy::performYield(OperationContext* opCtx,
     // has a 'locks internally' lock policy.
     // Yieldable restore may set a new read source if necessary.
     yieldable.restore();
+}
+
+void PlanYieldPolicy::performYieldWithAcquisitions(OperationContext* opCtx,
+                                                   std::function<void()> whileYieldingFn) {
+    // Things have to happen here in a specific order:
+    //   * Yield the acquired TransactionResources
+    //   * Abandon the current storage engine snapshot.
+    //   * Check for interrupt if the yield policy requires.
+    //   * Restore the yielded TransactionResources
+    invariant(_policy == YieldPolicy::YIELD_AUTO || _policy == YieldPolicy::YIELD_MANUAL);
+
+    // Release any storage engine resources. This requires holding a global lock to correctly
+    // synchronize with states such as shutdown and rollback.
+    opCtx->recoveryUnit()->abandonSnapshot();
+
+    // Check for interrupt before releasing locks. This avoids the complexities of having to
+    // re-acquire locks to clean up when we are interrupted. This is the main interrupt check during
+    // query execution. Yield points and interrupt points are one and the same.
+    if (getPolicy() == PlanYieldPolicy::YieldPolicy::YIELD_AUTO) {
+        opCtx->checkForInterrupt();  // throws
+    }
+
+    auto yieldedTransactionResources = yieldTransactionResourcesFromOperationContext(opCtx);
+    ScopeGuard disposeYieldedTransactionResourcesScopeGuard(
+        [&yieldedTransactionResources] { yieldedTransactionResources.dispose(); });
+
+    if (_callbacks) {
+        _callbacks->duringYield(opCtx);
+    }
+
+    if (whileYieldingFn) {
+        whileYieldingFn();
+    }
+
+    disposeYieldedTransactionResourcesScopeGuard.dismiss();
+    try {
+        restoreTransactionResourcesToOperationContext(opCtx,
+                                                      std::move(yieldedTransactionResources));
+    } catch (const ExceptionFor<ErrorCodes::CollectionUUIDMismatch>& ex) {
+        const auto extraInfo = ex.extraInfo<CollectionUUIDMismatchInfo>();
+        if (extraInfo->actualCollection()) {
+            throwCollectionRenamedError(NamespaceString(extraInfo->expectedCollection()),
+                                        NamespaceString(*extraInfo->actualCollection()),
+                                        extraInfo->collectionUUID());
+        } else {
+            throwCollectionDroppedError(extraInfo->collectionUUID());
+        }
+    }
 }
 
 }  // namespace mongo

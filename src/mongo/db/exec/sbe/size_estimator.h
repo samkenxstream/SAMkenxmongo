@@ -36,11 +36,13 @@
 
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/stages/hash_agg.h"
 #include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
 #include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/util/indexed_string_vector.h"
 
 /**
  * Contains a set of functions for shallow estimating the size of allocated on the heap objects
@@ -86,6 +88,15 @@ inline size_t estimate(S) {
 
 inline size_t estimate(const StringData& str) {
     return 0;
+}
+
+inline size_t estimate(const HashAggStage::AggExprPair& expr) {
+    size_t size = 0;
+    if (expr.init) {
+        size += expr.init->estimateSize();
+    }
+    size += expr.acc->estimateSize();
+    return size;
 }
 
 // Calculate the size of a SpecificStats's derived class.
@@ -176,4 +187,11 @@ inline size_t estimate(const value::MaterializedRow& row) {
     }
     return size;
 }
+
+inline size_t estimate(const IndexedStringVector& vec) {
+    size_t size = size_estimator::estimate(vec.getUnderlyingVector());
+    size += size_estimator::estimate(vec.getUnderlyingMap());
+    return size;
+}
+
 }  // namespace mongo::sbe::size_estimator

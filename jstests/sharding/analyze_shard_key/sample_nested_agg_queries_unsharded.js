@@ -2,7 +2,7 @@
  * Tests basic support for sampling nested aggregate queries (i.e. inside $lookup, $graphLookup,
  * $unionWith) against an unsharded collection on a sharded cluster.
  *
- * @tags: [requires_fcv_63, featureFlagAnalyzeShardKey]
+ * @tags: [requires_fcv_70]
  */
 (function() {
 "use strict";
@@ -43,7 +43,9 @@ assert.commandWorked(mongosDB.createCollection(foreignCollName));
 
 assert.commandWorked(
     st.s.adminCommand({configureQueryAnalyzer: foreignNs, mode: "full", sampleRate: 1000}));
-QuerySamplingUtil.waitForActiveSamplingOnAllShards(st);
+const foreignCollUUid = QuerySamplingUtil.getCollectionUuid(mongosDB, foreignCollName);
+QuerySamplingUtil.waitForActiveSamplingShardedCluster(
+    st, foreignNs, foreignCollUUid, {skipMongoses: true});
 
 // The foreign collection is unsharded so all documents are on the primary shard.
 const shardNames = [st.rs0.name];

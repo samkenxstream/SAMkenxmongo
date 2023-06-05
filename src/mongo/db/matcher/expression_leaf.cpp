@@ -38,6 +38,7 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/config.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_parser.h"
@@ -51,10 +52,11 @@
 
 namespace mongo {
 
+template <typename T>
 ComparisonMatchExpressionBase::ComparisonMatchExpressionBase(
     MatchType type,
     boost::optional<StringData> path,
-    Value rhs,
+    T&& rhs,
     ElementPath::LeafArrayBehavior leafArrBehavior,
     ElementPath::NonLeafArrayBehavior nonLeafArrBehavior,
     clonable_ptr<ErrorAnnotation> annotation,
@@ -65,6 +67,24 @@ ComparisonMatchExpressionBase::ComparisonMatchExpressionBase(
     setData(_backingBSON.firstElement());
     invariant(_rhs.type() != BSONType::EOO);
 }
+
+// Instantiate above constructor for 'Value&&' and 'const BSONElement&' types.
+template ComparisonMatchExpressionBase::ComparisonMatchExpressionBase(
+    MatchType,
+    boost::optional<StringData>,
+    Value&&,
+    ElementPath::LeafArrayBehavior,
+    ElementPath::NonLeafArrayBehavior,
+    clonable_ptr<ErrorAnnotation>,
+    const CollatorInterface*);
+template ComparisonMatchExpressionBase::ComparisonMatchExpressionBase(
+    MatchType,
+    boost::optional<StringData>,
+    const BSONElement&,
+    ElementPath::LeafArrayBehavior,
+    ElementPath::NonLeafArrayBehavior,
+    clonable_ptr<ErrorAnnotation>,
+    const CollatorInterface*);
 
 bool ComparisonMatchExpressionBase::equivalent(const MatchExpression* other) const {
     if (other->matchType() != matchType())
@@ -88,21 +108,18 @@ void ComparisonMatchExpressionBase::debugString(StringBuilder& debug, int indent
 }
 
 BSONObj ComparisonMatchExpressionBase::getSerializedRightHandSide(SerializationOptions opts) const {
-    if (opts.replacementForLiteralArgs) {
-        return BSON(name() << *opts.replacementForLiteralArgs);
-    } else {
-        return BSON(name() << _rhs);
-    }
+    return BSON(name() << opts.serializeLiteral(_rhs));
 }
 
+template <typename T>
 ComparisonMatchExpression::ComparisonMatchExpression(MatchType type,
                                                      boost::optional<StringData> path,
-                                                     Value rhs,
+                                                     T&& rhs,
                                                      clonable_ptr<ErrorAnnotation> annotation,
                                                      const CollatorInterface* collator)
     : ComparisonMatchExpressionBase(type,
                                     path,
-                                    std::move(rhs),
+                                    std::forward<T>(rhs),
                                     ElementPath::LeafArrayBehavior::kTraverse,
                                     ElementPath::NonLeafArrayBehavior::kTraverse,
                                     std::move(annotation),
@@ -121,6 +138,18 @@ ComparisonMatchExpression::ComparisonMatchExpression(MatchType type,
             uasserted(ErrorCodes::BadValue, "bad match type for ComparisonMatchExpression");
     }
 }
+
+// Instantiate above constructor for 'Value&&' and 'const BSONElement&' types.
+template ComparisonMatchExpression::ComparisonMatchExpression(MatchType,
+                                                              boost::optional<StringData>,
+                                                              Value&&,
+                                                              clonable_ptr<ErrorAnnotation>,
+                                                              const CollatorInterface*);
+template ComparisonMatchExpression::ComparisonMatchExpression(MatchType,
+                                                              boost::optional<StringData>,
+                                                              const BSONElement&,
+                                                              clonable_ptr<ErrorAnnotation>,
+                                                              const CollatorInterface*);
 
 bool ComparisonMatchExpression::matchesSingleElement(const BSONElement& e,
                                                      MatchDetails* details) const {
@@ -278,10 +307,10 @@ void RegexMatchExpression::debugString(StringBuilder& debug, int indentationLeve
 
 BSONObj RegexMatchExpression::getSerializedRightHandSide(SerializationOptions opts) const {
     BSONObjBuilder regexBuilder;
-    regexBuilder.append("$regex", opts.replacementForLiteralArgs.value_or(_regex));
+    opts.appendLiteral(&regexBuilder, "$regex", _regex);
 
     if (!_flags.empty()) {
-        regexBuilder.append("$options", opts.replacementForLiteralArgs.value_or(_flags));
+        opts.appendLiteral(&regexBuilder, "$options", _flags);
     }
 
     return regexBuilder.obj();
@@ -353,11 +382,8 @@ void ModMatchExpression::debugString(StringBuilder& debug, int indentationLevel)
 }
 
 BSONObj ModMatchExpression::getSerializedRightHandSide(SerializationOptions opts) const {
-    if (auto str = opts.replacementForLiteralArgs) {
-        return BSON("$mod" << *str);
-    } else {
-        return BSON("$mod" << BSON_ARRAY(_divisor << _remainder));
-    }
+    return BSON(
+        "$mod" << BSON_ARRAY(opts.serializeLiteral(_divisor) << opts.serializeLiteral(_remainder)));
 }
 
 bool ModMatchExpression::equivalent(const MatchExpression* other) const {
@@ -388,11 +414,7 @@ void ExistsMatchExpression::debugString(StringBuilder& debug, int indentationLev
 }
 
 BSONObj ExistsMatchExpression::getSerializedRightHandSide(SerializationOptions opts) const {
-    if (opts.replacementForLiteralArgs) {
-        return BSON("$exists" << *opts.replacementForLiteralArgs);
-    } else {
-        return BSON("$exists" << true);
-    }
+    return BSON("$exists" << opts.serializeLiteral(true));
 }
 
 bool ExistsMatchExpression::equivalent(const MatchExpression* other) const {
@@ -471,10 +493,38 @@ void InMatchExpression::debugString(StringBuilder& debug, int indentationLevel) 
     _debugStringAttachTagInfo(&debug);
 }
 
+namespace {
+/**
+ * Reduces the potentially large vector of elements to just the first of each "canonical" type.
+ * Different types of numbers are not considered distinct.
+ *
+ * For example, collapses [2, 4, NumberInt(3), "string", "another", 3, 5] into just [2, "string"].
+ */
+std::vector<Value> justFirstOfEachType(std::vector<BSONElement> elems) {
+    stdx::unordered_set<int> seenTypes;
+    std::vector<Value> result;
+    for (auto&& elem : elems) {
+        bool inserted = seenTypes.insert(canonicalizeBSONType(elem.type())).second;
+        if (inserted) {
+            // A new type.
+            result.emplace_back(elem);
+        }
+    }
+    return result;
+}
+}  // namespace
+
+BSONObj InMatchExpression::serializeToShape(SerializationOptions opts) const {
+    std::vector<Value> firstOfEachType = justFirstOfEachType(_equalitySet);
+    if (hasRegex()) {
+        firstOfEachType.emplace_back(BSONRegEx());
+    }
+    return BSON("$in" << opts.serializeLiteral(std::move(firstOfEachType)));
+}
+
 BSONObj InMatchExpression::getSerializedRightHandSide(SerializationOptions opts) const {
-    if (opts.replacementForLiteralArgs) {
-        // In this case, treat an '$in' with any number of arguments as equivalent.
-        return BSON("$in" << BSON_ARRAY(*opts.replacementForLiteralArgs));
+    if (opts.literalPolicy != LiteralSerializationPolicy::kUnchanged) {
+        return serializeToShape(opts);
     }
 
     BSONObjBuilder inBob;
@@ -846,17 +896,13 @@ BSONObj BitTestMatchExpression::getSerializedRightHandSide(SerializationOptions 
             MONGO_UNREACHABLE;
     }
 
-    if (opts.replacementForLiteralArgs) {
-        return BSON(opString << *opts.replacementForLiteralArgs);
-    }
-
     BSONArrayBuilder arrBob;
     for (auto bitPosition : _bitPositions) {
         arrBob.append(static_cast<int32_t>(bitPosition));
     }
     arrBob.doneFast();
 
-    return BSON(opString << arrBob.arr());
+    return BSON(opString << opts.serializeLiteral(arrBob.arr()));
 }
 
 bool BitTestMatchExpression::equivalent(const MatchExpression* other) const {

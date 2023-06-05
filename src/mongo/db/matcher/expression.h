@@ -119,6 +119,9 @@ public:
         INTERNAL_EXPR_LT,
         INTERNAL_EXPR_LTE,
 
+        // Used to represent the comparison to a hashed index key value.
+        INTERNAL_EQ_HASHED_KEY,
+
         // JSON Schema expressions.
         INTERNAL_SCHEMA_ALLOWED_PROPERTIES,
         INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX,
@@ -485,9 +488,9 @@ public:
      * parsed, produces a logically equivalent MatchExpression. However, if special options are set,
      * this no longer holds.
      *
-     * If 'options.replacementForLiteralArgs' is set, the result is no longer expected to re-parse,
-     * since we will put strings in places where strings may not be accpeted syntactically (e.g. a
-     * number is always expected, as in with the $mod expression).
+     * If 'options.literalPolicy' is set to 'kToDebugTypeString', the result is no longer expected
+     * to re-parse, since we will put strings in places where strings may not be accpeted
+     * syntactically (e.g. a number is always expected, as in with the $mod expression).
      */
     virtual void serialize(BSONObjBuilder* out, SerializationOptions options) const = 0;
 

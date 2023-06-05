@@ -60,7 +60,7 @@ BSONObj selectMedianKey(OperationContext* opCtx,
                         const CollectionRoutingInfo& cri,
                         const ChunkRange& chunkRange) {
     BSONObjBuilder cmd;
-    cmd.append("splitVector", nss.ns());
+    cmd.append("splitVector", NamespaceStringUtil::serialize(nss));
     cmd.append("keyPattern", shardKeyPattern.toBSON());
     chunkRange.append(&cmd);
     cmd.appendBool("force", true);
@@ -132,7 +132,8 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
-        const NamespaceString nss(parseNs({boost::none, dbname}, cmdObj));
+        const NamespaceString nss(
+            parseNs(DatabaseNameUtil::deserialize(boost::none, dbname), cmdObj));
 
         const auto cri = uassertStatusOK(
             Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,

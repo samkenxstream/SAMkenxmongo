@@ -34,7 +34,7 @@
 
 #include "mongo/client/connection_string.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/query/find_command_gen.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/rpc/unique_message.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/concurrency/spin_lock.h"
@@ -155,7 +155,7 @@ public:
      * @param ns the namespace to be associated with the uuid.
      * @param uuid the uuid to associate with the namespace.
      */
-    void assignCollectionUuid(const std::string& ns, const mongo::UUID& uuid);
+    void assignCollectionUuid(StringData ns, const mongo::UUID& uuid);
 
     //
     // DBClientBase methods

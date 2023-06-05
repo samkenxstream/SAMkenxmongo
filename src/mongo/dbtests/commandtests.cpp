@@ -89,7 +89,7 @@ public:
         return NamespaceString("test.testCollection");
     }
     DatabaseName nsDb() {
-        return {boost::none, "test"};
+        return DatabaseName::createDatabaseName_forTest(boost::none, "test");
     }
     const char* nsColl() {
         return "testCollection";
@@ -105,7 +105,8 @@ namespace FileMD5 {
 struct Base {
     Base() : db(&_opCtx) {
         db.dropCollection(nss());
-        ASSERT_OK(dbtests::createIndex(&_opCtx, nss().ns(), BSON("files_id" << 1 << "n" << 1)));
+        ASSERT_OK(
+            dbtests::createIndex(&_opCtx, nss().ns_forTest(), BSON("files_id" << 1 << "n" << 1)));
     }
 
     NamespaceString nss() {
@@ -136,7 +137,9 @@ struct Type0 : Base {
         }
 
         BSONObj result;
-        ASSERT(db.runCommand({boost::none, "test"}, BSON("filemd5" << 0), result));
+        ASSERT(db.runCommand(DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+                             BSON("filemd5" << 0),
+                             result));
         ASSERT_EQUALS(string("5eb63bbbe01eeed093cb22bb8f5acdc3"), result.getStringField("md5"));
     }
 };
@@ -160,7 +163,9 @@ struct Type2 : Base {
         }
 
         BSONObj result;
-        ASSERT(db.runCommand({boost::none, "test"}, BSON("filemd5" << 0), result));
+        ASSERT(db.runCommand(DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+                             BSON("filemd5" << 0),
+                             result));
         ASSERT_EQUALS(string("5eb63bbbe01eeed093cb22bb8f5acdc3"), result.getStringField("md5"));
     }
 };

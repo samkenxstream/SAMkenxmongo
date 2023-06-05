@@ -125,8 +125,8 @@ auto makeOnSuppressedErrorFn(const std::function<void()>& saveCursorBeforeWrite,
 }
 
 bool shouldRelaxConstraints(OperationContext* opCtx, const CollectionPtr& collection) {
-    // (Ignore FCV check): This feature flag doesn't have any upgrade/downgrade concerns.
-    if (!feature_flags::gIndexBuildGracefulErrorHandling.isEnabledAndIgnoreFCVUnsafe()) {
+    if (!feature_flags::gIndexBuildGracefulErrorHandling.isEnabled(
+            serverGlobalParams.featureCompatibility)) {
         // Always suppress.
         return true;
     }
@@ -253,8 +253,9 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(
     InitMode initMode,
     const boost::optional<ResumeIndexInfo>& resumeInfo) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X),
-              str::stream() << "Collection " << collection->ns() << " with UUID "
-                            << collection->uuid() << " is holding the incorrect lock");
+              str::stream() << "Collection " << collection->ns().toStringForErrorMsg()
+                            << " with UUID " << collection->uuid()
+                            << " is holding the incorrect lock");
     _collectionUUID = collection->uuid();
 
     _buildIsCleanedUp = false;
@@ -319,9 +320,10 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(
                     // indexes and start the build while holding a lock throughout.
                     if (status == ErrorCodes::IndexBuildAlreadyInProgress) {
                         invariant(indexSpecs.size() > 1,
-                                  str::stream() << "Collection: " << collection->ns() << " ("
-                                                << _collectionUUID
-                                                << "), Index spec: " << indexSpecs.front());
+                                  str::stream()
+                                      << "Collection: " << collection->ns().toStringForErrorMsg()
+                                      << " (" << _collectionUUID
+                                      << "), Index spec: " << indexSpecs.front());
                         return {ErrorCodes::OperationFailed,
                                 "Cannot build two identical indexes. Try again without duplicate "
                                 "indexes."};
@@ -357,7 +359,8 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(
                 uassert(ErrorCodes::NoSuchKey,
                         str::stream() << "Unable to locate resume information for " << info
                                       << " due to inconsistent resume information for index build "
-                                      << _buildUUID << " on namespace " << collection->ns() << "("
+                                      << _buildUUID << " on namespace "
+                                      << collection->ns().toStringForErrorMsg() << "("
                                       << _collectionUUID << ")",
                         stateInfoIt != resumeInfoIndexes.end());
 
@@ -380,8 +383,10 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(
             if (!status.isOK())
                 return status;
 
-            index.bulk = index.real->initiateBulk(
-                eachIndexBuildMaxMemoryUsageBytes, stateInfo, collection->ns().db());
+            index.bulk = index.real->initiateBulk(indexCatalogEntry,
+                                                  eachIndexBuildMaxMemoryUsageBytes,
+                                                  stateInfo,
+                                                  collection->ns().dbName());
 
             const IndexDescriptor* descriptor = indexCatalogEntry->descriptor();
 
@@ -439,12 +444,13 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(
         // Avoid converting TenantMigrationCommittedException to Status.
         throw;
     } catch (...) {
-        return exceptionToStatus().withContext(
-            str::stream() << "Caught exception during index builder (" << _buildUUID
-                          << ") initialization on namespace" << collection->ns() << " ("
-                          << _collectionUUID << "). " << indexSpecs.size()
-                          << " index specs provided. First index spec: "
-                          << (indexSpecs.empty() ? BSONObj() : indexSpecs[0]));
+        return exceptionToStatus().withContext(str::stream()
+                                               << "Caught exception during index builder ("
+                                               << _buildUUID << ") initialization on namespace"
+                                               << collection->ns().toStringForErrorMsg() << " ("
+                                               << _collectionUUID << "). " << indexSpecs.size()
+                                               << " index specs provided. First index spec: "
+                                               << (indexSpecs.empty() ? BSONObj() : indexSpecs[0]));
     }
 }
 
@@ -504,7 +510,7 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(
         // Unlock before hanging so replication recognizes we've completed.
         collection.yield();
         Locker::LockSnapshot lockInfo;
-        invariant(opCtx->lockState()->saveLockStateAndUnlock(&lockInfo));
+        opCtx->lockState()->saveLockStateAndUnlock(&lockInfo);
 
         LOGV2(4585201,
               "Hanging index build with no locks due to "
@@ -547,10 +553,12 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(
 
         _lastRecordIdInserted = boost::none;
         for (auto& index : _indexes) {
+            auto indexCatalogEntry = index.block->getEntry(opCtx, collection);
             index.bulk =
-                index.real->initiateBulk(getEachIndexBuildMaxMemoryUsageBytes(_indexes.size()),
+                index.real->initiateBulk(indexCatalogEntry,
+                                         getEachIndexBuildMaxMemoryUsageBytes(_indexes.size()),
                                          /*stateInfo=*/boost::none,
-                                         collection->ns().db());
+                                         collection->ns().dbName());
         }
     };
 
@@ -619,7 +627,7 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(
         // Unlock before hanging so replication recognizes we've completed.
         collection.yield();
         Locker::LockSnapshot lockInfo;
-        invariant(opCtx->lockState()->saveLockStateAndUnlock(&lockInfo));
+        opCtx->lockState()->saveLockStateAndUnlock(&lockInfo);
 
         LOGV2(20390,
               "Hanging index build with no locks due to "
@@ -786,6 +794,8 @@ Status MultiIndexBlock::_insert(
             continue;
         }
 
+        auto indexCatalogEntry = _indexes[i].block->getEntry(opCtx, collection);
+
         Status idxStatus = Status::OK();
 
         // When calling insert, BulkBuilderImpl's Sorter performs file I/O that may result in an
@@ -793,6 +803,7 @@ Status MultiIndexBlock::_insert(
         try {
             idxStatus = _indexes[i].bulk->insert(opCtx,
                                                  collection,
+                                                 indexCatalogEntry,
                                                  doc,
                                                  loc,
                                                  _indexes[i].options,
@@ -856,21 +867,23 @@ Status MultiIndexBlock::dumpInsertsFromBulk(
         // SERVER-41918 This call to bulk->commit() results in file I/O that may result in an
         // exception.
         try {
+            const IndexCatalogEntry* entry = _indexes[i].block->getEntry(opCtx, collection);
             Status status = _indexes[i].bulk->commit(
                 opCtx,
                 collection,
+                entry,
                 dupsAllowed,
                 kYieldIterations,
-                [=](const KeyString::Value& duplicateKey) {
+                [=, this](const KeyString::Value& duplicateKey) {
                     // Do not record duplicates when explicitly ignored. This may be the case on
                     // secondaries.
                     return writeConflictRetry(
-                        opCtx, "recordingDuplicateKey", entry->getNSSFromCatalog(opCtx).ns(), [&] {
+                        opCtx, "recordingDuplicateKey", entry->getNSSFromCatalog(opCtx), [&] {
                             if (dupsAllowed && !onDuplicateRecord && !_ignoreUnique &&
                                 entry->indexBuildInterceptor()) {
                                 WriteUnitOfWork wuow(opCtx);
                                 Status status = entry->indexBuildInterceptor()->recordDuplicateKey(
-                                    opCtx, duplicateKey);
+                                    opCtx, entry, duplicateKey);
                                 if (!status.isOK()) {
                                     return status;
                                 }
@@ -926,8 +939,12 @@ Status MultiIndexBlock::drainBackgroundWrites(
         // _ignoreUnique is set explicitly.
         auto trackDups = !_ignoreUnique ? IndexBuildInterceptor::TrackDuplicates::kTrack
                                         : IndexBuildInterceptor::TrackDuplicates::kNoTrack;
-        auto status = interceptor->drainWritesIntoIndex(
-            opCtx, coll, _indexes[i].options, trackDups, drainYieldPolicy);
+        auto status = interceptor->drainWritesIntoIndex(opCtx,
+                                                        coll,
+                                                        _indexes[i].block->getEntry(opCtx, coll),
+                                                        _indexes[i].options,
+                                                        trackDups,
+                                                        drainYieldPolicy);
         if (!status.isOK()) {
             return status;
         }
@@ -944,7 +961,8 @@ Status MultiIndexBlock::retrySkippedRecords(OperationContext* opCtx,
         if (!interceptor)
             continue;
 
-        auto status = interceptor->retrySkippedRecords(opCtx, collection, mode);
+        auto status = interceptor->retrySkippedRecords(
+            opCtx, collection, index.block->getEntry(opCtx, collection), mode);
         if (!status.isOK()) {
             return status;
         }
@@ -963,7 +981,8 @@ Status MultiIndexBlock::checkConstraints(OperationContext* opCtx, const Collecti
         if (!interceptor)
             continue;
 
-        auto status = interceptor->checkDuplicateKeyConstraints(opCtx);
+        auto status = interceptor->checkDuplicateKeyConstraints(
+            opCtx, _indexes[i].block->getEntry(opCtx, collection));
         if (!status.isOK()) {
             return status;
         }
@@ -982,8 +1001,9 @@ Status MultiIndexBlock::commit(OperationContext* opCtx,
                                OnCommitFn onCommit) {
     invariant(!_buildIsCleanedUp);
     invariant(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X),
-              str::stream() << "Collection " << collection->ns() << " with UUID "
-                            << collection->uuid() << " is holding the incorrect lock");
+              str::stream() << "Collection " << collection->ns().toStringForErrorMsg()
+                            << " with UUID " << collection->uuid()
+                            << " is holding the incorrect lock");
 
     // UUIDs are not guaranteed during startup because the check happens after indexes are rebuilt.
     if (_collectionUUID) {
@@ -1003,7 +1023,8 @@ Status MultiIndexBlock::commit(OperationContext* opCtx,
         return {
             ErrorCodes::CannotCreateIndex,
             str::stream()
-                << "Index build on collection '" << collection->ns() << "' (" << collection->uuid()
+                << "Index build on collection '" << collection->ns().toStringForErrorMsg() << "' ("
+                << collection->uuid()
                 << ") failed due to the detection of mixed-schema data in the time-series buckets "
                    "collection. Starting as of v5.2, time-series measurement bucketing has been "
                    "modified to ensure that newly created time-series buckets do not contain "
@@ -1093,7 +1114,8 @@ void MultiIndexBlock::abortWithoutCleanup(OperationContext* opCtx,
                                           const CollectionPtr& collection,
                                           bool isResumable) {
     invariant(!_buildIsCleanedUp);
-    // TODO (SERVER-71610): Fix to be interruptible or document exception.
+    // Aborting without cleanup is done during shutdown. At this point the operation context is
+    // killed, but acquiring locks must succeed.
     UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
     // Lock if it's not already locked, to ensure storage engine cannot be destructed out from
     // underneath us.
@@ -1220,7 +1242,7 @@ Status MultiIndexBlock::_failPointHangDuringBuild(OperationContext* opCtx,
                                                   unsigned long long iteration) const {
     try {
         fp->executeIf(
-            [=, &doc](const BSONObj& data) {
+            [=, this, &doc](const BSONObj& data) {
                 LOGV2(20386,
                       "Hanging index build during collection scan phase",
                       "where"_attr = where,

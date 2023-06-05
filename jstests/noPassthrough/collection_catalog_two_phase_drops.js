@@ -12,7 +12,6 @@
 "use strict";
 
 load("jstests/disk/libs/wt_file_helper.js");
-load("jstests/libs/feature_flag_util.js");
 
 const rst = new ReplSetTest({
     nodes: 1,
@@ -31,12 +30,6 @@ const primary = rst.getPrimary();
 
 const dbName = "test";
 const db = primary.getDB(dbName);
-
-if (!FeatureFlagUtil.isEnabled(db, "PointInTimeCatalogLookups")) {
-    jsTestLog("Skipping as featureFlagPointInTimeCatalogLookups is not enabled");
-    rst.stopSet();
-    return;
-}
 
 // Pause the checkpoint thread to control the checkpoint timestamp.
 assert.commandWorked(
@@ -83,8 +76,8 @@ checkLog.containsJson(primary, 6825301, {
 assert.commandWorked(db.adminCommand({appendOplogNote: 1, data: {msg: "advance timestamp"}}));
 assert.commandWorked(db.adminCommand({fsync: 1}));
 
-// Completing drop for ident.
-checkLog.containsJson(primary, 22237, {
+// "The ident was successfully dropped".
+checkLog.containsJson(primary, 6776600, {
     ident: function(ident) {
         return ident == xIndexUri;
     }
@@ -133,13 +126,13 @@ checkLog.containsJson(primary, 6825300, {
 assert.commandWorked(db.adminCommand({appendOplogNote: 1, data: {msg: "advance timestamp"}}));
 assert.commandWorked(db.adminCommand({fsync: 1}));
 
-// Completing drop for ident.
-checkLog.containsJson(primary, 22237, {
+// "The ident was successfully dropped".
+checkLog.containsJson(primary, 6776600, {
     ident: function(ident) {
         return ident == collUri;
     }
 });
-checkLog.containsJson(primary, 22237, {
+checkLog.containsJson(primary, 6776600, {
     ident: function(ident) {
         return ident == idIndexUri;
     }

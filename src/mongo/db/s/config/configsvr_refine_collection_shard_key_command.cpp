@@ -68,7 +68,8 @@ public:
         void _internalRun(OperationContext* opCtx) {
             const NamespaceString& nss = ns();
 
-            audit::logRefineCollectionShardKey(opCtx->getClient(), nss.ns(), request().getKey());
+            audit::logRefineCollectionShardKey(
+                opCtx->getClient(), NamespaceStringUtil::serialize(nss), request().getKey());
 
             // Set the operation context read concern level to local for reads into the config
             // database.
@@ -86,8 +87,8 @@ public:
                     opCtx, nss, repl::ReadConcernLevel::kLocalReadConcern);
             } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
                 uasserted(ErrorCodes::NamespaceNotSharded,
-                          str::stream()
-                              << "refineCollectionShardKey namespace " << nss << " is not sharded");
+                          str::stream() << "refineCollectionShardKey namespace "
+                                        << nss.toStringForErrorMsg() << " is not sharded");
             }
 
             const ShardKeyPattern oldShardKeyPattern(collType.getKeyPattern());
@@ -102,7 +103,7 @@ public:
 
             uassert(ErrorCodes::StaleEpoch,
                     str::stream()
-                        << "refineCollectionShardKey namespace " << nss.toString()
+                        << "refineCollectionShardKey namespace " << nss.toStringForErrorMsg()
                         << " has a different epoch than mongos had in its routing table cache",
                     request().getEpoch() == collType.getEpoch());
 

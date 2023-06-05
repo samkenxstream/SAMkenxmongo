@@ -45,12 +45,9 @@ namespace {
 RecordId find(OperationContext* opCtx,
               const CollectionPtr& systemViews,
               const NamespaceString& viewName) {
-    return systemViews->getIndexCatalog()
-        ->findIdIndex(opCtx)
-        ->getEntry()
-        ->accessMethod()
-        ->asSortedData()
-        ->findSingle(opCtx, systemViews, BSON("_id" << NamespaceStringUtil::serialize(viewName)));
+    const IndexCatalogEntry* entry = systemViews->getIndexCatalog()->findIdIndex(opCtx)->getEntry();
+    return entry->accessMethod()->asSortedData()->findSingle(
+        opCtx, systemViews, entry, BSON("_id" << NamespaceStringUtil::serialize(viewName)));
 }
 
 StatusWith<std::unique_ptr<CollatorInterface>> parseCollator(OperationContext* opCtx,
@@ -207,17 +204,6 @@ Status ViewsForDatabase::update(OperationContext* opCtx,
 
 Status ViewsForDatabase::_upsertIntoMap(OperationContext* opCtx,
                                         std::shared_ptr<ViewDefinition> view) {
-    // Cannot have a secondary view on a system.buckets collection, only the time-series
-    // collection view.
-    if (view->viewOn().isTimeseriesBucketsCollection() &&
-        view->name() != view->viewOn().getTimeseriesViewNamespace()) {
-        return {
-            ErrorCodes::InvalidNamespace,
-            "Invalid view: cannot define a view over a system.buckets namespace except by "
-            "creating a time-series collection",
-        };
-    }
-
     if (!view->name().isOnInternalDb() && !view->name().isSystem()) {
         if (view->timeseries()) {
             _stats.userTimeseries += 1;
@@ -246,7 +232,7 @@ Status ViewsForDatabase::_upsertIntoGraph(OperationContext* opCtx,
             if (needsValidation) {
                 uassertStatusOKWithContext(pipelineStatus.getStatus(),
                                            str::stream() << "Invalid pipeline for view "
-                                                         << viewDef.name().ns());
+                                                         << viewDef.name().toStringForErrorMsg());
             }
             return pipelineStatus.getStatus();
         }
@@ -332,6 +318,7 @@ Status ViewsForDatabase::_upsertIntoCatalog(OperationContext* opCtx,
                                             oldView,
                                             viewObj,
                                             collection_internal::kUpdateAllIndexes,
+                                            nullptr /* indexesAffected */,
                                             &CurOp::get(opCtx)->debug(),
                                             &args);
     }
@@ -390,9 +377,9 @@ Status ViewsForDatabase::_validateCollation(OperationContext* opCtx,
             !CollatorInterface::collatorsMatch(view.defaultCollator(),
                                                otherView->defaultCollator())) {
             return {ErrorCodes::OptionNotSupportedOnView,
-                    str::stream() << "View " << view.name().toString()
+                    str::stream() << "View " << view.name().toStringForErrorMsg()
                                   << " has conflicting collation with view "
-                                  << otherView->name().toString()};
+                                  << otherView->name().toStringForErrorMsg()};
         }
     }
 

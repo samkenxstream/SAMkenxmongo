@@ -156,7 +156,7 @@ void ShardingRecoveryService::acquireRecoverableCriticalSectionBlockWrites(
     tassert(7032360,
             fmt::format("Can't acquire recoverable critical section for collection '{}' with "
                         "reason '{}' while holding locks",
-                        nss.toString(),
+                        nss.toStringForErrorMsg(),
                         reason.toString()),
             !opCtx->lockState()->isLocked());
 
@@ -164,7 +164,7 @@ void ShardingRecoveryService::acquireRecoverableCriticalSectionBlockWrites(
         Lock::GlobalLock lk(opCtx, MODE_IX);
         boost::optional<AutoGetDb> dbLock;
         boost::optional<AutoGetCollection> collLock;
-        if (nsIsDbOnly(nss.ns())) {
+        if (nsIsDbOnly(NamespaceStringUtil::serialize(nss))) {
             dbLock.emplace(opCtx, nss.dbName(), MODE_S);
         } else {
             // TODO SERVER-68084 add the AutoGetCollectionViewMode::kViewsPermitted parameter to
@@ -179,8 +179,8 @@ void ShardingRecoveryService::acquireRecoverableCriticalSectionBlockWrites(
 
         DBDirectClient dbClient(opCtx);
         FindCommandRequest findRequest{NamespaceString::kCollectionCriticalSectionsNamespace};
-        findRequest.setFilter(
-            BSON(CollectionCriticalSectionDocument::kNssFieldName << nss.toString()));
+        findRequest.setFilter(BSON(CollectionCriticalSectionDocument::kNssFieldName
+                                   << NamespaceStringUtil::serialize(nss)));
         auto cursor = dbClient.find(std::move(findRequest));
 
         // if there is a doc with the same nss -> in order to not fail it must have the same
@@ -194,7 +194,7 @@ void ShardingRecoveryService::acquireRecoverableCriticalSectionBlockWrites(
                     fmt::format("Trying to acquire a  critical section blocking writes for "
                                 "namespace '{}' and reason '{}' but it is already taken by another "
                                 "operation with different reason '{}'",
-                                nss.toString(),
+                                nss.toStringForErrorMsg(),
                                 reason.toString(),
                                 collCSDoc.getReason().toString()),
                     collCSDoc.getReason().woCompare(reason) == 0);
@@ -233,11 +233,12 @@ void ShardingRecoveryService::acquireRecoverableCriticalSectionBlockWrites(
         std::string unusedErrmsg;
         batchedResponse.parseBSON(commandReply, &unusedErrmsg);
         tassert(7032369,
-                fmt::format("Insert did not add any doc to collection '{}' for namespace '{}' "
-                            "and reason '{}'",
-                            nss.toString(),
-                            reason.toString(),
-                            NamespaceString::kCollectionCriticalSectionsNamespace.toString()),
+                fmt::format(
+                    "Insert did not add any doc to collection '{}' for namespace '{}' "
+                    "and reason '{}'",
+                    nss.toStringForErrorMsg(),
+                    reason.toString(),
+                    NamespaceString::kCollectionCriticalSectionsNamespace.toStringForErrorMsg()),
                 batchedResponse.getN() > 0);
     }
 
@@ -269,14 +270,14 @@ void ShardingRecoveryService::promoteRecoverableCriticalSectionToBlockAlsoReads(
     tassert(7032364,
             fmt::format("Can't promote recoverable critical section for collection '{}' with "
                         "reason '{}' while holding locks",
-                        nss.toString(),
+                        nss.toStringForErrorMsg(),
                         reason.toString()),
             !opCtx->lockState()->isLocked());
 
     {
         boost::optional<AutoGetDb> dbLock;
         boost::optional<AutoGetCollection> collLock;
-        if (nsIsDbOnly(nss.ns())) {
+        if (nsIsDbOnly(NamespaceStringUtil::serialize(nss))) {
             dbLock.emplace(opCtx, nss.dbName(), MODE_X);
         } else {
             // TODO SERVER-68084 add the AutoGetCollectionViewMode::kViewsPermitted parameter to
@@ -291,15 +292,15 @@ void ShardingRecoveryService::promoteRecoverableCriticalSectionToBlockAlsoReads(
 
         DBDirectClient dbClient(opCtx);
         FindCommandRequest findRequest{NamespaceString::kCollectionCriticalSectionsNamespace};
-        findRequest.setFilter(
-            BSON(CollectionCriticalSectionDocument::kNssFieldName << nss.toString()));
+        findRequest.setFilter(BSON(CollectionCriticalSectionDocument::kNssFieldName
+                                   << NamespaceStringUtil::serialize(nss)));
         auto cursor = dbClient.find(std::move(findRequest));
 
         tassert(7032361,
                 fmt::format(
                     "Trying to acquire a critical section blocking reads for namespace '{}' and "
                     "reason '{}' but the critical section wasn't acquired first blocking writers.",
-                    nss.toString(),
+                    nss.toStringForErrorMsg(),
                     reason.toString()),
                 cursor->more());
         BSONObj bsonObj = cursor->next();
@@ -311,7 +312,7 @@ void ShardingRecoveryService::promoteRecoverableCriticalSectionToBlockAlsoReads(
                     "Trying to acquire a critical section blocking reads for namespace '{}' and "
                     "reason "
                     "'{}' but it is already taken by another operation with different reason '{}'",
-                    nss.toString(),
+                    nss.toStringForErrorMsg(),
                     reason.toString(),
                     collCSDoc.getReason().toString()),
                 collCSDoc.getReason().woCompare(reason) == 0);
@@ -338,9 +339,10 @@ void ShardingRecoveryService::promoteRecoverableCriticalSectionToBlockAlsoReads(
         // - Otherwise this call will fail and the CS won't be advanced (neither persisted nor
         // in-mem)
         auto commandResponse = dbClient.runCommand([&] {
-            const auto query = BSON(
-                CollectionCriticalSectionDocument::kNssFieldName
-                << nss.toString() << CollectionCriticalSectionDocument::kReasonFieldName << reason);
+            const auto query =
+                BSON(CollectionCriticalSectionDocument::kNssFieldName
+                     << NamespaceStringUtil::serialize(nss)
+                     << CollectionCriticalSectionDocument::kReasonFieldName << reason);
             const auto update = BSON(
                 "$set" << BSON(CollectionCriticalSectionDocument::kBlockReadsFieldName << true));
 
@@ -359,13 +361,14 @@ void ShardingRecoveryService::promoteRecoverableCriticalSectionToBlockAlsoReads(
         BatchedCommandResponse batchedResponse;
         std::string unusedErrmsg;
         batchedResponse.parseBSON(commandReply, &unusedErrmsg);
-        tassert(7032363,
-                fmt::format("Update did not modify any doc from collection '{}' for namespace '{}' "
-                            "and reason '{}'",
-                            NamespaceString::kCollectionCriticalSectionsNamespace.toString(),
-                            nss.toString(),
-                            reason.toString()),
-                batchedResponse.getNModified() > 0);
+        tassert(
+            7032363,
+            fmt::format("Update did not modify any doc from collection '{}' for namespace '{}' "
+                        "and reason '{}'",
+                        NamespaceString::kCollectionCriticalSectionsNamespace.toStringForErrorMsg(),
+                        nss.toStringForErrorMsg(),
+                        reason.toString()),
+            batchedResponse.getNModified() > 0);
     }
 
     WriteConcernResult ignoreResult;
@@ -397,14 +400,14 @@ void ShardingRecoveryService::releaseRecoverableCriticalSection(
     tassert(7032365,
             fmt::format("Can't release recoverable critical section for collection '{}' with "
                         "reason '{}' while holding locks",
-                        nss.toString(),
+                        nss.toStringForErrorMsg(),
                         reason.toString()),
             !opCtx->lockState()->isLocked());
 
     {
         boost::optional<AutoGetDb> dbLock;
         boost::optional<AutoGetCollection> collLock;
-        if (nsIsDbOnly(nss.ns())) {
+        if (nsIsDbOnly(NamespaceStringUtil::serialize(nss))) {
             dbLock.emplace(opCtx, nss.dbName(), MODE_X);
         } else {
             // TODO SERVER-68084 add the AutoGetCollectionViewMode::kViewsPermitted parameter to
@@ -419,8 +422,8 @@ void ShardingRecoveryService::releaseRecoverableCriticalSection(
 
         DBDirectClient dbClient(opCtx);
 
-        const auto queryNss =
-            BSON(CollectionCriticalSectionDocument::kNssFieldName << nss.toString());
+        const auto queryNss = BSON(CollectionCriticalSectionDocument::kNssFieldName
+                                   << NamespaceStringUtil::serialize(nss));
         FindCommandRequest findRequest{NamespaceString::kCollectionCriticalSectionsNamespace};
         findRequest.setFilter(queryNss);
         auto cursor = dbClient.find(std::move(findRequest));
@@ -456,7 +459,7 @@ void ShardingRecoveryService::releaseRecoverableCriticalSection(
         tassert(7032366,
                 fmt::format("Trying to release a critical for namespace '{}' and reason '{}' but "
                             "it is already taken by another operation with different reason '{}'",
-                            nss.toString(),
+                            nss.toStringForErrorMsg(),
                             reason.toString(),
                             collCSDoc.getReason().toString()),
                 !isDifferentReason);
@@ -489,13 +492,14 @@ void ShardingRecoveryService::releaseRecoverableCriticalSection(
         BatchedCommandResponse batchedResponse;
         std::string unusedErrmsg;
         batchedResponse.parseBSON(commandReply, &unusedErrmsg);
-        tassert(7032367,
-                fmt::format("Delete did not remove any doc from collection '{}' for namespace '{}' "
-                            "and reason '{}'",
-                            NamespaceString::kCollectionCriticalSectionsNamespace.toString(),
-                            nss.toString(),
-                            reason.toString()),
-                batchedResponse.getN() > 0);
+        tassert(
+            7032367,
+            fmt::format("Delete did not remove any doc from collection '{}' for namespace '{}' "
+                        "and reason '{}'",
+                        NamespaceString::kCollectionCriticalSectionsNamespace.toStringForErrorMsg(),
+                        nss.toStringForErrorMsg(),
+                        reason.toString()),
+            batchedResponse.getN() > 0);
     }
 
     WriteConcernResult ignoreResult;
@@ -536,7 +540,7 @@ void ShardingRecoveryService::recoverRecoverableCriticalSections(OperationContex
     store.forEach(opCtx, BSONObj{}, [&opCtx](const CollectionCriticalSectionDocument& doc) {
         const auto& nss = doc.getNss();
         {
-            if (nsIsDbOnly(nss.ns())) {
+            if (nsIsDbOnly(NamespaceStringUtil::serialize(nss))) {
                 AutoGetDb dbLock(opCtx, nss.dbName(), MODE_X);
                 auto scopedDss =
                     DatabaseShardingState::assertDbLockedAndAcquireExclusive(opCtx, nss.dbName());

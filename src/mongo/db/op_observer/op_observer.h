@@ -37,6 +37,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/rollback.h"
 #include "mongo/db/transaction/transaction_operations.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 
@@ -46,6 +47,39 @@ class OperationContext;
 namespace repl {
 class OpTime;
 }  // namespace repl
+
+struct OpTimeBundle {
+    repl::OpTime writeOpTime;
+    Date_t wallClockTime;
+};
+
+/**
+ * The generic container for onUpdate/onDelete/onUnpreparedTransactionCommit state-passing between
+ * OpObservers. Despite the naming, some OpObserver's don't strictly observe. This struct is written
+ * by OpObserverImpl and useful for later observers to inspect state they need.
+ *
+ * These structs are decorable to support the sharing of critical resources between OpObserverImpl
+ * and MigrationChunkClonerSourceOpObserver. No other decorations should be added to these structs.
+ */
+struct OpStateAccumulator : Decorable<OpStateAccumulator> {
+    OpStateAccumulator() = default;
+
+    OpTimeBundle opTime;
+
+private:
+    OpStateAccumulator(const OpStateAccumulator&) = delete;
+    OpStateAccumulator& operator=(const OpStateAccumulator&) = delete;
+};
+
+struct InsertsOpStateAccumulator : Decorable<InsertsOpStateAccumulator> {
+    InsertsOpStateAccumulator() = default;
+
+    std::vector<repl::OpTime> opTimes;
+
+private:
+    InsertsOpStateAccumulator(const InsertsOpStateAccumulator&) = delete;
+    InsertsOpStateAccumulator& operator=(const InsertsOpStateAccumulator&) = delete;
+};
 
 enum class RetryableFindAndModifyLocation {
     // The operation is not retryable, or not a "findAndModify" command. Do not record a
@@ -72,7 +106,15 @@ struct OplogUpdateEntryArgs {
         : updateArgs(updateArgs), coll(coll) {}
 };
 
-struct OplogDeleteEntryArgs {
+/**
+ * Holds supplementary information required for OpObserver::onDelete() to write out an
+ * oplog entry for deleting a single document from a collection.
+ *
+ * This struct is also passed to OpObserver::aboutToDelete() so that OpObserver
+ * implementations may include additional information (via decorations) to be shared with
+ * the onDelete() method within the same implementation.
+ */
+struct OplogDeleteEntryArgs : Decorable<OplogDeleteEntryArgs> {
     const BSONObj* deletedDoc = nullptr;
 
     // "fromMigrate" indicates whether the delete was induced by a chunk migration, and so
@@ -183,14 +225,15 @@ public:
      * and is intended to be forwarded to downstream subsystems that expect a single
      * 'fromMigrate' to describe the entire set of inserts.
      * Examples: ShardServerOpObserver, UserWriteBlockModeOpObserver, and
-     * OpObserverShardingImpl::shardObserveInsertsOp().
+     * MigrationChunkClonerSourceOpObserver::onInserts().
      */
     virtual void onInserts(OperationContext* opCtx,
                            const CollectionPtr& coll,
                            std::vector<InsertStatement>::const_iterator begin,
                            std::vector<InsertStatement>::const_iterator end,
                            std::vector<bool> fromMigrate,
-                           bool defaultFromMigrate) = 0;
+                           bool defaultFromMigrate,
+                           InsertsOpStateAccumulator* opAccumulator = nullptr) = 0;
 
     virtual void onInsertGlobalIndexKey(OperationContext* opCtx,
                                         const NamespaceString& globalIndexNss,
@@ -204,11 +247,15 @@ public:
                                         const BSONObj& key,
                                         const BSONObj& docKey) = 0;
 
-    virtual void onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) = 0;
+    virtual void onUpdate(OperationContext* opCtx,
+                          const OplogUpdateEntryArgs& args,
+                          OpStateAccumulator* opAccumulator = nullptr) = 0;
 
     virtual void aboutToDelete(OperationContext* opCtx,
                                const CollectionPtr& coll,
-                               const BSONObj& doc) = 0;
+                               const BSONObj& doc,
+                               OplogDeleteEntryArgs* args,
+                               OpStateAccumulator* opAccumulator = nullptr) = 0;
 
     /**
      * Handles logging before document is deleted.
@@ -222,7 +269,8 @@ public:
     virtual void onDelete(OperationContext* opCtx,
                           const CollectionPtr& coll,
                           StmtId stmtId,
-                          const OplogDeleteEntryArgs& args) = 0;
+                          const OplogDeleteEntryArgs& args,
+                          OpStateAccumulator* opAccumulator = nullptr) = 0;
 
     /**
      * Logs a no-op with "msgObj" in the o field into oplog.
@@ -312,15 +360,8 @@ public:
                                           const NamespaceString& collectionName,
                                           const UUID& uuid,
                                           std::uint64_t numRecords,
-                                          CollectionDropType dropType) = 0;
-    virtual repl::OpTime onDropCollection(OperationContext* opCtx,
-                                          const NamespaceString& collectionName,
-                                          const UUID& uuid,
-                                          std::uint64_t numRecords,
                                           CollectionDropType dropType,
-                                          bool markFromMigrate) {
-        return onDropCollection(opCtx, collectionName, uuid, numRecords, dropType);
-    }
+                                          bool markFromMigrate) = 0;
 
 
     /**
@@ -352,18 +393,9 @@ public:
                                              const UUID& uuid,
                                              const boost::optional<UUID>& dropTargetUUID,
                                              std::uint64_t numRecords,
-                                             bool stayTemp) = 0;
-    virtual repl::OpTime preRenameCollection(OperationContext* opCtx,
-                                             const NamespaceString& fromCollection,
-                                             const NamespaceString& toCollection,
-                                             const UUID& uuid,
-                                             const boost::optional<UUID>& dropTargetUUID,
-                                             std::uint64_t numRecords,
                                              bool stayTemp,
-                                             bool markFromMigrate) {
-        return preRenameCollection(
-            opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
-    }
+                                             bool markFromMigrate) = 0;
+
     /**
      * This function performs all op observer handling for a 'renameCollection' command except for
      * logging the oplog entry. It should be used specifically in instances where the optime is
@@ -387,18 +419,8 @@ public:
                                     const UUID& uuid,
                                     const boost::optional<UUID>& dropTargetUUID,
                                     std::uint64_t numRecords,
-                                    bool stayTemp) = 0;
-    virtual void onRenameCollection(OperationContext* opCtx,
-                                    const NamespaceString& fromCollection,
-                                    const NamespaceString& toCollection,
-                                    const UUID& uuid,
-                                    const boost::optional<UUID>& dropTargetUUID,
-                                    std::uint64_t numRecords,
                                     bool stayTemp,
-                                    bool markFromMigrate) {
-        onRenameCollection(
-            opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
-    }
+                                    bool markFromMigrate) = 0;
 
     virtual void onImportCollection(OperationContext* opCtx,
                                     const UUID& importUUID,
@@ -430,8 +452,9 @@ public:
      * The 'transactionOperations' contains the list of CRUD operations (formerly 'statements') to
      * be applied in this transaction.
      */
-    virtual void onUnpreparedTransactionCommit(
-        OperationContext* opCtx, const TransactionOperations& transactionOperations) = 0;
+    virtual void onUnpreparedTransactionCommit(OperationContext* opCtx,
+                                               const TransactionOperations& transactionOperations,
+                                               OpStateAccumulator* opAccumulator = nullptr) = 0;
     /**
      * The onPreparedTransactionCommit method is called on the commit of a prepared transaction,
      * after the RecoveryUnit onCommit() is called.  It must not be called when no transaction is
@@ -524,11 +547,20 @@ public:
         Date_t wallClockTime) = 0;
 
     /**
-     * This is called when a transaction transitions into prepare while it is not primary. Example
-     * case can include secondary oplog application or when node was restared and tries to
-     * recover prepared transactions from the oplog.
+     * This method is called when a transaction transitions into prepare while it is not primary,
+     * e.g. during secondary oplog application or recoverying prepared transactions from the
+     * oplog after restart. The method explicitly requires a session id (i.e. does not use the
+     * session id attached to the opCtx) because transaction oplog application currently applies the
+     * oplog entries for each prepared transaction in multiple internal sessions acquired from the
+     * InternalSessionPool. Currently, those internal sessions are completely unrelated to the
+     * session for the transaction itself. For a non-retryable internal transaction, not using the
+     * transaction session id in the codepath here can cause the opTime for the transaction to
+     * show up in the chunk migration opTime buffer although the writes they correspond to are not
+     * retryable and therefore are discarded anyway.
+     *
      */
     virtual void onTransactionPrepareNonPrimary(OperationContext* opCtx,
+                                                const LogicalSessionId& lsid,
                                                 const std::vector<repl::OplogEntry>& statements,
                                                 const repl::OpTime& prepareOpTime) = 0;
 
@@ -587,19 +619,9 @@ public:
      *
      * This method is only applicable to the "rollback to a stable timestamp" algorithm, and is not
      * called when using any other rollback algorithm i.e "rollback via refetch".
-     *
-     * This function will call the private virtual '_onReplicationRollback' method. Any exceptions
-     * thrown indicates rollback failure that may have led us to some inconsistent on-disk or memory
-     * state, so we crash instead.
      */
-    void onReplicationRollback(OperationContext* opCtx,
-                               const RollbackObserverInfo& rbInfo) noexcept {
-        try {
-            _onReplicationRollback(opCtx, rbInfo);
-        } catch (const DBException& ex) {
-            fassert(6050902, ex.toStatus());
-        }
-    };
+    virtual void onReplicationRollback(OperationContext* opCtx,
+                                       const RollbackObserverInfo& rbInfo) = 0;
 
     /**
      * Called when the majority commit point is updated by replication.
@@ -612,10 +634,6 @@ public:
                                              const repl::OpTime& newCommitPoint) = 0;
 
     struct Times;
-
-private:
-    virtual void _onReplicationRollback(OperationContext* opCtx,
-                                        const RollbackObserverInfo& rbInfo) = 0;
 
 protected:
     class ReservedTimes;

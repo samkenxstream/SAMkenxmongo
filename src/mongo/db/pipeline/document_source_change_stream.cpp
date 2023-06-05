@@ -72,6 +72,10 @@ using std::list;
 using std::string;
 using std::vector;
 
+namespace {
+CounterMetric changeStreamsShowExpandedEvents("changeStreams.showExpandedEvents");
+}
+
 // The $changeStream stage is an alias for many stages.
 REGISTER_DOCUMENT_SOURCE(changeStream,
                          DocumentSourceChangeStream::LiteParsed::parse,
@@ -340,6 +344,7 @@ std::list<boost::intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::_bui
         stages.push_back(DocumentSourceMatch::create(
             change_stream_filter::getMatchFilterForClassicOperationTypes(), expCtx));
     }
+    changeStreamsShowExpandedEvents.increment(spec.getShowExpandedEvents());
     return stages;
 }
 
@@ -359,7 +364,7 @@ void DocumentSourceChangeStream::assertIsLegalSpecification(
     uassert(ErrorCodes::InvalidOptions,
             str::stream() << "A $changeStream with 'allChangesForCluster:true' may only be opened "
                              "on the 'admin' database, and with no collection name; found "
-                          << expCtx->ns.ns(),
+                          << expCtx->ns.toStringForErrorMsg(),
             !spec.getAllChangesForCluster() ||
                 (expCtx->ns.isAdminDB() && expCtx->ns.isCollectionlessAggregateNS()));
 
@@ -367,10 +372,10 @@ void DocumentSourceChangeStream::assertIsLegalSpecification(
     // 'admin' database iff 'allChangesForCluster' is true. A stream may run against the 'config'
     // database iff 'allowToRunOnConfigDB' is true.
     const bool isNotBannedInternalDB =
-        !expCtx->ns.isLocal() && (!expCtx->ns.isConfigDB() || spec.getAllowToRunOnConfigDB());
+        !expCtx->ns.isLocalDB() && (!expCtx->ns.isConfigDB() || spec.getAllowToRunOnConfigDB());
     uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "$changeStream may not be opened on the internal " << expCtx->ns.db()
-                          << " database",
+            str::stream() << "$changeStream may not be opened on the internal "
+                          << expCtx->ns.dbName().toStringForErrorMsg() << " database",
             expCtx->ns.isAdminDB() ? static_cast<bool>(spec.getAllChangesForCluster())
                                    : isNotBannedInternalDB);
 
@@ -378,8 +383,8 @@ void DocumentSourceChangeStream::assertIsLegalSpecification(
     // against the internal collections iff 'allowToRunOnSystemNS' is true and the stream is not
     // opened through a mongos process.
     uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "$changeStream may not be opened on the internal " << expCtx->ns.ns()
-                          << " collection"
+            str::stream() << "$changeStream may not be opened on the internal "
+                          << expCtx->ns.toStringForErrorMsg() << " collection"
                           << (spec.getAllowToRunOnSystemNS() ? " through mongos" : ""),
             !expCtx->ns.isSystem() || (spec.getAllowToRunOnSystemNS() && !expCtx->inMongos));
 

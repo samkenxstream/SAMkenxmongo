@@ -51,6 +51,7 @@
 namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(hangDuringYieldingLocksForValidation);
+MONGO_FAIL_POINT_DEFINE(hangDuringHoldingLocksForValidation);
 
 namespace CollectionValidation {
 
@@ -78,6 +79,11 @@ ValidateState::ValidateState(OperationContext* opCtx,
         _collectionLock.emplace(opCtx, _nss, MODE_X);
     }
 
+    if (MONGO_unlikely(hangDuringHoldingLocksForValidation.shouldFail())) {
+        LOGV2(7490901, "Hanging on fail point 'hangDuringHoldingLocksForValidation'");
+        hangDuringHoldingLocksForValidation.pauseWhileSet();
+    }
+
     _database = _databaseLock->getDb() ? _databaseLock->getDb() : nullptr;
     if (_database)
         _collection =
@@ -87,12 +93,11 @@ ValidateState::ValidateState(OperationContext* opCtx,
         auto view = CollectionCatalog::get(opCtx)->lookupView(opCtx, _nss);
         if (!view) {
             uasserted(ErrorCodes::NamespaceNotFound,
-                      str::stream() << "Collection '" << _nss << "' does not exist to validate.");
+                      str::stream() << "Collection '" << _nss.toStringForErrorMsg()
+                                    << "' does not exist to validate.");
         } else {
             // Uses the bucket collection in place of the time-series collection view.
-            if (!view->timeseries() ||
-                !feature_flags::gExtendValidateCommand.isEnabled(
-                    serverGlobalParams.featureCompatibility)) {
+            if (!view->timeseries()) {
                 uasserted(ErrorCodes::CommandNotSupportedOnView, "Cannot validate a view");
             }
             _nss = _nss.makeTimeseriesBucketsNamespace();
@@ -107,7 +112,7 @@ ValidateState::ValidateState(OperationContext* opCtx,
                 ErrorCodes::NamespaceNotFound,
                 fmt::format(
                     "Cannot validate a time-series collection without its bucket collection {}.",
-                    _nss.toString()),
+                    _nss.toStringForErrorMsg()),
                 _collection);
         }
     }
@@ -175,18 +180,22 @@ void ValidateState::_yieldLocks(OperationContext* opCtx) {
     _relockDatabaseAndCollection(opCtx);
 
     uassert(ErrorCodes::Interrupted,
-            str::stream() << "Interrupted due to: catalog restart: " << _nss << " (" << *_uuid
-                          << ") while validating the collection",
+            str::stream() << "Interrupted due to: catalog restart: " << _nss.toStringForErrorMsg()
+                          << " (" << *_uuid << ") while validating the collection",
             _catalogGeneration == opCtx->getServiceContext()->getCatalogGeneration());
 
     // Check if any of the indexes we were validating were dropped. Indexes created while
     // yielding will be ignored.
-    for (const auto& index : _indexes) {
+    for (const auto& indexIdent : _indexIdents) {
+        const IndexDescriptor* desc =
+            _collection->getIndexCatalog()->findIndexByIdent(opCtx, indexIdent);
         uassert(ErrorCodes::Interrupted,
                 str::stream()
                     << "Interrupted due to: index being validated was dropped from collection: "
-                    << _nss << " (" << *_uuid << "), index: " << index->descriptor()->indexName(),
-                !index->isDropped());
+                    << _nss.toStringForErrorMsg() << " (" << *_uuid
+                    << "), index ident: " << indexIdent,
+                desc);
+        invariant(!desc->getEntry()->isDropped());
     }
 };
 
@@ -220,7 +229,7 @@ void ValidateState::_yieldCursors(OperationContext* opCtx) {
 
 void ValidateState::initializeCursors(OperationContext* opCtx) {
     invariant(!_traverseRecordStoreCursor && !_seekRecordStoreCursor && _indexCursors.size() == 0 &&
-              _columnStoreIndexCursors.size() == 0 && _indexes.size() == 0);
+              _columnStoreIndexCursors.size() == 0 && _indexIdents.size() == 0);
 
     // Background validation reads from the last stable checkpoint instead of the latest data. This
     // allows concurrent writes to go ahead without interfering with validation's view of the data.
@@ -245,7 +254,7 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
     uint64_t currCheckpointId = 0;
     do {
         _indexCursors.clear();
-        _indexes.clear();
+        _indexIdents.clear();
         StringSet readyDurableIndexes;
         try {
             _traverseRecordStoreCursor = std::make_unique<SeekableRecordThrottleCursor>(
@@ -343,7 +352,7 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
                 continue;
             }
 
-            _indexes.push_back(indexCatalog->getEntryShared(desc));
+            _indexIdents.push_back(desc->getEntry()->getIdent());
         }
         // For foreground validation which doesn't use checkpoint cursors, the checkpoint id will
         // always be zero.
@@ -383,15 +392,16 @@ void ValidateState::_relockDatabaseAndCollection(OperationContext* opCtx) {
 
     std::string dbErrMsg = str::stream()
         << "Interrupted due to: database drop: " << _nss.db()
-        << " while validating collection: " << _nss << " (" << *_uuid << ")";
+        << " while validating collection: " << _nss.toStringForErrorMsg() << " (" << *_uuid << ")";
 
     _databaseLock.emplace(opCtx, _nss.dbName(), MODE_IS);
     _database = DatabaseHolder::get(opCtx)->getDb(opCtx, _nss.dbName());
     uassert(ErrorCodes::Interrupted, dbErrMsg, _database);
     uassert(ErrorCodes::Interrupted, dbErrMsg, !_database->isDropPending(opCtx));
 
-    std::string collErrMsg = str::stream() << "Interrupted due to: collection drop: " << _nss
-                                           << " (" << *_uuid << ") while validating the collection";
+    std::string collErrMsg = str::stream()
+        << "Interrupted due to: collection drop: " << _nss.toStringForErrorMsg() << " (" << *_uuid
+        << ") while validating the collection";
 
     try {
         NamespaceStringOrUUID nssOrUUID(_nss.dbName(), *_uuid);

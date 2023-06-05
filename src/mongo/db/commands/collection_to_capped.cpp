@@ -76,7 +76,7 @@ public:
         const NamespaceString nss(
             NamespaceStringUtil::parseNamespaceFromRequest(dbName, nssElt.valueStringData()));
         uassert(ErrorCodes::InvalidNamespace,
-                str::stream() << "Invalid target namespace: " << nss.ns(),
+                str::stream() << "Invalid target namespace: " << nss.toStringForErrorMsg(),
                 nss.isValid());
 
         if (!as->isAuthorizedForActionsOnResource(
@@ -132,7 +132,7 @@ public:
         Database* const db = autoColl.getDb();
         if (!db) {
             uasserted(ErrorCodes::NamespaceNotFound,
-                      str::stream() << "database " << dbName.toString() << " not found");
+                      str::stream() << "database " << dbName.toStringForErrorMsg() << " not found");
         }
 
         cloneCollectionAsCapped(opCtx, db, fromNs, toNs, size, temp);

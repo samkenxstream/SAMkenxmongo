@@ -109,6 +109,9 @@ class Type(common.SourceLocation):
         self.first_element_field_name = None  # type: str
         self.deserialize_with_tenant = False  # type: bool
         self.internal_only = False  # type: bool
+        # Marks whether this type is a query shape component.
+        # Can only be true if is_struct is true.
+        self.is_query_shape_component = False  # type: bool
         super(Type, self).__init__(file_name, line, column)
 
 
@@ -140,6 +143,11 @@ class Struct(common.SourceLocation):
         self.cpp_validator_func = None  # type: str
         self.is_command_reply = False  # type: bool
         self.generic_list_type = None  # type: Optional[GenericListType]
+        # Determines whether or not this IDL struct can be a component of a query shape. See WRITING-13831.
+        self.query_shape_component = False  # type: bool
+        # pylint: disable=invalid-name
+        self.unsafe_dangerous_disable_extra_field_duplicate_checks = None  # type: bool
+
         super(Struct, self).__init__(file_name, line, column)
 
 
@@ -202,6 +210,31 @@ class Validator(common.SourceLocation):
         super(Validator, self).__init__(file_name, line, column)
 
 
+@enum.unique
+class QueryShapeFieldType(enum.Enum):
+    # Abstract literal from shape.
+    LITERAL = enum.auto()
+    # Leave value as-is in shape.
+    PARAMETER = enum.auto()
+    # Anonymize string value.
+    ANONYMIZE = enum.auto()
+    # IDL type uses custom serializer -- defer to that serializer.
+    CUSTOM = enum.auto()
+
+    @classmethod
+    def bind(cls, string_value):
+        # type: (Optional[str]) -> Optional[QueryShapeFieldType]
+        if string_value is None:
+            return None
+        bindings = {
+            "literal": cls.LITERAL,
+            "parameter": cls.PARAMETER,
+            "anonymize": cls.ANONYMIZE,
+            "custom": cls.CUSTOM,
+        }
+        return bindings.get(string_value, None)
+
+
 class Field(common.SourceLocation):
     """
     An instance of a field in a struct.
@@ -245,7 +278,23 @@ class Field(common.SourceLocation):
         # Extra info for generic fields.
         self.generic_field_info = None  # type: Optional[GenericFieldInfo]
 
+        # Determines whether or not this field represents a literal value that should be abstracted when serializing a query shape.
+        # See WRITING-13831 for details on query shape.
+        self.query_shape = None  # type: Optional[QueryShapeFieldType]
+
         super(Field, self).__init__(file_name, line, column)
+
+    @property
+    def should_serialize_with_options(self):
+        # type: () -> bool
+        """Returns true if the IDL compiler should add a call to serialization options for this field."""
+        return self.query_shape is not None and self.query_shape in [
+            QueryShapeFieldType.LITERAL, QueryShapeFieldType.ANONYMIZE
+        ]
+
+    @property
+    def should_shapify(self):
+        return self.query_shape is not None and self.query_shape != QueryShapeFieldType.PARAMETER
 
 
 class Privilege(common.SourceLocation):

@@ -73,32 +73,14 @@ void reopenAllDatabasesAndReloadCollectionCatalog(OperationContext* opCtx,
     for (auto&& dbName : databasesToOpen) {
         LOGV2_FOR_RECOVERY(23992, 1, "openCatalog: dbholder reopening database", logAttrs(dbName));
         auto db = databaseHolder->openDb(opCtx, dbName);
-        invariant(db, str::stream() << "failed to reopen database " << dbName.toString());
+        invariant(db,
+                  str::stream() << "failed to reopen database " << dbName.toStringForErrorMsg());
         for (auto&& collNss : catalogWriter.value()->getAllCollectionNamesFromDb(opCtx, dbName)) {
             // Note that the collection name already includes the database component.
             auto collection = catalogWriter.value()->lookupCollectionByNamespace(opCtx, collNss);
             invariant(collection,
-                      str::stream()
-                          << "failed to get valid collection pointer for namespace " << collNss);
-
-            if (previousCatalogState.minVisibleTimestampMap.count(collection->uuid()) > 0) {
-                // After rolling back to a stable timestamp T, the minimum visible timestamp for
-                // each collection must be reset to (at least) its value at T. Additionally, there
-                // cannot exist a minimum visible timestamp greater than lastApplied. This allows us
-                // to upper bound what the minimum visible timestamp can be coming out of rollback.
-                //
-                // Because we only save the latest minimum visible timestamp for each collection, we
-                // bound the minimum visible timestamp (where necessary) to the stable timestamp.
-                // The benefit of fine grained tracking is assumed to be low-value compared to the
-                // cost/effort.
-                auto minVisible = std::min(
-                    stableTimestamp,
-                    previousCatalogState.minVisibleTimestampMap.find(collection->uuid())->second);
-                auto writableCollection =
-                    catalogWriter.value()->lookupCollectionByUUIDForMetadataWrite(
-                        opCtx, collection->uuid());
-                writableCollection->setMinimumVisibleSnapshot(minVisible);
-            }
+                      str::stream() << "failed to get valid collection pointer for namespace "
+                                    << collNss.toStringForErrorMsg());
 
             if (auto it = previousCatalogState.minValidTimestampMap.find(collection->uuid());
                 it != previousCatalogState.minValidTimestampMap.end()) {
@@ -165,35 +147,20 @@ PreviousCatalogState closeCatalog(OperationContext* opCtx) {
     auto databaseHolder = DatabaseHolder::get(opCtx);
     auto catalog = CollectionCatalog::get(opCtx);
     for (auto&& dbName : allDbs) {
-        for (auto collIt = catalog->begin(opCtx, dbName); collIt != catalog->end(opCtx); ++collIt) {
-            auto coll = *collIt;
+        for (auto&& coll : catalog->range(dbName)) {
             if (!coll) {
                 break;
             }
 
-            boost::optional<Timestamp> minVisible = coll->getMinimumVisibleSnapshot();
-
-            // If there's a minimum visible, invariant there's also a UUID.
-            if (minVisible) {
-                LOGV2_DEBUG(20269,
-                            1,
-                            "closeCatalog: preserving min visible timestamp.",
-                            "coll_ns"_attr = coll->ns(),
-                            "uuid"_attr = coll->uuid(),
-                            "minVisible"_attr = minVisible);
-                previousCatalogState.minVisibleTimestampMap[coll->uuid()] = *minVisible;
-            }
-
-            boost::optional<Timestamp> minValid = coll->getMinimumValidSnapshot();
-
             // If there's a minimum valid, invariant there's also a UUID.
+            boost::optional<Timestamp> minValid = coll->getMinimumValidSnapshot();
             if (minValid) {
                 LOGV2_DEBUG(6825500,
                             1,
                             "closeCatalog: preserving min valid timestamp.",
                             "ns"_attr = coll->ns(),
                             "uuid"_attr = coll->uuid(),
-                            "minVisible"_attr = minValid);
+                            "minValid"_attr = minValid);
                 previousCatalogState.minValidTimestampMap[coll->uuid()] = *minValid;
             }
 
@@ -244,7 +211,7 @@ void openCatalog(OperationContext* opCtx,
 
     // Remove catalogId mappings for larger timestamp than 'stableTimestamp'.
     CollectionCatalog::write(opCtx, [stableTimestamp](CollectionCatalog& catalog) {
-        catalog.cleanupForCatalogReopen(stableTimestamp);
+        catalog.catalogIdTracker().rollback(stableTimestamp);
     });
 
     // Ignore orphaned idents because this function is used during rollback and not at
@@ -269,8 +236,9 @@ void openCatalog(OperationContext* opCtx,
         if (!indexSpecs.isOK() || indexSpecs.getValue().first.empty()) {
             fassert(40689,
                     {ErrorCodes::InternalError,
-                     str::stream() << "failed to get index spec for index " << indexName
-                                   << " in collection " << indexIdentifier.nss});
+                     str::stream()
+                         << "failed to get index spec for index " << indexName << " in collection "
+                         << indexIdentifier.nss.toStringForErrorMsg()});
         }
         auto indexesToRebuild = indexSpecs.getValue();
         invariant(
@@ -291,7 +259,8 @@ void openCatalog(OperationContext* opCtx,
         NamespaceString collNss(entry.first);
 
         auto collection = catalog->lookupCollectionByNamespace(opCtx, collNss);
-        invariant(collection, str::stream() << "couldn't get collection " << collNss.toString());
+        invariant(collection,
+                  str::stream() << "couldn't get collection " << collNss.toStringForErrorMsg());
 
         for (const auto& indexName : entry.second.first) {
             LOGV2(20275,
@@ -301,7 +270,7 @@ void openCatalog(OperationContext* opCtx,
                   "index"_attr = indexName);
         }
 
-        std::vector<BSONObj> indexSpecs = entry.second.second;
+        const std::vector<BSONObj>& indexSpecs = entry.second.second;
         fassert(40690, rebuildIndexesOnCollection(opCtx, collection, indexSpecs, RepairData::kNo));
     }
 

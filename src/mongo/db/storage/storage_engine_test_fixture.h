@@ -40,7 +40,6 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/durable_catalog.h"
-#include "mongo/db/storage/durable_catalog_impl.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/storage_engine_impl.h"
 #include "mongo/db/storage/storage_repair_observer.h"
@@ -78,12 +77,11 @@ public:
             opCtx,
             ns,
             catalogId,
-            _storageEngine->getCatalog()->getMetaData(opCtx, catalogId),
+            _storageEngine->getCatalog()->getParsedCatalogEntry(opCtx, catalogId)->metadata,
             std::move(rs));
 
         CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
-            catalog.registerCollection(
-                opCtx, options.uuid.get(), std::move(coll), /*ts=*/boost::none);
+            catalog.registerCollection(opCtx, std::move(coll), /*ts=*/boost::none);
         });
 
         return {{_storageEngine->getCatalog()->getEntry(catalogId)}};
@@ -101,7 +99,7 @@ public:
      * Create a collection table in the KVEngine not reflected in the DurableCatalog.
      */
     Status createCollTable(OperationContext* opCtx, NamespaceString collName) {
-        const std::string identName = "collection-" + collName.ns();
+        const std::string identName = "collection-" + collName.ns_forTest();
         return _storageEngine->getEngine()->createRecordStore(
             opCtx, collName, identName, CollectionOptions());
     }
@@ -190,18 +188,17 @@ public:
         Collection* collection =
             CollectionCatalog::get(opCtx)->lookupCollectionByNamespaceForMetadataWrite(opCtx,
                                                                                        collNs);
-        auto descriptor = collection->getIndexCatalog()->findIndexByName(
+        auto writableEntry = collection->getIndexCatalog()->getWritableEntryByName(
             opCtx,
             key,
             IndexCatalog::InclusionPolicy::kReady | IndexCatalog::InclusionPolicy::kUnfinished);
-        collection->indexBuildSuccess(opCtx, descriptor->getEntry());
+        collection->indexBuildSuccess(opCtx, writableEntry);
     }
 
     Status removeEntry(OperationContext* opCtx, StringData collNs, DurableCatalog* catalog) {
         const Collection* collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
             opCtx, NamespaceString::createNamespaceString_forTest(collNs));
-        return dynamic_cast<DurableCatalogImpl*>(catalog)->_removeEntry(opCtx,
-                                                                        collection->getCatalogId());
+        return catalog->_removeEntry(opCtx, collection->getCatalogId());
     }
 
     StorageEngine* _storageEngine;

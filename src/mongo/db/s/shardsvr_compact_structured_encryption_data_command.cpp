@@ -89,14 +89,6 @@ public:
                 [&]() -> std::shared_ptr<ShardingDDLCoordinatorService::Instance> {
                 FixedFCVRegion fixedFcvRegion(opCtx);
 
-                // TODO: SERVER-68373 Remove once 7.0 becomes last LTS
-                uassert(7330300,
-                        "The preview version of compactStructuredEncryptionData is no longer "
-                        "supported in this binary version",
-                        gFeatureFlagFLE2CompactForProtocolV2.isEnabled(
-                            serverGlobalParams.featureCompatibility));
-
-
                 auto compact = makeRequest(opCtx);
                 return ShardingDDLCoordinatorService::getService(opCtx)->getOrCreateInstance(
                     opCtx, compact.toBSON());
@@ -114,7 +106,7 @@ public:
 
             AutoGetCollection baseColl(opCtx, nss, MODE_IX);
             uassert(ErrorCodes::NamespaceNotFound,
-                    str::stream() << "Unknown collection: " << nss,
+                    str::stream() << "Unknown collection: " << nss.toStringForErrorMsg(),
                     baseColl.getCollection());
 
             validateCompactRequest(req, *(baseColl.getCollection().get()));

@@ -146,13 +146,9 @@ class TestReport(unittest.TestResult):
 
         try:
             # check if there are stacktrace files, if so, invoke the symbolizer here.
-            # If there are no stacktrace files for this job, we do not need to invoke the symbolizer at all.
-            # Take a lock to download the debug symbols if it hasn't already been downloaded.
             # log symbolized output to test.logger.info()
-
             symbolizer = ResmokeSymbolizer()
             symbolizer.symbolize_test_logs(test)
-            # symbolization completed
 
             unittest.TestResult.stopTest(self, test)
 
@@ -224,12 +220,7 @@ class TestReport(unittest.TestResult):
 
             test_info = self.find_test_info(test)
             test_info.status = "fail"
-            if test_info.dynamic:
-                # Dynamic tests are used for data consistency checks, so the failures are never
-                # silenced.
-                test_info.evergreen_status = "fail"
-            else:
-                test_info.evergreen_status = self.suite_options.report_failure_status
+            test_info.evergreen_status = "fail"
             test_info.return_code = test.return_code
 
     def setFailure(self, test, return_code=1):
@@ -241,12 +232,7 @@ class TestReport(unittest.TestResult):
                 raise ValueError("stopTest was not called on %s" % (test.basename()))
 
             test_info.status = "fail"
-            if test_info.dynamic:
-                # Dynamic tests are used for data consistency checks, so the failures are never
-                # silenced.
-                test_info.evergreen_status = "fail"
-            else:
-                test_info.evergreen_status = self.suite_options.report_failure_status
+            test_info.evergreen_status = "fail"
             test_info.return_code = return_code
 
         # Recompute number of success, failures, and errors.
@@ -414,7 +400,7 @@ class TestInfo(object):
         self.evergreen_status = None
         self.return_code = None
         self.url_endpoint = None
-        self.exception_extractors = None
+        self.exception_extractors = []
         self.error = None
 
 

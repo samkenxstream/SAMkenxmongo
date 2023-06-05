@@ -78,7 +78,7 @@ EvalExpr makeBalancedBooleanOpTree(sbe::EPrimBinary::Op logicOp,
     std::vector<std::unique_ptr<sbe::EExpression>> exprs;
     exprs.reserve(leaves.size());
     for (auto&& e : leaves) {
-        exprs.emplace_back(e.extractExpr(state.slotVarMap, *state.data->env));
+        exprs.emplace_back(e.extractExpr(state.slotVarMap, *state.env));
     }
     return EvalExpr{makeBalancedBooleanOpTree(logicOp, std::move(exprs))};
 }
@@ -138,6 +138,11 @@ optimizer::ABT makeFillEmptyFalse(optimizer::ABT e) {
 
 optimizer::ABT makeFillEmptyTrue(optimizer::ABT e) {
     return makeFillEmpty(std::move(e), true);
+}
+
+optimizer::ABT makeFillEmptyNull(optimizer::ABT e) {
+    return optimizer::make<optimizer::BinaryOp>(
+        optimizer::Operations::FillEmpty, std::move(e), optimizer::Constant::null());
 }
 
 optimizer::ABT makeNot(optimizer::ABT e) {

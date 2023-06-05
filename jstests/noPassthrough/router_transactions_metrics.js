@@ -201,7 +201,15 @@ const dbName = "test";
 const collName = "foo";
 const ns = dbName + '.' + collName;
 
-const st = new ShardingTest({shards: 2, mongos: 2, config: 1});
+const st = new ShardingTest({
+    shards: 2,
+    mongos: 2,
+    config: 1,
+    other: {
+        mongosOptions:
+            {setParameter: {'failpoint.skipClusterParameterRefresh': "{'mode':'alwaysOn'}"}}
+    }
+});
 
 const session = st.s.startSession();
 const sessionDB = session.getDatabase(dbName);

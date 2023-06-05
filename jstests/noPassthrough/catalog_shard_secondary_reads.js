@@ -1,5 +1,5 @@
 /**
- * Tests catalog shard topology.
+ * Tests config shard topology.
  *
  * @tags: [
  *   requires_fcv_70,
@@ -9,9 +9,7 @@
 (function() {
 "use strict";
 
-// TODO SERVER-74534: Enable metadata consistency check when it works with a catalog shard.
-TestData.skipCheckMetadataConsistency = true;
-
+load("jstests/libs/config_shard_util.js");
 load("jstests/libs/fail_point_util.js");
 load('jstests/libs/chunk_manipulation_util.js');
 
@@ -21,7 +19,7 @@ const st = new ShardingTest({
     shards: {rs0: {nodes: 2}, rs1: {nodes: 2}},
     config: 2,
     mongos: 1,
-    catalogShard: true,
+    configShard: true,
 });
 
 assert.commandWorked(st.s0.getDB('test').user.insert({_id: 1234}));
@@ -57,13 +55,8 @@ assert.eq({_id: 5678}, doc);
 let removeRes = assert.commandWorked(st.s0.adminCommand({transitionToDedicatedConfigServer: 1}));
 assert.eq("started", removeRes.state, tojson(removeRes));
 
-let hangCollectionFlush = configureFailPoint(st.rs0.getPrimary(), 'hangCollectionFlush');
-
 assert.commandWorked(st.s0.adminCommand(
     {moveChunk: 'config.system.sessions', find: {_id: 0}, to: st.shard1.shardName}));
-
-let hangBeforePostMigrationCommitRefresh =
-    configureFailPoint(st.rs0.getPrimary(), 'hangBeforePostMigrationCommitRefresh');
 
 var joinMoveChunk = moveChunkParallel(staticMongod,
                                       st.s0.host,
@@ -73,24 +66,19 @@ var joinMoveChunk = moveChunkParallel(staticMongod,
                                       st.shard1.shardName,
                                       true /**Parallel should expect success */);
 
-hangBeforePostMigrationCommitRefresh.wait();
-let skipShardFilteringMetadataRefresh =
-    configureFailPoint(st.rs0.getPrimary(), 'skipShardFilteringMetadataRefresh');
-hangBeforePostMigrationCommitRefresh.off();
-
 joinMoveChunk();
 
 assert.commandWorked(st.s0.adminCommand({movePrimary: 'test', to: st.shard1.shardName}));
 assert.commandWorked(st.s0.adminCommand({movePrimary: 'sharded', to: st.shard1.shardName}));
+
+// A config shard can't be removed until all range deletions have finished.
+ConfigShardUtil.waitForRangeDeletions(st.s0);
 
 removeRes = assert.commandWorked(st.s0.adminCommand({transitionToDedicatedConfigServer: 1}));
 assert.eq("completed", removeRes.state, tojson(removeRes));
 
 const downgradeFCV = binVersionToFCV('last-lts');
 assert.commandWorked(st.s0.adminCommand({setFeatureCompatibilityVersion: downgradeFCV}));
-
-skipShardFilteringMetadataRefresh.off();
-hangCollectionFlush.off();
 
 // Connect directly to the config to simulate a stale mongos that thinks config server is
 // still a shard
@@ -131,7 +119,7 @@ assert.commandWorked(st.s0.adminCommand({setFeatureCompatibilityVersion: upgrade
 // Need to drop the database before it can become a shard again.
 assert.commandWorked(st.configRS.getPrimary().getDB('sharded').dropDatabase());
 
-assert.commandWorked(st.s0.adminCommand({transitionToCatalogShard: 1}));
+assert.commandWorked(st.s0.adminCommand({transitionFromDedicatedConfigServer: 1}));
 assert.commandWorked(st.s0.adminCommand({movePrimary: 'test', to: st.shard0.shardName}));
 assert.commandWorked(
     st.s0.adminCommand({moveChunk: 'sharded.user', find: {_id: 0}, to: st.shard0.shardName}));

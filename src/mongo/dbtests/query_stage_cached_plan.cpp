@@ -81,7 +81,7 @@ public:
         addIndex(BSON("a" << 1));
         addIndex(BSON("b" << 1));
 
-        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns_forTest());
         CollectionPtr collection = ctx.getCollection();
         ASSERT(collection);
 
@@ -92,7 +92,7 @@ public:
     }
 
     void addIndex(const BSONObj& obj) {
-        ASSERT_OK(dbtests::createIndex(&_opCtx, nss.ns(), obj));
+        ASSERT_OK(dbtests::createIndex(&_opCtx, nss.ns_forTest(), obj));
     }
 
     void dropIndex(BSONObj keyPattern) {
@@ -166,7 +166,7 @@ public:
                                         std::move(mockChild));
 
         // This should succeed after triggering a replan.
-        NoopYieldPolicy yieldPolicy(_opCtx.getServiceContext()->getFastClockSource());
+        NoopYieldPolicy yieldPolicy(&_opCtx, _opCtx.getServiceContext()->getFastClockSource());
         ASSERT_OK(cachedPlanStage.pickBestPlan(&yieldPolicy));
     }
 
@@ -221,7 +221,7 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanFailureMemoryLimitExceeded) {
                                     std::move(mockChild));
 
     // This should succeed after triggering a replan.
-    NoopYieldPolicy yieldPolicy(_opCtx.getServiceContext()->getFastClockSource());
+    NoopYieldPolicy yieldPolicy(&_opCtx, _opCtx.getServiceContext()->getFastClockSource());
     ASSERT_OK(cachedPlanStage.pickBestPlan(&yieldPolicy));
 
     ASSERT_EQ(getNumResultsForStage(_ws, &cachedPlanStage, cq.get()), 2U);
@@ -275,7 +275,7 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanHitMaxWorks) {
                                     std::move(mockChild));
 
     // This should succeed after triggering a replan.
-    NoopYieldPolicy yieldPolicy(_opCtx.getServiceContext()->getFastClockSource());
+    NoopYieldPolicy yieldPolicy(&_opCtx, _opCtx.getServiceContext()->getFastClockSource());
     ASSERT_OK(cachedPlanStage.pickBestPlan(&yieldPolicy));
 
     ASSERT_EQ(getNumResultsForStage(_ws, &cachedPlanStage, cq.get()), 2U);
@@ -538,7 +538,7 @@ TEST_F(QueryStageCachedPlan, DoesNotThrowOnYieldRecoveryWhenIndexIsDroppedAferPl
                                     decisionWorks,
                                     std::make_unique<MockStage>(_expCtx.get(), &_ws));
 
-    NoopYieldPolicy yieldPolicy(_opCtx.getServiceContext()->getFastClockSource());
+    NoopYieldPolicy yieldPolicy(&_opCtx, _opCtx.getServiceContext()->getFastClockSource());
     ASSERT_OK(cachedPlanStage.pickBestPlan(&yieldPolicy));
 
     // Drop an index while the CachedPlanStage is in a saved state. We should be able to restore

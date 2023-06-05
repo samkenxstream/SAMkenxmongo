@@ -40,8 +40,8 @@
 #include "mongo/db/catalog/capped_visibility.h"
 #include "mongo/db/catalog/collection_operation_source.h"
 #include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/record_id.h"
@@ -644,23 +644,12 @@ public:
     virtual uint64_t getIndexFreeStorageBytes(OperationContext* opCtx) const = 0;
 
     /**
-     * If return value is not boost::none, reads with majority read concern using an older snapshot
-     * must error.
-     */
-    virtual boost::optional<Timestamp> getMinimumVisibleSnapshot() const = 0;
-
-    virtual void setMinimumVisibleSnapshot(Timestamp name) = 0;
-
-
-    /**
      * Get the timestamp this Collection instance was most recently changed at.
-     * TODO SERVER-68270: Should currently not be used until min visible snapshot is removed
      */
     virtual boost::optional<Timestamp> getMinimumValidSnapshot() const = 0;
 
     /**
      * Sets the timestamp this Collection instance was most recently changed at.
-     * TODO SERVER-68270: Should currently not be used until min visible snapshot is removed
      */
     virtual void setMinimumValidSnapshot(Timestamp name) = 0;
 
@@ -809,5 +798,26 @@ inline ValidationActionEnum validationActionOrDefault(
 inline ValidationLevelEnum validationLevelOrDefault(boost::optional<ValidationLevelEnum> level) {
     return level.value_or(ValidationLevelEnum::strict);
 }
+
+/**
+ * Returns a collator for the user-specified collation 'userCollation'.
+ *
+ * Note: The caller should check if 'userCollation' is not empty since the empty 'userCollation'
+ * has the special meaning that the query follows the collection default collation that exists.
+ */
+inline std::unique_ptr<CollatorInterface> getUserCollator(OperationContext* opCtx,
+                                                          const BSONObj& userCollation) {
+    tassert(7542402, "Empty user collation", !userCollation.isEmpty());
+    return uassertStatusOK(
+        CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(userCollation));
+}
+
+/**
+ * Resolves the collator to either the user-specified collation or, if none was specified, to
+ * the collection-default collation and also returns a flag indicating whether the user-provided
+ * collation matches the collection default collation.
+ */
+std::pair<std::unique_ptr<CollatorInterface>, ExpressionContext::CollationMatchesDefault>
+resolveCollator(OperationContext* opCtx, BSONObj userCollation, const CollectionPtr& collection);
 
 }  // namespace mongo

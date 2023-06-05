@@ -57,14 +57,8 @@ ABT maxABT(const ABT& v1, const ABT& v2) {
 };
 
 void constFoldInterval(IntervalRequirement& interval, const ConstFoldFn& constFold) {
-    ABT low = interval.getLowBound().getBound();
-    ABT high = interval.getHighBound().getBound();
-    constFold(low);
-    constFold(high);
-    interval = IntervalRequirement{
-        BoundRequirement{interval.getLowBound().isInclusive(), std::move(low)},
-        BoundRequirement{interval.getHighBound().isInclusive(), std::move(high)},
-    };
+    constFold(interval.getLowBound().getBound());
+    constFold(interval.getHighBound().getBound());
 }
 
 // Returns true if the interval can be proven to be empty. If no conclusion can be made, or the
@@ -774,56 +768,6 @@ private:
 
 void normalizeIntervals(IntervalReqExpr::Node& intervals) {
     IntervalNormalizer{}.normalize(intervals);
-}
-
-boost::optional<ABT> coerceIntervalToPathCompareEqMember(const IntervalReqExpr::Node& interval) {
-    // Create the array that EqMember will use to hold the members.
-    auto [eqMembersTag, eqMembersVal] = sbe::value::makeNewArray();
-    sbe::value::ValueGuard guard{eqMembersTag, eqMembersVal};
-    auto eqMembersArray = sbe::value::getArrayView(eqMembersVal);
-
-    // An EqMember is a disjunction of conjunctions of atoms (point intervals). For example [1, 1] U
-    // [2, 2] U [3, 3] However each conjunction should only have one atom child, so we can think of
-    // it as a disjunction of point intervals instead.
-    if (const auto disj = interval.cast<IntervalReqExpr::Disjunction>()) {
-        // We only make an EqMember if we have 2 or more comparisons.
-        if (disj->nodes().size() < 2) {
-            return boost::none;
-        }
-
-        for (const auto& child : disj->nodes()) {
-            if (!child.is<IntervalReqExpr::Conjunction>()) {
-                return boost::none;
-            }
-
-            // Check that the conjunction has one atom child.
-            const auto conjChild = child.cast<IntervalReqExpr::Conjunction>();
-            if (conjChild->nodes().size() != 1 ||
-                !conjChild->nodes().front().is<IntervalReqExpr::Atom>()) {
-                return boost::none;
-            }
-
-            // Check that the atom is a point interval, and the bound is a constant.
-            const auto atomChild = conjChild->nodes().front().cast<IntervalReqExpr::Atom>();
-            if (!atomChild->getExpr().isEquality() ||
-                !atomChild->getExpr().getLowBound().getBound().is<Constant>()) {
-                return boost::none;
-            }
-
-            const auto constAtomChildPair =
-                atomChild->getExpr().getLowBound().getBound().cast<Constant>()->get();
-
-            // Make a copy of the point bound, insert it into our EqMember members.
-            const auto newEqMember = copyValue(constAtomChildPair.first, constAtomChildPair.second);
-            eqMembersArray->push_back(newEqMember.first, newEqMember.second);
-        }
-
-        // If we got to this point, we have successfully coerced the interval into an EqMember!
-        // Reset the guard so the members array doesn't get deleted.
-        guard.reset();
-        return make<PathCompare>(Operations::EqMember, make<Constant>(eqMembersTag, eqMembersVal));
-    }
-    return boost::none;
 }
 
 bool isSimpleRange(const CompoundIntervalReqExpr::Node& interval) {

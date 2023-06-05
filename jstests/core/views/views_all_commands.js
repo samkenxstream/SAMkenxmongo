@@ -76,6 +76,7 @@
 "use strict";
 
 load('jstests/sharding/libs/last_lts_mongod_commands.js');
+load('jstests/sharding/libs/last_lts_mongos_commands.js');
 
 // Pre-written reasons for skipping a test.
 const isAnInternalCommand = "internal command";
@@ -122,14 +123,16 @@ let viewsCommandTests = {
     _configsvrRemoveShardFromZone: {skip: isAnInternalCommand},
     _configsvrRemoveTags: {skip: isAnInternalCommand},
     _configsvrRepairShardedCollectionChunksHistory: {skip: isAnInternalCommand},
+    _configsvrResetPlacementHistory: {skip: isAnInternalCommand},
     _configsvrReshardCollection: {skip: isAnInternalCommand},
     _configsvrRunRestore: {skip: isAnInternalCommand},
     _configsvrSetAllowMigrations: {skip: isAnInternalCommand},
     _configsvrSetClusterParameter: {skip: isAnInternalCommand},
     _configsvrSetUserWriteBlockMode: {skip: isAnInternalCommand},
-    _configsvrTransitionToCatalogShard: {skip: isAnInternalCommand},
+    _configsvrTransitionFromDedicatedConfigServer: {skip: isAnInternalCommand},
     _configsvrTransitionToDedicatedConfigServer: {skip: isAnInternalCommand},
     _configsvrUpdateZoneKeyRange: {skip: isAnInternalCommand},
+    _dropConnectionsToMongot: {skip: isAnInternalCommand},
     _flushDatabaseCacheUpdates: {skip: isUnrelated},
     _flushDatabaseCacheUpdatesWithWriteConcern: {skip: isUnrelated},
     _flushReshardingStateChange: {skip: isUnrelated},
@@ -143,6 +146,7 @@ let viewsCommandTests = {
     _killOperations: {skip: isUnrelated},
     _mergeAuthzCollections: {skip: isAnInternalCommand},
     _migrateClone: {skip: isAnInternalCommand},
+    _mongotConnPoolStats: {skip: isAnInternalCommand},
     _movePrimary: {skip: isAnInternalCommand},
     _movePrimaryRecipientAbortMigration: {skip: isAnInternalCommand},
     _movePrimaryRecipientForgetMigration: {skip: isAnInternalCommand},
@@ -156,6 +160,7 @@ let viewsCommandTests = {
     _shardsvrAbortReshardCollection: {skip: isAnInternalCommand},
     _shardsvrCheckMetadataConsistency: {skip: isAnInternalCommand},
     _shardsvrCheckMetadataConsistencyParticipant: {skip: isAnInternalCommand},
+    _shardsvrCleanupStructuredEncryptionData: {skip: isAnInternalCommand},
     _shardsvrCloneCatalogData: {skip: isAnInternalCommand},
     _shardsvrCompactStructuredEncryptionData: {skip: isAnInternalCommand},
     _shardsvrDropCollection: {skip: isAnInternalCommand},
@@ -207,7 +212,13 @@ let viewsCommandTests = {
     _shardsvrCollModParticipant: {skip: isAnInternalCommand},
     _shardsvrParticipantBlock: {skip: isAnInternalCommand},
     _shardsvrUnregisterIndex: {skip: isAnInternalCommand},
-    _startStreamProcessor: {skip: isAnInternalCommand},
+    streams_startStreamProcessor: {skip: isAnInternalCommand},
+    streams_startStreamSample: {skip: isAnInternalCommand},
+    streams_stopStreamProcessor: {skip: isAnInternalCommand},
+    streams_listStreamProcessors: {skip: isAnInternalCommand},
+    streams_getMoreStreamSample: {skip: isAnInternalCommand},
+    streams_getStats: {skip: isAnInternalCommand},
+    streams_testOnlyInsert: {skip: isAnInternalCommand},
     _transferMods: {skip: isAnInternalCommand},
     _vectorClockPersist: {skip: isAnInternalCommand},
     abortReshardCollection: {skip: isUnrelated},
@@ -256,12 +267,16 @@ let viewsCommandTests = {
         command: {captrunc: "view", n: 2, inc: false},
         expectFailure: true,
     },
-    checkMetadataConsistency: {skip: isUnrelated},
+    checkMetadataConsistency: {
+        command: {checkMetadataConsistency: "view"},
+        expectFailure: false,
+    },
     checkShardingIndex: {skip: isUnrelated},
     cleanupOrphaned: {
         skip: "Tested in views/views_sharded.js",
     },
     cleanupReshardCollection: {skip: isUnrelated},
+    cleanupStructuredEncryptionData: {skip: isUnrelated},
     clearJumboFlag: {
         command: {clearJumboFlag: "test.view"},
         skipStandalone: true,
@@ -611,6 +626,7 @@ let viewsCommandTests = {
     replSetTestEgress: {skip: isUnrelated},
     replSetUpdatePosition: {skip: isUnrelated},
     replSetResizeOplog: {skip: isUnrelated},
+    resetPlacementHistory: {skip: isUnrelated},
     reshardCollection: {
         command: {reshardCollection: "test.view", key: {_id: 1}},
         setup: function(conn) {
@@ -718,7 +734,7 @@ let viewsCommandTests = {
     testVersion2: {skip: isAnInternalCommand},
     testVersions1And2: {skip: isAnInternalCommand},
     top: {skip: "tested in views/views_stats.js"},
-    transitionToCatalogShard: {skip: isUnrelated},
+    transitionFromDedicatedConfigServer: {skip: isUnrelated},
     transitionToDedicatedConfigServer: {skip: isUnrelated},
     update: {command: {update: "view", updates: [{q: {x: 1}, u: {x: 2}}]}, expectFailure: true},
     updateRole: {
@@ -753,6 +769,10 @@ let viewsCommandTests = {
 };
 
 commandsRemovedFromMongodSinceLastLTS.forEach(function(cmd) {
+    viewsCommandTests[cmd] = {skip: "must define test coverage for backwards compatibility"};
+});
+
+commandsRemovedFromMongosSinceLastLTS.forEach(function(cmd) {
     viewsCommandTests[cmd] = {skip: "must define test coverage for backwards compatibility"};
 });
 

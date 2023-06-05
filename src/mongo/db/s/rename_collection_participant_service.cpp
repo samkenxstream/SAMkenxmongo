@@ -86,7 +86,7 @@ void renameOrDropTarget(OperationContext* opCtx,
                 return;
             }
             uassert(5807602,
-                    str::stream() << "Target collection " << toNss
+                    str::stream() << "Target collection " << toNss.toStringForErrorMsg()
                                   << " UUID does not match the provided UUID.",
                     !targetUUID || targetCollPtr->uuid() == *targetUUID);
         }
@@ -99,7 +99,7 @@ void renameOrDropTarget(OperationContext* opCtx,
         const auto sourceCollPtr =
             CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, fromNss);
         uassert(ErrorCodes::CommandFailed,
-                str::stream() << "Source Collection " << fromNss
+                str::stream() << "Source Collection " << fromNss.toStringForErrorMsg()
                               << " UUID does not match provided uuid.",
                 !sourceCollPtr || sourceCollPtr->uuid() == sourceUUID);
     }
@@ -143,7 +143,7 @@ bool RenameParticipantInstance::hasSameOptions(const BSONObj& participantDoc) {
     const auto otherDoc = RenameCollectionParticipantDocument::parse(
         IDLParserContext("RenameCollectionParticipantDocument"), participantDoc);
 
-    const auto& selfReq = _doc.getRenameCollectionRequest().toBSON();
+    const auto& selfReq = _request.toBSON();
     const auto& otherReq = otherDoc.getRenameCollectionRequest().toBSON();
 
     return SimpleBSONObjComparator::kInstance.evaluate(selfReq == otherReq);
@@ -161,8 +161,8 @@ boost::optional<BSONObj> RenameParticipantInstance::reportForCurrentOp(
     bob.append("type", "op");
     bob.append("desc", "RenameParticipantInstance");
     bob.append("op", "command");
-    bob.append("ns", fromNss().toString());
-    bob.append("to", toNss().toString());
+    bob.append("ns", NamespaceStringUtil::serialize(fromNss()));
+    bob.append("to", NamespaceStringUtil::serialize(toNss()));
     bob.append("command", cmdBob.obj());
     bob.append("currentPhase", _doc.getPhase());
     bob.append("active", true);
@@ -394,10 +394,10 @@ SemiFuture<void> RenameParticipantInstance::_runImpl(
                 // migration. It is not needed for the source collection because no migration can
                 // start until it first becomes sharded, which cannot happen until the DDLLock is
                 // released.
-                const auto reason =
-                    BSON("command"
-                         << "rename"
-                         << "from" << fromNss().toString() << "to" << toNss().toString());
+                const auto reason = BSON("command"
+                                         << "rename"
+                                         << "from" << NamespaceStringUtil::serialize(fromNss())
+                                         << "to" << NamespaceStringUtil::serialize(toNss()));
                 auto service = ShardingRecoveryService::get(opCtx);
                 service->releaseRecoverableCriticalSection(
                     opCtx, fromNss(), reason, ShardingCatalogClient::kLocalWriteConcern);

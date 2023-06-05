@@ -203,10 +203,14 @@ std::unique_ptr<HealthLogEntry> dbCheckBatchEntry(
         if (hashesMatch) {
             return SeverityEnum::Info;
         }
-        // Implicitly replicated collections and capped collections not replicating truncation are
-        // not designed to be consistent, so inconsistency is not necessarily pathological.
+        // We relax inconsistency checks for some collections to a simple warning in some cases.
+        // preimages and change collections may be using untimestamped truncates on each node
+        // independently and can easily be inconsistent. In addition, by design
+        // the image_collection can skip a write during steady-state replication, and the preimages
+        // collection can be inconsistent during logical initial sync, all of which is
+        // harmless.
         if (nss.isChangeStreamPreImagesCollection() || nss.isConfigImagesCollection() ||
-            (options && options->capped)) {
+            nss.isChangeCollection() || (options && options->capped)) {
             return SeverityEnum::Warning;
         }
 
@@ -224,10 +228,26 @@ DbCheckHasher::DbCheckHasher(OperationContext* opCtx,
                              const BSONKey& end,
                              int64_t maxCount,
                              int64_t maxBytes)
-    : _opCtx(opCtx), _maxKey(end), _maxCount(maxCount), _maxBytes(maxBytes) {
+    : _opCtx(opCtx),
+      _maxKey(end),
+      _maxCount(maxCount),
+      _maxBytes(maxBytes),
+      _previousDataCorruptionMode(opCtx->recoveryUnit()->getDataCorruptionDetectionMode()),
+      _previousPrepareConflictBehavior(opCtx->recoveryUnit()->getPrepareConflictBehavior()) {
 
     // Get the MD5 hasher set up.
     md5_init(&_state);
+
+    // We don't want detected data corruption to prevent us from finishing our scan. Locations where
+    // we throw these errors should already be writing to the health log anyways.
+    opCtx->recoveryUnit()->setDataCorruptionDetectionMode(
+        DataCorruptionDetectionMode::kLogAndContinue);
+
+    // We need to enforce prepare conflicts in order to return correct results. This can't be done
+    // while a snapshot is already open.
+    if (_previousPrepareConflictBehavior != PrepareConflictBehavior::kEnforce) {
+        opCtx->recoveryUnit()->setPrepareConflictBehavior(PrepareConflictBehavior::kEnforce);
+    }
 
     if (!collection->isClustered()) {
         // Get the _id index.
@@ -257,6 +277,13 @@ DbCheckHasher::DbCheckHasher(OperationContext* opCtx,
         params.boundInclusion = CollectionScanParams::ScanBoundInclusion::kIncludeEndRecordOnly;
         _exec = InternalPlanner::collectionScan(
             opCtx, &collection, params, PlanYieldPolicy::YieldPolicy::NO_YIELD);
+    }
+}
+
+DbCheckHasher::~DbCheckHasher() {
+    _opCtx->recoveryUnit()->setDataCorruptionDetectionMode(_previousDataCorruptionMode);
+    if (_previousPrepareConflictBehavior != PrepareConflictBehavior::kEnforce) {
+        _opCtx->recoveryUnit()->setPrepareConflictBehavior(_previousPrepareConflictBehavior);
     }
 }
 

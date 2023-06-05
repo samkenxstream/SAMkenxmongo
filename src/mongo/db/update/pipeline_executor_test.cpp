@@ -52,7 +52,6 @@ TEST_F(UpdateTestFixture, Noop) {
     mutablebson::Document doc(fromjson("{a: 1, b: 2}"));
     auto result = exec.applyUpdate(getApplyParams(doc.root()));
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: 2}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_TRUE(result.oplogEntry.isEmpty());
@@ -69,7 +68,6 @@ TEST_F(UpdateTestFixture, ShouldNotCreateIdIfNoIdExistsAndNoneIsSpecified) {
     ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{c: 1, d: 'largeStringValue', a: 1, b: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_FALSE(result.indexesAffected);
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{$v: 2, diff: {i: {a: 1, b: 2}}}"), result.oplogEntry);
 }
 
@@ -83,7 +81,6 @@ TEST_F(UpdateTestFixture, ShouldPreserveIdOfExistingDocumentIfIdNotReplaced) {
     mutablebson::Document doc(fromjson("{_id: 0, c: 1, d: 2}"));
     auto result = exec.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 0, a: 1, b: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: 0, a: 1, b: 2}"), result.oplogEntry);
@@ -102,7 +99,6 @@ TEST_F(UpdateTestFixture, ShouldSucceedWhenImmutableIdIsNotModified) {
 
     ASSERT_EQUALS(fromjson("{_id: 0, c: 1, d: 'largeStringValue', a: 1, b: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_FALSE(result.indexesAffected);
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{$v: 2, diff: {i: {a: 1, b: 2 }}}"), result.oplogEntry);
 }
 
@@ -118,7 +114,6 @@ TEST_F(UpdateTestFixture, ComplexDoc) {
 
     ASSERT_EQUALS(fromjson("{a: 1, b: [0, 1, 2], e: ['val1', 'val2'], c: {d: 1}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_FALSE(result.indexesAffected);
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{$v: 2, diff: {i: {c: {d: 1}}, sb: {a: true, u1: 1} }}"),
                              result.oplogEntry);
 }
@@ -149,7 +144,6 @@ TEST_F(UpdateTestFixture, IdFieldIsNotRemoved) {
     addImmutablePath("_id");
     auto result = exec.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 0}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: 0}"), result.oplogEntry);
@@ -225,7 +219,6 @@ TEST_F(UpdateTestFixture, CanAddImmutableField) {
     addImmutablePath("a.b");
     auto result = exec.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{c: 1, a: {b: 1}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{c: 1, a: {b: 1}}"), result.oplogEntry);
@@ -241,7 +234,6 @@ TEST_F(UpdateTestFixture, CanAddImmutableId) {
     addImmutablePath("_id");
     auto result = exec.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{c: 1, _id: 0}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{c: 1, _id: 0}"), result.oplogEntry);
@@ -264,7 +256,6 @@ TEST_F(UpdateTestFixture, NoLogBuilder) {
     setLogBuilderToNull();
     auto result = exec.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{b: 1, a: 1}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 }
@@ -317,7 +308,6 @@ TEST_F(UpdateTestFixture, CanUseConstants) {
     mutablebson::Document doc(fromjson("{a: 1}"));
     const auto result = exec.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: 10, c : {x: 1, y: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: 1, b: 10, c : {x: 1, y: 2}}"), result.oplogEntry);
@@ -335,7 +325,6 @@ TEST_F(UpdateTestFixture, CanUseConstantsAcrossMultipleUpdates) {
     mutablebson::Document doc1(fromjson("{a: 1}"));
     auto result = exec.applyUpdate(getApplyParams(doc1.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: 'foo'}"), doc1);
     ASSERT_FALSE(doc1.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: 1, b: 'foo'}"), result.oplogEntry);
@@ -345,7 +334,6 @@ TEST_F(UpdateTestFixture, CanUseConstantsAcrossMultipleUpdates) {
     resetApplyParams();
     result = exec.applyUpdate(getApplyParams(doc2.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 2, b: 'foo'}"), doc2);
     ASSERT_FALSE(doc2.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: 2, b: 'foo'}"), result.oplogEntry);
@@ -361,7 +349,6 @@ TEST_F(UpdateTestFixture, NoopWithConstants) {
     mutablebson::Document doc(fromjson("{a: 1, b: 2}"));
     const auto result = exec.applyUpdate(getApplyParams(doc.root()));
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: 2}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_TRUE(result.oplogEntry.isEmpty());
@@ -384,7 +371,7 @@ TEST_F(UpdateTestFixture, TestIndexesAffectedWithDeletes) {
         // Verify post-image and diff format.
         ASSERT_EQUALS(doc, fromjson("{paddingField: 'largeValueString'}"));
         ASSERT_BSONOBJ_BINARY_EQ(result.oplogEntry, fromjson("{$v: 2, diff: {d: {f1: false}}}"));
-        ASSERT(result.indexesAffected);
+        ASSERT_TRUE(getIndexAffectedFromLogEntry(result.oplogEntry));
     }
     {
         // When a path in the diff is same as index path.
@@ -400,7 +387,7 @@ TEST_F(UpdateTestFixture, TestIndexesAffectedWithDeletes) {
                 "{f1: {a: {paddingField: 'largeValueString'}}, paddingField: 'largeValueString'}"));
         ASSERT_BSONOBJ_BINARY_EQ(result.oplogEntry,
                                  fromjson("{$v: 2, diff: {sf1: {sa: {d: {b: false, c: false}}}}}"));
-        ASSERT(result.indexesAffected);
+        ASSERT_TRUE(getIndexAffectedFromLogEntry(result.oplogEntry));
     }
     {
         // When the index path is a prefix of a path in the diff.
@@ -416,7 +403,7 @@ TEST_F(UpdateTestFixture, TestIndexesAffectedWithDeletes) {
             doc,
             fromjson("{f1: {a: {b: {paddingField: 'largeValueString'}, c: 1, paddingField: "
                      "'largeValueString'}}, paddingField: 'largeValueString'}"));
-        ASSERT(result.indexesAffected);
+        ASSERT_TRUE(getIndexAffectedFromLogEntry(result.oplogEntry));
     }
     {
         // With common parent, but path diverges.
@@ -432,7 +419,7 @@ TEST_F(UpdateTestFixture, TestIndexesAffectedWithDeletes) {
             doc,
             fromjson("{f1: {a: {b: {c: 1, paddingField: 'largeValueString'}, paddingField: "
                      "'largeValueString'}}, paddingField: 'largeValueString'}"));
-        ASSERT(!result.indexesAffected);
+        ASSERT_FALSE(getIndexAffectedFromLogEntry(result.oplogEntry));
     }
 }
 
@@ -455,7 +442,7 @@ TEST_F(UpdateTestFixture, TestIndexesAffectedWithUpdatesAndInserts) {
         ASSERT_EQUALS(doc, fromjson("{f1: true, paddingField: 'largeValueString', f2: true}"));
         ASSERT_BSONOBJ_BINARY_EQ(result.oplogEntry,
                                  fromjson("{$v: 2, diff: {u: {f1: true}, i: {f2: true}}}"));
-        ASSERT(result.indexesAffected);
+        ASSERT_TRUE(getIndexAffectedFromLogEntry(result.oplogEntry));
     }
     {
         // When a path in the diff is same as index path.
@@ -467,7 +454,7 @@ TEST_F(UpdateTestFixture, TestIndexesAffectedWithUpdatesAndInserts) {
         // Verify diff format.
         ASSERT_BSONOBJ_BINARY_EQ(result.oplogEntry,
                                  fromjson("{$v: 2, diff: {sf1: {sa: {i: {newField: true}}}}}"));
-        ASSERT(result.indexesAffected);
+        ASSERT_TRUE(getIndexAffectedFromLogEntry(result.oplogEntry));
     }
     {
         // When the index path is a prefix of a path in the diff.
@@ -484,7 +471,7 @@ TEST_F(UpdateTestFixture, TestIndexesAffectedWithUpdatesAndInserts) {
             fromjson(
                 "{f1: {a: {b: {c: true, paddingField: 'largeValueString'}, c: 1, paddingField: "
                 "'largeValueString'}}, paddingField: 'largeValueString'}"));
-        ASSERT(result.indexesAffected);
+        ASSERT_TRUE(getIndexAffectedFromLogEntry(result.oplogEntry));
     }
     {
         // With common parent, but path diverges.
@@ -500,7 +487,7 @@ TEST_F(UpdateTestFixture, TestIndexesAffectedWithUpdatesAndInserts) {
             doc,
             fromjson("{f1: {a: {b: {c: 1, paddingField: 'largeValueString'}, c: 1, paddingField: "
                      "'largeValueString', p: true}}, paddingField: 'largeValueString'}"));
-        ASSERT(!result.indexesAffected);
+        ASSERT_FALSE(getIndexAffectedFromLogEntry(result.oplogEntry));
     }
 }
 
@@ -530,7 +517,7 @@ TEST_F(UpdateTestFixture, TestIndexesAffectedWithArraysAlongIndexPath) {
         ASSERT_BSONOBJ_BINARY_EQ(
             result.oplogEntry,
             fromjson("{$v: 2, diff: {sf1: {a: true, s1: {sa: {sb: {a: true, l: 1}}}}}}"));
-        ASSERT(result.indexesAffected);
+        ASSERT_TRUE(getIndexAffectedFromLogEntry(result.oplogEntry));
     }
     {
         // When the index path is a prefix of a path in the diff and also involves numeric
@@ -552,7 +539,7 @@ TEST_F(UpdateTestFixture, TestIndexesAffectedWithArraysAlongIndexPath) {
             result.oplogEntry,
             fromjson(
                 "{$v: 2, diff: {sf1: {a: true, s1: {sa: {sb: {a: true, s1: {i: {d: 1} }}}}}}}"));
-        ASSERT(result.indexesAffected);
+        ASSERT_TRUE(getIndexAffectedFromLogEntry(result.oplogEntry));
     }
     {
         // When inserting a sub-object into array, and the sub-object diverges from the index path.
@@ -571,7 +558,7 @@ TEST_F(UpdateTestFixture, TestIndexesAffectedWithArraysAlongIndexPath) {
                 "'largeValueString'}"));
         ASSERT_BSONOBJ_BINARY_EQ(result.oplogEntry,
                                  fromjson("{$v: 2, diff: {sf1: {a: true, u2: {newField: 1} }}}"));
-        ASSERT(result.indexesAffected);
+        ASSERT_TRUE(getIndexAffectedFromLogEntry(result.oplogEntry));
     }
     {
         // When a common array path element is updated, but the paths diverge at the last element.
@@ -591,7 +578,7 @@ TEST_F(UpdateTestFixture, TestIndexesAffectedWithArraysAlongIndexPath) {
             fromjson(
                 "{f1: [0, {a: {b: ['someStringValue', {c: 1, paddingField: 'largeValueString'}], "
                 "c: 2, paddingField: 'largeValueString'}}], paddingField: 'largeValueString'}"));
-        ASSERT(!result.indexesAffected);
+        ASSERT_FALSE(getIndexAffectedFromLogEntry(result.oplogEntry));
     }
 }
 
@@ -618,7 +605,7 @@ TEST_F(UpdateTestFixture, TestIndexesAffectedWithArraysAfterIndexPath) {
                      "'largeValueString'}}, paddingField: 'largeValueString'}"));
         ASSERT_BSONOBJ_BINARY_EQ(
             result.oplogEntry, fromjson("{$v: 2, diff: {sf1: {sa: {sb: {sc: {a: true, l: 1}}}}}}"));
-        ASSERT(result.indexesAffected);
+        ASSERT_TRUE(getIndexAffectedFromLogEntry(result.oplogEntry));
     }
     {
         // Add an array element.
@@ -636,7 +623,7 @@ TEST_F(UpdateTestFixture, TestIndexesAffectedWithArraysAfterIndexPath) {
         ASSERT_BSONOBJ_BINARY_EQ(
             result.oplogEntry,
             fromjson("{$v: 2, diff: {sf1: {sa: {sb: {sc: {a: true, u2: {newField: 1} }}}}}}"));
-        ASSERT(result.indexesAffected);
+        ASSERT_TRUE(getIndexAffectedFromLogEntry(result.oplogEntry));
     }
     {
         // Updating a sub-array element.
@@ -654,7 +641,7 @@ TEST_F(UpdateTestFixture, TestIndexesAffectedWithArraysAfterIndexPath) {
         ASSERT_BSONOBJ_BINARY_EQ(
             result.oplogEntry,
             fromjson("{$v: 2, diff: {sf1: {sa: {sb: {sc: {a: true, u1: 'updatedVal'}}}}}}"));
-        ASSERT(result.indexesAffected);
+        ASSERT_TRUE(getIndexAffectedFromLogEntry(result.oplogEntry));
     }
 }
 

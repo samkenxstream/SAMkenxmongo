@@ -46,28 +46,33 @@ const auto validatedTenancyScopeDecoration =
     OperationContext::declareDecoration<boost::optional<ValidatedTenancyScope>>();
 MONGO_INITIALIZER(SecurityTokenOptionValidate)(InitializerContext*) {
     if (gMultitenancySupport) {
-        logv2::detail::setGetTenantIDCallback([]() -> boost::optional<TenantId> {
+        logv2::detail::setGetTenantIDCallback([]() -> std::string {
             auto* client = Client::getCurrent();
             if (!client) {
-                return boost::none;
+                return std::string();
             }
 
             if (auto* opCtx = client->getOperationContext()) {
                 if (auto token = ValidatedTenancyScope::get(opCtx)) {
-                    return token->tenantId();
+                    return token->tenantId().toString();
                 }
             }
 
-            return boost::none;
+            return std::string();
         });
+    }
+
+    if (gFeatureFlagSecurityToken.isEnabledAndIgnoreFCVUnsafeAtStartup()) {
+        LOGV2_WARNING(
+            7539600,
+            "featureFlagSecurityToken is enabled.  This flag MUST NOT be enabled in production");
     }
 }
 }  // namespace
 
 ValidatedTenancyScope::ValidatedTenancyScope(BSONObj obj, InitTag tag) : _originalToken(obj) {
-    // (Ignore FCV check): TODO(SERVER-75396): add why FCV is ignored here.
-    const bool enabled =
-        gMultitenancySupport && gFeatureFlagSecurityToken.isEnabledAndIgnoreFCVUnsafe();
+    const bool enabled = gMultitenancySupport &&
+        gFeatureFlagSecurityToken.isEnabled(serverGlobalParams.featureCompatibility);
 
     uassert(ErrorCodes::InvalidOptions,
             "Multitenancy not enabled, refusing to accept securityToken",

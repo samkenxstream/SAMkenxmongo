@@ -37,6 +37,7 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/s/shard_key_index_util.h"
+#include "mongo/db/shard_role.h"
 
 namespace mongo {
 
@@ -46,6 +47,7 @@ class CollectionPtr;
 class IndexDescriptor;
 class OperationContext;
 class PlanStage;
+class ScopedCollectionAcquisition;
 class WorkingSet;
 struct UpdateStageParams;
 
@@ -76,7 +78,7 @@ public:
      */
     static std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> collectionScan(
         OperationContext* opCtx,
-        const CollectionPtr* collection,
+        VariantCollectionPtrOrAcquisition collection,
         PlanYieldPolicy::YieldPolicy yieldPolicy,
         Direction direction = FORWARD,
         const boost::optional<RecordId>& resumeAfterRecordId = boost::none,
@@ -98,7 +100,7 @@ public:
      */
     static std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> deleteWithCollectionScan(
         OperationContext* opCtx,
-        const CollectionPtr* collection,
+        const ScopedCollectionAcquisition& collection,
         std::unique_ptr<DeleteStageParams> deleteStageParams,
         PlanYieldPolicy::YieldPolicy yieldPolicy,
         Direction direction = FORWARD,
@@ -130,7 +132,7 @@ public:
      */
     static std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> deleteWithIndexScan(
         OperationContext* opCtx,
-        const CollectionPtr* collection,
+        const ScopedCollectionAcquisition& collection,
         std::unique_ptr<DeleteStageParams> params,
         const IndexDescriptor* descriptor,
         const BSONObj& startKey,
@@ -164,7 +166,7 @@ public:
      */
     static std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> deleteWithShardKeyIndexScan(
         OperationContext* opCtx,
-        const CollectionPtr* collection,
+        const ScopedCollectionAcquisition& collection,
         std::unique_ptr<DeleteStageParams> params,
         const ShardKeyIndex& shardKeyIdx,
         const BSONObj& startKey,
@@ -178,7 +180,7 @@ public:
      */
     static std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> updateWithIdHack(
         OperationContext* opCtx,
-        const CollectionPtr* collection,
+        const ScopedCollectionAcquisition& collection,
         const UpdateStageParams& params,
         const IndexDescriptor* descriptor,
         const BSONObj& key,

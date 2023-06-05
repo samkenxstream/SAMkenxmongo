@@ -49,7 +49,7 @@ public:
     inline static const NamespaceString collNss =
         NamespaceString::createNamespaceString_forTest("TestDB", "TestCollection");
     inline static const BSONObj collOpReason =
-        BSON("Dummy operation on collection" << collNss.ns());
+        BSON("Dummy operation on collection" << collNss.ns_forTest());
 
     inline static const NamespaceString dbName =
         NamespaceString::createNamespaceString_forTest("TestDB");
@@ -73,7 +73,8 @@ public:
     boost::optional<CollectionCriticalSectionDocument> readCriticalSectionDocument(
         const NamespaceString& nss, const BSONObj& reason) {
         FindCommandRequest findOp(NamespaceString::kCollectionCriticalSectionsNamespace);
-        findOp.setFilter(BSON(CollectionCriticalSectionDocument::kNssFieldName << nss.toString()));
+        findOp.setFilter(
+            BSON(CollectionCriticalSectionDocument::kNssFieldName << nss.toString_forTest()));
 
         DBDirectClient dbClient(opCtx());
         auto cursor = dbClient.find(std::move(findOp));
@@ -109,10 +110,11 @@ public:
         ASSERT_NE(doc->getBlockReads(), blockReads);
 
         DBDirectClient dbClient(opCtx());
-        dbClient.update(NamespaceString::kCollectionCriticalSectionsNamespace,
-                        BSON(CollectionCriticalSectionDocument::kNssFieldName << nss.toString()),
-                        BSON("$set" << BSON(CollectionCriticalSectionDocument::kBlockReadsFieldName
-                                            << blockReads)));
+        dbClient.update(
+            NamespaceString::kCollectionCriticalSectionsNamespace,
+            BSON(CollectionCriticalSectionDocument::kNssFieldName << nss.toString_forTest()),
+            BSON("$set" << BSON(CollectionCriticalSectionDocument::kBlockReadsFieldName
+                                << blockReads)));
     }
 
     void deleteReadCriticalSectionDocument(const NamespaceString& nss, const BSONObj& reason) {
@@ -120,13 +122,14 @@ public:
         ASSERT(readCriticalSectionDocument(nss, reason));
 
         DBDirectClient dbClient(opCtx());
-        dbClient.remove(NamespaceString::kCollectionCriticalSectionsNamespace,
-                        BSON(CollectionCriticalSectionDocument::kNssFieldName << nss.toString()),
-                        false /* removeMany */);
+        dbClient.remove(
+            NamespaceString::kCollectionCriticalSectionsNamespace,
+            BSON(CollectionCriticalSectionDocument::kNssFieldName << nss.toString_forTest()),
+            false /* removeMany */);
     }
 
     void assertCriticalSectionCatchUpEnteredInMemory(const NamespaceString& nss) {
-        if (nsIsDbOnly(nss.ns())) {
+        if (nsIsDbOnly(nss.ns_forTest())) {
             AutoGetDb db(opCtx(), nss.dbName(), MODE_IS);
             const auto scopedDss =
                 DatabaseShardingState::assertDbLockedAndAcquireShared(opCtx(), nss.dbName());
@@ -144,7 +147,7 @@ public:
     }
 
     void assertCriticalSectionCommitEnteredInMemory(const NamespaceString& nss) {
-        if (nsIsDbOnly(nss.ns())) {
+        if (nsIsDbOnly(nss.ns_forTest())) {
             AutoGetDb db(opCtx(), nss.dbName(), MODE_IS);
             const auto scopedDss =
                 DatabaseShardingState::assertDbLockedAndAcquireShared(opCtx(), nss.dbName());
@@ -161,7 +164,7 @@ public:
     }
 
     void assertCriticalSectionLeftInMemory(const NamespaceString& nss) {
-        if (nsIsDbOnly(nss.ns())) {
+        if (nsIsDbOnly(nss.ns_forTest())) {
             AutoGetDb db(opCtx(), nss.dbName(), MODE_IS);
             const auto scopedDss =
                 DatabaseShardingState::assertDbLockedAndAcquireShared(opCtx(), nss.dbName());
@@ -618,8 +621,9 @@ TEST_F(ShardingRecoveryServiceTestOnSecondary, BlockAndUnblockOperationsOnDataba
     {
         WriteUnitOfWork wuow(opCtx());
         AutoGetDb db(opCtx(), dbName.dbName(), MODE_IX);
-        opObserver().aboutToDelete(opCtx(), criticalSectionColl(), doc.toBSON());
-        opObserver().onDelete(opCtx(), criticalSectionColl(), kUninitializedStmtId, {});
+        OplogDeleteEntryArgs args;
+        opObserver().aboutToDelete(opCtx(), criticalSectionColl(), doc.toBSON(), &args);
+        opObserver().onDelete(opCtx(), criticalSectionColl(), kUninitializedStmtId, args);
         wuow.commit();
     }
 
@@ -686,8 +690,9 @@ TEST_F(ShardingRecoveryServiceTestOnSecondary, BlockAndUnblockOperationsOnCollec
     {
         WriteUnitOfWork wuow(opCtx());
         AutoGetCollection coll(opCtx(), collNss, MODE_IX);
-        opObserver().aboutToDelete(opCtx(), criticalSectionColl(), doc.toBSON());
-        opObserver().onDelete(opCtx(), criticalSectionColl(), kUninitializedStmtId, {});
+        OplogDeleteEntryArgs args;
+        opObserver().aboutToDelete(opCtx(), criticalSectionColl(), doc.toBSON(), &args);
+        opObserver().onDelete(opCtx(), criticalSectionColl(), kUninitializedStmtId, args);
         wuow.commit();
     }
 

@@ -118,7 +118,7 @@ TEST(ViewDefinitionTest, SetViewOnSucceedsIfNewViewOnIsInSameDatabaseAsView) {
 }
 
 TEST(ViewDefinitionTest, SetPipelineSucceedsOnValidArrayBSONElement) {
-    ViewDefinition viewDef(viewNss.db(), viewNss.coll(), backingNss.coll(), BSONObj(), nullptr);
+    ViewDefinition viewDef(viewNss.dbName(), viewNss.coll(), backingNss.coll(), BSONObj(), nullptr);
     ASSERT(viewDef.pipeline().empty());
 
     BSONObj matchStage = BSON("match" << BSON("x" << 9));
@@ -137,14 +137,7 @@ TEST(ViewDefinitionTest, SetPipelineSucceedsOnValidArrayBSONElement) {
 TEST(ViewDefinitionTest, ViewDefinitionCreationCorrectlySetsTimeseries) {
     ViewDefinition viewDef(
         viewNss.dbName(), viewNss.coll(), bucketsColl.coll(), samplePipeline, nullptr);
-    ASSERT_FALSE(viewDef.timeseries());
-
-    ViewDefinition timeseriesDef(timeseriesColl.dbName(),
-                                 timeseriesColl.coll(),
-                                 bucketsColl.coll(),
-                                 samplePipeline,
-                                 nullptr);
-    ASSERT_TRUE(timeseriesDef.timeseries());
+    ASSERT(viewDef.timeseries());
 }
 
 TEST(ViewDefinitionTest, ViewDefinitionCreationCorrectlyBuildsNamespaceStringsWithTenantIds) {

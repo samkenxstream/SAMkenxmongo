@@ -6,10 +6,10 @@
 const commandsRemovedFromMongosSinceLastLTS = [
     "repairShardedCollectionChunksHistory",
     // last-continuos
-    "availableQueryOptions",  // TODO SERVER-67689: remove this once 7.0 becomes last-lts
     "getLastError",
     "getnonce",
     "driverOIDTest",
+    "transitionToCatalogShard",
 ];
 // These commands were added in mongos since the last LTS version, so will not appear in the
 // listCommands output of a last LTS version mongos. We will allow these commands to have a test
@@ -19,15 +19,14 @@ const commandsAddedToMongosSinceLastLTS = [
     "_clusterWriteWithoutShardKey",
     "abortReshardCollection",
     "analyze",
-    "analyzeShardKey",  // TODO (SERVER-68977): Remove upgrade/downgrade for PM-1858.
     "appendOplogNote",
     "bulkWrite",
     "checkMetadataConsistency",
     "cleanupReshardCollection",
+    "cleanupStructuredEncryptionData",
     "commitReshardCollection",
     "compactStructuredEncryptionData",
     "configureCollectionBalancing",
-    "configureQueryAnalyzer",  // TODO (SERVER-68977): Remove upgrade/downgrade for PM-1858.
     "coordinateCommitTransaction",
     "createSearchIndexes",
     "dropSearchIndex",
@@ -38,6 +37,7 @@ const commandsAddedToMongosSinceLastLTS = [
     "moveRange",
     "oidcListKeys",
     "oidcRefreshKeys",
+    "resetPlacementHistory",  // TODO (SERVER-68217): remove item from array.
     "reshardCollection",
     "rotateCertificates",
     "setAllowMigrations",
@@ -49,7 +49,7 @@ const commandsAddedToMongosSinceLastLTS = [
     "testRemoval",
     "testVersions1And2",
     "testVersion2",
-    "transitionToCatalogShard",
+    "transitionFromDedicatedConfigServer",
     "transitionToDedicatedConfigServer",
     "updateSearchIndex",
 ];

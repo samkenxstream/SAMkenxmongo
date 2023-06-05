@@ -19,6 +19,7 @@
  *   requires_replication,
  *   # This test depends on hardcoded database name equality.
  *   tenant_migration_incompatible,
+ *   references_foreign_collection,
  * ]
  */
 (function() {
@@ -37,8 +38,6 @@ assert.commandWorked(testDB.dropDatabase());
 assert.commandWorked(testDB.createCollection(testName));
 const coll = testDB.getCollection(testName);
 coll.drop();
-
-const isMongos = (testDB.runCommand("hello").msg === "isdbgrid");
 
 // Test that $jsonSchema is rejected in an $elemMatch projection.
 assert.throws(function() {

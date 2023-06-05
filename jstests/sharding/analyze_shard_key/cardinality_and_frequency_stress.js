@@ -2,7 +2,7 @@
  * Tests that the analyzeShardKey command still works correctly when the shard key values exceeds
  * the memory limit for aggregation.
  *
- * @tags: [requires_fcv_63, featureFlagAnalyzeShardKey]
+ * @tags: [requires_fcv_70]
  */
 (function() {
 "use strict";
@@ -91,8 +91,7 @@ function testAnalyzeShardKeysUnshardedCollection(conn, mongodConns) {
 
         docs.push(doc);
         mostCommonValues.push({
-            value: AnalyzeShardKeyUtil.extractShardKeyValueFromDocument(
-                doc, candidateShardKey, candidateShardKey),
+            value: AnalyzeShardKeyUtil.extractShardKeyValueFromDocument(doc, candidateShardKey),
             frequency: 1
         });
     }
@@ -150,8 +149,7 @@ function testAnalyzeShardKeysShardedCollection(st, mongodConns) {
 
         docs.push(doc);
         mostCommonValues.push({
-            value: AnalyzeShardKeyUtil.extractShardKeyValueFromDocument(
-                doc, candidateShardKey, candidateShardKey),
+            value: AnalyzeShardKeyUtil.extractShardKeyValueFromDocument(doc, candidateShardKey),
             frequency: 1
         });
 

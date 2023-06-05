@@ -184,7 +184,7 @@ ChunkVersion getPersistedMaxChunkVersion(OperationContext* opCtx, const Namespac
     uassertStatusOKWithContext(statusWithCollection,
                                str::stream()
                                    << "Failed to read persisted collections entry for collection '"
-                                   << nss.ns() << "'.");
+                                   << nss.toStringForErrorMsg() << "'.");
 
     auto cachedCollection = statusWithCollection.getValue();
     if (cachedCollection.getRefreshing() && *cachedCollection.getRefreshing()) {
@@ -208,7 +208,7 @@ ChunkVersion getPersistedMaxChunkVersion(OperationContext* opCtx, const Namespac
     uassertStatusOKWithContext(
         statusWithChunk,
         str::stream() << "Failed to read highest version persisted chunk for collection '"
-                      << nss.ns() << "'.");
+                      << nss.toStringForErrorMsg() << "'.");
 
     return statusWithChunk.getValue().empty() ? ChunkVersion::UNSHARDED()
                                               : statusWithChunk.getValue().front().getVersion();
@@ -293,7 +293,7 @@ StatusWith<CollectionAndChangedChunks> getIncompletePersistedMetadataSinceVersio
         if (status == ErrorCodes::NamespaceNotFound) {
             return CollectionAndChangedChunks();
         }
-        return status.withContext(str::stream() << "Failed to load local metadata.");
+        return status.withContext(str::stream() << "Failed to read local metadata.");
     }
 }
 
@@ -442,7 +442,7 @@ SemiFuture<CollectionAndChangedChunks> ShardServerCatalogCacheLoader::getChunksS
     // unavailable, unnecessarily reducing availability.
     if (nss.isNamespaceAlwaysUnsharded()) {
         return Status(ErrorCodes::NamespaceNotFound,
-                      str::stream() << "Collection " << nss.ns() << " not found");
+                      str::stream() << "Collection " << nss.toStringForErrorMsg() << " not found");
     }
 
     bool isPrimary;
@@ -453,10 +453,17 @@ SemiFuture<CollectionAndChangedChunks> ShardServerCatalogCacheLoader::getChunksS
     }();
 
     return ExecutorFuture<void>(_executor)
-        .then([=]() {
+        .then([=, this]() {
             ThreadClient tc("ShardServerCatalogCacheLoader::getChunksSince",
                             getGlobalServiceContext());
             auto context = _contexts.makeOperationContext(*tc);
+
+            // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+            {
+                stdx::lock_guard<Client> lk(*tc.get());
+                tc.get()->setSystemOperationUnkillableByStepdown(lk);
+            }
+
             {
                 // We may have missed an OperationContextGroup interrupt since this operation
                 // began but before the OperationContext was added to the group. So we'll check
@@ -498,6 +505,12 @@ SemiFuture<DatabaseType> ShardServerCatalogCacheLoader::getDatabase(StringData d
                             getGlobalServiceContext());
             auto context = _contexts.makeOperationContext(*tc);
 
+            // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+            {
+                stdx::lock_guard<Client> lk(*tc.get());
+                tc.get()->setSystemOperationUnkillableByStepdown(lk);
+            }
+
             {
                 // We may have missed an OperationContextGroup interrupt since this operation began
                 // but before the OperationContext was added to the group. So we'll check that we're
@@ -527,7 +540,8 @@ void ShardServerCatalogCacheLoader::waitForCollectionFlush(OperationContext* opC
 
     while (true) {
         uassert(ErrorCodes::NotWritablePrimary,
-                str::stream() << "Unable to wait for collection metadata flush for " << nss.ns()
+                str::stream() << "Unable to wait for collection metadata flush for "
+                              << nss.toStringForErrorMsg()
                               << " because the node's replication role changed.",
                 _role == ReplicaSetRole::Primary && _term == initialTerm);
 
@@ -682,11 +696,6 @@ StatusWith<CollectionAndChangedChunks> ShardServerCatalogCacheLoader::_runSecond
 
     // Read the local metadata.
 
-    // Disallow reading on an older snapshot because this relies on being able to read the
-    // side effects of writes during secondary replication after being signalled from the
-    // CollectionPlacementVersionLogOpHandler.
-    BlockSecondaryReadsDuringBatchApplication_DONT_USE secondaryReadsBlockBehindReplication(opCtx);
-
     return _getCompletePersistedMetadataForSecondarySinceVersion(
         opCtx, nss, catalogCacheSinceVersion);
 }
@@ -755,7 +764,7 @@ ShardServerCatalogCacheLoader::_schedulePrimaryGetChunksSince(
             {collAndChunks.epoch, collAndChunks.timestamp})) {
         return Status{ErrorCodes::ConflictingOperationInProgress,
                       str::stream()
-                          << "Invalid chunks found when reloading '" << nss.toString()
+                          << "Invalid chunks found when reloading '" << nss.toStringForErrorMsg()
                           << "' Previous collection timestamp was '" << collAndChunks.timestamp
                           << "', but found a new timestamp '"
                           << collAndChunks.changedChunks.back().getVersion().getTimestamp()
@@ -808,12 +817,13 @@ ShardServerCatalogCacheLoader::_schedulePrimaryGetChunksSince(
         // to attempt the refresh as secondary instead of failing the operation
         return Status(ErrorCodes::ConflictingOperationInProgress,
                       str::stream() << "Replication stepdown occurred during refresh for  '"
-                                    << nss.toString());
+                                    << nss.toStringForErrorMsg());
     }
 
     // After finding metadata remotely, we must have found metadata locally.
     tassert(7032350,
-            str::stream() << "No chunks metadata found for collection '" << nss
+            str::stream() << "No chunks metadata found for collection '"
+                          << nss.toStringForErrorMsg()
                           << "' despite the config server returned actual information",
             !collAndChunks.changedChunks.empty());
 
@@ -843,7 +853,6 @@ StatusWith<DatabaseType> ShardServerCatalogCacheLoader::_runSecondaryGetDatabase
     DatabaseType dbt;
     dbt.setName(shardDatabase.getName());
     dbt.setPrimary(shardDatabase.getPrimary());
-    dbt.setSharded(shardDatabase.getSharded());
     dbt.setVersion(shardDatabase.getVersion());
 
     return dbt;
@@ -1071,6 +1080,12 @@ void ShardServerCatalogCacheLoader::_runCollAndChunksTasks(const NamespaceString
                     getGlobalServiceContext());
     auto context = _contexts.makeOperationContext(*tc);
 
+    // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+    {
+        stdx::lock_guard<Client> lk(*tc.get());
+        tc.get()->setSystemOperationUnkillableByStepdown(lk);
+    }
+
     bool taskFinished = false;
     bool inShutdown = false;
     try {
@@ -1149,6 +1164,12 @@ void ShardServerCatalogCacheLoader::_runCollAndChunksTasks(const NamespaceString
 void ShardServerCatalogCacheLoader::_runDbTasks(StringData dbName) {
     ThreadClient tc("ShardServerCatalogCacheLoader::runDbTasks", getGlobalServiceContext());
     auto context = _contexts.makeOperationContext(*tc);
+
+    // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+    {
+        stdx::lock_guard<Client> lk(*tc.get());
+        tc.get()->setSystemOperationUnkillableByStepdown(lk);
+    }
 
     bool taskFinished = false;
     bool inShutdown = false;
@@ -1246,8 +1267,8 @@ void ShardServerCatalogCacheLoader::_updatePersistedCollAndChunksMetadata(
         // The namespace was dropped. The persisted metadata for the collection must be cleared.
         uassertStatusOKWithContext(
             dropChunksAndDeleteCollectionsEntry(opCtx, nss),
-            str::stream() << "Failed to clear persisted chunk metadata for collection '" << nss.ns()
-                          << "'. Will be retried.");
+            str::stream() << "Failed to clear persisted chunk metadata for collection '"
+                          << nss.toStringForErrorMsg() << "'. Will be retried.");
         return;
     }
 
@@ -1255,8 +1276,8 @@ void ShardServerCatalogCacheLoader::_updatePersistedCollAndChunksMetadata(
         persistCollectionAndChangedChunks(
             opCtx, nss, *task.collectionAndChangedChunks, task.minQueryVersion),
         str::stream() << "Failed to update the persisted chunk metadata for collection '"
-                      << nss.ns() << "' from '" << task.minQueryVersion.toString() << "' to '"
-                      << task.maxQueryVersion.toString() << "'. Will be retried.");
+                      << nss.toStringForErrorMsg() << "' from '" << task.minQueryVersion.toString()
+                      << "' to '" << task.maxQueryVersion.toString() << "'. Will be retried.");
 
     LOGV2_FOR_CATALOG_REFRESH(
         24112,
@@ -1310,6 +1331,17 @@ ShardServerCatalogCacheLoader::_getCompletePersistedMetadataForSecondarySinceVer
     // Keep trying to load the metadata until we get a complete view without updates being
     // concurrently applied.
     while (true) {
+        // Disallow reading on an older snapshot because this relies on being able to read the
+        // side effects of writes during secondary replication after being signalled from the
+        // CollectionPlacementVersionLogOpHandler.
+        BlockSecondaryReadsDuringBatchApplication_DONT_USE secondaryReadsBlockBehindReplication(
+            opCtx);
+
+        // Taking the PBWM and blocking on admission control can lead to deadlock with prepared
+        // transactions, so have internal refresh operations skip admission control
+        ScopedAdmissionPriorityForLock skipAdmissionControl(opCtx->lockState(),
+                                                            AdmissionContext::Priority::kImmediate);
+
         const auto beginRefreshState = [&]() {
             while (true) {
                 auto notif = _namespaceNotifications.createNotification(nss);

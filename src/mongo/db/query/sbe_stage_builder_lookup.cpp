@@ -368,8 +368,8 @@ std::pair<SlotId /* keyValuesSetSlot */, std::unique_ptr<sbe::PlanStage>> buildK
     EvalStage packedKeyValuesStage = makeHashAgg(
         EvalStage{std::move(keyValuesStage), SlotVector{}},
         makeSV(), /* groupBy slots - "none" means creating a single group */
-        makeSlotExprPairVec(keyValuesSetSlot,
-                            makeFunction("addToSet"_sd, makeVariable(keyValueSlot))),
+        makeAggExprVector(
+            keyValuesSetSlot, nullptr, makeFunction("addToSet"_sd, makeVariable(keyValueSlot))),
         boost::none /* we group _all_ key values into a single set, so collator is irrelevant */,
         allowDiskUse,
         makeSlotExprPairVec(spillSlot, makeFunction("aggSetUnion"_sd, makeVariable(spillSlot))),
@@ -418,10 +418,11 @@ std::pair<SlotId /* resultSlot */, std::unique_ptr<sbe::PlanStage>> buildForeign
     innerBranch = makeHashAgg(
         std::move(innerBranch),
         makeSV(), /* groupBy slots */
-        makeSlotExprPairVec(accumulatorSlot,
-                            makeFunction("addToArrayCapped"_sd,
-                                         makeVariable(foreignRecordSlot),
-                                         makeConstant(TypeTags::NumberInt32, sizeCap))),
+        makeAggExprVector(accumulatorSlot,
+                          nullptr,
+                          makeFunction("addToArrayCapped"_sd,
+                                       makeVariable(foreignRecordSlot),
+                                       makeConstant(TypeTags::NumberInt32, sizeCap))),
         {} /* collatorSlot, no collation here because we want to return all matches "as is" */,
         allowDiskUse,
         makeSlotExprPairVec(spillSlot,
@@ -702,13 +703,11 @@ std::pair<SlotId, std::unique_ptr<sbe::PlanStage>> buildIndexJoinLookupStage(
     const FieldPath& foreignFieldName,
     const CollectionPtr& foreignColl,
     const IndexEntry& index,
-    StringMap<const IndexAccessMethod*>& iamMap,
     PlanYieldPolicySBE* yieldPolicy,
     boost::optional<SlotId> collatorSlot,
     const PlanNodeId nodeId,
     SlotIdGenerator& slotIdGenerator,
-    FrameIdGenerator& frameIdGenerator,
-    RuntimeEnvironment* env) {
+    FrameIdGenerator& frameIdGenerator) {
     CurOp::get(state.opCtx)->debug().indexedLoopJoin += 1;
 
     const auto foreignCollUUID = foreignColl->uuid();
@@ -723,7 +722,6 @@ std::pair<SlotId, std::unique_ptr<sbe::PlanStage>> buildIndexJoinLookupStage(
         foreignColl->getIndexCatalog()->getEntry(indexDescriptor)->accessMethod()->asSortedData();
     const auto indexVersion = indexAccessMethod->getSortedDataInterface()->getKeyStringVersion();
     const auto indexOrdering = indexAccessMethod->getSortedDataInterface()->getOrdering();
-    iamMap.insert({indexName, indexAccessMethod});
 
     // Build the outer branch that produces the correlated local key slot.
     auto [localKeysSetSlot, localKeysSetStage] = buildKeySet(JoinSide::Local,
@@ -835,11 +833,10 @@ std::pair<SlotId, std::unique_ptr<sbe::PlanStage>> buildIndexJoinLookupStage(
 
     // Calculate the low key and high key of each individual local field. They are stored in
     // 'lowKeySlot' and 'highKeySlot', respectively. These two slots will be made available in
-    // the loop join stage to perform index seek. We also set 'indexIdSlot' and
-    // 'indexKeyPatternSlot' constants for the seek stage later to perform consistency check.
+    // the loop join stage to perform index seek. We also set the 'indexKeyPatternSlot' constant
+    // for the seek stage later to perform consistency check.
     auto lowKeySlot = slotIdGenerator.generate();
     auto highKeySlot = slotIdGenerator.generate();
-    auto indexIdSlot = slotIdGenerator.generate();
     auto indexKeyPatternSlot = slotIdGenerator.generate();
     auto [_, indexKeyPatternValue] =
         copyValue(TypeTags::bsonObject, bitcastFrom<const char*>(index.keyPattern.objdata()));
@@ -866,8 +863,6 @@ std::pair<SlotId, std::unique_ptr<sbe::PlanStage>> buildIndexJoinLookupStage(
                          makeNewKeyStringCall(KeyString::Discriminator::kExclusiveBefore),
                          highKeySlot,
                          makeNewKeyStringCall(KeyString::Discriminator::kExclusiveAfter),
-                         indexIdSlot,
-                         makeConstant(indexName),
                          indexKeyPatternSlot,
                          makeConstant(value::TypeTags::bsonObject, indexKeyPatternValue));
 
@@ -888,12 +883,14 @@ std::pair<SlotId, std::unique_ptr<sbe::PlanStage>> buildIndexJoinLookupStage(
     auto foreignRecordIdSlot = slotIdGenerator.generate();
     auto indexKeySlot = slotIdGenerator.generate();
     auto snapshotIdSlot = slotIdGenerator.generate();
+    auto indexIdentSlot = slotIdGenerator.generate();
     auto ixScanStage = makeS<SimpleIndexScanStage>(foreignCollUUID,
                                                    indexName,
                                                    true /* forward */,
                                                    indexKeySlot,
                                                    foreignRecordIdSlot,
                                                    snapshotIdSlot,
+                                                   indexIdentSlot,
                                                    IndexKeysInclusionSet{} /* indexKeysToInclude */,
                                                    makeSV() /* vars */,
                                                    makeVariable(lowKeySlot),
@@ -906,7 +903,7 @@ std::pair<SlotId, std::unique_ptr<sbe::PlanStage>> buildIndexJoinLookupStage(
     auto ixScanNljStage =
         makeS<LoopJoinStage>(std::move(indexBoundKeyStage),
                              std::move(ixScanStage),
-                             makeSV(indexIdSlot, indexKeyPatternSlot) /* outerProjects */,
+                             makeSV(indexKeyPatternSlot) /* outerProjects */,
                              makeSV(lowKeySlot, highKeySlot) /* outerCorrelated */,
                              nullptr /* predicate */,
                              nodeId);
@@ -925,9 +922,8 @@ std::pair<SlotId, std::unique_ptr<sbe::PlanStage>> buildIndexJoinLookupStage(
 
     // Loop join the foreign record id produced by the index seek on the outer side with seek
     // stage on the inner side to get matched foreign documents. The foreign documents are
-    // stored in 'foreignRecordSlot'. We also pass in 'snapshotIdSlot', 'indexIdSlot',
-    // 'indexKeySlot' and 'indexKeyPatternSlot' to perform index consistency check during the
-    // seek.
+    // stored in 'foreignRecordSlot'. We also pass in 'snapshotIdSlot', 'indexIdentSlot',
+    // 'indexKeySlot' and 'indexKeyPatternSlot' to perform index consistency check during the seek.
     auto foreignRecordSlot = slotIdGenerator.generate();
     auto scanNljStage = makeLoopJoinForFetch(std::move(ixScanNljStage),
                                              foreignRecordSlot,
@@ -936,11 +932,10 @@ std::pair<SlotId, std::unique_ptr<sbe::PlanStage>> buildIndexJoinLookupStage(
                                              makeSV(),
                                              foreignRecordIdSlot,
                                              snapshotIdSlot,
-                                             indexIdSlot,
+                                             indexIdentSlot,
                                              indexKeySlot,
                                              indexKeyPatternSlot,
                                              foreignColl,
-                                             iamMap,
                                              nodeId,
                                              makeSV() /* slotsToForward */);
 
@@ -1168,7 +1163,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
         const auto& foreignColl =
             _collections.lookupCollection(NamespaceString(eqLookupNode->foreignCollection));
 
-        boost::optional<SlotId> collatorSlot = _state.data->env->getSlotIfExists("collator"_sd);
+        boost::optional<SlotId> collatorSlot = _state.env->getSlotIfExists("collator"_sd);
         switch (eqLookupNode->lookupStrategy) {
             // When foreign collection doesn't exist, we create stages that simply append empty
             // arrays to each local document and do not consider the case that foreign collection
@@ -1192,13 +1187,11 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
                                                  eqLookupNode->joinFieldForeign,
                                                  foreignColl,
                                                  *eqLookupNode->idxEntry,
-                                                 _data.iamMap,
                                                  _yieldPolicy,
                                                  collatorSlot,
                                                  eqLookupNode->nodeId(),
                                                  _slotIdGenerator,
-                                                 _frameIdGenerator,
-                                                 _data.env);
+                                                 _frameIdGenerator);
             }
             case EqLookupNode::LookupStrategy::kNestedLoopJoin:
             case EqLookupNode::LookupStrategy::kHashJoin: {
@@ -1208,21 +1201,24 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
                 auto foreignResultSlot = _slotIdGenerator.generate();
                 auto foreignRecordIdSlot = _slotIdGenerator.generate();
 
-                auto foreignStage = makeS<ScanStage>(foreignColl->uuid(),
-                                                     foreignResultSlot,
-                                                     foreignRecordIdSlot,
-                                                     boost::none /* snapshotIdSlot */,
-                                                     boost::none /* indexIdSlot */,
-                                                     boost::none /* indexKeySlot */,
-                                                     boost::none /* indexKeyPatternSlot */,
-                                                     boost::none /* tsSlot */,
-                                                     std::vector<std::string>{} /* fields */,
-                                                     makeSV() /* vars */,
-                                                     boost::none /* seekKeySlot */,
-                                                     true /* forward */,
-                                                     _yieldPolicy,
-                                                     eqLookupNode->nodeId(),
-                                                     ScanCallbacks{});
+                auto foreignStage =
+                    makeS<sbe::ScanStage>(foreignColl->uuid(),
+                                          foreignResultSlot,
+                                          foreignRecordIdSlot,
+                                          boost::none /* snapshotIdSlot */,
+                                          boost::none /* indexIdentSlot */,
+                                          boost::none /* indexKeySlot */,
+                                          boost::none /* indexKeyPatternSlot */,
+                                          boost::none /* oplogTsSlot */,
+                                          std::vector<std::string>{} /* scanFieldNames */,
+                                          makeSV() /* scanFieldSlots */,
+                                          boost::none /* seekRecordIdSlot */,
+                                          boost::none /* minRecordIdSlot */,
+                                          boost::none /* maxRecordIdSlot */,
+                                          true /* forward */,
+                                          _yieldPolicy,
+                                          eqLookupNode->nodeId(),
+                                          ScanCallbacks{});
 
                 return buildLookupStage(_state,
                                         eqLookupNode->lookupStrategy,

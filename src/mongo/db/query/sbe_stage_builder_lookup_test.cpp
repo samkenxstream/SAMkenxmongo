@@ -104,7 +104,7 @@ public:
                                     const std::string& asKey) {
         // Documents from the local collection are provided using collection scan.
         auto localScanNode = std::make_unique<CollectionScanNode>();
-        localScanNode->name = _nss.toString();
+        localScanNode->name = _nss.toString_forTest();
 
         // Construct logical query solution.
         auto lookupNode = std::make_unique<EqLookupNode>(std::move(localScanNode),
@@ -132,7 +132,7 @@ public:
         auto ctx = makeCompileCtx();
         prepareTree(ctx.get(), stage.get());
 
-        auto resultSlot = data.outputs.get(stage_builder::PlanStageSlots::kResult);
+        auto resultSlot = data.staticData->outputs.get(stage_builder::PlanStageSlots::kResult);
         SlotAccessor* resultSlotAccessor = stage->getAccessor(*ctx, resultSlot);
 
         return CompiledTree{std::move(stage), std::move(data), std::move(ctx), resultSlotAccessor};
@@ -150,8 +150,11 @@ public:
                       << std::endl;
         }
 
-        AutoGetCollection localColl(operationContext(), _nss, LockMode::MODE_IS);
-        AutoGetCollection foreignColl(operationContext(), _foreignNss, LockMode::MODE_IS);
+        AutoGetCollection localColl(
+            operationContext(),
+            _nss,
+            LockMode::MODE_IS,
+            AutoGetCollection::Options{}.secondaryNssOrUUIDs({_foreignNss}));
 
         MultipleCollectionAccessor colls(operationContext(),
                                          &localColl.getCollection(),
@@ -224,7 +227,7 @@ public:
         expectedDocuments.reserve(expectedPairs.size());
         for (auto& [localDocument, matchedDocuments] : expectedPairs) {
             MutableDocument expectedDocument;
-            expectedDocument.reset(localDocument, false /* stripMetadata */);
+            expectedDocument.reset(localDocument, false /* bsonHasMetadata */);
 
             std::vector<mongo::Value> matchedValues{matchedDocuments.begin(),
                                                     matchedDocuments.end()};

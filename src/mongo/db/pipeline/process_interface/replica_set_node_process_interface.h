@@ -68,12 +68,13 @@ public:
 
     Status insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                   const NamespaceString& ns,
-                  std::vector<BSONObj>&& objs,
+                  std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
                   const WriteConcernOptions& wc,
                   boost::optional<OID> targetEpoch) final;
+
     StatusWith<UpdateResult> update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                     const NamespaceString& ns,
-                                    BatchedObjects&& batch,
+                                    std::unique_ptr<write_ops::UpdateCommandRequest> updateCommand,
                                     const WriteConcernOptions& wc,
                                     UpsertType upsert,
                                     bool multi,
@@ -93,6 +94,16 @@ public:
     void createIndexesOnEmptyCollection(OperationContext* opCtx,
                                         const NamespaceString& ns,
                                         const std::vector<BSONObj>& indexSpecs);
+    void createTimeseriesView(OperationContext* opCtx,
+                              const NamespaceString& ns,
+                              const BSONObj& cmdObj,
+                              const TimeseriesOptions& userOpts);
+
+    Status insertTimeseries(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                            const NamespaceString& ns,
+                            std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
+                            const WriteConcernOptions& wc,
+                            boost::optional<OID> targetEpoch);
 
 private:
     /**

@@ -217,7 +217,7 @@ void SessionCatalogMigrationDestination::start(ServiceContext* service) {
         _state = State::Migrating;
     }
 
-    _thread = stdx::thread([=] {
+    _thread = stdx::thread([=, this] {
         try {
             _retrieveSessionStateFromSource(service);
         } catch (const DBException& ex) {
@@ -262,12 +262,6 @@ void SessionCatalogMigrationDestination::join() {
 void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(ServiceContext* service) {
     Client::initThread(
         "sessionCatalogMigrationProducer-" + _migrationSessionId.toString(), service, nullptr);
-    auto client = Client::getCurrent();
-    {
-        stdx::lock_guard lk(*client);
-        client->setSystemOperationKillableByStepdown(lk);
-    }
-
     bool oplogDrainedAfterCommiting = false;
     ProcessOplogResult lastResult;
     repl::OpTime lastOpTimeWaited;
@@ -287,6 +281,7 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
             auto uniqueCtx = CancelableOperationContext(
                 cc().makeOperationContext(), _cancellationToken, executor);
             auto opCtx = uniqueCtx.get();
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             nextBatch = getNextSessionOplogBatch(opCtx, _fromShard, _migrationSessionId);
             oplogArray = BSONArray{nextBatch[kOplogField].Obj()};
@@ -367,6 +362,7 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
     auto executor = Grid::get(service)->getExecutorPool()->getFixedExecutor();
     auto uniqueOpCtx =
         CancelableOperationContext(cc().makeOperationContext(), _cancellationToken, executor);
+    uniqueOpCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
     uassertStatusOK(
         waitForWriteConcern(uniqueOpCtx.get(), lastResult.oplogTime, kMajorityWC, &unusedWCResult));
@@ -436,6 +432,8 @@ SessionCatalogMigrationDestination::_processSessionOplog(const BSONObj& oplogBSO
     auto uniqueOpCtx =
         CancelableOperationContext(cc().makeOperationContext(), cancellationToken, executor);
     auto opCtx = uniqueOpCtx.get();
+    opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+
     {
         auto lk = stdx::lock_guard(*opCtx->getClient());
         opCtx->setLogicalSessionId(result.sessionId);
@@ -496,10 +494,7 @@ SessionCatalogMigrationDestination::_processSessionOplog(const BSONObj& oplogBSO
     oplogEntry.setHash(boost::none);
 
     writeConflictRetry(
-        opCtx,
-        "SessionOplogMigration",
-        NamespaceString::kSessionTransactionsTableNamespace.ns(),
-        [&] {
+        opCtx, "SessionOplogMigration", NamespaceString::kSessionTransactionsTableNamespace, [&] {
             // Need to take global lock here so repl::logOp will not unlock it and trigger the
             // invariant that disallows unlocking global lock while inside a WUOW. Take the
             // transaction table db lock to ensure the same lock ordering with normal replicated

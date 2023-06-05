@@ -78,7 +78,8 @@ const auto kTinyMatchStage = BSON("$match" << BSONObj());
 
 class ViewCatalogFixture : public CatalogTestFixture {
 public:
-    ViewCatalogFixture() : ViewCatalogFixture(DatabaseName(boost::none, "db")) {}
+    ViewCatalogFixture()
+        : ViewCatalogFixture(DatabaseName::createDatabaseName_forTest(boost::none, "db")) {}
 
     ViewCatalogFixture(DatabaseName dbName) : _dbName(std::move(dbName)) {}
 
@@ -86,8 +87,8 @@ public:
         CatalogTestFixture::setUp();
 
         _db = _createDatabase(_dbName);
-        _createDatabase({_dbName.tenantId(), "db1"});
-        _createDatabase({_dbName.tenantId(), "db2"});
+        _createDatabase(DatabaseName::createDatabaseName_forTest(_dbName.tenantId(), "db1"));
+        _createDatabase(DatabaseName::createDatabaseName_forTest(_dbName.tenantId(), "db2"));
     }
 
     void tearDown() override {
@@ -531,7 +532,7 @@ TEST_F(ViewCatalogFixture, LookupRIDExistingView) {
     auto resourceID =
         ResourceId(RESOURCE_COLLECTION,
                    NamespaceString::createNamespaceString_forTest(boost::none, "db.view"));
-    ASSERT_EQ(ResourceCatalog::get(getServiceContext()).name(resourceID), std::string{"db.view"});
+    ASSERT_EQ(ResourceCatalog::get().name(resourceID), std::string{"db.view"});
 }
 
 TEST_F(ViewCatalogFixture, LookupRIDExistingViewRollback) {
@@ -556,7 +557,7 @@ TEST_F(ViewCatalogFixture, LookupRIDExistingViewRollback) {
     auto resourceID =
         ResourceId(RESOURCE_COLLECTION,
                    NamespaceString::createNamespaceString_forTest(boost::none, "db.view"));
-    ASSERT(!ResourceCatalog::get(getServiceContext()).name(resourceID));
+    ASSERT(!ResourceCatalog::get().name(resourceID));
 }
 
 TEST_F(ViewCatalogFixture, LookupRIDAfterDrop) {
@@ -569,7 +570,7 @@ TEST_F(ViewCatalogFixture, LookupRIDAfterDrop) {
     auto resourceID =
         ResourceId(RESOURCE_COLLECTION,
                    NamespaceString::createNamespaceString_forTest(boost::none, "db.view"));
-    ASSERT(!ResourceCatalog::get(getServiceContext()).name(resourceID));
+    ASSERT(!ResourceCatalog::get().name(resourceID));
 }
 
 TEST_F(ViewCatalogFixture, LookupRIDAfterDropRollback) {
@@ -583,8 +584,7 @@ TEST_F(ViewCatalogFixture, LookupRIDAfterDropRollback) {
         WriteUnitOfWork wunit(operationContext());
         ASSERT_OK(createView(operationContext(), viewName, viewOn, emptyPipeline, emptyCollation));
         wunit.commit();
-        ASSERT_EQ(ResourceCatalog::get(getServiceContext()).name(resourceID).value(),
-                  viewName.ns());
+        ASSERT_EQ(ResourceCatalog::get().name(resourceID).value(), viewName.ns().toString());
     }
 
     {
@@ -600,7 +600,7 @@ TEST_F(ViewCatalogFixture, LookupRIDAfterDropRollback) {
         // Do not commit, rollback.
     }
     // Make sure drop was rolled back and view is still in catalog.
-    ASSERT_EQ(ResourceCatalog::get(getServiceContext()).name(resourceID), viewName.ns());
+    ASSERT_EQ(ResourceCatalog::get().name(resourceID), viewName.ns().toString());
 }
 
 TEST_F(ViewCatalogFixture, LookupRIDAfterModify) {
@@ -612,7 +612,7 @@ TEST_F(ViewCatalogFixture, LookupRIDAfterModify) {
                    NamespaceString::createNamespaceString_forTest(boost::none, "db.view"));
     ASSERT_OK(createView(operationContext(), viewName, viewOn, emptyPipeline, emptyCollation));
     ASSERT_OK(modifyView(operationContext(), viewName, viewOn, emptyPipeline));
-    ASSERT_EQ(ResourceCatalog::get(getServiceContext()).name(resourceID), viewName.ns());
+    ASSERT_EQ(ResourceCatalog::get().name(resourceID), viewName.ns().toString());
 }
 
 TEST_F(ViewCatalogFixture, LookupRIDAfterModifyRollback) {
@@ -626,7 +626,7 @@ TEST_F(ViewCatalogFixture, LookupRIDAfterModifyRollback) {
         WriteUnitOfWork wunit(operationContext());
         ASSERT_OK(createView(operationContext(), viewName, viewOn, emptyPipeline, emptyCollation));
         wunit.commit();
-        ASSERT_EQ(ResourceCatalog::get(getServiceContext()).name(resourceID), viewName.ns());
+        ASSERT_EQ(ResourceCatalog::get().name(resourceID), viewName.ns().toString());
     }
 
     {
@@ -643,11 +643,11 @@ TEST_F(ViewCatalogFixture, LookupRIDAfterModifyRollback) {
                                            viewOn,
                                            emptyPipeline,
                                            view_catalog_helpers::validatePipeline));
-        ASSERT_EQ(ResourceCatalog::get(getServiceContext()).name(resourceID), viewName.ns());
+        ASSERT_EQ(ResourceCatalog::get().name(resourceID), viewName.ns().toString());
         // Do not commit, rollback.
     }
     // Make sure view resource is still available after rollback.
-    ASSERT_EQ(ResourceCatalog::get(getServiceContext()).name(resourceID), viewName.ns());
+    ASSERT_EQ(ResourceCatalog::get().name(resourceID), viewName.ns().toString());
 }
 
 TEST_F(ViewCatalogFixture, CreateViewThenDropAndLookup) {
@@ -675,7 +675,7 @@ TEST_F(ViewCatalogFixture, Iterate) {
     Lock::DBLock dbLock(operationContext(), view1.dbName(), MODE_IX);
     getCatalog()->iterateViews(
         operationContext(), view1.dbName(), [&viewNames](const ViewDefinition& view) {
-            std::string name = view.name().toString();
+            std::string name = view.name().toString_forTest();
             ASSERT(viewNames.end() != viewNames.find(name));
             viewNames.erase(name);
             return true;
@@ -770,7 +770,9 @@ TEST_F(ViewCatalogFixture, ResolveViewCorrectlyExtractsDefaultCollation) {
 
 class ServerlessViewCatalogFixture : public ViewCatalogFixture {
 public:
-    ServerlessViewCatalogFixture() : ViewCatalogFixture(DatabaseName(TenantId(OID::gen()), "db")) {}
+    ServerlessViewCatalogFixture()
+        : ViewCatalogFixture(DatabaseName::createDatabaseName_forTest(TenantId(OID::gen()), "db")) {
+    }
 };
 
 TEST_F(ServerlessViewCatalogFixture, LookupExistingViewBeforeAndAfterDropFeatureFlagOff) {

@@ -37,6 +37,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/api_parameters',
         '$BUILD_DIR/mongo/rpc/metadata',
+        '$BUILD_DIR/mongo/s/mongos_server_parameters',
         '$BUILD_DIR/mongo/util/net/network',
     ],
 )
@@ -121,6 +122,16 @@ env.Library(
         '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/db/server_feature_flags',
         'egress_tag_closer_manager',
+    ],
+)
+
+env.Library(
+    target='connection_pool_controllers',
+    source=[
+        'connection_pool_controllers.cpp',
+    ],
+    LIBDEPS=[
+        'connection_pool_executor',
     ],
 )
 
@@ -330,6 +341,9 @@ env.Library(
         '$BUILD_DIR/mongo/db/query/command_request_response',
         'task_executor_interface',
     ],
+    LIBDEPS_PRIVATE=[
+        'pinned_connection_task_executor_factory',
+    ],
 )
 
 env.Library(
@@ -342,6 +356,21 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/util/concurrency/thread_pool',
         '$BUILD_DIR/mongo/util/fail_point',
+    ],
+)
+
+env.Library(
+    target='pinned_connection_task_executor_factory',
+    source=[
+        'pinned_connection_task_executor_factory.cpp',
+    ],
+    LIBDEPS=[
+        'task_executor_interface',
+    ],
+    LIBDEPS_PRIVATE=[
+        'network_interface',
+        'pinned_connection_task_executor',
+        'thread_pool_task_executor',
     ],
 )
 
@@ -386,7 +415,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/repl/hello_command',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
         '$BUILD_DIR/mongo/s/mongos_server_parameters',
-        "$BUILD_DIR/mongo/s/sharding_router_test_fixture",
+        '$BUILD_DIR/mongo/s/sharding_router_test_fixture',
         '$BUILD_DIR/mongo/transport/message_compressor',
         '$BUILD_DIR/mongo/util/clock_source_mock',
         'async_rpc',
@@ -416,9 +445,11 @@ env.CppIntegrationTest(
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/async_client',
         '$BUILD_DIR/mongo/client/clientdriver_network',
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/wire_version',
         '$BUILD_DIR/mongo/executor/network_interface_factory',
         '$BUILD_DIR/mongo/executor/network_interface_thread_pool',
+        '$BUILD_DIR/mongo/executor/pinned_connection_task_executor',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor',
         '$BUILD_DIR/mongo/transport/transport_layer_egress_init',
         '$BUILD_DIR/mongo/util/concurrency/thread_pool',

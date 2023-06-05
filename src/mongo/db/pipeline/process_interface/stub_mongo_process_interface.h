@@ -55,6 +55,16 @@ public:
 
     class StubWriteSizeEstimator final : public WriteSizeEstimator {
     public:
+        int estimateInsertHeaderSize(
+            const write_ops::InsertCommandRequest& insertReq) const override {
+            return 0;
+        }
+
+        int estimateUpdateHeaderSize(
+            const write_ops::UpdateCommandRequest& insertReq) const override {
+            return 0;
+        }
+
         int estimateInsertSizeBytes(const BSONObj& insert) const override {
             MONGO_UNREACHABLE;
         }
@@ -64,6 +74,7 @@ public:
             MONGO_UNREACHABLE;
         }
     };
+
     std::unique_ptr<WriteSizeEstimator> getWriteSizeEstimator(
         OperationContext* opCtx, const NamespaceString& ns) const override {
         return std::make_unique<StubWriteSizeEstimator>();
@@ -77,15 +88,23 @@ public:
 
     Status insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                   const NamespaceString& ns,
-                  std::vector<BSONObj>&& objs,
+                  std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
                   const WriteConcernOptions& wc,
                   boost::optional<OID>) override {
         MONGO_UNREACHABLE;
     }
 
+    Status insertTimeseries(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                            const NamespaceString& ns,
+                            std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
+                            const WriteConcernOptions& wc,
+                            boost::optional<OID> targetEpoch) override {
+        MONGO_UNREACHABLE;
+    }
+
     StatusWith<UpdateResult> update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                     const NamespaceString& ns,
-                                    BatchedObjects&& batch,
+                                    std::unique_ptr<write_ops::UpdateCommandRequest> updateCommand,
                                     const WriteConcernOptions& wc,
                                     UpsertType upsert,
                                     bool multi,
@@ -107,6 +126,13 @@ public:
     }
 
     std::deque<BSONObj> listCatalog(OperationContext* opCtx) const override {
+        MONGO_UNREACHABLE;
+    }
+
+    void createTimeseriesView(OperationContext* opCtx,
+                              const NamespaceString& ns,
+                              const BSONObj& cmdObj,
+                              const TimeseriesOptions& userOpts) final {
         MONGO_UNREACHABLE;
     }
 

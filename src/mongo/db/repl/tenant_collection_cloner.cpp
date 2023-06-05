@@ -104,7 +104,7 @@ TenantCollectionCloner::TenantCollectionCloner(const NamespaceString& sourceNss,
     invariant(ClonerUtils::isNamespaceForTenant(sourceNss, tenantId));
     invariant(collectionOptions.uuid);
     _sourceDbAndUuid = NamespaceStringOrUUID(sourceNss.dbName(), *collectionOptions.uuid);
-    _stats.ns = _sourceNss.ns();
+    _stats.ns = _sourceNss.ns().toString();
 }
 
 BaseCloner::ClonerStages TenantCollectionCloner::getStages() {
@@ -237,15 +237,14 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::listIndexesStage() {
             }
         },
         [&](const BSONObj& data) {
+            const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "nss"_sd);
             // Only hang when cloning the specified collection, or if no collection was specified.
-            auto nss = data["nss"].str();
-            return nss.empty() || nss == _sourceNss.toString();
+            return fpNss.isEmpty() || fpNss == _sourceNss;
         });
 
     BSONObj readResult;
     BSONObj cmd = ClonerUtils::buildMajorityWaitRequest(_operationTime);
-    getClient()->runCommand(
-        DatabaseName(boost::none, "admin"), cmd, readResult, QueryOption_SecondaryOk);
+    getClient()->runCommand(DatabaseName::kAdmin, cmd, readResult, QueryOption_SecondaryOk);
     uassertStatusOKWithContext(
         getStatusFromCommandResult(readResult),
         "TenantCollectionCloner failed to get listIndexes result majority-committed");
@@ -277,7 +276,7 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::listIndexesStage() {
         ErrorCodes::IllegalOperation,
         str::stream() << "Found empty '_id' index spec but the collection is not specified with "
                          "'autoIndexId' as false, tenantId: "
-                      << _tenantId << ", namespace: " << this->_sourceNss,
+                      << _tenantId << ", namespace: " << this->_sourceNss.toStringForErrorMsg(),
         _collectionOptions.clusteredIndex || !_idIndexSpec.isEmpty() ||
             _collectionOptions.autoIndexId == CollectionOptions::NO);
 
@@ -307,7 +306,8 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::createCollectionStage() {
                               << " already exists but does not belong to the same database",
                 collection->ns().db() == _sourceNss.db());
         uassert(ErrorCodes::NamespaceExists,
-                str::stream() << "Tenant '" << _tenantId << "': collection '" << collection->ns()
+                str::stream() << "Tenant '" << _tenantId << "': collection '"
+                              << collection->ns().toStringForErrorMsg()
                               << "' already exists prior to data sync",
                 getSharedData()->getResumePhase() == ResumePhase::kDataSync);
 
@@ -513,9 +513,9 @@ void TenantCollectionCloner::handleNextBatch(DBClientCursor& cursor) {
             }
         },
         [&](const BSONObj& data) {
+            const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "nss"_sd);
             // Only hang when cloning the specified collection, or if no collection was specified.
-            auto nss = data["nss"].str();
-            return nss.empty() || nss == _sourceNss.toString();
+            return fpNss.isEmpty() || fpNss == _sourceNss;
         });
 }
 
@@ -567,8 +567,8 @@ void TenantCollectionCloner::insertDocuments(std::vector<BSONObj> docsToInsert) 
 }
 
 bool TenantCollectionCloner::isMyFailPoint(const BSONObj& data) const {
-    auto nss = data["nss"].str();
-    return (nss.empty() || nss == _sourceNss.toString()) && BaseCloner::isMyFailPoint(data);
+    const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "nss"_sd);
+    return (fpNss.isEmpty() || fpNss == _sourceNss) && BaseCloner::isMyFailPoint(data);
 }
 
 TenantCollectionCloner::Stats TenantCollectionCloner::getStats() const {

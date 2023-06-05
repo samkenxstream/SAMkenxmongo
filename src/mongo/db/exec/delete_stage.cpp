@@ -45,6 +45,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -75,7 +76,7 @@ bool shouldRestartDeleteIfNoLongerMatches(const DeleteStageParams* params) {
 DeleteStage::DeleteStage(ExpressionContext* expCtx,
                          std::unique_ptr<DeleteStageParams> params,
                          WorkingSet* ws,
-                         const CollectionPtr& collection,
+                         const ScopedCollectionAcquisition& collection,
                          PlanStage* child)
     : DeleteStage(kStageType.rawData(), expCtx, std::move(params), ws, collection, child) {}
 
@@ -83,12 +84,12 @@ DeleteStage::DeleteStage(const char* stageType,
                          ExpressionContext* expCtx,
                          std::unique_ptr<DeleteStageParams> params,
                          WorkingSet* ws,
-                         const CollectionPtr& collection,
+                         const ScopedCollectionAcquisition& collection,
                          PlanStage* child)
-    : RequiresMutableCollectionStage(stageType, expCtx, collection),
+    : RequiresWritableCollectionStage(stageType, expCtx, collection),
       _params(std::move(params)),
       _ws(ws),
-      _preWriteFilter(opCtx(), collection->ns()),
+      _preWriteFilter(opCtx(), collection.nss()),
       _idRetrying(WorkingSet::INVALID_ID),
       _idReturning(WorkingSet::INVALID_ID) {
     _children.emplace_back(child);
@@ -169,7 +170,6 @@ PlanStage::StageState DeleteStage::doWork(WorkingSetID* out) {
     const auto ret = handlePlanStageYield(
         expCtx(),
         "DeleteStage ensureStillMatches",
-        collection()->ns().ns(),
         [&] {
             docStillMatches = write_stage_common::ensureStillMatches(
                 collection(), opCtx(), _ws, id, _params->canonicalQuery);
@@ -225,14 +225,9 @@ PlanStage::StageState DeleteStage::doWork(WorkingSetID* out) {
     Snapshotted<Document> memberDoc = member->doc;
     BSONObj bsonObjDoc = memberDoc.value().toBson();
 
-    if (_params->removeSaver) {
-        uassertStatusOK(_params->removeSaver->goingToDelete(bsonObjDoc));
-    }
-
     handlePlanStageYield(
         expCtx(),
         "DeleteStage saveState",
-        collection()->ns().ns(),
         [&] {
             child()->saveState();
             return PlanStage::NEED_TIME /* unused */;
@@ -248,7 +243,6 @@ PlanStage::StageState DeleteStage::doWork(WorkingSetID* out) {
             const auto ret = handlePlanStageYield(
                 expCtx(),
                 "DeleteStage deleteDocument",
-                collection()->ns().ns(),
                 [&] {
                     WriteUnitOfWork wunit(opCtx());
                     collection_internal::deleteDocument(
@@ -307,7 +301,6 @@ PlanStage::StageState DeleteStage::doWork(WorkingSetID* out) {
     const auto restoreStateRet = handlePlanStageYield(
         expCtx(),
         "DeleteStage restoreState",
-        collection()->ns().ns(),
         [&] {
             child()->restoreState(&collection());
             return PlanStage::NEED_TIME;
@@ -347,7 +340,8 @@ PlanStage::StageState DeleteStage::doWork(WorkingSetID* out) {
 void DeleteStage::doRestoreStateRequiresCollection() {
     const NamespaceString& ns = collection()->ns();
     uassert(ErrorCodes::PrimarySteppedDown,
-            str::stream() << "Demoted from primary while removing from " << ns.ns(),
+            str::stream() << "Demoted from primary while removing from "
+                          << ns.toStringForErrorMsg(),
             !opCtx()->writesAreReplicated() ||
                 repl::ReplicationCoordinator::get(opCtx())->canAcceptWritesFor(opCtx(), ns));
 

@@ -38,7 +38,6 @@
 #include "mongo/crypto/encryption_fields_gen.h"
 #include "mongo/crypto/fle_stats.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/commands/fle2_compact_gen.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
@@ -49,9 +48,12 @@
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 
-MONGO_FAIL_POINT_DEFINE(fleCompactFailBeforeECOCRead);
+MONGO_FAIL_POINT_DEFINE(fleCompactOrCleanupFailBeforeECOCRead);
 MONGO_FAIL_POINT_DEFINE(fleCompactHangBeforeESCAnchorInsert);
-
+MONGO_FAIL_POINT_DEFINE(fleCleanupHangBeforeNullAnchorUpdate);
+MONGO_FAIL_POINT_DEFINE(fleCleanupFailAfterTransactionCommit);
+MONGO_FAIL_POINT_DEFINE(fleCompactFailAfterTransactionCommit);
+MONGO_FAIL_POINT_DEFINE(fleCleanupFailDuringAnchorDeletes);
 
 namespace mongo {
 namespace {
@@ -105,34 +107,136 @@ void CompactStatsCounter<ECOCStats>::add(const ECOCStats& other) {
     addDeletes(other.getDeleted());
 }
 
+FLEEdgeCountInfo fetchEdgeCountInfo(FLEQueryInterface* queryImpl,
+                                    const ESCDerivedFromDataTokenAndContentionFactorToken& token,
+                                    const NamespaceString& escNss,
+                                    FLEQueryInterface::TagQueryType queryType,
+                                    const StringData queryTypeStr) {
+    std::vector<std::vector<FLEEdgePrfBlock>> tags;
+    tags.emplace_back().push_back(FLEEdgePrfBlock{token.data, boost::none});
+    auto countInfoSets = queryImpl->getTags(escNss, tags, queryType);
+    uassert(7517100,
+            str::stream() << "getQueryableEncryptionCountInfo for " << queryTypeStr
+                          << " returned an invalid number of edge count info",
+            countInfoSets.size() == 1 && countInfoSets[0].size() == 1);
+
+    auto& countInfo = countInfoSets[0][0];
+    uassert(7517103,
+            str::stream() << "getQueryableEncryptionCountInfo for " << queryTypeStr
+                          << " returned non-existent stats",
+            countInfo.stats.has_value());
+
+    uassert(7295001,
+            str::stream() << "getQueryableEncryptionCountInfo for " << queryTypeStr
+                          << " returned non-existent searched counts",
+            countInfo.searchedCounts.has_value());
+
+    return countInfo;
+}
+
 /**
- * Implementation of FLEStateCollectionReader for txn_api::TransactionClient
+ * Inserts or updates a null anchor document in ESC.
+ * The newNullAnchor must contain the _id of the null anchor document to update.
  */
-template <typename StatsType>
-class TxnCollectionReaderForCompact : public FLEStateCollectionReader {
-public:
-    TxnCollectionReaderForCompact(FLEQueryInterface* queryImpl,
-                                  const NamespaceString& nss,
-                                  StatsType* stats)
-        : _queryImpl(queryImpl), _nss(nss), _stats(stats) {}
+void upsertNullAnchor(FLEQueryInterface* queryImpl,
+                      bool hasNullAnchor,
+                      BSONObj newNullAnchor,
+                      const NamespaceString& nss,
+                      ECStats* stats) {
+    CompactStatsCounter<ECStats> statsCtr(stats);
 
-    uint64_t getDocumentCount() const override {
-        return _queryImpl->countDocuments(_nss);
+    if (MONGO_unlikely(fleCleanupHangBeforeNullAnchorUpdate.shouldFail())) {
+        LOGV2(7618811, "Hanging due to fleCleanupHangBeforeNullAnchorUpdate fail point");
+        fleCleanupHangBeforeNullAnchorUpdate.pauseWhileSet();
     }
 
-    BSONObj getById(PrfBlock block) const override {
-        auto doc = BSON("v" << BSONBinData(block.data(), block.size(), BinDataGeneral));
-        BSONElement element = doc.firstElement();
-        auto result = _queryImpl->getById(_nss, element);
-        _stats.addReads(1);
-        return result;
+    if (hasNullAnchor) {
+        // update the null doc with a replacement modification
+        write_ops::UpdateOpEntry updateEntry;
+        updateEntry.setMulti(false);
+        updateEntry.setUpsert(false);
+        updateEntry.setQ(newNullAnchor.getField("_id").wrap());
+        updateEntry.setU(mongo::write_ops::UpdateModification(
+            newNullAnchor, write_ops::UpdateModification::ReplacementTag{}));
+        write_ops::UpdateCommandRequest updateRequest(nss, {std::move(updateEntry)});
+
+        auto reply = queryImpl->update(nss, kUninitializedStmtId, updateRequest);
+        checkWriteErrors(reply);
+        statsCtr.addUpdates(reply.getNModified());
+    } else {
+        // insert the null anchor; translate duplicate key error to a FLE contention error
+        StmtId stmtId = kUninitializedStmtId;
+        auto reply =
+            uassertStatusOK(queryImpl->insertDocuments(nss, {newNullAnchor}, &stmtId, true));
+        checkWriteErrors(reply);
+        statsCtr.addInserts(1);
+    }
+}
+
+void checkSchemaAndCompactionTokens(const BSONObj& tokens, const Collection& edc) {
+    uassert(6346807,
+            "Target namespace is not an encrypted collection",
+            edc.getCollectionOptions().encryptedFieldConfig);
+
+    // Validate the request contains a compaction token for each encrypted field
+    const auto& efc = edc.getCollectionOptions().encryptedFieldConfig.value();
+    CompactionHelpers::validateCompactionTokens(efc, tokens);
+}
+
+std::shared_ptr<stdx::unordered_set<ECOCCompactionDocumentV2>> readUniqueECOCEntriesInTxn(
+    OperationContext* opCtx,
+    GetTxnCallback getTxn,
+    const NamespaceString ecocCompactNss,
+    BSONObj compactionTokens,
+    ECOCStats* ecocStats) {
+
+    auto innerEcocStats = std::make_shared<ECOCStats>();
+    auto uniqueEcocEntries = std::make_shared<stdx::unordered_set<ECOCCompactionDocumentV2>>();
+
+    if (MONGO_unlikely(fleCompactOrCleanupFailBeforeECOCRead.shouldFail())) {
+        uasserted(7293605, "Failed due to fleCompactOrCleanupFailBeforeECOCRead fail point");
     }
 
-private:
-    FLEQueryInterface* _queryImpl;
-    const NamespaceString& _nss;
-    mutable CompactStatsCounter<StatsType> _stats;
-};
+    std::shared_ptr<txn_api::SyncTransactionWithRetries> trun = getTxn(opCtx);
+
+    // The function that handles the transaction may outlive this function so we need to use
+    // shared_ptrs
+    auto argsBlock = std::make_tuple(compactionTokens, ecocCompactNss);
+    auto sharedBlock = std::make_shared<decltype(argsBlock)>(argsBlock);
+
+    auto swResult = trun->runNoThrow(
+        opCtx,
+        [sharedBlock, uniqueEcocEntries, innerEcocStats](
+            const txn_api::TransactionClient& txnClient, ExecutorPtr txnExec) {
+            FLEQueryInterfaceImpl queryImpl(txnClient, getGlobalServiceContext());
+
+            auto [compactionTokens2, ecocCompactNss2] = *sharedBlock.get();
+
+            *uniqueEcocEntries = getUniqueCompactionDocuments(
+                &queryImpl, compactionTokens2, ecocCompactNss2, innerEcocStats.get());
+
+            return SemiFuture<void>::makeReady();
+        });
+    uassertStatusOK(swResult);
+    uassertStatusOK(swResult.getValue().getEffectiveStatus());
+
+    if (ecocStats) {
+        CompactStatsCounter<ECOCStats> ctr(ecocStats);
+        ctr.add(*innerEcocStats);
+    }
+    return uniqueEcocEntries;
+}
+
+EncryptionInformation makeEmptyProcessEncryptionInformation() {
+    EncryptionInformation encryptionInformation;
+    encryptionInformation.setCrudProcessed(true);
+
+    // We need to set an empty BSON object here for the schema.
+    encryptionInformation.setSchema(BSONObj());
+
+    return encryptionInformation;
+}
+
 }  // namespace
 
 
@@ -140,8 +244,9 @@ StatusWith<EncryptedStateCollectionsNamespaces>
 EncryptedStateCollectionsNamespaces::createFromDataCollection(const Collection& edc) {
     if (!edc.getCollectionOptions().encryptedFieldConfig) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "Encrypted data collection " << edc.ns()
-                                    << " is missing encrypted fields metadata");
+                      str::stream()
+                          << "Encrypted data collection " << edc.ns().toStringForErrorMsg()
+                          << " is missing encrypted fields metadata");
     }
 
     auto& cfg = *(edc.getCollectionOptions().encryptedFieldConfig);
@@ -164,12 +269,16 @@ EncryptedStateCollectionsNamespaces::createFromDataCollection(const Collection& 
     if (!missingColl.empty()) {
         return Status(ErrorCodes::BadValue,
                       str::stream()
-                          << "Encrypted data collection " << edc.ns()
+                          << "Encrypted data collection " << edc.ns().toStringForErrorMsg()
                           << " is missing the name of its " << missingColl << " collection");
     }
 
     namespaces.ecocRenameNss =
         NamespaceString(db, namespaces.ecocNss.coll().toString().append(".compact"));
+    namespaces.ecocLockNss =
+        NamespaceString(db, namespaces.ecocNss.coll().toString().append(".lock"));
+    namespaces.escDeletesNss =
+        NamespaceString(db, namespaces.escNss.coll().toString().append(".deletes"));
     return namespaces;
 }
 
@@ -179,9 +288,9 @@ EncryptedStateCollectionsNamespaces::createFromDataCollection(const Collection& 
  * that have been encrypted with that token. All entries are returned
  * in a set in their decrypted form.
  */
-stdx::unordered_set<ECOCCompactionDocumentV2> getUniqueCompactionDocumentsV2(
+stdx::unordered_set<ECOCCompactionDocumentV2> getUniqueCompactionDocuments(
     FLEQueryInterface* queryImpl,
-    const CompactStructuredEncryptionData& request,
+    BSONObj tokensObj,
     const NamespaceString& ecocNss,
     ECOCStats* ecocStats) {
 
@@ -190,7 +299,7 @@ stdx::unordered_set<ECOCCompactionDocumentV2> getUniqueCompactionDocumentsV2(
     // Initialize a set 'C' and for each compaction token, find all entries
     // in ECOC with matching field name. Decrypt entries and add to set 'C'.
     stdx::unordered_set<ECOCCompactionDocumentV2> c;
-    auto compactionTokens = CompactionHelpers::parseCompactionTokens(request.getCompactionTokens());
+    auto compactionTokens = CompactionHelpers::parseCompactionTokens(tokensObj);
 
     for (auto& compactionToken : compactionTokens) {
         auto docs = queryImpl->findDocuments(
@@ -209,47 +318,54 @@ void compactOneFieldValuePairV2(FLEQueryInterface* queryImpl,
                                 const ECOCCompactionDocumentV2& ecocDoc,
                                 const NamespaceString& escNss,
                                 ECStats* escStats) {
-    auto escTagToken = FLETwiceDerivedTokenGenerator::generateESCTwiceDerivedTagToken(ecocDoc.esc);
-    auto escValueToken =
-        FLETwiceDerivedTokenGenerator::generateESCTwiceDerivedValueToken(ecocDoc.esc);
-
     CompactStatsCounter<ECStats> stats(escStats);
-    TxnCollectionReaderForCompact reader(queryImpl, escNss, escStats);
 
-    auto positions = ESCCollection::emuBinaryV2(reader, escTagToken, escValueToken);
+    /**
+     * Send a getQueryableEncryptionCountInfo command with query type "compact".
+     * The target of this command will perform the actual search for the next anchor
+     * position, which happens in the getEdgeCountInfoForCompact() function in fle_crypto.
+     *
+     * It is expected to return a single reply token, whose "count" field contains the
+     * next anchor position, and whose "searchedCounts" field contains the result of
+     * emuBinary.
+     */
+    auto countInfo = fetchEdgeCountInfo(
+        queryImpl, ecocDoc.esc, escNss, FLEQueryInterface::TagQueryType::kCompact, "compact"_sd);
+    auto& emuBinaryResult = countInfo.searchedCounts.value();
 
-    // Handle case where cpos is none. This means that no new non-anchors have been inserted
-    // since since the last compact/cleanup.
-    // This could happen if a previous compact inserted an anchor, but the temp ECOC drop
-    // was interrupted. On restart, the compaction will run emuBinaryV2 again, but since the
-    // anchor was already inserted for this value, it may return null cpos if there have been no
-    // new insertions for that value since the first compact attempt.
-    if (!positions.cpos.has_value()) {
-        // No new non-anchors since the last compact/cleanup.
-        // There must be at least one anchor.
-        uassert(7293602,
-                "An ESC anchor document is expected but none is found",
-                !positions.apos.has_value() || positions.apos.value() > 0);
-        // the anchor with the latest cpos already exists so no more work needed
+    stats.add(countInfo.stats.get());
+
+    // Check for the invalid case where emuBinary returned (0,0).
+    // This means that the tokens can't be trusted or the state collections are already hosed.
+    if (emuBinaryResult.cpos.value_or(1) == 0) {
+        // apos must also be 0 if cpos is 0
+        uassert(7666501,
+                "getQueryableEncryptionCountInfo returned an invalid position for the next anchor",
+                emuBinaryResult.apos.has_value() && emuBinaryResult.apos.value() == 0);
+        uasserted(7666502,
+                  str::stream() << "Queryable Encryption compaction encountered invalid searched "
+                                   "ESC positions for field "
+                                << ecocDoc.fieldName
+                                << ". This may be due to invalid compaction tokens or corrupted "
+                                   "state collections.");
+    }
+
+    if (emuBinaryResult.cpos == boost::none) {
+        // no new non-anchors since the last compact/cleanup, so don't insert a new anchor
         return;
     }
 
-    uint64_t nextAnchorPos = 0;
+    // the "count" field contains the next anchor position and must not be zero
+    uassert(7295002,
+            "getQueryableEncryptionCountInfo returned an invalid position for the next anchor",
+            countInfo.count > 0);
 
-    if (!positions.apos.has_value()) {
-        auto r_esc = reader.getById(ESCCollection::generateNullAnchorId(escTagToken));
-
-        uassert(7293601, "ESC null anchor document not found", !r_esc.isEmpty());
-
-        auto nullAnchorDoc =
-            uassertStatusOK(ESCCollection::decryptAnchorDocument(escValueToken, r_esc));
-        nextAnchorPos = nullAnchorDoc.position + 1;
-    } else {
-        nextAnchorPos = positions.apos.value() + 1;
-    }
+    auto valueToken = FLETwiceDerivedTokenGenerator::generateESCTwiceDerivedValueToken(ecocDoc.esc);
+    auto latestCpos = emuBinaryResult.cpos.value();
 
     auto anchorDoc = ESCCollection::generateAnchorDocument(
-        escTagToken, escValueToken, nextAnchorPos, positions.cpos.value());
+        countInfo.tagToken, valueToken, countInfo.count, latestCpos);
+
     StmtId stmtId = kUninitializedStmtId;
 
     if (MONGO_unlikely(fleCompactHangBeforeESCAnchorInsert.shouldFail())) {
@@ -263,48 +379,136 @@ void compactOneFieldValuePairV2(FLEQueryInterface* queryImpl,
     stats.addInserts(1);
 }
 
+
+void cleanupOneFieldValuePair(FLEQueryInterface* queryImpl,
+                              const ECOCCompactionDocumentV2& ecocDoc,
+                              const NamespaceString& escNss,
+                              const NamespaceString& escDeletesNss,
+                              ECStats* escStats) {
+
+    CompactStatsCounter<ECStats> stats(escStats);
+    auto valueToken = FLETwiceDerivedTokenGenerator::generateESCTwiceDerivedValueToken(ecocDoc.esc);
+
+    /**
+     * Send a getQueryableEncryptionCountInfo command with query type "cleanup".
+     * The target of this command will perform steps (B), (C), and (D) of the cleanup
+     * algorithm, and is implemented in getEdgeCountInfoForCleanup() function in fle_crypto.
+     *
+     * It is expected to return a single reply token, whose "searchedCounts" field contains
+     * the result of emuBinary (C), and whose "nullAnchorCounts" field may contain the result
+     * of the null anchor lookup (D). The "count" field shall contain the value of a_1 that
+     * the null anchor should be updated with.
+     */
+    auto countInfo = fetchEdgeCountInfo(
+        queryImpl, ecocDoc.esc, escNss, FLEQueryInterface::TagQueryType::kCleanup, "cleanup"_sd);
+    auto& emuBinaryResult = countInfo.searchedCounts.value();
+
+    stats.add(countInfo.stats.get());
+
+    // Check for the invalid case where emuBinary returned (0,0).
+    // This means that the tokens can't be trusted or the state collections are already hosed.
+    if (emuBinaryResult.cpos.value_or(1) == 0) {
+        // apos must also be 0 if cpos is 0
+        uassert(7618815,
+                "getQueryableEncryptionCountInfo returned an invalid position for the next anchor",
+                emuBinaryResult.apos.has_value() && emuBinaryResult.apos.value() == 0);
+        uasserted(7618816,
+                  str::stream() << "Queryable Encryption cleanup encountered invalid searched "
+                                   "ESC positions for field "
+                                << ecocDoc.fieldName
+                                << ". This may be due to invalid compaction tokens or corrupted "
+                                   "state collections.");
+    }
+
+    if (emuBinaryResult.apos == boost::none) {
+        // case (E)
+        // Null anchor exists & contains the latest anchor position,
+        // and *maybe* the latest non-anchor position.
+        uassert(7295003,
+                str::stream() << "getQueryableEncryptionCountInfo for cleanup returned "
+                                 "non-existent null anchor counts",
+                countInfo.nullAnchorCounts.has_value());
+
+        if (emuBinaryResult.cpos == boost::none) {
+            // if cpos is none, then the null anchor also contains the latest
+            // non-anchor position, so no need to update it.
+            return;
+        }
+
+        auto latestApos = countInfo.nullAnchorCounts->apos;
+        auto latestCpos = countInfo.count;
+
+        // Update null anchor with the latest positions
+        auto newAnchor = ESCCollection::generateNullAnchorDocument(
+            countInfo.tagToken, valueToken, latestApos, latestCpos);
+        upsertNullAnchor(queryImpl, true, newAnchor, escNss, escStats);
+
+    } else if (emuBinaryResult.apos.value() == 0) {
+        // case (F)
+        // No anchors yet exist, so latest apos is 0.
+
+        uint64_t latestApos = 0;
+        auto latestCpos = countInfo.count;
+
+        // Insert a new null anchor.
+        auto newAnchor = ESCCollection::generateNullAnchorDocument(
+            countInfo.tagToken, valueToken, latestApos, latestCpos);
+        upsertNullAnchor(queryImpl, false, newAnchor, escNss, escStats);
+
+    } else /* (apos > 0) */ {
+        // case (G)
+        // New anchors exist - if null anchor exists, then it contains stale positions.
+        // Latest apos is returned by emuBinary.
+
+        auto latestApos = emuBinaryResult.apos.value();
+        auto latestCpos = countInfo.count;
+
+        bool nullAnchorExists = countInfo.nullAnchorCounts.has_value();
+
+        // upsert the null anchor with the latest positions
+        auto newAnchor = ESCCollection::generateNullAnchorDocument(
+            countInfo.tagToken, valueToken, latestApos, latestCpos);
+        upsertNullAnchor(queryImpl, nullAnchorExists, newAnchor, escNss, escStats);
+
+        // insert the _id of stale anchors (anchors in range [bottomApos + 1, latestApos])
+        // into the deletes collection.
+        uint64_t bottomApos = 0;
+        if (nullAnchorExists) {
+            bottomApos = countInfo.nullAnchorCounts->apos;
+        }
+
+        StmtId stmtId = kUninitializedStmtId;
+
+        for (auto i = bottomApos + 1; i <= latestApos; i++) {
+            auto block = ESCCollection::generateAnchorId(countInfo.tagToken, i);
+            auto doc = BSON("_id"_sd << BSONBinData(block.data(), block.size(), BinDataGeneral));
+
+            auto swReply = queryImpl->insertDocuments(escDeletesNss, {doc}, &stmtId, false);
+            if (swReply.getStatus() == ErrorCodes::DuplicateKey) {
+                // ignore duplicate _id error, which can happen in case of a restart.
+                LOGV2_DEBUG(7295010,
+                            2,
+                            "Duplicate anchor ID found in ESC deletes collection",
+                            "namespace"_attr = escDeletesNss);
+                continue;
+            }
+            uassertStatusOK(swReply.getStatus());
+            checkWriteErrors(swReply.getValue());
+        }
+    }
+}
+
 void processFLECompactV2(OperationContext* opCtx,
                          const CompactStructuredEncryptionData& request,
                          GetTxnCallback getTxn,
                          const EncryptedStateCollectionsNamespaces& namespaces,
                          ECStats* escStats,
                          ECOCStats* ecocStats) {
-    auto innerEcocStats = std::make_shared<ECOCStats>();
     auto innerEscStats = std::make_shared<ECStats>();
 
     /* uniqueEcocEntries corresponds to the set 'C_f' in OST-1 */
-    auto uniqueEcocEntries = std::make_shared<stdx::unordered_set<ECOCCompactionDocumentV2>>();
-
-    if (MONGO_unlikely(fleCompactFailBeforeECOCRead.shouldFail())) {
-        uasserted(7293605, "Failed compact due to fleCompactFailBeforeECOCRead fail point");
-    }
-
-    // Read the ECOC documents in a transaction
-    {
-        std::shared_ptr<txn_api::SyncTransactionWithRetries> trun = getTxn(opCtx);
-
-        // The function that handles the transaction may outlive this function so we need to use
-        // shared_ptrs
-        auto argsBlock = std::make_tuple(request, namespaces.ecocRenameNss);
-        auto sharedBlock = std::make_shared<decltype(argsBlock)>(argsBlock);
-
-        auto swResult = trun->runNoThrow(
-            opCtx,
-            [sharedBlock, uniqueEcocEntries, innerEcocStats](
-                const txn_api::TransactionClient& txnClient, ExecutorPtr txnExec) {
-                FLEQueryInterfaceImpl queryImpl(txnClient, getGlobalServiceContext());
-
-                auto [request2, ecocRenameNss] = *sharedBlock.get();
-
-                *uniqueEcocEntries = getUniqueCompactionDocumentsV2(
-                    &queryImpl, request2, ecocRenameNss, innerEcocStats.get());
-
-                return SemiFuture<void>::makeReady();
-            });
-
-        uassertStatusOK(swResult);
-        uassertStatusOK(swResult.getValue().getEffectiveStatus());
-    }
+    auto uniqueEcocEntries = readUniqueECOCEntriesInTxn(
+        opCtx, getTxn, namespaces.ecocRenameNss, request.getCompactionTokens(), ecocStats);
 
     // Each entry in 'C_f' represents a unique field/value pair. For each field/value pair,
     // compact the ESC entries for that field/value pair in one transaction.
@@ -332,6 +536,10 @@ void processFLECompactV2(OperationContext* opCtx,
 
         uassertStatusOK(swResult);
         uassertStatusOK(swResult.getValue().getEffectiveStatus());
+
+        if (MONGO_unlikely(fleCompactFailAfterTransactionCommit.shouldFail())) {
+            uasserted(7663001, "Failed due to fleCompactFailAfterTransactionCommit fail point");
+        }
     }
 
     // Update stats
@@ -339,20 +547,66 @@ void processFLECompactV2(OperationContext* opCtx,
         CompactStatsCounter<ECStats> ctr(escStats);
         ctr.add(*innerEscStats);
     }
-    if (ecocStats) {
-        CompactStatsCounter<ECOCStats> ctr(ecocStats);
-        ctr.add(*innerEcocStats);
+}
+
+void processFLECleanup(OperationContext* opCtx,
+                       const CleanupStructuredEncryptionData& request,
+                       GetTxnCallback getTxn,
+                       const EncryptedStateCollectionsNamespaces& namespaces,
+                       ECStats* escStats,
+                       ECOCStats* ecocStats) {
+    auto innerEscStats = std::make_shared<ECStats>();
+
+    /* uniqueEcocEntries corresponds to the set 'C_f' in OST-1 */
+    auto uniqueEcocEntries = readUniqueECOCEntriesInTxn(
+        opCtx, getTxn, namespaces.ecocRenameNss, request.getCleanupTokens(), ecocStats);
+
+    // Each entry in 'C_f' represents a unique field/value pair. For each field/value pair,
+    // compact the ESC entries for that field/value pair in one transaction.
+    for (auto& ecocDoc : *uniqueEcocEntries) {
+        // start a new transaction
+        std::shared_ptr<txn_api::SyncTransactionWithRetries> trun = getTxn(opCtx);
+
+        // The function that handles the transaction may outlive this function so we need to use
+        // shared_ptrs
+        auto argsBlock = std::make_tuple(ecocDoc, namespaces.escNss, namespaces.escDeletesNss);
+        auto sharedBlock = std::make_shared<decltype(argsBlock)>(argsBlock);
+
+        auto swResult = trun->runNoThrow(
+            opCtx,
+            [sharedBlock, innerEscStats](const txn_api::TransactionClient& txnClient,
+                                         ExecutorPtr txnExec) {
+                FLEQueryInterfaceImpl queryImpl(txnClient, getGlobalServiceContext());
+
+                auto [ecocDoc2, escNss, escDeletesNss] = *sharedBlock.get();
+
+                cleanupOneFieldValuePair(
+                    &queryImpl, ecocDoc2, escNss, escDeletesNss, innerEscStats.get());
+
+                return SemiFuture<void>::makeReady();
+            });
+
+        uassertStatusOK(swResult);
+        uassertStatusOK(swResult.getValue().getEffectiveStatus());
+
+        if (MONGO_unlikely(fleCleanupFailAfterTransactionCommit.shouldFail())) {
+            uasserted(7663002, "Failedg due to fleCleanupFailAfterTransactionCommit fail point");
+        }
+    }
+
+    // Update stats
+    if (escStats) {
+        CompactStatsCounter<ECStats> ctr(escStats);
+        ctr.add(*innerEscStats);
     }
 }
 
 void validateCompactRequest(const CompactStructuredEncryptionData& request, const Collection& edc) {
-    uassert(6346807,
-            "Target namespace is not an encrypted collection",
-            edc.getCollectionOptions().encryptedFieldConfig);
+    checkSchemaAndCompactionTokens(request.getCompactionTokens(), edc);
+}
 
-    // Validate the request contains a compaction token for each encrypted field
-    const auto& efc = edc.getCollectionOptions().encryptedFieldConfig.value();
-    CompactionHelpers::validateCompactionTokens(efc, request.getCompactionTokens());
+void validateCleanupRequest(const CleanupStructuredEncryptionData& request, const Collection& edc) {
+    checkSchemaAndCompactionTokens(request.getCleanupTokens(), edc);
 }
 
 const PrfBlock& FLECompactESCDeleteSet::at(size_t index) const {
@@ -392,11 +646,16 @@ FLECompactESCDeleteSet readRandomESCNonAnchorIds(OperationContext* opCtx,
         aggCmd.setPipeline(std::move(pipeline));
     }
 
+    aggCmd.setEncryptionInformation(makeEmptyProcessEncryptionInformation());
+
     auto swCursor = DBClientCursor::fromAggregationRequest(&client, aggCmd, false, false);
     uassertStatusOK(swCursor.getStatus());
     auto cursor = std::move(swCursor.getValue());
 
-    uassert(7293607, "Got an invalid cursor while reading the Queryable Encryption ESC", cursor);
+    uassert(7293607,
+            str::stream() << "Got an invalid cursor while reading the Queryable Encryption ESC "
+                          << escNss.toStringForErrorMsg(),
+            cursor);
 
     while (cursor->more()) {
         auto& deleteIds = deleteSet.deleteIdSets.emplace_back();
@@ -445,6 +704,9 @@ void cleanupESCNonAnchors(OperationContext* opCtx,
     for (size_t idIndex = 0; idIndex < deleteSet.size();) {
         write_ops::DeleteCommandRequest deleteRequest(escNss,
                                                       std::vector<write_ops::DeleteOpEntry>{});
+        deleteRequest.getWriteCommandRequestBase().setEncryptionInformation(
+            makeEmptyProcessEncryptionInformation());
+
         auto& opEntry = deleteRequest.getDeletes().emplace_back();
         opEntry.setMulti(true);
 
@@ -467,6 +729,77 @@ void cleanupESCNonAnchors(OperationContext* opCtx,
                           "Queryable Encryption compaction encountered write errors",
                           "namespace"_attr = escNss,
                           "reply"_attr = reply);
+        }
+        deleted += reply.getN();
+    }
+
+    if (escStats) {
+        CompactStatsCounter<ECStats> stats(escStats);
+        stats.addDeletes(deleted);
+    }
+}
+
+void cleanupESCAnchors(OperationContext* opCtx,
+                       const NamespaceString& escNss,
+                       const NamespaceString& escDeletesNss,
+                       size_t maxTagsPerDelete,
+                       ECStats* escStats) {
+
+    DBDirectClient client(opCtx);
+    std::int64_t deleted = 0;
+
+    FindCommandRequest findCmd{escDeletesNss};
+
+    auto cursor = client.find(std::move(findCmd));
+
+    uassert(7618812,
+            str::stream() << "Got an invalid cursor while reading the Queryable Encryption ESC "
+                          << escDeletesNss.toStringForErrorMsg(),
+            cursor);
+
+    std::vector<PrfBlock> deleteSet;
+    deleteSet.reserve(maxTagsPerDelete);
+
+    while (cursor->more()) {
+        write_ops::DeleteCommandRequest deleteRequest(escNss,
+                                                      std::vector<write_ops::DeleteOpEntry>{});
+        deleteRequest.getWriteCommandRequestBase().setEncryptionInformation(
+            makeEmptyProcessEncryptionInformation());
+
+        auto& opEntry = deleteRequest.getDeletes().emplace_back();
+        opEntry.setMulti(true);
+
+        BSONObjBuilder queryBuilder;
+        {
+            BSONObjBuilder idBuilder(queryBuilder.subobjStart(kId));
+            BSONArrayBuilder array = idBuilder.subarrayStart("$in");
+
+            for (size_t tagCount = 0; tagCount < maxTagsPerDelete && cursor->more(); tagCount++) {
+                const auto doc = cursor->nextSafe();
+                BSONElement id;
+                auto status = bsonExtractTypedField(doc, kId, BinData, &id);
+                uassertStatusOK(status);
+                uassert(7618813,
+                        "Found a document in esc.deletes with _id of incorrect BinDataType",
+                        id.binDataType() == BinDataType::BinDataGeneral);
+
+                array.append(id);
+            }
+        }
+
+        opEntry.setQ(queryBuilder.obj());
+
+        if (MONGO_unlikely(fleCleanupFailDuringAnchorDeletes.shouldFail())) {
+            uasserted(7723800, "Failing due to fleCleanupFailDuringAnchorDeletes failpoint");
+        }
+
+        auto reply = client.remove(deleteRequest);
+        if (reply.getWriteCommandReplyBase().getWriteErrors()) {
+            LOGV2_WARNING(7618814,
+                          "Queryable Encryption compaction encountered write errors",
+                          "namespace"_attr = escNss,
+                          "reply"_attr = reply);
+            checkWriteErrors(reply.getWriteCommandReplyBase());
         }
         deleted += reply.getN();
     }

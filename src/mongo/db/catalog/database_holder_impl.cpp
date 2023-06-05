@@ -48,7 +48,7 @@ namespace mongo {
 Database* DatabaseHolderImpl::getDb(OperationContext* opCtx, const DatabaseName& dbName) const {
     uassert(
         13280,
-        "invalid db name: " + dbName.db(),
+        "invalid db name: " + dbName.toStringForErrorMsg(),
         NamespaceString::validDBName(dbName.db(), NamespaceString::DollarInDbNameBehavior::Allow));
 
     invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IS) ||
@@ -66,7 +66,7 @@ Database* DatabaseHolderImpl::getDb(OperationContext* opCtx, const DatabaseName&
 bool DatabaseHolderImpl::dbExists(OperationContext* opCtx, const DatabaseName& dbName) const {
     uassert(
         6198702,
-        "invalid db name: " + dbName.db(),
+        "invalid db name: " + dbName.toStringForErrorMsg(),
         NamespaceString::validDBName(dbName.db(), NamespaceString::DollarInDbNameBehavior::Allow));
     stdx::lock_guard<SimpleMutex> lk(_m);
     auto it = _dbs.find(dbName);
@@ -105,7 +105,7 @@ Database* DatabaseHolderImpl::openDb(OperationContext* opCtx,
                                      bool* justCreated) {
     uassert(
         6198701,
-        "invalid db name: " + dbName.db(),
+        "invalid db name: " + dbName.toStringForErrorMsg(),
         NamespaceString::validDBName(dbName.db(), NamespaceString::DollarInDbNameBehavior::Allow));
     invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IX));
 
@@ -134,8 +134,8 @@ Database* DatabaseHolderImpl::openDb(OperationContext* opCtx,
     auto duplicates = _getNamesWithConflictingCasing_inlock(dbName);
     uassert(ErrorCodes::DatabaseDifferCase,
             str::stream() << "db already exists with different case already have: ["
-                          << (*duplicates.cbegin()) << "] trying to create [" << dbName.toString()
-                          << "]",
+                          << (*duplicates.cbegin()).toStringForErrorMsg() << "] trying to create ["
+                          << dbName.toStringForErrorMsg() << "]",
             duplicates.empty());
 
     // Do the catalog lookup and database creation outside of the scoped lock, because these may
@@ -143,7 +143,7 @@ Database* DatabaseHolderImpl::openDb(OperationContext* opCtx,
     lk.unlock();
 
     if (CollectionCatalog::get(opCtx)->getAllCollectionUUIDsFromDb(dbName).empty()) {
-        audit::logCreateDatabase(opCtx->getClient(), dbName.toString());
+        audit::logCreateDatabase(opCtx->getClient(), DatabaseNameUtil::serialize(dbName));
         if (justCreated)
             *justCreated = true;
     }
@@ -179,8 +179,7 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
     invariant(opCtx->lockState()->isDbLockedForMode(name, MODE_X));
 
     auto catalog = CollectionCatalog::get(opCtx);
-    for (auto collIt = catalog->begin(opCtx, name); collIt != catalog->end(opCtx); ++collIt) {
-        auto coll = *collIt;
+    for (auto&& coll : catalog->range(name)) {
         if (!coll) {
             break;
         }
@@ -188,15 +187,15 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
         // It is the caller's responsibility to ensure that no index builds are active in the
         // database.
         invariant(!coll->getIndexCatalog()->haveAnyIndexesInProgress(),
-                  str::stream() << "An index is building on collection '" << coll->ns() << "'.");
+                  str::stream() << "An index is building on collection '"
+                                << coll->ns().toStringForErrorMsg() << "'.");
     }
 
-    audit::logDropDatabase(opCtx->getClient(), name.toString());
+    audit::logDropDatabase(opCtx->getClient(), DatabaseNameUtil::serialize(name));
 
     auto const serviceContext = opCtx->getServiceContext();
 
-    for (auto collIt = catalog->begin(opCtx, name); collIt != catalog->end(opCtx); ++collIt) {
-        auto coll = *collIt;
+    for (auto&& coll : catalog->range(name)) {
         if (!coll) {
             break;
         }
@@ -212,7 +211,8 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
                 coll->ns(),
                 coll->uuid(),
                 coll->numRecords(opCtx),
-                OpObserver::CollectionDropType::kOnePhase);
+                OpObserver::CollectionDropType::kOnePhase,
+                /*markFromMigrate=*/false);
         }
 
         Top::get(serviceContext).collectionDropped(coll->ns());
@@ -230,7 +230,7 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
         });
 
     auto const storageEngine = serviceContext->getStorageEngine();
-    writeConflictRetry(opCtx, "dropDatabase", name.toString(), [&] {
+    writeConflictRetry(opCtx, "dropDatabase", NamespaceString(name), [&] {
         storageEngine->dropDatabase(opCtx, name).transitional_ignore();
     });
 }
@@ -238,7 +238,7 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
 void DatabaseHolderImpl::close(OperationContext* opCtx, const DatabaseName& dbName) {
     uassert(
         6198700,
-        "invalid db name: " + dbName.db(),
+        "invalid db name: " + dbName.toStringForErrorMsg(),
         NamespaceString::validDBName(dbName.db(), NamespaceString::DollarInDbNameBehavior::Allow));
     invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
 

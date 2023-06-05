@@ -53,6 +53,7 @@
 #include "mongo/s/analyze_shard_key_server_parameters_gen.h"
 #include "mongo/s/analyze_shard_key_util.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/query_analysis_client.h"
 #include "mongo/s/service_entry_point_mongos.h"
 #include "mongo/s/stale_shard_version_helpers.h"
 
@@ -67,6 +68,7 @@ MONGO_FAIL_POINT_DEFINE(analyzeShardKeyPauseBeforeCalculatingKeyCharacteristicsM
 MONGO_FAIL_POINT_DEFINE(analyzeShardKeyPauseBeforeCalculatingReadWriteDistributionMetrics);
 
 constexpr StringData kIndexKeyFieldName = "key"_sd;
+constexpr StringData kDocFieldName = "doc"_sd;
 constexpr StringData kNumDocsFieldName = "numDocs"_sd;
 constexpr StringData kNumBytesFieldName = "numBytes"_sd;
 constexpr StringData kNumDistinctValuesFieldName = "numDistinctValues"_sd;
@@ -78,6 +80,26 @@ const int64_t kEmptyDocSizeBytes = BSONObj().objsize();
 /**
  * Returns an aggregate command request for calculating the cardinality and frequency metrics for
  * the given shard key.
+ *
+ * If the hint index is a hashed index and the shard key contains the hashed field, the aggregation
+ * will return documents of the following format, where 'doc' is a document whose shard key value
+ * has the attached 'frequency'.
+ *   {
+ *      doc: <object>
+ *      frequency: <integer>
+ *      numDocs: <integer>
+ *      numDistinctValues: <integer>
+ *   }
+ * Otherwise, the aggregation will return documents of the following format, where 'key' is the
+ * hint index value for the shard key value that has the attached 'frequency'.
+ *   {
+ *      key: <object>
+ *      frequency: <integer>
+ *      numDocs: <integer>
+ *      numDistinctValues: <integer>
+ *   }
+ * The former case involves an additional FETCH for every document returned since it needs to look
+ * up a document from the index value.
  */
 AggregateCommandRequest makeAggregateRequestForCardinalityAndFrequency(const NamespaceString& nss,
                                                                        const BSONObj& shardKey,
@@ -93,11 +115,22 @@ AggregateCommandRequest makeAggregateRequestForCardinalityAndFrequency(const Nam
 
     BSONObjBuilder groupByBuilder;
     int fieldNum = 0;
+    boost::optional<std::string> origHashedFieldName;
+    boost::optional<std::string> tempHashedFieldName;
+    StringMap<std::string> origToTempFieldName;
     for (const auto& element : shardKey) {
-        const auto fieldName = element.fieldNameStringData();
-        groupByBuilder.append(kIndexKeyFieldName + std::to_string(fieldNum),
-                              BSON("$getField" << BSON("field" << fieldName << "input"
+        // Use a temporary field name since it is invalid to group by a field name that contains
+        // dots.
+        const auto origFieldName = element.fieldNameStringData();
+        const auto tempFieldName = kIndexKeyFieldName + std::to_string(fieldNum);
+        groupByBuilder.append(tempFieldName,
+                              BSON("$getField" << BSON("field" << origFieldName << "input"
                                                                << ("$" + kIndexKeyFieldName))));
+        if (ShardKeyPattern::isHashedPatternEl(hintIndexKey.getField(origFieldName))) {
+            origHashedFieldName.emplace(origFieldName);
+            tempHashedFieldName.emplace(tempFieldName);
+        }
+        origToTempFieldName.emplace(origFieldName, tempFieldName);
         fieldNum++;
     }
     pipeline.push_back(BSON("$group" << BSON("_id" << groupByBuilder.obj() << kFrequencyFieldName
@@ -111,6 +144,38 @@ AggregateCommandRequest makeAggregateRequestForCardinalityAndFrequency(const Nam
                                             << kNumDistinctValuesFieldName << BSON("$sum" << 1)))));
 
     pipeline.push_back(BSON("$limit" << numMostCommonValues));
+
+    if (origHashedFieldName) {
+        invariant(tempHashedFieldName);
+
+        BSONObjBuilder letBuilder;
+        BSONObjBuilder matchBuilder;
+        BSONArrayBuilder matchArrayBuilder(matchBuilder.subarrayStart("$and"));
+        for (const auto& [origFieldName, tempFieldName] : origToTempFieldName) {
+            letBuilder.append(tempFieldName, ("$_id." + tempFieldName));
+            auto eqArray = (origFieldName == *origHashedFieldName)
+                ? BSON_ARRAY(BSON("$toHashedIndexKey" << ("$" + *origHashedFieldName))
+                             << ("$$" + tempFieldName))
+                : BSON_ARRAY(("$" + origFieldName) << ("$$" + tempFieldName));
+            matchArrayBuilder.append(BSON("$expr" << BSON("$eq" << eqArray)));
+        }
+        matchArrayBuilder.done();
+
+        pipeline.push_back(BSON(
+            "$lookup" << BSON(
+                "from" << nss.coll().toString() << "let" << letBuilder.obj() << "pipeline"
+                       << BSON_ARRAY(BSON("$match" << matchBuilder.obj()) << BSON("$limit" << 1))
+                       << "as"
+                       << "docs")));
+        pipeline.push_back(BSON("$set" << BSON(kDocFieldName << BSON("$first"
+                                                                     << "$docs"))));
+        pipeline.push_back(BSON("$unset"
+                                << "docs"));
+    } else {
+        pipeline.push_back(BSON("$set" << BSON(kIndexKeyFieldName << "$_id")));
+    }
+    pipeline.push_back(BSON("$unset"
+                            << "_id"));
 
     AggregateCommandRequest aggRequest(nss, pipeline);
     aggRequest.setHint(hintIndexKey);
@@ -430,8 +495,21 @@ CardinalityFrequencyMetrics calculateCardinalityAndFrequencyGeneric(OperationCon
             invariant(metrics.numDistinctValues == numDistinctValues);
         }
 
-        auto value = dotted_path_support::extractElementsBasedOnTemplate(
-            doc.getObjectField("_id").replaceFieldNames(shardKey), shardKey);
+        auto value = [&] {
+            if (doc.hasField(kIndexKeyFieldName)) {
+                return dotted_path_support::extractElementsBasedOnTemplate(
+                    doc.getObjectField(kIndexKeyFieldName).replaceFieldNames(shardKey), shardKey);
+            }
+            if (doc.hasField(kDocFieldName)) {
+                return dotted_path_support::extractElementsBasedOnTemplate(
+                    doc.getObjectField(kDocFieldName), shardKey);
+            }
+            uasserted(7588600,
+                      str::stream() << "Failed to look up documents for most common shard key "
+                                       "values. This is likely caused by concurrent deletions. "
+                                       "Please try running the analyzeShardKey command again. "
+                                    << doc);
+        }();
         if (value.objsize() > maxSizeBytesPerValue) {
             value = truncateBSONObj(value, maxSizeBytesPerValue);
         }
@@ -468,9 +546,15 @@ MonotonicityMetrics calculateMonotonicity(OperationContext* opCtx,
         return metrics;
     }
 
-    if (KeyPattern::isHashedKeyPattern(shardKey) && shardKey.nFields() == 1) {
-        metrics.setType(MonotonicityTypeEnum::kNotMonotonic);
-        metrics.setRecordIdCorrelationCoefficient(0);
+    if (KeyPattern::isHashedKeyPattern(shardKey)) {
+        if (shardKey.nFields() == 1 || shardKey.firstElement().valueStringDataSafe() == "hashed") {
+            metrics.setType(MonotonicityTypeEnum::kNotMonotonic);
+            metrics.setRecordIdCorrelationCoefficient(0);
+        } else {
+            // The monotonicity cannot be inferred from the recordIds in the index since hashing
+            // introduces randomness.
+            metrics.setType(MonotonicityTypeEnum::kUnknown);
+        }
         return metrics;
     }
 
@@ -616,46 +700,41 @@ CollStatsMetrics calculateCollStats(OperationContext* opCtx, const NamespaceStri
 }
 
 /**
- * Generates the namespace for the temporary collection storing the split points.
- */
-NamespaceString makeSplitPointsNss(const UUID& origCollUuid, const UUID& tempCollUuid) {
-    return NamespaceString::makeGlobalConfigCollection(
-        fmt::format("{}{}.{}",
-                    NamespaceString::kAnalyzeShardKeySplitPointsCollectionPrefix,
-                    origCollUuid.toString(),
-                    tempCollUuid.toString()));
-}
-
-/**
  * Generates split points that partition the data for the given collection into N number of ranges
  * with roughly equal number of documents, where N is equal to 'gNumShardKeyRanges', and then
- * persists the split points to a temporary config collection. Returns the namespace for the
- * temporary collection and the afterClusterTime to use in order to find all split point documents
- * (note that this corresponds to the 'operationTime' in the response for the last insert command).
+ * persists the split points to the config collection for storing split point documents. Returns
+ * the filter and the afterClusterTime to use when fetching the split point documents, where the
+ * latter corresponds to the 'operationTime' in the response for the last insert command.
  */
-std::pair<NamespaceString, Timestamp> generateSplitPoints(OperationContext* opCtx,
-                                                          const NamespaceString& nss,
-                                                          const UUID& collUuid,
-                                                          const KeyPattern& shardKey) {
+std::pair<BSONObj, Timestamp> generateSplitPoints(OperationContext* opCtx,
+                                                  const NamespaceString& nss,
+                                                  const UUID& collUuid,
+                                                  const KeyPattern& shardKey) {
     auto origCollUuid = CollectionCatalog::get(opCtx)->lookupUUIDByNSS(opCtx, nss);
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "Cannot analyze a shard key for a non-existing collection",
             origCollUuid);
     // Perform best-effort validation that the collection has not been dropped and recreated.
-    uassert(CollectionUUIDMismatchInfo(nss.db(), collUuid, nss.coll().toString(), boost::none),
+    uassert(CollectionUUIDMismatchInfo(nss.dbName(), collUuid, nss.coll().toString(), boost::none),
             str::stream() << "Found that the collection UUID has changed from " << collUuid
                           << " to " << origCollUuid << " since the command started",
             origCollUuid == collUuid);
 
-    auto tempCollUuid = UUID::gen();
-    auto splitPointsNss = makeSplitPointsNss(*origCollUuid, tempCollUuid);
+    auto commandId = UUID::gen();
+    LOGV2(7559400,
+          "Generating split points using the shard key being analyzed",
+          logAttrs(nss),
+          "shardKey"_attr = shardKey,
+          "commandId"_attr = commandId);
 
+    auto tempCollUuid = UUID::gen();
     auto shardKeyPattern = ShardKeyPattern(shardKey);
     auto initialSplitter = SamplingBasedSplitPolicy::make(opCtx,
                                                           nss,
                                                           shardKeyPattern,
                                                           gNumShardKeyRanges.load(),
-                                                          boost::none,
+                                                          boost::none /*zones*/,
+                                                          boost::none /*availableShardIds*/,
                                                           gNumSamplesPerShardKeyRange.load());
     const SplitPolicyParams splitParams{tempCollUuid, ShardingState::get(opCtx)->shardId()};
     auto splitPoints = [&] {
@@ -698,6 +777,8 @@ std::pair<NamespaceString, Timestamp> generateSplitPoints(OperationContext* opCt
     std::vector<BSONObj> splitPointsToInsert;
     int64_t objSize = 0;
 
+    auto expireAt = opCtx->getServiceContext()->getFastClockSource()->now() +
+        mongo::Milliseconds(gAnalyzeShardKeySplitPointExpirationSecs.load() * 1000);
     for (const auto& splitPoint : splitPoints) {
         // Performs best-effort validation again that the shard key does not contain an array field
         // by asserting that split point does not contain an array field.
@@ -705,22 +786,35 @@ std::pair<NamespaceString, Timestamp> generateSplitPoints(OperationContext* opCt
 
         if (splitPoint.objsize() + objSize >= BSONObjMaxUserSize ||
             splitPointsToInsert.size() >= write_ops::kMaxWriteBatchSize) {
-            insertDocuments(opCtx, splitPointsNss, splitPointsToInsert, uassertWriteStatusFn);
+            QueryAnalysisClient::get(opCtx).insert(
+                opCtx,
+                NamespaceString::kConfigAnalyzeShardKeySplitPointsNamespace,
+                splitPointsToInsert,
+                uassertWriteStatusFn);
             splitPointsToInsert.clear();
         }
         AnalyzeShardKeySplitPointDocument doc;
-        doc.setId(UUID::gen());
+        doc.setId({commandId, UUID::gen() /* splitPointId */});
+        doc.setNs(nss);
         doc.setSplitPoint(splitPoint);
+        doc.setExpireAt(expireAt);
         splitPointsToInsert.push_back(doc.toBSON());
         objSize += splitPoint.objsize();
     }
     if (!splitPointsToInsert.empty()) {
-        insertDocuments(opCtx, splitPointsNss, splitPointsToInsert, uassertWriteStatusFn);
+        QueryAnalysisClient::get(opCtx).insert(
+            opCtx,
+            NamespaceString::kConfigAnalyzeShardKeySplitPointsNamespace,
+            splitPointsToInsert,
+            uassertWriteStatusFn);
         splitPointsToInsert.clear();
     }
 
     invariant(!splitPointsAfterClusterTime.isNull());
-    return std::make_pair(splitPointsNss, splitPointsAfterClusterTime);
+    auto splitPointsFilter = BSON((AnalyzeShardKeySplitPointDocument::kIdFieldName + "." +
+                                   AnalyzeShardKeySplitPointId::kCommandIdFieldName)
+                                  << commandId);
+    return {std::move(splitPointsFilter), splitPointsAfterClusterTime};
 }
 
 }  // namespace
@@ -740,10 +834,11 @@ KeyCharacteristicsMetrics calculateKeyCharacteristicsMetrics(OperationContext* o
                 str::stream() << "Cannot analyze a shard key for a non-existing collection",
                 collection);
         // Perform best-effort validation that the collection has not been dropped and recreated.
-        uassert(CollectionUUIDMismatchInfo(nss.db(), collUuid, nss.coll().toString(), boost::none),
-                str::stream() << "Found that the collection UUID has changed from " << collUuid
-                              << " to " << collection->uuid() << " since the command started",
-                collection->uuid() == collUuid);
+        uassert(
+            CollectionUUIDMismatchInfo(nss.dbName(), collUuid, nss.coll().toString(), boost::none),
+            str::stream() << "Found that the collection UUID has changed from " << collUuid
+                          << " to " << collection->uuid() << " since the command started",
+            collection->uuid() == collUuid);
 
         // Performs best-effort validation that the shard key does not contain an array field by
         // extracting the shard key value from a random document in the collection and asserting
@@ -823,12 +918,12 @@ std::pair<ReadDistributionMetrics, WriteDistributionMetrics> calculateReadWriteD
     ReadDistributionMetrics readDistributionMetrics;
     WriteDistributionMetrics writeDistributionMetrics;
 
-    auto [splitPointsNss, splitPointsAfterClusterTime] =
+    auto [splitPointsFilter, splitPointsAfterClusterTime] =
         generateSplitPoints(opCtx, nss, collUuid, shardKey);
 
     std::vector<BSONObj> pipeline;
     DocumentSourceAnalyzeShardKeyReadWriteDistributionSpec spec(
-        shardKey, splitPointsNss, splitPointsAfterClusterTime);
+        shardKey, splitPointsFilter, splitPointsAfterClusterTime);
     if (ShardingState::get(opCtx)->enabled()) {
         spec.setSplitPointsShardId(ShardingState::get(opCtx)->shardId());
     }
@@ -854,8 +949,6 @@ std::pair<ReadDistributionMetrics, WriteDistributionMetrics> calculateReadWriteD
     writeDistributionMetrics.setNumShardKeyUpdates(boost::none);
     writeDistributionMetrics.setNumSingleWritesWithoutShardKey(boost::none);
     writeDistributionMetrics.setNumMultiWritesWithoutShardKey(boost::none);
-
-    dropCollection(opCtx, splitPointsNss);
 
     return std::make_pair(readDistributionMetrics, writeDistributionMetrics);
 }

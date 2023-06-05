@@ -59,52 +59,47 @@ bool isIdHackEligibleQuery(const CollectionPtr& collection, const CanonicalQuery
 }
 
 bool isQuerySbeCompatible(const CollectionPtr* collection, const CanonicalQuery* cq) {
-    tassert(6071400, "Expected CanonicalQuery pointer to not be nullptr", cq);
-    invariant(cq);
+    tassert(6071400,
+            "Expected CanonicalQuery and Collection pointer to not be nullptr",
+            cq && collection);
     auto expCtx = cq->getExpCtxRaw();
-    const auto& sortPattern = cq->getSortPattern();
-    const bool allExpressionsSupported =
-        expCtx && expCtx->sbeCompatibility != SbeCompatibility::notCompatible;
-    const auto nss = cq->nss();
-    const bool isNotOplog = !nss.isOplog();
-    const bool isNotChangeCollection = !nss.isChangeCollection();
-    const bool doesNotContainMetadataRequirements = cq->metadataDeps().none();
-    const bool doesNotSortOnMetaOrPathWithNumericComponents =
-        !sortPattern || std::all_of(sortPattern->begin(), sortPattern->end(), [](auto&& part) {
-            return part.fieldPath &&
-                !sbe::MatchPath(part.fieldPath->fullPath()).hasNumericPathComponents();
-        });
 
-    // Queries against a time-series collection are not currently supported by SBE.
-    const bool isQueryNotAgainstTimeseriesCollection = !nss.isTimeseriesBucketsCollection();
-
-    // Queries against a clustered collection are not currently supported by SBE.
-    tassert(6038600, "Expected CollectionPtr to not be nullptr", collection);
-    const bool isQueryNotAgainstClusteredCollection =
-        !(collection->get() && collection->get()->isClustered());
+    // If we don't support all expressions used or the query is eligible for IDHack, don't use SBE.
+    if (!expCtx || expCtx->sbeCompatibility == SbeCompatibility::notCompatible ||
+        (*collection && isIdHackEligibleQuery(*collection, *cq))) {
+        return false;
+    }
 
     const auto* proj = cq->getProj();
+    if (proj && (proj->requiresMatchDetails() || proj->containsElemMatch())) {
+        return false;
+    }
 
-    const bool doesNotRequireMatchDetails = !proj || !proj->requiresMatchDetails();
+    // Queries against the oplog, a change collection, or a time-series collection are not
+    // supported. Also queries on the inner side of a $lookup are not considered for SBE.
+    const auto& nss = cq->nss();
+    if (expCtx->inLookup || nss.isOplog() || nss.isChangeCollection() ||
+        nss.isTimeseriesBucketsCollection() || !cq->metadataDeps().none()) {
+        return false;
+    }
 
-    const bool doesNotHaveElemMatchProject = !proj || !proj->containsElemMatch();
-
-    const bool isNotInnerSideOfLookup = !(expCtx && expCtx->inLookup);
-
-    return allExpressionsSupported && doesNotContainMetadataRequirements &&
-        isQueryNotAgainstTimeseriesCollection && isQueryNotAgainstClusteredCollection &&
-        doesNotSortOnMetaOrPathWithNumericComponents && isNotOplog && doesNotRequireMatchDetails &&
-        doesNotHaveElemMatchProject && isNotChangeCollection && isNotInnerSideOfLookup &&
-        !(*collection && isIdHackEligibleQuery(*collection, *cq));
+    const auto& sortPattern = cq->getSortPattern();
+    // If the sort has meta or numeric path components, we cannot use SBE.
+    return !sortPattern || std::all_of(sortPattern->begin(), sortPattern->end(), [](auto&& part) {
+        return part.fieldPath &&
+            !sbe::MatchPath(part.fieldPath->fullPath()).hasNumericPathComponents();
+    });
 }
 
 bool isQueryPlanSbeCompatible(const QuerySolution* root) {
     tassert(7061701, "Expected QuerySolution pointer to not be nullptr", root);
 
-    // TODO SERVER-52958: Add support in the SBE stage builders for the COUNT_SCAN stage.
+    // (Ignore FCV check): This is intentional because we always want to use this feature once the
+    // feature flag is enabled.
+    const bool sbeFull = feature_flags::gFeatureFlagSbeFull.isEnabledAndIgnoreFCVUnsafe();
     const bool isNotCountScan = !root->hasNode(StageType::STAGE_COUNT_SCAN);
 
-    return isNotCountScan;
+    return isNotCountScan || sbeFull;
 }
 
 }  // namespace mongo

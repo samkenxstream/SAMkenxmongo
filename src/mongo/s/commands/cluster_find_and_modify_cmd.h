@@ -159,7 +159,13 @@ private:
     static void _runCommandWithoutShardKey(OperationContext* opCtx,
                                            const NamespaceString& nss,
                                            const BSONObj& cmdObj,
-                                           bool isExplain,
+                                           BSONObjBuilder* result);
+
+    // Two-phase protocol to run an explain for a findAndModify command without a shard key or _id.
+    static void _runExplainWithoutShardKey(OperationContext* opCtx,
+                                           const NamespaceString& nss,
+                                           const BSONObj& cmdObj,
+                                           ExplainOptions::Verbosity verbosity,
                                            BSONObjBuilder* result);
 
     // Command invocation to be used if a shard key is specified or the collection is unsharded.
@@ -170,6 +176,7 @@ private:
                             const NamespaceString& nss,
                             const BSONObj& cmdObj,
                             bool isExplain,
+                            boost::optional<bool> allowShardKeyUpdatesWithoutFullShardKeyInQuery,
                             BSONObjBuilder* result);
 
     // TODO SERVER-67429: Remove this function.

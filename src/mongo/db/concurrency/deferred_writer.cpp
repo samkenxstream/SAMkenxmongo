@@ -111,7 +111,7 @@ Status DeferredWriter::_worker(InsertStatement stmt) noexcept try {
 
     const CollectionPtr& collection = agc->getCollection();
 
-    Status status = writeConflictRetry(opCtx, "deferred insert", _nss.ns(), [&] {
+    Status status = writeConflictRetry(opCtx, "deferred insert", _nss, [&] {
         WriteUnitOfWork wuow(opCtx);
         Status status =
             collection_internal::insertDocument(opCtx, collection, stmt, nullptr, false);
@@ -151,9 +151,6 @@ void DeferredWriter::startup(std::string workerName) {
     options.maxThreads = 1;
     options.onCreateThread = [](const std::string& name) {
         Client::initThread(name);
-
-        stdx::lock_guard<Client> lk(cc());
-        cc().setSystemOperationKillableByStepdown(lk);
     };
     _pool = std::make_unique<ThreadPool>(options);
     _pool->startup();

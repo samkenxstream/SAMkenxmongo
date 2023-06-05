@@ -26,11 +26,14 @@ function assertUnauthorized(res, msg) {
 var st = new ShardingTest({auth: true, other: {keyFile: 'jstests/libs/key1', useHostname: false}});
 
 var shardAdmin = st.shard0.getDB('admin');
-if (!TestData.catalogShard) {
-    // In catalog shard mode, this will create a user on the config server, which we already do
+if (!TestData.configShard) {
+    // In config shard mode, this will create a user on the config server, which we already do
     // below.
-    shardAdmin.createUser(
-        {user: 'admin', pwd: 'x', roles: ['clusterAdmin', 'userAdminAnyDatabase']});
+    shardAdmin.createUser({
+        user: 'admin',
+        pwd: 'x',
+        roles: ['clusterAdmin', 'userAdminAnyDatabase', 'directShardOperations']
+    });
     shardAdmin.auth('admin', 'x');
 }
 
@@ -38,7 +41,11 @@ var mongos = st.s0;
 var mongosAdmin = mongos.getDB('admin');
 var coll = mongos.getCollection('foo.bar');
 
-mongosAdmin.createUser({user: 'admin', pwd: 'x', roles: ['clusterAdmin', 'userAdminAnyDatabase']});
+mongosAdmin.createUser({
+    user: 'admin',
+    pwd: 'x',
+    roles: ['clusterAdmin', 'userAdminAnyDatabase', 'directShardOperations']
+});
 mongosAdmin.auth('admin', 'x');
 
 assert.commandWorked(mongosAdmin.runCommand({enableSharding: coll.getDB().getName()}));
@@ -47,7 +54,7 @@ assert.commandWorked(
     mongosAdmin.runCommand({shardCollection: coll.getFullName(), key: {_id: 'hashed'}}));
 
 // cleanupOrphaned requires auth as admin user.
-if (!TestData.catalogShard) {
+if (!TestData.configShard) {
     assert.commandWorked(shardAdmin.logout());
 }
 assertUnauthorized(shardAdmin.runCommand({cleanupOrphaned: 'foo.bar'}));

@@ -42,6 +42,7 @@
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/repl/tenant_migration_recipient_entry_helpers.h"
 #include "mongo/db/repl/tenant_migration_state_machine_gen.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/util/str.h"
 
@@ -55,7 +56,13 @@ namespace tenantMigrationRecipientEntryHelpers {
 
 Status insertStateDoc(OperationContext* opCtx, const TenantMigrationRecipientDocument& stateDoc) {
     const auto nss = NamespaceString::kTenantMigrationRecipientsNamespace;
-    AutoGetCollection collection(opCtx, nss, MODE_IX);
+    auto collection = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
 
     // Sanity check
     uassert(ErrorCodes::PrimarySteppedDown,
@@ -64,7 +71,7 @@ Status insertStateDoc(OperationContext* opCtx, const TenantMigrationRecipientDoc
             repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss));
 
     return writeConflictRetry(
-        opCtx, "insertTenantMigrationRecipientStateDoc", nss.ns(), [&]() -> Status {
+        opCtx, "insertTenantMigrationRecipientStateDoc", nss, [&]() -> Status {
             // Insert the 'stateDoc' if no active tenant migration found for the 'tenantId' provided
             // in the 'stateDoc'. Tenant Migration is considered as active for a tenantId if a state
             // document exists on the disk for that 'tenantId' and not marked to be garbage
@@ -75,7 +82,7 @@ Status insertStateDoc(OperationContext* opCtx, const TenantMigrationRecipientDoc
                                      << BSON("$exists" << false));
             const auto updateMod = BSON("$setOnInsert" << stateDoc.toBSON());
             auto updateResult =
-                Helpers::upsert(opCtx, nss, filter, updateMod, /*fromMigrate=*/false);
+                Helpers::upsert(opCtx, collection, filter, updateMod, /*fromMigrate=*/false);
 
             // '$setOnInsert' update operator can no way modify the existing on-disk state doc.
             invariant(!updateResult.numDocsModified);
@@ -92,17 +99,23 @@ Status insertStateDoc(OperationContext* opCtx, const TenantMigrationRecipientDoc
 
 Status updateStateDoc(OperationContext* opCtx, const TenantMigrationRecipientDocument& stateDoc) {
     const auto nss = NamespaceString::kTenantMigrationRecipientsNamespace;
-    AutoGetCollection collection(opCtx, nss, MODE_IX);
+    auto collection = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
 
-    if (!collection) {
+    if (!collection.exists()) {
         return Status(ErrorCodes::NamespaceNotFound,
-                      str::stream() << nss.ns() << " does not exist");
+                      str::stream() << nss.toStringForErrorMsg() << " does not exist");
     }
 
     return writeConflictRetry(
-        opCtx, "updateTenantMigrationRecipientStateDoc", nss.ns(), [&]() -> Status {
+        opCtx, "updateTenantMigrationRecipientStateDoc", nss, [&]() -> Status {
             auto updateResult =
-                Helpers::upsert(opCtx, nss, stateDoc.toBSON(), /*fromMigrate=*/false);
+                Helpers::upsert(opCtx, collection, stateDoc.toBSON(), /*fromMigrate=*/false);
             if (updateResult.numMatched == 0) {
                 return {ErrorCodes::NoSuchKey,
                         str::stream()
@@ -116,35 +129,45 @@ Status updateStateDoc(OperationContext* opCtx, const TenantMigrationRecipientDoc
 StatusWith<bool> deleteStateDocIfMarkedAsGarbageCollectable(OperationContext* opCtx,
                                                             StringData tenantId) {
     const auto nss = NamespaceString::kTenantMigrationRecipientsNamespace;
-    AutoGetCollection collection(opCtx, nss, MODE_IX);
+    const auto collection = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
 
-    if (!collection) {
+    if (!collection.exists()) {
         return Status(ErrorCodes::NamespaceNotFound,
-                      str::stream() << nss.ns() << " does not exist");
+                      str::stream() << nss.toStringForErrorMsg() << " does not exist");
     }
 
     auto query = BSON(TenantMigrationRecipientDocument::kTenantIdFieldName
                       << tenantId << TenantMigrationRecipientDocument::kExpireAtFieldName
                       << BSON("$exists" << 1));
-    return writeConflictRetry(
-        opCtx, "deleteTenantMigrationRecipientStateDoc", nss.ns(), [&]() -> bool {
-            auto nDeleted =
-                deleteObjects(opCtx, collection.getCollection(), nss, query, true /* justOne */);
-            return nDeleted > 0;
-        });
+    return writeConflictRetry(opCtx, "deleteTenantMigrationRecipientStateDoc", nss, [&]() -> bool {
+        auto nDeleted = deleteObjects(opCtx, collection, query, true /* justOne */);
+        return nDeleted > 0;
+    });
 }
 
 StatusWith<TenantMigrationRecipientDocument> getStateDoc(OperationContext* opCtx,
                                                          const UUID& migrationUUID) {
     // Read the most up to date data.
     ReadSourceScope readSourceScope(opCtx, RecoveryUnit::ReadSource::kNoTimestamp);
+    // ReadConcern must also be fixed for the new scope. It will get restored when exiting this.
+    auto originalReadConcern =
+        std::exchange(repl::ReadConcernArgs::get(opCtx), repl::ReadConcernArgs());
+    ON_BLOCK_EXIT([&] { repl::ReadConcernArgs::get(opCtx) = std::move(originalReadConcern); });
+
     AutoGetCollectionForRead collection(opCtx,
                                         NamespaceString::kTenantMigrationRecipientsNamespace);
 
     if (!collection) {
         return Status(ErrorCodes::NamespaceNotFound,
                       str::stream() << "Collection not found: "
-                                    << NamespaceString::kTenantMigrationRecipientsNamespace.ns());
+                                    << NamespaceString::kTenantMigrationRecipientsNamespace
+                                           .toStringForErrorMsg());
     }
 
     BSONObj result;

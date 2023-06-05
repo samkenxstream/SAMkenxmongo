@@ -78,12 +78,12 @@ bool ReplicationCoordinatorEmbedded::isWritablePrimaryForReportingPurposes() {
 }
 
 bool ReplicationCoordinatorEmbedded::canAcceptWritesForDatabase(OperationContext* opCtx,
-                                                                StringData dbName) {
+                                                                const DatabaseName& dbName) {
     return true;
 }
 
 bool ReplicationCoordinatorEmbedded::canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx,
-                                                                       StringData dbName) {
+                                                                       const DatabaseName& dbName) {
     return true;
 }
 
@@ -209,7 +209,7 @@ void ReplicationCoordinatorEmbedded::setMyHeartbeatMessage(const std::string&) {
 }
 
 void ReplicationCoordinatorEmbedded::setMyLastAppliedOpTimeAndWallTimeForward(
-    const OpTimeAndWallTime&) {
+    const OpTimeAndWallTime&, bool) {
     UASSERT_NOT_IMPLEMENTED;
 }
 

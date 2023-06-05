@@ -18,6 +18,9 @@ selector:
   - build/install/bin/simple8b_bm*
   # Hash table benchmark is really slow, don't run on evergreen
   - build/install/bin/hash_table_bm*
+  # These benchmarks are being run as part of the benchmarks_query.yml
+  - build/install/bin/percentile_algo_bm*
+  - build/install/bin/window_function_percentile_bm*
   # These benchmarks are being run as part of the benchmarks_expression*.yml
   - build/install/bin/expression_bm*
   - build/install/bin/sbe_expression_bm*
@@ -26,7 +29,10 @@ selector:
   # These benchmarks are being run as part of the benchmarks_streams.yml test suite.
   - build/install/bin/streams_operator_dag_bm*
   # These benchmarks are only run when modifying or upgrading the immutable library.
-  - build/install/bin/absl_comparison_bm*
+  - build/install/bin/immutable_absl_comparison_bm*
+  - build/install/bin/immutable_std_comparison_bm*
+  # These benchmarks are being run as part of the benchmarks_replication.yml test suite.
+  - build/install/bin/oplog_application_bm*
 
 
 executor:

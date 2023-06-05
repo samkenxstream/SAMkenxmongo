@@ -55,11 +55,14 @@ namespace mongo {
 struct RemoveShardProgress {
     /**
      * Used to indicate to the caller of the removeShard method whether draining of chunks for
-     * a particular shard has started, is ongoing, or has been completed.
+     * a particular shard has started, is ongoing, or has been completed. When removing a catalog
+     * shard, there is a new state when waiting for range deletions of all moved away chunks.
+     * Removing other shards will skip this state.
      */
     enum DrainingShardStatus {
         STARTED,
         ONGOING,
+        PENDING_RANGE_DELETIONS,
         COMPLETED,
     };
 
@@ -75,6 +78,7 @@ struct RemoveShardProgress {
 
     DrainingShardStatus status;
     boost::optional<DrainingShardUsage> remainingCounts;
+    boost::optional<long long> pendingRangeDeletions;
 };
 
 /**
@@ -272,8 +276,7 @@ public:
         const boost::optional<Timestamp>& requestTimestamp,
         const ChunkRange& range,
         const std::vector<BSONObj>& splitPoints,
-        const std::string& shardName,
-        bool fromChunkSplitter);
+        const std::string& shardName);
 
     /**
      * Updates metadata in the config.chunks collection so the chunks within the specified key range
@@ -390,7 +393,8 @@ public:
     void setAllowMigrationsAndBumpOneChunk(OperationContext* opCtx,
                                            const NamespaceString& nss,
                                            const boost::optional<UUID>& collectionUUID,
-                                           bool allowMigrations);
+                                           bool allowMigrations,
+                                           const std::string& cmdName);
 
     /**
      * Bump the minor version of the newest chunk on each shard
@@ -453,7 +457,6 @@ public:
                                       const NamespaceString& nss,
                                       boost::optional<int32_t> chunkSizeMB,
                                       boost::optional<bool> defragmentCollection,
-                                      boost::optional<bool> enableAutoSplitter,
                                       boost::optional<bool> enableAutoMerger);
 
     /**
@@ -483,7 +486,7 @@ public:
     StatusWith<std::string> addShard(OperationContext* opCtx,
                                      const std::string* shardProposedName,
                                      const ConnectionString& shardConnectionString,
-                                     bool isCatalogShard);
+                                     bool isConfigShard);
 
     /**
      * Inserts the config server shard identity document using a sentinel shard id. Requires the
@@ -564,11 +567,6 @@ public:
                               const Timestamp& validAfter);
 
     /**
-     * Creates config.settings (if needed) and adds a schema to the collection.
-     */
-    Status upgradeConfigSettings(OperationContext* opCtx);
-
-    /**
      * Set `onCurrentShardSince` to the same value as `history[0].validAfter` for all config.chunks
      * entries.
      * Only called on the FCV upgrade
@@ -599,6 +597,13 @@ public:
      * Returns the oldest timestamp that is supported for history preservation.
      */
     static Timestamp getOldestTimestampSupportedForSnapshotHistory(OperationContext* opCtx);
+
+    /**
+     * Removes from config.placementHistory any document that is no longer needed to describe
+     * the data distribution of the cluster from earliestClusterTime onwards (and updates the
+     * related initialization metadata).
+     **/
+    void cleanUpPlacementHistory(OperationContext* opCtx, const Timestamp& earliestClusterTime);
 
 private:
     /**
@@ -657,7 +662,7 @@ private:
                                                std::shared_ptr<RemoteCommandTargeter> targeter,
                                                const std::string* shardProposedName,
                                                const ConnectionString& connectionString,
-                                               bool isCatalogShard);
+                                               bool isConfigShard);
 
     /**
      * Drops the sessions collection on the specified host.
@@ -881,6 +886,12 @@ private:
      * taking this.
      */
     Lock::ResourceMutex _kZoneOpLock;
+
+    /**
+     * Lock for serializing internal/external initialization requests of config.placementHistory.
+     * Regular DDL and chunk operations over the same collection may be run concurrently.
+     */
+    Lock::ResourceMutex _kPlacementHistoryInitializationLock;
 };
 
 }  // namespace mongo

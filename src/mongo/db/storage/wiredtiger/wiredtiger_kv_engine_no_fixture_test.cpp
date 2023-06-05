@@ -170,7 +170,8 @@ TEST(WiredTigerKVEngineNoFixtureTest, Basic) {
     CollectionOptions collectionOptions;
     auto keyFormat = KeyFormat::Long;
     ASSERT_OK(kvEngine->createRecordStore(opCtx.get(), nss, ident, collectionOptions, keyFormat))
-        << fmt::format("failed to create record store with namespace {}", nss.toString());
+        << fmt::format("failed to create record store with namespace {}",
+                       nss.toStringForErrorMsg());
 
     // Pin oldest and stable to timestamps (1,10).
     // The timestamps in the RollbackToStable40 in the C API test translate to MDB timestamps
@@ -198,7 +199,8 @@ TEST(WiredTigerKVEngineNoFixtureTest, Basic) {
 
     // Insert 3 keys with the value A.
     auto rs = kvEngine->getRecordStore(opCtx.get(), nss, ident, collectionOptions);
-    ASSERT(rs) << fmt::format("failed to look up record store with namespace {}", nss.toString());
+    ASSERT(rs) << fmt::format("failed to look up record store with namespace {}",
+                              nss.toString_forTest());
     {
         Lock::GlobalLock globalLock(opCtx.get(), MODE_IX);
         WriteUnitOfWork wuow(opCtx.get());

@@ -37,7 +37,14 @@ namespace mongo {
 
 class LockManagerTest : public ServiceContextTest {};
 
-TEST(ResourceId, Semantics) {
+class ResourceIdTest : public unittest::Test {
+protected:
+    constexpr int getResourceTypeBits() {
+        return ResourceId::resourceTypeBits;
+    }
+};
+
+TEST(ResourceIdTest, Semantics) {
     ResourceId resIdDb(RESOURCE_DATABASE, 324334234);
     ASSERT(resIdDb.getType() == RESOURCE_DATABASE);
     ASSERT(resIdDb.getHashId() == 324334234);
@@ -60,8 +67,9 @@ TEST(ResourceId, Semantics) {
     ASSERT_EQUALS(resId, resIdColl);
 }
 
-TEST(ResourceId, Masking) {
-    const uint64_t maxHash = (1ULL << 61) - 1;  //  Only 61 bits usable for hash
+TEST_F(ResourceIdTest, Masking) {
+    const uint64_t maxHash =
+        (1ULL << (64 - getResourceTypeBits())) - 1;  //  Only 60 bits usable for hash
     ResourceType resources[3] = {RESOURCE_GLOBAL, RESOURCE_COLLECTION, RESOURCE_METADATA};
     uint64_t hashes[3] = {maxHash, maxHash / 3, maxHash / 3 * 2};
 
@@ -74,8 +82,6 @@ TEST(ResourceId, Masking) {
         }
     }
 }
-
-class ResourceIdTest : public unittest::Test {};
 
 DEATH_TEST_F(ResourceIdTest, StringConstructorMustNotBeCollection, "invariant") {
     ResourceId(RESOURCE_COLLECTION, "TestDB.collection");
@@ -1012,13 +1018,13 @@ TEST_F(LockManagerTest, HasConflictingRequests) {
     LockerImpl lockerIX{getServiceContext()};
     LockRequestCombo requestIX{&lockerIX};
     ASSERT_EQ(lockMgr.lock(resId, &requestIX, LockMode::MODE_IX), LockResult::LOCK_OK);
-    ASSERT_FALSE(lockMgr.hasConflictingRequests(&requestIX));
+    ASSERT_FALSE(lockMgr.hasConflictingRequests(resId, &requestIX));
 
     LockerImpl lockerX{getServiceContext()};
     LockRequestCombo requestX{&lockerX};
     ASSERT_EQ(lockMgr.lock(resId, &requestX, LockMode::MODE_X), LockResult::LOCK_WAITING);
-    ASSERT_TRUE(lockMgr.hasConflictingRequests(&requestIX));
-    ASSERT_TRUE(lockMgr.hasConflictingRequests(&requestX));
+    ASSERT_TRUE(lockMgr.hasConflictingRequests(resId, &requestIX));
+    ASSERT_TRUE(lockMgr.hasConflictingRequests(resId, &requestX));
 
     ASSERT(lockMgr.unlock(&requestIX));
     ASSERT(lockMgr.unlock(&requestX));

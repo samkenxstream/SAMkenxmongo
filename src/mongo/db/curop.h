@@ -30,8 +30,6 @@
 
 #pragma once
 
-#include <memory>
-
 #include "mongo/config.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/user_acquisition_stats.h"
@@ -40,6 +38,7 @@
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/profile_filter.h"
+#include "mongo/db/query/request_shapifier.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/db/write_concern_options.h"
@@ -264,6 +263,7 @@ public:
     boost::optional<long long> mongotCursorId{boost::none};
     boost::optional<long long> msWaitingForMongot{boost::none};
     long long mongotBatchNum = 0;
+    BSONObj mongotCountVal = BSONObj();
 
     bool hasSortStage{false};  // true if the query plan involves an in-memory sort
 
@@ -291,8 +291,11 @@ public:
     // The hash of the query's "stable" key. This represents the query's shape.
     boost::optional<uint32_t> queryHash;
     // The shape of the original query serialized with readConcern, application name, and namespace.
-    // If boost::none, telemetry should not be collected for this operation.
-    boost::optional<BSONObj> telemetryStoreKey;
+    // If boost::none, query stats should not be collected for this operation.
+    boost::optional<std::size_t> queryStatsStoreKeyHash;
+    // The RequestShapifier used by query stats to shapify the request payload into the query stats
+    // store key.
+    std::unique_ptr<query_stats::RequestShapifier> queryStatsRequestShapifier;
 
     // The query framework that this operation used. Will be unknown for non query operations.
     PlanExecutor::QueryFramework queryFramework{PlanExecutor::QueryFramework::kUnknown};
@@ -425,7 +428,7 @@ public:
      * report, since this may be called in either a mongoD or mongoS context and the latter does not
      * supply lock stats. The client must be locked before calling this method.
      */
-    static void reportCurrentOpForClient(OperationContext* opCtx,
+    static void reportCurrentOpForClient(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                          Client* client,
                                          bool truncateOps,
                                          bool backtraceMode,
@@ -467,6 +470,13 @@ public:
                                     const Command* command,
                                     BSONObj cmdObj,
                                     NetworkOp op);
+
+    /**
+     * Sets metrics collected at the end of an operation onto curOp's OpDebug instance. Note that
+     * this is used in tandem with OpDebug::setPlanSummaryMetrics so should not repeat any metrics
+     * collected there.
+     */
+    void setEndOfOpMetrics(long long nreturned);
 
     /**
      * Marks the operation end time, records the length of the client response if a valid response
@@ -576,7 +586,7 @@ public:
         if (_dbprofile <= 0)
             return false;
 
-        if (CollectionCatalog::get(opCtx())->getDatabaseProfileSettings(getNSS().db()).filter)
+        if (CollectionCatalog::get(opCtx())->getDatabaseProfileSettings(getNSS().dbName()).filter)
             return true;
 
         return elapsedTimeExcludingPauses() >= Milliseconds{serverGlobalParams.slowMS.load()};
@@ -762,7 +772,7 @@ public:
         return computeElapsedTimeTotal(start, _end.load()) - _totalPausedDuration;
     }
     /**
-    * The planningTimeMicros metric, reported in the system profiler and in telemetry, is measured
+    * The planningTimeMicros metric, reported in the system profiler and in queryStats, is measured
     * using the Curop instance's _tickSource. Currently, _tickSource is only paused in places where
     logical work is being done. If this were to change, and _tickSource
     were to be paused during query planning for reasons unrelated to the work of
@@ -813,11 +823,20 @@ public:
         auto start = _waitForWriteConcernStart.load();
         if (start != 0) {
             _waitForWriteConcernEnd = _tickSource->getTicks();
-            debug().waitForWriteConcernDurationMillis += duration_cast<Milliseconds>(
+            auto duration = duration_cast<Milliseconds>(
                 computeElapsedTimeTotal(start, _waitForWriteConcernEnd.load()));
+            _atomicWaitForWriteConcernDurationMillis =
+                _atomicWaitForWriteConcernDurationMillis.load() + duration;
+            debug().waitForWriteConcernDurationMillis = _atomicWaitForWriteConcernDurationMillis;
             _waitForWriteConcernStart = 0;
         }
     }
+
+    /**
+     * If the platform supports the CPU timer, and we haven't collected this operation's CPU time
+     * already, then calculates this operation's CPU time and stores it on the 'OpDebug'.
+     */
+    void calculateCpuTime();
 
     /**
      * 'opDescription' must be either an owned BSONObj or guaranteed to outlive the OperationContext
@@ -852,7 +871,9 @@ public:
      * If called from a thread other than the one executing the operation associated with this
      * CurOp, it is necessary to lock the associated Client object before executing this method.
      */
-    void reportState(BSONObjBuilder* builder, bool truncateOps = false);
+    void reportState(BSONObjBuilder* builder,
+                     const SerializationContext& serializationContext,
+                     bool truncateOps = false);
 
     /**
      * Sets the message for FailPoints used.
@@ -941,16 +962,6 @@ public:
         _tickSource = tickSource;
     }
 
-    /**
-     * Merge match counters from the current operation into the global map and stop counting.
-     */
-    void stopMatchExprCounter();
-
-    /**
-     * Increment the counter for the match expression with given name in the current operation.
-     */
-    void incrementMatchExprCounter(StringData name);
-
 private:
     class CurOpStack;
 
@@ -963,7 +974,6 @@ private:
     TickSource::Tick startTime();
     Microseconds computeElapsedTimeTotal(TickSource::Tick startTime,
                                          TickSource::Tick endTime) const;
-
     /**
      * Handles failpoints that check whether a command has completed or not.
      * Used for testing purposes instead of the getLog command.
@@ -990,7 +1000,7 @@ private:
 
     // This CPU timer tracks the CPU time spent for this operation. Will be nullptr on unsupported
     // platforms.
-    std::unique_ptr<OperationCPUTimer> _cpuTimer;
+    std::shared_ptr<OperationCPUTimer> _cpuTimer;
 
     // The time at which this CurOp instance had its timer paused, or 0 if the timer is not
     // currently paused.
@@ -1039,6 +1049,10 @@ private:
     // These values are used to calculate the amount of time spent waiting for write concern.
     std::atomic<TickSource::Tick> _waitForWriteConcernStart{0};  // NOLINT
     std::atomic<TickSource::Tick> _waitForWriteConcernEnd{0};    // NOLINT
+    // This metric is the same value as debug().waitForWriteConcernDurationMillis.
+    // We cannot use std::atomic in OpDebug since it is not copy assignable, but using a non-atomic
+    // allows for a data race between stopWaitForWriteConcernTimer and curop::reportState.
+    std::atomic<Milliseconds> _atomicWaitForWriteConcernDurationMillis{Milliseconds{0}};  // NOLINT
 };
 
 }  // namespace mongo

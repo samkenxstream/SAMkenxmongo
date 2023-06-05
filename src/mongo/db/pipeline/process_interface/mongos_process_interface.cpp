@@ -70,7 +70,7 @@ StatusWith<CollectionRoutingInfo> getCollectionRoutingInfo(
     if (swRoutingInfo.isOK() && expCtx->uuid && swRoutingInfo.getValue().cm.isSharded()) {
         if (!swRoutingInfo.getValue().cm.uuidMatches(*expCtx->uuid)) {
             return {ErrorCodes::NamespaceNotFound,
-                    str::stream() << "The UUID of collection " << expCtx->ns.ns()
+                    str::stream() << "The UUID of collection " << expCtx->ns.toStringForErrorMsg()
                                   << " changed; it may have been dropped and re-created."};
         }
     }
@@ -98,7 +98,7 @@ bool supportsUniqueKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
 
 }  // namespace
 
-std::unique_ptr<CommonProcessInterface::WriteSizeEstimator>
+std::unique_ptr<MongoProcessInterface::WriteSizeEstimator>
 MongosProcessInterface::getWriteSizeEstimator(OperationContext* opCtx,
                                               const NamespaceString& ns) const {
     return std::make_unique<TargetPrimaryWriteSizeEstimator>();
@@ -201,8 +201,15 @@ boost::optional<Document> MongosProcessInterface::lookupSingleDocument(
                 // single shard will be targeted here; however, in certain cases where only the _id
                 // is present, we may need to scatter-gather the query to all shards in order to
                 // find the document.
-                auto requests = getVersionedRequestsForTargetedShards(
-                    expCtx->opCtx, nss, cri, findCmd, filterObj, CollationSpec::kSimpleSpec);
+                auto requests =
+                    getVersionedRequestsForTargetedShards(expCtx->opCtx,
+                                                          nss,
+                                                          cri,
+                                                          findCmd,
+                                                          filterObj,
+                                                          CollationSpec::kSimpleSpec,
+                                                          boost::none /*letParameters*/,
+                                                          boost::none /*runtimeConstants*/);
 
                 // Dispatch the requests. The 'establishCursors' method conveniently prepares the
                 // result into a vector of cursor responses for us.
@@ -252,13 +259,13 @@ boost::optional<Document> MongosProcessInterface::lookupSingleDocumentLocally(
 }
 
 BSONObj MongosProcessInterface::_reportCurrentOpForClient(
-    OperationContext* opCtx,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
     Client* client,
     CurrentOpTruncateMode truncateOps,
     CurrentOpBacktraceMode backtraceMode) const {
     BSONObjBuilder builder;
 
-    CurOp::reportCurrentOpForClient(opCtx,
+    CurOp::reportCurrentOpForClient(expCtx,
                                     client,
                                     (truncateOps == CurrentOpTruncateMode::kTruncateOps),
                                     (backtraceMode == CurrentOpBacktraceMode::kIncludeBacktrace),

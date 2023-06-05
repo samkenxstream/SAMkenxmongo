@@ -203,6 +203,32 @@ protected:
     }
 
     /**
+     * Checks if plan cache size calculation returns expected result.
+     */
+    void assertSbePlanCacheKeySize(const char* queryStr,
+                                   const char* sortStr,
+                                   const char* projectionStr,
+                                   const char* collationStr) {
+        // Create canonical query.
+        std::unique_ptr<CanonicalQuery> cq = makeCQ(queryStr, sortStr, projectionStr, collationStr);
+        cq->setSbeCompatible(true);
+
+        auto sbeKey = makeSbeKey(*cq);
+
+        // The static size of the key structure.
+        const size_t staticSize = sizeof(sbeKey);
+
+        // The actual key representation is encoded as a string.
+        const size_t keyRepresentationSize = sbeKey.toString().size();
+
+        // The tests are setup for a single collection.
+        const size_t additionalCollectionSize = 0;
+
+        ASSERT_TRUE(sbeKey.estimatedKeySizeBytes() ==
+                    staticSize + keyRepresentationSize + additionalCollectionSize);
+    }
+
+    /**
      * Utility function to get list of index filters from the query settings.
      */
     vector<BSONObj> getFilters() {
@@ -317,7 +343,9 @@ private:
         // matter to the tests.
         auto cacheData = std::make_unique<sbe::CachedSbePlan>(
             std::make_unique<sbe::CoScanStage>(PlanNodeId{}),
-            stage_builder::PlanStageData{std::make_unique<sbe::RuntimeEnvironment>()});
+            stage_builder::PlanStageData(
+                stage_builder::PlanStageEnvironment(std::make_unique<sbe::RuntimeEnvironment>()),
+                std::make_unique<stage_builder::PlanStageStaticData>()));
         auto decision = createDecision(1U);
         auto querySolution = std::make_unique<QuerySolution>();
 
@@ -571,4 +599,14 @@ TEST_F(IndexFilterCommandsTest, SetFilterAcceptsIndexNames) {
     ASSERT_BSONOBJ_EQ(indexes[0].embeddedObject(), fromjson("{a: 1}"));
     ASSERT_EQUALS(indexes[1].valueStringData(), "a_1:rev");
 }
+
+TEST_F(IndexFilterCommandsTest, SBEPlanCacheBudgetTest) {
+    assertSbePlanCacheKeySize("{a: 2}", "{}", "{}", "{}");
+
+    assertSbePlanCacheKeySize("{b: 'foo'}", "{}", "{}", "{locale: 'mock_reverse_string'}");
+
+    assertSbePlanCacheKeySize(
+        "{a: 1, b: 1}", "{a: -1}", "{_id: 0, a: 1}", "{locale: 'mock_reverse_string'}");
+}
+
 }  // namespace

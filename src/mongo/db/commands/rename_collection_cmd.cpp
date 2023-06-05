@@ -120,9 +120,7 @@ public:
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
             uassertStatusOK(rename_collection::checkAuthForRenameCollectionCommand(
-                opCtx->getClient(),
-                request().getDbName().toStringWithTenantId(),
-                request().toBSON(BSONObj())));
+                opCtx->getClient(), request()));
         }
     };
 

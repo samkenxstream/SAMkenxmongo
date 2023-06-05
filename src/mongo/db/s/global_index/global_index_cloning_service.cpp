@@ -212,8 +212,14 @@ void GlobalIndexCloningService::CloningStateMachine::_init(
         _metadata.getNss(), indexSpec.getName(), _metadata.getIndexCollectionUUID(), **executor);
 
     auto client = _serviceContext->makeClient("globalIndexClonerServiceInit");
-    AlternativeClientRegion clientRegion(client);
 
+    // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+    {
+        stdx::lock_guard<Client> lk(*client.get());
+        client.get()->setSystemOperationUnkillableByStepdown(lk);
+    }
+
+    AlternativeClientRegion clientRegion(client);
     auto opCtx = _serviceContext->makeOperationContext(Client::getCurrent());
 
     auto routingInfo =
@@ -221,7 +227,7 @@ void GlobalIndexCloningService::CloningStateMachine::_init(
 
     uassert(6755901,
             str::stream() << "Cannot create global index on unsharded ns "
-                          << _metadata.getNss().ns(),
+                          << _metadata.getNss().toStringForErrorMsg(),
             routingInfo.isSharded());
 
     auto myShardId = _externalState->myShardId(_serviceContext);
@@ -278,7 +284,8 @@ void GlobalIndexCloningService::CloningStateMachine::checkIfOptionsConflict(
     uassert(6755900,
             str::stream() << "New global index " << stateDoc
                           << " is incompatible with ongoing global index build in namespace: "
-                          << _metadata.getNss() << ", uuid: " << _metadata.getCollectionUUID(),
+                          << _metadata.getNss().toStringForErrorMsg()
+                          << ", uuid: " << _metadata.getCollectionUUID(),
             newCloning.getNss() == _metadata.getNss() &&
                 newCloning.getCollectionUUID() == _metadata.getCollectionUUID());
 }
@@ -430,12 +437,12 @@ ExecutorFuture<void> GlobalIndexCloningService::CloningStateMachine::_processBat
                _lastProcessedIdSinceStepUp = Value(next.documentKey["_id"]);
                _fetcher->setResumeId(_lastProcessedIdSinceStepUp);
 
-               _fetchedDocs.pop();
-
                _metrics->onDocumentsProcessed(1,
                                               next.documentKey.objsize() +
                                                   next.indexKeyValues.objsize(),
                                               duration_cast<Milliseconds>(timer.elapsed()));
+
+               _fetchedDocs.pop();
            })
         .until([this](const Status& status) { return !status.isOK() || _fetchedDocs.empty(); })
         .on(**executor, cancelToken)
@@ -464,7 +471,7 @@ void GlobalIndexCloningService::CloningStateMachine::_ensureCollection(Operation
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());
 
     // Create the destination collection if necessary.
-    writeConflictRetry(opCtx, "CloningStateMachine::_ensureCollection", nss.toString(), [&] {
+    writeConflictRetry(opCtx, "CloningStateMachine::_ensureCollection", nss, [&] {
         const Collection* coll =
             CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
         if (coll) {

@@ -49,7 +49,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceListSessions::createFromBson(
 
     uassert(ErrorCodes::InvalidNamespace,
             str::stream() << kStageName << " may only be run against "
-                          << NamespaceString::kLogicalSessionsNamespace.ns(),
+                          << NamespaceString::kLogicalSessionsNamespace.toStringForErrorMsg(),
             nss == NamespaceString::kLogicalSessionsNamespace);
 
     const auto& spec = listSessionsParseSpec(kStageName, elem);
@@ -75,14 +75,11 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceListSessions::createFromBson(
 }
 
 Value DocumentSourceListSessions::serialize(SerializationOptions opts) const {
-    if (opts.redactIdentifiers || opts.replacementForLiteralArgs) {
-        MONGO_UNIMPLEMENTED_TASSERT(7484327);
-    }
     ListSessionsSpec spec;
     spec.setAllUsers(_allUsers);
     spec.setUsers(_users);
     spec.setPredicate(_predicate);
-    return Value(Document{{getSourceName(), spec.toBSON()}});
+    return Value(Document{{getSourceName(), spec.toBSON(opts)}});
 }
 
 }  // namespace mongo

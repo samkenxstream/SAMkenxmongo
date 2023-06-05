@@ -23,19 +23,6 @@ const metaField = 'hostid';
 const st = new ShardingTest({shards: 2, rs: {nodes: 2}});
 const mongos = st.s0;
 
-// Sanity checks.
-if (!TimeseriesTest.shardedtimeseriesCollectionsEnabled(st.shard0)) {
-    jsTestLog("Skipping test because the sharded time-series collection feature flag is disabled");
-    st.stop();
-    return;
-}
-
-const deletesEnabled = TimeseriesTest.shardedTimeseriesUpdatesAndDeletesEnabled(st.shard0);
-if (!deletesEnabled) {
-    jsTestLog(
-        "Sharded time-series updates and deletes feature flag is disabled, expecting all delete commands to fail.");
-}
-
 // Databases.
 assert.commandWorked(mongos.adminCommand({enableSharding: dbName}));
 const mainDB = mongos.getDB(dbName);
@@ -228,14 +215,6 @@ function runTest(collConfig, reqConfig, insert) {
 
     const isBulkOperation = !reqConfig.deleteQuery;
     if (!isBulkOperation) {
-        // If sharded updates and deletes feature flag is disabled, we only test that the delete
-        // command fails.
-        if (!deletesEnabled) {
-            assert.throwsWithCode(() => coll.deleteMany(reqConfig.deleteQuery),
-                                  ErrorCodes.NotImplemented);
-            return;
-        }
-
         // The 'isTimeseriesNamespace' parameter is not allowed on mongos.
         const failingDeleteCommand = {
             delete: `system.buckets.${collName}`,
@@ -254,28 +233,6 @@ function runTest(collConfig, reqConfig, insert) {
         failingDeleteCommand.delete = collName;
         assert.commandFailedWithCode(st.shard0.getDB(dbName).runCommand(failingDeleteCommand),
                                      5916400);
-
-        // TODO (SERVER-75379): Remove these tests.
-        if (!FeatureFlagUtil.isPresentAndEnabled(mainDB, "TimeseriesDeletesSupport")) {
-            delete failingDeleteCommand.isTimeseriesNamespace;
-            for (let additionalField of [timeField, 'randomFieldWhichShouldNotBeHere']) {
-                // JavaScript does not have a reliable way to perform deep copy of an object. So
-                // instead of copying delete query each time, we just set and unset additional
-                // fields in it. See https://stackoverflow.com/a/122704 for details.
-                failingDeleteCommand.deletes[0].q[additionalField] = 1;
-
-                // Currently, we do not support queries on non-meta fields for delete commands.
-                assert.commandFailedWithCode(mainDB.runCommand(failingDeleteCommand),
-                                             ErrorCodes.InvalidOptions);
-                delete failingDeleteCommand.deletes[0].q[additionalField];
-            }
-
-            // Currently, we support only delete commands with 'limit: 0' for sharded time-series
-            // collections.
-            failingDeleteCommand.deletes[0].limit = 1;
-            assert.commandFailedWithCode(mainDB.runCommand(failingDeleteCommand),
-                                         ErrorCodes.IllegalOperation);
-        }
     }
 
     // Reset database profiler.
@@ -304,12 +261,7 @@ function runTest(collConfig, reqConfig, insert) {
         for (let predicate of predicates) {
             bulk.find(predicate).remove();
         }
-        if (deletesEnabled) {
-            assert.commandWorked(bulk.execute());
-        } else {
-            assert.throws(() => bulk.execute());
-            return;
-        }
+        assert.commandWorked(bulk.execute());
     }
 
     // Check that the query was routed to the correct shards.

@@ -431,6 +431,10 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
         return false;
     }
 
+    if (exprtype == MatchExpression::INTERNAL_EQ_HASHED_KEY && index.type != INDEX_HASHED) {
+        return false;
+    }
+
     if (indexedFieldType.empty()) {
         // We can't use a sparse index for certain match expressions.
         if (index.sparse && !nodeIsSupportedBySparseIndex(node, isChildOfElemMatchValue)) {
@@ -644,7 +648,7 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
                 return false;
             }
 
-            verify(SPHERE == cap->crs);
+            MONGO_verify(SPHERE == cap->crs);
             const Circle& circle = cap->circle;
 
             // No wrapping around the edge of the world is allowed in 2d centerSphere.
@@ -660,7 +664,7 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
                       "Unknown indexing for given node and field",
                       "node"_attr = node->debugString(),
                       "field"_attr = keyPatternElt.toString());
-        verify(0);
+        MONGO_verify(0);
     }
     MONGO_UNREACHABLE;
 }
@@ -742,6 +746,9 @@ bool QueryPlannerIXSelect::nodeIsSupportedByHashedIndex(const MatchExpression* q
     if (ComparisonMatchExpressionBase::isEquality(queryExpr->matchType())) {
         return true;
     }
+    if (queryExpr->matchType() == MatchExpression::INTERNAL_EQ_HASHED_KEY) {
+        return true;
+    }
     // An $in can be answered so long as its operand contains only simple equalities.
     if (queryExpr->matchType() == MatchExpression::MATCH_IN) {
         const InMatchExpression* expr = static_cast<const InMatchExpression*>(queryExpr);
@@ -785,7 +792,7 @@ void QueryPlannerIXSelect::_rateIndices(MatchExpression* node,
             fullPath = prefix + node->path().toString();
         }
 
-        verify(nullptr == node->getTag());
+        MONGO_verify(nullptr == node->getTag());
         node->setTag(new RelevantTag());
         auto rt = static_cast<RelevantTag*>(node->getTag());
         rt->path = fullPath;
@@ -953,7 +960,7 @@ void QueryPlannerIXSelect::stripUnneededAssignments(MatchExpression* node,
  */
 static void removeIndexRelevantTag(MatchExpression* node, size_t idx) {
     RelevantTag* tag = static_cast<RelevantTag*>(node->getTag());
-    verify(tag);
+    MONGO_verify(tag);
     vector<size_t>::iterator firstIt = std::find(tag->first.begin(), tag->first.end(), idx);
     if (firstIt != tag->first.end()) {
         tag->first.erase(firstIt);
@@ -1171,7 +1178,7 @@ void QueryPlannerIXSelect::stripInvalidAssignmentsToTextIndexes(MatchExpression*
         // the prefix precedes "text".
         for (BSONElement elt = it.next(); elt.type() != String; elt = it.next()) {
             textIndexPrefixPaths.insert(elt.fieldName());
-            verify(it.more());
+            MONGO_verify(it.more());
         }
 
         // If the index prefix is non-empty, remove invalid assignments to it.

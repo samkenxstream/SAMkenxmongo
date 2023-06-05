@@ -167,6 +167,9 @@ public:
         auto parsedDistinct = uassertStatusOK(
             ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, true, defaultCollator));
 
+        SerializationContext sc(SerializationContext::stateCommandRequest());
+        sc.setTenantIdSource(request.getValidatedTenantId() != boost::none);
+
         if (ctx->getView()) {
             // Relinquish locks. The aggregation command will re-acquire them.
             ctx.reset();
@@ -185,7 +188,8 @@ public:
                 nss,
                 viewAggCmd,
                 verbosity,
-                APIParameters::get(opCtx).getAPIStrict().value_or(false));
+                APIParameters::get(opCtx).getAPIStrict().value_or(false),
+                sc);
 
             // An empty PrivilegeVector is acceptable because these privileges are only checked on
             // getMore and explain will not open a cursor.
@@ -199,8 +203,13 @@ public:
             getExecutorDistinct(&collection, QueryPlannerParams::DEFAULT, &parsedDistinct));
 
         auto bodyBuilder = result->getBodyBuilder();
-        Explain::explainStages(
-            executor.get(), collection, verbosity, BSONObj(), cmdObj, &bodyBuilder);
+        Explain::explainStages(executor.get(),
+                               collection,
+                               verbosity,
+                               BSONObj(),
+                               SerializationContext::stateCommandReply(sc),
+                               cmdObj,
+                               &bodyBuilder);
         return Status::OK();
     }
 

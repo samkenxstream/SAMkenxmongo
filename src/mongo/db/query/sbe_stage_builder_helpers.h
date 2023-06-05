@@ -53,6 +53,8 @@ class Projection;
 namespace mongo::stage_builder {
 
 class PlanStageSlots;
+struct PlanStageEnvironment;
+struct PlanStageStaticData;
 
 std::unique_ptr<sbe::EExpression> makeUnaryOp(sbe::EPrimUnary::Op unaryOp,
                                               std::unique_ptr<sbe::EExpression> operand);
@@ -72,6 +74,11 @@ std::unique_ptr<sbe::EExpression> makeBinaryOp(sbe::EPrimBinary::Op binaryOp,
                                                std::unique_ptr<sbe::EExpression> rhs,
                                                sbe::RuntimeEnvironment* env);
 
+std::unique_ptr<sbe::EExpression> makeBinaryOp(sbe::EPrimBinary::Op binaryOp,
+                                               std::unique_ptr<sbe::EExpression> lhs,
+                                               std::unique_ptr<sbe::EExpression> rhs,
+                                               PlanStageEnvironment& env);
+
 std::unique_ptr<sbe::EExpression> makeIsMember(std::unique_ptr<sbe::EExpression> input,
                                                std::unique_ptr<sbe::EExpression> arr,
                                                std::unique_ptr<sbe::EExpression> collator = {});
@@ -79,6 +86,10 @@ std::unique_ptr<sbe::EExpression> makeIsMember(std::unique_ptr<sbe::EExpression>
 std::unique_ptr<sbe::EExpression> makeIsMember(std::unique_ptr<sbe::EExpression> input,
                                                std::unique_ptr<sbe::EExpression> arr,
                                                sbe::RuntimeEnvironment* env);
+
+std::unique_ptr<sbe::EExpression> makeIsMember(std::unique_ptr<sbe::EExpression> input,
+                                               std::unique_ptr<sbe::EExpression> arr,
+                                               PlanStageEnvironment& env);
 
 /**
  * Generates an EExpression that checks if the input expression is null or missing.
@@ -419,7 +430,7 @@ EvalStage makeUnion(std::vector<EvalStage> inputStages,
 
 EvalStage makeHashAgg(EvalStage stage,
                       sbe::value::SlotVector gbs,
-                      sbe::SlotExprPairVector aggs,
+                      sbe::HashAggStage::AggExprVector aggs,
                       boost::optional<sbe::value::SlotId> collatorSlot,
                       bool allowDiskUse,
                       sbe::SlotExprPairVector mergingExprs,
@@ -518,13 +529,12 @@ std::unique_ptr<sbe::PlanStage> makeLoopJoinForFetch(std::unique_ptr<sbe::PlanSt
                                                      sbe::value::SlotId recordIdSlot,
                                                      std::vector<std::string> fields,
                                                      sbe::value::SlotVector fieldSlots,
-                                                     sbe::value::SlotId seekKeySlot,
+                                                     sbe::value::SlotId seekRecordIdSlot,
                                                      sbe::value::SlotId snapshotIdSlot,
-                                                     sbe::value::SlotId indexIdSlot,
+                                                     sbe::value::SlotId indexIdentSlot,
                                                      sbe::value::SlotId indexKeySlot,
                                                      sbe::value::SlotId indexKeyPatternSlot,
                                                      const CollectionPtr& collToFetch,
-                                                     StringMap<const IndexAccessMethod*> iamMap,
                                                      PlanNodeId planNodeId,
                                                      sbe::value::SlotVector slotsToForward);
 
@@ -557,15 +567,14 @@ std::pair<sbe::IndexKeysInclusionSet, std::vector<std::string>> makeIndexKeyIncl
     return {std::move(indexKeyBitset), std::move(keyFieldNames)};
 }
 
-struct PlanStageData;
-
 /**
  * Common parameters to SBE stage builder functions extracted into separate class to simplify
  * argument passing. Also contains a mapping of global variable ids to slot ids.
  */
 struct StageBuilderState {
     StageBuilderState(OperationContext* opCtx,
-                      PlanStageData* data,
+                      PlanStageEnvironment& env,
+                      PlanStageStaticData* data,
                       const Variables& variables,
                       sbe::value::SlotIdGenerator* slotIdGenerator,
                       sbe::value::FrameIdGenerator* frameIdGenerator,
@@ -576,6 +585,7 @@ struct StageBuilderState {
           frameIdGenerator{frameIdGenerator},
           spoolIdGenerator{spoolIdGenerator},
           opCtx{opCtx},
+          env{env},
           data{data},
           variables{variables},
           needsMerge{needsMerge},
@@ -610,7 +620,8 @@ struct StageBuilderState {
     sbe::value::SpoolIdGenerator* const spoolIdGenerator;
 
     OperationContext* const opCtx;
-    PlanStageData* const data;
+    PlanStageEnvironment& env;
+    PlanStageStaticData* const data;
 
     const Variables& variables;
     // When the mongos splits $group stage and sends it to shards, it adds 'needsMerge'/'fromMongs'
@@ -642,18 +653,20 @@ struct StageBuilderState {
 template <typename T>
 struct PathTreeNode {
     PathTreeNode() = default;
-    explicit PathTreeNode(StringData name) : name(name) {}
+    explicit PathTreeNode(std::string name) : name(std::move(name)) {}
 
     // Aside from the root node, it is very common for a node to have no children or only 1 child.
     using ChildrenVector = absl::InlinedVector<std::unique_ptr<PathTreeNode<T>>, 1>;
 
-    PathTreeNode<T>* emplace(StringData fieldComponent) {
-        auto newNode = std::make_unique<PathTreeNode<T>>(fieldComponent);
+    // It is the caller's responsibility to verify that there is not an existing field with the
+    // same name as 'fieldComponent'.
+    PathTreeNode<T>* emplace_back(std::string fieldComponent) {
+        auto newNode = std::make_unique<PathTreeNode<T>>(std::move(fieldComponent));
         const auto newNodeRaw = newNode.get();
         children.emplace_back(std::move(newNode));
 
         if (childrenMap) {
-            childrenMap->emplace(fieldComponent, newNodeRaw);
+            childrenMap->emplace(newNodeRaw->name, newNodeRaw);
         } else if (children.size() >= 3) {
             // If 'childrenMap' is null and there are 3 or more children, build 'childrenMap' now.
             buildChildrenMap();
@@ -781,9 +794,9 @@ inline auto buildPathTreeImpl(const std::vector<StringT>& paths,
         const bool ignorePath = (removeConflictingPaths && node->isLeaf() && node != tree.get());
         if (!ignorePath) {
             if (i < numParts) {
-                node = node->emplace(part);
+                node = node->emplace_back(std::string(part));
                 for (++i; i < numParts; ++i) {
-                    node = node->emplace(path.getPart(i));
+                    node = node->emplace_back(std::string(path.getPart(i)));
                 }
             } else if (removeConflictingPaths && !node->isLeaf()) {
                 // If 'removeConflictingPaths' is true, delete any children that 'node' has.
@@ -1162,6 +1175,29 @@ inline std::vector<T> appendVectorUnique(std::vector<T> lhs, std::vector<T> rhs)
         }
     }
     return lhs;
+}
+
+inline std::pair<std::unique_ptr<KeyString::Value>, std::unique_ptr<KeyString::Value>>
+makeKeyStringPair(const BSONObj& lowKey,
+                  bool lowKeyInclusive,
+                  const BSONObj& highKey,
+                  bool highKeyInclusive,
+                  KeyString::Version version,
+                  Ordering ordering,
+                  bool forward) {
+    // Note that 'makeKeyFromBSONKeyForSeek()' is intended to compute the "start" key for an
+    // index scan. The logic for computing a "discriminator" for an "end" key is reversed, which
+    // is why we use 'makeKeyStringFromBSONKey()' to manually specify the discriminator for the
+    // end key.
+    return {
+        std::make_unique<KeyString::Value>(IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+            lowKey, version, ordering, forward, lowKeyInclusive)),
+        std::make_unique<KeyString::Value>(IndexEntryComparison::makeKeyStringFromBSONKey(
+            highKey,
+            version,
+            ordering,
+            forward != highKeyInclusive ? KeyString::Discriminator::kExclusiveBefore
+                                        : KeyString::Discriminator::kExclusiveAfter))};
 }
 
 }  // namespace mongo::stage_builder

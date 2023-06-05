@@ -27,11 +27,10 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <benchmark/benchmark.h>
 
 #include "mongo/base/checked_cast.h"
+#include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context.h"
@@ -76,6 +75,7 @@ public:
         : _dbpath("wt_test"),
           _connection(_dbpath.path(), ""),
           _sessionCache(_connection.getConnection(), &_clockSource) {
+        setGlobalServiceContext(ServiceContext::make());
         _opCtx.reset(newOperationContext());
         auto ru = WiredTigerRecoveryUnit::get(_opCtx.get());
         _wtSession = ru->getSession()->getSession();

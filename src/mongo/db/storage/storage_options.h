@@ -87,8 +87,10 @@ struct StorageGlobalParams {
     bool ephemeral = false;
 
     // --journalCommitInterval
+    // This parameter is both a server parameter and a configuration parameter, and to resolve
+    // conflicts between the two the default must be set here.
     static constexpr int kMaxJournalCommitIntervalMs = 500;
-    AtomicWord<int> journalCommitIntervalMs;
+    AtomicWord<int> journalCommitIntervalMs{100};
 
     // --notablescan
     // no table scans allowed
@@ -101,12 +103,14 @@ struct StorageGlobalParams {
     bool directoryperdb;
 
     // --syncdelay
-    // Controls how much time can pass before MongoDB flushes data to the data files
-    // via an fsync operation.
+    // Delay in seconds between triggering the next checkpoint after the completion of the previous
+    // one. A value of 0 indicates that checkpointing will be skipped.
     // Do not set this value on production systems.
     // In almost every situation, you should use the default setting.
+    // This parameter is both a server parameter and a configuration parameter, and to resolve
+    // conflicts between the two the default must be set here.
     static constexpr double kMaxSyncdelaySecs = 60 * 60;  // 1hr
-    AtomicDouble syncdelay;                               // seconds between fsyncs
+    AtomicDouble syncdelay{60.0};                         // seconds between checkpoints
 
     // --queryableBackupMode
     // Prevents user-originating operations from performing writes to the server. Internally
@@ -131,10 +135,6 @@ struct StorageGlobalParams {
     // Disables lock-free reads. Lock-free reads is incompatible with
     // enableMajorityReadConcern=false.
     bool disableLockFreeReads = false;
-
-    // Delay in seconds between triggering the next checkpoint after the completion of the previous
-    // one. A value of 0 indicates that checkpointing will be skipped.
-    size_t checkpointDelaySecs;
 
     // Test-only option. Disables table logging.
     bool forceDisableTableLogging = false;

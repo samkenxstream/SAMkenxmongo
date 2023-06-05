@@ -77,12 +77,12 @@ bool ReplicationCoordinatorNoOp::isWritablePrimaryForReportingPurposes() {
 }
 
 bool ReplicationCoordinatorNoOp::canAcceptWritesForDatabase(OperationContext* opCtx,
-                                                            StringData dbName) {
+                                                            const DatabaseName& dbName) {
     MONGO_UNREACHABLE;
 }
 
 bool ReplicationCoordinatorNoOp::canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx,
-                                                                   StringData dbName) {
+                                                                   const DatabaseName& dbName) {
     MONGO_UNREACHABLE;
 }
 
@@ -199,8 +199,8 @@ void ReplicationCoordinatorNoOp::setMyHeartbeatMessage(const std::string&) {
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::setMyLastAppliedOpTimeAndWallTimeForward(
-    const OpTimeAndWallTime&) {
+void ReplicationCoordinatorNoOp::setMyLastAppliedOpTimeAndWallTimeForward(const OpTimeAndWallTime&,
+                                                                          bool) {
     MONGO_UNREACHABLE;
 }
 

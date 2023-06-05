@@ -42,7 +42,10 @@
 #include "mongo/db/internal_transactions_feature_flag_gen.h"
 #include "mongo/db/ops/write_ops_gen.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/timeseries/timeseries_update_delete_util.h"
 #include "mongo/db/transaction/transaction_api.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
@@ -52,6 +55,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/cluster_ddl.h"
+#include "mongo/s/collection_routing_info_targeter.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/document_shard_key_update_util.h"
 #include "mongo/s/commands/strategy.h"
@@ -130,19 +134,34 @@ boost::optional<LegacyRuntimeConstants> getLegacyRuntimeConstants(const BSONObj&
     return boost::none;
 }
 
-BSONObj getShardKey(OperationContext* opCtx,
-                    const ChunkManager& chunkMgr,
-                    const NamespaceString& nss,
-                    const BSONObj& query,
-                    const BSONObj& collation,
-                    const boost::optional<ExplainOptions::Verbosity> verbosity,
-                    const boost::optional<BSONObj>& let,
-                    const boost::optional<LegacyRuntimeConstants>& runtimeConstants) {
-    auto expCtx = makeExpressionContextWithDefaultsForTargeter(
-        opCtx, nss, collation, verbosity, let, runtimeConstants);
+namespace {
+BSONObj getQueryForShardKey(boost::intrusive_ptr<ExpressionContext> expCtx,
+                            const ChunkManager& cm,
+                            const BSONObj& query) {
+    if (auto tsFields = cm.getTimeseriesFields(); cm.isSharded() && tsFields) {
+        // Note: The useTwoPhaseProtocol() uses the shard key extractor to decide whether it should
+        // use the two phase protocol and the shard key extractor is only based on the equality
+        // query. But we still should be able to route the query to the correct shard from a range
+        // query on shard keys (not always) and unfortunately, even an equality query on the time
+        // field for timeseries collections would be translated into a range query on
+        // control.min.time and control.max.time. So, with this, we can support targeted
+        // findAndModify based on the time field.
+        //
+        // If the collection is a sharded timeseries collection, rewrite the query into a
+        // bucket-level query.
+        return timeseries::getBucketLevelPredicateForRouting(
+            query, expCtx, tsFields->getTimeseriesOptions(), /* allowArbitraryWrites */ true);
+    }
 
-    BSONObj shardKey = uassertStatusOK(
-        extractShardKeyFromBasicQueryWithContext(expCtx, chunkMgr.getShardKeyPattern(), query));
+    return query;
+}
+}  // namespace
+
+BSONObj getShardKey(boost::intrusive_ptr<ExpressionContext> expCtx,
+                    const ChunkManager& chunkMgr,
+                    const BSONObj& query) {
+    BSONObj shardKey = uassertStatusOK(extractShardKeyFromBasicQueryWithContext(
+        expCtx, chunkMgr.getShardKeyPattern(), getQueryForShardKey(expCtx, chunkMgr, query)));
     uassert(ErrorCodes::ShardKeyNotFound,
             "Query for sharded findAndModify must contain the shard key",
             !shardKey.isEmpty());
@@ -156,11 +175,10 @@ void handleWouldChangeOwningShardErrorNonTransaction(
     const write_ops::FindAndModifyCommandRequest& request,
     BSONObjBuilder* result) {
     auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
-    auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(
-        Grid::get(opCtx)->getExecutorPool()->getFixedExecutor());
+    auto& executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
 
     auto txn = txn_api::SyncTransactionWithRetries(
-        opCtx, sleepInlineExecutor, nullptr /* resourceYielder */, inlineExecutor);
+        opCtx, executor, nullptr /* resourceYielder */, inlineExecutor);
 
     // Shared state for the transaction API use below.
     struct SharedBlock {
@@ -257,11 +275,10 @@ void handleWouldChangeOwningShardErrorTransaction(
     try {
         auto& executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
         auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
-        auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(executor);
 
         auto txn = txn_api::SyncTransactionWithRetries(
             opCtx,
-            sleepInlineExecutor,
+            executor,
             TransactionRouterResourceYielder::makeForLocalHandoff(),
             inlineExecutor);
 
@@ -399,7 +416,7 @@ Status FindAndModifyCmd::checkAuthForOperation(OperationContext* opCtx,
     }
 
     auto nss = CommandHelpers::parseNsFromCommand(dbName, cmdObj);
-    ResourcePattern resource(CommandHelpers::resourcePatternForNamespace(nss.ns()));
+    ResourcePattern resource(CommandHelpers::resourcePatternForNamespace(nss));
     uassert(17137,
             "Invalid target namespace " + resource.toString(),
             resource.isExactNamespacePattern());
@@ -412,11 +429,125 @@ Status FindAndModifyCmd::checkAuthForOperation(OperationContext* opCtx,
     return Status::OK();
 }
 
+namespace {
+/**
+ * Replaces the target namespace in the 'cmdObj' by 'bucketNss'. Also sets the
+ * 'isTimeseriesNamespace' flag.
+ */
+BSONObj replaceNamespaceByBucketNss(const BSONObj& cmdObj, const NamespaceString& bucketNss) {
+    BSONObjBuilder bob;
+    for (const auto& elem : cmdObj) {
+        const auto name = elem.fieldNameStringData();
+        if (name == write_ops::FindAndModifyCommandRequest::kCommandName) {
+            bob.append(write_ops::FindAndModifyCommandRequest::kCommandName, bucketNss.coll());
+        } else {
+            bob.append(elem);
+        }
+    }
+    bob.append(write_ops::FindAndModifyCommandRequest::kIsTimeseriesNamespaceFieldName, true);
+
+    return bob.obj();
+}
+
+/**
+ * Returns CollectionRoutingInfo for 'maybeTsNss' namespace. If 'maybeTsNss' is a timeseries
+ * collection, returns CollectionRoutingInfo for the corresponding timeseries buckets collection.
+ */
+CollectionRoutingInfo getCollectionRoutingInfo(OperationContext* opCtx,
+                                               const BSONObj& cmdObj,
+                                               const NamespaceString& maybeTsNss) {
+    // Apparently, we should return the CollectionRoutingInfo for the original namespace if we're
+    // not writing to a timeseries collection.
+    auto cri = uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, maybeTsNss));
+
+    // Note: We try to get CollectionRoutingInfo for the timeseries buckets collection only when the
+    // timeseries deletes or updates feature flag is enabled.
+    const bool arbitraryTimeseriesWritesEnabled =
+        feature_flags::gTimeseriesDeletesSupport.isEnabled(
+            serverGlobalParams.featureCompatibility) ||
+        feature_flags::gTimeseriesUpdatesSupport.isEnabled(serverGlobalParams.featureCompatibility);
+    if (!arbitraryTimeseriesWritesEnabled || cri.cm.isSharded() ||
+        maybeTsNss.isTimeseriesBucketsCollection()) {
+        return cri;
+    }
+
+    // If the 'maybeTsNss' namespace is not a timeseries buckets collection and not sharded, try
+    // to get the CollectionRoutingInfo for the corresponding timeseries buckets collection to
+    // see if it's sharded and it really is a timeseries buckets collection. We should do this to
+    // figure out whether we need to use the two phase write protocol or not on timeseries buckets
+    // collections.
+    auto bucketCollNss = maybeTsNss.makeTimeseriesBucketsNamespace();
+    auto bucketCollCri = uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, bucketCollNss));
+    if (!bucketCollCri.cm.isSharded() || !bucketCollCri.cm.getTimeseriesFields()) {
+        return cri;
+    }
+
+    uassert(ErrorCodes::InvalidOptions,
+            "Cannot perform findAndModify with sort on a sharded timeseries collection",
+            !cmdObj.hasField("sort"));
+
+    // TODO SERVER-76871: Remove this check. For now, we only support findAndModify remove on
+    // sharded timeseries collections.
+    uassert(7653001,
+            "Cannot perform findAndModify update on a sharded timeseries collection",
+            cmdObj["remove"].trueValue());
+
+    return bucketCollCri;
+}
+
+boost::intrusive_ptr<ExpressionContext> makeExpCtx(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const BSONObj& collation,
+    const boost::optional<ExplainOptions::Verbosity> verbosity,
+    const boost::optional<BSONObj>& let,
+    const boost::optional<LegacyRuntimeConstants>& runtimeConstants) {
+    return makeExpressionContextWithDefaultsForTargeter(
+        opCtx, nss, collation, verbosity, let, runtimeConstants);
+}
+
+/**
+ * Returns the shard id if the 'query' can be targeted to a single shard. Otherwise, returns
+ * boost::none.
+ */
+boost::optional<ShardId> targetPotentiallySingleShard(
+    boost::intrusive_ptr<ExpressionContext> expCtx,
+    const ChunkManager& cm,
+    const BSONObj& query,
+    const BSONObj& collation) {
+    // Special case: there's only one shard owning all the chunks.
+    if (cm.getNShardsOwningChunks() == 1) {
+        std::set<ShardId> shardIds;
+        cm.getAllShardIds(&shardIds);
+        return *shardIds.begin();
+    }
+
+    std::set<ShardId> shardIds;
+    getShardIdsForQuery(expCtx, getQueryForShardKey(expCtx, cm, query), collation, cm, &shardIds);
+
+    if (shardIds.size() == 1) {
+        // If we can find a single shard to target, we can skip the two phase write protocol.
+        return *shardIds.begin();
+    }
+
+    return boost::none;
+}
+
+BSONObj makeExplainCmd(OperationContext* opCtx,
+                       const BSONObj& cmdObj,
+                       ExplainOptions::Verbosity verbosity) {
+    return ClusterExplain::wrapAsExplain(appendLegacyRuntimeConstantsToCommandObject(opCtx, cmdObj),
+                                         verbosity);
+}
+}  // namespace
+
 Status FindAndModifyCmd::explain(OperationContext* opCtx,
                                  const OpMsgRequest& request,
                                  ExplainOptions::Verbosity verbosity,
                                  rpc::ReplyBuilderInterface* result) const {
-    const DatabaseName dbName(request.getValidatedTenantId(), request.getDatabase());
+    const DatabaseName dbName =
+        DatabaseNameUtil::deserialize(request.getValidatedTenantId(), request.getDatabase());
+    auto bodyBuilder = result->getBodyBuilder();
     const BSONObj& cmdObj = [&]() {
         // Check whether the query portion needs to be rewritten for FLE.
         auto findAndModifyRequest = write_ops::FindAndModifyCommandRequest::parse(
@@ -430,53 +561,71 @@ Status FindAndModifyCmd::explain(OperationContext* opCtx,
             return request.body;
         }
     }();
-    const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
+    NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
-    const auto cri =
-        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+    const auto cri = getCollectionRoutingInfo(opCtx, cmdObj, nss);
     const auto& cm = cri.cm;
-
-    std::shared_ptr<Shard> shard;
-    if (cm.isSharded()) {
-        const BSONObj query = cmdObj.getObjectField("query");
-        const BSONObj collation = getCollation(cmdObj);
-        const auto let = getLet(cmdObj);
-        const auto rc = getLegacyRuntimeConstants(cmdObj);
-        const BSONObj shardKey = getShardKey(opCtx, cm, nss, query, collation, verbosity, let, rc);
-        const auto chunk = cm.findIntersectingChunk(shardKey, collation);
-
-        shard =
-            uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, chunk.getShardId()));
-    } else {
-        shard = uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, cm.dbPrimary()));
+    auto isShardedTimeseries = cm.isSharded() && cm.getTimeseriesFields();
+    if (isShardedTimeseries) {
+        nss = std::move(cm.getNss());
     }
+    // Note: at this point, 'nss' should be the timeseries buckets collection namespace if we're
+    // writing to a sharded timeseries collection.
 
-    const auto explainCmd = ClusterExplain::wrapAsExplain(
-        appendLegacyRuntimeConstantsToCommandObject(opCtx, cmdObj), verbosity);
+    boost::optional<ShardId> shardId;
+    const BSONObj query = cmdObj.getObjectField("query");
+    const BSONObj collation = getCollation(cmdObj);
+    const auto isUpsert = cmdObj.getBoolField("upsert");
+    const auto let = getLet(cmdObj);
+    const auto rc = getLegacyRuntimeConstants(cmdObj);
+    if (cm.isSharded()) {
+        auto expCtx = makeExpCtx(opCtx, nss, collation, boost::none, let, rc);
+        if (write_without_shard_key::useTwoPhaseProtocol(
+                opCtx, nss, false /* isUpdateOrDelete */, isUpsert, query, collation, let, rc)) {
+            shardId = targetPotentiallySingleShard(expCtx, cm, query, collation);
+        } else {
+            const BSONObj shardKey = getShardKey(expCtx, cm, query);
+            const auto chunk = cm.findIntersectingChunk(shardKey, collation);
+            shardId = chunk.getShardId();
+        }
+    } else {
+        shardId = cm.dbPrimary();
+    }
 
     // Time how long it takes to run the explain command on the shard.
     Timer timer;
     BSONObjBuilder bob;
-
-    if (cm.isSharded()) {
-        _runCommand(opCtx,
-                    shard->getId(),
-                    cri.getShardVersion(shard->getId()),
-                    boost::none,
-                    nss,
-                    applyReadWriteConcern(opCtx, false, false, explainCmd),
-                    true /* isExplain */,
-                    &bob);
-    } else {
-        _runCommand(opCtx,
-                    shard->getId(),
-                    boost::make_optional(!cm.dbVersion().isFixed(), ShardVersion::UNSHARDED()),
-                    cm.dbVersion(),
-                    nss,
-                    applyReadWriteConcern(opCtx, false, false, explainCmd),
-                    true /* isExplain */,
-                    &bob);
+    if (!shardId) {
+        // The two phase write protocol requires that the target namespace in the command is sharded
+        // and we shard the underlying timeseries buckets collection. So, if we're writing to a
+        // sharded timeseries collection, replace the target namespace in the command by 'nss' which
+        // is the buckets namespace.
+        _runExplainWithoutShardKey(
+            opCtx,
+            nss,
+            makeExplainCmd(opCtx,
+                           isShardedTimeseries ? replaceNamespaceByBucketNss(cmdObj, nss) : cmdObj,
+                           verbosity),
+            verbosity,
+            &bob);
+        bodyBuilder.appendElementsUnique(bob.obj());
+        return Status::OK();
     }
+
+    auto shardVersion = cm.isSharded()
+        ? boost::make_optional(cri.getShardVersion(*shardId))
+        : boost::make_optional(!cm.dbVersion().isFixed(), ShardVersion::UNSHARDED());
+
+    _runCommand(
+        opCtx,
+        *shardId,
+        shardVersion,
+        cm.dbVersion(),
+        nss,
+        applyReadWriteConcern(opCtx, false, false, makeExplainCmd(opCtx, cmdObj, verbosity)),
+        true /* isExplain */,
+        boost::none /* allowShardKeyUpdatesWithoutFullShardKeyInQuery */,
+        &bob);
 
     const auto millisElapsed = timer.millis();
 
@@ -484,10 +633,10 @@ Status FindAndModifyCmd::explain(OperationContext* opCtx,
 
     // We fetch an arbitrary host from the ConnectionString, since
     // ClusterExplain::buildExplainResult() doesn't use the given HostAndPort.
+    auto shard = uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, *shardId));
     AsyncRequestsSender::Response arsResponse{
-        shard->getId(), response, shard->getConnString().getServers().front()};
+        *shardId, response, shard->getConnString().getServers().front()};
 
-    auto bodyBuilder = result->getBodyBuilder();
     return ClusterExplain::buildExplainResult(
         opCtx, {arsResponse}, ClusterExplain::kSingleShard, millisElapsed, cmdObj, &bodyBuilder);
 }
@@ -496,7 +645,7 @@ bool FindAndModifyCmd::run(OperationContext* opCtx,
                            const DatabaseName& dbName,
                            const BSONObj& cmdObj,
                            BSONObjBuilder& result) {
-    const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
+    NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
     if (processFLEFindAndModify(opCtx, cmdObj, result) == FLEBatchResult::kProcessed) {
         return true;
@@ -509,37 +658,71 @@ bool FindAndModifyCmd::run(OperationContext* opCtx,
     // would require that the parsing be pulled into this function.
     cluster::createDatabase(opCtx, nss.db());
 
+    auto cri = getCollectionRoutingInfo(opCtx, cmdObj, nss);
+    const auto& cm = cri.cm;
+    auto isShardedTimeseries = cm.isSharded() && cm.getTimeseriesFields();
+    if (isShardedTimeseries) {
+        nss = std::move(cm.getNss());
+    }
+    // Note: at this point, 'nss' should be the timeseries buckets collection namespace if we're
+    // writing to a sharded timeseries collection.
+
     // Append mongoS' runtime constants to the command object before forwarding it to the shard.
     auto cmdObjForShard = appendLegacyRuntimeConstantsToCommandObject(opCtx, cmdObj);
-
-    const auto cri = uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, nss));
-    const auto& cm = cri.cm;
     if (cm.isSharded()) {
-        const BSONObj query = cmdObjForShard.getObjectField("query");
+        BSONObj query = cmdObjForShard.getObjectField("query");
         const bool isUpsert = cmdObjForShard.getBoolField("upsert");
+        const BSONObj collation = getCollation(cmdObjForShard);
+        const auto letParams = getLet(cmdObjForShard);
+        const auto runtimeConstants = getLegacyRuntimeConstants(cmdObjForShard);
+        auto expCtx = makeExpCtx(opCtx, nss, collation, boost::none, letParams, runtimeConstants);
+
         if (write_without_shard_key::useTwoPhaseProtocol(opCtx,
                                                          nss,
                                                          false /* isUpdateOrDelete */,
                                                          isUpsert,
                                                          query,
-                                                         getCollation(cmdObjForShard))) {
-            _runCommandWithoutShardKey(opCtx,
-                                       nss,
-                                       applyReadWriteConcern(opCtx, this, cmdObjForShard),
-                                       false /* isExplain */,
-                                       &result);
-        } else {
-            const BSONObj collation = getCollation(cmdObjForShard);
-            const auto let = getLet(cmdObjForShard);
-            const auto rc = getLegacyRuntimeConstants(cmdObjForShard);
-            const BSONObj shardKey =
-                getShardKey(opCtx, cm, nss, query, collation, boost::none, let, rc);
+                                                         collation,
+                                                         letParams,
+                                                         runtimeConstants)) {
+            findAndModifyNonTargetedShardedCount.increment(1);
+            auto allowShardKeyUpdatesWithoutFullShardKeyInQuery =
+                opCtx->isRetryableWrite() || opCtx->inMultiDocumentTransaction();
 
+            if (auto shardId = targetPotentiallySingleShard(expCtx, cm, query, collation)) {
+                // If we can find a single shard to target, we can skip the two phase write
+                // protocol.
+                _runCommand(opCtx,
+                            *shardId,
+                            cri.getShardVersion(*shardId),
+                            boost::none,
+                            nss,
+                            applyReadWriteConcern(opCtx, this, cmdObjForShard),
+                            false /* isExplain */,
+                            allowShardKeyUpdatesWithoutFullShardKeyInQuery,
+                            &result);
+            } else {
+                // The two phase write protocol requires that the target namespace in the command is
+                // sharded and we shard the underlying timeseries buckets collection. So, if we're
+                // writing to a sharded timeseries collection, replace the target namespace in the
+                // command by 'nss' which is the buckets namespace.
+                if (isShardedTimeseries) {
+                    cmdObjForShard = replaceNamespaceByBucketNss(cmdObjForShard, nss);
+                }
+
+                _runCommandWithoutShardKey(
+                    opCtx, nss, applyReadWriteConcern(opCtx, this, cmdObjForShard), &result);
+            }
+        } else {
+            findAndModifyTargetedShardedCount.increment(1);
+
+            const BSONObj shardKey = getShardKey(expCtx, cm, query);
             // For now, set bypassIsFieldHashedCheck to be true in order to skip the
             // isFieldHashedCheck in the special case where _id is hashed and used as the shard
             // key. This means that we always assume that a findAndModify request using _id is
             // targetable to a single shard.
             auto chunk = cm.findIntersectingChunk(shardKey, collation, true);
+
             _runCommand(opCtx,
                         chunk.getShardId(),
                         cri.getShardVersion(chunk.getShardId()),
@@ -547,9 +730,11 @@ bool FindAndModifyCmd::run(OperationContext* opCtx,
                         nss,
                         applyReadWriteConcern(opCtx, this, cmdObjForShard),
                         false /* isExplain */,
+                        boost::none /* allowShardKeyUpdatesWithoutFullShardKeyInQuery */,
                         &result);
         }
     } else {
+        findAndModifyUnshardedCount.increment(1);
         _runCommand(opCtx,
                     cm.dbPrimary(),
                     boost::make_optional(!cm.dbVersion().isFixed(), ShardVersion::UNSHARDED()),
@@ -557,6 +742,7 @@ bool FindAndModifyCmd::run(OperationContext* opCtx,
                     nss,
                     applyReadWriteConcern(opCtx, this, cmdObjForShard),
                     false /* isExplain */,
+                    boost::none /* allowShardKeyUpdatesWithoutFullShardKeyInQuery */,
                     &result);
     }
 
@@ -635,7 +821,6 @@ void FindAndModifyCmd::_constructResult(OperationContext* opCtx,
 void FindAndModifyCmd::_runCommandWithoutShardKey(OperationContext* opCtx,
                                                   const NamespaceString& nss,
                                                   const BSONObj& cmdObj,
-                                                  bool isExplain,
                                                   BSONObjBuilder* result) {
     auto allowShardKeyUpdatesWithoutFullShardKeyInQuery =
         opCtx->isRetryableWrite() || opCtx->inMultiDocumentTransaction();
@@ -644,7 +829,7 @@ void FindAndModifyCmd::_runCommandWithoutShardKey(OperationContext* opCtx,
         prepareCmdObjForPassthrough(opCtx,
                                     cmdObj,
                                     nss,
-                                    isExplain,
+                                    false /* isExplain */,
                                     boost::none /* dbVersion */,
                                     boost::none /* shardVersion */,
                                     allowShardKeyUpdatesWithoutFullShardKeyInQuery);
@@ -686,28 +871,74 @@ void FindAndModifyCmd::_runCommandWithoutShardKey(OperationContext* opCtx,
                      result);
 }
 
+// Two-phase protocol to run an explain for a findAndModify command without a shard key or _id.
+void FindAndModifyCmd::_runExplainWithoutShardKey(OperationContext* opCtx,
+                                                  const NamespaceString& nss,
+                                                  const BSONObj& cmdObj,
+                                                  ExplainOptions::Verbosity verbosity,
+                                                  BSONObjBuilder* result) {
+    auto cmdObjForPassthrough = prepareCmdObjForPassthrough(
+        opCtx,
+        cmdObj,
+        nss,
+        true /* isExplain */,
+        boost::none /* dbVersion */,
+        boost::none /* shardVersion */,
+        boost::none /* allowShardKeyUpdatesWithoutFullShardKeyInQuery */);
+
+    // Explain currently cannot be run within a transaction, so each command is instead run
+    // separately outside of a transaction, and we compose the results at the end.
+    auto clusterQueryWithoutShardKeyExplainRes = [&] {
+        ClusterQueryWithoutShardKey clusterQueryWithoutShardKeyCommand(cmdObjForPassthrough);
+        const auto explainClusterQueryWithoutShardKeyCmd =
+            ClusterExplain::wrapAsExplain(clusterQueryWithoutShardKeyCommand.toBSON({}), verbosity);
+        auto opMsg = OpMsgRequest::fromDBAndBody(nss.db(), explainClusterQueryWithoutShardKeyCmd);
+        return CommandHelpers::runCommandDirectly(opCtx, opMsg).getOwned();
+    }();
+
+    auto clusterWriteWithoutShardKeyExplainRes = [&] {
+        // Since 'explain' does not return the results of the query, we do not have an _id
+        // document to target by from the 'Read Phase'. We instead will use a dummy _id
+        // target document for the 'Write Phase'.
+        ClusterWriteWithoutShardKey clusterWriteWithoutShardKeyCommand(
+            cmdObjForPassthrough,
+            clusterQueryWithoutShardKeyExplainRes.getStringField("targetShardId").toString(),
+            write_without_shard_key::targetDocForExplain);
+        const auto explainClusterWriteWithoutShardKeyCmd =
+            ClusterExplain::wrapAsExplain(clusterWriteWithoutShardKeyCommand.toBSON({}), verbosity);
+        auto opMsg = OpMsgRequest::fromDBAndBody(nss.db(), explainClusterWriteWithoutShardKeyCmd);
+        return CommandHelpers::runCommandDirectly(opCtx, opMsg).getOwned();
+    }();
+
+    auto output = write_without_shard_key::generateExplainResponseForTwoPhaseWriteProtocol(
+        clusterQueryWithoutShardKeyExplainRes, clusterWriteWithoutShardKeyExplainRes);
+    result->appendElementsUnique(output);
+}
+
 // Command invocation to be used if a shard key is specified or the collection is unsharded.
-void FindAndModifyCmd::_runCommand(OperationContext* opCtx,
-                                   const ShardId& shardId,
-                                   const boost::optional<ShardVersion>& shardVersion,
-                                   const boost::optional<DatabaseVersion>& dbVersion,
-                                   const NamespaceString& nss,
-                                   const BSONObj& cmdObj,
-                                   bool isExplain,
-                                   BSONObjBuilder* result) {
+void FindAndModifyCmd::_runCommand(
+    OperationContext* opCtx,
+    const ShardId& shardId,
+    const boost::optional<ShardVersion>& shardVersion,
+    const boost::optional<DatabaseVersion>& dbVersion,
+    const NamespaceString& nss,
+    const BSONObj& cmdObj,
+    bool isExplain,
+    boost::optional<bool> allowShardKeyUpdatesWithoutFullShardKeyInQuery,
+    BSONObjBuilder* result) {
     auto txnRouter = TransactionRouter::get(opCtx);
     bool isRetryableWrite = opCtx->getTxnNumber() && !txnRouter;
 
     const auto response = [&] {
         std::vector<AsyncRequestsSender::Request> requests;
-        auto cmdObjForPassthrough = prepareCmdObjForPassthrough(
-            opCtx,
-            cmdObj,
-            nss,
-            isExplain,
-            dbVersion,
-            shardVersion,
-            boost::none /* allowShardKeyUpdatesWithoutFullShardKeyInQuery */);
+        auto cmdObjForPassthrough =
+            prepareCmdObjForPassthrough(opCtx,
+                                        cmdObj,
+                                        nss,
+                                        isExplain,
+                                        dbVersion,
+                                        shardVersion,
+                                        allowShardKeyUpdatesWithoutFullShardKeyInQuery);
         requests.emplace_back(shardId, cmdObjForPassthrough);
 
         MultiStatementTransactionRequestsSender ars(
@@ -758,17 +989,19 @@ void FindAndModifyCmd::_handleWouldChangeOwningShardErrorRetryableWriteLegacy(
         // from the opCtx (which has been set previously in Strategy).
         documentShardKeyUpdateUtil::startTransactionForShardKeyUpdate(opCtx);
 
-        if (const auto query = cmdObj.getObjectField("query");
-            write_without_shard_key::useTwoPhaseProtocol(
-                opCtx,
-                nss,
-                false /* isUpdateOrDelete */,
-                cmdObj.getBoolField("upsert") /* isUpsert */,
-                query,
-                getCollation(cmdObj))) {
-            _runCommandWithoutShardKey(
-                opCtx, nss, stripWriteConcern(cmdObj), false /* isExplain */, result);
+        if (write_without_shard_key::useTwoPhaseProtocol(opCtx,
+                                                         nss,
+                                                         false /* isUpdateOrDelete */,
+                                                         cmdObj.getBoolField("upsert"),
+                                                         cmdObj.getObjectField("query"),
+                                                         getCollation(cmdObj),
+                                                         getLet(cmdObj),
+                                                         getLegacyRuntimeConstants(cmdObj))) {
+            findAndModifyNonTargetedShardedCount.increment(1);
+            _runCommandWithoutShardKey(opCtx, nss, stripWriteConcern(cmdObj), result);
+
         } else {
+            findAndModifyTargetedShardedCount.increment(1);
             _runCommand(opCtx,
                         shardId,
                         shardVersion,
@@ -776,6 +1009,7 @@ void FindAndModifyCmd::_handleWouldChangeOwningShardErrorRetryableWriteLegacy(
                         nss,
                         stripWriteConcern(cmdObj),
                         false /* isExplain */,
+                        boost::none /* allowShardKeyUpdatesWithoutFullShardKeyInQuery */,
                         result);
         }
 

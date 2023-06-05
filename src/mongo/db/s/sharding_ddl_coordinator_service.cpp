@@ -33,6 +33,7 @@
 #include "mongo/base/checked_cast.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/s/cleanup_structured_encryption_data_coordinator.h"
 #include "mongo/db/s/collmod_coordinator.h"
 #include "mongo/db/s/compact_structured_encryption_data_coordinator.h"
 #include "mongo/db/s/create_collection_coordinator.h"
@@ -40,7 +41,6 @@
 #include "mongo/db/s/drop_collection_coordinator.h"
 #include "mongo/db/s/drop_database_coordinator.h"
 #include "mongo/db/s/move_primary_coordinator.h"
-#include "mongo/db/s/move_primary_coordinator_no_resilient.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/refine_collection_shard_key_coordinator.h"
 #include "mongo/db/s/rename_collection_coordinator.h"
@@ -48,6 +48,7 @@
 #include "mongo/db/s/set_allow_migrations_coordinator.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
 #include "mongo/logv2/log.h"
+#include "mongo/util/fail_point.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -55,17 +56,14 @@
 namespace mongo {
 namespace {
 
+MONGO_FAIL_POINT_DEFINE(pauseShardingDDLCoordinatorServiceOnRecovery);
+
 std::shared_ptr<ShardingDDLCoordinator> constructShardingDDLCoordinatorInstance(
     ShardingDDLCoordinatorService* service, BSONObj initialState) {
     const auto op = extractShardingDDLCoordinatorMetadata(initialState);
     LOGV2(
         5390510, "Constructing new sharding DDL coordinator", "coordinatorDoc"_attr = op.toBSON());
     switch (op.getId().getOperationType()) {
-        // TODO (SERVER-71309): Remove once 7.0 becomes last LTS.
-        case DDLCoordinatorTypeEnum::kMovePrimaryNoResilient:
-            return std::make_shared<MovePrimaryCoordinatorNoResilient>(service,
-                                                                       std::move(initialState));
-            break;
         case DDLCoordinatorTypeEnum::kMovePrimary:
             return std::make_shared<MovePrimaryCoordinator>(service, std::move(initialState));
             break;
@@ -80,8 +78,6 @@ std::shared_ptr<ShardingDDLCoordinator> constructShardingDDLCoordinatorInstance(
             return std::make_shared<DropCollectionCoordinator>(service, std::move(initialState));
             break;
         case DDLCoordinatorTypeEnum::kRenameCollection:
-        // TODO SERVER-72796: Remove once gGlobalIndexesShardingCatalog is enabled.
-        case DDLCoordinatorTypeEnum::kRenameCollectionPre63Compatible:
             return std::make_shared<RenameCollectionCoordinator>(service, std::move(initialState));
         case DDLCoordinatorTypeEnum::kCreateCollection:
         // TODO SERVER-68008 Remove the Pre61Compatible case once 7.0 becomes last LTS
@@ -104,15 +100,12 @@ std::shared_ptr<ShardingDDLCoordinator> constructShardingDDLCoordinatorInstance(
         case DDLCoordinatorTypeEnum::kReshardCollection:
             return std::make_shared<ReshardCollectionCoordinator>(service, std::move(initialState));
             break;
-        case DDLCoordinatorTypeEnum::kCompactStructuredEncryptionDataPre61Compatible:
-            // TODO SERVER-68373 remove once 7.0 becomes last LTS
-        case DDLCoordinatorTypeEnum::kCompactStructuredEncryptionDataPre70Compatible:
-            // TODO SERVER-68373 remove once 7.0 becomes last LTS
-            return std::make_shared<CompactStructuredEncryptionDataCoordinatorPre70Compatible>(
-                service, std::move(initialState));
-            break;
         case DDLCoordinatorTypeEnum::kCompactStructuredEncryptionData:
             return std::make_shared<CompactStructuredEncryptionDataCoordinator>(
+                service, std::move(initialState));
+            break;
+        case DDLCoordinatorTypeEnum::kCleanupStructuredEncryptionData:
+            return std::make_shared<CleanupStructuredEncryptionDataCoordinator>(
                 service, std::move(initialState));
             break;
         default:
@@ -146,6 +139,8 @@ ShardingDDLCoordinatorService::constructInstance(BSONObj initialState) {
         }
     }
 
+    pauseShardingDDLCoordinatorServiceOnRecovery.pauseWhileSet();
+
     coord->getConstructionCompletionFuture()
         .thenRunOn(getInstanceCleanupExecutor())
         .getAsync([this](auto status) {
@@ -155,8 +150,8 @@ ShardingDDLCoordinatorService::constructInstance(BSONObj initialState) {
             }
             invariant(_numCoordinatorsToWait > 0);
             if (--_numCoordinatorsToWait == 0) {
-                _state = State::kRecovered;
-                _recoveredOrCoordinatorCompletedCV.notify_all();
+                auto opCtx = cc().makeOperationContext();
+                _transitionToRecovered(lg, opCtx.get());
             }
         });
 
@@ -204,6 +199,7 @@ void ShardingDDLCoordinatorService::_afterStepDown() {
     stdx::lock_guard lg(_mutex);
     _state = State::kPaused;
     _numCoordinatorsToWait = 0;
+    DDLLockManager::get(cc().getServiceContext())->setState(DDLLockManager::State::kPaused);
 }
 
 size_t ShardingDDLCoordinatorService::_countCoordinatorDocs(OperationContext* opCtx) {
@@ -246,13 +242,14 @@ ExecutorFuture<void> ShardingDDLCoordinatorService::_rebuildService(
                       "Found Sharding DDL Coordinators to rebuild",
                       "numCoordinators"_attr = numCoordinators);
             }
-            stdx::lock_guard lg(_mutex);
             if (numCoordinators > 0) {
+                stdx::lock_guard lg(_mutex);
                 _state = State::kRecovering;
                 _numCoordinatorsToWait = numCoordinators;
             } else {
-                _state = State::kRecovered;
-                _recoveredOrCoordinatorCompletedCV.notify_all();
+                pauseShardingDDLCoordinatorServiceOnRecovery.pauseWhileSet();
+                stdx::lock_guard lg(_mutex);
+                _transitionToRecovered(lg, opCtx.get());
             }
         })
         .onError([this](const Status& status) {
@@ -278,7 +275,7 @@ ShardingDDLCoordinatorService::getOrCreateInstance(OperationContext* opCtx, BSON
         uassert(ErrorCodes::IllegalOperation,
                 "Request sent without attaching database version",
                 clientDbVersion);
-        DatabaseShardingState::assertIsPrimaryShardForDb(opCtx, nss.db());
+        DatabaseShardingState::assertIsPrimaryShardForDb(opCtx, nss.dbName());
         coorMetadata.setDatabaseVersion(clientDbVersion);
     }
 
@@ -308,6 +305,12 @@ ShardingDDLCoordinatorService::getOrCreateInstance(OperationContext* opCtx, BSON
 std::shared_ptr<executor::TaskExecutor> ShardingDDLCoordinatorService::getInstanceCleanupExecutor()
     const {
     return PrimaryOnlyService::getInstanceCleanupExecutor();
+}
+
+void ShardingDDLCoordinatorService::_transitionToRecovered(WithLock lk, OperationContext* opCtx) {
+    _state = State::kRecovered;
+    DDLLockManager::get(opCtx)->setState(DDLLockManager::State::kPrimaryAndRecovered);
+    _recoveredOrCoordinatorCompletedCV.notify_all();
 }
 
 }  // namespace mongo

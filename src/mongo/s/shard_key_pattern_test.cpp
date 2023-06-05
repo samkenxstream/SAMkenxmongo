@@ -28,10 +28,10 @@
  */
 
 #include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/db/concurrency/locker_impl_client_observer.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/json.h"
 #include "mongo/db/service_context_test_fixture.h"
-#include "mongo/s/concurrency/locker_mongos_client_observer.h"
 #include "mongo/s/shard_key_pattern_query_util.h"
 #include "mongo/unittest/death_test.h"
 
@@ -42,7 +42,7 @@ class ShardKeyPatternTest : public ServiceContextTest {
 protected:
     ShardKeyPatternTest() {
         auto service = getServiceContext();
-        service->registerClientObserver(std::make_unique<LockerMongosClientObserver>());
+        service->registerClientObserver(std::make_unique<LockerImplClientObserver>());
         _opCtxHolder = makeOperationContext();
         _opCtx = _opCtxHolder.get();
     }
@@ -82,12 +82,18 @@ TEST_F(ShardKeyPatternTest, SingleFieldShardKeyPatternsValidityCheck) {
     ASSERT_THROWS(ShardKeyPattern(BSON("$" << 1)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("$a" << 1)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("$**" << 1)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("$id" << 1)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("$db" << 1)), DBException);
+    ASSERT_THROWS(ShardKeyPattern(BSON("$ref" << 1)), DBException);
 }
 
 TEST_F(ShardKeyPatternTest, CompositeShardKeyPatternsValidityCheck) {
     ShardKeyPattern s1(BSON("a" << 1 << "b" << 1));
     ShardKeyPattern s2(BSON("a" << 1.0f << "b" << 1.0));
     ShardKeyPattern s3(BSON("a" << 1 << "b" << 1.0 << "c" << 1.0f));
+    ShardKeyPattern s4(BSON("a.$id" << 1));
+    ShardKeyPattern s5(BSON("a.$db" << 1));
+    ShardKeyPattern s6(BSON("a.$ref" << 1));
 
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "b" << -1)), DBException);
     ASSERT_THROWS(ShardKeyPattern(BSON("a" << 1 << "b"

@@ -87,6 +87,15 @@ public:
         const CollectionShardingRuntime& csr);
 
     /**
+     * Returns true if the document being deleted belongs to a chunk which, while still in the
+     * shard, is being migrated out. (Not to be confused with "fromMigrate", which tags
+     * operations that are steps in performing the migration.)
+     */
+    static bool isMigrating(OperationContext* opCtx,
+                            NamespaceString const& nss,
+                            BSONObj const& docToDelete);
+
+    /**
      * Instantiates a new migration source manager with the specified migration parameters. Must be
      * called with the distributed lock acquired in advance (not asserted).
      *
@@ -95,8 +104,8 @@ public:
      *
      * May throw any exception. Known exceptions are:
      *  - InvalidOptions if the operation context is missing shard version
-     *  - StaleConfigException if the expected placement version does not match what we find it
-     *      to be after acquiring the distributed lock.
+     *  - StaleConfig if the expected placement version does not match what we find it to be after
+     *    acquiring the distributed lock
      */
     MigrationSourceManager(OperationContext* opCtx,
                            ShardsvrMoveRange&& request,
@@ -174,6 +183,17 @@ public:
 
     const NamespaceString& nss() {
         return _args.getCommandParameter();
+    }
+
+    boost::optional<UUID> getMigrationId() {
+        if (_coordinator) {
+            return _coordinator->getMigrationId();
+        }
+        return boost::none;
+    }
+
+    long long getOpTimeMillis() {
+        return _entireOpTimer.millis();
     }
 
 private:

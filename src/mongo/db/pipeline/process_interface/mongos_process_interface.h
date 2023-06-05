@@ -72,15 +72,23 @@ public:
 
     Status insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                   const NamespaceString& ns,
-                  std::vector<BSONObj>&& objs,
+                  std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
                   const WriteConcernOptions& wc,
                   boost::optional<OID>) final {
         MONGO_UNREACHABLE;
     }
 
+    Status insertTimeseries(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                            const NamespaceString& ns,
+                            std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
+                            const WriteConcernOptions& wc,
+                            boost::optional<OID> targetEpoch) final {
+        MONGO_UNREACHABLE;
+    }
+
     StatusWith<UpdateResult> update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                     const NamespaceString& ns,
-                                    BatchedObjects&& batch,
+                                    std::unique_ptr<write_ops::UpdateCommandRequest> updateCommand,
                                     const WriteConcernOptions& wc,
                                     UpsertType upsert,
                                     bool multi,
@@ -154,6 +162,14 @@ public:
     void createCollection(OperationContext* opCtx,
                           const DatabaseName& dbName,
                           const BSONObj& cmdObj) final {
+        MONGO_UNREACHABLE;
+    }
+
+
+    void createTimeseriesView(OperationContext* opCtx,
+                              const NamespaceString& ns,
+                              const BSONObj& cmdObj,
+                              const TimeseriesOptions& userOpts) final {
         MONGO_UNREACHABLE;
     }
 
@@ -294,7 +310,7 @@ public:
     }
 
 protected:
-    BSONObj _reportCurrentOpForClient(OperationContext* opCtx,
+    BSONObj _reportCurrentOpForClient(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                       Client* client,
                                       CurrentOpTruncateMode truncateOps,
                                       CurrentOpBacktraceMode backtraceMode) const final;

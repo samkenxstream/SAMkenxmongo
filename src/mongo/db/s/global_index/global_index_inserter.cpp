@@ -64,54 +64,48 @@ NamespaceString GlobalIndexInserter::_skipIdNss() {
 void GlobalIndexInserter::processDoc(OperationContext* opCtx,
                                      const BSONObj& indexKeyValues,
                                      const BSONObj& documentKey) {
-    auto insertToGlobalIndexFn =
-        [this, service = opCtx->getServiceContext(), indexKeyValues, documentKey](
-            const txn_api::TransactionClient& txnClient, ExecutorPtr txnExec) {
-            FindCommandRequest skipIdQuery(_skipIdNss());
-            skipIdQuery.setFilter(BSON("_id" << documentKey));
-            skipIdQuery.setLimit(1);
+    auto insertToGlobalIndexFn = [this,
+                                  service = opCtx->getServiceContext(),
+                                  indexKeyValues,
+                                  documentKey](const txn_api::TransactionClient& txnClient,
+                                               ExecutorPtr txnExec) {
+        FindCommandRequest skipIdQuery(_skipIdNss());
+        skipIdQuery.setFilter(BSON("_id" << documentKey));
+        skipIdQuery.setLimit(1);
 
-            return txnClient.exhaustiveFind(skipIdQuery)
-                .thenRunOn(txnExec)
-                .then([this, service, indexKeyValues, documentKey, &txnClient, txnExec](
-                          const auto& skipIdDocResults) {
-                    auto client = service->makeClient("globalIndexInserter");
-                    auto opCtx = service->makeOperationContext(client.get());
+        return txnClient.exhaustiveFind(skipIdQuery)
+            .thenRunOn(txnExec)
+            .then([this, service, indexKeyValues, documentKey, &txnClient, txnExec](
+                      const auto& skipIdDocResults) {
+                auto client = service->makeClient("globalIndexInserter");
+                auto opCtx = service->makeOperationContext(client.get());
+                globalIndexInserterPauseAfterReadingSkipCollection.pauseWhileSet(opCtx.get());
 
-                    {
-                        stdx::lock_guard<Client> lk(*client);
-                        client->setSystemOperationKillableByStepdown(lk);
-                    }
+                if (!skipIdDocResults.empty()) {
+                    return SemiFuture<void>::makeReady();
+                }
 
-                    globalIndexInserterPauseAfterReadingSkipCollection.pauseWhileSet(opCtx.get());
+                InsertGlobalIndexKey globalIndexEntryInsert(_indexUUID);
+                // Note: dbName is unused by command but required by idl.
+                globalIndexEntryInsert.setDbName(DatabaseName::kAdmin);
+                globalIndexEntryInsert.setGlobalIndexKeyEntry(
+                    GlobalIndexKeyEntry(indexKeyValues, documentKey));
 
-                    if (!skipIdDocResults.empty()) {
-                        return SemiFuture<void>::makeReady();
-                    }
+                return txnClient.runCommandChecked(_nss.dbName(), globalIndexEntryInsert.toBSON({}))
+                    .thenRunOn(txnExec)
+                    .then([this, documentKey, &txnClient](const auto& commandResponse) {
+                        write_ops::InsertCommandRequest skipIdInsert(_skipIdNss());
 
-                    InsertGlobalIndexKey globalIndexEntryInsert(_indexUUID);
-                    // Note: dbName is unused by command but required by idl.
-                    globalIndexEntryInsert.setDbName({boost::none, "admin"});
-                    globalIndexEntryInsert.setGlobalIndexKeyEntry(
-                        GlobalIndexKeyEntry(indexKeyValues, documentKey));
-
-                    return txnClient.runCommand(_nss.dbName(), globalIndexEntryInsert.toBSON({}))
-                        .thenRunOn(txnExec)
-                        .then([this, documentKey, &txnClient](const auto& commandResponse) {
-                            write_ops::InsertCommandRequest skipIdInsert(_skipIdNss());
-
-                            skipIdInsert.setDocuments({BSON("_id" << documentKey)});
-                            return txnClient.runCRUDOp({skipIdInsert}, {}).ignoreValue();
-                        })
-                        .semi();
-                })
-                .semi();
-        };
+                        skipIdInsert.setDocuments({BSON("_id" << documentKey)});
+                        return txnClient.runCRUDOp({skipIdInsert}, {}).ignoreValue();
+                    })
+                    .semi();
+            })
+            .semi();
+    };
 
     auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
-    auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(_executor);
-
-    txn_api::SyncTransactionWithRetries txn(opCtx, sleepInlineExecutor, nullptr, inlineExecutor);
+    txn_api::SyncTransactionWithRetries txn(opCtx, _executor, nullptr, inlineExecutor);
     txn.run(opCtx, insertToGlobalIndexFn);
 }
 

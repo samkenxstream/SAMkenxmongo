@@ -27,24 +27,20 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/storage/kv/kv_engine_test_harness.h"
-
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
 #include <boost/filesystem/path.hpp>
-#include <memory>
 
 #include "mongo/base/init.h"
+#include "mongo/db/concurrency/locker_noop.h"
 #include "mongo/db/global_settings.h"
-#include "mongo/db/operation_context_noop.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/storage/checkpointer.h"
+#include "mongo/db/storage/kv/kv_engine_test_harness.h"
 #include "mongo/db/storage/storage_engine_impl.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
@@ -56,7 +52,6 @@
 #include "mongo/util/clock_source_mock.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
-
 
 namespace mongo {
 namespace {
@@ -132,7 +127,7 @@ protected:
         opCtx->setRecoveryUnit(
             std::unique_ptr<RecoveryUnit>(_helper.getEngine()->newRecoveryUnit()),
             WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
-        opCtx->swapLockState(std::make_unique<LockerNoop>(), WithLock::withoutLock());
+        opCtx->getClient()->swapLockState(std::make_unique<LockerNoop>());
         return opCtx;
     }
 
@@ -278,33 +273,28 @@ TEST_F(WiredTigerKVEngineRepairTest, UnrecoverableOrphanedDataFilesAreRebuilt) {
 }
 
 TEST_F(WiredTigerKVEngineTest, TestOplogTruncation) {
+    // To diagnose any intermittent failures, maximize logging from WiredTigerKVEngine and friends.
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kStorage,
+                                                              logv2::LogSeverity::Debug(3)};
+
+    // Set syncdelay before starting the checkpoint thread, otherwise it can observe the default
+    // checkpoint frequency of 60 seconds, causing the test to fail due to a 10 second timeout.
+    storageGlobalParams.syncdelay.store(1);
+
     std::unique_ptr<Checkpointer> checkpointer = std::make_unique<Checkpointer>();
     checkpointer->go();
+
+    // If the test fails we want to ensure the checkpoint thread shuts down to avoid accessing the
+    // storage engine during shutdown.
+    ON_BLOCK_EXIT([&] {
+        checkpointer->shutdown({ErrorCodes::ShutdownInProgress, "Test finished"});
+    });
 
     auto opCtxPtr = _makeOperationContext();
     // The initial data timestamp has to be set to take stable checkpoints. The first stable
     // timestamp greater than this will also trigger a checkpoint. The following loop of the
-    // CheckpointThread will observe the new `checkpointDelaySecs` value.
+    // CheckpointThread will observe the new `syncdelay` value.
     _helper.getWiredTigerKVEngine()->setInitialDataTimestamp(Timestamp(1, 1));
-
-
-    // Ignore data race on this variable when running with TSAN, this is only an issue in this
-    // unittest and not in mongod
-    []()
-#if defined(__has_feature)
-#if __has_feature(thread_sanitizer)
-        __attribute__((no_sanitize("thread")))
-#endif
-#endif
-    {
-        storageGlobalParams.checkpointDelaySecs = 1;
-    }
-    ();
-
-
-    // To diagnose any intermittent failures, maximize logging from WiredTigerKVEngine and friends.
-    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kStorage,
-                                                              logv2::LogSeverity::Debug(3)};
 
     // Simulate the callback that queries config.transactions for the oldest active transaction.
     boost::optional<Timestamp> oldestActiveTxnTimestamp;
@@ -345,10 +335,9 @@ TEST_F(WiredTigerKVEngineTest, TestOplogTruncation) {
         }
 
         LOGV2(22367,
-              "Expected the pinned oplog to advance. Expected value: {newPinned} Published value: "
-              "{engine_getOplogNeededForCrashRecovery}",
-              "newPinned"_attr = newPinned,
-              "engine_getOplogNeededForCrashRecovery"_attr =
+              "Expected the pinned oplog to advance.",
+              "expectedValue"_attr = newPinned,
+              "publishedValue"_attr =
                   _helper.getWiredTigerKVEngine()->getOplogNeededForCrashRecovery());
         FAIL("");
     };
@@ -379,8 +368,6 @@ TEST_F(WiredTigerKVEngineTest, TestOplogTruncation) {
     _helper.getWiredTigerKVEngine()->setStableTimestamp(Timestamp(30, 1), false);
     callbackShouldFail.store(false);
     assertPinnedMovesSoon(Timestamp(40, 1));
-
-    checkpointer->shutdown({ErrorCodes::ShutdownInProgress, "Test finished"});
 }
 
 TEST_F(WiredTigerKVEngineTest, IdentDrop) {

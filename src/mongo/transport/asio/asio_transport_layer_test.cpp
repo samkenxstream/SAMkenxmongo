@@ -79,6 +79,17 @@ using SetsockoptPtr = char*;
 using SetsockoptPtr = void*;
 #endif
 
+std::string loadFile(std::string filename) try {
+    std::ifstream f;
+    f.exceptions(f.exceptions() | std::ios::failbit);
+    f.open(filename);
+    return {std::istreambuf_iterator<char>{f}, std::istreambuf_iterator<char>{}};
+} catch (const std::ifstream::failure& ex) {
+    auto ec = lastSystemError();
+    FAIL("Failed to load file: \"{}\": {}: {}"_format(filename, ex.what(), errorMessage(ec)));
+    MONGO_UNREACHABLE;
+}
+
 class JoinThread : public stdx::thread {
 public:
     using stdx::thread::thread;
@@ -625,15 +636,17 @@ TEST(AsioTransportLayer, EgressConnectionResetByPeerDuringSessionCtor) {
 
     // `fp` pauses the `AsioSession` constructor immediately prior to its
     // `setsockopt` sequence, to allow time for the peer reset to propagate.
-    FailPoint& fp = transport::asioTransportLayerSessionPauseBeforeSetSocketOption;
+    auto fp = std::make_unique<FailPointEnableBlock>(
+        "asioTransportLayerSessionPauseBeforeSetSocketOption");
 
     Acceptor server(ioContext);
     server.setOnAccept([&](std::shared_ptr<Acceptor::Connection> conn) {
+        LOGV2(7598701, "waiting for the client to reach the fail-point");
+        (*fp)->waitForTimesEntered(fp->initialTimesEntered() + 1);
         LOGV2(6101604, "handling a connection by resetting it");
         conn->socket.set_option(asio::socket_base::linger(true, 0));
         conn->socket.close();
-        sleepFor(Seconds{1});
-        fp.setMode(FailPoint::off);
+        fp.reset();
     });
     JoinThread ioThread{[&] {
         ioContext.run();
@@ -642,7 +655,6 @@ TEST(AsioTransportLayer, EgressConnectionResetByPeerDuringSessionCtor) {
         ioContext.stop();
     };
 
-    fp.setMode(FailPoint::alwaysOn);
     LOGV2(6101602, "Connecting", "port"_attr = server.port());
     using namespace unittest::match;
     // On MacOS, calling `setsockopt` on a peer-reset connection yields an
@@ -835,11 +847,7 @@ TEST_F(AsioTransportLayerWithServiceContextTest, ShutdownDuringSSLHandshake) {
     conn.setSoTimeout(1);  // 1 second timeout
 
     TransientSSLParams params;
-    params.sslClusterPEMPayload = [] {
-        std::ifstream input("jstests/libs/client.pem");
-        std::string str((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-        return str;
-    }();
+    params.sslClusterPEMPayload = loadFile("jstests/libs/client.pem");
     params.targetedClusterConnectionString = ConnectionString::forLocal();
 
     auto status = conn.connectSocketOnly({"localhost", port}, std::move(params));
@@ -851,30 +859,25 @@ TEST_F(AsioTransportLayerWithServiceContextTest, ShutdownDuringSSLHandshake) {
 #ifdef __linux__
 
 /**
- * Helper constants to be used as template parameters for AsioNetworkingBatonTest. Indicates
- * whether the test is allowed to accept connections after establishing the first Session associated
- * with `_client`.
- */
-enum class AllowMultipleSessions : bool {};
-
-/**
  * Creates a connection between a client and a server, then runs tests against the
  * `AsioNetworkingBaton` associated with the server-side of the connection (i.e., `Client`). The
  * client-side of this connection is associated with `_connThread`, and the server-side is wrapped
  * inside `_client`.
- *
- * Instantiated with `shouldAllowMultipleSessions` which indicates whether the listener thread for
- * this test's transport layer should accept more than the connection initially established by
- * `_client`.
  */
-template <AllowMultipleSessions shouldAllowMultipleSessions>
 class AsioNetworkingBatonTest : public LockerNoopServiceContextTest {
-    // A service entry point that emplaces a Future with the ingress session corresponding to the
-    // first connection.
+public:
+    /**
+     * Emplaces a Promise with the first ingress session. Can optionally accept
+     * further sessions, of which it takes co-ownership.
+     */
     class FirstSessionSEP : public ServiceEntryPoint {
     public:
         explicit FirstSessionSEP(Promise<std::shared_ptr<transport::Session>> promise)
             : _promise(std::move(promise)) {}
+
+        ~FirstSessionSEP() override {
+            _join();
+        }
 
         Status start() override {
             return Status::OK();
@@ -887,32 +890,48 @@ class AsioNetworkingBatonTest : public LockerNoopServiceContextTest {
         }
 
         void startSession(std::shared_ptr<transport::Session> session) override {
-            if (!_isEmplaced) {
-                _promise.emplaceValue(std::move(session));
-                _isEmplaced = true;
+            stdx::lock_guard lk{_mutex};
+            _sessions.push_back(session);
+            if (_promise) {
+                _promise->emplaceValue(std::move(session));
+                _promise.reset();
                 return;
             }
-            invariant(static_cast<bool>(shouldAllowMultipleSessions),
-                      "Created a second ingress Session when only one was expected.");
+            invariant(_allowMultipleSessions, "Unexpected multiple ingress sessions");
         }
 
-        void endAllSessions(transport::Session::TagMask) override {}
+        void endAllSessions(transport::Session::TagMask) override {
+            _join();
+        }
 
         bool shutdown(Milliseconds) override {
+            _join();
             return true;
         }
 
         size_t numOpenSessions() const override {
-            MONGO_UNREACHABLE;
+            stdx::lock_guard lk{_mutex};
+            return _sessions.size();
         }
 
         logv2::LogSeverity slowSessionWorkflowLogSeverity() override {
             MONGO_UNIMPLEMENTED;
         }
 
+        void setAllowMultipleSessions() {
+            _allowMultipleSessions = true;
+        }
+
     private:
-        Promise<std::shared_ptr<transport::Session>> _promise;
-        bool _isEmplaced = false;
+        void _join() {
+            stdx::lock_guard lk{_mutex};
+            _sessions.clear();
+        }
+
+        bool _allowMultipleSessions = false;
+        mutable Mutex _mutex;
+        std::vector<std::shared_ptr<transport::Session>> _sessions;
+        boost::optional<Promise<std::shared_ptr<transport::Session>>> _promise;
     };
 
     // Used for setting and canceling timers on the networking baton. Does not offer any timer
@@ -928,11 +947,14 @@ class AsioNetworkingBatonTest : public LockerNoopServiceContextTest {
         }
     };
 
-public:
+    virtual void configureSep(FirstSessionSEP& sep) {}
+
     void setUp() override {
         auto pf = makePromiseFuture<std::shared_ptr<transport::Session>>();
         auto servCtx = getServiceContext();
-        servCtx->setServiceEntryPoint(std::make_unique<FirstSessionSEP>(std::move(pf.promise)));
+        auto sep = std::make_unique<FirstSessionSEP>(std::move(pf.promise));
+        configureSep(*sep);
+        servCtx->setServiceEntryPoint(std::move(sep));
 
         auto tla = makeTLA(servCtx->getServiceEntryPoint());
         const auto listenerPort = tla->listenerPort();
@@ -964,10 +986,12 @@ private:
     std::unique_ptr<ConnectionThread> _connThread;
 };
 
-class IngressAsioNetworkingBatonTest
-    : public AsioNetworkingBatonTest<AllowMultipleSessions{false}> {};
+class IngressAsioNetworkingBatonTest : public AsioNetworkingBatonTest {};
 
-class EgressAsioNetworkingBatonTest : public AsioNetworkingBatonTest<AllowMultipleSessions{true}> {
+class EgressAsioNetworkingBatonTest : public AsioNetworkingBatonTest {
+    void configureSep(FirstSessionSEP& sep) override {
+        sep.setAllowMultipleSessions();
+    }
 };
 
 // A `JoinThread` that waits for a ready signal from its underlying worker thread before returning

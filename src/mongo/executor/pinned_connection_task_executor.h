@@ -135,19 +135,23 @@ private:
     // If we already have a _stream when this function is called, ensures the
     // remote is `target` and returns a ready-future. Otherwise asynchronously
     // initailizes _stream and returns a future that resolves once _stream is ready.
-    ExecutorFuture<void> _ensureStream(WithLock, HostAndPort target, Milliseconds timeout);
+    ExecutorFuture<void> _ensureStream(WithLock,
+                                       HostAndPort target,
+                                       Milliseconds timeout,
+                                       transport::ConnectSSLMode sslMode);
 
     // Start processing pending/queued RPCs.
     void _doNetworking(stdx::unique_lock<Latch>&&);
 
-    // Asynchronously invoke the RPC `command` and return a future of its response.
+    // CallbackState for RPCs. Non-RPC callbacks use the CallbackState from the _underlyingExecutor.
+    class CallbackState;
+
+    // Invoke the RPC and return a future of its response.
     Future<RemoteCommandResponse> _runSingleCommand(RemoteCommandRequest command,
-                                                    BatonHandle baton);
+                                                    std::shared_ptr<CallbackState> cbState);
 
     void _shutdown(WithLock);
 
-    // CallbackState for RPCs. Non-RPC callbacks use the CallbackState from the _underlyingExecutor.
-    class CallbackState;
     // Alias for an RPC request and the associated CallbackState.
     using RequestAndCallback = std::pair<RemoteCommandRequest, std::shared_ptr<CallbackState>>;
 
@@ -183,6 +187,7 @@ private:
     // RPCs scheduled through this executor.
     std::unique_ptr<NetworkInterface::LeasedStream> _stream;
     bool _isDoingNetworking{false};
+    std::shared_ptr<CallbackState> _inProgressRequest;
 
     enum class State { running, joinRequired, joining, shutdownComplete };
     State _state = State::running;

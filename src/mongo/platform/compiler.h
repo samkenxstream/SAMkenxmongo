@@ -177,6 +177,14 @@
  *    function will return a pointer to, potentially allowing static
  *    analysis of use of the region when the argument to the
  *    allocation function is a constant expression.
+ *
+ *
+ * MONGO_GSL_POINTER
+ *
+ *    Hints to the compiler that this type is a gsl::Pointer type,
+ *    which will produce a compiler warning if this type is assigned
+ *    a temporary (xvalue) gsl::Owner type (such as std::string). This
+ *    matches the annotation libc++ uses for std::string_view.
  */
 
 
@@ -186,4 +194,10 @@
 #include "mongo/platform/compiler_gcc.h"
 #else
 #error "Unsupported compiler family"
+#endif
+
+// Define clang's has_feature macro for other compilers
+// See https://clang.llvm.org/docs/LanguageExtensions.html#has-feature-and-has-extension
+#if !defined(__has_feature)
+#define __has_feature(x) 0
 #endif

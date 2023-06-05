@@ -167,9 +167,18 @@ public:
                                             const NamespaceString& newNss,
                                             UUID collUuid) {
         uasserted(ErrorCodes::QueryPlanKilled,
-                  str::stream() << "collection renamed from '" << oldNss << "' to '" << newNss
-                                << "'. UUID " << collUuid);
+                  str::stream() << "collection renamed from '" << oldNss.toStringForErrorMsg()
+                                << "' to '" << newNss.toStringForErrorMsg() << "'. UUID "
+                                << collUuid);
     }
+
+    /**
+     * Returns the policy that this operation should use, accounting for any special circumstances,
+     * and otherwise the desired policy. Should always be used when constructing a PlanYieldPolicy.
+     */
+    static YieldPolicy getPolicyOverrideForOperation(OperationContext* opCtx, YieldPolicy desired);
+
+    class YieldThroughAcquisitions {};
 
     /**
      * Constructs a PlanYieldPolicy of the given 'policy' type. This class uses an ElapsedTracker
@@ -177,13 +186,17 @@ public:
      * 'yieldIterations' and 'yieldPeriod'.
      *
      * If provided, the given 'yieldable' is released and restored by the 'PlanYieldPolicy' (in
-     * addition to releasing/restoring locks and the storage engine snapshot).
+     * addition to releasing/restoring locks and the storage engine snapshot). The provided 'policy'
+     * will be overridden depending on the nature of this operation. For example, multi-document
+     * transactions will always downgrade to INTERRUPT_ONLY, and operations with recursively held
+     * locks will downgrade to NO_YIELD.
      */
-    PlanYieldPolicy(YieldPolicy policy,
+    PlanYieldPolicy(OperationContext* opCtx,
+                    YieldPolicy policy,
                     ClockSource* cs,
                     int yieldIterations,
                     Milliseconds yieldPeriod,
-                    const Yieldable* yieldable,
+                    stdx::variant<const Yieldable*, YieldThroughAcquisitions> yieldable,
                     std::unique_ptr<const YieldPolicyCallbacks> callbacks);
 
     virtual ~PlanYieldPolicy() = default;
@@ -273,7 +286,12 @@ public:
     }
 
     void setYieldable(const Yieldable* yieldable) {
+        invariant(!usesCollectionAcquisitions());
         _yieldable = yieldable;
+    }
+
+    bool usesCollectionAcquisitions() const {
+        return stdx::holds_alternative<YieldThroughAcquisitions>(_yieldable);
     }
 
 private:
@@ -303,9 +321,11 @@ private:
     void performYield(OperationContext* opCtx,
                       const Yieldable& yieldable,
                       std::function<void()> whileYieldingFn);
+    void performYieldWithAcquisitions(OperationContext* opCtx,
+                                      std::function<void()> whileYieldingFn);
 
     const YieldPolicy _policy;
-    const Yieldable* _yieldable;
+    stdx::variant<const Yieldable*, YieldThroughAcquisitions> _yieldable;
     std::unique_ptr<const YieldPolicyCallbacks> _callbacks;
 
     bool _forceYield = false;

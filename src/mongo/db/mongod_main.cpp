@@ -66,12 +66,13 @@
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/feature_compatibility_version_gen.h"
+#include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/shutdown.h"
 #include "mongo/db/commands/test_commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/flow_control_ticketholder.h"
-#include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/concurrency/locker_impl.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -97,6 +98,7 @@
 #include "mongo/db/mirror_maestro.h"
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/fallback_op_observer.h"
 #include "mongo/db/op_observer/fcv_op_observer.h"
 #include "mongo/db/op_observer/op_observer_impl.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
@@ -140,9 +142,10 @@
 #include "mongo/db/s/config/configsvr_coordinator_service.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/config_server_op_observer.h"
+#include "mongo/db/s/migration_chunk_cloner_source_op_observer.h"
 #include "mongo/db/s/migration_util.h"
+#include "mongo/db/s/move_primary/move_primary_donor_service.h"
 #include "mongo/db/s/move_primary/move_primary_recipient_service.h"
-#include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/s/periodic_sharded_index_consistency_checker.h"
 #include "mongo/db/s/query_analysis_op_observer.h"
 #include "mongo/db/s/rename_collection_participant_service.h"
@@ -184,7 +187,7 @@
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/system_index.h"
-#include "mongo/db/transaction/internal_transactions_reap_service.h"
+#include "mongo/db/timeseries/timeseries_op_observer.h"
 #include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
 #include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/db/ttl.h"
@@ -204,6 +207,7 @@
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/query_analysis_client.h"
 #include "mongo/s/query_analysis_sampler.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/scripting/engine.h"
@@ -381,6 +385,7 @@ void registerPrimaryOnlyServices(ServiceContext* serviceContext) {
         services.push_back(std::make_unique<ReshardingRecipientService>(serviceContext));
         services.push_back(std::make_unique<TenantMigrationDonorService>(serviceContext));
         services.push_back(std::make_unique<repl::TenantMigrationRecipientService>(serviceContext));
+        services.push_back(std::make_unique<MovePrimaryDonorService>(serviceContext));
         services.push_back(std::make_unique<MovePrimaryRecipientService>(serviceContext));
         if (getGlobalReplSettings().isServerless()) {
             services.push_back(std::make_unique<repl::ShardMergeRecipientService>(serviceContext));
@@ -415,6 +420,12 @@ MONGO_FAIL_POINT_DEFINE(shutdownAtStartup);
 // any necessary changes are also made to File Copy Based Initial Sync.
 ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     Client::initThread("initandlisten");
+
+    // TODO(SERVER-74659): Please revisit if this thread could be made killable.
+    {
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationUnkillableByStepdown(lk);
+    }
 
     serviceContext->setFastClockSource(FastClockSourceFactory::create(Milliseconds(10)));
 
@@ -699,7 +710,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     WaitForMajorityService::get(serviceContext).startup(serviceContext);
 
     if (!serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
-        // A catalog shard initializes sharding awareness after setting up its config server state.
+        // A config shard initializes sharding awareness after setting up its config server state.
 
         // This function may take the global lock.
         initializeShardingAwarenessIfNeededAndLoadGlobalSettings(startupOpCtx.get());
@@ -809,6 +820,17 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
                 "maintenance and no other clients are connected. The TTL collection monitor will "
                 "not start because of this. For more info see "
                 "http://dochub.mongodb.org/core/ttlcollections");
+
+            if (gAllowUnsafeUntimestampedWrites &&
+                !repl::ReplSettings::shouldRecoverFromOplogAsStandalone()) {
+                LOGV2_WARNING_OPTIONS(
+                    7692300,
+                    {logv2::LogTag::kStartupWarnings},
+                    "Replica set member is in standalone mode. Performing any writes will result "
+                    "in them being untimestamped. If a write is to an existing document, the "
+                    "document's history will be overwritten with the new value since the beginning "
+                    "of time. This can break snapshot isolation within the storage engine.");
+            }
         } else {
             startTTLMonitor(serviceContext);
         }
@@ -906,7 +928,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
 
     LogicalSessionCache::set(serviceContext, makeLogicalSessionCacheD(kind));
 
-    if (analyze_shard_key::supportsSamplingQueries(serviceContext, true /* ignoreFCV */) &&
+    if (analyze_shard_key::supportsSamplingQueries(serviceContext) &&
         serverGlobalParams.clusterRole.has(ClusterRole::None)) {
         analyze_shard_key::QueryAnalysisSampler::get(serviceContext).onStartup();
     }
@@ -1154,6 +1176,9 @@ auto makeReplicaSetNodeExecutor(ServiceContext* serviceContext) {
     tpOptions.maxThreads = ThreadPool::Options::kUnlimited;
     tpOptions.onCreateThread = [](const std::string& threadName) {
         Client::initThread(threadName.c_str());
+
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationUnkillableByStepdown(lk);
     };
     auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
     hookList->addHook(std::make_unique<rpc::VectorClockMetadataHook>(serviceContext));
@@ -1170,6 +1195,9 @@ auto makeReplicationExecutor(ServiceContext* serviceContext) {
     tpOptions.maxThreads = 50;
     tpOptions.onCreateThread = [](const std::string& threadName) {
         Client::initThread(threadName.c_str());
+
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationUnkillableByStepdown(lk);
     };
     auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
     hookList->addHook(std::make_unique<rpc::VectorClockMetadataHook>(serviceContext));
@@ -1212,9 +1240,15 @@ void setUpReplication(ServiceContext* serviceContext) {
         SecureRandom().nextInt64());
     // Only create a ReplicaSetNodeExecutor if sharding is disabled and replication is enabled.
     // Note that sharding sets up its own executors for scheduling work to remote nodes.
-    if (serverGlobalParams.clusterRole.has(ClusterRole::None) && replCoord->isReplEnabled())
+    if (serverGlobalParams.clusterRole.has(ClusterRole::None) && replCoord->isReplEnabled()) {
         ReplicaSetNodeProcessInterface::setReplicaSetNodeExecutor(
             serviceContext, makeReplicaSetNodeExecutor(serviceContext));
+
+        analyze_shard_key::QueryAnalysisClient::get(serviceContext)
+            .setTaskExecutor(
+                serviceContext,
+                ReplicaSetNodeProcessInterface::getReplicaSetNodeExecutor(serviceContext));
+    }
 
     repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
 
@@ -1235,8 +1269,9 @@ void setUpObservers(ServiceContext* serviceContext) {
     if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer)) {
         DurableHistoryRegistry::get(serviceContext)
             ->registerPin(std::make_unique<ReshardingHistoryHook>());
-        opObserverRegistry->addObserver(std::make_unique<OpObserverShardingImpl>(
+        opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>(
             std::make_unique<OplogWriterTransactionProxy>(std::make_unique<OplogWriterImpl>())));
+        opObserverRegistry->addObserver(std::make_unique<MigrationChunkClonerSourceOpObserver>());
         opObserverRegistry->addObserver(std::make_unique<ShardServerOpObserver>());
         opObserverRegistry->addObserver(std::make_unique<ReshardingOpObserver>());
         opObserverRegistry->addObserver(std::make_unique<repl::TenantMigrationDonorOpObserver>());
@@ -1274,6 +1309,8 @@ void setUpObservers(ServiceContext* serviceContext) {
         }
     }
 
+    opObserverRegistry->addObserver(std::make_unique<FallbackOpObserver>());
+    opObserverRegistry->addObserver(std::make_unique<TimeSeriesOpObserver>());
     opObserverRegistry->addObserver(std::make_unique<AuthOpObserver>());
     opObserverRegistry->addObserver(
         std::make_unique<repl::PrimaryOnlyServiceOpObserver>(serviceContext));
@@ -1297,17 +1334,17 @@ MONGO_INITIALIZER_GENERAL(setSSLManagerType, (), ("SSLManager"))
 }
 #endif
 
-#if !defined(__has_feature)
-#define __has_feature(x) 0
-#endif
-
 // NOTE: This function may be called at any time after registerShutdownTask is called below. It
 // must not depend on the prior execution of mongo initializers or the existence of threads.
 void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     // This client initiation pattern is only to be used here, with plans to eliminate this pattern
     // down the line.
-    if (!haveClient())
+    if (!haveClient()) {
         Client::initThread(getThreadName());
+
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationUnkillableByStepdown(lk);
+    }
 
     auto const client = Client::getCurrent();
     auto const serviceContext = client->getServiceContext();
@@ -1323,6 +1360,14 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     if (MONGO_unlikely(hangBeforeShutdown.shouldFail())) {
         LOGV2(4944800, "Hanging before shutdown due to hangBeforeShutdown failpoint");
         hangBeforeShutdown.pauseWhileSet();
+    }
+
+    // Before doing anything else, ensure fsync is inactive or make it release its GlobalRead lock.
+    {
+        stdx::unique_lock<Latch> stateLock(fsyncStateMutex);
+        if (globalFsyncLockThread) {
+            globalFsyncLockThread->shutdown(stateLock);
+        }
     }
 
     // If we don't have shutdownArgs, we're shutting down from a signal, or other clean shutdown
@@ -1392,7 +1437,7 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         lsc->joinOnShutDown();
     }
 
-    if (analyze_shard_key::supportsSamplingQueries(serviceContext, true /* ignoreFCV */)) {
+    if (analyze_shard_key::supportsSamplingQueries(serviceContext)) {
         LOGV2_OPTIONS(7350601, {LogComponent::kDefault}, "Shutting down the QueryAnalysisSampler");
         analyze_shard_key::QueryAnalysisSampler::get(serviceContext).onShutdown();
     }
@@ -1511,7 +1556,10 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     LOGV2_OPTIONS(4784918, {LogComponent::kNetwork}, "Shutting down the ReplicaSetMonitor");
     ReplicaSetMonitor::shutdown();
 
-    if (auto sr = Grid::get(serviceContext)->shardRegistry()) {
+    auto sr = Grid::get(serviceContext)->isInitialized()
+        ? Grid::get(serviceContext)->shardRegistry()
+        : nullptr;
+    if (sr) {
         LOGV2_OPTIONS(4784919, {LogComponent::kSharding}, "Shutting down the shard registry");
         sr->shutdown();
     }
@@ -1528,6 +1576,14 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         validator->shutDown();
     }
 
+    auto pool = Grid::get(serviceContext)->isInitialized()
+        ? Grid::get(serviceContext)->getExecutorPool()
+        : nullptr;
+    if (pool) {
+        LOGV2_OPTIONS(6773200, {LogComponent::kSharding}, "Shutting down the ExecutorPool");
+        pool->shutdownAndJoin();
+    }
+
     // The migrationutil executor must be shut down before shutting down the CatalogCacheLoader.
     // Otherwise, it may try to schedule work on the CatalogCacheLoader and fail.
     LOGV2_OPTIONS(4784921, {LogComponent::kSharding}, "Shutting down the MigrationUtilExecutor");
@@ -1535,7 +1591,12 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     migrationUtilExecutor->shutdown();
     migrationUtilExecutor->join();
 
-    if (ShardingState::get(serviceContext)->enabled()) {
+    if (Grid::get(serviceContext)->isShardingInitialized()) {
+        // The CatalogCache must be shuted down before shutting down the CatalogCacheLoader as the
+        // CatalogCache may try to schedule work on CatalogCacheLoader and fail.
+        LOGV2_OPTIONS(6773201, {LogComponent::kSharding}, "Shutting down the CatalogCache");
+        Grid::get(serviceContext)->catalogCache()->shutDownAndJoin();
+
         LOGV2_OPTIONS(4784922, {LogComponent::kSharding}, "Shutting down the CatalogCacheLoader");
         CatalogCacheLoader::get(serviceContext).shutDown();
     }
@@ -1685,8 +1746,6 @@ int mongod_main(int argc, char* argv[]) {
     setUpReplication(service);
     setUpObservers(service);
     service->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(service));
-    SessionCatalog::get(service)->setOnEagerlyReapedSessionsFn(
-        InternalTransactionsReapService::onEagerlyReapedSessions);
 
     ErrorExtraInfo::invariantHaveAllParsers();
 

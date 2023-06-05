@@ -115,10 +115,6 @@ public:
         // onStepUp() relies on the storage interface to create the config.transactions table.
         repl::StorageInterface::set(getServiceContext(),
                                     std::make_unique<repl::StorageInterfaceImpl>());
-        MongoDSessionCatalog::set(
-            getServiceContext(),
-            std::make_unique<MongoDSessionCatalog>(
-                std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
         auto mongoDSessionCatalog = MongoDSessionCatalog::get(operationContext());
         mongoDSessionCatalog->onStepUp(operationContext());
         LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
@@ -217,7 +213,7 @@ public:
     }
 
     void create(NamespaceString nss) {
-        writeConflictRetry(_opCtx, "create", nss.ns(), [&] {
+        writeConflictRetry(_opCtx, "create", nss, [&] {
             AllowLockAcquisitionOnTimestampedUnitOfWork allowLockAcquisition(_opCtx->lockState());
             AutoGetDb autoDb(_opCtx, nss.dbName(), LockMode::MODE_X);
             WriteUnitOfWork wunit(_opCtx);
@@ -228,7 +224,7 @@ public:
             OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
                 unsafeCreateCollection(_opCtx);
             auto db = autoDb.ensureDbExists(_opCtx);
-            ASSERT(db->createCollection(_opCtx, nss)) << nss;
+            ASSERT(db->createCollection(_opCtx, nss)) << nss.toStringForErrorMsg();
             wunit.commit();
         });
     }
@@ -248,7 +244,10 @@ public:
             onCommand([&](const executor::RemoteCommandRequest& request) -> StatusWith<BSONObj> {
                 DBDirectClient client(cc().getOperationContext());
                 BSONObj result;
-                bool res = client.runCommand({boost::none, request.dbname}, request.cmdObj, result);
+                bool res = client.runCommand(
+                    DatabaseName::createDatabaseName_forTest(boost::none, request.dbname),
+                    request.cmdObj,
+                    result);
                 if (res == false || result.hasField("cursorsKilled") ||
                     result["cursor"]["id"].Long() == 0) {
                     hasMore = false;
@@ -301,7 +300,7 @@ public:
                     dataColl.getCollection()->uuid(),
                     BSON(
                         "msg" << fmt::format("Writes to {} are temporarily blocked for resharding.",
-                                             dataColl.getCollection()->ns().toString())),
+                                             dataColl.getCollection()->ns().toString_forTest())),
                     BSON("type" << resharding::kReshardFinalOpLogType << "reshardingUUID"
                                 << _reshardingUUID),
                     boost::none,

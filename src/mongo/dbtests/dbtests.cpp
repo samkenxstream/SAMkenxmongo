@@ -181,14 +181,14 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
 WriteContextForTests::WriteContextForTests(OperationContext* opCtx, StringData ns)
     : _opCtx(opCtx), _nss(ns) {
     // Lock the database and collection
-    _autoDb.emplace(opCtx, _nss.db(), MODE_IX);
+    _autoDb.emplace(opCtx, _nss.dbName(), MODE_IX);
     _collLock.emplace(opCtx, _nss, MODE_IX);
 
     const bool doShardVersionCheck = false;
 
     _clientContext.emplace(opCtx, _nss, doShardVersionCheck);
     auto db = _autoDb->ensureDbExists(opCtx);
-    invariant(db, _nss.ns());
+    invariant(db, _nss.toStringForErrorMsg());
     invariant(db == _clientContext->db());
 
     // If the collection exists, there is no need to lock into stronger mode

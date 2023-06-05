@@ -113,7 +113,7 @@ BSONObj fixQuery(const BSONObj& obj, BsonTemplateEvaluator& btl) {
         return obj;
 
     BSONObjBuilder b(obj.objsize() + 128);
-    verify(BsonTemplateEvaluator::StatusSuccess == btl.evaluate(obj, b));
+    MONGO_verify(BsonTemplateEvaluator::StatusSuccess == btl.evaluate(obj, b));
     return b.obj();
 }
 
@@ -179,7 +179,7 @@ void abortTransaction(DBClientBase* conn,
     BSONObj abortTransactionCmd = BSON("abortTransaction" << 1);
     BSONObj abortCommandResult;
     const bool successful = runCommandWithSession(conn,
-                                                  DatabaseName(boost::none, "admin"),
+                                                  DatabaseName::kAdmin,
                                                   abortTransactionCmd,
                                                   kMultiStatementTransactionOption,
                                                   lsid,
@@ -840,7 +840,7 @@ void BenchRunState::tellWorkersToCollectStats() {
 
 void BenchRunState::assertFinished() const {
     stdx::lock_guard<Latch> lk(_mutex);
-    verify(0 == _numUnstartedWorkers + _numActiveWorkers);
+    MONGO_verify(0 == _numUnstartedWorkers + _numActiveWorkers);
 }
 
 bool BenchRunState::shouldWorkerFinish() const {
@@ -853,7 +853,7 @@ bool BenchRunState::shouldWorkerCollectStats() const {
 
 void BenchRunState::onWorkerStarted() {
     stdx::lock_guard<Latch> lk(_mutex);
-    verify(_numUnstartedWorkers > 0);
+    MONGO_verify(_numUnstartedWorkers > 0);
     --_numUnstartedWorkers;
     ++_numActiveWorkers;
     if (_numUnstartedWorkers == 0) {
@@ -863,7 +863,7 @@ void BenchRunState::onWorkerStarted() {
 
 void BenchRunState::onWorkerFinished() {
     stdx::lock_guard<Latch> lk(_mutex);
-    verify(_numActiveWorkers > 0);
+    MONGO_verify(_numActiveWorkers > 0);
     --_numActiveWorkers;
     if (_numActiveWorkers + _numUnstartedWorkers == 0) {
         _stateChangeCondition.notify_all();
@@ -907,7 +907,7 @@ bool BenchRunWorker::shouldCollectStats() const {
  * Executes the workload on a worker thread. This is the main routine for benchRunXXX() benchmarks.
  */
 void BenchRunWorker::generateLoadOnConnection(DBClientBase* conn) {
-    verify(conn);
+    MONGO_verify(conn);
     long long count = 0;
     Timer timer;
 
@@ -926,8 +926,7 @@ void BenchRunWorker::generateLoadOnConnection(DBClientBase* conn) {
         BSONObj result;
         uassert(40640,
                 str::stream() << "Unable to create session due to error " << result,
-                conn->runCommand(
-                    DatabaseName(boost::none, "admin"), BSON("startSession" << 1), result));
+                conn->runCommand(DatabaseName::kAdmin, BSON("startSession" << 1), result));
 
         lsid.emplace(LogicalSessionIdToClient::parse(IDLParserContext("lsid"), result["id"].Obj()));
     }
@@ -1085,7 +1084,7 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
                            "namespace"_attr = this->ns,
                            "expected"_attr = this->expectedDoc,
                            "got"_attr = result);
-                verify(false);
+                MONGO_verify(false);
             }
         } break;
         case OpType::COMMAND: {
@@ -1093,12 +1092,13 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
             BSONObj result;
             {
                 BenchRunEventTrace _bret(&state->stats->commandCounter);
-                ok = runCommandWithSession(conn,
-                                           DatabaseName(this->tenantId, this->ns),
-                                           fixQuery(this->command, *state->bsonTemplateEvaluator),
-                                           this->options,
-                                           lsid,
-                                           &result);
+                ok = runCommandWithSession(
+                    conn,
+                    DatabaseName::createDatabaseName_forTest(this->tenantId, this->ns),
+                    fixQuery(this->command, *state->bsonTemplateEvaluator),
+                    this->options,
+                    lsid,
+                    &result);
             }
             if (!ok) {
                 ++state->stats->errCount;
@@ -1115,12 +1115,13 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
                     uassert(ErrorCodes::CommandFailed,
                             str::stream()
                                 << "getMore command failed; reply was: " << getMoreCommandResult,
-                            runCommandWithSession(conn,
-                                                  DatabaseName(this->tenantId, this->ns),
-                                                  getMoreRequest.toBSON({}),
-                                                  kNoOptions,
-                                                  lsid,
-                                                  &getMoreCommandResult));
+                            runCommandWithSession(
+                                conn,
+                                DatabaseName::createDatabaseName_forTest(this->tenantId, this->ns),
+                                getMoreRequest.toBSON({}),
+                                kNoOptions,
+                                lsid,
+                                &getMoreCommandResult));
                     cursorResponse =
                         uassertStatusOK(CursorResponse::parseFromBSON(getMoreCommandResult));
                     count += cursorResponse.getBatch().size();
@@ -1197,7 +1198,7 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
                            "namespace"_attr = this->ns,
                            "expected"_attr = this->expected,
                            "got"_attr = count);
-                verify(false);
+                MONGO_verify(false);
             }
             LOGV2_DEBUG(22798, 5, "Result from benchRun thread [query]", "count"_attr = count);
         } break;
@@ -1258,7 +1259,8 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
                     txnNumberForOp = state->txnNumber;
                 }
                 runCommandWithSession(conn,
-                                      DatabaseName(this->tenantId, nsToDatabaseSubstring(this->ns)),
+                                      DatabaseName::createDatabaseName_forTest(
+                                          this->tenantId, nsToDatabaseSubstring(this->ns)),
                                       builder.done(),
                                       kNoOptions,
                                       lsid,
@@ -1296,7 +1298,8 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
                     txnNumberForOp = state->txnNumber;
                 }
                 runCommandWithSession(conn,
-                                      DatabaseName(this->tenantId, nsToDatabaseSubstring(this->ns)),
+                                      DatabaseName::createDatabaseName_forTest(
+                                          this->tenantId, nsToDatabaseSubstring(this->ns)),
                                       builder.done(),
                                       kNoOptions,
                                       lsid,
@@ -1326,7 +1329,8 @@ void BenchRunOp::executeOnce(DBClientBase* conn,
                     txnNumberForOp = state->txnNumber;
                 }
                 runCommandWithSession(conn,
-                                      DatabaseName(this->tenantId, nsToDatabaseSubstring(this->ns)),
+                                      DatabaseName::createDatabaseName_forTest(
+                                          this->tenantId, nsToDatabaseSubstring(this->ns)),
                                       builder.done(),
                                       kNoOptions,
                                       lsid,
@@ -1574,7 +1578,7 @@ BSONObj BenchRunner::benchRunSync(const BSONObj& argsFake, void* data) {
  * give each worker all the entries to be executed round-robin until the 'seconds' timer expires.
  */
 BSONObj BenchRunner::benchRunOnce(const BSONObj& argsFake, void* data) {
-    verify(argsFake.firstElement().isABSONObj());
+    MONGO_verify(argsFake.firstElement().isABSONObj());
     BSONObj args = argsFake.firstElement().Obj();
 
     // Add a config field to indicate this variant.
@@ -1590,7 +1594,7 @@ BSONObj BenchRunner::benchRunOnce(const BSONObj& argsFake, void* data) {
  * benchRun( { ops : [] , host : XXX , db : XXXX , parallel : 5 , seconds : 5 }
  */
 BSONObj BenchRunner::benchStart(const BSONObj& argsFake, void* data) {
-    verify(argsFake.firstElement().isABSONObj());
+    MONGO_verify(argsFake.firstElement().isABSONObj());
     BSONObj args = argsFake.firstElement().Obj();
 
     // Get new BenchRunner object

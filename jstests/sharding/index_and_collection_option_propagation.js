@@ -6,8 +6,9 @@
  *
  * This test verifies this behavior.
  *
- * Shuts down shard0, which also shuts down the config server. See if the test can be reworked.
- * @tags: [temporary_catalog_shard_incompatible]
+ * Shuts down shard0, which also shuts down the config server. Tests mongos targeting, which won't
+ * be affected by a config shard.
+ * @tags: [config_shard_incompatible]
  */
 
 // This test shuts down a shard's node and because of this consistency checking
@@ -25,7 +26,7 @@ function checkShardIndexes(indexKey, shardsWithIndex, shardsWithoutIndex) {
             return [res, false];
         }
         assert.commandWorked(res);
-        for (index of res.cursor.firstBatch) {
+        for (let index of res.cursor.firstBatch) {
             if (index.key.hasOwnProperty(indexKey)) {
                 return [res, true];
             }
@@ -33,15 +34,15 @@ function checkShardIndexes(indexKey, shardsWithIndex, shardsWithoutIndex) {
         return [res, false];
     }
 
-    for (shard of shardsWithIndex) {
-        [listIndexesRes, foundIndex] = shardHasIndex(indexKey, shard);
+    for (let shard of shardsWithIndex) {
+        let [listIndexesRes, foundIndex] = shardHasIndex(indexKey, shard);
         assert(foundIndex,
                "expected to see index with key " + indexKey + " in listIndexes response from " +
                    shard + ": " + tojson(listIndexesRes));
     }
 
-    for (shard of shardsWithoutIndex) {
-        [listIndexesRes, foundIndex] = shardHasIndex(indexKey, shard);
+    for (let shard of shardsWithoutIndex) {
+        let [listIndexesRes, foundIndex] = shardHasIndex(indexKey, shard);
         assert(!foundIndex,
                "expected not to see index with key " + indexKey + " in listIndexes response from " +
                    shard + ": " + tojson(listIndexesRes));
@@ -64,18 +65,18 @@ function checkShardCollOption(optionKey, optionValue, shardsWithOption, shardsWi
         return [res, false];
     }
 
-    for (shard of shardsWithOption) {
-        [listCollsRes, foundOption] = shardHasOption(optionKey, optionValue, shard);
+    for (let shard of shardsWithOption) {
+        let [listCollsRes, foundOption] = shardHasOption(optionKey, optionValue, shard);
         assert(foundOption,
                "expected to see option " + optionKey + " in listCollections response from " +
                    shard + ": " + tojson(listCollsRes));
     }
 
-    for (shard of shardsWithoutOption) {
-        [listOptionsRes, foundOption] = shardHasOption(optionKey, optionValue, shard);
+    for (let shard of shardsWithoutOption) {
+        let [listOptionsRes, foundOption] = shardHasOption(optionKey, optionValue, shard);
         assert(!foundOption,
                "expected not to see option " + optionKey + " in listCollections response from " +
-                   shard + ": " + tojson(listCollsRes));
+                   shard + ": " + tojson(listOptionsRes));
     }
 }
 

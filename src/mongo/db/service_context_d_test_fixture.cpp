@@ -27,12 +27,7 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/service_context_d_test_fixture.h"
-
-#include <memory>
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/db/catalog/catalog_control.h"
@@ -48,6 +43,7 @@
 #include "mongo/db/s/collection_sharding_state_factory_shard.h"
 #include "mongo/db/service_entry_point_mongod.h"
 #include "mongo/db/storage/control/storage_control.h"
+#include "mongo/db/storage/execution_control/concurrency_adjustment_parameters_gen.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_engine_parameters_gen.h"
 #include "mongo/db/storage/storage_options.h"
@@ -58,13 +54,12 @@
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
-
 namespace mongo {
 
 ServiceContextMongoDTest::ServiceContextMongoDTest(Options options)
     : _journalListener(std::move(options._journalListener)),
       _tempDir("service_context_d_test_fixture") {
-    gStorageEngineConcurrencyAdjustmentAlgorithm = "";
+    gStorageEngineConcurrencyAdjustmentAlgorithm = "fixedConcurrentTransactions";
 
     if (options._forceDisableTableLogging) {
         storageGlobalParams.forceDisableTableLogging = true;
@@ -99,6 +94,7 @@ ServiceContextMongoDTest::ServiceContextMongoDTest(Options options)
     }
 
     auto const serviceContext = getServiceContext();
+
     if (options._useMockClock) {
         // Copied from dbtests.cpp. DBTests sets up a controlled mock clock while
         // ServiceContextMongoDTest uses the system clock. Tests moved from dbtests to unittests may
@@ -128,9 +124,12 @@ ServiceContextMongoDTest::ServiceContextMongoDTest(Options options)
 
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(serviceContext));
 
+    auto observerRegistry = std::make_unique<OpObserverRegistry>();
+    serviceContext->setOpObserver(std::move(observerRegistry));
+
     // Set up the periodic runner to allow background job execution for tests that require it.
-    auto runner = makePeriodicRunner(getServiceContext());
-    getServiceContext()->setPeriodicRunner(std::move(runner));
+    auto runner = makePeriodicRunner(serviceContext);
+    serviceContext->setPeriodicRunner(std::move(runner));
 
     storageGlobalParams.dbpath = _tempDir.path();
 
@@ -147,9 +146,8 @@ ServiceContextMongoDTest::ServiceContextMongoDTest(Options options)
     Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
     IndexBuildsCoordinator::set(serviceContext, std::make_unique<IndexBuildsCoordinatorMongod>());
     CollectionShardingStateFactory::set(
-        getServiceContext(),
-        std::make_unique<CollectionShardingStateFactoryShard>(getServiceContext()));
-    getServiceContext()->getStorageEngine()->notifyStartupComplete();
+        serviceContext, std::make_unique<CollectionShardingStateFactoryShard>(serviceContext));
+    serviceContext->getStorageEngine()->notifyStartupComplete();
 
     if (_journalListener) {
         serviceContext->getStorageEngine()->setJournalListener(_journalListener.get());

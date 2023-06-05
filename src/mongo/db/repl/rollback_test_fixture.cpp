@@ -67,12 +67,12 @@ ReplSettings createReplSettings() {
 
 class RollbackTestOpObserver : public OpObserverNoop {
 public:
-    using OpObserver::onDropCollection;
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   const UUID& uuid,
                                   std::uint64_t numRecords,
-                                  const CollectionDropType dropType) override {
+                                  const CollectionDropType dropType,
+                                  bool markFromMigrate) override {
         // If the oplog is not disabled for this namespace, then we need to reserve an op time for
         // the drop.
         if (!repl::ReplicationCoordinator::get(opCtx)->isOplogDisabledFor(opCtx, collectionName)) {
@@ -88,7 +88,10 @@ public:
 
 void RollbackTest::setUp() {
     ServiceContextMongoDTest::setUp();
-
+    {
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationUnkillableByStepdown(lk);
+    }
     _storageInterface = new StorageInterfaceRollback();
     auto serviceContext = getServiceContext();
     auto consistencyMarkers = std::make_unique<ReplicationConsistencyMarkersMock>();

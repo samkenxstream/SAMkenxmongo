@@ -48,6 +48,21 @@ namespace mongo {
 namespace metadata_consistency_util {
 
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(insertFakeInconsistencies);
+
+/*
+ * Emit a warning log containing information about the given inconsistency
+ */
+void logMetadataInconsistency(const MetadataInconsistencyItem& inconsistencyItem) {
+    // Please do not change the error code of this log message if not strictly necessary.
+    // Automated log ingestion system relies on this specific log message to monitor cluster.
+    // inconsistencies
+    LOGV2_WARNING(7514800,
+                  "Detected sharding metadata inconsistency",
+                  "inconsistency"_attr = inconsistencyItem);
+}
+
 void _checkShardKeyIndexInconsistencies(OperationContext* opCtx,
                                         const NamespaceString& nss,
                                         const ShardId& shardId,
@@ -67,7 +82,7 @@ void _checkShardKeyIndexInconsistencies(OperationContext* opCtx,
 
     std::vector<MetadataInconsistencyItem> tmpInconsistencies;
 
-    // Shards that do not own any chunks do not partecipate in the creation of new indexes, so they
+    // Shards that do not own any chunks do not participate in the creation of new indexes, so they
     // could potentially miss any indexes created after they no longer own chunks. Thus we first
     // perform a check optimistically without taking collection lock, if missing indexes are found
     // we check under the collection lock if this shard currently own any chunk and re-execute again
@@ -83,7 +98,7 @@ void _checkShardKeyIndexInconsistencies(OperationContext* opCtx,
     AutoGetCollection ac(opCtx, nss, MODE_IS);
     tassert(7531700,
             str::stream() << "Collection unexpectedly disappeared while holding database DDL lock: "
-                          << nss,
+                          << nss.toStringForErrorMsg(),
             ac);
 
     const auto scopedCsr =
@@ -98,11 +113,14 @@ void _checkShardKeyIndexInconsistencies(OperationContext* opCtx,
         return;
     }
 
-    tassert(7531702,
-            str::stream()
-                << "Collection unexpectedly became unsharded while holding database DDL lock: "
-                << nss,
-            optCollDescr->isSharded());
+    if (!optCollDescr->isSharded()) {
+        // The collection is registered as SHARDED in the sharding catalog. This shard has the
+        // collection locally but is marked as UNSHARDED.
+        inconsistencies.emplace_back(metadata_consistency_util::makeInconsistency(
+            MetadataInconsistencyTypeEnum::kShardThinksCollectionIsUnsharded,
+            ShardThinksCollectionIsUnshardedDetails{localColl->ns(), localColl->uuid(), shardId}));
+        return;
+    }
 
     if (!optCollDescr->currentShardHasAnyChunks()) {
         LOGV2_DEBUG(7531703,
@@ -119,9 +137,20 @@ void _checkShardKeyIndexInconsistencies(OperationContext* opCtx,
 }
 }  // namespace
 
+
+MetadataConsistencyCommandLevelEnum getCommandLevel(const NamespaceString& nss) {
+    if (nss.isAdminDB()) {
+        return MetadataConsistencyCommandLevelEnum::kClusterLevel;
+    } else if (nss.isCollectionlessCursorNamespace()) {
+        return MetadataConsistencyCommandLevelEnum::kDatabaseLevel;
+    } else {
+        return MetadataConsistencyCommandLevelEnum::kCollectionLevel;
+    }
+}
+
 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeQueuedPlanExecutor(
     OperationContext* opCtx,
-    const std::vector<MetadataInconsistencyItem>& inconsistencies,
+    std::vector<MetadataInconsistencyItem>&& inconsistencies,
     const NamespaceString& nss) {
 
     auto expCtx =
@@ -129,7 +158,19 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeQueuedPlanExecutor(
     auto ws = std::make_unique<WorkingSet>();
     auto root = std::make_unique<QueuedDataStage>(expCtx.get(), ws.get());
 
+    insertFakeInconsistencies.execute([&](const BSONObj& data) {
+        const auto numInconsistencies = data["numInconsistencies"].safeNumberLong();
+        for (int i = 0; i < numInconsistencies; i++) {
+            inconsistencies.emplace_back(makeInconsistency(
+                MetadataInconsistencyTypeEnum::kCollectionUUIDMismatch,
+                CollectionUUIDMismatchDetails{nss, ShardId{"shard"}, UUID::gen(), UUID::gen()}));
+        }
+    });
+
     for (auto&& inconsistency : inconsistencies) {
+        // Every inconsistency encountered need to be logged with the same format
+        // to allow log injestion systems to correctly detect them.
+        logMetadataInconsistency(inconsistency);
         WorkingSetID id = ws->allocate();
         WorkingSetMember* member = ws->get(id);
         member->keyData.clear();
@@ -176,7 +217,13 @@ CursorInitialReply createInitialCursorReplyMongod(OperationContext* opCtx,
         firstBatch.push_back(std::move(nextDoc));
     }
 
+    auto&& opDebug = CurOp::get(opCtx)->debug();
+    opDebug.additiveMetrics.nBatches = 1;
+    opDebug.additiveMetrics.nreturned = firstBatch.size();
+
     if (exec->isEOF()) {
+        opDebug.cursorExhausted = true;
+
         CursorInitialReply resp;
         InitialResponseCursor initRespCursor{std::move(firstBatch)};
         initRespCursor.setResponseCursorBase({0LL /* cursorId */, nss});
@@ -194,8 +241,13 @@ CursorInitialReply createInitialCursorReplyMongod(OperationContext* opCtx,
 
     CursorInitialReply resp;
     InitialResponseCursor initRespCursor{std::move(firstBatch)};
-    initRespCursor.setResponseCursorBase({pinnedCursor.getCursor()->cursorid(), nss});
+    const auto cursorId = pinnedCursor.getCursor()->cursorid();
+    initRespCursor.setResponseCursorBase({cursorId, nss});
     resp.setCursor(std::move(initRespCursor));
+
+    // Record the cursorID in CurOp.
+    opDebug.cursorid = cursorId;
+
     return resp;
 }
 
@@ -213,14 +265,15 @@ std::vector<MetadataInconsistencyItem> checkCollectionMetadataInconsistencies(
         const auto& localColl = *itLocalCollections;
         const auto& localUUID = localColl->uuid();
         const auto& localNss = localColl->ns();
-        const auto& nss = itCatalogCollections->getNss();
+        const auto& remoteNss = itCatalogCollections->getNss();
 
-        const auto cmp = nss.coll().compare(localNss.coll());
+        const auto cmp = remoteNss.coll().compare(localNss.coll());
         if (cmp < 0) {
             // Case where we have found a collection in the catalog client that it is not in the
             // local catalog.
             itCatalogCollections++;
         } else if (cmp == 0) {
+            const auto& nss = remoteNss;
             // Case where we have found same collection in the catalog client than in the local
             // catalog.
 
@@ -230,20 +283,24 @@ std::vector<MetadataInconsistencyItem> checkCollectionMetadataInconsistencies(
                 inconsistencies.emplace_back(makeInconsistency(
                     MetadataInconsistencyTypeEnum::kCollectionUUIDMismatch,
                     CollectionUUIDMismatchDetails{localNss, shardId, localUUID, UUID}));
+            } else {
+                _checkShardKeyIndexInconsistencies(opCtx,
+                                                   nss,
+                                                   shardId,
+                                                   itCatalogCollections->getKeyPattern().toBSON(),
+                                                   localColl,
+                                                   inconsistencies);
             }
-
-            _checkShardKeyIndexInconsistencies(opCtx,
-                                               nss,
-                                               shardId,
-                                               itCatalogCollections->getKeyPattern().toBSON(),
-                                               localColl,
-                                               inconsistencies);
 
             itLocalCollections++;
             itCatalogCollections++;
         } else {
             // Case where we have found a local collection that is not in the catalog client.
-            if (shardId != primaryShardId) {
+            const auto& nss = localNss;
+
+            // TODO SERVER-59957 use function introduced in this ticket to decide if a namesapce
+            // should be ignored and stop using isNamepsaceAlwaysUnsharded().
+            if (!nss.isNamespaceAlwaysUnsharded() && shardId != primaryShardId) {
                 inconsistencies.emplace_back(
                     makeInconsistency(MetadataInconsistencyTypeEnum::kMisplacedCollection,
                                       MisplacedCollectionDetails{localNss, shardId, localUUID}));
@@ -252,16 +309,21 @@ std::vector<MetadataInconsistencyItem> checkCollectionMetadataInconsistencies(
         }
     }
 
-    // Case where we have found more local collections than in the catalog client. It is a
-    // hidden unsharded collection inconsistency if we are not the db primary shard.
-    while (itLocalCollections != localCollections.end() && shardId != primaryShardId) {
-        const auto localColl = itLocalCollections->get();
-        inconsistencies.emplace_back(makeInconsistency(
-            MetadataInconsistencyTypeEnum::kMisplacedCollection,
-            MisplacedCollectionDetails{localColl->ns(), shardId, localColl->uuid()}));
-        itLocalCollections++;
+    if (shardId != primaryShardId) {
+        // Case where we have found more local collections than in the catalog client. It is a
+        // hidden unsharded collection inconsistency if we are not the db primary shard.
+        while (itLocalCollections != localCollections.end()) {
+            const auto localColl = itLocalCollections->get();
+            // TODO SERVER-59957 use function introduced in this ticket to decide if a namesapce
+            // should be ignored and stop using isNamepsaceAlwaysUnsharded().
+            if (!localColl->ns().isNamespaceAlwaysUnsharded()) {
+                inconsistencies.emplace_back(makeInconsistency(
+                    MetadataInconsistencyTypeEnum::kMisplacedCollection,
+                    MisplacedCollectionDetails{localColl->ns(), shardId, localColl->uuid()}));
+            }
+            itLocalCollections++;
+        }
     }
-
     return inconsistencies;
 }
 
@@ -272,7 +334,6 @@ std::vector<MetadataInconsistencyItem> checkChunksInconsistencies(
     const auto& uuid = collection.getUuid();
     const auto& nss = collection.getNss();
     const auto shardKeyPattern = ShardKeyPattern{collection.getKeyPattern()};
-    const auto configShardId = ShardId::kConfigServerId;
 
     std::vector<MetadataInconsistencyItem> inconsistencies;
     auto previousChunk = chunks.begin();
@@ -329,6 +390,45 @@ std::vector<MetadataInconsistencyItem> checkChunksInconsistencies(
                 MetadataInconsistencyTypeEnum::kRoutingTableMissingMaxKey,
                 RoutingTableMissingMaxKeyDetails{nss, uuid, maxKeyObj, globalMax}));
         }
+    }
+
+    return inconsistencies;
+}
+
+std::vector<MetadataInconsistencyItem> checkZonesInconsistencies(
+    OperationContext* opCtx, const CollectionType& collection, const std::vector<TagsType>& zones) {
+    const auto& uuid = collection.getUuid();
+    const auto& nss = collection.getNss();
+    const auto shardKeyPattern = ShardKeyPattern{collection.getKeyPattern()};
+
+    std::vector<MetadataInconsistencyItem> inconsistencies;
+    auto previousZone = zones.begin();
+    for (auto it = zones.begin(); it != zones.end(); it++) {
+        const auto& zone = *it;
+
+        // Skip the first iteration as we need to compare the current zone with the previous one.
+        if (it == zones.begin()) {
+            continue;
+        }
+
+        if (!shardKeyPattern.isShardKey(zone.getMinKey()) ||
+            !shardKeyPattern.isShardKey(zone.getMaxKey())) {
+            inconsistencies.emplace_back(makeInconsistency(
+                MetadataInconsistencyTypeEnum::kCorruptedZoneShardKey,
+                CorruptedZoneShardKeyDetails{nss, uuid, zone.toBSON(), shardKeyPattern.toBSON()}));
+        }
+
+        // As the zones are sorted by minKey, we can check if the previous zone maxKey is less than
+        // the current zone minKey.
+        const auto& minKey = zone.getMinKey();
+        auto cmp = previousZone->getMaxKey().woCompare(minKey);
+        if (cmp > 0) {
+            inconsistencies.emplace_back(makeInconsistency(
+                MetadataInconsistencyTypeEnum::kZonesRangeOverlap,
+                ZonesRangeOverlapDetails{nss, uuid, previousZone->toBSON(), zone.toBSON()}));
+        }
+
+        previousZone = it;
     }
 
     return inconsistencies;

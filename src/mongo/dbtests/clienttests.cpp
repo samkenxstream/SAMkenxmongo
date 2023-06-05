@@ -51,7 +51,7 @@ public:
         OperationContext& opCtx = *opCtxPtr;
         DBDirectClient db(&opCtx);
 
-        db.dropDatabase({boost::none, "test"});
+        db.dropDatabase(DatabaseName::createDatabaseName_forTest(boost::none, "test"));
     }
 
     virtual ~Base() {
@@ -66,8 +66,8 @@ public:
         return _nss;
     }
 
-    const std::string& ns() {
-        return _nss.toString();
+    StringData ns() {
+        return _nss.ns_forTest();
     }
 
     const NamespaceString _nss;

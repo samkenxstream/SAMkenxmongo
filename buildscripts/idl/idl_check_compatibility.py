@@ -226,7 +226,6 @@ IGNORE_STABLE_TO_UNSTABLE_LIST: List[str] = [
     'aggregate-param-needsMerge',
     'aggregate-param-fromMongos',
     # Bulk fixes for fields that are strictly internal all along and should thus be marked unstable.
-    'aggregate-param-$_generateV2ResumeTokens',
     'endSessions-param-txnNumber',
     'endSessions-param-txnUUID',
     'findAndModify-param-stmtId',
@@ -311,6 +310,7 @@ ALLOWED_STABLE_FIELDS_LIST: List[str] = [
     'listIndexes-reply-clustered',
     'create-param-encryptedFields',
     'create-param-bucketRoundingSeconds',
+    'create-param-temp',
     'endSessions-param-txnNumber',
     'endSessions-param-txnUUID',
     'refreshSessions-param-txnNumber',
@@ -319,7 +319,6 @@ ALLOWED_STABLE_FIELDS_LIST: List[str] = [
     'update-param-isTimeseriesNamespace',
     'delete-param-isTimeseriesNamespace',
     'findAndModify-param-stmtId',
-    'aggregate-param-$_generateV2ResumeTokens',
     'hello-param-loadBalanced',
     'hello-reply-serviceId',
     'hello-reply-isImplicitDefaultMajorityWC',

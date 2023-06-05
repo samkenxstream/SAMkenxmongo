@@ -78,7 +78,7 @@ public:
         // Ensure N is significantly larger then internalQueryPlanEvaluationWorks.
         ASSERT_GTE(N, internalQueryPlanEvaluationWorks.load() + 1000);
 
-        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns_forTest());
         _client.dropCollection(nss);
     }
 
@@ -89,12 +89,12 @@ public:
     }
 
     void insert(const BSONObj& obj) {
-        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns_forTest());
         _client.insert(nss, obj);
     }
 
     void addIndex(const BSONObj& obj) {
-        ASSERT_OK(dbtests::createIndex(&_opCtx, nss.ns(), obj));
+        ASSERT_OK(dbtests::createIndex(&_opCtx, nss.ns_forTest(), obj));
     }
 
     /**
@@ -126,7 +126,7 @@ public:
             _mps->addPlan(std::move(solutions[i]), std::move(root), ws.get());
         }
         // This is what sets a backup plan, should we test for it.
-        NoopYieldPolicy yieldPolicy(_opCtx.getServiceContext()->getFastClockSource());
+        NoopYieldPolicy yieldPolicy(&_opCtx, _opCtx.getServiceContext()->getFastClockSource());
         _mps->pickBestPlan(&yieldPolicy).transitional_ignore();
         ASSERT(_mps->bestPlanChosen());
 
@@ -282,7 +282,7 @@ public:
             auto findCommand = std::make_unique<FindCommandRequest>(nss);
             findCommand->setFilter(BSON("a" << 100 << "b" << 1));
             auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(findCommand));
-            verify(statusWithCQ.isOK());
+            MONGO_verify(statusWithCQ.isOK());
             cq = std::move(statusWithCQ.getValue());
             ASSERT(cq.get());
         }
@@ -302,7 +302,7 @@ public:
             auto findCommand = std::make_unique<FindCommandRequest>(nss);
             findCommand->setFilter(BSON("a" << 100 << "b" << 1));
             auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(findCommand));
-            verify(statusWithCQ.isOK());
+            MONGO_verify(statusWithCQ.isOK());
             cq = std::move(statusWithCQ.getValue());
         }
 
@@ -337,7 +337,7 @@ public:
         auto findCommand = std::make_unique<FindCommandRequest>(nss);
         findCommand->setFilter(BSON("a" << 1 << "b" << BSON("$gt" << 1)));
         auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(findCommand));
-        verify(statusWithCQ.isOK());
+        MONGO_verify(statusWithCQ.isOK());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(nullptr != cq.get());
 
@@ -486,7 +486,7 @@ public:
         auto findCommand = std::make_unique<FindCommandRequest>(nss);
         findCommand->setFilter(BSON("a" << N + 1 << "b" << 1));
         auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(findCommand));
-        verify(statusWithCQ.isOK());
+        MONGO_verify(statusWithCQ.isOK());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(nullptr != cq.get());
 
@@ -523,7 +523,7 @@ public:
         auto findCommand = std::make_unique<FindCommandRequest>(nss);
         findCommand->setFilter(BSON("a" << BSON("$gte" << N + 1) << "b" << 1));
         auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(findCommand));
-        verify(statusWithCQ.isOK());
+        MONGO_verify(statusWithCQ.isOK());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(nullptr != cq.get());
 
@@ -584,7 +584,7 @@ public:
         auto findCommand = std::make_unique<FindCommandRequest>(nss);
         findCommand->setFilter(BSON("foo" << 2001));
         auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(findCommand));
-        verify(statusWithCQ.isOK());
+        MONGO_verify(statusWithCQ.isOK());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(nullptr != cq.get());
 

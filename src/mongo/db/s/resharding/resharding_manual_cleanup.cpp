@@ -76,7 +76,7 @@ void assertResponseOK(const NamespaceString& nss,
                       StatusWith<executor::RemoteCommandResponse> response,
                       ShardId shardId) {
     auto errorContext = "Unable to cleanup reshard collection for namespace {} on shard {}"_format(
-        nss.ns(), shardId.toString());
+        nss.toStringForErrorMsg(), shardId.toString());
     auto shardResponse = uassertStatusOKWithContext(std::move(response), errorContext);
 
     auto status = getStatusFromCommandResult(shardResponse.data);
@@ -239,7 +239,7 @@ bool ReshardingCoordinatorCleaner::_checkExistsTempReshardingCollection(
 void ReshardingCoordinatorCleaner::_dropTemporaryReshardingCollection(
     OperationContext* opCtx, const NamespaceString& tempReshardingNss) {
     ShardsvrDropCollection dropCollectionCommand(tempReshardingNss);
-    dropCollectionCommand.setDbName(tempReshardingNss.db());
+    dropCollectionCommand.setDbName(tempReshardingNss.dbName());
 
     const auto dbInfo = uassertStatusOK(
         Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, tempReshardingNss.db()));

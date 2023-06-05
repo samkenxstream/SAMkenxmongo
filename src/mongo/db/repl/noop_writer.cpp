@@ -83,6 +83,13 @@ public:
 private:
     void run(Seconds waitTime, NoopWriteFn noopWrite) {
         Client::initThread("NoopWriter");
+
+        // TODO(SERVER-74656): Please revisit if this thread could be made killable.
+        {
+            stdx::lock_guard<Client> lk(cc());
+            cc().setSystemOperationUnkillableByStepdown(lk);
+        }
+
         while (true) {
             const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
             OperationContext& opCtx = *opCtxPtr;
@@ -162,7 +169,7 @@ void NoopWriter::_writeNoop(OperationContext* opCtx) {
 
     auto replCoord = ReplicationCoordinator::get(opCtx);
     // Its a proxy for being a primary
-    if (!replCoord->canAcceptWritesForDatabase(opCtx, "admin")) {
+    if (!replCoord->canAcceptWritesForDatabase(opCtx, DatabaseName::kAdmin)) {
         LOGV2_DEBUG(21220, 1, "Not a primary, skipping the noop write");
         return;
     }
@@ -188,13 +195,12 @@ void NoopWriter::_writeNoop(OperationContext* opCtx) {
                         "Writing noop to oplog as there has been no writes to this replica set "
                         "within write interval",
                         "writeInterval"_attr = _writeInterval);
-            writeConflictRetry(
-                opCtx, "writeNoop", NamespaceString::kRsOplogNamespace.ns(), [&opCtx] {
-                    WriteUnitOfWork uow(opCtx);
-                    opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(opCtx,
-                                                                                          kMsgObj);
-                    uow.commit();
-                });
+            writeConflictRetry(opCtx, "writeNoop", NamespaceString::kRsOplogNamespace, [&opCtx] {
+                WriteUnitOfWork uow(opCtx);
+                opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(opCtx,
+                                                                                      kMsgObj);
+                uow.commit();
+            });
         }
     }
 

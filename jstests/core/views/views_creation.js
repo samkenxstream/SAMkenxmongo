@@ -5,6 +5,7 @@
  *   assumes_superuser_permissions,
  *   # TODO SERVER-73967: Remove this tag.
  *   does_not_support_stepdowns,
+ *   references_foreign_collection,
  * ]
  */
 (function() {
@@ -111,12 +112,6 @@ assert.commandFailedWithCode(viewsDB.runCommand({
 }),
                              40600);
 
-// The remainder of this test will not work on server versions < 7.0 as the 'create' command
-// is not idempotent there.  TODO SERVER-74062: remove this.
-if (db.version().split('.')[0] < 7) {
-    return;
-}
-
 // Test that creating a view which already exists with identical options reports success.
 let repeatedCmd = {
     create: "existingViewTest",
@@ -158,4 +153,8 @@ assert.commandFailedWithCode(viewsDB.runCommand({
 // Test that creating a view when there is already a collection with the same name fails.
 assert.commandFailedWithCode(viewsDB.runCommand({create: "collection", viewOn: "collection"}),
                              ErrorCodes.NamespaceExists);
+
+// Ensure we accept a view with a name of greater than 64 characters (the maximum dbname length).
+assert.commandWorked(viewsDB.createView(
+    "longNamedView", "Queries_IdentityView_UnindexedLargeInMatching0_BackingCollection", []));
 }());

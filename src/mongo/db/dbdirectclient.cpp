@@ -27,9 +27,6 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/dbdirectclient.h"
 
 #include <boost/core/swap.hpp>
@@ -150,7 +147,8 @@ std::unique_ptr<DBClientCursor> DBDirectClient::find(FindCommandRequest findRequ
                                                      const ReadPreferenceSetting& readPref,
                                                      ExhaustMode exhaustMode) {
     invariant(!findRequest.getReadConcern(),
-              "passing readConcern to DBDirectClient::find() is not supported");
+              "passing readConcern to DBDirectClient::find() is not supported as it has to use the "
+              "parent operation's readConcern");
     return DBClientBase::find(std::move(findRequest), readPref, exhaustMode);
 }
 
@@ -200,11 +198,11 @@ long long DBDirectClient::count(const NamespaceStringOrUUID nsOrUuid,
                                 int limit,
                                 int skip,
                                 boost::optional<BSONObj> readConcernObj) {
-    invariant(!readConcernObj, "passing readConcern to DBDirectClient functions is not supported");
+    invariant(!readConcernObj,
+              "passing readConcern to DBDirectClient functions is not supported as it has to use "
+              "the parent operation's readConcern");
     BSONObj cmdObj = _countCmd(nsOrUuid, query, options, limit, skip, boost::none);
-
-    auto& dbName = (nsOrUuid.uuid() ? nsOrUuid.dbName().value() : (*nsOrUuid.nss()).dbName());
-    auto request = OpMsgRequestBuilder::create(dbName, cmdObj);
+    auto request = OpMsgRequestBuilder::create(nsOrUuid.dbName(), cmdObj);
 
     // Calls runCommand instead of runCommandDirectly to ensure the tenant inforamtion of this
     // command gets validated and is used for parsing the command request.

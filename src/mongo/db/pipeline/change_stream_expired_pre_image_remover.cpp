@@ -88,18 +88,16 @@ public:
     void run() {
         LOGV2(7080100, "Starting Change Stream Expired Pre-images Remover thread");
         ThreadClient tc(name(), getGlobalServiceContext());
-        AuthorizationSession::get(cc())->grantInternalAuthorization(&cc());
 
-        {
-            stdx::lock_guard<Client> lk(*tc.get());
-            tc.get()->setSystemOperationKillableByStepdown(lk);
-        }
+        AuthorizationSession::get(cc())->grantInternalAuthorization(&cc());
 
         while (true) {
             LOGV2_DEBUG(6278517, 3, "Thread awake");
+
             auto iterationStartTime = Date_t::now();
-            ChangeStreamPreImagesCollectionManager::performExpiredChangeStreamPreImagesRemovalPass(
-                tc.get());
+            ChangeStreamPreImagesCollectionManager::get(tc->getServiceContext())
+                .performExpiredChangeStreamPreImagesRemovalPass(tc.get());
+
             {
                 // Wait until either gExpiredChangeStreamPreImageRemovalJobSleepSecs passes or a
                 // shutdown is requested.

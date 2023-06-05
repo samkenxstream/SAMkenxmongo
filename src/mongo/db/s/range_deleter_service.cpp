@@ -34,13 +34,11 @@
 #include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
-#include "mongo/db/s/balancer_stats_registry.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/range_deleter_service_op_observer.h"
 #include "mongo/db/s/range_deletion_util.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/sharding_feature_flags_gen.h"
 #include "mongo/util/future_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kShardingRangeDeleter
@@ -57,7 +55,9 @@ BSONObj getShardKeyPattern(OperationContext* opCtx,
         boost::optional<NamespaceString> optNss;
         {
             AutoGetCollection collection(
-                opCtx, NamespaceStringOrUUID{dbName.toString(), collectionUuid}, MODE_IS);
+                opCtx,
+                NamespaceStringOrUUID{DatabaseNameUtil::serialize(dbName), collectionUuid},
+                MODE_IS);
 
             auto optMetadata = CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(
                                    opCtx, collection.getNss())
@@ -132,11 +132,6 @@ void RangeDeleterService::ReadyRangeDeletionsProcessor::_completedRangeDeletion(
 
 void RangeDeleterService::ReadyRangeDeletionsProcessor::_runRangeDeletions() {
     Client::initThread(kRangeDeletionThreadName);
-    {
-        stdx::lock_guard<Client> lk(cc());
-        cc().setSystemOperationKillableByStepdown(lk);
-    }
-
     {
         stdx::lock_guard<Latch> lock(_mutex);
         if (_state != kRunning) {
@@ -283,10 +278,7 @@ void RangeDeleterService::ReadyRangeDeletionsProcessor::_runRangeDeletions() {
 }
 
 void RangeDeleterService::onStartup(OperationContext* opCtx) {
-    // (Ignore FCV check): This feature doesn't have any upgrade/downgrade concerns. The feature
-    // flag is used to turn on new range deleter on startup.
-    if (disableResumableRangeDeleter.load() ||
-        !feature_flags::gRangeDeleterService.isEnabledAndIgnoreFCVUnsafe()) {
+    if (disableResumableRangeDeleter.load()) {
         return;
     }
 
@@ -296,12 +288,6 @@ void RangeDeleterService::onStartup(OperationContext* opCtx) {
 }
 
 void RangeDeleterService::onStepUpComplete(OperationContext* opCtx, long long term) {
-    // (Ignore FCV check): This feature doesn't have any upgrade/downgrade concerns. The feature
-    // flag is used to turn on new range deleter on startup.
-    if (!feature_flags::gRangeDeleterService.isEnabledAndIgnoreFCVUnsafe()) {
-        return;
-    }
-
     if (disableResumableRangeDeleter.load()) {
         LOGV2_INFO(
             6872508,
@@ -517,13 +503,6 @@ SharedSemiFuture<void> RangeDeleterService::registerTask(
             .share();
     }
 
-    LOGV2_DEBUG(7536600,
-                2,
-                "Registering range deletion task",
-                "collectionUUID"_attr = rdt.getCollectionUuid(),
-                "range"_attr = redact(rdt.getRange().toString()),
-                "pending"_attr = pending);
-
     auto scheduleRangeDeletionChain = [&](SharedSemiFuture<void> pendingFuture) {
         (void)pendingFuture.thenRunOn(_executor)
             .then([this,
@@ -569,6 +548,13 @@ SharedSemiFuture<void> RangeDeleterService::registerTask(
 
     auto lock =
         fromResubmitOnStepUp ? _acquireMutexUnconditionally() : _acquireMutexFailIfServiceNotUp();
+
+    LOGV2_DEBUG(7536600,
+                2,
+                "Registering range deletion task",
+                "collectionUUID"_attr = rdt.getCollectionUuid(),
+                "range"_attr = redact(rdt.getRange().toString()),
+                "pending"_attr = pending);
 
     auto [registeredTask, firstRegistration] =
         _rangeDeletionTasks[rdt.getCollectionUuid()].insert(std::make_shared<RangeDeletion>(rdt));

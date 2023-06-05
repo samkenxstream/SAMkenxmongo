@@ -39,6 +39,7 @@
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_ddl_coordinator_gen.h"
 #include "mongo/db/s/sharding_ddl_util.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/session/logical_session_id_helpers.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/db/write_concern.h"
@@ -183,6 +184,42 @@ ExecutorFuture<void> ShardingDDLCoordinator::_translateTimeseriesNss(
         .on(**executor, token);
 }
 
+ExecutorFuture<void> ShardingDDLCoordinator::_acquireAllLocksAsync(
+    OperationContext* opCtx,
+    std::shared_ptr<executor::ScopedTaskExecutor> executor,
+    const CancellationToken& token) {
+
+    // Fetching all the locks that need to be acquired
+    std::set<NamespaceString> locksToAcquire = _getAdditionalLocksToAcquire(opCtx);
+    locksToAcquire.insert(originalNss());
+
+    // Acquiring all DDL locks in sorted order to avoid deadlocks
+    // Note that the sorted order is provided by default through the std::set container
+    auto futureChain = ExecutorFuture<void>(**executor);
+    boost::optional<DatabaseName> lastDb;
+    for (const auto& lockNss : locksToAcquire) {
+        if (lastDb != lockNss.dbName()) {
+            // Acquiring the database DDL lock
+            const auto& dbName = lockNss.dbName();
+            futureChain = std::move(futureChain)
+                              .then([this, executor, token, dbName, anchor = shared_from_this()] {
+                                  return _acquireLockAsync(executor, token, dbName.db());
+                              });
+            lastDb = dbName;
+        }
+
+        if (!lockNss.coll().empty()) {
+            // Acquiring the collection DDL lock
+            futureChain =
+                std::move(futureChain)
+                    .then([this, executor, token, nss = lockNss, anchor = shared_from_this()] {
+                        return _acquireLockAsync(executor, token, nss.ns());
+                    });
+        }
+    }
+    return futureChain;
+}
+
 ExecutorFuture<void> ShardingDDLCoordinator::_acquireLockAsync(
     std::shared_ptr<executor::ScopedTaskExecutor> executor,
     const CancellationToken& token,
@@ -207,7 +244,8 @@ ExecutorFuture<void> ShardingDDLCoordinator::_acquireLockAsync(
                    return DDLLockManager::kDefaultLockTimeout;
                }();
 
-               _scopedLocks.emplace(ddlLockManager->lock(opCtx, resource, coorName, lockTimeOut));
+               _scopedLocks.emplace(ddlLockManager->lock(
+                   opCtx, resource, coorName, lockTimeOut, false /* waitForRecovery */));
            })
         .until([this, resource = resource.toString()](Status status) {
             if (!status.isOK()) {
@@ -274,7 +312,9 @@ SemiFuture<void> ShardingDDLCoordinator::run(std::shared_ptr<executor::ScopedTas
             }
         })
         .then([this, executor, token, anchor = shared_from_this()] {
-            return _acquireLockAsync(executor, token, originalNss().db());
+            auto opCtxHolder = cc().makeOperationContext();
+            auto* opCtx = opCtxHolder.get();
+            return _acquireAllLocksAsync(opCtx, executor, token);
         })
         .then([this, executor, token, anchor = shared_from_this()] {
             if (!originalNss().isConfigDB() && !originalNss().isAdminDB() && !_recoveredFromDisk) {
@@ -289,14 +329,8 @@ SemiFuture<void> ShardingDDLCoordinator::run(std::shared_ptr<executor::ScopedTas
                     metadata().getDatabaseVersion() /* databaseVersion */);
 
                 // Check under the dbLock if this is still the primary shard for the database
-                DatabaseShardingState::assertIsPrimaryShardForDb(opCtx, originalNss().db());
+                DatabaseShardingState::assertIsPrimaryShardForDb(opCtx, originalNss().dbName());
             };
-        })
-        .then([this, executor, token, anchor = shared_from_this()] {
-            if (!originalNss().coll().empty()) {
-                return _acquireLockAsync(executor, token, originalNss().ns());
-            }
-            return ExecutorFuture<void>(**executor);
         })
         .then([this, executor, token, anchor = shared_from_this()] {
             if (!_firstExecution ||
@@ -313,17 +347,8 @@ SemiFuture<void> ShardingDDLCoordinator::run(std::shared_ptr<executor::ScopedTas
         })
         .then([this, executor, token, anchor = shared_from_this()] {
             if (const auto bucketNss = metadata().getBucketNss()) {
-                return _acquireLockAsync(executor, token, bucketNss.value().ns());
-            }
-            return ExecutorFuture<void>(**executor);
-        })
-        .then([this, executor, token, anchor = shared_from_this()] {
-            auto opCtxHolder = cc().makeOperationContext();
-            auto* opCtx = opCtxHolder.get();
-            auto additionalLocks = _acquireAdditionalLocks(opCtx);
-            if (!additionalLocks.empty()) {
-                invariant(additionalLocks.size() == 1);
-                return _acquireLockAsync(executor, token, additionalLocks.front());
+                return _acquireLockAsync(
+                    executor, token, NamespaceStringUtil::serialize(bucketNss.value()));
             }
             return ExecutorFuture<void>(**executor);
         })
@@ -416,6 +441,13 @@ SemiFuture<void> ShardingDDLCoordinator::run(std::shared_ptr<executor::ScopedTas
 
             if (cleanup()) {
                 try {
+                    if (!completionStatus.isOK()) {
+                        LOGV2_ERROR(7524000,
+                                    "Failed sharding DDL coordinator",
+                                    "coordinatorId"_attr = _coordId,
+                                    "reason"_attr = redact(completionStatus));
+                    }
+
                     LOGV2(5565601,
                           "Releasing sharding DDL coordinator",
                           "coordinatorId"_attr = _coordId);

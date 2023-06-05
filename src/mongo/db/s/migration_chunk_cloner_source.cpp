@@ -107,7 +107,7 @@ BSONObj createRequestWithSessionId(StringData commandName,
                                    const MigrationSessionId& sessionId,
                                    bool waitForSteadyOrDone = false) {
     BSONObjBuilder builder;
-    builder.append(commandName, nss.ns());
+    builder.append(commandName, NamespaceStringUtil::serialize(nss));
     builder.append("waitForSteadyOrDone", waitForSteadyOrDone);
     sessionId.append(&builder);
     return builder.obj();
@@ -339,7 +339,7 @@ Status MigrationChunkClonerSource::startClone(OperationContext* opCtx,
     invariant(!opCtx->lockState()->isLocked());
 
     if (_sessionCatalogSource) {
-        _sessionCatalogSource->init(opCtx);
+        _sessionCatalogSource->init(opCtx, lsid);
 
         // Prime up the session migration source if there are oplog entries to migrate.
         _sessionCatalogSource->fetchNextOplog(opCtx);
@@ -448,7 +448,7 @@ StatusWith<BSONObj> MigrationChunkClonerSource::commitClone(OperationContext* op
 
     auto responseStatus = _callRecipient(opCtx, [&] {
         BSONObjBuilder builder;
-        builder.append(kRecvChunkCommit, nss().ns());
+        builder.append(kRecvChunkCommit, NamespaceStringUtil::serialize(nss()));
         // For backward compatibility with v6.0 recipients.
         // TODO (SERVER-67844): Remove it once 7.0 becomes LTS.
         builder.append("acquireCSOnRecipient", true);
@@ -543,8 +543,7 @@ void MigrationChunkClonerSource::onInsertOp(OperationContext* opCtx,
 void MigrationChunkClonerSource::onUpdateOp(OperationContext* opCtx,
                                             boost::optional<BSONObj> preImageDoc,
                                             const BSONObj& postImageDoc,
-                                            const repl::OpTime& opTime,
-                                            const repl::OpTime& prePostImageOpTime) {
+                                            const repl::OpTime& opTime) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(nss(), MODE_IX));
 
     BSONElement idElement = postImageDoc["_id"];
@@ -564,7 +563,7 @@ void MigrationChunkClonerSource::onUpdateOp(OperationContext* opCtx,
         // the deletion of the preImage document so that the destination chunk does not receive an
         // outdated version of this document.
         if (preImageDoc && isDocInRange(*preImageDoc, getMin(), getMax(), _shardKeyPattern)) {
-            onDeleteOp(opCtx, *preImageDoc, opTime, prePostImageOpTime);
+            onDeleteOp(opCtx, *preImageDoc, opTime);
         }
         return;
     }
@@ -584,8 +583,7 @@ void MigrationChunkClonerSource::onUpdateOp(OperationContext* opCtx,
 
 void MigrationChunkClonerSource::onDeleteOp(OperationContext* opCtx,
                                             const BSONObj& deletedDocId,
-                                            const repl::OpTime& opTime,
-                                            const repl::OpTime&) {
+                                            const repl::OpTime& opTime) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(nss(), MODE_IX));
 
     BSONElement idElement = deletedDocId["_id"];
@@ -723,6 +721,7 @@ void MigrationChunkClonerSource::_nextCloneBatchFromIndexScan(OperationContext* 
             lk.unlock();
 
             ShardingStatistics::get(opCtx).countDocsClonedOnDonor.addAndFetch(1);
+            ShardingStatistics::get(opCtx).countBytesClonedOnDonor.addAndFetch(obj.objsize());
         }
     } catch (DBException& exception) {
         exception.addContext("Executor error while scanning for documents belonging to chunk");
@@ -794,6 +793,7 @@ void MigrationChunkClonerSource::_nextCloneBatchFromCloneRecordIds(OperationCont
 
         arrBuilder->append(doc->value());
         ShardingStatistics::get(opCtx).countDocsClonedOnDonor.addAndFetch(1);
+        ShardingStatistics::get(opCtx).countBytesClonedOnDonor.addAndFetch(doc->value().objsize());
     }
 }
 
@@ -1014,7 +1014,7 @@ MigrationChunkClonerSource::_getIndexScanExecutor(OperationContext* opCtx,
     if (!shardKeyIdx) {
         return {ErrorCodes::IndexNotFound,
                 str::stream() << "can't find index with prefix " << _shardKeyPattern.toBSON()
-                              << " in storeCurrentRecordId for " << nss().ns()};
+                              << " in storeCurrentRecordId for " << nss().toStringForErrorMsg()};
     }
 
     // Assume both min and max non-empty, append MinKey's to make them fit chosen index
@@ -1040,7 +1040,8 @@ Status MigrationChunkClonerSource::_storeCurrentRecordId(OperationContext* opCtx
     AutoGetCollection collection(opCtx, nss(), MODE_IS);
     if (!collection) {
         return {ErrorCodes::NamespaceNotFound,
-                str::stream() << "Collection " << nss().ns() << " does not exist."};
+                str::stream() << "Collection " << nss().toStringForErrorMsg()
+                              << " does not exist."};
     }
 
     auto swExec = _getIndexScanExecutor(
@@ -1119,7 +1120,7 @@ Status MigrationChunkClonerSource::_storeCurrentRecordId(OperationContext* opCtx
         if (!idIdx || !idIdx->getEntry()) {
             return {ErrorCodes::IndexNotFound,
                     str::stream() << "can't find index '_id' in storeCurrentRecordId for "
-                                  << nss().ns()};
+                                  << nss().toStringForErrorMsg()};
         }
 
         averageObjectIdSize =
@@ -1133,7 +1134,8 @@ Status MigrationChunkClonerSource::_storeCurrentRecordId(OperationContext* opCtx
                           << maxRecsWhenFull << ", the maximum chunk size is "
                           << _args.getMaxChunkSizeBytes() << ", average document size is "
                           << avgRecSize << ". Found " << recCount << " documents in chunk "
-                          << " ns: " << nss().ns() << " " << getMin() << " -> " << getMax()};
+                          << " ns: " << nss().toStringForErrorMsg() << " " << getMin() << " -> "
+                          << getMax()};
     }
 
     stdx::lock_guard<Latch> lk(_mutex);
@@ -1262,7 +1264,8 @@ Status MigrationChunkClonerSource::_checkRecipientCloningStatus(OperationContext
                 _args.getMaxChunkSizeBytes();
             int64_t maxUntransferredSessionsSize = BSONObjMaxUserSize *
                 _args.getMaxChunkSizeBytes() / ChunkSizeSettingsType::kDefaultMaxChunkSizeBytes;
-            if (estimatedUntransferredChunkPercentage < maxCatchUpPercentageBeforeBlockingWrites &&
+            if (estimatedUntransferredChunkPercentage <
+                    maxCatchUpPercentageBeforeBlockingWrites.load() &&
                 estimateUntransferredSessionsSize < maxUntransferredSessionsSize) {
                 // The recipient is sufficiently caught-up with the writes on the donor.
                 // Block writes, so that it can drain everything.
@@ -1294,7 +1297,7 @@ Status MigrationChunkClonerSource::_checkRecipientCloningStatus(OperationContext
                                   << migrationSessionIdStatus.getStatus().toString()};
         }
 
-        if (res["ns"].str() != nss().ns() ||
+        if (res["ns"].str() != NamespaceStringUtil::serialize(nss()) ||
             (res.hasField("fromShardId")
                  ? (res["fromShardId"].str() != _args.getFromShard().toString())
                  : (res["from"].str() != _donorConnStr.toString())) ||

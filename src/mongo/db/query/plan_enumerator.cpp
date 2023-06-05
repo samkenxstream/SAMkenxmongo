@@ -34,6 +34,7 @@
 
 #include "mongo/db/query/index_tag.h"
 #include "mongo/db/query/indexability.h"
+#include "mongo/db/query/query_planner_common.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/string_map.h"
 
@@ -60,8 +61,8 @@ std::string getPathPrefix(std::string path) {
  * is a predicate that is required to use an index.
  */
 bool expressionRequiresIndex(const MatchExpression* node) {
-    return CanonicalQuery::countNodes(node, MatchExpression::GEO_NEAR) > 0 ||
-        CanonicalQuery::countNodes(node, MatchExpression::TEXT) > 0;
+    return QueryPlannerCommon::countNodes(node, MatchExpression::GEO_NEAR) > 0 ||
+        QueryPlannerCommon::countNodes(node, MatchExpression::TEXT) > 0;
 }
 
 size_t getPathLength(const MatchExpression* expr) {
@@ -398,9 +399,9 @@ void PlanEnumerator::allocateAssignment(MatchExpression* expr,
     size_t newID = _memo.size() + 1;
 
     // Shouldn't be anything there already.
-    verify(_nodeToId.end() == _nodeToId.find(expr));
+    MONGO_verify(_nodeToId.end() == _nodeToId.find(expr));
     _nodeToId[expr] = newID;
-    verify(_memo.end() == _memo.find(newID));
+    MONGO_verify(_memo.end() == _memo.find(newID));
     NodeAssignment* newAssignment = new NodeAssignment();
     _memo[newID] = newAssignment;
     *assign = newAssignment;
@@ -1331,7 +1332,6 @@ void PlanEnumerator::getIndexedPreds(MatchExpression* node,
 }
 
 bool PlanEnumerator::prepSubNodes(MatchExpression* node,
-
                                   PrepMemoContext context,
                                   vector<MemoID>* subnodesOut,
                                   vector<MemoID>* mandatorySubnodes) {
@@ -1366,9 +1366,13 @@ bool PlanEnumerator::prepSubNodes(MatchExpression* node,
             childContext.elemMatchExpr = child;
             childContext.outsidePreds = context.outsidePreds;
             markTraversedThroughElemMatchObj(&childContext);
-            prepSubNodes(child, childContext, subnodesOut, mandatorySubnodes);
+            if (!prepSubNodes(child, childContext, subnodesOut, mandatorySubnodes)) {
+                return false;
+            }
         } else if (MatchExpression::AND == child->matchType()) {
-            prepSubNodes(child, context, subnodesOut, mandatorySubnodes);
+            if (!prepSubNodes(child, context, subnodesOut, mandatorySubnodes)) {
+                return false;
+            }
         }
     }
     return true;
@@ -1397,7 +1401,7 @@ void PlanEnumerator::getMultikeyCompoundablePreds(const vector<MatchExpression*>
         RelevantTag* usedRt = static_cast<RelevantTag*>(assignedPred->getTag());
         set<string> usedPrefixes;
         usedPrefixes.insert(getPathPrefix(usedRt->path));
-        used[nullptr] = usedPrefixes;
+        used[nullptr] = std::move(usedPrefixes);
 
         // If 'assigned' is a predicate inside an $elemMatch, we have to
         // add the prefix not only to the top-level context, but also to the
@@ -1412,7 +1416,7 @@ void PlanEnumerator::getMultikeyCompoundablePreds(const vector<MatchExpression*>
             // in the top-level context, but here must be different because 'usedRt'
             // is in an $elemMatch context.
             elemMatchUsed.insert(usedRt->pathPrefix);
-            used[usedRt->elemMatchExpr] = elemMatchUsed;
+            used[usedRt->elemMatchExpr] = std::move(elemMatchUsed);
         }
     }
 
@@ -1431,7 +1435,7 @@ void PlanEnumerator::getMultikeyCompoundablePreds(const vector<MatchExpression*>
                 topLevelUsed.insert(getPathPrefix(rt->path));
                 set<string> usedPrefixes;
                 usedPrefixes.insert(rt->pathPrefix);
-                used[rt->elemMatchExpr] = usedPrefixes;
+                used[rt->elemMatchExpr] = std::move(usedPrefixes);
 
                 // Output the predicate.
                 out->push_back(couldCompound[i]);
@@ -1638,7 +1642,7 @@ void PlanEnumerator::compound(const vector<MatchExpression*>& tryCompound,
 void PlanEnumerator::tagMemo(size_t id) {
     LOGV2_DEBUG(20944, 5, "Tagging memoID", "id"_attr = id);
     NodeAssignment* assign = _memo[id];
-    verify(nullptr != assign);
+    MONGO_verify(nullptr != assign);
 
     if (nullptr != assign->orAssignment) {
         OrAssignment* oa = assign->orAssignment.get();
@@ -1655,7 +1659,7 @@ void PlanEnumerator::tagMemo(size_t id) {
         tagMemo(aa->subnodes[aa->counter]);
     } else if (nullptr != assign->andAssignment) {
         AndAssignment* aa = assign->andAssignment.get();
-        verify(aa->counter < aa->choices.size());
+        MONGO_verify(aa->counter < aa->choices.size());
 
         const AndEnumerableState& aes = aa->choices[aa->counter];
 
@@ -1689,7 +1693,7 @@ void PlanEnumerator::tagMemo(size_t id) {
             }
         }
     } else {
-        verify(0);
+        MONGO_verify(0);
     }
 }
 
@@ -1811,7 +1815,7 @@ bool PlanEnumerator::_nextMemoForLockstepOrAssignment(
 
 bool PlanEnumerator::nextMemo(size_t id) {
     NodeAssignment* assign = _memo[id];
-    verify(nullptr != assign);
+    MONGO_verify(nullptr != assign);
 
     if (nullptr != assign->orAssignment) {
         OrAssignment* oa = assign->orAssignment.get();

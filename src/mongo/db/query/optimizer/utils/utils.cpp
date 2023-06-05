@@ -377,7 +377,7 @@ public:
                 }
             }
 
-            leftReqMap = std::move(*resultReqs.finish());
+            leftReqMap = PartialSchemaRequirements{std::move(*resultReqs.finish())};
             return leftResult;
         }
         // Left and right don't all use the same key.
@@ -584,29 +584,28 @@ public:
 
         // Union the single intervals together. If we have PathCompare [EqMember] Const [[1, 2, 3]]
         // we create [1, 1] U [2, 2] U [3, 3].
-        boost::optional<IntervalReqExpr::Node> unionedInterval;
+        // The intervals are added so that they form a DNF from single-predicate conjunctions that
+        // are children of a top-level disjunction. The creation of the interval DNF doesn't reuse
+        // combineIntervalsDNF() because this function would end up adding its first argument to
+        // itself for each new bound, thus creating N*(N+1)/2 duplicates.
 
+        IntervalReqExpr::Builder builder;
+        builder.pushDisj();
         for (size_t i = 0; i < boundArray->size(); i++) {
             auto singleBoundLow =
                 Constant::createFromCopy(boundArray->getAt(i).first, boundArray->getAt(i).second);
             auto singleBoundHigh = singleBoundLow;
-
-            auto singleInterval = IntervalReqExpr::makeSingularDNF(
-                IntervalRequirement{{true /*inclusive*/, std::move(singleBoundLow)},
-                                    {true /*inclusive*/, std::move(singleBoundHigh)}});
-
-            if (unionedInterval) {
-                // Union the singleInterval with the unionedInterval we want to update.
-                combineIntervalsDNF(false /*intersect*/, *unionedInterval, singleInterval);
-            } else {
-                unionedInterval = std::move(singleInterval);
-            }
+            builder.pushConj()
+                .atom({{true /*inclusive*/, std::move(singleBoundLow)},
+                       {true /*inclusive*/, std::move(singleBoundHigh)}})
+                .pop();
         }
+        auto unionedInterval = std::move(*builder.finish());
 
         return {{PartialSchemaRequirements{
             PSRExpr::makeSingularDNF(PartialSchemaKey{make<PathIdentity>()},
                                      PartialSchemaRequirement{boost::none /*boundProjectionName*/,
-                                                              std::move(*unionedInterval),
+                                                              std::move(unionedInterval),
                                                               false /*isPerfOnly*/})}}};
     }
 
@@ -979,7 +978,6 @@ bool isSubsetOfPartialSchemaReq(const PartialSchemaRequirements& lhs,
 
 bool intersectPartialSchemaReq(PartialSchemaRequirements& target,
                                const PartialSchemaRequirements& source) {
-    // TODO SERVER-69026 Consider implementing intersect for top-level disjunctions.
     if (!PSRExpr::isSingletonDisjunction(target.getRoot()) ||
         !PSRExpr::isSingletonDisjunction(source.getRoot())) {
         return false;
@@ -1007,7 +1005,7 @@ PartialSchemaRequirements unionPartialSchemaReq(PartialSchemaRequirements&& left
     resultNodes.insert(resultNodes.end(),
                        std::make_move_iterator(rightDisj.nodes().begin()),
                        std::make_move_iterator(rightDisj.nodes().end()));
-    return PSRExpr::make<PSRExpr::Disjunction>(std::move(resultNodes));
+    return PartialSchemaRequirements{PSRExpr::make<PSRExpr::Disjunction>(std::move(resultNodes))};
 }
 
 std::string encodeIndexKeyName(const size_t indexField) {
@@ -1696,6 +1694,7 @@ void lowerPartialSchemaRequirement(const PartialSchemaKey& key,
 }
 
 void lowerPartialSchemaRequirements(boost::optional<CEType> scanGroupCE,
+                                    boost::optional<CEType> baseCE,
                                     std::vector<SelectivityType> indexPredSels,
                                     ResidualRequirementsWithOptionalCE::Node requirements,
                                     const PathToIntervalFn& pathToInterval,
@@ -1706,7 +1705,7 @@ void lowerPartialSchemaRequirements(boost::optional<CEType> scanGroupCE,
     if (ResidualRequirementsWithOptionalCE::isSingletonDisjunction(requirements)) {
         ResidualRequirementsWithOptionalCE::visitDNF(
             requirements, [&](const ResidualRequirementWithOptionalCE& entry) {
-                auto residualCE = scanGroupCE;
+                auto residualCE = baseCE;
                 if (residualCE) {
                     if (!indexPredSels.empty()) {
                         *residualCE *= ce::conjExponentialBackoff(indexPredSels);
@@ -1757,10 +1756,10 @@ void lowerPartialSchemaRequirements(boost::optional<CEType> scanGroupCE,
             toOr.push_back(makeBalancedBooleanOpTree(Operations::And, std::move(toAnd)));
         });
 
-    boost::optional<CEType> finalFilterCE = scanGroupCE;
+    boost::optional<CEType> finalFilterCE = baseCE;
     if (!disjSels.empty()) {
         indexPredSels.push_back(ce::disjExponentialBackoff(disjSels));
-        finalFilterCE = *scanGroupCE * ce::conjExponentialBackoff(indexPredSels);
+        finalFilterCE = *baseCE * ce::conjExponentialBackoff(indexPredSels);
     }
     builder.make<FilterNode>(finalFilterCE,
                              makeBalancedBooleanOpTree(Operations::Or, std::move(toOr)),
@@ -2260,11 +2259,13 @@ public:
                            ProjectionNameVector correlatedProjNames,
                            const std::map<size_t, SelectivityType>& indexPredSelMap,
                            const CEType currentGroupCE,
-                           const CEType scanGroupCE)
+                           const CEType scanGroupCE,
+                           const bool useSortedMerge)
         : _prefixId(prefixId),
           _ridProjName(ridProjName),
           _scanDefName(scanDefName),
           _indexDefName(indexDefName),
+          _useSortedMerge(useSortedMerge),
           _spoolId(spoolId),
           _indexFieldCount(indexFieldCount),
           _eqPrefixes(eqPrefixes),
@@ -2398,7 +2399,8 @@ public:
                                          currentCorrelatedProjNames,
                                          _indexPredSelMap,
                                          currentCE,
-                                         _scanGroupCE);
+                                         _scanGroupCE,
+                                         _useSortedMerge);
 
         auto result = generateDistinctScan(_scanDefName,
                                            _indexDefName,
@@ -2486,6 +2488,24 @@ public:
         const size_t inputSize = inputs.size();
         if (inputSize == 1) {
             return std::move(inputs.front());
+        }
+
+        if (_useSortedMerge) {
+            invariant(!isIntersect);
+            PhysPlanBuilder result;
+            ABTVector inputABTs;
+            for (auto& input : inputs) {
+                inputABTs.push_back(std::move(input._node));
+                result.merge(input);
+            }
+            // If we're lowering a disjunction and only have equality intervals, use a SortedMerge
+            // instead of a Union because the child streams will be sorted. Only applies when
+            // sorting on RID only.
+            result.make<SortedMergeNode>(
+                ce,
+                properties::CollationRequirement({{_ridProjName, CollationOp::Ascending}}),
+                std::move(inputABTs));
+            return result;
         }
 
         // The input projections names we will be combining from both sides.
@@ -2582,6 +2602,7 @@ private:
     const ProjectionName& _ridProjName;
     const std::string& _scanDefName;
     const std::string& _indexDefName;
+    const bool _useSortedMerge;
 
     // Equality-prefix and related.
     SpoolIdGenerator& _spoolId;
@@ -2617,7 +2638,8 @@ PhysPlanBuilder lowerEqPrefixes(PrefixId& prefixId,
                                 ProjectionNameVector correlatedProjNames,
                                 const std::map<size_t, SelectivityType>& indexPredSelMap,
                                 const CEType indexCE,
-                                const CEType scanGroupCE) {
+                                const CEType scanGroupCE,
+                                const bool useSortedMerge) {
     IntervalLowerTransport lowerTransport(prefixId,
                                           ridProjName,
                                           std::move(indexProjectionMap),
@@ -2628,17 +2650,18 @@ PhysPlanBuilder lowerEqPrefixes(PrefixId& prefixId,
                                           eqPrefixes,
                                           eqPrefixIndex,
                                           reverseOrder,
-                                          correlatedProjNames,
+                                          std::move(correlatedProjNames),
                                           indexPredSelMap,
                                           indexCE,
-                                          scanGroupCE);
+                                          scanGroupCE,
+                                          useSortedMerge);
     return lowerTransport.lower(eqPrefixes.at(eqPrefixIndex)._interval);
 }
 
-bool hasProperIntervals(const PartialSchemaRequirements& reqMap) {
+bool hasProperIntervals(const PSRExpr::Node& reqs) {
     // Compute if this node has any proper (not fully open) intervals.
     bool hasProperIntervals = false;
-    PSRExpr::visitDNF(reqMap.getRoot(), [&](const PartialSchemaEntry& e) {
+    PSRExpr::visitAnyShape(reqs, [&](const PartialSchemaEntry& e) {
         hasProperIntervals |= !isIntervalReqFullyOpenDNF(e.second.getIntervals());
     });
     return hasProperIntervals;

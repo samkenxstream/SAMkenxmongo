@@ -53,8 +53,7 @@ CollectionType createTempReshardingCollectionType(
     const BSONObj& collation,
     boost::optional<CollectionIndexes> indexVersion);
 
-void cleanupSourceConfigCollections(OperationContext* opCtx,
-                                    const ReshardingCoordinatorDocument& coordinatorDoc);
+void removeChunkDocs(OperationContext* opCtx, const UUID& collUUID);
 
 void writeDecisionPersistedState(OperationContext* opCtx,
                                  ReshardingMetrics* metrics,
@@ -65,7 +64,8 @@ void writeDecisionPersistedState(OperationContext* opCtx,
                                  const std::vector<ShardId>& reshardedCollectionPlacement);
 
 void updateTagsDocsForTempNss(OperationContext* opCtx,
-                              const ReshardingCoordinatorDocument& coordinatorDoc);
+                              const ReshardingCoordinatorDocument& coordinatorDoc,
+                              TxnNumber txnNumber);
 
 void insertCoordDocAndChangeOrigCollEntry(OperationContext* opCtx,
                                           ReshardingMetrics* metrics,

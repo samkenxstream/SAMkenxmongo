@@ -61,7 +61,7 @@ Document fromBson(BSONObj obj) {
     return Document(obj);
 }
 
-std::string redactFieldNameForTest(StringData s) {
+std::string applyHmacForTest(StringData s) {
     return str::stream() << "HASH<" << s << ">";
 }
 
@@ -233,8 +233,8 @@ TEST(FieldPath, ScalarVariableWithDottedFieldPathOptimizesToConstantMissingValue
 
 TEST(FieldPath, SerializeWithRedaction) {
     SerializationOptions options;
-    options.identifierRedactionPolicy = redactFieldNameForTest;
-    options.redactIdentifiers = true;
+    options.transformIdentifiersCallback = applyHmacForTest;
+    options.transformIdentifiers = true;
 
     auto expCtx = ExpressionContextForTest{};
     intrusive_ptr<Expression> expression =
@@ -280,12 +280,11 @@ TEST(FieldPath, SerializeWithRedaction) {
         expression->serialize(options).getDocument());
 
     // Test that a variable followed by user fields is properly hashed.
-    std::string replacementChar = "?";
-    options.replacementForLiteralArgs = replacementChar;
+    options.literalPolicy = LiteralSerializationPolicy::kToDebugTypeString;
 
     expression = expr(R"({$gt: ["$$ROOT.a.b", 5]})");
     ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
-        R"({"$gt":["$$ROOT.HASH<a>.HASH<b>",{"$const":"?"}]})",
+        R"({"$gt":["$$ROOT.HASH<a>.HASH<b>","?number"]})",
         expression->serialize(options).getDocument());
 
     expression = expr(R"({$gt: ["$foo", "$$NOW"]})");

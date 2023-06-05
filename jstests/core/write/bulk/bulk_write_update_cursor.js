@@ -5,22 +5,13 @@
  * @tags: [
  *   assumes_against_mongod_not_mongos,
  *   not_allowed_with_security_token,
- *   # TODO SERVER-72988: Until bulkWrite is compatible with retryable writes.
- *   requires_non_retryable_writes,
- *   # Command is not yet compatible with tenant migration.
- *   tenant_migration_incompatible,
+ *   command_not_supported_in_serverless,
+ *   # TODO SERVER-52419 Remove this tag.
+ *   featureFlagBulkWriteCommand,
  * ]
  */
 (function() {
 "use strict";
-load("jstests/libs/feature_flag_util.js");
-
-// Skip this test if the BulkWriteCommand feature flag is not enabled.
-// TODO SERVER-67711: Remove feature flag check.
-if (!FeatureFlagUtil.isPresentAndEnabled(db, "BulkWriteCommand")) {
-    jsTestLog('Skipping test because the BulkWriteCommand feature flag is disabled.');
-    return;
-}
 
 var coll = db.getCollection("coll");
 var coll1 = db.getCollection("coll1");
@@ -28,11 +19,11 @@ coll.drop();
 coll1.drop();
 
 const cursorEntryValidator = function(entry, expectedEntry) {
-    assert(entry.ok == expectedEntry.ok);
-    assert(entry.idx == expectedEntry.idx);
-    assert(entry.n == expectedEntry.n);
-    assert(entry.nModified == expectedEntry.nModified);
-    assert(entry.code == expectedEntry.code);
+    assert.eq(entry.ok, expectedEntry.ok);
+    assert.eq(entry.idx, expectedEntry.idx);
+    assert.eq(entry.n, expectedEntry.n);
+    assert.eq(entry.nModified, expectedEntry.nModified);
+    assert.eq(entry.code, expectedEntry.code);
 };
 
 // Test generic update with no return.
@@ -46,9 +37,10 @@ var res = db.adminCommand({
 });
 
 assert.commandWorked(res);
+assert.eq(res.numErrors, 0);
 
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
-cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, nModified: 1});
+cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, n: 1, nModified: 1});
 assert(!res.cursor.firstBatch[1].value);
 assert(!res.cursor.firstBatch[2]);
 
@@ -68,9 +60,10 @@ res = db.adminCommand({
 });
 
 assert.commandWorked(res);
+assert.eq(res.numErrors, 0);
 
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
-cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, nModified: 1});
+cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, n: 1, nModified: 1});
 assert.docEq(res.cursor.firstBatch[1].value, {_id: 1, skey: "MongoDB"});
 assert(!res.cursor.firstBatch[2]);
 
@@ -90,9 +83,10 @@ res = db.adminCommand({
 });
 
 assert.commandWorked(res);
+assert.eq(res.numErrors, 0);
 
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
-cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, nModified: 1});
+cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, n: 1, nModified: 1});
 assert.docEq(res.cursor.firstBatch[1].value, {_id: 1, skey: "MongoDB2"});
 assert(!res.cursor.firstBatch[2]);
 
@@ -118,10 +112,11 @@ res = db.adminCommand({
 });
 
 assert.commandWorked(res);
+assert.eq(res.numErrors, 0);
 
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
 cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, n: 1});
-cursorEntryValidator(res.cursor.firstBatch[2], {ok: 1, idx: 2, nModified: 1});
+cursorEntryValidator(res.cursor.firstBatch[2], {ok: 1, idx: 2, n: 1, nModified: 1});
 assert.docEq(res.cursor.firstBatch[2].value, {_id: 1, skey: "MongoDB2"});
 assert(!res.cursor.firstBatch[3]);
 assert.sameMembers(coll.find().toArray(), [{_id: 0, skey: "MongoDB"}, {_id: 1, skey: "MongoDB2"}]);
@@ -146,35 +141,14 @@ res = db.adminCommand({
 });
 
 assert.commandWorked(res);
+assert.eq(res.numErrors, 0);
 
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
 cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, n: 1});
-cursorEntryValidator(res.cursor.firstBatch[2], {ok: 1, idx: 2, nModified: 1});
+cursorEntryValidator(res.cursor.firstBatch[2], {ok: 1, idx: 2, n: 1, nModified: 1});
 assert.docEq(res.cursor.firstBatch[2].value, {_id: 0, skey: "MongoDB2"});
 assert(!res.cursor.firstBatch[3]);
 assert.sameMembers(coll.find().toArray(), [{_id: 0, skey: "MongoDB2"}, {_id: 1, skey: "MongoDB"}]);
-
-coll.drop();
-
-// Test updates multiple when multi is true.
-res = db.adminCommand({
-    bulkWrite: 1,
-    ops: [
-        {insert: 0, document: {_id: 0, skey: "MongoDB"}},
-        {insert: 0, document: {_id: 1, skey: "MongoDB"}},
-        {update: 0, filter: {skey: "MongoDB"}, updateMods: {$set: {skey: "MongoDB2"}}, multi: true},
-    ],
-    nsInfo: [{ns: "test.coll"}]
-});
-
-assert.commandWorked(res);
-
-cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
-cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, n: 1});
-cursorEntryValidator(res.cursor.firstBatch[2], {ok: 1, idx: 2, nModified: 2});
-assert(!res.cursor.firstBatch[2].value);
-assert(!res.cursor.firstBatch[3]);
-assert.sameMembers(coll.find().toArray(), [{_id: 0, skey: "MongoDB2"}, {_id: 1, skey: "MongoDB2"}]);
 
 coll.drop();
 
@@ -190,8 +164,9 @@ res = db.adminCommand({
 });
 
 assert.commandWorked(res);
+assert.eq(res.numErrors, 0);
 
-cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, nModified: 1});
+cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1, nModified: 1});
 assert.docEq(res.cursor.firstBatch[0].value, {_id: 1, skey: "MongoDB2"});
 assert(!res.cursor.firstBatch[1]);
 
@@ -211,8 +186,9 @@ res = db.adminCommand({
 });
 
 assert.commandWorked(res);
+assert.eq(res.numErrors, 0);
 
-cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, nModified: 0});
+cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 0, nModified: 0});
 assert(!res.cursor.firstBatch[0].value);
 assert(!res.cursor.firstBatch[1]);
 
@@ -237,8 +213,9 @@ res = db.adminCommand({
 });
 
 assert.commandWorked(res);
+assert.eq(res.numErrors, 0);
 
-cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, nModified: 0});
+cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1, nModified: 0});
 assert.docEq(res.cursor.firstBatch[0].upserted, {index: 0, _id: 1});
 assert(!res.cursor.firstBatch[0].value);
 assert(!res.cursor.firstBatch[1]);
@@ -263,83 +240,14 @@ res = db.adminCommand({
 });
 
 assert.commandWorked(res);
+assert.eq(res.numErrors, 0);
 
-cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, nModified: 0});
+cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1, nModified: 0});
 assert.docEq(res.cursor.firstBatch[0].upserted, {index: 0, _id: 1});
 assert.docEq(res.cursor.firstBatch[0].value, {_id: 1, skey: "MongoDB2"});
 assert(!res.cursor.firstBatch[1]);
 
 assert.eq("MongoDB2", coll.findOne().skey);
-
-coll.drop();
-
-// Make sure multi:true + return fails the op.
-res = db.adminCommand({
-    bulkWrite: 1,
-    ops: [
-        {
-            update: 0,
-            filter: {_id: 1},
-            updateMods: {$set: {skey: "MongoDB2"}},
-            multi: true,
-            return: "post"
-        },
-    ],
-    nsInfo: [{ns: "test.coll"}]
-});
-
-assert.commandWorked(res);
-
-cursorEntryValidator(res.cursor.firstBatch[0], {ok: 0, idx: 0, code: ErrorCodes.InvalidOptions});
-assert(!res.cursor.firstBatch[1]);
-
-// Test returnFields with return.
-res = db.adminCommand({
-    bulkWrite: 1,
-    ops: [
-        {insert: 0, document: {_id: 0, skey: "MongoDB"}},
-        {
-            update: 0,
-            filter: {_id: 0},
-            updateMods: {$set: {skey: "MongoDB2"}},
-            returnFields: {_id: 0, skey: 1},
-            return: "post"
-        },
-    ],
-    nsInfo: [{ns: "test.coll"}]
-});
-
-assert.commandWorked(res);
-
-cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
-cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, nModified: 1});
-assert.docEq(res.cursor.firstBatch[1].value, {skey: "MongoDB2"});
-assert(!res.cursor.firstBatch[2]);
-
-assert.eq("MongoDB2", coll.findOne().skey);
-
-coll.drop();
-
-// Test providing returnFields without return option.
-res = db.adminCommand({
-    bulkWrite: 1,
-    ops: [
-        {insert: 0, document: {_id: 0, skey: "MongoDB"}},
-        {
-            update: 0,
-            filter: {_id: 0},
-            updateMods: {$set: {skey: "MongoDB2"}},
-            returnFields: {_id: 1}
-        },
-    ],
-    nsInfo: [{ns: "test.coll"}]
-});
-
-assert.commandWorked(res);
-
-cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
-cursorEntryValidator(res.cursor.firstBatch[1], {ok: 0, idx: 1, code: ErrorCodes.InvalidOptions});
-assert(!res.cursor.firstBatch[2]);
 
 coll.drop();
 
@@ -354,9 +262,10 @@ res = db.adminCommand({
 });
 
 assert.commandWorked(res);
+assert.eq(res.numErrors, 0);
 
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
-cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, nModified: 1});
+cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, n: 1, nModified: 1});
 assert.docEq(res.cursor.firstBatch[1].value, {_id: 0, a: 3});
 assert.eq(res.cursor.firstBatch[1].nModified, 1);
 assert(!res.cursor.firstBatch[2]);
@@ -381,8 +290,9 @@ res = db.adminCommand({
 });
 
 assert.commandWorked(res);
+assert.eq(res.numErrors, 0);
 
-cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, nModified: 1});
+cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1, nModified: 1});
 assert.eq(res.cursor.firstBatch[0].nModified, 1);
 assert.docEq(res.cursor.firstBatch[0].value, {_id: 0, a: [{b: 6}, {b: 1}, {b: 2}]});
 assert(!res.cursor.firstBatch[1]);
@@ -400,19 +310,20 @@ res = db.adminCommand({
             update: 0,
             filter: {$expr: {$eq: ["$skey", "$$targetKey"]}},
             updateMods: {skey: "MongoDB2"},
-            let : {targetKey: "MongoDB"},
             return: "post"
         },
     ],
-    nsInfo: [{ns: "test.coll"}]
+    nsInfo: [{ns: "test.coll"}],
+    let : {targetKey: "MongoDB"}
 });
 
 assert.commandWorked(res);
+assert.eq(res.numErrors, 0);
 
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
 cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, n: 1});
 cursorEntryValidator(res.cursor.firstBatch[2], {ok: 1, idx: 2, n: 1});
-cursorEntryValidator(res.cursor.firstBatch[3], {ok: 1, idx: 3, nModified: 1});
+cursorEntryValidator(res.cursor.firstBatch[3], {ok: 1, idx: 3, n: 1, nModified: 1});
 assert.docEq(res.cursor.firstBatch[3].value, {_id: 0, skey: "MongoDB2"});
 assert(!res.cursor.firstBatch[4]);
 
@@ -422,24 +333,89 @@ assert.sameMembers(
 
 coll.drop();
 
+// Test constants works in pipeline update.
+res = db.adminCommand({
+    bulkWrite: 1,
+    ops: [
+        {insert: 0, document: {_id: 0, skey: "MongoDB"}},
+        {insert: 0, document: {_id: 1, skey: "MongoDB2"}},
+        {insert: 0, document: {_id: 2, skey: "MongoDB3"}},
+        {
+            update: 0,
+            filter: {$expr: {$eq: ["$skey", "$$targetKey"]}},
+            updateMods: [{$set: {skey: "$$replacedKey"}}],
+            constants: {targetKey: "MongoDB", replacedKey: "MongoDB2"},
+            return: "post"
+        },
+    ],
+    nsInfo: [{ns: "test.coll"}],
+});
+
+assert.commandWorked(res);
+assert.eq(res.numErrors, 0);
+
+cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
+cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, n: 1});
+cursorEntryValidator(res.cursor.firstBatch[2], {ok: 1, idx: 2, n: 1});
+cursorEntryValidator(res.cursor.firstBatch[3], {ok: 1, idx: 3, n: 1, nModified: 1});
+assert.docEq(res.cursor.firstBatch[3].value, {_id: 0, skey: "MongoDB2"});
+assert(!res.cursor.firstBatch[4]);
+
+assert.sameMembers(
+    coll.find().toArray(),
+    [{_id: 0, skey: "MongoDB2"}, {_id: 1, skey: "MongoDB2"}, {_id: 2, skey: "MongoDB3"}]);
+
+coll.drop();
+
+// Test let matches specific document (targetKey) and constants overwrite let (replacedKey).
+res = db.adminCommand({
+    bulkWrite: 1,
+    ops: [
+        {insert: 0, document: {_id: 0, skey: "MongoDB"}},
+        {insert: 0, document: {_id: 1, skey: "MongoDB2"}},
+        {insert: 0, document: {_id: 2, skey: "MongoDB3"}},
+        {
+            update: 0,
+            filter: {$expr: {$eq: ["$skey", "$$targetKey"]}},
+            updateMods: [{$set: {skey: "$$replacedKey"}}],
+            constants: {replacedKey: "MongoDB4"},
+            return: "post"
+        },
+    ],
+    nsInfo: [{ns: "test.coll"}],
+    let : {targetKey: "MongoDB3", replacedKey: "MongoDB2"}
+});
+
+assert.commandWorked(res);
+assert.eq(res.numErrors, 0);
+
+cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
+cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, n: 1});
+cursorEntryValidator(res.cursor.firstBatch[2], {ok: 1, idx: 2, n: 1});
+cursorEntryValidator(res.cursor.firstBatch[3], {ok: 1, idx: 3, n: 1, nModified: 1});
+assert.docEq(res.cursor.firstBatch[3].value, {_id: 2, skey: "MongoDB4"});
+assert(!res.cursor.firstBatch[4]);
+
+coll.drop();
+
 // Test multiple updates on same namespace.
 res = db.adminCommand({
     bulkWrite: 1,
     ops: [
         {insert: 0, document: {_id: 1, skey: "MongoDB"}},
         {update: 0, filter: {_id: 1}, updateMods: {$set: {skey: "MongoDB2"}}, return: "post"},
-        {update: 0, filter: {_id: 1}, updateMods: {$set: {skey: "MongoDB3"}}, return: "post"},
+        {update: 0, filter: {_id: 1}, updateMods: {$set: {skey: "MongoDB3"}}},
     ],
     nsInfo: [{ns: "test.coll"}]
 });
 
 assert.commandWorked(res);
+assert.eq(res.numErrors, 0);
 
 cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1});
-cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, nModified: 1});
+cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, n: 1, nModified: 1});
 assert.docEq(res.cursor.firstBatch[1].value, {_id: 1, skey: "MongoDB2"});
-cursorEntryValidator(res.cursor.firstBatch[2], {ok: 1, idx: 2, nModified: 1});
-assert.docEq(res.cursor.firstBatch[2].value, {_id: 1, skey: "MongoDB3"});
+cursorEntryValidator(res.cursor.firstBatch[2], {ok: 1, idx: 2, n: 1, nModified: 1});
 assert(!res.cursor.firstBatch[3]);
 
 assert.eq("MongoDB3", coll.findOne().skey);
@@ -462,84 +438,13 @@ res = db.adminCommand({
 });
 
 assert.commandWorked(res);
+assert.eq(res.numErrors, 0);
 
-cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, nModified: 0});
+cursorEntryValidator(res.cursor.firstBatch[0], {ok: 1, idx: 0, n: 1, nModified: 0});
 assert.docEq(res.cursor.firstBatch[0].upserted, {index: 0, _id: 1});
 assert.docEq(res.cursor.firstBatch[0].value, {_id: 1, skey: "MongoDB2"});
 assert(!res.cursor.firstBatch[1]);
 
 var coll2 = db.getCollection("coll2");
-coll2.drop();
-
-// Test write fails userAllowedWriteNS.
-res = db.adminCommand({
-    bulkWrite: 1,
-    ops: [
-        {
-            update: 0,
-            filter: {_id: 1},
-            updateMods: {$set: {skey: "MongoDB2"}},
-            multi: true,
-        },
-    ],
-    nsInfo: [{ns: "test.system.profile"}]
-});
-
-assert.commandWorked(res);
-
-cursorEntryValidator(res.cursor.firstBatch[0], {ok: 0, idx: 0, code: ErrorCodes.InvalidNamespace});
-assert(!res.cursor.firstBatch[1]);
-
-// Test update continues on error with ordered:false.
-assert.commandWorked(coll2.createIndex({x: 1}, {unique: true}));
-assert.commandWorked(coll2.insert({x: 3}));
-assert.commandWorked(coll2.insert({x: 4}));
-res = db.adminCommand({
-    bulkWrite: 1,
-    ops: [
-        {update: 0, filter: {x: 3}, updateMods: {$inc: {x: 1}}, upsert: true, return: "post"},
-        {
-            update: 1,
-            filter: {_id: 1},
-            updateMods: {$set: {skey: "MongoDB2"}},
-            upsert: true,
-            return: "post"
-        },
-    ],
-    nsInfo: [{ns: "test.coll2"}, {ns: "test.coll"}],
-    ordered: false
-});
-
-cursorEntryValidator(res.cursor.firstBatch[0], {ok: 0, idx: 0, code: ErrorCodes.DuplicateKey});
-cursorEntryValidator(res.cursor.firstBatch[1], {ok: 1, idx: 1, nModified: 0});
-assert.docEq(res.cursor.firstBatch[1].upserted, {index: 0, _id: 1});
-assert.docEq(res.cursor.firstBatch[1].value, {_id: 1, skey: "MongoDB2"});
-assert(!res.cursor.firstBatch[2]);
-coll.drop();
-coll2.drop();
-
-// Test update stop on error with ordered:true.
-assert.commandWorked(coll2.createIndex({x: 1}, {unique: true}));
-assert.commandWorked(coll2.insert({x: 3}));
-assert.commandWorked(coll2.insert({x: 4}));
-res = db.adminCommand({
-    bulkWrite: 1,
-    ops: [
-        {update: 0, filter: {x: 3}, updateMods: {$inc: {x: 1}}, upsert: true, return: "post"},
-        {
-            update: 1,
-            filter: {_id: 1},
-            updateMods: {$set: {skey: "MongoDB2"}},
-            upsert: true,
-            return: "post"
-        },
-        {insert: 0, document: {_id: 1, skey: "MongoDB"}},
-    ],
-    nsInfo: [{ns: "test.coll2"}, {ns: "test.coll"}],
-});
-
-cursorEntryValidator(res.cursor.firstBatch[0], {ok: 0, idx: 0, code: ErrorCodes.DuplicateKey});
-assert(!res.cursor.firstBatch[1]);
-coll.drop();
 coll2.drop();
 })();

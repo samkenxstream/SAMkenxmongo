@@ -62,8 +62,7 @@
 #include "mongo/s/query/document_source_merge_cursors.h"
 #include "mongo/s/query/establish_cursors.h"
 #include "mongo/s/query_analysis_sampler_util.h"
-#include "mongo/s/router.h"
-#include "mongo/s/stale_exception.h"
+#include "mongo/s/router_role.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/overloaded_visitor.h"
@@ -118,13 +117,6 @@ RemoteCursor openChangeStreamNewShardMonitor(const boost::intrusive_ptr<Expressi
                       << DocumentSourceChangeStreamSpec::kAllowToRunOnConfigDBFieldName << true))});
     aggReq.setFromMongos(true);
     aggReq.setNeedsMerge(true);
-
-    // TODO SERVER-65369: This code block can be removed after 7.0.
-    if (isMongos() && expCtx->changeStreamTokenVersion == 1) {
-        // A request for v1 resume tokens on mongos should only be allowed in test mode.
-        tassert(6497000, "Invalid request for v1 resume tokens", getTestCommandsEnabled());
-        aggReq.setGenerateV2ResumeTokens(false);
-    }
 
     SimpleCursorOptions cursor;
     cursor.setBatchSize(0);
@@ -202,9 +194,6 @@ std::vector<RemoteCursor> establishShardCursors(
     invariant(cri || mustRunOnAllShards);
 
     if (targetEveryShardServer) {
-        uassert(7355703,
-                "Cannot target all hosts if the pipeline is not run on all shards.",
-                mustRunOnAllShards);
         if (MONGO_unlikely(shardedAggregateHangBeforeEstablishingShardCursors.shouldFail())) {
             LOGV2(
                 7355704,
@@ -1193,7 +1182,7 @@ DispatchShardPipelineResults dispatchShardPipeline(
             // shards, and should participate in the shard version protocol.
             invariant(executionNsRoutingInfo);
             shardResults =
-                scatterGatherVersionedTargetByRoutingTable(opCtx,
+                scatterGatherVersionedTargetByRoutingTable(expCtx,
                                                            expCtx->ns.db(),
                                                            expCtx->ns,
                                                            *executionNsRoutingInfo,
@@ -1216,7 +1205,7 @@ DispatchShardPipelineResults dispatchShardPipeline(
                                             ReadPreferenceSetting::get(opCtx),
                                             targetEveryShardServer);
 
-        } catch (const StaleConfigException& e) {
+        } catch (const ExceptionFor<ErrorCodes::StaleConfig>& e) {
             // Check to see if the command failed because of a stale shard version or something
             // else.
             auto staleInfo = e.extraInfo<StaleConfigInfo>();
@@ -1598,7 +1587,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> attachCursorToPipeline(
     // these namespaces, a local cursor should always be used.
     // TODO SERVER-59957: use NamespaceString::isPerShardNamespace instead.
     auto shouldAlwaysAttachLocalCursorForNamespace = [](const NamespaceString& ns) {
-        return (ns.isLocal() || ns.isConfigDotCacheDotChunks() ||
+        return (ns.isLocalDB() || ns.isConfigDotCacheDotChunks() ||
                 ns.isReshardingLocalOplogBufferCollection() ||
                 ns == NamespaceString::kConfigImagesNamespace ||
                 ns.isChangeStreamPreImagesCollection());

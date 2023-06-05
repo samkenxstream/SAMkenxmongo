@@ -59,16 +59,12 @@ struct PlanCacheKeyShardingEpoch {
 struct PlanCacheKeyCollectionState {
     bool operator==(const PlanCacheKeyCollectionState& other) const {
         return other.uuid == uuid && other.version == version &&
-            other.newestVisibleIndexTimestamp == newestVisibleIndexTimestamp &&
             other.collectionGeneration == collectionGeneration;
     }
 
     size_t hashCode() const {
         size_t hash = UUID::Hash{}(uuid);
         boost::hash_combine(hash, version);
-        if (newestVisibleIndexTimestamp) {
-            boost::hash_combine(hash, newestVisibleIndexTimestamp->asULL());
-        }
         if (collectionGeneration) {
             collectionGeneration->epoch.hash_combine(hash);
             boost::hash_combine(hash, collectionGeneration->ts.asULL());
@@ -87,20 +83,6 @@ struct PlanCacheKeyCollectionState {
     // We also clean up all cache entries for a particular (collectionUuid, versionNumber) pair when
     // all readers seeing this version of the collection have drained.
     size_t version;
-
-    // The '_collectionVersion' is not currently sufficient in order to ensure that the indexes
-    // visible to the reader are consistent with the indexes present in the cache entry. The reason
-    // is that all readers see the latest copy-on-write version of the 'Collection' object, even
-    // though they are allowed to read at an older timestamp, potentially at a time before an index
-    // build completed.
-    //
-    // To solve this problem, we incorporate the timestamp of the newest index visible to the reader
-    // into the plan cache key. This ensures that the set of indexes visible to the reader match
-    // those present in the plan cache entry, preventing a situation where the plan cache entry
-    // reflects a newer version of the index catalog than the one visible to the reader.
-    //
-    // In the future, this could instead be solved with point-in-time catalog lookups.
-    boost::optional<Timestamp> newestVisibleIndexTimestamp;
 
     // Ensures that a cached SBE plan cannot be reused if the collection has since become sharded or
     // changed its shard key. The cached plan may no longer be valid after sharding or shard key
@@ -165,6 +147,11 @@ public:
         return _info.toString();
     }
 
+    uint64_t estimatedKeySizeBytes() const {
+        return sizeof(*this) + _info.keySizeInBytes() +
+            container_size_helper::estimateObjectSizeInBytes(_secondaryCollectionStates);
+    }
+
 private:
     // Contains the actual encoding of the query shape as well as the index discriminators.
     const PlanCacheKeyInfo _info;
@@ -198,7 +185,7 @@ struct PlanCachePartitioner {
 struct CachedSbePlan {
     CachedSbePlan(std::unique_ptr<sbe::PlanStage> root, stage_builder::PlanStageData data)
         : root(std::move(root)), planStageData(std::move(data)) {
-        tassert(5968206, "The RuntimeEnvironment should not be null", planStageData.env);
+        tassert(5968206, "The RuntimeEnvironment should not be null", planStageData.env.runtimeEnv);
     }
 
     std::unique_ptr<CachedSbePlan> clone() const {
@@ -223,9 +210,7 @@ struct BudgetEstimator {
      */
     size_t operator()(const sbe::PlanCacheKey& key,
                       const std::shared_ptr<const PlanCacheEntry>& entry) {
-        // TODO: SERVER-73649 include size of underlying query shape and size of int_32 key hash in
-        // total size estimation.
-        return entry->estimatedEntrySizeBytes;
+        return entry->estimatedEntrySizeBytes + key.estimatedKeySizeBytes();
     }
 };
 

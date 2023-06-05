@@ -69,7 +69,7 @@ const char* DocumentSourceMatch::getSourceName() const {
 }
 
 Value DocumentSourceMatch::serialize(SerializationOptions opts) const {
-    if (opts.verbosity || opts.redactIdentifiers || opts.replacementForLiteralArgs) {
+    if (opts.verbosity || opts.transformIdentifiers || opts.replacementForLiteralArgs) {
         return Value(DOC(getSourceName() << Document(_expression->serialize(opts))));
     }
     return Value(DOC(getSourceName() << Document(getQuery())));
@@ -274,6 +274,7 @@ Document redactSafePortionDollarOps(BSONObj expr) {
             case PathAcceptingKeyword::INTERNAL_EXPR_GTE:
             case PathAcceptingKeyword::INTERNAL_EXPR_LT:
             case PathAcceptingKeyword::INTERNAL_EXPR_LTE:
+            case PathAcceptingKeyword::INTERNAL_EQ_HASHED_KEY:
             case PathAcceptingKeyword::INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX:
             case PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_ENCRYPTED_TYPE:
             case PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_SUBTYPE:
@@ -502,7 +503,7 @@ DocumentSourceMatch::splitMatchByModifiedFields(
             // This stage modifies all paths, so cannot be swapped with a $match at all.
             return {nullptr, match};
         case DocumentSource::GetModPathsReturn::Type::kFiniteSet:
-            modifiedPaths = std::move(modifiedPathsRet.paths);
+            modifiedPaths = modifiedPathsRet.paths;
             break;
         case DocumentSource::GetModPathsReturn::Type::kAllExcept: {
             DepsTracker depsTracker;

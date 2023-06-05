@@ -2,8 +2,11 @@
  * Tests that resharding participants do not block replication while waiting for the
  * ReshardingCoordinatorService to be rebuilt.
  *
- * Looks like a test incompatibility, but should be verified and maybe rework the test.
- * @tags: [temporary_catalog_shard_incompatible]
+ * Incompatible because it uses a fail point to block all primary only services from being rebuilt
+ * on the config server, and if the config server is the first shard, this prevents the test from
+ * making progress. This tests logic that shouldn't be different on a config server, so there's no
+ * need to run it with a config shard.
+ * @tags: [config_shard_incompatible]
  */
 (function() {
 "use strict";

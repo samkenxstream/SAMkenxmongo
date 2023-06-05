@@ -34,14 +34,19 @@ Checks:          '-*,
                   modernize-shrink-to-fit,
                   modernize-unary-static-assert,
                   mongo-cctype-check,
+                  mongo-config-header-check,
+                  mongo-collection-sharding-runtime-check,
+                  mongo-cxx20-banned-includes-check,
                   mongo-header-bracket-check,
                   mongo-std-atomic-check,
                   mongo-mutex-check,
                   mongo-assert-check,
                   mongo-std-optional-check,
                   mongo-uninterruptible-lock-guard-check,
+                  mongo-unstructured-log-check,
                   mongo-volatile-check,
                   mongo-trace-check,
+                  mongo-fcv-constant-check,
                   performance-faster-string-find,
                   performance-implicit-conversion-in-loop,
                   performance-inefficient-algorithm,
@@ -126,6 +131,8 @@ CheckOptions:
     value:           assert
   - key:             mongo-header-bracket-check.mongoSourceDirs
     value:           'src/mongo;@MONGO_BUILD_DIR@'
+  - key:             mongo-collection-sharding-runtime-check.exceptionDirs
+    value:           'src/mongo/db/s'
   - key:             bugprone-assert-side-effect.CheckFunctionCalls
     value:           '0'
   - key:             bugprone-dangling-handle.HandleClasses

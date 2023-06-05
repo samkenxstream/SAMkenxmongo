@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/s/query/cluster_aggregation_planner.h"
 
 #include "mongo/bson/util/bson_extract.h"
@@ -63,7 +61,6 @@
 #include "mongo/s/transaction_router.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
-
 
 namespace mongo {
 namespace cluster_aggregation_planner {
@@ -363,15 +360,16 @@ BSONObj establishMergingMongosCursor(OperationContext* opCtx,
     int nShards = ccc->getNumRemotes();
 
     auto&& opDebug = CurOp::get(opCtx)->debug();
-    // Fill out the aggregation metrics in CurOp, and record telemetry metrics, before detaching the
-    // cursor from its opCtx.
+    // Fill out the aggregation metrics in CurOp, and record queryStats metrics, before detaching
+    // the cursor from its opCtx.
     opDebug.nShards = std::max(opDebug.nShards, nShards);
     opDebug.cursorExhausted = exhausted;
     opDebug.additiveMetrics.nBatches = 1;
+    CurOp::get(opCtx)->setEndOfOpMetrics(responseBuilder.numDocs());
     if (exhausted) {
-        collectTelemetryMongos(opCtx, ccc->getOriginatingCommand(), responseBuilder.numDocs());
+        collectQueryStatsMongos(opCtx, ccc->getRequestShapifier());
     } else {
-        collectTelemetryMongos(opCtx, ccc, responseBuilder.numDocs());
+        collectQueryStatsMongos(opCtx, ccc);
     }
 
     ccc->detachFromOperationContext();
@@ -572,7 +570,7 @@ bool isMergeSkipOrLimit(const boost::intrusive_ptr<DocumentSource>& stage) {
 }
 
 bool isAllLimitsAndSkips(Pipeline* pipeline) {
-    const auto stages = pipeline->getSources();
+    const auto& stages = pipeline->getSources();
     return std::all_of(
         stages.begin(), stages.end(), [](const auto& stage) { return isMergeSkipOrLimit(stage); });
 }

@@ -90,16 +90,23 @@ plan_cache_debug_info::DebugInfo buildDebugInfo(
 plan_cache_debug_info::DebugInfoSBE buildDebugInfo(const QuerySolution* solution);
 
 /**
- * Caches the best candidate plan, chosen from the given 'candidates' based on the 'ranking'
- * decision, if the 'query' is of a type that can be cached. Otherwise, does nothing.
+ * Caches the best candidate execution plan for 'query', chosen from the given 'candidates' based on
+ * the 'ranking' decision, if the 'query' is of a type that can be cached. Otherwise, does nothing.
  *
  * The 'cachingMode' specifies whether the query should be:
  *    * Always cached.
  *    * Never cached.
  *    * Cached, except in certain special cases.
+ *
+ * This method is shared between Classic and SBE. The plan roots 'candidates[i].root' have different
+ * types between the two:
+ *    * Classic - mongo::PlanStage*
+ *    * SBE     - std::unique_ptr<sbe::PlanStage>>
+ * This breaks polymorphism because native pointers and std::unique_ptr must be handled differently.
+ * std::is_same_v is used to distinguish in these cases.
  */
 template <typename PlanStageType, typename ResultType, typename Data>
-void updatePlanCache(
+void updatePlanCacheFromCandidates(
     OperationContext* opCtx,
     const MultipleCollectionAccessor& collections,
     PlanCachingMode cachingMode,
@@ -176,7 +183,8 @@ void updatePlanCache(
 
     // Store the choice we just made in the cache, if the query is of a type that is safe to
     // cache.
-    if (shouldCacheQuery(query) && canCache) {
+    if (canCache && shouldCacheQuery(query)) {
+        const CollectionPtr& collection = collections.getMainCollection();
         auto rankingDecision = ranking.get();
         auto cacheClassicPlan = [&]() {
             auto buildDebugInfoFn = [&]() -> plan_cache_debug_info::DebugInfo {
@@ -188,7 +196,6 @@ void updatePlanCache(
                 callbacks{query, buildDebugInfoFn};
             winningPlan.solution->cacheData->indexFilterApplied =
                 winningPlan.solution->indexFilterApplied;
-            auto& collection = collections.getMainCollection();
             auto isSensitive = CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation;
             uassertStatusOK(CollectionQueryInfo::get(collection)
                                 .getPlanCache()
@@ -243,10 +250,10 @@ void updatePlanCache(
 }
 
 /**
- * Caches the SBE plan 'root' along with its accompanying 'data' if the 'query' is of a type that
- * can be cached. Otherwise, does nothing.
+ * Caches the plan 'root' along with its accompanying 'data' if the 'query' is of a type that can be
+ * cached. Otherwise, does nothing.
  *
- * The given plan will be "pinned" to the cache and will be not subject to replanning. One put into
+ * The given plan will be "pinned" to the cache and will not be subject to replanning. Once put into
  * the cache, the plan immediately becomes "active".
  */
 void updatePlanCache(OperationContext* opCtx,
@@ -254,6 +261,6 @@ void updatePlanCache(OperationContext* opCtx,
                      const CanonicalQuery& query,
                      const QuerySolution& solution,
                      const sbe::PlanStage& root,
-                     const stage_builder::PlanStageData& data);
+                     stage_builder::PlanStageData& stageData);
 }  // namespace plan_cache_util
 }  // namespace mongo

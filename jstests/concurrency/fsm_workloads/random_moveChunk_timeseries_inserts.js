@@ -32,12 +32,10 @@ var $config = extendWorkload($config, function($config, $super) {
     $config.data.numInitialDocs = 60 * 24 * 30;
     $config.data.numMetaCount = 30;
 
-    $config.data.featureFlagDisabled = true;
-
     $config.data.bucketPrefix = "system.buckets.";
 
-    $config.data.timeField = 't';
     $config.data.metaField = 'm';
+    $config.data.timeField = 't';
 
     $config.data.generateMetaFieldValueForInitialInserts = () => {
         return Math.floor(Random.rand() * $config.data.numMetaCount);
@@ -52,18 +50,16 @@ var $config = extendWorkload($config, function($config, $super) {
     $config.startState = "init";
 
     $config.states.insert = function insert(db, collName, connCache) {
-        if (this.featureFlagDisabled) {
-            return;
-        }
-
         for (let i = 0; i < 10; i++) {
             // Generate a random timestamp between 'startTime' and largest timestamp we inserted.
             const timer =
                 this.startTime + Math.floor(Random.rand() * this.numInitialDocs * this.increment);
+            const metaVal = this.generateMetaFieldValueForInsertStage(this.tid);
             const doc = {
                 _id: new ObjectId(),
+                [this.metaField]: metaVal,
                 [this.timeField]: new Date(timer),
-                [this.metaField]: this.generateMetaFieldValueForInsertStage(this.tid),
+                f: metaVal,
             };
             assertAlways.commandWorked(db[collName].insert(doc));
             assertAlways.commandWorked(db[this.nonShardCollName].insert(doc));
@@ -74,10 +70,6 @@ var $config = extendWorkload($config, function($config, $super) {
      * Moves a random chunk in the target collection.
      */
     $config.states.moveChunk = function moveChunk(db, collName, connCache) {
-        if (this.featureFlagDisabled) {
-            return;
-        }
-
         const configDB = db.getSiblingDB('config');
         const ns = db[this.bucketPrefix + collName].getFullName();
         const chunks = findChunksUtil.findChunksByNs(configDB, ns).toArray();
@@ -100,11 +92,7 @@ var $config = extendWorkload($config, function($config, $super) {
                               waitForDelete);
     };
 
-    $config.states.init = function init(db, collName, connCache) {
-        if (TimeseriesTest.shardedtimeseriesCollectionsEnabled(db.getMongo())) {
-            this.featureFlagDisabled = false;
-        }
-    };
+    $config.states.init = function init(db, collName, connCache) {};
 
     $config.transitions = {
         init: {insert: 1},
@@ -112,31 +100,33 @@ var $config = extendWorkload($config, function($config, $super) {
         moveChunk: {insert: 1, moveChunk: 0}
     };
 
-    $config.teardown = function teardown(db, collName, cluster) {
-        if (this.featureFlagDisabled) {
-            return;
-        }
-
-        const numBuckets = db[this.bucketPrefix + collName].find({}).itcount();
-        const numInitialDocs = db[collName].find().itcount();
-
-        jsTestLog("NumBuckets " + numBuckets + ", numDocs on sharded cluster" +
-                  db[collName].find().itcount() + "numDocs on unsharded collection " +
-                  db[this.nonShardCollName].find({}).itcount());
+    $config.data.validateCollection = function validate(db, collName) {
         const pipeline =
             [{$project: {_id: "$_id", m: "$m", t: "$t"}}, {$sort: {m: 1, t: 1, _id: 1}}];
         const diff = DataConsistencyChecker.getDiff(db[collName].aggregate(pipeline),
                                                     db[this.nonShardCollName].aggregate(pipeline));
         assertAlways.eq(
             diff, {docsWithDifferentContents: [], docsMissingOnFirst: [], docsMissingOnSecond: []});
+    };
+
+    $config.teardown = function teardown(db, collName, cluster) {
+        const numBuckets = db[this.bucketPrefix + collName].find({}).itcount();
+        const numInitialDocs = db[collName].find().itcount();
+
+        jsTestLog("NumBuckets " + numBuckets + ", numDocs on sharded cluster" +
+                  db[collName].find().itcount() + "numDocs on unsharded collection " +
+                  db[this.nonShardCollName].find({}).itcount());
+
+        // Validate the contents of the collection.
+        this.validateCollection(db, collName);
 
         // Make sure that queries using various indexes on time-series buckets collection return
         // buckets with all documents.
         const verifyBucketIndex = (bucketIndex) => {
             const unpackStage = {
                 "$_internalUnpackBucket": {
-                    "timeField": this.timeField,
                     "metaField": this.metaField,
+                    "timeField": this.timeField,
                     "bucketMaxSpanSeconds": NumberInt(3600)
                 }
             };
@@ -157,17 +147,11 @@ var $config = extendWorkload($config, function($config, $super) {
     };
 
     $config.setup = function setup(db, collName, cluster) {
-        if (TimeseriesTest.shardedtimeseriesCollectionsEnabled(db.getMongo())) {
-            this.featureFlagDisabled = false;
-        } else {
-            return;
-        }
-
         db[collName].drop();
         db[this.nonShardCollName].drop();
 
         assertAlways.commandWorked(db.createCollection(
-            collName, {timeseries: {timeField: this.timeField, metaField: this.metaField}}));
+            collName, {timeseries: {metaField: this.metaField, timeField: this.timeField}}));
         cluster.shardCollection(db[collName], {t: 1}, false);
 
         // Create indexes to verify index integrity during the teardown state.
@@ -185,10 +169,12 @@ var $config = extendWorkload($config, function($config, $super) {
         for (let i = 0; i < this.numInitialDocs; ++i) {
             currentTimeStamp += this.increment;
 
+            const metaVal = this.generateMetaFieldValueForInitialInserts(i);
             const doc = {
                 _id: new ObjectId(),
+                [this.metaField]: metaVal,
                 [this.timeField]: new Date(currentTimeStamp),
-                [this.metaField]: this.generateMetaFieldValueForInitialInserts(i),
+                f: metaVal,
             };
             bulk.insert(doc);
             bulkUnsharded.insert(doc);

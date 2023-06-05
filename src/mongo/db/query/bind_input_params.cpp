@@ -29,12 +29,14 @@
 
 #include "mongo/db/query/bind_input_params.h"
 
+#include "mongo/db/exec/sbe/stages/scan.h"
 #include "mongo/db/exec/sbe/values/bson.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_visitor.h"
 #include "mongo/db/matcher/expression_where.h"
 #include "mongo/db/query/index_bounds_builder.h"
+#include "mongo/db/query/planner_access.h"
 #include "mongo/db/query/sbe_stage_builder_filter.h"
 #include "mongo/db/query/sbe_stage_builder_index_scan.h"
 
@@ -43,15 +45,9 @@ namespace {
 
 class MatchExpressionParameterBindingVisitor final : public MatchExpressionConstVisitor {
 public:
-    MatchExpressionParameterBindingVisitor(
-        const stage_builder::InputParamToSlotMap& inputParamToSlotMap,
-        sbe::RuntimeEnvironment* runtimeEnvironment,
-        bool bindingCachedPlan)
-        : _inputParamToSlotMap(inputParamToSlotMap),
-          _runtimeEnvironment(runtimeEnvironment),
-          _bindingCachedPlan(bindingCachedPlan) {
-        invariant(_runtimeEnvironment);
-    }
+    MatchExpressionParameterBindingVisitor(stage_builder::PlanStageData& data,
+                                           bool bindingCachedPlan)
+        : _data(data), _bindingCachedPlan(bindingCachedPlan) {}
 
     void visit(const BitsAllClearMatchExpression* expr) final {
         visitBitTestExpression(expr);
@@ -92,8 +88,9 @@ public:
         // contains any regexes.
         tassert(6279503, "Unexpected parameter marker for $in with regexes", !expr->hasRegex());
 
+        auto coll = _data.staticData->queryCollator.get();
         auto&& [arrSetTag, arrSetVal, hasArray, hasObject, hasNull] =
-            stage_builder::convertInExpressionEqualities(expr);
+            stage_builder::convertInExpressionEqualities(expr, coll);
         bindParam(*slotId, true /*owned*/, arrSetTag, arrSetVal);
 
         // Auto-parameterization should not kick in if the $in's list of equalities includes any
@@ -217,6 +214,7 @@ public:
     void visit(const InternalExprGTEMatchExpression* expr) final {}
     void visit(const InternalExprLTMatchExpression* expr) final {}
     void visit(const InternalExprLTEMatchExpression* expr) final {}
+    void visit(const InternalEqHashedKey* expr) final {}
     void visit(const InternalSchemaAllElemMatchFromIndexMatchExpression* expr) final {}
     void visit(const InternalSchemaAllowedPropertiesMatchExpression* expr) final {}
     void visit(const InternalSchemaBinDataEncryptedTypeExpression* expr) final {}
@@ -290,7 +288,7 @@ private:
         if (owned) {
             guard.emplace(typeTag, value);
         }
-        auto accessor = _runtimeEnvironment->getAccessor(slotId);
+        auto accessor = _data.env->getAccessor(slotId);
         if (owned) {
             guard->reset();
         }
@@ -303,17 +301,14 @@ private:
     }
 
     boost::optional<sbe::value::SlotId> getSlotId(MatchExpression::InputParamId paramId) const {
-        auto it = _inputParamToSlotMap.find(paramId);
-        if (it != _inputParamToSlotMap.end()) {
+        auto it = _data.staticData->inputParamToSlotMap.find(paramId);
+        if (it != _data.staticData->inputParamToSlotMap.end()) {
             return it->second;
         }
         return boost::none;
     }
 
-    const stage_builder::InputParamToSlotMap& _inputParamToSlotMap;
-
-    sbe::RuntimeEnvironment* const _runtimeEnvironment;
-
+    stage_builder::PlanStageData& _data;
     // True if the plan for which we are binding parameter values is being recovered from the SBE
     // plan cache.
     const bool _bindingCachedPlan;
@@ -429,11 +424,9 @@ void bindGenericPlanSlots(const stage_builder::IndexBoundsEvaluationInfo& indexB
 }  // namespace
 
 void bind(const CanonicalQuery& canonicalQuery,
-          const stage_builder::InputParamToSlotMap& inputParamToSlotMap,
-          sbe::RuntimeEnvironment* runtimeEnvironment,
+          stage_builder::PlanStageData& data,
           const bool bindingCachedPlan) {
-    MatchExpressionParameterBindingVisitor visitor{
-        inputParamToSlotMap, runtimeEnvironment, bindingCachedPlan};
+    MatchExpressionParameterBindingVisitor visitor{data, bindingCachedPlan};
     MatchExpressionParameterBindingWalker walker{&visitor};
     tree_walker::walk<true, MatchExpression>(canonicalQuery.root(), &walker);
 }
@@ -443,11 +436,13 @@ void bindIndexBounds(
     const stage_builder::IndexBoundsEvaluationInfo& indexBoundsInfo,
     sbe::RuntimeEnvironment* runtimeEnvironment,
     interval_evaluation_tree::IndexBoundsEvaluationCache* indexBoundsEvaluationCache) {
-    auto bounds = makeIndexBounds(indexBoundsInfo, cq, indexBoundsEvaluationCache);
-    auto intervals = stage_builder::makeIntervalsFromIndexBounds(*bounds,
-                                                                 indexBoundsInfo.direction == 1,
-                                                                 indexBoundsInfo.keyStringVersion,
-                                                                 indexBoundsInfo.ordering);
+    std::unique_ptr<IndexBounds> bounds =
+        makeIndexBounds(indexBoundsInfo, cq, indexBoundsEvaluationCache);
+    stage_builder::IndexIntervals intervals =
+        stage_builder::makeIntervalsFromIndexBounds(*bounds,
+                                                    indexBoundsInfo.direction == 1,
+                                                    indexBoundsInfo.keyStringVersion,
+                                                    indexBoundsInfo.ordering);
     const bool isSingleIntervalSolution = stdx::holds_alternative<
         mongo::stage_builder::ParameterizedIndexScanSlots::SingleIntervalPlan>(
         indexBoundsInfo.slots.slots);
@@ -458,4 +453,54 @@ void bindIndexBounds(
             indexBoundsInfo, std::move(intervals), std::move(bounds), runtimeEnvironment);
     }
 }
+
+void bindClusteredCollectionBounds(const CanonicalQuery& cq,
+                                   const sbe::PlanStage* root,
+                                   const stage_builder::PlanStageData* data,
+                                   sbe::RuntimeEnvironment* runtimeEnvironment) {
+    // Arguments needed to mimic the original build-time bounds setting from the current query.
+    const MatchExpression* conjunct = cq.root();                // this is csn->filter
+    const CollatorInterface* queryCollator = cq.getCollator();  // current query's desired collator
+
+    // The outputs produced by the QueryPlannerAccess APIs below (passed by reference).
+    boost::optional<RecordIdBound> minRecord;                 // scan start bound
+    boost::optional<RecordIdBound> maxRecord;                 // scan end bound
+    CollectionScanParams::ScanBoundInclusion boundInclusion;  // whether end bound is inclusive
+
+    // Cast the return value to void since we are not building a CollectionScanNode here so do not
+    // need to set it in its 'hasCompatibleCollation' member.
+    static_cast<void>(QueryPlannerAccess::handleRIDRangeScan(conjunct,
+                                                             queryCollator,
+                                                             data->staticData->ccCollator.get(),
+                                                             data->staticData->clusterKeyFieldName,
+                                                             minRecord,
+                                                             maxRecord));
+    QueryPlannerAccess::handleRIDRangeMinMax(cq,
+                                             data->staticData->direction,
+                                             queryCollator,
+                                             data->staticData->ccCollator.get(),
+                                             minRecord,
+                                             maxRecord,
+                                             boundInclusion);
+
+    // Bind the scan bounds to input slots. We don't need to bind 'boundInclusion' to a slot because
+    // it is always the same as the original in a plan matched from cache since only the "max"
+    // keyword can change it from its default, and plans using "max" are not cached.
+    if (minRecord) {
+        boost::optional<sbe::value::SlotId> slotId =
+            runtimeEnvironment->getSlotIfExists("minRecordId"_sd);
+        tassert(7571500, "minRecordId slot missing", slotId);
+        auto [tag, val] = sbe::value::makeCopyRecordId(minRecord->recordId());
+        sbe::RuntimeEnvironment::Accessor* accessor = runtimeEnvironment->getAccessor(*slotId);
+        accessor->reset(true, tag, val);
+    }
+    if (maxRecord) {
+        boost::optional<sbe::value::SlotId> slotId =
+            runtimeEnvironment->getSlotIfExists("maxRecordId"_sd);
+        tassert(7571501, "maxRecordId slot missing", slotId);
+        auto [tag, val] = sbe::value::makeCopyRecordId(maxRecord->recordId());
+        sbe::RuntimeEnvironment::Accessor* accessor = runtimeEnvironment->getAccessor(*slotId);
+        accessor->reset(true, tag, val);
+    }
+}  // bindClusteredCollectionBounds
 }  // namespace mongo::input_params

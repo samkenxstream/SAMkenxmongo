@@ -6,7 +6,7 @@
  *   # We need a timeseries collection.
  *   requires_timeseries,
  *   requires_non_retryable_writes,
- *   featureFlagTimeseriesDeletesSupport,
+ *   requires_fcv_70,
  * ]
  */
 
@@ -67,11 +67,12 @@ assert.eq(coll.countDocuments({str: "odd"}),
           numDocs / 2,
           "Expected records not matching the filter not to be deleted.");
 
-// TODO SERVER-73682: Enable this test.
 // Delete one record from the compressed bucket.
-// result = assert.commandWorked(coll.deleteOne({f: {$lt: 100}}));
-// assert.eq(1, result.deletedCount);
-// assert.eq(coll.countDocuments({f: {$lt: 100}}),
-//           100 - 50 - 1,  // 100 records to start + 50 deleted above + 1 more deleted
-//           "Expected records matching the filter to be deleted.");
+if (FeatureFlagUtil.isPresentAndEnabled(db, "UpdateOneWithoutShardKey")) {
+    result = assert.commandWorked(coll.deleteOne({f: {$lt: 100}}));
+    assert.eq(1, result.deletedCount);
+    assert.eq(coll.countDocuments({f: {$lt: 100}}),
+              100 - 50 - 1,  // 100 records to start + 50 deleted above + 1 more deleted
+              "Expected records matching the filter to be deleted.");
+}
 })();

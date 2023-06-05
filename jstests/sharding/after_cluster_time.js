@@ -31,6 +31,9 @@ rst.initiate();
 
 // Start the sharding test and add the majority read concern enabled replica set.
 const st = new ShardingTest({manualAddShard: true});
+if (TestData.configShard) {
+    assert.commandWorked(st.s.adminCommand({transitionFromDedicatedConfigServer: 1}));
+}
 assert.commandWorked(st.s.adminCommand({addShard: rst.getURL()}));
 
 const testDB = st.s.getDB("test");

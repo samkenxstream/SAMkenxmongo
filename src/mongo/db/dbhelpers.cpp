@@ -179,8 +179,9 @@ bool Helpers::findById(OperationContext* opCtx,
     if (indexFound)
         *indexFound = 1;
 
-    auto recordId = catalog->getEntry(desc)->accessMethod()->asSortedData()->findSingle(
-        opCtx, CollectionPtr(collection), query["_id"].wrap());
+    const IndexCatalogEntry* entry = catalog->getEntry(desc);
+    auto recordId = entry->accessMethod()->asSortedData()->findSingle(
+        opCtx, CollectionPtr(collection), entry, query["_id"].wrap());
     if (recordId.isNull())
         return false;
     result = collection->docFor(opCtx, recordId).value();
@@ -190,7 +191,7 @@ bool Helpers::findById(OperationContext* opCtx,
 RecordId Helpers::findById(OperationContext* opCtx,
                            const CollectionPtr& collection,
                            const BSONObj& idquery) {
-    verify(collection);
+    MONGO_verify(collection);
     const IndexCatalog* catalog = collection->getIndexCatalog();
     const IndexDescriptor* desc = catalog->findIdIndex(opCtx);
     if (!desc && clustered_util::isClusteredOnId(collection->getClusteredInfo())) {
@@ -201,8 +202,9 @@ RecordId Helpers::findById(OperationContext* opCtx,
     }
 
     uassert(13430, "no _id index", desc);
-    return catalog->getEntry(desc)->accessMethod()->asSortedData()->findSingle(
-        opCtx, collection, idquery["_id"].wrap());
+    const IndexCatalogEntry* entry = catalog->getEntry(desc);
+    return entry->accessMethod()->asSortedData()->findSingle(
+        opCtx, collection, entry, idquery["_id"].wrap());
 }
 
 // Acquires necessary locks to read the collection with the given namespace. If this is an oplog
@@ -271,24 +273,24 @@ bool Helpers::getLast(OperationContext* opCtx, const NamespaceString& nss, BSONO
 }
 
 UpdateResult Helpers::upsert(OperationContext* opCtx,
-                             const NamespaceString& nss,
+                             ScopedCollectionAcquisition& coll,
                              const BSONObj& o,
                              bool fromMigrate) {
     BSONElement e = o["_id"];
-    verify(e.type());
+    MONGO_verify(e.type());
     BSONObj id = e.wrap();
-    return upsert(opCtx, nss, id, o, fromMigrate);
+    return upsert(opCtx, coll, id, o, fromMigrate);
 }
 
 UpdateResult Helpers::upsert(OperationContext* opCtx,
-                             const NamespaceString& nss,
+                             ScopedCollectionAcquisition& coll,
                              const BSONObj& filter,
                              const BSONObj& updateMod,
                              bool fromMigrate) {
-    OldClientContext context(opCtx, nss);
+    OldClientContext context(opCtx, coll.nss());
 
     auto request = UpdateRequest();
-    request.setNamespaceString(nss);
+    request.setNamespaceString(coll.nss());
 
     request.setQuery(filter);
     request.setUpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(updateMod));
@@ -298,18 +300,18 @@ UpdateResult Helpers::upsert(OperationContext* opCtx,
     }
     request.setYieldPolicy(PlanYieldPolicy::YieldPolicy::NO_YIELD);
 
-    return ::mongo::update(opCtx, context.db(), request);
+    return ::mongo::update(opCtx, coll, request);
 }
 
 void Helpers::update(OperationContext* opCtx,
-                     const NamespaceString& nss,
+                     ScopedCollectionAcquisition& coll,
                      const BSONObj& filter,
                      const BSONObj& updateMod,
                      bool fromMigrate) {
-    OldClientContext context(opCtx, nss);
+    OldClientContext context(opCtx, coll.nss());
 
     auto request = UpdateRequest();
-    request.setNamespaceString(nss);
+    request.setNamespaceString(coll.nss());
 
     request.setQuery(filter);
     request.setUpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(updateMod));
@@ -318,19 +320,21 @@ void Helpers::update(OperationContext* opCtx,
     }
     request.setYieldPolicy(PlanYieldPolicy::YieldPolicy::NO_YIELD);
 
-    ::mongo::update(opCtx, context.db(), request);
+    ::mongo::update(opCtx, coll, request);
 }
 
-void Helpers::putSingleton(OperationContext* opCtx, const NamespaceString& nss, BSONObj obj) {
-    OldClientContext context(opCtx, nss);
+void Helpers::putSingleton(OperationContext* opCtx,
+                           ScopedCollectionAcquisition& coll,
+                           BSONObj obj) {
+    OldClientContext context(opCtx, coll.nss());
 
     auto request = UpdateRequest();
-    request.setNamespaceString(nss);
+    request.setNamespaceString(coll.nss());
 
     request.setUpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(obj));
     request.setUpsert();
 
-    ::mongo::update(opCtx, context.db(), request);
+    ::mongo::update(opCtx, coll, request);
 
     CurOp::get(opCtx)->done();
 }
@@ -351,14 +355,10 @@ BSONObj Helpers::inferKeyPattern(const BSONObj& o) {
     return kpBuilder.obj();
 }
 
-void Helpers::emptyCollection(OperationContext* opCtx, const NamespaceString& nss) {
-    OldClientContext context(opCtx, nss);
+void Helpers::emptyCollection(OperationContext* opCtx, const ScopedCollectionAcquisition& coll) {
+    OldClientContext context(opCtx, coll.nss());
     repl::UnreplicatedWritesBlock uwb(opCtx);
-    CollectionPtr collection = CollectionPtr(
-        context.db() ? CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)
-                     : nullptr);
-
-    deleteObjects(opCtx, collection, nss, BSONObj(), false);
+    deleteObjects(opCtx, coll, BSONObj(), false);
 }
 
 bool Helpers::findByIdAndNoopUpdate(OperationContext* opCtx,
@@ -393,7 +393,8 @@ bool Helpers::findByIdAndNoopUpdate(OperationContext* opCtx,
                                         snapshottedDoc,
                                         result,
                                         collection_internal::kUpdateNoIndexes,
-                                        nullptr,
+                                        nullptr /* indexesAffected */,
+                                        nullptr /* opDebug */,
                                         &args);
 
     return true;

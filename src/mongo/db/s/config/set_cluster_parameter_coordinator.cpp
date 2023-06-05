@@ -146,7 +146,7 @@ void SetClusterParameterCoordinator::_sendSetClusterParameterToAllShards(
     LOGV2_DEBUG(6387001, 1, "Sending setClusterParameter to shards:", "shards"_attr = shards);
 
     ShardsvrSetClusterParameter request(_doc.getParameter());
-    request.setDbName(DatabaseName(_doc.getTenantId(), DatabaseName::kAdmin.db()));
+    request.setDbName(DatabaseNameUtil::deserialize(_doc.getTenantId(), DatabaseName::kAdmin.db()));
     request.setClusterParameterTime(*_doc.getClusterParameterTime());
     sharding_util::sendCommandToShards(
         opCtx,
@@ -161,14 +161,17 @@ void SetClusterParameterCoordinator::_commit(OperationContext* opCtx) {
 
     SetClusterParameter setClusterParameterRequest(_doc.getParameter());
     setClusterParameterRequest.setDbName(
-        DatabaseName(_doc.getTenantId(), DatabaseName::kAdmin.db()));
+        DatabaseNameUtil::deserialize(_doc.getTenantId(), DatabaseName::kAdmin.db()));
     std::unique_ptr<ServerParameterService> parameterService =
         std::make_unique<ClusterParameterService>();
     DBDirectClient client(opCtx);
     ClusterParameterDBClientService dbService(client);
     SetClusterParameterInvocation invocation{std::move(parameterService), dbService};
-    invocation.invoke(
-        opCtx, setClusterParameterRequest, _doc.getClusterParameterTime(), kMajorityWriteConcern);
+    invocation.invoke(opCtx,
+                      setClusterParameterRequest,
+                      _doc.getClusterParameterTime(),
+                      kMajorityWriteConcern,
+                      true /* skipValidation */);
 }
 
 const ConfigsvrCoordinatorMetadata& SetClusterParameterCoordinator::metadata() const {
@@ -202,7 +205,7 @@ ExecutorFuture<void> SetClusterParameterCoordinator::_runImpl(
                 ShardingLogging::get(opCtx)->logChange(
                     opCtx,
                     "setClusterParameter.start",
-                    NamespaceString::kClusterParametersNamespace.toString(),
+                    toStringForLogging(NamespaceString::kClusterParametersNamespace),
                     _doc.getParameter(),
                     kMajorityWriteConcern,
                     catalogManager->localConfigShard(),
@@ -233,7 +236,7 @@ ExecutorFuture<void> SetClusterParameterCoordinator::_runImpl(
                 ShardingLogging::get(opCtx)->logChange(
                     opCtx,
                     "setClusterParameter.end",
-                    NamespaceString::kClusterParametersNamespace.toString(),
+                    toStringForLogging(NamespaceString::kClusterParametersNamespace),
                     _doc.getParameter(),
                     kMajorityWriteConcern,
                     catalogManager->localConfigShard(),

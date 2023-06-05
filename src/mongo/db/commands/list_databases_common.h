@@ -93,13 +93,14 @@ int64_t setReplyItems(OperationContext* opCtx,
 
     for (const auto& dbName : dbNames) {
         if (authorizedDatabases &&
-            !as->isAuthorizedForAnyActionOnAnyResourceInDB(dbName.toString())) {
+            !as->isAuthorizedForAnyActionOnAnyResourceInDB(DatabaseNameUtil::serialize(dbName))) {
             // We don't have listDatabases on the cluster or find on this database.
             continue;
         }
 
         // If setTenantId is true, always return the dbName without the tenantId
-        ReplyItemType item(setTenantId ? dbName.db() : DatabaseNameUtil::serialize(dbName));
+        ReplyItemType item(setTenantId ? dbName.db().toString()
+                                       : DatabaseNameUtil::serialize(dbName));
         if (setTenantId) {
             initializeItemWithTenantId(item, dbName);
         }
@@ -117,7 +118,7 @@ int64_t setReplyItems(OperationContext* opCtx,
                 continue;
             }
 
-            writeConflictRetry(opCtx, "sizeOnDisk", dbName.toString(), [&] {
+            writeConflictRetry(opCtx, "sizeOnDisk", NamespaceString(dbName), [&] {
                 size = storageEngine->sizeOnDiskForDb(opCtx, dbName);
             });
             item.setSizeOnDisk(size);

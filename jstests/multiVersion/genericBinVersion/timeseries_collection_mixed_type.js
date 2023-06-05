@@ -11,7 +11,11 @@ load('jstests/multiVersion/libs/multi_rs.js');
 const timeFieldName = "time";
 
 // Note that this list will need to be kept up to date as versions are added/dropped.
-const upgradeVersions = [{binVersion: "6.0", fcv: "6.0"}, {binVersion: "latest"}];
+const upgradeVersions = [
+    {binVersion: "6.0", fcv: "6.0"},
+    {binVersion: "last-lts", fcv: lastLTSFCV},
+    {binVersion: "latest"}
+];
 
 /*
  * Creates a collection, populates it with `docs`, runs the `query` and ensures that the result set

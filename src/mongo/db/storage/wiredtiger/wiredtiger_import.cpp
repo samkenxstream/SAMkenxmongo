@@ -57,8 +57,6 @@ bool shouldImport(const NamespaceString& ns, const UUID& migrationId) {
     const auto tenantId =
         tenant_migration_access_blocker::parseTenantIdFromDatabaseName(ns.dbName());
 
-    // TODO SERVER-62491: Update this code path to handle TenantId::kSystemTenantId for internal
-    // collections.
     tenant_migration_access_blocker::validateNssIsBeingMigrated(tenantId, ns, migrationId);
 
     return !!tenantId;
@@ -217,11 +215,11 @@ std::vector<CollectionImportMetadata> wiredTigerRollbackToStableAndGetMetadata(
         for (const auto& index : catalogEntry.indexes) {
             uassert(6113807,
                     "No ident for donor index '{}' in collection '{}'"_format(
-                        index.nameStringData(), ns.toString()),
+                        index.nameStringData(), ns.toStringForErrorMsg()),
                     indexNameToIdent.contains(index.nameStringData()));
             uassert(6114302,
                     "Index '{}' for collection '{}' isn't ready"_format(index.nameStringData(),
-                                                                        ns.ns()),
+                                                                        ns.toStringForErrorMsg()),
                     index.ready);
 
             WTIndexImportArgs indexImportArgs;

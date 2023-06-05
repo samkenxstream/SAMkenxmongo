@@ -38,6 +38,7 @@
 #include "mongo/db/internal_transactions_feature_flag_gen.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/s/client/num_hosts_targeted_metrics.h"
 #include "mongo/s/collection_uuid_mismatch.h"
 #include "mongo/s/transaction_router.h"
@@ -148,49 +149,6 @@ bool wouldMakeBatchesTooBig(const std::vector<std::unique_ptr<TargetedWrite>>& w
     }
 
     return false;
-}
-
-/**
- * Gets an estimated size of how much the particular write operation would add to the size of the
- * batch.
- */
-int getWriteSizeBytes(const WriteOp& writeOp) {
-    const BatchItemRef& item = writeOp.getWriteItem();
-    const BatchedCommandRequest::BatchType batchType = item.getOpType();
-
-    using UpdateOpEntry = write_ops::UpdateOpEntry;
-    using DeleteOpEntry = write_ops::DeleteOpEntry;
-
-    if (batchType == BatchedCommandRequest::BatchType_Insert) {
-        return item.getDocument().objsize();
-    } else if (batchType == BatchedCommandRequest::BatchType_Update) {
-        // Note: Be conservative here - it's okay if we send slightly too many batches.
-        const auto& update = item.getUpdate();
-        auto estSize = write_ops::getUpdateSizeEstimate(
-            update.getQ(),
-            update.getU(),
-            update.getC(),
-            update.getUpsertSupplied().has_value(),
-            update.getCollation(),
-            update.getArrayFilters(),
-            update.getHint(),
-            update.getSampleId(),
-            update.getAllowShardKeyUpdatesWithoutFullShardKeyInQuery());
-
-        // When running a debug build, verify that estSize is at least the BSON serialization size.
-        dassert(estSize >= update.toBSON().objsize());
-        return estSize;
-    } else if (batchType == BatchedCommandRequest::BatchType_Delete) {
-        const auto& deleteOp = item.getDelete();
-        auto estSize = write_ops::getDeleteSizeEstimate(
-            deleteOp.getQ(), deleteOp.getCollation(), deleteOp.getHint(), deleteOp.getSampleId());
-
-        // When running a debug build, verify that estSize is at least the BSON serialization size.
-        dassert(estSize >= deleteOp.toBSON().objsize());
-        return estSize;
-    }
-
-    MONGO_UNREACHABLE;
 }
 
 /**
@@ -409,31 +367,39 @@ StatusWith<bool> targetWriteOps(OperationContext* opCtx,
             bool isUpsert = false;
 
             if (writeItem.getOpType() == BatchedCommandRequest::BatchType_Update) {
-                auto updateReq = writeItem.getUpdate();
+                auto updateReq = writeItem.getUpdateRef();
                 isMultiWrite = updateReq.getMulti();
-                query = updateReq.getQ();
+                query = updateReq.getFilter();
                 collation = updateReq.getCollation().value_or(BSONObj());
                 isUpsert = updateReq.getUpsert();
             } else {
-                auto deleteReq = writeItem.getDelete();
+                auto deleteReq = writeItem.getDeleteRef();
                 isMultiWrite = deleteReq.getMulti();
-                query = deleteReq.getQ();
+                query = deleteReq.getFilter();
                 collation = deleteReq.getCollation().value_or(BSONObj());
             }
 
             if (!isMultiWrite &&
-                write_without_shard_key::useTwoPhaseProtocol(opCtx,
-                                                             targeter.getNS(),
-                                                             true /* isUpdateOrDelete */,
-                                                             isUpsert,
-                                                             query,
-                                                             collation)) {
-
+                write_without_shard_key::useTwoPhaseProtocol(
+                    opCtx,
+                    targeter.getNS(),
+                    true /* isUpdateOrDelete */,
+                    isUpsert,
+                    query,
+                    collation,
+                    writeItem.getLet(),
+                    writeItem.getLegacyRuntimeConstants())) {
                 // Writes without shard key should be in their own batch.
                 if (!batchMap.empty()) {
                     writeOp.cancelWrites(nullptr);
                     break;
                 } else {
+                    if (writeItem.getOpType() == BatchedCommandRequest::BatchType_Update) {
+                        updateOneNonTargetedShardedCount.increment(1);
+                    } else {
+                        deleteOneNonTargetedShardedCount.increment(1);
+                    }
+
                     isWriteWithoutShardKeyOrId = true;
                 }
             };
@@ -499,7 +465,7 @@ StatusWith<bool> BatchWriteOp::targetBatch(const NSTargeter& targeter,
             // size.
             //
             // The constant 4 is chosen as the size of the BSON representation of the stmtId.
-            const int writeSizeBytes = getWriteSizeBytes(writeOp) +
+            const int writeSizeBytes = writeOp.getWriteItem().getWriteSizeBytes() +
                 getEncryptionInformationSize(_clientRequest) +
                 write_ops::kWriteCommandBSONArrayPerElementOverheadBytes +
                 (_batchTxnNum ? write_ops::kWriteCommandBSONArrayPerElementOverheadBytes + 4 : 0);

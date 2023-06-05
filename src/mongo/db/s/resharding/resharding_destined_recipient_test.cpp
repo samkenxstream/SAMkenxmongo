@@ -43,6 +43,7 @@
 #include "mongo/db/s/sharding_write_router.h"
 #include "mongo/db/session/session_catalog_mongod.h"
 #include "mongo/db/shard_id.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
@@ -277,8 +278,11 @@ protected:
                    const BSONObj& filter,
                    const BSONObj& update,
                    const ReshardingEnv& env) {
-        AutoGetCollection coll(opCtx, nss, MODE_IX);
-        Helpers::update(opCtx, nss, filter, update);
+        auto coll = acquireCollection(
+            opCtx,
+            CollectionAcquisitionRequest::fromOpCtx(opCtx, nss, AcquisitionPrerequisites::kWrite),
+            MODE_IX);
+        Helpers::update(opCtx, coll, filter, update);
     }
 
     void deleteDoc(OperationContext* opCtx,
@@ -314,7 +318,7 @@ TEST_F(DestinedRecipientTest, TestGetDestinedRecipient) {
 
     AutoGetCollection coll(opCtx, kNss, MODE_IX);
     OperationShardingState::setShardRole(opCtx, kNss, env.version, env.dbVersion);
-    ShardingWriteRouter shardingWriteRouter(opCtx, kNss, Grid::get(opCtx)->catalogCache());
+    ShardingWriteRouter shardingWriteRouter(opCtx, kNss);
 
     auto destShardId =
         shardingWriteRouter.getReshardingDestinedRecipient(BSON("x" << 2 << "y" << 10));
@@ -331,7 +335,7 @@ TEST_F(DestinedRecipientTest, TestGetDestinedRecipientThrowsOnBlockedRefresh) {
         OperationShardingState::setShardRole(opCtx, kNss, env.version, env.dbVersion);
 
         FailPointEnableBlock failPoint("blockCollectionCacheLookup");
-        ASSERT_THROWS_WITH_CHECK(ShardingWriteRouter(opCtx, kNss, Grid::get(opCtx)->catalogCache()),
+        ASSERT_THROWS_WITH_CHECK(ShardingWriteRouter(opCtx, kNss),
                                  ShardCannotRefreshDueToLocksHeldException,
                                  [&](const ShardCannotRefreshDueToLocksHeldException& ex) {
                                      const auto refreshInfo =

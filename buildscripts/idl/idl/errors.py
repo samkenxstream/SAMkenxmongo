@@ -130,6 +130,16 @@ ERROR_ID_MISSING_ACCESS_CHECK = "ID0090"
 ERROR_ID_STABILITY_UNKNOWN_VALUE = "ID0091"
 ERROR_ID_DUPLICATE_UNSTABLE_STABILITY = "ID0092"
 ERROR_ID_INVALID_ARRAY_VARIANT = "ID0093"
+ERROR_ID_FIELD_MUST_DECLARE_SHAPE_LITERAL = "ID0094"
+ERROR_ID_CANNOT_DECLARE_SHAPE_LITERAL = "ID0095"
+ERROR_ID_INVALID_TYPE_FOR_SHAPIFY = "ID0096"
+ERROR_ID_QUERY_SHAPE_PROPERTIES_MUTUALLY_EXCLUSIVE = "ID0097"
+ERROR_ID_QUERY_SHAPE_PROPERTY_CANNOT_BE_FALSE = "ID0098"
+ERROR_ID_STRICT_AND_DISABLE_CHECK_NOT_ALLOWED = "ID0099"
+ERROR_ID_INHERITANCE_AND_DISABLE_CHECK_NOT_ALLOWED = "ID0100"
+ERROR_ID_FEATURE_FLAG_SHOULD_BE_FCV_GATED_FALSE_HAS_VERSION = "ID0101"
+ERROR_ID_QUERY_SHAPE_INVALID_VALUE = "ID0102"
+ERROR_ID_BAD_CPP_NAMESPACE = "ID0103"
 
 
 class IDLError(Exception):
@@ -365,6 +375,14 @@ class ParserContext(object):
         if node.value == "true":
             return True
         return False
+
+    def get_required_bool(self, node):
+        # type: (Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> bool
+        boolean_value = yaml.safe_load(node.value)
+        if not isinstance(boolean_value, bool):
+            self._add_node_error(node, ERROR_ID_IS_NODE_VALID_BOOL,
+                                 "Illegal bool value, expected either 'true' or 'false'.")
+        return boolean_value
 
     def get_list(self, node):
         # type: (Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> List[str]
@@ -828,9 +846,10 @@ class ParserContext(object):
 
     def add_feature_flag_default_true_missing_version(self, location):
         # type: (common.SourceLocation) -> None
-        """Add an error about a default flag with a default value of true but no version."""
-        self._add_error(location, ERROR_ID_FEATURE_FLAG_DEFAULT_TRUE_MISSING_VERSION,
-                        ("Missing 'version' required for feature flag that defaults to true"))
+        """Add an error about a default flag with a default value of true and should be FCV gated but no version."""
+        self._add_error(location, ERROR_ID_FEATURE_FLAG_DEFAULT_TRUE_MISSING_VERSION, (
+            "Missing 'version' required for feature flag that defaults to true and should be FCV gated"
+        ))
 
     def add_feature_flag_default_false_has_version(self, location):
         # type: (common.SourceLocation) -> None
@@ -838,6 +857,13 @@ class ParserContext(object):
         self._add_error(
             location, ERROR_ID_FEATURE_FLAG_DEFAULT_FALSE_HAS_VERSION,
             ("The 'version' attribute is not allowed for feature flag that defaults to false"))
+
+    def add_feature_flag_fcv_gated_false_has_version(self, location):
+        # type: (common.SourceLocation) -> None
+        """Add an error about a feature flag that should not be FCV gated but has a version."""
+        self._add_error(
+            location, ERROR_ID_FEATURE_FLAG_SHOULD_BE_FCV_GATED_FALSE_HAS_VERSION,
+            ("The 'version' attribute is not allowed for feature flag that should be FCV gated"))
 
     def add_reply_type_invalid_type(self, location, command_name, reply_type_name):
         # type: (common.SourceLocation, str, str) -> None
@@ -934,6 +960,50 @@ class ParserContext(object):
         self._add_error(location, ERROR_ID_DUPLICATE_UNSTABLE_STABILITY, (
             "Field specifies both 'unstable' and 'stability' options, should use 'stability: [stable|unstable|internal]' instead and remove the deprecated 'unstable' option."
         ))
+
+    def add_must_declare_shape_type(self, location, struct_name, field_name):
+        # type: (common.SourceLocation, str, str) -> None
+        """Add an error about a field not specifying either query_shape_literal or query_shape_anonymize if the struct is query_shape_component."""
+        self._add_error(
+            location, ERROR_ID_FIELD_MUST_DECLARE_SHAPE_LITERAL,
+            f"Field '{field_name}' must specify either 'query_shape_literal' or 'query_shape_anonymize' since struct '{struct_name}' is a query shape component."
+        )
+
+    def add_must_be_query_shape_component(self, location, struct_name, field_name):
+        # type: (common.SourceLocation, str, str) -> None
+        self._add_error(
+            location, ERROR_ID_CANNOT_DECLARE_SHAPE_LITERAL,
+            f"Field '{field_name}' cannot specify 'query_shape_literal' property since struct '{struct_name}' is not a query shape component."
+        )
+
+    def add_query_shape_anonymize_must_be_string(self, location, field_name, field_type):
+        self._add_error(
+            location, ERROR_ID_INVALID_TYPE_FOR_SHAPIFY,
+            f"In order for {field_name} to be marked as a query shape fieldpath, it must have a string type, not {field_type}."
+        )
+
+    def add_invalid_query_shape_value(self, location, query_shape_value):
+        self._add_error(location, ERROR_ID_QUERY_SHAPE_INVALID_VALUE,
+                        f"'{query_shape_value}' is not a valid value for 'query_shape'.")
+
+    def add_strict_and_disable_check_not_allowed(self, location):
+        self._add_error(
+            location, ERROR_ID_STRICT_AND_DISABLE_CHECK_NOT_ALLOWED,
+            "Cannot set strict = true and unsafe_dangerous_disable_extra_field_duplicate_checks = true on a struct. unsafe_dangerous_disable_extra_field_duplicate_checks is only permitted on strict = false"
+        )
+
+    def add_inheritance_and_disable_check_not_allowed(self, location):
+        self._add_error(
+            location, ERROR_ID_INHERITANCE_AND_DISABLE_CHECK_NOT_ALLOWED,
+            "Fields cannot have unsafe_dangerous_disable_extra_field_duplicate_checks = true. unsafe_dangerous_disable_extra_field_duplicate_checks on non field structs"
+        )
+
+    def add_bad_cpp_namespace(self, location, namespace):
+        # type: (common.SourceLocation, str) -> None
+        self._add_error(
+            location, ERROR_ID_BAD_CPP_NAMESPACE,
+            "cpp_namespace must start with 'mongo::' or be just 'mongo', namespace '%s' is not supported"
+            % (namespace))
 
 
 def _assert_unique_error_messages():

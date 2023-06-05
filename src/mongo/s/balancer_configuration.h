@@ -51,7 +51,7 @@ class StatusWith;
  *
  * balancer: {
  *  stopped: <true|false>,
- *  mode: <full|autoSplitOnly|off>,  // Only consulted if "stopped" is missing or
+ *  mode: <full|off>,  // Only consulted if "stopped" is missing or
  * false activeWindow: { start: "<HH:MM>", stop: "<HH:MM>" }
  * }
  */
@@ -59,9 +59,8 @@ class BalancerSettingsType {
 public:
     // Supported balancer modes
     enum BalancerMode {
-        kFull,           // Balancer will always try to keep the cluster even
-        kAutoSplitOnly,  // Only balance on auto splits
-        kOff,            // Balancer is completely off
+        kFull,  // Balancer will always try to keep the cluster even
+        kOff,   // Balancer is completely off
     };
 
     // The key under which this setting is stored on the config server
@@ -172,37 +171,6 @@ private:
 };
 
 /**
- * Utility class to parse the sharding autoSplit settings document, which has the following format:
- *
- * autosplit: { enabled: <true|false> }
- */
-class AutoSplitSettingsType {
-public:
-    // The key under which this setting is stored on the config server
-    static const char kKey[];
-
-    /**
-     * Constructs a settings object with the default values. To be used when no AutoSplit settings
-     * have been specified.
-     */
-    static AutoSplitSettingsType createDefault();
-
-    /**
-     * Interprets the BSON content as autosplit settings and extracts the respective values
-     */
-    static StatusWith<AutoSplitSettingsType> fromBSON(const BSONObj& obj);
-
-    bool getShouldAutoSplit() const {
-        return _shouldAutoSplit;
-    }
-
-private:
-    AutoSplitSettingsType();
-
-    bool _shouldAutoSplit{true};
-};
-
-/**
  * Utility class to parse the sharding autoMerge settings document, which has the following format:
  *
  * automerge: { enabled: <true|false> }
@@ -266,7 +234,6 @@ public:
      * balancing window.
      */
     bool shouldBalance() const;
-    bool shouldBalanceForAutoSplit() const;
     bool shouldBalanceForAutoMerge() const;
 
     /**
@@ -292,15 +259,6 @@ public:
      */
     uint64_t getMaxChunkSizeBytes() const {
         return _maxChunkSizeBytes.loadRelaxed();
-    }
-
-    /**
-     * Change the cluster wide auto split settings.
-     */
-    Status enableAutoSplit(OperationContext* opCtx, bool enable);
-
-    bool getShouldAutoSplit() const {
-        return _shouldAutoSplit.loadRelaxed();
     }
 
     /**
@@ -338,12 +296,6 @@ private:
     Status _refreshChunkSizeSettings(OperationContext* opCtx);
 
     /**
-     * Reloads the autosplit configuration from the settings document. Fails if the settings
-     * document cannot be read.
-     */
-    Status _refreshAutoSplitSettings(OperationContext* opCtx);
-
-    /**
      * Reloads the autoMerge configuration from the settings document. Fails if the settings
      * document cannot be read.
      */
@@ -357,7 +309,6 @@ private:
     // Max chunk size after which a chunk would be considered jumbo and won't be moved. This value
     // is read on the critical path after each write operation, that's why it is cached.
     AtomicWord<unsigned long long> _maxChunkSizeBytes;
-    AtomicWord<bool> _shouldAutoSplit;
     AtomicWord<bool> _shouldAutoMerge;
 };
 

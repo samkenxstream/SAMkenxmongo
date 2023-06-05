@@ -114,9 +114,10 @@ public:
 
     virtual bool isWritablePrimaryForReportingPurposes();
 
-    virtual bool canAcceptWritesForDatabase(OperationContext* opCtx, StringData dbName);
+    virtual bool canAcceptWritesForDatabase(OperationContext* opCtx, const DatabaseName& dbName);
 
-    virtual bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx, StringData dbName);
+    virtual bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx,
+                                                   const DatabaseName& dbName);
 
     bool canAcceptWritesFor(OperationContext* opCtx,
                             const NamespaceStringOrUUID& nsOrUUID) override;
@@ -144,7 +145,7 @@ public:
     virtual void setMyLastDurableOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime);
 
     virtual void setMyLastAppliedOpTimeAndWallTimeForward(
-        const OpTimeAndWallTime& opTimeAndWallTime);
+        const OpTimeAndWallTime& opTimeAndWallTime, bool advanceGlobalTimestamp);
     virtual void setMyLastDurableOpTimeAndWallTimeForward(
         const OpTimeAndWallTime& opTimeAndWallTime);
 

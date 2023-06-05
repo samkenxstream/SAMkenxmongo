@@ -292,15 +292,20 @@ CandidatePlans MultiPlanner::finalizeExecutionPlans(
         // explain operation, save the stats from the old tree before we discard it.
         if (_cq.getExplain()) {
             winner.data.stageData.savedStatsOnEarlyExit =
-                winner.root->getStats(true /* includeDebugInfo  */);
+                winner.root->getStats(true /* includeDebugInfo */);
         }
         winner.root = winner.clonedPlan->first->clone();
 
-        stage_builder::prepareSlotBasedExecutableTree(
-            _opCtx, winner.root.get(), &winner.data.stageData, _cq, _collections, _yieldPolicy);
+        stage_builder::prepareSlotBasedExecutableTree(_opCtx,
+                                                      winner.root.get(),
+                                                      &winner.data.stageData,
+                                                      _cq,
+                                                      _collections,
+                                                      _yieldPolicy,
+                                                      false /* preparingFromCache */);
         // Clear the results queue.
         winner.results = {};
-        winner.root->open(false);
+        winner.root->open(false /* reOpen*/);
     }
 
     // Extend the winning candidate with the agg pipeline and rebuild the execution tree. Because
@@ -322,8 +327,13 @@ CandidatePlans MultiPlanner::finalizeExecutionPlans(
         // cache prior to preparation, whereas the original copy of the tree will be prepared and
         // used to execute this query.
         auto clonedPlan = std::make_pair(rootStage->clone(), plan_ranker::CandidatePlanData{data});
-        stage_builder::prepareSlotBasedExecutableTree(
-            _opCtx, rootStage.get(), &data, _cq, _collections, _yieldPolicy);
+        stage_builder::prepareSlotBasedExecutableTree(_opCtx,
+                                                      rootStage.get(),
+                                                      &data,
+                                                      _cq,
+                                                      _collections,
+                                                      _yieldPolicy,
+                                                      false /* preparingFromCache */);
         candidates[winnerIdx] =
             sbe::plan_ranker::CandidatePlan{std::move(solution),
                                             std::move(rootStage),
@@ -347,7 +357,7 @@ CandidatePlans MultiPlanner::finalizeExecutionPlans(
     }
 
     // Writes a cache entry for the winning plan to the plan cache if possible.
-    plan_cache_util::updatePlanCache(
+    plan_cache_util::updatePlanCacheFromCandidates(
         _opCtx, _collections, _cachingMode, _cq, std::move(decision), candidates);
 
     return {std::move(candidates), winnerIdx};

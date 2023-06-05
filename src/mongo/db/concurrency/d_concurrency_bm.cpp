@@ -32,6 +32,7 @@
 #include "mongo/base/init.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_test_help.h"
+#include "mongo/db/concurrency/locker_impl_client_observer.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/unittest/unittest.h"
@@ -45,22 +46,6 @@ MONGO_INITIALIZER_GENERAL(DConcurrencyTestServiceContext, ("DConcurrencyTestClie
 (InitializerContext* context) {
     setGlobalServiceContext(ServiceContext::make());
 }
-
-class LockerImplClientObserver : public ServiceContext::ClientObserver {
-public:
-    LockerImplClientObserver() = default;
-    ~LockerImplClientObserver() = default;
-
-    void onCreateClient(Client* client) final {}
-
-    void onDestroyClient(Client* client) final {}
-
-    void onCreateOperationContext(OperationContext* opCtx) override {
-        opCtx->setLockState(std::make_unique<LockerImpl>(opCtx->getServiceContext()));
-    }
-
-    void onDestroyOperationContext(OperationContext* opCtx) final {}
-};
 
 const ServiceContext::ConstructorActionRegisterer clientObserverRegisterer{
     "DConcurrencyTestClientObserver",
@@ -133,7 +118,7 @@ BENCHMARK_DEFINE_F(DConcurrencyTest, BM_CollectionIntentSharedLock)(benchmark::S
         makeKClientsWithLockers(state.threads);
     }
 
-    DatabaseName dbName(boost::none, "test");
+    DatabaseName dbName = DatabaseName::createDatabaseName_forTest(boost::none, "test");
     for (auto keepRunning : state) {
         Lock::DBLock dlk(clients[state.thread_index].second.get(), dbName, MODE_IS);
         Lock::CollectionLock clk(
@@ -150,7 +135,7 @@ BENCHMARK_DEFINE_F(DConcurrencyTest, BM_CollectionIntentExclusiveLock)(benchmark
         makeKClientsWithLockers(state.threads);
     }
 
-    DatabaseName dbName(boost::none, "test");
+    DatabaseName dbName = DatabaseName::createDatabaseName_forTest(boost::none, "test");
     for (auto keepRunning : state) {
         Lock::DBLock dlk(clients[state.thread_index].second.get(), dbName, MODE_IX);
         Lock::CollectionLock clk(
@@ -167,7 +152,7 @@ BENCHMARK_DEFINE_F(DConcurrencyTest, BM_CollectionSharedLock)(benchmark::State& 
         makeKClientsWithLockers(state.threads);
     }
 
-    DatabaseName dbName(boost::none, "test");
+    DatabaseName dbName = DatabaseName::createDatabaseName_forTest(boost::none, "test");
     for (auto keepRunning : state) {
         Lock::DBLock dlk(clients[state.thread_index].second.get(), dbName, MODE_IS);
         Lock::CollectionLock clk(
@@ -184,7 +169,7 @@ BENCHMARK_DEFINE_F(DConcurrencyTest, BM_CollectionExclusiveLock)(benchmark::Stat
         makeKClientsWithLockers(state.threads);
     }
 
-    DatabaseName dbName(boost::none, "test");
+    DatabaseName dbName = DatabaseName::createDatabaseName_forTest(boost::none, "test");
     for (auto keepRunning : state) {
         Lock::DBLock dlk(clients[state.thread_index].second.get(), dbName, MODE_IX);
         Lock::CollectionLock clk(

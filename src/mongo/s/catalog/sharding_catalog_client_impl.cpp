@@ -122,7 +122,8 @@ AggregateCommandRequest makeCollectionAndChunksAggregation(OperationContext* opC
     //     }
     // }
     stages.emplace_back(DocumentSourceMatch::create(
-        Doc{{CollectionType::kNssFieldName, nss.toString()}}.toBson(), expCtx));
+        Doc{{CollectionType::kNssFieldName, NamespaceStringUtil::serialize(nss)}}.toBson(),
+        expCtx));
 
     // 2. Two $unionWith stages guarded by a mutually exclusive condition on whether the refresh is
     // incremental ('lastmodEpoch' matches sinceVersion.epoch), so that only a single one of them
@@ -246,7 +247,9 @@ AggregateCommandRequest makeCollectionAndChunksAggregation(OperationContext* opC
         return Doc{
             {"coll", CollectionType::ConfigNS.coll()},
             {"pipeline",
-             Arr{Value{Doc{{"$match", Doc{{CollectionType::kNssFieldName, nss.toString()}}}}},
+             Arr{Value{Doc{
+                     {"$match",
+                      Doc{{CollectionType::kNssFieldName, NamespaceStringUtil::serialize(nss)}}}}},
                  Value{Doc{{"$match", Doc{{CollectionType::kEpochFieldName, lastmodEpochMatch}}}}},
                  Value{Doc{{"$lookup", lookupPipeline}}},
                  Value{Doc{{"$unwind", Doc{{"path", "$" + chunksLookupOutputFieldName}}}}},
@@ -290,7 +293,8 @@ AggregateCommandRequest makeCollectionAndIndexesAggregation(OperationContext* op
     //     }
     // }
     stages.emplace_back(DocumentSourceMatch::create(
-        Doc{{CollectionType::kNssFieldName, nss.toString()}}.toBson(), expCtx));
+        Doc{{CollectionType::kNssFieldName, NamespaceStringUtil::serialize(nss)}}.toBson(),
+        expCtx));
 
     // 2. Retrieve config.csrs.indexes entries with the same uuid as the one from the
     // config.collections document.
@@ -453,7 +457,7 @@ std::vector<BSONObj> ShardingCatalogClientImpl::runCatalogAggregation(
     aggRequest.setWriteConcern(WriteConcernOptions());
 
     const auto readPref = [&]() -> ReadPreferenceSetting {
-        // (Ignore FCV check): This is in mongos so we expect to ignore FCV.
+        // (Ignore FCV check): Config servers always use ShardRemote for themselves in 7.0.
         if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer) &&
             !gFeatureFlagCatalogShard.isEnabledAndIgnoreFCVUnsafe()) {
             // When the feature flag is on, the config server may read from any node in its replica
@@ -508,12 +512,13 @@ CollectionType ShardingCatalogClientImpl::getCollection(OperationContext* opCtx,
                                                 kConfigReadSelector,
                                                 readConcernLevel,
                                                 CollectionType::ConfigNS,
-                                                BSON(CollectionType::kNssFieldName << nss.ns()),
+                                                BSON(CollectionType::kNssFieldName
+                                                     << NamespaceStringUtil::serialize(nss)),
                                                 BSONObj(),
                                                 1))
             .value;
     uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "collection " << nss.ns() << " not found",
+            str::stream() << "collection " << nss.toStringForErrorMsg() << " not found",
             !collDoc.empty());
 
     return CollectionType(collDoc[0]);
@@ -619,12 +624,14 @@ StatusWith<VersionType> ShardingCatalogClientImpl::getConfigVersion(
 
     if (queryResults.size() > 1) {
         return {ErrorCodes::TooManyMatchingDocuments,
-                str::stream() << "should only have 1 document in " << VersionType::ConfigNS.ns()};
+                str::stream() << "should only have 1 document in "
+                              << VersionType::ConfigNS.toStringForErrorMsg()};
     }
 
     if (queryResults.empty()) {
         return {ErrorCodes::NoMatchingDocument,
-                str::stream() << "No documents found in " << VersionType::ConfigNS.ns()};
+                str::stream() << "No documents found in "
+                              << VersionType::ConfigNS.toStringForErrorMsg()};
     }
 
     BSONObj versionDoc = queryResults.front();
@@ -726,7 +733,7 @@ std::pair<CollectionType, std::vector<ChunkType>> ShardingCatalogClientImpl::get
         opCtx, aggRequest, readConcern, Milliseconds(gFindChunksOnConfigTimeoutMS.load()));
 
     uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "Collection " << nss.ns() << " not found",
+            str::stream() << "Collection " << nss.toStringForErrorMsg() << " not found",
             !aggResult.empty());
 
 
@@ -765,7 +772,8 @@ std::pair<CollectionType, std::vector<ChunkType>> ShardingCatalogClientImpl::get
         }
 
         uassert(ErrorCodes::ConflictingOperationInProgress,
-                str::stream() << "No chunks were found for the collection " << nss,
+                str::stream() << "No chunks were found for the collection "
+                              << nss.toStringForErrorMsg(),
                 !chunks.empty());
     }
 
@@ -781,11 +789,12 @@ ShardingCatalogClientImpl::getCollectionAndShardingIndexCatalogEntries(
     std::vector<BSONObj> aggResult = runCatalogAggregation(opCtx, aggRequest, readConcern);
 
     uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "Collection " << nss.ns() << " not found",
+            str::stream() << "Collection " << nss.toStringForErrorMsg() << " not found",
             !aggResult.empty());
 
     uassert(6958800,
-            str::stream() << "More than one collection for ns " << nss.ns() << " found",
+            str::stream() << "More than one collection for ns " << nss.toStringForErrorMsg()
+                          << " found",
             aggResult.size() == 1);
 
     boost::optional<CollectionType> coll;
@@ -804,13 +813,14 @@ ShardingCatalogClientImpl::getCollectionAndShardingIndexCatalogEntries(
 
 StatusWith<std::vector<TagsType>> ShardingCatalogClientImpl::getTagsForCollection(
     OperationContext* opCtx, const NamespaceString& nss) {
-    auto findStatus = _exhaustiveFindOnConfig(opCtx,
-                                              kConfigReadSelector,
-                                              repl::ReadConcernLevel::kMajorityReadConcern,
-                                              TagsType::ConfigNS,
-                                              BSON(TagsType::ns(nss.ns())),
-                                              BSON(TagsType::min() << 1),
-                                              boost::none);  // no limit
+    auto findStatus =
+        _exhaustiveFindOnConfig(opCtx,
+                                kConfigReadSelector,
+                                repl::ReadConcernLevel::kMajorityReadConcern,
+                                TagsType::ConfigNS,
+                                BSON(TagsType::ns(NamespaceStringUtil::serialize(nss))),
+                                BSON(TagsType::min() << 1),
+                                boost::none);  // no limit
     if (!findStatus.isOK()) {
         return findStatus.getStatus().withContext("Failed to load tags");
     }
@@ -871,7 +881,11 @@ std::vector<NamespaceString> ShardingCatalogClientImpl::getAllNssThatHaveZonesFo
 
     // Run the aggregation
     const auto readConcern = [&]() -> repl::ReadConcernArgs {
-        if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
+        // (Ignore FCV check): Config servers always use ShardRemote for themselves in 7.0.
+        if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer) &&
+            !gFeatureFlagCatalogShard.isEnabledAndIgnoreFCVUnsafe()) {
+            // When the feature flag is on, the config server may read from a secondary which may
+            // need to wait for replication, so we should use afterClusterTime.
             return {repl::ReadConcernLevel::kMajorityReadConcern};
         } else {
             const auto time = VectorClock::get(opCtx)->getTime();
@@ -1390,7 +1404,7 @@ HistoricalPlacement ShardingCatalogClientImpl::getHistoricalPlacement(
                 "timestamp": {
                   "$lte": <clusterTime>
                 },
-                "nss": kConfigsvrPlacementHistoryFcvMarkerNamespace
+                "nss": kConfigPlacementHistoryInitializationMarker
               }
             },
             {
@@ -1421,7 +1435,8 @@ HistoricalPlacement ShardingCatalogClientImpl::getHistoricalPlacement(
     // Build the pipeline for the exact placement data.
     // 1. Get all the history entries prior to the requested time concerning either the collection
     // or the parent database.
-    const auto& kMarkerNss = NamespaceString::kConfigsvrPlacementHistoryFcvMarkerNamespace.ns();
+    const auto& kMarkerNss = NamespaceStringUtil::serialize(
+        ShardingCatalogClient::kConfigPlacementHistoryInitializationMarker);
     auto matchStage = [&]() {
         bool isClusterSearch = !nss.has_value();
         if (isClusterSearch)
@@ -1508,15 +1523,15 @@ HistoricalPlacement ShardingCatalogClientImpl::getHistoricalPlacement(
 
     // Run the aggregation
     const auto readConcern = [&]() -> repl::ReadConcernArgs {
-        // (Ignore FCV check): This is in mongos so we expect to ignore FCV.
+        // (Ignore FCV check): Config servers always use ShardRemote for themselves in 7.0.
         if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer) &&
             !gFeatureFlagCatalogShard.isEnabledAndIgnoreFCVUnsafe()) {
             // When the feature flag is on, the config server may read from a secondary which may
             // need to wait for replication, so we should use afterClusterTime.
-            return {repl::ReadConcernLevel::kMajorityReadConcern};
+            return {repl::ReadConcernLevel::kSnapshotReadConcern};
         } else {
-            const auto time = VectorClock::get(opCtx)->getTime();
-            return {time.configTime(), repl::ReadConcernLevel::kMajorityReadConcern};
+            const auto vcTime = VectorClock::get(opCtx)->getTime();
+            return {vcTime.configTime(), repl::ReadConcernLevel::kSnapshotReadConcern};
         }
     }();
 

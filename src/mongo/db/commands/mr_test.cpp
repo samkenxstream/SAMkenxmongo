@@ -112,7 +112,7 @@ void _testConfigParseOutputOptions(const std::string& dbname,
     _compareOutputOptionField(dbname,
                               cmdObjStr,
                               "finalNamespace",
-                              outputOptions.finalNamespace.ns(),
+                              outputOptions.finalNamespace.toString_forTest(),
                               expectedFinalNamespace);
     _compareOutputOptionField(
         dbname, cmdObjStr, "outNonAtomic", outputOptions.outNonAtomic, expectedOutNonAtomic);
@@ -265,7 +265,8 @@ public:
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
                    std::vector<bool> fromMigrate,
-                   bool defaultFromMigrate) override;
+                   bool defaultFromMigrate,
+                   InsertsOpStateAccumulator* opAccumulator = nullptr) override;
 
     /**
      * Tracks the temporary collections mapReduces creates.
@@ -278,12 +279,12 @@ public:
                             const OplogSlot& createOpTime,
                             bool fromMigrate) override;
 
-    using OpObserver::onDropCollection;
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   const UUID& uuid,
                                   std::uint64_t numRecords,
-                                  CollectionDropType dropType) override;
+                                  CollectionDropType dropType,
+                                  bool markFromMigrate) override;
 
     // Hook for onInserts. Defaults to a no-op function but may be overridden to inject exceptions
     // while mapReduce inserts its results into the temporary output collection.
@@ -323,7 +324,8 @@ void MapReduceOpObserver::onInserts(OperationContext* opCtx,
                                     std::vector<InsertStatement>::const_iterator begin,
                                     std::vector<InsertStatement>::const_iterator end,
                                     std::vector<bool> fromMigrate,
-                                    bool defaultFromMigrate) {
+                                    bool defaultFromMigrate,
+                                    InsertsOpStateAccumulator* opAccumulator) {
     onInsertsFn();
 }
 
@@ -344,7 +346,8 @@ repl::OpTime MapReduceOpObserver::onDropCollection(OperationContext* opCtx,
                                                    const NamespaceString& collectionName,
                                                    const UUID& uuid,
                                                    std::uint64_t numRecords,
-                                                   const CollectionDropType dropType) {
+                                                   const CollectionDropType dropType,
+                                                   bool markFromMigrate) {
     // If the oplog is not disabled for this namespace, then we need to reserve an op time for the
     // drop.
     if (!repl::ReplicationCoordinator::get(opCtx)->isOplogDisabledFor(opCtx, collectionName)) {
@@ -476,7 +479,7 @@ void MapReduceCommandTest::_assertTemporaryCollectionsAreDropped() {
     for (const auto& tempNss : _opObserver->tempNamespaces) {
         ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
                       _storage.getCollectionCount(_opCtx.get(), tempNss))
-            << "mapReduce did not remove temporary collection on success: " << tempNss.ns();
+            << "mapReduce did not remove temporary collection on success: " << tempNss.ns_forTest();
     }
 }
 
@@ -528,7 +531,7 @@ TEST_F(MapReduceCommandTest, PrimaryStepDownPreventsTemporaryCollectionDrops) {
     _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kLastApplied);
     for (const auto& tempNss : _opObserver->tempNamespaces) {
         ASSERT_OK(_storage.getCollectionCount(_opCtx.get(), tempNss).getStatus())
-            << "missing mapReduce temporary collection: " << tempNss;
+            << "missing mapReduce temporary collection: " << tempNss.toStringForErrorMsg();
     }
 }
 
@@ -545,7 +548,7 @@ TEST_F(MapReduceCommandTest, ReplacingExistingOutputCollectionPreservesIndexes) 
         AutoGetCollection coll(_opCtx.get(), outputNss, MODE_X);
         ASSERT(coll);
         writeConflictRetry(
-            _opCtx.get(), "ReplacingExistingOutputCollectionPreservesIndexes", outputNss.ns(), [&] {
+            _opCtx.get(), "ReplacingExistingOutputCollectionPreservesIndexes", outputNss, [&] {
                 WriteUnitOfWork wuow(_opCtx.get());
                 ASSERT_OK(
                     coll.getWritableCollection(_opCtx.get())
@@ -572,7 +575,7 @@ TEST_F(MapReduceCommandTest, ReplacingExistingOutputCollectionPreservesIndexes) 
     ASSERT_NOT_EQUALS(
         *options.uuid,
         *CollectionCatalog::get(_opCtx.get())->lookupUUIDByNSS(_opCtx.get(), outputNss))
-        << "Output collection " << outputNss << " was not replaced";
+        << "Output collection " << outputNss.toStringForErrorMsg() << " was not replaced";
 
     _assertTemporaryCollectionsAreDropped();
 }

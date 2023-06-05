@@ -69,7 +69,8 @@ public:
             const NamespaceString& nss = ns();
 
             uassert(ErrorCodes::InvalidNamespace,
-                    str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
+                    str::stream() << "Invalid namespace specified '" << nss.toStringForErrorMsg()
+                                  << "'",
                     nss.isValid());
 
             // throws if collection does not exist or parameters are invalid
@@ -78,7 +79,6 @@ public:
                 nss,
                 request().getChunkSizeMB(),
                 request().getDefragmentCollection(),
-                request().getEnableAutoSplitter(),
                 request().getEnableAutoMerger());
         }
 

@@ -56,30 +56,30 @@ void notifyChangeStreamsOnRefineCollectionShardKeyComplete(OperationContext* opC
                                                            const UUID& collUUID) {
 
     const std::string oMessage = str::stream()
-        << "Refine shard key for collection " << collNss << " with " << shardKey.toString();
+        << "Refine shard key for collection " << NamespaceStringUtil::serialize(collNss) << " with "
+        << shardKey.toString();
 
     BSONObjBuilder cmdBuilder;
-    cmdBuilder.append("refineCollectionShardKey", collNss.ns());
+    cmdBuilder.append("refineCollectionShardKey", NamespaceStringUtil::serialize(collNss));
     cmdBuilder.append("shardKey", shardKey.toBSON());
     cmdBuilder.append("oldShardKey", oldShardKey.toBSON());
 
     auto const serviceContext = opCtx->getClient()->getServiceContext();
 
-    writeConflictRetry(
-        opCtx, "RefineCollectionShardKey", NamespaceString::kRsOplogNamespace.ns(), [&] {
-            AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
-            WriteUnitOfWork uow(opCtx);
-            serviceContext->getOpObserver()->onInternalOpMessage(opCtx,
-                                                                 collNss,
-                                                                 collUUID,
-                                                                 BSON("msg" << oMessage),
-                                                                 cmdBuilder.obj(),
-                                                                 boost::none,
-                                                                 boost::none,
-                                                                 boost::none,
-                                                                 boost::none);
-            uow.commit();
-        });
+    writeConflictRetry(opCtx, "RefineCollectionShardKey", NamespaceString::kRsOplogNamespace, [&] {
+        AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+        WriteUnitOfWork uow(opCtx);
+        serviceContext->getOpObserver()->onInternalOpMessage(opCtx,
+                                                             collNss,
+                                                             collUUID,
+                                                             BSON("msg" << oMessage),
+                                                             cmdBuilder.obj(),
+                                                             boost::none,
+                                                             boost::none,
+                                                             boost::none,
+                                                             boost::none);
+        uow.commit();
+    });
 }
 }  // namespace
 
@@ -157,14 +157,6 @@ ExecutorFuture<void> RefineCollectionShardKeyCoordinator::_runImpl(
 
                 uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(std::move(cmdResponse)));
             }))
-        .onError([this, anchor = shared_from_this()](const Status& status) {
-            LOGV2_ERROR(5277700,
-                        "Error running refine collection shard key",
-                        logAttrs(nss()),
-                        "error"_attr = redact(status));
-
-            return status;
-        })
         .onCompletion([this, anchor = shared_from_this()](const Status& status) {
             auto opCtxHolder = cc().makeOperationContext();
             auto* opCtx = opCtxHolder.get();

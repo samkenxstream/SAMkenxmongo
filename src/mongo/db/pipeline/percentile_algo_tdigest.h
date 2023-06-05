@@ -67,9 +67,11 @@ public:
      * We compute percentile by linearly scanning centroids to find the one that matches the rank of
      * the requested percentile and then doing a linear interpolation between centroid means. We are
      * currently not optimizing for accessing multiple percentiles as we don't think that would
-     * result in noticeable performance gains for accumulators or expressions.
+     * result in noticeable performance gains for accumulators and expressions should not be using
+     * t-digest.
      */
     boost::optional<double> computePercentile(double p) final;
+    std::vector<double> computePercentiles(const std::vector<double>& ps) final;
 
     long memUsageBytes() const final;
 
@@ -257,8 +259,8 @@ protected:
 
     // Buffer for the incoming inputs. When the buffer is full, the inputs are sorted and merged
     // into '_centroids'. The max size is set in constructors to bufferCoeff * delta. The
-    // coefficient has been determined empirically from micro-benchmarks.
-    static constexpr int bufferCoeff = 5;
+    // coefficient has been determined empirically from benchmarks.
+    static constexpr int bufferCoeff = 3;
     const size_t _maxBufferSize;
     std::vector<double> _buffer;
 

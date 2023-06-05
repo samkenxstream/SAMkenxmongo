@@ -78,6 +78,20 @@ bool hasTimeSeriesBucketingUpdate(const CollModRequest& request) {
     return ts->getGranularity() || ts->getBucketMaxSpanSeconds() || ts->getBucketRoundingSeconds();
 }
 
+std::vector<AsyncRequestsSender::Response> sendAuthenticatedCommandWithOsiToShards(
+    OperationContext* opCtx,
+    StringData dbName,
+    const BSONObj& command,
+    const std::vector<ShardId>& shardIds,
+    const std::shared_ptr<executor::TaskExecutor>& executor,
+    const OperationSessionInfo& osi,
+    WriteConcernOptions wc = WriteConcernOptions()) {
+    command.addFields(osi.toBSON());
+    const auto commandWithWc = CommandHelpers::appendMajorityWriteConcern(command, wc);
+    return sharding_ddl_util::sendAuthenticatedCommandToShards(
+        opCtx, dbName, commandWithWc, shardIds, executor);
+}
+
 }  // namespace
 
 CollModCoordinator::CollModCoordinator(ShardingDDLCoordinatorService* service,
@@ -93,7 +107,7 @@ void CollModCoordinator::checkIfOptionsConflict(const BSONObj& doc) const {
     const auto& otherReq = otherDoc.getCollModRequest().toBSON();
 
     uassert(ErrorCodes::ConflictingOperationInProgress,
-            str::stream() << "Another collMod for namespace " << originalNss()
+            str::stream() << "Another collMod for namespace " << originalNss().toStringForErrorMsg()
                           << " is being executed with different parameters: " << selfReq,
             SimpleBSONObjComparator::kInstance.evaluate(selfReq == otherReq));
 }
@@ -120,9 +134,8 @@ void CollModCoordinator::_performNoopRetryableWriteOnParticipants(
         return participants;
     }();
 
-    _updateSession(opCtx);
     sharding_ddl_util::performNoopRetryableWriteOnShards(
-        opCtx, shardsAndConfigsvr, getCurrentSession(), executor);
+        opCtx, shardsAndConfigsvr, getNewSession(opCtx), executor);
 }
 
 void CollModCoordinator::_saveCollectionInfoOnCoordinatorIfNecessary(OperationContext* opCtx) {
@@ -200,10 +213,11 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
                     _saveCollectionInfoOnCoordinatorIfNecessary(opCtx);
 
                     if (_collInfo->isSharded) {
-                        _doc.setCollUUID(
-                            sharding_ddl_util::getCollectionUUID(opCtx, _collInfo->nsForTargeting));
+                        const auto& collUUID =
+                            sharding_ddl_util::getCollectionUUID(opCtx, _collInfo->nsForTargeting);
+                        _doc.setCollUUID(collUUID);
                         sharding_ddl_util::stopMigrations(
-                            opCtx, _collInfo->nsForTargeting, _doc.getCollUUID());
+                            opCtx, _collInfo->nsForTargeting, collUUID, getNewSession(opCtx));
                     }
                 })();
         })
@@ -214,8 +228,6 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
                 auto* opCtx = opCtxHolder.get();
                 getForwardableOpMetadata().setOn(opCtx);
 
-                _updateSession(opCtx);
-
                 _saveCollectionInfoOnCoordinatorIfNecessary(opCtx);
 
                 if (_isPre61Compatible() && _collInfo->isSharded) {
@@ -224,10 +236,11 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
                         _doc.getMigrationsAlreadyBlockedForBucketNss();
 
                     if (!migrationsAlreadyBlockedForBucketNss) {
-                        _doc.setCollUUID(sharding_ddl_util::getCollectionUUID(
-                            opCtx, _collInfo->nsForTargeting, true /* allowViews */));
+                        const auto& collUUID = sharding_ddl_util::getCollectionUUID(
+                            opCtx, _collInfo->nsForTargeting, true /* allowViews */);
+                        _doc.setCollUUID(collUUID);
                         sharding_ddl_util::stopMigrations(
-                            opCtx, _collInfo->nsForTargeting, _doc.getCollUUID());
+                            opCtx, _collInfo->nsForTargeting, collUUID, getNewSession(opCtx));
                     }
                 }
 
@@ -241,10 +254,14 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
                     }
 
                     ShardsvrParticipantBlock blockCRUDOperationsRequest(_collInfo->nsForTargeting);
-                    const auto cmdObj = CommandHelpers::appendMajorityWriteConcern(
-                        blockCRUDOperationsRequest.toBSON({}));
-                    sharding_ddl_util::sendAuthenticatedCommandToShards(
-                        opCtx, nss().db(), cmdObj, _shardingInfo->shardsOwningChunks, **executor);
+                    blockCRUDOperationsRequest.setBlockType(
+                        CriticalSectionBlockTypeEnum::kReadsAndWrites);
+                    sendAuthenticatedCommandWithOsiToShards(opCtx,
+                                                            nss().db().toString(),
+                                                            blockCRUDOperationsRequest.toBSON({}),
+                                                            _shardingInfo->shardsOwningChunks,
+                                                            **executor,
+                                                            getNewSession(opCtx));
                 }
             }))
         .then(_buildPhaseHandler(
@@ -255,8 +272,6 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
                 getForwardableOpMetadata().setOn(opCtx);
-
-                _updateSession(opCtx);
 
                 _saveCollectionInfoOnCoordinatorIfNecessary(opCtx);
                 _saveShardingInfoOnCoordinatorIfNecessary(opCtx);
@@ -277,13 +292,10 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
                 }
             }))
         .then(_buildPhaseHandler(
-            Phase::kUpdateShards,
-            [this, executor = executor, anchor = shared_from_this()] {
+            Phase::kUpdateShards, [this, executor = executor, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
                 getForwardableOpMetadata().setOn(opCtx);
-
-                _updateSession(opCtx);
 
                 _saveCollectionInfoOnCoordinatorIfNecessary(opCtx);
                 _saveShardingInfoOnCoordinatorIfNecessary(opCtx);
@@ -333,7 +345,7 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
                                 originalNss(), makeCollModDryRunRequest(_request)};
                             sharding_ddl_util::sendAuthenticatedCommandToShards(
                                 opCtx,
-                                nss().db(),
+                                nss().db().toString(),
                                 CommandHelpers::appendMajorityWriteConcern(
                                     dryRunRequest.toBSON({})),
                                 shardsOwningChunks,
@@ -344,13 +356,13 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
                         // an addition 'performViewChange' flag only to the primary shard.
                         if (primaryShardOwningChunk != shardsOwningChunks.end()) {
                             request.setPerformViewChange(true);
-                            const auto& primaryResponse =
-                                sharding_ddl_util::sendAuthenticatedCommandToShards(
-                                    opCtx,
-                                    nss().db(),
-                                    CommandHelpers::appendMajorityWriteConcern(request.toBSON({})),
-                                    {_shardingInfo->primaryShard},
-                                    **executor);
+                            const auto& primaryResponse = sendAuthenticatedCommandWithOsiToShards(
+                                opCtx,
+                                nss().db().toString(),
+                                request.toBSON({}),
+                                {_shardingInfo->primaryShard},
+                                **executor,
+                                getNewSession(opCtx));
                             responses.insert(
                                 responses.end(), primaryResponse.begin(), primaryResponse.end());
                             shardsOwningChunks.erase(primaryShardOwningChunk);
@@ -358,12 +370,12 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
 
                         request.setPerformViewChange(false);
                         const auto& secondaryResponses =
-                            sharding_ddl_util::sendAuthenticatedCommandToShards(
-                                opCtx,
-                                nss().db(),
-                                CommandHelpers::appendMajorityWriteConcern(request.toBSON({})),
-                                shardsOwningChunks,
-                                **executor);
+                            sendAuthenticatedCommandWithOsiToShards(opCtx,
+                                                                    nss().db().toString(),
+                                                                    request.toBSON({}),
+                                                                    shardsOwningChunks,
+                                                                    **executor,
+                                                                    getNewSession(opCtx));
                         responses.insert(
                             responses.end(), secondaryResponses.begin(), secondaryResponses.end());
 
@@ -375,12 +387,15 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
                             CommandHelpers::appendSimpleCommandStatus(builder, ok, errmsg);
                         }
                         _result = builder.obj();
+
+                        const auto collUUID = _doc.getCollUUID();
                         sharding_ddl_util::resumeMigrations(
-                            opCtx, _collInfo->nsForTargeting, _doc.getCollUUID());
+                            opCtx, _collInfo->nsForTargeting, collUUID, getNewSession(opCtx));
                     } catch (DBException& ex) {
                         if (!_isRetriableErrorForDDLCoordinator(ex.toStatus())) {
+                            const auto collUUID = _doc.getCollUUID();
                             sharding_ddl_util::resumeMigrations(
-                                opCtx, _collInfo->nsForTargeting, _doc.getCollUUID());
+                                opCtx, _collInfo->nsForTargeting, collUUID, getNewSession(opCtx));
                         }
                         throw;
                     }
@@ -403,17 +418,7 @@ ExecutorFuture<void> CollModCoordinator::_runImpl(
                     subBuilder.doneFast();
                     _result = builder.obj();
                 }
-            }))
-        .onError([this, anchor = shared_from_this()](const Status& status) {
-            if (!status.isA<ErrorCategory::NotPrimaryError>() &&
-                !status.isA<ErrorCategory::ShutdownError>()) {
-                LOGV2_ERROR(5757002,
-                            "Error running collMod",
-                            logAttrs(nss()),
-                            "error"_attr = redact(status));
-            }
-            return status;
-        });
+            }));
 }
 
 }  // namespace mongo

@@ -54,6 +54,7 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_executor_impl.h"
 #include "mongo/db/query/plan_executor_sbe.h"
+#include "mongo/db/query/plan_explainer_impl.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_settings.h"
@@ -84,10 +85,12 @@ namespace {
 void generatePlannerInfo(PlanExecutor* exec,
                          const MultipleCollectionAccessor& collections,
                          BSONObj extraInfo,
+                         const SerializationContext& serializationContext,
                          BSONObjBuilder* out) {
     BSONObjBuilder plannerBob(out->subobjStart("queryPlanner"));
 
-    plannerBob.append("namespace", NamespaceStringUtil::serialize(exec->nss()));
+    plannerBob.append("namespace",
+                      NamespaceStringUtil::serialize(exec->nss(), serializationContext));
 
     // Find whether there is an index filter set for the query shape. The 'indexFilterSet' field
     // will always be false in the case of EOF or idhack plans.
@@ -345,6 +348,7 @@ void Explain::explainStages(PlanExecutor* exec,
                             Status executePlanStatus,
                             boost::optional<PlanExplainer::PlanStatsDetails> winningPlanTrialStats,
                             BSONObj extraInfo,
+                            const SerializationContext& serializationContext,
                             const BSONObj& command,
                             BSONObjBuilder* out) {
     //
@@ -355,7 +359,7 @@ void Explain::explainStages(PlanExecutor* exec,
     out->appendElements(explainVersionToBson(explainer.getVersion()));
 
     if (verbosity >= ExplainOptions::Verbosity::kQueryPlanner) {
-        generatePlannerInfo(exec, collections, extraInfo, out);
+        generatePlannerInfo(exec, collections, extraInfo, serializationContext, out);
     }
 
     if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
@@ -397,6 +401,7 @@ void Explain::explainStages(PlanExecutor* exec,
                             const MultipleCollectionAccessor& collections,
                             ExplainOptions::Verbosity verbosity,
                             BSONObj extraInfo,
+                            const SerializationContext& serializationContext,
                             const BSONObj& command,
                             BSONObjBuilder* out) {
     auto&& explainer = exec->getPlanExplainer();
@@ -427,6 +432,7 @@ void Explain::explainStages(PlanExecutor* exec,
                   executePlanStatus,
                   winningPlanTrialStats,
                   extraInfo,
+                  serializationContext,
                   command,
                   out);
 
@@ -438,9 +444,16 @@ void Explain::explainStages(PlanExecutor* exec,
                             const CollectionPtr& collection,
                             ExplainOptions::Verbosity verbosity,
                             BSONObj extraInfo,
+                            const SerializationContext& serializationContext,
                             const BSONObj& command,
                             BSONObjBuilder* out) {
-    explainStages(exec, MultipleCollectionAccessor(collection), verbosity, extraInfo, command, out);
+    explainStages(exec,
+                  MultipleCollectionAccessor(collection),
+                  verbosity,
+                  extraInfo,
+                  serializationContext,
+                  command,
+                  out);
 }
 
 void Explain::planCacheEntryToBSON(const PlanCacheEntry& entry, BSONObjBuilder* out) {
@@ -464,18 +477,8 @@ void Explain::planCacheEntryToBSON(const PlanCacheEntry& entry, BSONObjBuilder* 
             }
         }
 
-        auto explainer = stdx::visit(
-            OverloadedVisitor{[](const plan_ranker::StatsDetails&) {
-                                  return plan_explainer_factory::make(nullptr);
-                              },
-                              [](const plan_ranker::SBEStatsDetails&) {
-                                  return plan_explainer_factory::make(nullptr, nullptr, nullptr);
-                              }},
-            debugInfo.decision->stats);
-        auto plannerStats =
-            explainer->getCachedPlanStats(debugInfo, ExplainOptions::Verbosity::kQueryPlanner);
-        auto execStats =
-            explainer->getCachedPlanStats(debugInfo, ExplainOptions::Verbosity::kExecStats);
+        auto plannerStats = getCachedPlanStats(debugInfo, ExplainOptions::Verbosity::kQueryPlanner);
+        auto execStats = getCachedPlanStats(debugInfo, ExplainOptions::Verbosity::kExecStats);
 
         invariant(plannerStats.size() > 0);
         out->append("cachedPlan", plannerStats[0].first);

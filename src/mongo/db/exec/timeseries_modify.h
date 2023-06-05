@@ -30,12 +30,77 @@
 
 #pragma once
 
-#include "mongo/db/exec/bucket_unpacker.h"
 #include "mongo/db/exec/delete_stage.h"
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/requires_collection_stage.h"
+#include "mongo/db/exec/timeseries/bucket_unpacker.h"
+#include "mongo/db/exec/update_stage.h"
 
 namespace mongo {
+
+struct TimeseriesModifyParams {
+    TimeseriesModifyParams(const DeleteStageParams* deleteParams)
+        : isUpdate(false),
+          isMulti(deleteParams->isMulti),
+          fromMigrate(deleteParams->fromMigrate),
+          isExplain(deleteParams->isExplain),
+          returnOld(deleteParams->returnDeleted),
+          stmtId(deleteParams->stmtId),
+          canonicalQuery(deleteParams->canonicalQuery) {}
+
+    TimeseriesModifyParams(const UpdateStageParams* updateParams)
+        : isUpdate(true),
+          isMulti(updateParams->request->isMulti()),
+          fromMigrate(updateParams->request->source() == OperationSource::kFromMigrate),
+          isExplain(updateParams->request->explain()),
+          returnOld(updateParams->request->shouldReturnOldDocs()),
+          returnNew(updateParams->request->shouldReturnNewDocs()),
+          allowShardKeyUpdatesWithoutFullShardKeyInQuery(
+              updateParams->request->getAllowShardKeyUpdatesWithoutFullShardKeyInQuery()),
+          canonicalQuery(updateParams->canonicalQuery),
+          isFromOplogApplication(updateParams->request->isFromOplogApplication()),
+          updateDriver(updateParams->driver) {
+        tassert(7314203,
+                "timeseries updates should only have one stmtId",
+                updateParams->request->getStmtIds().size() == 1);
+        stmtId = updateParams->request->getStmtIds().front();
+    }
+
+    // Is this an update or a delete operation?
+    bool isUpdate;
+
+    // Is this a multi update/delete?
+    bool isMulti;
+
+    // Is this command part of a migrate operation that is essentially like a no-op when the
+    // cluster is observed by an external client.
+    bool fromMigrate;
+
+    // Are we explaining a command rather than actually executing it?
+    bool isExplain;
+
+    // Should we return the old measurement?
+    bool returnOld;
+
+    // Should we return the new measurement?
+    bool returnNew = false;
+
+    // Should we allow shard key updates without the full shard key in the query?
+    OptionalBool allowShardKeyUpdatesWithoutFullShardKeyInQuery;
+
+    // The stmtId for this particular command.
+    StmtId stmtId = kUninitializedStmtId;
+
+    // The parsed query predicate for this command. Not owned here.
+    CanonicalQuery* canonicalQuery;
+
+    // True if this command was triggered by the application of an oplog entry.
+    bool isFromOplogApplication = false;
+
+    // Contains the logic for applying mods to documents. Only present for updates. Not owned. Must
+    // outlive the TimeseriesModifyStage.
+    UpdateDriver* updateDriver = nullptr;
+};
 
 /**
  * Unpacks time-series bucket documents and writes the modified documents.
@@ -43,23 +108,24 @@ namespace mongo {
  * The stage processes one bucket at a time, unpacking all the measurements and writing the output
  * bucket in a single doWork() call.
  */
-class TimeseriesModifyStage final : public RequiresMutableCollectionStage {
+class TimeseriesModifyStage : public RequiresWritableCollectionStage {
 public:
     static const char* kStageType;
 
     TimeseriesModifyStage(ExpressionContext* expCtx,
-                          std::unique_ptr<DeleteStageParams> params,
+                          TimeseriesModifyParams&& params,
                           WorkingSet* ws,
                           std::unique_ptr<PlanStage> child,
-                          const CollectionPtr& coll,
+                          const ScopedCollectionAcquisition& coll,
                           BucketUnpacker bucketUnpacker,
-                          std::unique_ptr<MatchExpression> residualPredicate);
+                          std::unique_ptr<MatchExpression> residualPredicate,
+                          std::unique_ptr<MatchExpression> originalPredicate = nullptr);
 
     StageType stageType() const {
         return STAGE_TIMESERIES_MODIFY;
     }
 
-    bool isEOF() final;
+    bool isEOF() override;
 
     std::unique_ptr<PlanStageStats> getStats();
 
@@ -69,12 +135,8 @@ public:
 
     PlanStage::StageState doWork(WorkingSetID* id);
 
-    bool _isDeleteMulti() {
-        return _params->isMulti;
-    }
-
-    bool _isDeleteOne() {
-        return !_isDeleteMulti();
+    bool containsDotsAndDollarsField() const {
+        return _params.isUpdate && _params.updateDriver->containsDotsAndDollarsField();
     }
 
 protected:
@@ -84,14 +146,53 @@ protected:
 
     void doRestoreStateRequiresCollection() final;
 
+    /**
+     * Prepares returning the old or new measurement when requested so.
+     */
+    void _prepareToReturnMeasurement(WorkingSetID& out);
+
+    // A user-initiated write is one which is not caused by oplog application and is not part of a
+    // chunk migration.
+    bool _isUserInitiatedUpdate;
+
+    TimeseriesModifyParams _params;
+
+    TimeseriesModifyStats _specificStats{};
+
+    // Stores the old measurement that is modified or the new measurement after update/upsert when
+    // requested to return it for the deleteOne or updateOne.
+    boost::optional<BSONObj> _measurementToReturn = boost::none;
+
+    // Original, untranslated and complete predicate.
+    std::unique_ptr<MatchExpression> _originalPredicate;
+
 private:
+    bool _isMultiWrite() const {
+        return _params.isMulti;
+    }
+
+    bool _isSingletonWrite() const {
+        return !_isMultiWrite();
+    }
+
+    /**
+     * Builds insert requests based on the measurements needing to be updated.
+     */
+    std::pair<std::vector<BSONObj>, std::vector<write_ops::InsertCommandRequest>> _buildInsertOps(
+        const std::vector<BSONObj>& matchedMeasurements,
+        std::vector<BSONObj>& unchangedMeasurements);
+
     /**
      * Writes the modifications to a bucket.
+     *
+     * Returns the pair of (whether the write was successful, the stage state to propagate).
      */
-    PlanStage::StageState _writeToTimeseriesBuckets(
+    template <typename F>
+    std::pair<bool, PlanStage::StageState> _writeToTimeseriesBuckets(
+        ScopeGuard<F>& bucketFreer,
         WorkingSetID bucketWsmId,
-        const std::vector<BSONObj>& unchangedMeasurements,
-        const std::vector<BSONObj>& deletedMeasurements,
+        std::vector<BSONObj>&& unchangedMeasurements,
+        std::vector<BSONObj>&& matchedMeasurements,
         bool bucketFromMigrate);
 
     /**
@@ -109,7 +210,21 @@ private:
      */
     PlanStage::StageState _getNextBucket(WorkingSetID& id);
 
-    std::unique_ptr<DeleteStageParams> _params;
+    void _checkRestrictionsOnUpdatingShardKeyAreNotViolated(
+        const ScopedCollectionDescription& collDesc, const FieldRefSet& shardKeyPaths);
+
+    void _checkUpdateChangesExistingShardKey(const BSONObj& newBucket,
+                                             const BSONObj& oldBucket,
+                                             const BSONObj& oldMeasurement);
+
+    void _checkUpdateChangesReshardingKey(const ShardingWriteRouter& shardingWriteRouter,
+                                          const BSONObj& newBucket,
+                                          const BSONObj& oldBucke,
+                                          const BSONObj& oldMeasurementt);
+
+    void _checkUpdateChangesShardKeyFields(const BSONObj& newBucket,
+                                           const BSONObj& oldBucke,
+                                           const BSONObj& oldMeasurementt);
 
     WorkingSet* _ws;
 
@@ -119,7 +234,7 @@ private:
 
     BucketUnpacker _bucketUnpacker;
 
-    // Determines the measurements to delete from this bucket, and by inverse, those to keep
+    // Determines the measurements to modify in this bucket, and by inverse, those to keep
     // unmodified. This predicate can be null if we have a meta-only or empty predicate on singleton
     // deletes or updates.
     std::unique_ptr<MatchExpression> _residualPredicate;
@@ -133,8 +248,6 @@ private:
      * It's refreshed after yielding and reacquiring the locks.
      */
     write_stage_common::PreWriteFilter _preWriteFilter;
-
-    TimeseriesModifyStats _specificStats{};
 
     // A pending retry to get to after a NEED_YIELD propagation and a new storage snapshot is
     // established. This can be set when a write fails or when a fetch fails.

@@ -93,14 +93,10 @@ StageConstraints DocumentSourceReshardingOwnershipMatch::constraints(
 }
 
 Value DocumentSourceReshardingOwnershipMatch::serialize(SerializationOptions opts) const {
-    if (opts.redactIdentifiers || opts.replacementForLiteralArgs) {
-        MONGO_UNIMPLEMENTED_TASSERT(7484302);
-    }
-
     return Value{Document{{kStageName,
                            DocumentSourceReshardingOwnershipMatchSpec(
                                _recipientShardId, _reshardingKey.getKeyPattern())
-                               .toBSON()}}};
+                               .toBSON(opts)}}};
 }
 
 DepsTracker::State DocumentSourceReshardingOwnershipMatch::getDependencies(

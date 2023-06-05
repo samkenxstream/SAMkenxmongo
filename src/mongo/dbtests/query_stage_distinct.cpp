@@ -62,7 +62,7 @@ public:
     }
 
     void addIndex(const BSONObj& obj) {
-        ASSERT_OK(dbtests::createIndex(&_opCtx, nss.ns(), obj));
+        ASSERT_OK(dbtests::createIndex(&_opCtx, nss.ns_forTest(), obj));
     }
 
     void insert(const BSONObj& obj) {
@@ -199,7 +199,7 @@ public:
         std::vector<const IndexDescriptor*> indexes;
         coll->getIndexCatalog()->findIndexesByKeyPattern(
             &_opCtx, BSON("a" << 1), IndexCatalog::InclusionPolicy::kReady, &indexes);
-        verify(indexes.size() == 1);
+        MONGO_verify(indexes.size() == 1);
 
         DistinctParams params{&_opCtx, coll, indexes[0]};
         ASSERT_TRUE(params.isMultiKey);

@@ -48,11 +48,37 @@ public:
      * is included in the serialization.
      * eg. serialize(DatabaseName(tenantID, "foo")) -> "tenantID_foo"
      *
+     * If multitenancySupport is enabled and we are serializing a command reply, the
+     * featureFlagRequireTenantID has no bearing on whether we prefix or not, and is dependent on
+     * the value of the expectPrefix field in the request at the time of deserialization, and
+     * whether or not the tenantId was provided as a prefix.
+     *
      * If multitenancySupport is disabled, the tenantID is not set in the DatabaseName Object.
      * eg. serialize(DatabaseName(boost::none, "foo")) -> "foo"
      */
     static std::string serialize(const DatabaseName& dbName,
                                  const SerializationContext& context = SerializationContext());
+
+    // TODO SERVER-74284: Privatize the worker functions
+    static std::string serializeForStorage(
+        const DatabaseName& dbName, const SerializationContext& context = SerializationContext());
+
+    static std::string serializeForCommands(
+        const DatabaseName& dbName, const SerializationContext& context = SerializationContext());
+
+    /**
+     *
+     * TODO SERVER-76294 Remove this function. Any remaining call sites must be changed to use a
+     * function on DatabaseNameUtil.
+     */
+    static std::string serializeForAuth(
+        const DatabaseName& dbName, const SerializationContext& context = SerializationContext());
+    /**
+     * To be used only for durable catalog. We always include the tenantId as prefixed in a
+     * databasename for the catalog.
+     */
+    static std::string serializeForCatalog(
+        const DatabaseName& dbName, const SerializationContext& context = SerializationContext());
 
     /**
      * Deserializes StringData dbName to a DatabaseName object.
@@ -69,6 +95,11 @@ public:
      * eg. deserialize(boost::none, "preTenantID_foo") -> DatabaseName(preTenantId,
      * "foo")
      *
+     * If multitenancySupport is enabled and we are deserializing a command request, we will extract
+     * it from the prefix if a tenantId is not provided, otherwise we rely on the value of the
+     * expectPrefix field in the request to determine whether or not we should expect to parse a
+     * prefix.
+     *
      * If multitenancySupport is disabled then the invariant requires tenantID to not be initialized
      * and DatabaseName is constructed without the tenantID.
      * eg. deserialize(boost::none, "foo") -> DatabaseName(boost::none, "foo")
@@ -76,6 +107,26 @@ public:
     static DatabaseName deserialize(boost::optional<TenantId> tenantId,
                                     StringData db,
                                     const SerializationContext& context = SerializationContext());
+
+    // TODO SERVER-74284: Privatize the worker functions
+    static DatabaseName deserializeForStorage(
+        boost::optional<TenantId> tenantId,
+        StringData db,
+        const SerializationContext& context = SerializationContext());
+
+    static DatabaseName deserializeForCommands(
+        boost::optional<TenantId> tenantId,
+        StringData db,
+        const SerializationContext& context = SerializationContext());
+
+    /**
+     * To be used only by the storage catalog.
+     */
+    static DatabaseName deserializeForCatalog(
+        StringData db, const SerializationContext& context = SerializationContext());
+
+private:
+    static DatabaseName parseDbNameFromStringExpectTenantIdInMultitenancyMode(StringData dbName);
 };
 
 }  // namespace mongo

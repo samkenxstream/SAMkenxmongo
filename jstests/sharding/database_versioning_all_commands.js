@@ -5,7 +5,6 @@
 (function() {
 'use strict';
 
-load("jstests/libs/feature_flag_util.js");
 load('jstests/sharding/libs/last_lts_mongos_commands.js');
 
 function getNewDbName(dbName) {
@@ -118,13 +117,7 @@ function testCommandAfterMovePrimary(testCase, st, dbName, collName) {
     // After the movePrimary, both old and new primary shards should have cleared the dbVersion.
     assertMongosDatabaseVersion(st.s0, dbName, dbVersionBefore);
     assertShardDatabaseVersion(primaryShardBefore, dbName, {});
-    // TODO (SERVER-71309): Remove once 7.0 becomes last LTS.
-    if (FeatureFlagUtil.isEnabled(st.configRS.getPrimary().getDB('admin'),
-                                  "ResilientMovePrimary")) {
-        assertShardDatabaseVersion(primaryShardAfter, dbName, {});
-    } else {
-        assertShardDatabaseVersion(primaryShardAfter, dbName, dbVersionBefore);
-    }
+    assertShardDatabaseVersion(primaryShardAfter, dbName, {});
 
     // Run the test case's command.
     const res = st.s0.getDB(testCase.runsAgainstAdminDb ? "admin" : dbName).runCommand(command);
@@ -152,13 +145,7 @@ function testCommandAfterMovePrimary(testCase, st, dbName, collName) {
         // 3. Both old and new primary shards should have cleared the dbVersion
         assertMongosDatabaseVersion(st.s0, dbName, dbVersionBefore);
         assertShardDatabaseVersion(primaryShardBefore, dbName, {});
-        // TODO (SERVER-71309): Remove once 7.0 becomes last LTS.
-        if (FeatureFlagUtil.isEnabled(st.configRS.getPrimary().getDB('admin'),
-                                      "ResilientMovePrimary")) {
-            assertShardDatabaseVersion(primaryShardAfter, dbName, {});
-        } else {
-            assertShardDatabaseVersion(primaryShardAfter, dbName, dbVersionBefore);
-        }
+        assertShardDatabaseVersion(primaryShardAfter, dbName, {});
     }
 
     if (testCase.cleanUp) {
@@ -270,6 +257,8 @@ let testCases = {
     _isSelf: {skip: "executes locally on mongos (not sent to any remote node)"},
     _killOperations: {skip: "executes locally on mongos (not sent to any remote node)"},
     _mergeAuthzCollections: {skip: "always targets the config server"},
+    _mongotConnPoolStats: {skip: "not on a user database", conditional: true},
+    _dropConnectionsToMongot: {skip: "not on a user database", conditional: true},
     abortReshardCollection: {skip: "always targets the config server"},
     abortTransaction: {skip: "unversioned and uses special targetting rules"},
     addShard: {skip: "not on a user database"},
@@ -317,8 +306,17 @@ let testCases = {
     balancerStop: {skip: "not on a user database"},
     buildInfo: {skip: "executes locally on mongos (not sent to any remote node)"},
     bulkWrite: {skip: "not yet implemented"},
-    checkMetadataConsistency: {skip: "not yet implemented"},
+    checkMetadataConsistency: {
+        run: {
+            sendsDbVersion: true,
+            runsAgainstAdminDb: false,
+            command: function(dbName, collName) {
+                return {checkMetadataConsistency: 1};
+            }
+        }
+    },
     cleanupReshardCollection: {skip: "always targets the config server"},
+    cleanupStructuredEncryptionData: {skip: "requires encrypted collections"},
     clearJumboFlag: {skip: "does not forward command to primary shard"},
     clearLog: {skip: "executes locally on mongos (not sent to any remote node)"},
     collMod: {
@@ -460,7 +458,7 @@ let testCases = {
     echo: {skip: "does not forward command to primary shard"},
     enableSharding: {skip: "does not forward command to primary shard"},
     endSessions: {skip: "goes through the cluster write path"},
-    explain: {skip: "TODO SERVER-31226"},
+    explain: {skip: "already tested by each CRUD command through the 'explain' field"},
     features: {skip: "executes locally on mongos (not sent to any remote node)"},
     filemd5: {
         run: {
@@ -521,7 +519,7 @@ let testCases = {
                                 [{"s": BinData(0, "lUBO7Mov5Sb+c/D4cJ9whhhw/+PZFLCk/AQU2+BpumQ=")}]
                         },
                     ],
-                    "forInsert": true
+                    "queryType": "insert"
                 };
             }
         }
@@ -678,6 +676,7 @@ let testCases = {
     },
     repairShardedCollectionChunksHistory: {skip: "always targets the config server"},
     replSetGetStatus: {skip: "not supported in mongos"},
+    resetPlacementHistory: {skip: "always targets the config server"},
     reshardCollection: {skip: "does not forward command to primary shard"},
     revokePrivilegesFromRole: {skip: "always targets the config server"},
     revokeRolesFromRole: {skip: "always targets the config server"},
@@ -725,7 +724,7 @@ let testCases = {
     testRemoval: {skip: "executes locally on mongos (not sent to any remote node)"},
     testVersion2: {skip: "executes locally on mongos (not sent to any remote node)"},
     testVersions1And2: {skip: "executes locally on mongos (not sent to any remote node)"},
-    transitionToCatalogShard: {skip: "not on a user database"},
+    transitionFromDedicatedConfigServer: {skip: "not on a user database"},
     transitionToDedicatedConfigServer: {skip: "not on a user database"},
     update: {
         run: {

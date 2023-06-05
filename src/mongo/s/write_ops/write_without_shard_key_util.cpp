@@ -39,6 +39,8 @@
 #include "mongo/db/update/update_util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/collection_routing_info_targeter.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/cluster_commands_without_shard_key_gen.h"
 #include "mongo/s/shard_key_pattern_query_util.h"
@@ -53,51 +55,6 @@ namespace {
 constexpr auto kIdFieldName = "_id"_sd;
 const FieldRef idFieldRef(kIdFieldName);
 
-// Used to do query validation for the _id field.
-const ShardKeyPattern kVirtualIdShardKey(BSON(kIdFieldName << 1));
-
-/**
- * This returns "does the query have an _id field" and "is the _id field querying for a direct
- * value" e.g. _id : 3 and not _id : { $gt : 3 }.
- */
-bool isExactIdQuery(OperationContext* opCtx,
-                    const NamespaceString& nss,
-                    const BSONObj query,
-                    const BSONObj collation,
-                    bool hasDefaultCollation) {
-    auto findCommand = std::make_unique<FindCommandRequest>(nss);
-    findCommand->setFilter(query);
-    if (!collation.isEmpty()) {
-        findCommand->setCollation(collation);
-    }
-    const auto cq = CanonicalQuery::canonicalize(opCtx,
-                                                 std::move(findCommand),
-                                                 false, /* isExplain */
-                                                 nullptr,
-                                                 ExtensionsCallbackNoop(),
-                                                 MatchExpressionParser::kAllowAllSpecialFeatures);
-    if (cq.isOK()) {
-        // Only returns a shard key iff a query has a full shard key with direct/equality matches on
-        // all shard key fields.
-        auto shardKey = extractShardKeyFromQuery(kVirtualIdShardKey, *cq.getValue());
-        BSONElement idElt = shardKey["_id"];
-
-        if (!idElt) {
-            return false;
-        }
-
-        if (CollationIndexKey::isCollatableType(idElt.type()) && !collation.isEmpty() &&
-            !hasDefaultCollation) {
-            // The collation applies to the _id field, but the user specified a collation which
-            // doesn't match the collection default.
-            return false;
-        }
-        return true;
-    }
-
-    return false;
-}
-
 bool shardKeyHasCollatableType(const BSONObj& shardKey) {
     for (BSONElement elt : shardKey) {
         if (CollationIndexKey::isCollatableType(elt.type())) {
@@ -109,8 +66,8 @@ bool shardKeyHasCollatableType(const BSONObj& shardKey) {
 }  // namespace
 
 BSONObj generateUpsertDocument(OperationContext* opCtx, const UpdateRequest& updateRequest) {
-    ExtensionsCallbackNoop extensionsCallback = ExtensionsCallbackNoop();
-    ParsedUpdate parsedUpdate(opCtx, &updateRequest, extensionsCallback);
+    // We are only using this to parse the query for producing the upsert document.
+    ParsedUpdateForMongos parsedUpdate(opCtx, &updateRequest);
     uassertStatusOK(parsedUpdate.parseRequest());
 
     const CanonicalQuery* canonicalQuery =
@@ -177,59 +134,73 @@ bool useTwoPhaseProtocol(OperationContext* opCtx,
                          bool isUpdateOrDelete,
                          bool isUpsert,
                          const BSONObj& query,
-                         const BSONObj& collation) {
+                         const BSONObj& collation,
+                         const boost::optional<BSONObj>& let,
+                         const boost::optional<LegacyRuntimeConstants>& legacyRuntimeConstants) {
     if (!feature_flags::gFeatureFlagUpdateOneWithoutShardKey.isEnabled(
             serverGlobalParams.featureCompatibility)) {
         return false;
     }
 
-    auto [cm, _] =
+    auto cri =
         uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
 
     // Unsharded collections always target the primary shard.
-    if (!cm.isSharded()) {
+    if (!cri.cm.isSharded()) {
         return false;
     }
 
-    // Check if the query has specified a different collation than the default collation.
-    auto collator = collation.isEmpty()
-        ? nullptr  // If no collation is specified we return a nullptr signifying the simple
-                   // collation.
-        : uassertStatusOK(
-              CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collation));
-    auto hasDefaultCollation =
-        CollatorInterface::collatorsMatch(collator.get(), cm.getDefaultCollator());
-
-    auto tsFields = cm.getTimeseriesFields();
+    auto tsFields = cri.cm.getTimeseriesFields();
     bool isTimeseries = tsFields.has_value();
 
     // updateOne and deleteOne do not use the two phase protocol for single writes that specify
     // _id in their queries, unless a document is being upserted. An exact _id match requires
     // default collation if the _id value is a collatable type.
     if (isUpdateOrDelete && query.hasField("_id") &&
-        isExactIdQuery(opCtx, nss, query, collation, hasDefaultCollation) && !isUpsert &&
-        !isTimeseries) {
+        CollectionRoutingInfoTargeter::isExactIdQuery(opCtx, nss, query, collation, cri.cm) &&
+        !isUpsert && !isTimeseries) {
         return false;
     }
 
-    BSONObj deleteQuery = query;
-    if (isTimeseries) {
-        auto expCtx = make_intrusive<ExpressionContext>(opCtx, std::move(collator), nss);
-        deleteQuery =
-            timeseries::getBucketLevelPredicateForRouting(query, expCtx, tsFields->getMetaField());
-    }
+    auto expCtx = makeExpressionContextWithDefaultsForTargeter(opCtx,
+                                                               nss,
+                                                               collation,
+                                                               boost::none,  // explain
+                                                               let,
+                                                               legacyRuntimeConstants);
 
-    auto shardKey = uassertStatusOK(
-        extractShardKeyFromBasicQuery(opCtx, nss, cm.getShardKeyPattern(), deleteQuery));
+    bool arbitraryTimeseriesWritesEnabled = feature_flags::gTimeseriesDeletesSupport.isEnabled(
+                                                serverGlobalParams.featureCompatibility) ||
+        feature_flags::gTimeseriesUpdatesSupport.isEnabled(serverGlobalParams.featureCompatibility);
+    auto shardKey = uassertStatusOK(extractShardKeyFromBasicQueryWithContext(
+        expCtx,
+        cri.cm.getShardKeyPattern(),
+        !isTimeseries
+            ? query
+            : timeseries::getBucketLevelPredicateForRouting(query,
+                                                            expCtx,
+                                                            tsFields->getTimeseriesOptions(),
+                                                            arbitraryTimeseriesWritesEnabled)));
 
     // 'shardKey' will only be populated only if a full equality shard key is extracted.
     if (shardKey.isEmpty()) {
         return true;
     } else {
-        // If the default collection collation is not used and any field of the shard key is a
-        // collatable type, then we will use the two phase write protocol since we cannot target
-        // directly to a shard.
-        if (!hasDefaultCollation && shardKeyHasCollatableType(shardKey)) {
+        // Check if the query has specified a different collation than the default collation.
+        auto hasDefaultCollation = [&] {
+            if (collation.isEmpty()) {
+                return true;
+            }
+            auto collator = uassertStatusOK(
+                CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collation));
+            return CollatorInterface::collatorsMatch(collator.get(), cri.cm.getDefaultCollator());
+        }();
+
+        // If the default collection collation is not used or the default collation is not the
+        // simple collation and any field of the shard key is a collatable type, then we will use
+        // the two phase write protocol since we cannot target directly to a shard.
+        if ((!hasDefaultCollation || cri.cm.getDefaultCollator()) &&
+            shardKeyHasCollatableType(shardKey)) {
             return true;
         } else {
             return false;
@@ -260,13 +231,9 @@ StatusWith<ClusterWriteWithoutShardKeyResponse> runTwoPhaseWriteProtocol(Operati
 
     auto& executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
     auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
-    auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(executor);
 
-    auto txn =
-        txn_api::SyncTransactionWithRetries(opCtx,
-                                            sleepInlineExecutor,
-                                            TransactionRouterResourceYielder::makeForLocalHandoff(),
-                                            inlineExecutor);
+    auto txn = txn_api::SyncTransactionWithRetries(
+        opCtx, executor, TransactionRouterResourceYielder::makeForLocalHandoff(), inlineExecutor);
 
     auto sharedBlock = std::make_shared<SharedBlock>(nss, cmdObj);
     auto swResult = txn.runNoThrow(
@@ -338,6 +305,93 @@ StatusWith<ClusterWriteWithoutShardKeyResponse> runTwoPhaseWriteProtocol(Operati
     } else {
         return StatusWith<ClusterWriteWithoutShardKeyResponse>(swResult.getStatus());
     }
+}
+
+BSONObj generateExplainResponseForTwoPhaseWriteProtocol(
+    const BSONObj& clusterQueryWithoutShardKeyExplainObj,
+    const BSONObj& clusterWriteWithoutShardKeyExplainObj) {
+    // To express the two phase nature of the two phase write protocol, we use the output of the
+    // 'Read Phase' explain as the 'inputStage' of the 'Write Phase' explain for both queryPlanner
+    // and executionStats sections.
+    //
+    // An example output would look like:
+
+    //  "queryPlanner" : {
+    //      "winningPlan" : {
+    // 	        "stage" : "SHARD_WRITE",
+    // 	        ...
+    //          “inputStage”: {
+    // 		        queryPlanner: {
+    // 		            winningPlan: {
+    // 		                stage: "SHARD_MERGE",
+    //                      ...
+    //
+    //                  }
+    //              }
+    //          }
+    //      }
+    //  }
+    //
+    // executionStats : {
+    //     "executionStages" : {
+    //         "stage" : "SHARD_WRITE",
+    //          ...
+    //     },
+    //     "inputStage" : {
+    //         "stage" : "SHARD_MERGE",
+    //             ...
+    //      }
+    //
+    // }
+    // ... other explain result fields ...
+
+    auto queryPlannerOutput = [&] {
+        auto clusterQueryWithoutShardKeyQueryPlannerObj =
+            clusterQueryWithoutShardKeyExplainObj.getObjectField("queryPlanner");
+        auto clusterWriteWithoutShardKeyQueryPlannerObj =
+            clusterWriteWithoutShardKeyExplainObj.getObjectField("queryPlanner");
+
+        auto winningPlan = clusterWriteWithoutShardKeyQueryPlannerObj.getObjectField("winningPlan");
+        BSONObjBuilder newWinningPlanBuilder(winningPlan);
+        newWinningPlanBuilder.appendObject("inputStage",
+                                           clusterQueryWithoutShardKeyQueryPlannerObj.objdata());
+        auto newWinningPlan = newWinningPlanBuilder.obj();
+
+        auto queryPlannerObjNoWinningPlan =
+            clusterWriteWithoutShardKeyQueryPlannerObj.removeField("winningPlan");
+        BSONObjBuilder newQueryPlannerBuilder(queryPlannerObjNoWinningPlan);
+        newQueryPlannerBuilder.appendObject("winningPlan", newWinningPlan.objdata());
+        return newQueryPlannerBuilder.obj();
+    }();
+
+    auto executionStatsOutput = [&] {
+        auto clusterQueryWithoutShardKeyExecutionStatsObj =
+            clusterQueryWithoutShardKeyExplainObj.getObjectField("executionStats");
+        auto clusterWriteWithoutShardKeyExecutionStatsObj =
+            clusterWriteWithoutShardKeyExplainObj.getObjectField("executionStats");
+
+        if (clusterQueryWithoutShardKeyExecutionStatsObj.isEmpty() &&
+            clusterWriteWithoutShardKeyExecutionStatsObj.isEmpty()) {
+            return BSONObj();
+        }
+
+        BSONObjBuilder newExecutionStatsBuilder(clusterWriteWithoutShardKeyExecutionStatsObj);
+        newExecutionStatsBuilder.appendObject(
+            "inputStage", clusterQueryWithoutShardKeyExecutionStatsObj.objdata());
+        return newExecutionStatsBuilder.obj();
+    }();
+
+    BSONObjBuilder explainOutputBuilder;
+    if (!queryPlannerOutput.isEmpty()) {
+        explainOutputBuilder.appendObject("queryPlanner", queryPlannerOutput.objdata());
+    }
+    if (!executionStatsOutput.isEmpty()) {
+        explainOutputBuilder.appendObject("executionStats", executionStatsOutput.objdata());
+    }
+    // This step is to get 'command', 'serverInfo', and 'serverParamter' fields to return in the
+    // final explain output.
+    explainOutputBuilder.appendElementsUnique(clusterWriteWithoutShardKeyExplainObj);
+    return explainOutputBuilder.obj();
 }
 }  // namespace write_without_shard_key
 }  // namespace mongo

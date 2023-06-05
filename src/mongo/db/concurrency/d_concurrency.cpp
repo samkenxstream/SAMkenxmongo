@@ -29,11 +29,10 @@
 
 #include "mongo/db/concurrency/d_concurrency.h"
 
-#include <memory>
 #include <string>
 #include <vector>
 
-#include "mongo/db/concurrency/flow_control_ticketholder.h"
+#include "mongo/db/concurrency/resource_catalog.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
@@ -47,12 +46,7 @@
 namespace mongo {
 
 Lock::ResourceMutex::ResourceMutex(std::string resourceLabel)
-    : _rid(ResourceIdFactory::newResourceIdForMutex(std::move(resourceLabel))) {}
-
-std::string Lock::ResourceMutex::getName(ResourceId resourceId) {
-    invariant(resourceId.getType() == RESOURCE_MUTEX);
-    return ResourceIdFactory::nameForId(resourceId);
-}
+    : _rid(ResourceCatalog::get().newResourceIdForMutex(std::move(resourceLabel))) {}
 
 bool Lock::ResourceMutex::isExclusivelyLocked(Locker* locker) {
     return locker->isLockHeldForMode(_rid, MODE_X);
@@ -62,29 +56,33 @@ bool Lock::ResourceMutex::isAtLeastReadLocked(Locker* locker) {
     return locker->isLockHeldForMode(_rid, MODE_IS);
 }
 
-ResourceId Lock::ResourceMutex::ResourceIdFactory::newResourceIdForMutex(
-    std::string resourceLabel) {
-    return _resourceIdFactory()._newResourceIdForMutex(std::move(resourceLabel));
+void Lock::ResourceLock::_lock(LockMode mode, Date_t deadline) {
+    invariant(_result == LOCK_INVALID);
+    if (_opCtx)
+        _opCtx->lockState()->lock(_opCtx, _rid, mode, deadline);
+    else
+        _locker->lock(_rid, mode, deadline);
+
+    _result = LOCK_OK;
 }
 
-std::string Lock::ResourceMutex::ResourceIdFactory::nameForId(ResourceId resourceId) {
-    stdx::lock_guard<Latch> lk(_resourceIdFactory().labelsMutex);
-    return _resourceIdFactory().labels.at(resourceId.getHashId());
+void Lock::ResourceLock::_unlock() {
+    if (_isLocked()) {
+        if (_opCtx)
+            _opCtx->lockState()->unlock(_rid);
+        else
+            _locker->unlock(_rid);
+
+        _result = LOCK_INVALID;
+    }
 }
 
-Lock::ResourceMutex::ResourceIdFactory&
-Lock::ResourceMutex::ResourceIdFactory::_resourceIdFactory() {
-    static StaticImmortal<Lock::ResourceMutex::ResourceIdFactory> resourceIdFactory;
-    return resourceIdFactory.value();
-}
-
-ResourceId Lock::ResourceMutex::ResourceIdFactory::_newResourceIdForMutex(
-    std::string resourceLabel) {
-    stdx::lock_guard<Latch> lk(labelsMutex);
-    invariant(nextId == labels.size());
-    labels.push_back(std::move(resourceLabel));
-
-    return ResourceId::makeMutexResourceId(nextId++);
+void Lock::ExclusiveLock::lock() {
+    // The contract of the condition_variable-like utilities is that that the lock is returned in
+    // the locked state so the acquisition below must be guaranteed to always succeed.
+    invariant(_opCtx);
+    UninterruptibleLockGuard ulg(_opCtx->lockState());  // NOLINT.
+    _lock(MODE_X);
 }
 
 Lock::GlobalLock::GlobalLock(OperationContext* opCtx,
@@ -178,6 +176,27 @@ Lock::GlobalLock::GlobalLock(GlobalLock&& otherLock)
     otherLock._result = LOCK_INVALID;
 }
 
+Lock::GlobalLock::~GlobalLock() {
+    // Preserve the original lock result which will be overridden by unlock().
+    auto lockResult = _result;
+    auto* locker = _opCtx->lockState();
+
+    if (isLocked()) {
+        // Abandon our snapshot if destruction of the GlobalLock object results in actually
+        // unlocking the global lock. Recursive locking and the two-phase locking protocol may
+        // prevent lock release.
+        const bool willReleaseLock = _isOutermostLock && !locker->inAWriteUnitOfWork();
+        if (willReleaseLock) {
+            _opCtx->recoveryUnit()->abandonSnapshot();
+        }
+        _unlock();
+    }
+
+    if (!_skipRSTLLock && (lockResult == LOCK_OK || lockResult == LOCK_WAITING)) {
+        locker->unlock(resourceIdReplicationStateTransitionLock);
+    }
+}
+
 void Lock::GlobalLock::_unlock() {
     _opCtx->lockState()->unlockGlobal();
     _result = LOCK_INVALID;
@@ -229,7 +248,7 @@ Lock::DBLock::DBLock(OperationContext* opCtx,
 
     tassert(6671501,
             str::stream() << "Tenant lock mode " << modeName(*tenantLockMode)
-                          << " specified for database " << dbName.db()
+                          << " specified for database " << dbName.toStringForErrorMsg()
                           << " that does not belong to a tenant",
             !tenantLockMode || dbName.tenantId());
 
@@ -239,11 +258,11 @@ Lock::DBLock::DBLock(OperationContext* opCtx,
             const auto defaultTenantLockMode = isSharedLockMode(_mode) ? MODE_IS : MODE_IX;
             if (tenantLockMode) {
                 tassert(6671505,
-                        str::stream()
-                            << "Requested tenant lock mode " << modeName(*tenantLockMode)
-                            << " that is weaker than the default one  "
-                            << modeName(defaultTenantLockMode) << " for database " << dbName.db()
-                            << " of tenant  " << dbName.tenantId()->toString(),
+                        str::stream() << "Requested tenant lock mode " << modeName(*tenantLockMode)
+                                      << " that is weaker than the default one  "
+                                      << modeName(defaultTenantLockMode) << " for database "
+                                      << dbName.toStringForErrorMsg() << " of tenant  "
+                                      << dbName.tenantId()->toString(),
                         isModeCovered(defaultTenantLockMode, *tenantLockMode));
                 return *tenantLockMode;
             } else {
@@ -299,26 +318,5 @@ Lock::CollectionLock::~CollectionLock() {
 Lock::ParallelBatchWriterMode::ParallelBatchWriterMode(OperationContext* opCtx)
     : _pbwm(opCtx, resourceIdParallelBatchWriterMode, MODE_X),
       _shouldNotConflictBlock(opCtx->lockState()) {}
-
-void Lock::ResourceLock::_lock(LockMode mode, Date_t deadline) {
-    invariant(_result == LOCK_INVALID);
-    if (_opCtx)
-        _opCtx->lockState()->lock(_opCtx, _rid, mode, deadline);
-    else
-        _locker->lock(_rid, mode, deadline);
-
-    _result = LOCK_OK;
-}
-
-void Lock::ResourceLock::_unlock() {
-    if (_isLocked()) {
-        if (_opCtx)
-            _opCtx->lockState()->unlock(_rid);
-        else
-            _locker->unlock(_rid);
-
-        _result = LOCK_INVALID;
-    }
-}
 
 }  // namespace mongo

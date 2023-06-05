@@ -42,6 +42,7 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/timestamp_block.h"
 #include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/db/transaction/transaction_history_iterator.h"
 #include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/logv2/log.h"
@@ -123,10 +124,16 @@ Status _applyOperationsForTransaction(OperationContext* opCtx,
             // Presently, it is not allowed to run a prepared transaction with a command
             // inside. TODO(SERVER-46105)
             invariant(!op.isCommand());
-            AutoGetCollection coll(opCtx, op.getNss(), MODE_IX);
+            auto coll = acquireCollection(
+                opCtx,
+                CollectionAcquisitionRequest(op.getNss(),
+                                             AcquisitionPrerequisites::kPretendUnsharded,
+                                             repl::ReadConcernArgs::get(opCtx),
+                                             AcquisitionPrerequisites::kWrite),
+                MODE_IX);
             const bool isDataConsistent = true;
             auto status = repl::applyOperation_inlock(opCtx,
-                                                      coll.getDb(),
+                                                      coll,
                                                       ApplierOperation{&op},
                                                       false /*alwaysUpsert*/,
                                                       oplogApplicationMode,
@@ -154,7 +161,7 @@ Status _applyOperationsForTransaction(OperationContext* opCtx,
             if (ex.code() == ErrorCodes::NamespaceNotFound &&
                 oplogApplicationMode == repl::OplogApplication::Mode::kStableRecovering) {
                 repl::OplogApplication::checkOnOplogFailureForRecovery(
-                    opCtx, redact(op.toBSONForLogging()), redact(ex));
+                    opCtx, op.getNss(), redact(op.toBSONForLogging()), redact(ex));
             }
 
             if (!ignoreException) {
@@ -202,7 +209,7 @@ Status _applyTransactionFromOplogChain(OperationContext* opCtx,
     const auto dbName = entry.getNss().dbName();
     Status status = Status::OK();
 
-    writeConflictRetry(opCtx, "replaying prepared transaction", dbName.db(), [&] {
+    writeConflictRetry(opCtx, "replaying prepared transaction", NamespaceString(dbName), [&] {
         WriteUnitOfWork wunit(opCtx);
 
         // We might replay a prepared transaction behind oldest timestamp.
@@ -563,7 +570,7 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
         opCtx->resetMultiDocumentTransactionState();
     });
 
-    return writeConflictRetry(opCtx, "applying prepare transaction", prepareOp.getNss().ns(), [&] {
+    return writeConflictRetry(opCtx, "applying prepare transaction", prepareOp.getNss(), [&] {
         // The write on transaction table may be applied concurrently, so refreshing
         // state from disk may read that write, causing starting a new transaction
         // on an existing txnNumber. Thus, we start a new transaction without
@@ -639,7 +646,8 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
 
         auto opObserver = opCtx->getServiceContext()->getOpObserver();
         invariant(opObserver);
-        opObserver->onTransactionPrepareNonPrimary(opCtx, txnOps, prepareOp.getOpTime());
+        opObserver->onTransactionPrepareNonPrimary(
+            opCtx, *prepareOp.getSessionId(), txnOps, prepareOp.getOpTime());
 
         // Prepare transaction success.
         abortOnError.dismiss();
@@ -794,6 +802,13 @@ void reconstructPreparedTransactions(OperationContext* opCtx, repl::OplogApplica
             // transaction oplog entry.
             auto newClient =
                 opCtx->getServiceContext()->makeClient("reconstruct-prepared-transactions");
+
+            // TODO(SERVER-74656): Please revisit if this thread could be made killable.
+            {
+                stdx::lock_guard<Client> lk(*newClient.get());
+                newClient.get()->setSystemOperationUnkillableByStepdown(lk);
+            }
+
             AlternativeClientRegion acr(newClient);
             const auto newOpCtx = cc().makeOperationContext();
 

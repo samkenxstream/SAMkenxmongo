@@ -44,8 +44,7 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
-#include "mongo/db/concurrency/lock_state.h"
-#include "mongo/db/concurrency/locker.h"
+#include "mongo/db/concurrency/locker_impl.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/dbdirectclient.h"
@@ -72,6 +71,7 @@
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/would_change_owning_shard_exception.h"
+#include "mongo/util/debugger.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/log_with_sampling.h"
 #include "mongo/util/net/socket_utils.h"
@@ -97,6 +97,8 @@ MONGO_FAIL_POINT_DEFINE(skipCommitTxnCheckPrepareMajorityCommitted);
 MONGO_FAIL_POINT_DEFINE(restoreLocksFail);
 
 MONGO_FAIL_POINT_DEFINE(failTransactionNoopWrite);
+
+MONGO_FAIL_POINT_DEFINE(hangInCommitSplitPreparedTxnOnPrimary);
 
 const auto getTransactionParticipant = Session::declareDecoration<TransactionParticipant>();
 
@@ -168,6 +170,10 @@ void validateTransactionHistoryApplyOpsOplogEntry(const repl::OplogEntry& oplogE
 template <typename Callable>
 auto performReadWithNoTimestampDBDirectClient(OperationContext* opCtx, Callable&& callable) {
     ReadSourceScope readSourceScope(opCtx, RecoveryUnit::ReadSource::kNoTimestamp);
+    // ReadConcern must also be fixed for the new scope. It will get restored when exiting this.
+    auto originalReadConcern =
+        std::exchange(repl::ReadConcernArgs::get(opCtx), repl::ReadConcernArgs());
+    ON_BLOCK_EXIT([&] { repl::ReadConcernArgs::get(opCtx) = std::move(originalReadConcern); });
 
     DBDirectClient client(opCtx);
     return callable(&client);
@@ -180,10 +186,10 @@ void rethrowPartialIndexQueryBadValueWithContext(const DBException& ex) {
             ex.toStatus(),
             str::stream()
                 << "Failed to find partial index for "
-                << NamespaceString::kSessionTransactionsTableNamespace.ns()
+                << NamespaceString::kSessionTransactionsTableNamespace.toStringForErrorMsg()
                 << ". Please create an index directly on this replica set with the specification: "
                 << MongoDSessionCatalog::getConfigTxnPartialIndexSpec() << " or drop the "
-                << NamespaceString::kSessionTransactionsTableNamespace.ns()
+                << NamespaceString::kSessionTransactionsTableNamespace.toStringForErrorMsg()
                 << " collection and step up a new primary.");
     }
 }
@@ -206,6 +212,9 @@ ActiveTransactionHistory fetchActiveTransactionHistory(OperationContext* opCtx,
 
     result.lastTxnRecord = [&]() -> boost::optional<SessionTxnRecord> {
         ReadSourceScope readSourceScope(opCtx, RecoveryUnit::ReadSource::kNoTimestamp);
+        auto originalReadConcern =
+            std::exchange(repl::ReadConcernArgs::get(opCtx), repl::ReadConcernArgs());
+        ON_BLOCK_EXIT([&] { repl::ReadConcernArgs::get(opCtx) = std::move(originalReadConcern); });
 
         AutoGetCollectionForRead autoRead(opCtx,
                                           NamespaceString::kSessionTransactionsTableNamespace);
@@ -271,6 +280,9 @@ ActiveTransactionHistory fetchActiveTransactionHistory(OperationContext* opCtx,
     // Restore the current timestamp read source after fetching transaction history, which may
     // change our ReadSource.
     ReadSourceScope readSourceScope(opCtx, RecoveryUnit::ReadSource::kNoTimestamp);
+    auto originalReadConcern =
+        std::exchange(repl::ReadConcernArgs::get(opCtx), repl::ReadConcernArgs());
+    ON_BLOCK_EXIT([&] { repl::ReadConcernArgs::get(opCtx) = std::move(originalReadConcern); });
 
     auto it = TransactionHistoryIterator(result.lastTxnRecord->getLastWriteOpTime());
     while (it.hasNext()) {
@@ -393,30 +405,32 @@ void updateSessionEntry(OperationContext* opCtx,
     AutoGetCollection collection(
         opCtx, NamespaceString::kSessionTransactionsTableNamespace, MODE_IX);
 
-    uassert(40527,
-            str::stream() << "Unable to persist transaction state because the session transaction "
-                             "collection is missing. This indicates that the "
-                          << NamespaceString::kSessionTransactionsTableNamespace.ns()
-                          << " collection has been manually deleted.",
-            collection.getCollection());
+    uassert(
+        40527,
+        str::stream() << "Unable to persist transaction state because the session transaction "
+                         "collection is missing. This indicates that the "
+                      << NamespaceString::kSessionTransactionsTableNamespace.toStringForErrorMsg()
+                      << " collection has been manually deleted.",
+        collection.getCollection());
 
     WriteUnitOfWork wuow(opCtx);
 
     auto idIndex = collection->getIndexCatalog()->findIdIndex(opCtx);
 
-    uassert(40672,
-            str::stream() << "Failed to fetch _id index for "
-                          << NamespaceString::kSessionTransactionsTableNamespace.ns(),
-            idIndex);
+    uassert(
+        40672,
+        str::stream() << "Failed to fetch _id index for "
+                      << NamespaceString::kSessionTransactionsTableNamespace.toStringForErrorMsg(),
+        idIndex);
 
-    auto indexAccess =
-        collection->getIndexCatalog()->getEntry(idIndex)->accessMethod()->asSortedData();
+    const IndexCatalogEntry* entry = collection->getIndexCatalog()->getEntry(idIndex);
+    auto indexAccess = entry->accessMethod()->asSortedData();
     // Since we are looking up a key inside the _id index, create a key object consisting of only
     // the _id field.
     auto idToFetch = updateRequest.getQuery().firstElement();
     auto toUpdateIdDoc = idToFetch.wrap();
     dassert(idToFetch.fieldNameStringData() == "_id"_sd);
-    auto recordId = indexAccess->findSingle(opCtx, *collection, toUpdateIdDoc);
+    auto recordId = indexAccess->findSingle(opCtx, *collection, entry, toUpdateIdDoc);
     auto startingSnapshotId = opCtx->recoveryUnit()->getSnapshotId();
 
     if (recordId.isNull()) {
@@ -439,11 +453,13 @@ void updateSessionEntry(OperationContext* opCtx,
     auto originalDoc = originalRecordData.toBson();
 
     const auto parentLsidFieldName = SessionTxnRecord::kParentSessionIdFieldName;
-    uassert(5875700,
-            str::stream() << "Cannot modify the '" << parentLsidFieldName << "' field of "
-                          << NamespaceString::kSessionTransactionsTableNamespace << " entries",
-            updateMod.getObjectField(parentLsidFieldName)
-                    .woCompare(originalDoc.getObjectField(parentLsidFieldName)) == 0);
+    uassert(
+        5875700,
+        str::stream() << "Cannot modify the '" << parentLsidFieldName << "' field of "
+                      << NamespaceString::kSessionTransactionsTableNamespace.toStringForErrorMsg()
+                      << " entries",
+        updateMod.getObjectField(parentLsidFieldName)
+                .woCompare(originalDoc.getObjectField(parentLsidFieldName)) == 0);
 
     invariant(collection->getDefaultCollator() == nullptr);
     boost::intrusive_ptr<ExpressionContext> expCtx(
@@ -470,7 +486,8 @@ void updateSessionEntry(OperationContext* opCtx,
                                         Snapshotted<BSONObj>(startingSnapshotId, originalDoc),
                                         updateMod,
                                         collection_internal::kUpdateNoIndexes,
-                                        nullptr,
+                                        nullptr /* indexesAffected */,
+                                        nullptr /* opDebug */,
                                         &args);
 
     wuow.commit();
@@ -545,10 +562,10 @@ void TransactionParticipant::performNoopWrite(OperationContext* opCtx, StringDat
         AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
         uassert(ErrorCodes::NotWritablePrimary,
                 "Not primary when performing noop write for {}"_format(msg),
-                replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
+                replCoord->canAcceptWritesForDatabase(opCtx, DatabaseName::kAdmin));
 
         writeConflictRetry(
-            opCtx, "performNoopWrite", NamespaceString::kRsOplogNamespace.ns(), [&opCtx, &msg] {
+            opCtx, "performNoopWrite", NamespaceString::kRsOplogNamespace, [&opCtx, &msg] {
                 WriteUnitOfWork wuow(opCtx);
                 opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(
                     opCtx, BSON("msg" << msg));
@@ -564,6 +581,13 @@ TransactionParticipant::getOldestActiveTimestamp(Timestamp stableTimestamp) {
     // the server, and it both blocks this thread from querying config.transactions and waits for
     // this thread to terminate.
     auto client = getGlobalServiceContext()->makeClient("OldestActiveTxnTimestamp");
+
+    // TODO(SERVER-74656): Please revisit if this thread could be made killable.
+    {
+        stdx::lock_guard<Client> lk(*client.get());
+        client.get()->setSystemOperationUnkillableByStepdown(lk);
+    }
+
     AlternativeClientRegion acr(client);
 
     try {
@@ -931,7 +955,7 @@ void TransactionParticipant::Participant::beginOrContinue(
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
         uassert(ErrorCodes::NotWritablePrimary,
                 "Not primary so we cannot begin or continue a transaction",
-                replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
+                replCoord->canAcceptWritesForDatabase(opCtx, DatabaseName::kAdmin));
         // Disallow multi-statement transactions on shard servers that have
         // writeConcernMajorityJournalDefault=false unless enableTestCommands=true. But allow
         // retryable writes (autocommit == boost::none).
@@ -1084,10 +1108,6 @@ TransactionParticipant::Participant::onConflictingInternalTransactionCompletion(
 
 void TransactionParticipant::Participant::_setReadSnapshot(OperationContext* opCtx,
                                                            repl::ReadConcernArgs readConcernArgs) {
-    // (Ignore FCV check): This feature flag doesn't have any upgrade/downgrade concerns.
-    bool pitLookupFeatureEnabled =
-        feature_flags::gPointInTimeCatalogLookups.isEnabledAndIgnoreFCVUnsafe();
-
     if (readConcernArgs.getArgsAtClusterTime()) {
         // Read concern code should have already set the timestamp on the recovery unit.
         const auto readTimestamp = readConcernArgs.getArgsAtClusterTime()->asTimestamp();
@@ -1116,42 +1136,25 @@ void TransactionParticipant::Participant::_setReadSnapshot(OperationContext* opC
         // Using 'kNoTimestamp' ensures that transactions with mode 'local' are always able to read
         // writes from earlier transactions with mode 'local' on the same connection.
         opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
-        // Catalog conflicting timestamps must be set on primaries performing transactions.
-        // However, secondaries performing oplog application must avoid setting
-        // _catalogConflictTimestamp. Currently, only oplog application on secondaries can run
-        // inside a transaction, thus `writesAreReplicated` is a suitable proxy to single out
-        // transactions on primaries.
-        if (!pitLookupFeatureEnabled && opCtx->writesAreReplicated()) {
-            // Since this snapshot may reflect oplog holes, record the most visible timestamp before
-            // opening a storage transaction. This timestamp will be used later to detect any
-            // changes in the catalog after a storage transaction is opened.
-            opCtx->recoveryUnit()->setCatalogConflictingTimestamp(
-                opCtx->getServiceContext()->getStorageEngine()->getAllDurableTimestamp());
-        }
     }
 
-
-    if (pitLookupFeatureEnabled) {
-        // Allocate the snapshot together with a consistent CollectionCatalog instance. As we have
-        // no critical section we use optimistic concurrency control and check that there was no
-        // write to the CollectionCatalog while we allocated the storage snapshot. Stash the catalog
-        // instance so collection lookups within this transaction are consistent with the snapshot.
-        auto catalog = CollectionCatalog::get(opCtx);
-        while (true) {
-            opCtx->recoveryUnit()->preallocateSnapshot();
-            auto after = CollectionCatalog::get(opCtx);
-            if (catalog == after) {
-                // Catalog did not change, break out of the retry loop and use this instance
-                break;
-            }
-            // Catalog change detected, reallocate the snapshot and try again.
-            opCtx->recoveryUnit()->abandonSnapshot();
-            catalog = std::move(after);
-        }
-        CollectionCatalog::stash(opCtx, std::move(catalog));
-    } else {
+    // Allocate the snapshot together with a consistent CollectionCatalog instance. As we have no
+    // critical section we use optimistic concurrency control and check that there was no write to
+    // the CollectionCatalog while we allocated the storage snapshot. Stash the catalog instance so
+    // collection lookups within this transaction are consistent with the snapshot.
+    auto catalog = CollectionCatalog::get(opCtx);
+    while (true) {
         opCtx->recoveryUnit()->preallocateSnapshot();
+        auto after = CollectionCatalog::get(opCtx);
+        if (catalog == after) {
+            // Catalog did not change, break out of the retry loop and use this instance
+            break;
+        }
+        // Catalog change detected, reallocate the snapshot and try again.
+        opCtx->recoveryUnit()->abandonSnapshot();
+        catalog = std::move(after);
     }
+    CollectionCatalog::stash(opCtx, std::move(catalog));
 }
 
 TransactionParticipant::OplogSlotReserver::OplogSlotReserver(OperationContext* opCtx,
@@ -1221,8 +1224,8 @@ TransactionParticipant::TxnResources::TxnResources(WithLock wl,
     // On secondaries, we yield the locks for transactions.
     if (stashStyle == StashStyle::kSecondary) {
         _lockSnapshot = std::make_unique<Locker::LockSnapshot>();
-        // Transactions have at least a global IX lock. Invariant that we have something to release.
-        invariant(_locker->releaseWriteUnitOfWorkAndUnlock(_lockSnapshot.get()));
+        // Transactions have at least a global IX lock.
+        _locker->releaseWriteUnitOfWorkAndUnlock(_lockSnapshot.get());
     }
 
     // This thread must still respect the transaction lock timeout, since it can prevent the
@@ -1617,8 +1620,7 @@ Timestamp TransactionParticipant::Participant::prepareTransaction(
             // This shouldn't cause deadlocks with other prepared txns, because the acquisition
             // of RSTL lock inside abortTransaction will be no-op since we already have it.
             // This abortGuard gets dismissed before we release the RSTL while transitioning to
-            // prepared.
-            // TODO (SERVER-71610): Fix to be interruptible or document exception.
+            // the prepared state.
             UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
             abortTransaction(opCtx);
         } catch (...) {
@@ -1650,7 +1652,7 @@ Timestamp TransactionParticipant::Participant::prepareTransaction(
         uassert(ErrorCodes::OperationNotSupportedInTransaction,
                 str::stream() << "prepareTransaction failed because one of the transaction "
                                  "operations was done against a temporary collection '"
-                              << collection->ns() << "'.",
+                              << collection->ns().toStringForErrorMsg() << "'.",
                 !collection->isTemporary());
     }
 
@@ -1872,7 +1874,7 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
     if (opCtx->writesAreReplicated()) {
         uassert(ErrorCodes::NotWritablePrimary,
                 "Not primary so we cannot commit a prepared transaction",
-                replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
+                replCoord->canAcceptWritesForDatabase(opCtx, DatabaseName::kAdmin));
     }
 
     uassert(
@@ -1904,8 +1906,8 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
         // We can no longer uassert without terminating.
         unlockGuard.dismiss();
 
-        // Once entering "committing with prepare" we cannot throw an exception.
-        // TODO (SERVER-71610): Fix to be interruptible or document exception.
+        // Once entering "committing with prepare" we cannot throw an exception,
+        // and therefore our lock acquisitions cannot be interruptible.
         UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
 
         // On secondary, we generate a fake empty oplog slot, since it's not used by opObserver.
@@ -1940,27 +1942,24 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
         invariant(!o().lastWriteOpTime.isNull());
 
         auto commitOplogSlotOpTime = commitOplogEntryOpTime.value_or(commitOplogSlot);
+
+        // If we are a primary committing a transaction that was split into smaller prepared
+        // transactions, cascade the commit.
         auto* splitPrepareManager =
             repl::ReplicationCoordinator::get(opCtx)->getSplitPrepareSessionManager();
         if (opCtx->writesAreReplicated() &&
             splitPrepareManager->isSessionSplit(
                 _sessionId(), o().activeTxnNumberAndRetryCounter.getTxnNumber())) {
-            // If we are a primary committing a transaction that was split into smaller prepared
-            // transactions, use a special commit code path.
-            _commitSplitPreparedTxnOnPrimary(opCtx,
-                                             splitPrepareManager,
-                                             _sessionId(),
-                                             o().activeTxnNumberAndRetryCounter.getTxnNumber(),
-                                             commitTimestamp,
-                                             commitOplogSlot.getTimestamp());
-        } else {
-            // If commitOplogEntryOpTime is a nullopt, then we grab the OpTime from the
-            // commitOplogSlot which will only be set if we are primary. Otherwise, the
-            // commitOplogEntryOpTime must have been passed in during secondary oplog application.
-            opCtx->recoveryUnit()->setCommitTimestamp(commitTimestamp);
-            opCtx->recoveryUnit()->setDurableTimestamp(commitOplogSlotOpTime.getTimestamp());
-            _commitStorageTransaction(opCtx);
+            _commitSplitPreparedTxnOnPrimary(
+                opCtx, splitPrepareManager, commitTimestamp, commitOplogSlot.getTimestamp());
         }
+
+        // If commitOplogEntryOpTime is a nullopt, then we grab the OpTime from commitOplogSlot
+        // which will only be set if we are primary. Otherwise, the commitOplogEntryOpTime must
+        // have been passed in during secondary oplog application.
+        opCtx->recoveryUnit()->setCommitTimestamp(commitTimestamp);
+        opCtx->recoveryUnit()->setDurableTimestamp(commitOplogSlotOpTime.getTimestamp());
+        _commitStorageTransaction(opCtx);
 
         auto opObserver = opCtx->getServiceContext()->getOpObserver();
         invariant(opObserver);
@@ -2009,18 +2008,33 @@ void TransactionParticipant::Participant::_commitStorageTransaction(OperationCon
 void TransactionParticipant::Participant::_commitSplitPreparedTxnOnPrimary(
     OperationContext* userOpCtx,
     repl::SplitPrepareSessionManager* splitPrepareManager,
-    const LogicalSessionId& userSessionId,
-    const TxnNumber& userTxnNumber,
     const Timestamp& commitTimestamp,
     const Timestamp& durableTimestamp) {
+
+    const auto& userSessionId = _sessionId();
+    const auto& userTxnNumber = o().activeTxnNumberAndRetryCounter.getTxnNumber();
 
     for (const auto& sessInfos :
          splitPrepareManager->getSplitSessions(userSessionId, userTxnNumber).get()) {
 
+        if (MONGO_unlikely(hangInCommitSplitPreparedTxnOnPrimary.shouldFail())) {
+            LOGV2(
+                7369500,
+                "transaction - hangInCommitSplitPreparedTxnOnPrimary fail point enabled. Blocking "
+                "until fail point is disabled");
+            hangInCommitSplitPreparedTxnOnPrimary.pauseWhileSet();
+        }
+
         auto splitClientOwned = userOpCtx->getServiceContext()->makeClient("tempSplitClient");
         auto splitOpCtx = splitClientOwned->makeOperationContext();
-        AlternativeClientRegion acr(splitClientOwned);
 
+        // TODO(SERVER-74656): Please revisit if this thread could be made killable.
+        {
+            stdx::lock_guard<Client> lk(*splitClientOwned.get());
+            splitClientOwned.get()->setSystemOperationUnkillableByStepdown(lk);
+        }
+
+        AlternativeClientRegion acr(splitClientOwned);
         std::unique_ptr<MongoDSessionCatalog::Session> checkedOutSession;
 
         repl::UnreplicatedWritesBlock notReplicated(splitOpCtx.get());
@@ -2056,9 +2070,6 @@ void TransactionParticipant::Participant::_commitSplitPreparedTxnOnPrimary(
     }
 
     splitPrepareManager->releaseSplitSessions(userSessionId, userTxnNumber);
-    userOpCtx->recoveryUnit()->setCommitTimestamp(commitTimestamp);
-    userOpCtx->recoveryUnit()->setDurableTimestamp(durableTimestamp);
-    this->_commitStorageTransaction(userOpCtx);
 }
 
 void TransactionParticipant::Participant::_finishCommitTransaction(
@@ -2150,7 +2161,7 @@ void TransactionParticipant::Participant::_abortActivePreparedTransaction(Operat
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
         uassert(ErrorCodes::NotWritablePrimary,
                 "Not primary so we cannot abort a prepared transaction",
-                replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
+                replCoord->canAcceptWritesForDatabase(opCtx, DatabaseName::kAdmin));
     }
 
     _abortActiveTransaction(opCtx, TransactionState::kPrepared);
@@ -2160,17 +2171,11 @@ void TransactionParticipant::Participant::_abortActiveTransaction(
     OperationContext* opCtx, TransactionState::StateSet expectedStates) {
     invariant(!o().txnResourceStash);
 
-    // If this is a split-prepared transaction, cascade the abort.
     auto* splitPrepareManager =
         repl::ReplicationCoordinator::get(opCtx)->getSplitPrepareSessionManager();
-    if (opCtx->writesAreReplicated() &&
+    bool isSplitPreparedTxn = opCtx->writesAreReplicated() &&
         splitPrepareManager->isSessionSplit(_sessionId(),
-                                            o().activeTxnNumberAndRetryCounter.getTxnNumber())) {
-        _abortSplitPreparedTxnOnPrimary(opCtx,
-                                        splitPrepareManager,
-                                        _sessionId(),
-                                        o().activeTxnNumberAndRetryCounter.getTxnNumber());
-    }
+                                            o().activeTxnNumberAndRetryCounter.getTxnNumber());
 
     if (!o().txnState.isInRetryableWriteMode()) {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -2187,6 +2192,12 @@ void TransactionParticipant::Participant::_abortActiveTransaction(
         // causally related to the transaction abort enter the oplog at a timestamp earlier than the
         // abort oplog entry.
         OplogSlotReserver oplogSlotReserver(opCtx);
+
+        // If we are a primary aborting a transaction that was split into smaller prepared
+        // transactions, cascade the abort.
+        if (isSplitPreparedTxn) {
+            _abortSplitPreparedTxnOnPrimary(opCtx, splitPrepareManager);
+        }
 
         // Clean up the transaction resources on the opCtx even if the transaction resources on the
         // session were not aborted. This actually aborts the storage-transaction.
@@ -2224,6 +2235,7 @@ void TransactionParticipant::Participant::_abortActiveTransaction(
         // is not cleaning up some internal TransactionParticipant state, updating metrics, or
         // logging the end of the transaction. That will either be cleaned up in the
         // ServiceEntryPoint's abortGuard or when the next transaction begins.
+        invariant(!isSplitPreparedTxn);
         _cleanUpTxnResourceOnOpCtx(opCtx, TerminationCause::kAborted);
         opObserver->onTransactionAbort(opCtx, boost::none);
         _finishAbortingActiveTransaction(opCtx, expectedStates);
@@ -2231,19 +2243,26 @@ void TransactionParticipant::Participant::_abortActiveTransaction(
 }
 
 void TransactionParticipant::Participant::_abortSplitPreparedTxnOnPrimary(
-    OperationContext* opCtx,
-    repl::SplitPrepareSessionManager* splitPrepareManager,
-    const LogicalSessionId& sessionId,
-    const TxnNumber& txnNumber) {
+    OperationContext* userOpCtx, repl::SplitPrepareSessionManager* splitPrepareManager) {
+
+    const auto& userSessionId = _sessionId();
+    const auto& userTxnNumber = o().activeTxnNumberAndRetryCounter.getTxnNumber();
+
     // If there are split prepared sessions, it must be because this transaction was prepared
     // via an oplog entry applied as a secondary.
     for (const repl::SplitSessionInfo& sessionInfo :
-         splitPrepareManager->getSplitSessions(sessionId, txnNumber).get()) {
+         splitPrepareManager->getSplitSessions(userSessionId, userTxnNumber).get()) {
 
-        auto splitClientOwned = opCtx->getServiceContext()->makeClient("tempSplitClient");
+        auto splitClientOwned = userOpCtx->getServiceContext()->makeClient("tempSplitClient");
         auto splitOpCtx = splitClientOwned->makeOperationContext();
-        AlternativeClientRegion acr(splitClientOwned);
 
+        // TODO(SERVER-74656): Please revisit if this thread could be made killable.
+        {
+            stdx::lock_guard<Client> lk(*splitClientOwned.get());
+            splitClientOwned.get()->setSystemOperationUnkillableByStepdown(lk);
+        }
+
+        AlternativeClientRegion acr(splitClientOwned);
         std::unique_ptr<MongoDSessionCatalog::Session> checkedOutSession;
 
         repl::UnreplicatedWritesBlock notReplicated(splitOpCtx.get());
@@ -2264,7 +2283,7 @@ void TransactionParticipant::Participant::_abortSplitPreparedTxnOnPrimary(
         checkedOutSession->checkIn(splitOpCtx.get(), OperationContextSession::CheckInReason::kDone);
     }
 
-    splitPrepareManager->releaseSplitSessions(_sessionId(),
+    splitPrepareManager->releaseSplitSessions(userSessionId,
                                               o().activeTxnNumberAndRetryCounter.getTxnNumber());
 }
 
@@ -2304,6 +2323,7 @@ void TransactionParticipant::Participant::_abortTransactionOnSession(OperationCo
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
         o(lk).transactionMetricsObserver.onAbort(
+            opCtx,
             ServerTransactionsMetrics::get(opCtx->getServiceContext()),
             tickSource,
             &Top::get(opCtx->getServiceContext()));
@@ -2865,7 +2885,9 @@ void TransactionParticipant::Participant::_setNewTxnNumberAndRetryCounter(
         // Only observe parent sessions because retryable transactions begin the same txnNumber on
         // their parent session.
         OperationContextSession::observeNewTxnNumberStarted(
-            opCtx, _sessionId(), txnNumberAndRetryCounter.getTxnNumber());
+            opCtx,
+            _sessionId(),
+            {txnNumberAndRetryCounter.getTxnNumber(), SessionCatalog::Provenance::kParticipant});
     }
 }
 
@@ -3135,6 +3157,7 @@ void TransactionParticipant::Participant::_refreshActiveTransactionParticipantsF
                                 << parentTxnParticipant._sessionId() << " to be "
                                 << *activeRetryableWriteTxnNumber << " found a "
                                 << NamespaceString::kSessionTransactionsTableNamespace
+                                       .toStringForErrorMsg()
                                 << " entry for an internal transaction for retryable writes with "
                                 << "transaction number " << *childLsid.getTxnNumber(),
                             *childLsid.getTxnNumber() == *activeRetryableWriteTxnNumber);
@@ -3451,8 +3474,7 @@ void TransactionParticipant::Participant::handleWouldChangeOwningShardError(
         invariant(wouldChangeOwningShardInfo->getUuid());
         operation.setNss(*wouldChangeOwningShardInfo->getNs());
         operation.setUuid(*wouldChangeOwningShardInfo->getUuid());
-        ShardingWriteRouter shardingWriteRouter(
-            opCtx, *wouldChangeOwningShardInfo->getNs(), Grid::get(opCtx)->catalogCache());
+        ShardingWriteRouter shardingWriteRouter(opCtx, *wouldChangeOwningShardInfo->getNs());
         operation.setDestinedRecipient(shardingWriteRouter.getReshardingDestinedRecipient(
             wouldChangeOwningShardInfo->getPreImage()));
 
@@ -3515,7 +3537,9 @@ void TransactionParticipant::Participant::_registerUpdateCacheOnCommit(
     onPrimaryTransactionalWrite.execute([&](const BSONObj& data) {
         const auto closeConnectionElem = data["closeConnection"];
         if (closeConnectionElem.eoo() || closeConnectionElem.Bool()) {
-            opCtx->getClient()->session()->end();
+            if (auto session = opCtx->getClient()->session()) {
+                session->end();
+            }
         }
 
         const auto failBeforeCommitExceptionElem = data["failBeforeCommitExceptionCode"];

@@ -91,6 +91,8 @@ struct FastTuple<A, B, C> {
     C c;
 };
 
+struct MakeObjSpec;
+
 using FrameId = int64_t;
 using SpoolId = int64_t;
 
@@ -100,7 +102,6 @@ using IndexKeysInclusionSet = std::bitset<Ordering::kMaxCompoundIndexKeys>;
 
 namespace value {
 class SortSpec;
-struct MakeObjSpec;
 struct CsiCell;
 
 static constexpr size_t kNewUUIDLength = 16;
@@ -315,6 +316,7 @@ std::ostream& operator<<(std::ostream& os, TypeTags tag);
 str::stream& operator<<(str::stream& str, TypeTags tag);
 std::ostream& operator<<(std::ostream& os, const std::pair<TypeTags, Value>& value);
 str::stream& operator<<(str::stream& str, const std::pair<TypeTags, Value>& value);
+std::string print(const std::pair<TypeTags, Value>& value);
 
 /**
  * Three ways value comparison (aka spaceship operator).
@@ -844,6 +846,13 @@ public:
         }
     }
 
+    void pop_back() {
+        if (_vals.size() > 0) {
+            releaseValue(_vals.back().first, _vals.back().second);
+            _vals.pop_back();
+        }
+    }
+
     auto size() const noexcept {
         return _vals.size();
     }
@@ -854,6 +863,17 @@ public:
         }
 
         return _vals[idx];
+    }
+
+    std::pair<TypeTags, Value> swapAt(std::size_t idx, TypeTags tag, Value val) {
+        if (idx >= _vals.size() || tag == TypeTags::Nothing) {
+            return {TypeTags::Nothing, 0};
+        }
+
+        auto ret = _vals[idx];
+        _vals[idx].first = tag;
+        _vals[idx].second = val;
+        return ret;
     }
 
     auto& values() const noexcept {
@@ -949,7 +969,7 @@ private:
     ValueSetType _values;
 };
 
-/*
+/**
  * A vector of values representing a sort key. The values are NOT owned by this object.
  */
 struct SortKeyComponentVector {

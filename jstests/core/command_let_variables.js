@@ -6,13 +6,15 @@
 (function() {
 "use strict";
 
+load("jstests/libs/analyze_plan.js");
 load("jstests/libs/fixture_helpers.js");  // For 'isMongos' and 'isSharded'.
 
 const testDB = db.getSiblingDB("command_let_variables");
 const coll = testDB.command_let_variables;
-const targetColl = testDB.command_let_variables_target;
+coll.drop();
 
-assert.commandWorked(testDB.dropDatabase());
+const isMongos = FixtureHelpers.isMongos(testDB);
+const isCollSharded = FixtureHelpers.isSharded(coll);
 
 const testDocs = [
     {
@@ -82,7 +84,20 @@ expectedResults = [
 assert.eq(coll.aggregate(pipeline, {let : {target_trend: "weak decline"}}).toArray(),
           expectedResults);
 
-if (!FixtureHelpers.isMongos(testDB)) {
+// Test that running explain on the agg command works as expected.
+let explain = assert.commandWorked(testDB.runCommand({
+    explain:
+        {aggregate: coll.getName(), pipeline, let : {target_trend: "weak decline"}, cursor: {}},
+    verbosity: "executionStats"
+}));
+if (!isMongos) {
+    assert(explain.hasOwnProperty("stages"), explain);
+    assert.neq(explain.stages.length, 0, explain);
+    let lastStage = explain.stages[explain.stages.length - 1];
+    assert.eq(lastStage.nReturned, 2, explain);
+}
+
+if (!isMongos) {
     // Test that if runtimeConstants and let are both specified, both will coexist.
     // Runtime constants are not allowed on mongos passthroughs.
     let constants = {
@@ -262,9 +277,23 @@ expectedResults = {
 assert.eq(result.length, 1);
 assert.eq(expectedResults, result[0]);
 
-// Delete tests with let params will delete a record, assert that a point-wise find yields an empty
-// result, and then restore the collection state for further tests down the line. We can't exercise
-// a multi-delete here (limit: 0) because of failures in sharded txn passthrough tests.
+// Test that let parameters work as expected when the find is run as an explain.
+explain = assert.commandWorked(testDB.runCommand({
+    explain: {
+        find: coll.getName(),
+        let : {target_species: "Song Thrush (Turdus philomelos)"},
+        filter: {$expr: {$eq: ["$Species", "$$target_species"]}},
+        projection: {_id: 0}
+    },
+    verbosity: "executionStats"
+}));
+if (!isMongos) {
+    assert.eq(explain.executionStats.nReturned, 1, explain);
+}
+
+// Delete tests with let params will delete a record, assert that a point-wise find yields an
+// empty result, and then restore the collection state for further tests down the line. We can't
+// exercise a multi-delete here (limit: 0) because of failures in sharded txn passthrough tests.
 assert.commandWorked(testDB.runCommand({
     delete: coll.getName(),
     let : {target_species: "Song Thrush (Turdus philomelos)"},
@@ -277,8 +306,24 @@ result = assert
              .cursor.firstBatch;
 assert.eq(result.length, 0);
 
-// Test that the .remove() shell helper supports let parameters.
 assert.commandWorked(coll.insert({_id: 4, Species: "bird_to_remove"}));
+
+// Test that explain of a delete command works as expected with 'let' parameters.
+explain = assert.commandWorked(testDB.runCommand({
+    explain: {
+        delete: coll.getName(),
+        let : {target_species: "bird_to_remove"},
+        deletes:
+            [{q: {$and: [{_id: 4}, {$expr: {$eq: ["$Species", "$$target_species"]}}]}, limit: 1}]
+    },
+    verbosity: "executionStats"
+}));
+if (!isMongos) {
+    let deleteStage = getPlanStage(explain.executionStats.executionStages, "DELETE");
+    assert.eq(deleteStage.nWouldDelete, 1, explain);
+}
+
+// Test that the .remove() shell helper supports let parameters.
 result = assert.commandWorked(
     coll.remove({$and: [{_id: 4}, {$expr: {$eq: ["$Species", "$$target_species"]}}]},
                 {justOne: true, let : {target_species: "bird_to_remove"}}));
@@ -333,30 +378,49 @@ assert.commandWorked(testDB.runCommand({
     cursor: {}
 }));
 
-// Test that findAndModify works correctly with let parameter arguments.
 assert.commandWorked(coll.insert({_id: 5, Species: "spy_bird"}));
-result = testDB.runCommand({
+
+// Test that explain of findAndModify works correctly with let parameters.
+explain = assert.commandWorked(testDB.runCommand({
+    explain: {
+        findAndModify: coll.getName(),
+        let : {target_species: "spy_bird"},
+        // Querying on _id field for sharded collection passthroughs.
+        query: {$and: [{_id: 5}, {$expr: {$eq: ["$Species", "$$target_species"]}}]},
+        update: {Species: "questionable_bird"},
+        new: true
+    },
+    verbosity: "executionStats"
+}));
+if (!isMongos) {
+    let updateStage = getPlanStage(explain.executionStats.executionStages, "UPDATE");
+    assert.eq(updateStage.nMatched, 1, explain);
+    assert.eq(updateStage.nWouldModify, 1, explain);
+}
+
+// Test that findAndModify works correctly with let parameter arguments.
+result = assert.commandWorked(testDB.runCommand({
     findAndModify: coll.getName(),
     let : {target_species: "spy_bird"},
     // Querying on _id field for sharded collection passthroughs.
     query: {$and: [{_id: 5}, {$expr: {$eq: ["$Species", "$$target_species"]}}]},
     update: {Species: "questionable_bird"},
     new: true
-});
+}));
 expectedResults = {
     _id: 5,
     Species: "questionable_bird"
 };
 assert.eq(expectedResults, result.value, result);
 
-result = testDB.runCommand({
+result = assert.commandWorked(testDB.runCommand({
     findAndModify: coll.getName(),
     let : {species_name: "not_a_bird", realSpecies: "dino"},
     // Querying on _id field for sharded collection passthroughs.
     query: {$and: [{_id: 5}, {$expr: {$eq: ["$Species", "questionable_bird"]}}]},
     update: [{$project: {Species: "$$species_name"}}, {$addFields: {suspect: "$$realSpecies"}}],
     new: true
-});
+}));
 expectedResults = {
     _id: 5,
     Species: "not_a_bird",
@@ -364,12 +428,31 @@ expectedResults = {
 };
 assert.eq(expectedResults, result.value, result);
 
+// Test that explain of update works correctly with let parameters.
+explain = assert.commandWorked(testDB.runCommand({
+    explain: {
+        update: coll.getName(),
+        updates: [{
+            q: {_id: 3, $expr: {$eq: ["$Species", "$$target_species"]}},
+            u: [{$set: {Species: "$$new_name"}}],
+        }],
+        let : {target_species: "Chaffinch (Fringilla coelebs)", new_name: "Chaffinch"}
+    },
+    verbosity: "executionStats"
+}));
+if (!isMongos) {
+    let updateStage = getPlanStage(explain.executionStats.executionStages, "UPDATE");
+    assert.eq(updateStage.nMatched, 1, explain);
+    assert.eq(updateStage.nWouldModify, 1, explain);
+}
+
 // Test that update respects different parameters in both the query and update part.
 result = assert.commandWorked(testDB.runCommand({
     update: coll.getName(),
-    updates: [
-        {q: {$expr: {$eq: ["$Species", "$$target_species"]}}, u: [{$set: {Species: "$$new_name"}}]}
-    ],
+    updates: [{
+        q: {_id: 3, $expr: {$eq: ["$Species", "$$target_species"]}},
+        u: [{$set: {Species: "$$new_name"}}],
+    }],
     let : {target_species: "Chaffinch (Fringilla coelebs)", new_name: "Chaffinch"}
 }));
 assert.eq(result.n, 1);
@@ -387,8 +470,8 @@ assert.eq(result.cursor.firstBatch.length, 1);
 result = assert.commandWorked(testDB.runCommand({
     update: coll.getName(),
     updates: [{
-        q: {$expr: {$eq: ["$Species", "$$target_species"]}},
-        u: [{$set: {Timestamp: "$$NOW"}}, {$set: {Species: "$$new_name"}}]
+        q: {_id: 3, $expr: {$eq: ["$Species", "$$target_species"]}},
+        u: [{$set: {Timestamp: "$$NOW"}}, {$set: {Species: "$$new_name"}}],
     }],
     let : {target_species: "Chaffinch", new_name: "Pied Piper"}
 }));
@@ -402,6 +485,12 @@ assert.eq(result.cursor.firstBatch.length, 0, result);
 result = assert.commandWorked(
     testDB.runCommand({find: coll.getName(), filter: {$expr: {$eq: ["$Species", "Pied Piper"]}}}));
 assert.eq(result.cursor.firstBatch.length, 1, result);
+
+// This forces a multi-statement transaction to commit if this test is running in one of the
+// multi-statement transaction passthrough suites. We need to do this to ensure the updates
+// above commit before running an update that will fail, as the failed update aborts the entire
+// transaction and rolls back the updates above.
+assert.commandWorked(testDB.runCommand({ping: 1}));
 
 // Test that undefined let params in the update's query part fail gracefully.
 assert.commandFailedWithCode(testDB.runCommand({
@@ -418,8 +507,8 @@ assert.commandFailedWithCode(testDB.runCommand({
 assert.commandFailedWithCode(testDB.runCommand({
     update: coll.getName(),
     updates: [{
-        q: {$expr: {$eq: ["$Species", "Chaffinch (Fringilla coelebs)"]}},
-        u: [{$set: {Species: "$$new_name"}}]
+        q: {_id: 3, $expr: {$eq: ["$Species", "Chaffinch (Fringilla coelebs)"]}},
+        u: [{$set: {Species: "$$new_name"}}],
     }],
     let : {cat: "not_a_bird"}
 }),
@@ -427,7 +516,7 @@ assert.commandFailedWithCode(testDB.runCommand({
 
 // Test that the .update() shell helper supports let parameters.
 result = assert.commandWorked(
-    coll.update({$expr: {$eq: ["$Species", "$$target_species"]}},
+    coll.update({_id: 3, $expr: {$eq: ["$Species", "$$target_species"]}},
                 [{$set: {Species: "$$new_name"}}],
                 {let : {target_species: "Pied Piper", new_name: "Chaffinch"}}));
 assert.eq(result.nMatched, 1);
@@ -519,7 +608,10 @@ assert.between(0, result, 1);
 }
 
 // Test that the expressions are evaluated once up front.
-{
+//
+// TODO SERVER-75927: This does not work as expected when the collection is sharded. Once the bug
+// is fixed, we should re-enable this test case when the collection is sharded.
+if (!isCollSharded) {
     const values = assert
                        .commandWorked(testDB.runCommand({
                            find: coll.getName(),

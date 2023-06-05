@@ -491,8 +491,19 @@ void statsToBSON(const PlanStageStats& stats,
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("nBucketsUnpacked", static_cast<long long>(spec->nBucketsUnpacked));
-            bob->appendNumber("nMeasurementsDeleted",
-                              static_cast<long long>(spec->nMeasurementsDeleted));
+
+            bool isUpdate = spec->opType.starts_with("update");
+            if (isUpdate) {
+                bob->appendNumber("nMeasurementsMatched",
+                                  static_cast<long long>(spec->nMeasurementsMatched));
+                bob->appendNumber("nMeasurementsUpdated",
+                                  static_cast<long long>(spec->nMeasurementsModified));
+                bob->appendNumber("nMeasurementsUpserted",
+                                  static_cast<long long>(spec->nMeasurementsUpserted));
+            } else {
+                bob->appendNumber("nMeasurementsDeleted",
+                                  static_cast<long long>(spec->nMeasurementsModified));
+            }
         }
     } else if (STAGE_UNPACK_TIMESERIES_BUCKET == stats.stageType) {
         UnpackTimeseriesBucketStats* spec =
@@ -511,10 +522,16 @@ void statsToBSON(const PlanStageStats& stats,
         }
     } else if (STAGE_SPOOL == stats.stageType) {
         SpoolStats* spec = static_cast<SpoolStats*>(stats.specific.get());
+        bob->appendNumber("memLimit", static_cast<long long>(spec->maxMemoryUsageBytes));
+        bob->appendNumber("diskLimit", static_cast<long long>(spec->maxDiskUsageBytes));
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("totalDataSizeSpooled",
                               static_cast<long long>(spec->totalDataSizeBytes));
+            bob->appendBool("usedDisk", (spec->spills > 0));
+            bob->appendNumber("spills", static_cast<long long>(spec->spills));
+            bob->appendNumber("spilledDataStorageSize",
+                              static_cast<long long>(spec->spilledDataStorageSize));
         }
     }
 
@@ -823,22 +840,6 @@ std::vector<PlanExplainer::PlanStatsDetails> PlanExplainerImpl::getRejectedPlans
     return res;
 }
 
-std::vector<PlanExplainer::PlanStatsDetails> PlanExplainerImpl::getCachedPlanStats(
-    const plan_cache_debug_info::DebugInfo& debugInfo, ExplainOptions::Verbosity verbosity) const {
-    const auto& decision = *debugInfo.decision;
-    std::vector<PlanStatsDetails> res;
-    auto winningPlanIdx = getWinningPlanIdx(_root);
-
-    for (auto&& stats : decision.getStats<PlanStageStats>().candidatePlanStats) {
-        BSONObjBuilder bob;
-        statsToBSON(*stats, verbosity, winningPlanIdx, &bob, &bob);
-        res.push_back({bob.obj(),
-                       {verbosity >= ExplainOptions::Verbosity::kExecStats,
-                        collectExecutionStatsSummary(stats.get(), winningPlanIdx)}});
-    }
-    return res;
-}
-
 PlanStage* getStageByType(PlanStage* root, StageType type) {
     tassert(3420010, "Can't find a stage in a NULL plan root", root != nullptr);
     if (root->stageType() == type) {
@@ -854,5 +855,21 @@ PlanStage* getStageByType(PlanStage* root, StageType type) {
     }
 
     return nullptr;
+}
+
+std::vector<PlanExplainer::PlanStatsDetails> getCachedPlanStats(
+    const plan_cache_debug_info::DebugInfo& debugInfo, ExplainOptions::Verbosity verbosity) {
+    const auto& decision = *debugInfo.decision;
+    std::vector<PlanExplainer::PlanStatsDetails> res;
+    auto winningPlanIdx = getWinningPlanIdx(nullptr);
+
+    for (auto&& stats : decision.getStats<PlanStageStats>().candidatePlanStats) {
+        BSONObjBuilder bob;
+        statsToBSON(*stats, verbosity, winningPlanIdx, &bob, &bob);
+        res.push_back({bob.obj(),
+                       {verbosity >= ExplainOptions::Verbosity::kExecStats,
+                        collectExecutionStatsSummary(stats.get(), winningPlanIdx)}});
+    }
+    return res;
 }
 }  // namespace mongo

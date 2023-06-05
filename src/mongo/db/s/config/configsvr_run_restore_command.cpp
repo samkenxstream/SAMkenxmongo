@@ -35,9 +35,11 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/s/config/known_collections.h"
 #include "mongo/logv2/log.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/testing_proctor.h"
 #include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
@@ -86,9 +88,10 @@ ShouldRestoreDocument shouldRestoreDocument(OperationContext* opCtx,
                 (void)UUID::parse(doc);
             } catch (const AssertionException&) {
                 uasserted(ErrorCodes::BadValue,
-                          str::stream() << "The uuid field of '" << doc.toString() << "' in '"
-                                        << NamespaceString::kConfigsvrRestoreNamespace.toString()
-                                        << "' needs to be of type UUID");
+                          str::stream()
+                              << "The uuid field of '" << doc.toString() << "' in '"
+                              << NamespaceString::kConfigsvrRestoreNamespace.toStringForErrorMsg()
+                              << "' needs to be of type UUID");
             }
         }
     }
@@ -181,10 +184,31 @@ public:
             // this command.
             CollectionPtr restoreColl(CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
                 opCtx, NamespaceString::kConfigsvrRestoreNamespace));
-            uassert(ErrorCodes::NamespaceNotFound,
-                    str::stream() << "Collection " << NamespaceString::kConfigsvrRestoreNamespace
-                                  << " is missing",
-                    restoreColl);
+            uassert(
+                ErrorCodes::NamespaceNotFound,
+                str::stream() << "Collection "
+                              << NamespaceString::kConfigsvrRestoreNamespace.toStringForErrorMsg()
+                              << " is missing",
+                restoreColl);
+        }
+
+        DBDirectClient client(opCtx);
+
+        if (TestingProctor::instance().isEnabled()) {
+            // All collections in the config server must be defined in kConfigCollections.
+            // Collections to restore should be defined in kCollectionEntries.
+            auto collInfos =
+                client.getCollectionInfos(DatabaseNameUtil::deserialize(boost::none, "config"));
+            for (auto&& info : collInfos) {
+                StringData collName = info.getStringField("name");
+                // Ignore cache collections as they will be dropped later in the restore procedure.
+                if (kConfigCollections.find(collName) == kConfigCollections.end() &&
+                    !collName.startsWith("cache")) {
+                    LOGV2_FATAL(6863300,
+                                "Identified unknown collection in config server.",
+                                "collName"_attr = collName);
+                }
+            }
         }
 
         for (const auto& collectionEntry : kCollectionEntries) {
@@ -201,7 +225,6 @@ public:
                 continue;
             }
 
-            DBDirectClient client(opCtx);
             auto findRequest = FindCommandRequest(nss);
             auto cursor = client.find(findRequest);
 

@@ -5,6 +5,8 @@
  * parameter's valid bounds.
  */
 
+load("jstests/libs/optimizer_utils.js");  // For checkCascadesOptimizerEnabled
+
 (function() {
 "use strict";
 
@@ -63,6 +65,8 @@ const expectedParamDefaults = {
     internalQueryColumnScanMinAvgDocSizeBytes: 1024,
     internalQueryColumnScanMinCollectionSizeBytes: -1,
     internalQueryColumnScanMinNumColumnFilters: 3,
+    internalQueryMaxSpoolMemoryUsageBytes: 100 * 1024 * 1024,
+    internalQueryMaxSpoolDiskUsageBytes: 10 * 100 * 1024 * 1024,
 };
 
 function assertDefaultParameterValues() {
@@ -254,10 +258,18 @@ assertSetParameterSucceeds("allowDiskUseByDefault", true);
 assertSetParameterSucceeds("internalQueryFLERewriteMemoryLimit", 14 * 1024 * 1024);
 assertSetParameterFails("internalQueryFLERewriteMemoryLimit", 0);
 
+// Need to have the CQF feature flag enabled in order to set tryBonsai or forceBonsai.
 assertSetParameterSucceeds("internalQueryFrameworkControl", "forceClassicEngine");
 assertSetParameterSucceeds("internalQueryFrameworkControl", "trySbeEngine");
-assertSetParameterSucceeds("internalQueryFrameworkControl", "tryBonsai");
-assertSetParameterSucceeds("internalQueryFrameworkControl", "forceBonsai");
+if (checkCascadesOptimizerEnabled(testDB)) {
+    assertSetParameterSucceeds("internalQueryFrameworkControl", "tryBonsai");
+    assertSetParameterSucceeds("internalQueryFrameworkControl", "forceBonsai");
+} else {
+    assert.commandFailed(
+        testDB.adminCommand({setParameter: 1, internalQueryFrameworkControl: "tryBonsai"}));
+    assert.commandFailed(
+        testDB.adminCommand({setParameter: 1, internalQueryFrameworkControl: "forceBonsai"}));
+}
 assertSetParameterFails("internalQueryFrameworkControl", "tryCascades");
 assertSetParameterFails("internalQueryFrameworkControl", 1);
 
@@ -272,6 +284,14 @@ assertSetParameterFails("internalQueryColumnScanMinCollectionSizeBytes", -2);
 assertSetParameterSucceeds("internalQueryColumnScanMinNumColumnFilters", 100);
 assertSetParameterSucceeds("internalQueryColumnScanMinNumColumnFilters", 0);
 assertSetParameterFails("internalQueryColumnScanMinNumColumnFilters", -1);
+
+assertSetParameterSucceeds("internalQueryMaxSpoolMemoryUsageBytes", 100);
+assertSetParameterSucceeds("internalQueryMaxSpoolMemoryUsageBytes", 1);
+assertSetParameterFails("internalQueryMaxSpoolMemoryUsageBytes", 0);
+
+assertSetParameterSucceeds("internalQueryMaxSpoolDiskUsageBytes", 100);
+assertSetParameterSucceeds("internalQueryMaxSpoolDiskUsageBytes", 1);
+assertSetParameterFails("internalQueryMaxSpoolDiskUsageBytes", 0);
 
 MongoRunner.stopMongod(conn);
 })();

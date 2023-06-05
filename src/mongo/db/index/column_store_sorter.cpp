@@ -270,7 +270,7 @@ ColumnStoreSorter::persistDataForShutdown() {
                    std::back_inserter(ranges),
                    [](const auto it) { return it->getRange(); });
 
-    return {_spillFile->path().filename().string(), ranges};
+    return {_spillFile->path().filename().string(), std::move(ranges)};
 }
 
 /**
@@ -316,9 +316,17 @@ public:
         return {key, contents};
     }
 
-    const std::pair<Key, Value>& current() final {
+    Key nextWithDeferredValue() override {
+        MONGO_UNREACHABLE;
+    }
+
+    Value getDeferredValue() override {
+        MONGO_UNREACHABLE;
+    }
+
+    const Key& current() final {
         tasserted(ErrorCodes::NotImplemented,
-                  "current() not implemented for ColumnStoreSorter::Iterator");
+                  "current() not implemented for ColumnStoreSorter::InMemoryIterator");
     }
 
     void openSource() final {}

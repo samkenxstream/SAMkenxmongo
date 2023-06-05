@@ -75,7 +75,7 @@ namespace {
  * Utility class for recording permitted transitions between feature compatibility versions and
  * their on-disk representation as FeatureCompatibilityVersionDocument objects.
  */
-// TODO SERVER-65269: Add back 'const' qualifier to FCVTransitions class declaration
+// TODO (SERVER-74847): Add back 'const' qualifier to FCVTransitions class declaration
 class FCVTransitions {
 public:
     FCVTransitions() {
@@ -132,28 +132,17 @@ public:
             _transitions[{GenericFCV::kDowngradingFromLatestToLastLTS,
                           GenericFCV::kLastLTS,
                           isFromConfigServer}] = GenericFCV::kLastLTS;
+
+            // Add transition from downgrading -> upgrading.
+            _transitions[{GenericFCV::kDowngradingFromLatestToLastLTS,
+                          GenericFCV::kLatest,
+                          isFromConfigServer}] = GenericFCV::kUpgradingFromLastLTSToLatest;
         }
         _fcvDocuments[GenericFCV::kDowngradingFromLatestToLastLTS] =
             makeFCVDoc(GenericFCV::kLastLTS /* effective */,
                        GenericFCV::kLastLTS /* target */,
                        GenericFCV::kLatest /* previous */
             );
-    }
-
-    /**
-     * If feature flag gDowngradingToUpgrading is enabled,
-     * we add the new downgrading->upgrading->latest path.
-     */
-    void featureFlaggedAddNewTransitionState() {
-        // (Ignore FCV check): This is intentional because we want to use this feature even if we
-        // are in downgrading fcv state.
-        if (repl::feature_flags::gDowngradingToUpgrading.isEnabledAndIgnoreFCVUnsafe()) {
-            for (auto&& isFromConfigServer : {false, true}) {
-                _transitions[{GenericFCV::kDowngradingFromLatestToLastLTS,
-                              GenericFCV::kLatest,
-                              isFromConfigServer}] = GenericFCV::kUpgradingFromLastLTSToLatest;
-            }
-        }
     }
 
     // TODO (SERVER-74847): Remove this transition once we remove testing around
@@ -306,18 +295,13 @@ void FeatureCompatibilityVersion::validateSetFeatureCompatibilityVersionRequest(
     auto fcvDoc = FeatureCompatibilityVersionDocument::parse(
         IDLParserContext("featureCompatibilityVersionDocument"), fcvObj.value());
 
-    // (Ignore FCV check): This is intentional because we want to use this feature even if we are in
-    // downgrading fcv state.
-    if (repl::feature_flags::gDowngradingToUpgrading.isEnabledAndIgnoreFCVUnsafe()) {
-        auto isCleaningServerMetadata = fcvDoc.getIsCleaningServerMetadata();
-        uassert(
-            7428200,
+    auto isCleaningServerMetadata = fcvDoc.getIsCleaningServerMetadata();
+    uassert(7428200,
             "Cannot upgrade featureCompatibilityVersion if a previous FCV downgrade stopped in the "
             "middle of cleaning up internal server metadata. Retry the FCV downgrade until it "
             "succeeds before attempting to upgrade the FCV.",
             !(newVersion > fromVersion &&
               (isCleaningServerMetadata.is_initialized() && *isCleaningServerMetadata)));
-    }
 
     auto setFCVPhase = setFCVRequest.getPhase();
     if (!isFromConfigServer || !setFCVPhase) {
@@ -373,13 +357,10 @@ void FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
 
     // Only transition to fully upgraded or downgraded states when we have completed all required
     // upgrade/downgrade behavior, unless it is the newly added downgrading to upgrading path.
-    // (Ignore FCV check): This is intentional because we want to use this feature even if we are in
-    // downgrading fcv state.
     auto transitioningVersion = setTargetVersion &&
             serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading(fromVersion) &&
-            !(repl::feature_flags::gDowngradingToUpgrading.isEnabledAndIgnoreFCVUnsafe() &&
-              (fromVersion == GenericFCV::kDowngradingFromLatestToLastLTS &&
-               newVersion == GenericFCV::kLatest))
+            !(fromVersion == GenericFCV::kDowngradingFromLatestToLastLTS &&
+              newVersion == GenericFCV::kLatest)
         ? fromVersion
         : fcvTransitions.getTransitionalVersion(fromVersion, newVersion, isFromConfigServer);
 
@@ -389,50 +370,52 @@ void FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
 
     newFCVDoc.setChangeTimestamp(changeTimestamp);
 
-    // (Ignore FCV check): This is intentional because we want to use this feature even if we are in
-    // downgrading fcv state.
-    if (repl::feature_flags::gDowngradingToUpgrading.isEnabledAndIgnoreFCVUnsafe()) {
-        // The setIsCleaningServerMetadata parameter can either be true, false, or boost::none.
-        // True indicates we want to set the isCleaningServerMetadata FCV document field to true.
-        // False indicates we want to remove the isCleaningServerMetadata FCV document field.
-        // boost::none indicates that we don't want to change the current value of the
-        // isCleaningServerMetadata field.
-        if (setIsCleaningServerMetadata.is_initialized()) {
-            // True case: set isCleaningServerMetadata doc field to true.
-            if (*setIsCleaningServerMetadata) {
-                newFCVDoc.setIsCleaningServerMetadata(true);
-            }
-            // Else, false case: don't set the isCleaningServerMetadata field in newFCVDoc. This is
-            // because runUpdateCommand overrides the current whole FCV document with what is in
-            // newFCVDoc so not setting the field is effectively removing it.
-        } else {
-            // boost::none case:
-            // If we don't want to update the isCleaningServerMetadata, we need to make sure not to
-            // override the existing field if it exists, so get the current isCleaningServerMetadata
-            // field value from the current FCV document and set it in newFCVDoc.
-            // This is to protect against the case where a previous FCV downgrade failed
-            // in the isCleaningServerMetadata phase, and the user runs setFCV again. In that
-            // case we do not want to remove the existing isCleaningServerMetadata FCV doc field
-            // because it would not be safe to upgrade the FCV.
-            auto currentFCVObj = findFeatureCompatibilityVersionDocument(opCtx);
-            auto currentFCVDoc = FeatureCompatibilityVersionDocument::parse(
-                IDLParserContext("featureCompatibilityVersionDocument"), currentFCVObj.value());
+    // The setIsCleaningServerMetadata parameter can either be true, false, or boost::none.
+    // True indicates we want to set the isCleaningServerMetadata FCV document field to true.
+    // False indicates we want to remove the isCleaningServerMetadata FCV document field.
+    // boost::none indicates that we don't want to change the current value of the
+    // isCleaningServerMetadata field.
+    if (setIsCleaningServerMetadata.is_initialized()) {
+        // True case: set isCleaningServerMetadata doc field to true.
+        if (*setIsCleaningServerMetadata) {
+            newFCVDoc.setIsCleaningServerMetadata(true);
+        }
+        // Else, false case: don't set the isCleaningServerMetadata field in newFCVDoc. This is
+        // because runUpdateCommand overrides the current whole FCV document with what is in
+        // newFCVDoc so not setting the field is effectively removing it.
+    } else {
+        // boost::none case:
+        // If we don't want to update the isCleaningServerMetadata, we need to make sure not to
+        // override the existing field if it exists, so get the current isCleaningServerMetadata
+        // field value from the current FCV document and set it in newFCVDoc.
+        // This is to protect against the case where a previous FCV downgrade failed
+        // in the isCleaningServerMetadata phase, and the user runs setFCV again. In that
+        // case we do not want to remove the existing isCleaningServerMetadata FCV doc field
+        // because it would not be safe to upgrade the FCV.
+        auto currentFCVObj = findFeatureCompatibilityVersionDocument(opCtx);
+        auto currentFCVDoc = FeatureCompatibilityVersionDocument::parse(
+            IDLParserContext("featureCompatibilityVersionDocument"), currentFCVObj.value());
 
-            auto currentIsCleaningServerMetadata = currentFCVDoc.getIsCleaningServerMetadata();
-            if (currentIsCleaningServerMetadata.is_initialized() &&
-                *currentIsCleaningServerMetadata) {
-                newFCVDoc.setIsCleaningServerMetadata(*currentIsCleaningServerMetadata);
-            }
+        auto currentIsCleaningServerMetadata = currentFCVDoc.getIsCleaningServerMetadata();
+        if (currentIsCleaningServerMetadata.is_initialized() && *currentIsCleaningServerMetadata) {
+            newFCVDoc.setIsCleaningServerMetadata(*currentIsCleaningServerMetadata);
         }
     }
+
     // Replace the current FCV document with newFCVDoc.
     runUpdateCommand(opCtx, newFCVDoc);
 }
 
 void FeatureCompatibilityVersion::setIfCleanStartup(OperationContext* opCtx,
                                                     repl::StorageInterface* storageInterface) {
-    if (!hasNoReplicatedCollections(opCtx))
+    if (!hasNoReplicatedCollections(opCtx)) {
+        if (!gDefaultStartupFCV.empty()) {
+            LOGV2(7557701,
+                  "Ignoring the provided defaultStartupFCV parameter since the FCV already exists");
+        }
         return;
+    }
+
 
     // If the server was not started with --shardsvr, the default featureCompatibilityVersion on
     // clean startup is the upgrade version. If it was started with --shardsvr, the default
@@ -450,11 +433,34 @@ void FeatureCompatibilityVersion::setIfCleanStartup(OperationContext* opCtx,
         uassertStatusOK(storageInterface->createCollection(opCtx, nss, options));
     }
 
+    // Set FCV to lastLTS for nodes started with --shardsvr. If an FCV was specified at startup
+    // through a startup parameter, set it to that FCV. Otherwise, set it to latest.
     FeatureCompatibilityVersionDocument fcvDoc;
-    if (storeUpgradeVersion) {
-        fcvDoc.setVersion(GenericFCV::kLatest);
-    } else {
+    if (!storeUpgradeVersion) {
         fcvDoc.setVersion(GenericFCV::kLastLTS);
+    } else if (!gDefaultStartupFCV.empty()) {
+        StringData versionString = StringData(gDefaultStartupFCV);
+        FCV parsedVersion;
+
+        if (versionString == multiversion::toString(GenericFCV::kLastLTS)) {
+            parsedVersion = GenericFCV::kLastLTS;
+        } else if (versionString == multiversion::toString(GenericFCV::kLastContinuous)) {
+            parsedVersion = GenericFCV::kLastContinuous;
+        } else if (versionString == multiversion::toString(GenericFCV::kLatest)) {
+            parsedVersion = GenericFCV::kLatest;
+        } else {
+            parsedVersion = GenericFCV::kLatest;
+            LOGV2_WARNING_OPTIONS(7557700,
+                                  {logv2::LogTag::kStartupWarnings},
+                                  "The provided 'defaultStartupFCV' is not a valid FCV. Setting "
+                                  "the FCV to the latest FCV instead",
+                                  "defaultStartupFCV"_attr = versionString,
+                                  "latestFCV"_attr = multiversion::toString(GenericFCV::kLatest));
+        }
+
+        fcvDoc.setVersion(parsedVersion);
+    } else {
+        fcvDoc.setVersion(GenericFCV::kLatest);
     }
 
     // We then insert the featureCompatibilityVersion document into the server configuration
@@ -485,6 +491,13 @@ bool FeatureCompatibilityVersion::hasNoReplicatedCollections(OperationContext* o
 void FeatureCompatibilityVersion::updateMinWireVersion() {
     WireSpec& wireSpec = WireSpec::instance();
     const auto currentFcv = serverGlobalParams.featureCompatibility.getVersion();
+    // The reason we set the minWireVersion to LATEST_WIRE_VERSION when downgrading from latest as
+    // well as on upgrading to latest is because we shouldn’t decrease the minWireVersion until we
+    // have fully downgraded to the lower FCV in case we get any backwards compatibility breakages,
+    // since during `kDowngradingFrom_X_to_Y` we may still be stopping/cleaning up any features from
+    // the upgraded FCV. In essence, a node with the upgraded FCV/binary should not be able to
+    // communicate with downgraded binary nodes until the FCV is completely downgraded to
+    // `kVersion_Y`.
     if (currentFcv == GenericFCV::kLatest ||
         (serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading() &&
          currentFcv != GenericFCV::kUpgradingFromLastLTSToLastContinuous)) {
@@ -572,10 +585,6 @@ void FeatureCompatibilityVersion::fassertInitializedAfterStartup(OperationContex
     }
 
     auto fcvDocument = findFeatureCompatibilityVersionDocument(opCtx);
-
-    // TODO SERVER-65269: Move downgrading->upgrading transition back to FCVTransitions
-    // constructor. Adding the new fcv downgrading -> upgrading path
-    fcvTransitions.featureFlaggedAddNewTransitionState();
 
     auto const storageEngine = opCtx->getServiceContext()->getStorageEngine();
     auto dbNames = storageEngine->listDatabases();

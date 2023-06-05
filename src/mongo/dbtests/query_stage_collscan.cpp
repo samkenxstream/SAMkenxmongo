@@ -68,7 +68,7 @@ static const NamespaceString kNss{"unittests.QueryStageCollectionScan"};
 class QueryStageCollectionScanTest : public unittest::Test {
 public:
     QueryStageCollectionScanTest() : _client(&_opCtx) {
-        dbtests::WriteContextForTests ctx(&_opCtx, kNss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, kNss.ns_forTest());
 
         for (int i = 0; i < numObj(); ++i) {
             BSONObjBuilder bob;
@@ -78,7 +78,7 @@ public:
     }
 
     virtual ~QueryStageCollectionScanTest() {
-        dbtests::WriteContextForTests ctx(&_opCtx, kNss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, kNss.ns_forTest());
         _client.dropCollection(kNss);
     }
 
@@ -97,7 +97,7 @@ public:
         // Make the filter.
         StatusWithMatchExpression statusWithMatcher =
             MatchExpressionParser::parse(filterObj, _expCtx);
-        verify(statusWithMatcher.isOK());
+        MONGO_verify(statusWithMatcher.isOK());
         std::unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
 
         // Make a scan and have the runner own it.
@@ -141,7 +141,7 @@ public:
             PlanStage::StageState state = scan->work(&id);
             if (PlanStage::ADVANCED == state) {
                 WorkingSetMember* member = ws.get(id);
-                verify(member->hasRecordId());
+                MONGO_verify(member->hasRecordId());
                 out->push_back(member->recordId);
             }
         }
@@ -437,7 +437,7 @@ TEST_F(QueryStageCollectionScanTest, QueryStageCollscanObjectsInOrderBackward) {
 // Scan through half the objects, delete the one we're about to fetch, then expect to get the "next"
 // object we would have gotten after that.
 TEST_F(QueryStageCollectionScanTest, QueryStageCollscanDeleteUpcomingObject) {
-    dbtests::WriteContextForTests ctx(&_opCtx, kNss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, kNss.ns_forTest());
 
     const CollectionPtr& coll = ctx.getCollection();
 
@@ -491,7 +491,7 @@ TEST_F(QueryStageCollectionScanTest, QueryStageCollscanDeleteUpcomingObject) {
 // Scan through half the objects, delete the one we're about to fetch, then expect to get the "next"
 // object we would have gotten after that.  But, do it in reverse!
 TEST_F(QueryStageCollectionScanTest, QueryStageCollscanDeleteUpcomingObjectBackward) {
-    dbtests::WriteContextForTests ctx(&_opCtx, kNss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, kNss.ns_forTest());
     const CollectionPtr& coll = ctx.getCollection();
 
     // Get the RecordIds that would be returned by an in-order scan.
@@ -589,7 +589,7 @@ TEST_F(QueryStageCollectionScanTest, QueryTestCollscanResumeAfterRecordIdSeekSuc
 
 // Verify that if we fail to seek to the resumeAfterRecordId, the plan stage fails.
 TEST_F(QueryStageCollectionScanTest, QueryTestCollscanResumeAfterRecordIdSeekFailure) {
-    dbtests::WriteContextForTests ctx(&_opCtx, kNss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, kNss.ns_forTest());
     auto coll = ctx.getCollection();
 
     // Get the RecordIds that would be returned by an in-order scan.
@@ -1356,6 +1356,9 @@ TEST_F(QueryStageCollectionScanTest, QueryTestCollscanClusteredInclusionBoundsHa
 // Tests behavior of getLatestOplogTimestamp() method when the scanned collection is the change
 // collection.
 TEST_F(QueryStageCollectionScanTest, QueryTestCollscanChangeCollectionGetLatestOplogTimestamp) {
+    // This test is disabled for the reasons outlined in SERVER-76288.
+    // TODO SERVER-76309 reenable this test.
+    return;
     // Setup the change collection.
     auto collectionName = NamespaceString::makeChangeCollectionNSS(boost::none);
     auto scopedCollectionDeleter =
@@ -1392,6 +1395,50 @@ TEST_F(QueryStageCollectionScanTest, QueryTestCollscanChangeCollectionGetLatestO
     state = advance();
     ASSERT_EQUALS(PlanStage::IS_EOF, state) << " state: " << PlanStage::stateStr(state);
     ASSERT_EQUALS(Timestamp(16, 1), scanStage->getLatestOplogTimestamp());
+}
+
+// Tests behavior of getLatestOplogTimestamp() method when the scanned collection is the change
+// collection.
+TEST_F(QueryStageCollectionScanTest, QueryTestCollscanChangeCollectionLatestTimestampIsNotGlobal) {
+    // This test exercises the temporary behaviour introduced in SERVER-76288.
+    // TODO SERVER-76309 remove this test.
+    // Setup the change collection.
+    auto collectionName = NamespaceString::makeChangeCollectionNSS(boost::none);
+    auto scopedCollectionDeleter =
+        createClusteredCollection(collectionName, false /* prePopulate */);
+    insertDocument(collectionName, BSON("_id" << Timestamp(15, 5) << "ts" << Timestamp(15, 5)));
+
+    // Set the read timestamp.
+    _opCtx.recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
+                                                  Timestamp(16, 1));
+
+    // Build the collection scan stage.
+    AutoGetCollectionForRead autoColl(&_opCtx, collectionName);
+    const CollectionPtr& coll = autoColl.getCollection();
+    CollectionScanParams params;
+    params.tailable = true;
+    params.direction = CollectionScanParams::FORWARD;
+    params.shouldTrackLatestOplogTimestamp = true;
+    WorkingSet ws;
+    auto scanStage = std::make_unique<CollectionScan>(_expCtx.get(), coll, params, &ws, nullptr);
+    WorkingSetID id = WorkingSet::INVALID_ID;
+    auto advance = [&]() {
+        PlanStage::StageState state;
+        while ((state = scanStage->work(&id)) == PlanStage::NEED_TIME) {
+        };
+        return state;
+    };
+
+    // Verify that the latest oplog timestamp is equal to the 'ts' field of the retrieved document.
+    auto state = advance();
+    ASSERT_EQUALS(PlanStage::ADVANCED, state) << " state: " << PlanStage::stateStr(state);
+    ASSERT_EQUALS(Timestamp(15, 5), scanStage->getLatestOplogTimestamp());
+
+    // Verify that on EOF, the latest oplog timestamp is still equal to the ts of the last document
+    // retrieved, and has NOT advanced to the read timestamp.
+    state = advance();
+    ASSERT_EQUALS(PlanStage::IS_EOF, state) << " state: " << PlanStage::stateStr(state);
+    ASSERT_EQUALS(Timestamp(15, 5), scanStage->getLatestOplogTimestamp());
 }
 }  // namespace query_stage_collection_scan
 }  // namespace mongo

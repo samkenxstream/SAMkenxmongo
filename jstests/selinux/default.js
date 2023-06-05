@@ -6,11 +6,7 @@
 load('jstests/selinux/lib/selinux_base_test.js');
 
 class TestDefinition extends SelinuxBaseTest {
-    get config() {
-        return cat("rpm/mongod.conf");
-    }
-
-    run() {
+    async run() {
         // The only things we are verifying here:
         // - that we are connected
         // - that process is running in correct SELinux context

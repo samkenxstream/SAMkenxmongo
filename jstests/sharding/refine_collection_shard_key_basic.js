@@ -7,7 +7,7 @@ TestData.skipCheckShardFilteringMetadata = true;
 
 (function() {
 'use strict';
-load("jstests/libs/catalog_shard_util.js");
+load("jstests/libs/config_shard_util.js");
 load('jstests/libs/fail_point_util.js');
 load('jstests/libs/profiler.js');
 load('jstests/sharding/libs/shard_versioning_util.js');
@@ -307,10 +307,10 @@ assert.commandFailedWithCode(
     ErrorCodes.NamespaceNotSharded);
 
 // Should fail because operation can't run on config server
-const isCatalogShardEnabled = CatalogShardUtil.isEnabledIgnoringFCV(st);
+const isConfigShardEnabled = ConfigShardUtil.isEnabledIgnoringFCV(st);
 assert.commandFailedWithCode(
     mongos.adminCommand({refineCollectionShardKey: "config.collections", key: {_id: 1, aKey: 1}}),
-    isCatalogShardEnabled ? ErrorCodes.NamespaceNotSharded : ErrorCodes.NoShardingEnabled);
+    isConfigShardEnabled ? ErrorCodes.NamespaceNotSharded : ErrorCodes.NoShardingEnabled);
 
 enableShardingAndShardColl({_id: 1});
 
@@ -737,85 +737,9 @@ if (!isStepdownSuite) {
     assert.soon(() => oldPrimaryEpoch !==
                     st.shard0.adminCommand({getShardVersion: kNsName, fullMetadata: true})
                         .metadata.shardVersionEpoch.toString());
-    // TODO (SERVER-74477): Always assume that all shards will refresh during rename.
-    if (FeatureFlagUtil.isPresentAndEnabled(st.shard0.getDB(kDbName),
-                                            "AllowMigrationsRefreshToAll")) {
-        assert.soon(() => oldSecondaryEpoch !==
-                        st.shard1.adminCommand({getShardVersion: kNsName, fullMetadata: true})
-                            .metadata.shardVersionEpoch.toString());
-    } else {
-        assert.soon(() => oldSecondaryEpoch ===
-                        st.shard1.adminCommand({getShardVersion: kNsName, fullMetadata: true})
-                            .metadata.shardVersionEpoch.toString());
-    }
-}
-
-// TODO SERVER-72515: remove once 7.0 becomes last-lts.
-const fcvDoc = assert.commandWorked(
-    st.configRS.getPrimary().adminCommand({getParameter: 1, featureCompatibilityVersion: 1}));
-if (fcvDoc.featureCompatibilityVersion.version == lastLTSFCV &&
-    !jsTestOptions().shardMixedBinVersions) {
-    (() => {
-        //
-        // Verify listIndexes and checkShardingIndexes are retried on shard version errors and are
-        // sent with shard versions.
-        //
-
-        // Create a sharded collection with one chunk on shard0.
-        const dbName = "testShardVersions";
-        const collName = "fooShardVersions";
-        const ns = dbName + "." + collName;
-        assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-        st.ensurePrimaryShard(dbName, st.shard0.shardName);
-        assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 1}}));
-
-        const minKeyShardDB = st.rs0.getPrimary().getDB(dbName);
-        assert.commandWorked(minKeyShardDB.setProfilingLevel(2));
-
-        // Refining the shard key should internally retry on a stale epoch error for listIndexes and
-        // succeed.
-        assert.commandWorked(minKeyShardDB.adminCommand({
-            configureFailPoint: "failCommand",
-            mode: {times: 5},
-            data: {
-                errorCode: ErrorCodes.StaleEpoch,
-                failCommands: ["listIndexes"],
-                failInternalCommands: true
-            }
-        }));
-        assert.commandWorked(st.s.getCollection(ns).createIndex({x: 1, y: 1}));
-        assert.commandWorked(st.s.adminCommand({refineCollectionShardKey: ns, key: {x: 1, y: 1}}));
-
-        // Refining the shard key should internally retry on a stale epoch error for
-        // checkShardingIndex and succeed.
-        assert.commandWorked(minKeyShardDB.adminCommand({
-            configureFailPoint: "failCommand",
-            mode: {times: 5},
-            data: {
-                errorCode: ErrorCodes.StaleEpoch,
-                failCommands: ["checkShardingIndex"],
-                failInternalCommands: true
-            }
-        }));
-        assert.commandWorked(st.s.getCollection(ns).createIndex({x: 1, y: 1, z: 1}));
-        assert.commandWorked(
-            st.s.adminCommand({refineCollectionShardKey: ns, key: {x: 1, y: 1, z: 1}}));
-
-        // Verify both commands were sent with shard versions through the profiler.
-        profilerHasAtLeastOneMatchingEntryOrThrow({
-            profileDB: minKeyShardDB,
-            filter: {"command.listIndexes": collName, "command.shardVersion": {"$exists": true}}
-        });
-
-        profilerHasAtLeastOneMatchingEntryOrThrow({
-            profileDB: minKeyShardDB,
-            filter: {"command.checkShardingIndex": ns, "command.shardVersion": {"$exists": true}}
-        });
-
-        // Clean up.
-        assert.commandWorked(minKeyShardDB.setProfilingLevel(0));
-        assert(minKeyShardDB.system.profile.drop());
-    })();
+    assert.soon(() => oldSecondaryEpoch !==
+                    st.shard1.adminCommand({getShardVersion: kNsName, fullMetadata: true})
+                        .metadata.shardVersionEpoch.toString());
 }
 
 // Assumes the given arrays are sorted by the max field.

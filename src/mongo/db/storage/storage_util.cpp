@@ -59,8 +59,7 @@ auto removeEmptyDirectory =
         auto collectionCatalog = CollectionCatalog::latest(svcCtx);
         const DatabaseName& dbName = ns.dbName();
         if (!storageEngine->isUsingDirectoryPerDb() ||
-            (storageEngine->supportsPendingDrops() &&
-             collectionCatalog->begin(nullptr, dbName) != collectionCatalog->end(nullptr))) {
+            (storageEngine->supportsPendingDrops() && !collectionCatalog->range(dbName).empty())) {
             return;
         }
 
@@ -69,7 +68,7 @@ auto removeEmptyDirectory =
 
         if (!ec) {
             LOGV2(4888200, "Removed empty database directory", logAttrs(dbName));
-        } else if (collectionCatalog->begin(nullptr, dbName) == collectionCatalog->end(nullptr)) {
+        } else if (collectionCatalog->range(dbName).empty()) {
             // It is possible for a new collection to be created in the database between when we
             // check whether the database is empty and actually attempting to remove the directory.
             // In this case, don't log that the removal failed because it is expected. However,
@@ -122,9 +121,7 @@ void removeIndex(OperationContext* opCtx,
     const bool isTwoPhaseDrop =
         storageEngine->supportsPendingDrops() && dataRemoval == DataRemoval::kTwoPhase;
 
-    // TODO SERVER-68674: Remove feature flag check.
-    // (Ignore FCV check): This feature flag doesn't have any upgrade/downgrade concerns.
-    if (feature_flags::gPointInTimeCatalogLookups.isEnabledAndIgnoreFCVUnsafe() && isTwoPhaseDrop) {
+    if (isTwoPhaseDrop) {
         invariant(entry);
         CollectionCatalog::get(opCtx)->dropIndex(
             opCtx, collection->ns(), entry, /*isDropPending=*/true);
@@ -145,11 +142,7 @@ void removeIndex(OperationContext* opCtx,
                 [svcCtx, storageEngine, nss, ident = ident->getIdent(), isTwoPhaseDrop] {
                     removeEmptyDirectory(svcCtx, storageEngine, nss);
 
-                    // TODO SERVER-68674: Remove feature flag check.
-                    // (Ignore FCV check): This feature flag doesn't have any upgrade/downgrade
-                    // concerns.
-                    if (feature_flags::gPointInTimeCatalogLookups.isEnabledAndIgnoreFCVUnsafe() &&
-                        isTwoPhaseDrop) {
+                    if (isTwoPhaseDrop) {
                         CollectionCatalog::write(svcCtx, [&](CollectionCatalog& catalog) {
                             catalog.notifyIdentDropped(ident);
                         });
@@ -215,11 +208,7 @@ Status dropCollection(OperationContext* opCtx,
                 [svcCtx, storageEngine, nss, ident = ident->getIdent()] {
                     removeEmptyDirectory(svcCtx, storageEngine, nss);
 
-                    // TODO SERVER-68674: Remove feature flag check.
-                    // (Ignore FCV check): This feature flag doesn't have any upgrade/downgrade
-                    // concerns.
-                    if (feature_flags::gPointInTimeCatalogLookups.isEnabledAndIgnoreFCVUnsafe() &&
-                        storageEngine->supportsPendingDrops()) {
+                    if (storageEngine->supportsPendingDrops()) {
                         CollectionCatalog::write(svcCtx, [&](CollectionCatalog& catalog) {
                             catalog.notifyIdentDropped(ident);
                         });

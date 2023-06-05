@@ -44,6 +44,43 @@ ExpressionContext::ResolvedNamespace::ResolvedNamespace(NamespaceString ns,
     : ns(std::move(ns)), pipeline(std::move(pipeline)), uuid(collUUID) {}
 
 ExpressionContext::ExpressionContext(OperationContext* opCtx,
+                                     const FindCommandRequest& findCmd,
+                                     std::unique_ptr<CollatorInterface> collator,
+                                     bool mayDbProfile,
+                                     boost::optional<ExplainOptions::Verbosity> verbosity,
+                                     bool allowDiskUseDefault)
+    // Although both 'find' and 'aggregate' commands have an ExpressionContext, some of the data
+    // members in the ExpressionContext are used exclusively by the aggregation subsystem. This
+    // includes the following fields which here we simply initialize to some meaningless default
+    // value:
+    //  - explain
+    //  - fromMongos
+    //  - needsMerge
+    //  - bypassDocumentValidation
+    //  - mongoProcessInterface
+    //  - resolvedNamespaces
+    //  - uuid
+    //
+    // As we change the code to make the find and agg systems more tightly coupled, it would make
+    // sense to start initializing these fields for find operations as well.
+    : ExpressionContext(opCtx,
+                        verbosity,
+                        false,  // fromMongos
+                        false,  // needsMerge
+                        findCmd.getAllowDiskUse().value_or(allowDiskUseDefault),
+                        false,  // bypassDocumentValidation
+                        false,  // isMapReduceCommand
+                        findCmd.getNamespaceOrUUID().nss().value_or(NamespaceString{}),
+                        findCmd.getLegacyRuntimeConstants(),
+                        std::move(collator),
+                        nullptr,  // mongoProcessInterface
+                        {},       // resolvedNamespaces
+                        findCmd.getNamespaceOrUUID().uuid(),
+                        findCmd.getLet(),
+                        mayDbProfile,
+                        findCmd.getSerializationContext()) {}
+
+ExpressionContext::ExpressionContext(OperationContext* opCtx,
                                      const AggregateCommandRequest& request,
                                      std::unique_ptr<CollatorInterface> collator,
                                      std::shared_ptr<MongoProcessInterface> processInterface,
@@ -65,7 +102,8 @@ ExpressionContext::ExpressionContext(OperationContext* opCtx,
                         std::move(resolvedNamespaces),
                         std::move(collUUID),
                         request.getLet(),
-                        mayDbProfile) {
+                        mayDbProfile,
+                        request.getSerializationContext()) {
 
     if (request.getIsMapReduceCommand()) {
         // mapReduce command JavaScript invocation is only subject to the server global
@@ -90,7 +128,8 @@ ExpressionContext::ExpressionContext(
     StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces,
     boost::optional<UUID> collUUID,
     const boost::optional<BSONObj>& letParameters,
-    bool mayDbProfile)
+    bool mayDbProfile,
+    const SerializationContext& serializationCtx)
     : explain(explain),
       fromMongos(fromMongos),
       needsMerge(needsMerge),
@@ -98,6 +137,7 @@ ExpressionContext::ExpressionContext(
                    !(opCtx && opCtx->readOnly())),  // Disallow disk use if in read-only mode.
       bypassDocumentValidation(bypassDocumentValidation),
       ns(ns),
+      serializationCtxt(serializationCtx),
       uuid(std::move(collUUID)),
       opCtx(opCtx),
       mongoProcessInterface(mongoProcessInterface),
@@ -135,9 +175,11 @@ ExpressionContext::ExpressionContext(
     const NamespaceString& nss,
     const boost::optional<LegacyRuntimeConstants>& runtimeConstants,
     const boost::optional<BSONObj>& letParameters,
+    bool allowDiskUse,
     bool mayDbProfile,
     boost::optional<ExplainOptions::Verbosity> explain)
     : explain(explain),
+      allowDiskUse(allowDiskUse),
       ns(nss),
       opCtx(opCtx),
       mongoProcessInterface(std::make_shared<StubMongoProcessInterface>()),
@@ -204,7 +246,8 @@ boost::intrusive_ptr<ExpressionContext> ExpressionContext::copyWith(
                                                     _resolvedNamespaces,
                                                     uuid,
                                                     boost::none /* letParameters */,
-                                                    mayDbProfile);
+                                                    mayDbProfile,
+                                                    SerializationContext());
 
     expCtx->inMongos = inMongos;
     expCtx->maxFeatureCompatibilityVersion = maxFeatureCompatibilityVersion;
@@ -225,6 +268,7 @@ boost::intrusive_ptr<ExpressionContext> ExpressionContext::copyWith(
     expCtx->originalAggregateCommand = originalAggregateCommand.getOwned();
 
     expCtx->inLookup = inLookup;
+    expCtx->serializationCtxt = serializationCtxt;
 
     // Note that we intentionally skip copying the value of '_interruptCounter' because 'expCtx' is
     // intended to be used for executing a separate aggregation pipeline.
@@ -234,57 +278,49 @@ boost::intrusive_ptr<ExpressionContext> ExpressionContext::copyWith(
 
 void ExpressionContext::startExpressionCounters() {
     if (enabledCounters && !_expressionCounters) {
-        _expressionCounters = boost::make_optional<ExpressionCounters>({});
+        _expressionCounters = std::make_unique<ExpressionCounters>();
     }
 }
 
 void ExpressionContext::incrementMatchExprCounter(StringData name) {
     if (enabledCounters && _expressionCounters) {
-        ++_expressionCounters.value().matchExprCountersMap[name];
+        ++_expressionCounters->matchExprCountersMap[name];
     }
 }
 
 void ExpressionContext::incrementAggExprCounter(StringData name) {
     if (enabledCounters && _expressionCounters) {
-        ++_expressionCounters.value().aggExprCountersMap[name];
+        ++_expressionCounters->aggExprCountersMap[name];
     }
 }
 
 void ExpressionContext::incrementGroupAccumulatorExprCounter(StringData name) {
     if (enabledCounters && _expressionCounters) {
-        ++_expressionCounters.value().groupAccumulatorExprCountersMap[name];
+        ++_expressionCounters->groupAccumulatorExprCountersMap[name];
     }
 }
 
 void ExpressionContext::incrementWindowAccumulatorExprCounter(StringData name) {
     if (enabledCounters && _expressionCounters) {
-        ++_expressionCounters.value().windowAccumulatorExprCountersMap[name];
+        ++_expressionCounters->windowAccumulatorExprCountersMap[name];
     }
 }
 
 void ExpressionContext::stopExpressionCounters() {
     if (enabledCounters && _expressionCounters) {
-        operatorCountersMatchExpressions.mergeCounters(
-            _expressionCounters.value().matchExprCountersMap);
-        operatorCountersAggExpressions.mergeCounters(
-            _expressionCounters.value().aggExprCountersMap);
+        operatorCountersMatchExpressions.mergeCounters(_expressionCounters->matchExprCountersMap);
+        operatorCountersAggExpressions.mergeCounters(_expressionCounters->aggExprCountersMap);
         operatorCountersGroupAccumulatorExpressions.mergeCounters(
-            _expressionCounters.value().groupAccumulatorExprCountersMap);
+            _expressionCounters->groupAccumulatorExprCountersMap);
         operatorCountersWindowAccumulatorExpressions.mergeCounters(
-            _expressionCounters.value().windowAccumulatorExprCountersMap);
+            _expressionCounters->windowAccumulatorExprCountersMap);
     }
-    _expressionCounters = boost::none;
+    _expressionCounters.reset();
 }
 
 void ExpressionContext::setUserRoles() {
-    // We need to check the FCV here because the $$USER_ROLES variable will always appear in the
-    // serialized command when one shard is sending a sub-query to another shard. The query will
-    // fail in the case where the shards are running different binVersions and one of them does not
-    // have a notion of this variable. This FCV check prevents this from happening, as the value of
-    // the variable is not set (and therefore not serialized) if the FCV is too old.
-    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        feature_flags::gFeatureFlagUserRoles.isEnabled(serverGlobalParams.featureCompatibility) &&
-        enableAccessToUserRoles.load()) {
+    // Only set the value of $$USER_ROLES if it is referenced in the query.
+    if (isSystemVarReferencedInQuery(Variables::kUserRolesId) && enableAccessToUserRoles.load()) {
         variables.defineUserRoles(opCtx);
     }
 }

@@ -35,7 +35,7 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/query/find_command_gen.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/query/tailable_mode.h"
 
 namespace mongo {
@@ -83,11 +83,6 @@ std::unique_ptr<FindCommandRequest> makeFromFindCommandForTests(
     const BSONObj& cmdObj,
     boost::optional<NamespaceString> nss = boost::none,
     bool apiStrict = false);
-
-/**
- * If _uuid exists for this FindCommandRequest, update the value of _nss.
- */
-void refreshNSS(const NamespaceString& nss, FindCommandRequest* findCommand);
 
 /**
  * Converts this FindCommandRequest into an aggregation using $match. If this FindCommandRequest has
@@ -139,7 +134,9 @@ TailableModeEnum getTailableMode(const FindCommandRequest& findCommand);
 /**
  * Asserts whether the cursor response adhere to the format defined in IDL.
  */
-void validateCursorResponse(const BSONObj& outputAsBson, boost::optional<TenantId> tenantId);
+void validateCursorResponse(const BSONObj& outputAsBson,
+                            boost::optional<TenantId> tenantId,
+                            const SerializationContext& serializationContext);
 
 /**
  * Updates the projection object with a $meta projection for the showRecordId option.

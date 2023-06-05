@@ -38,6 +38,7 @@
 #include "mongo/db/shard_id.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_tags.h"
+#include "mongo/s/resharding/common_types_gen.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/string_map.h"
 namespace mongo {
@@ -287,11 +288,13 @@ public:
                                          const ShardKeyPattern& shardKey,
                                          int numInitialChunks,
                                          boost::optional<std::vector<TagsType>> zones,
+                                         boost::optional<std::vector<ShardId>> availableShardIds,
                                          int samplesPerChunk = kDefaultSamplesPerChunk);
 
     SamplingBasedSplitPolicy(int numInitialChunks,
                              boost::optional<std::vector<TagsType>> zones,
-                             std::unique_ptr<SampleDocumentSource> samples);
+                             std::unique_ptr<SampleDocumentSource> samples,
+                             boost::optional<std::vector<ShardId>> availableShardIds);
 
     /**
      * Generates the initial split points and returns them in ascending shard key order. Does not
@@ -331,12 +334,6 @@ private:
         MakePipelineOptions opts = {});
 
     /**
-     * Returns a set of split points to ensure that chunk boundaries will align with the zone
-     * ranges.
-     */
-    BSONObjSet _extractSplitPointsFromZones(const ShardKeyPattern& shardKey);
-
-    /**
      * Append split points based from the samples taken from the collection.
      */
     void _appendSplitPointsFromSample(BSONObjSet* splitPoints,
@@ -347,5 +344,44 @@ private:
     const int _numInitialChunks;
     boost::optional<std::vector<TagsType>> _zones;
     std::unique_ptr<SampleDocumentSource> _samples;
+    // If provided, only pick shard that is in this vector.
+    boost::optional<std::vector<ShardId>> _availableShardIds;
 };
+
+class ShardDistributionSplitPolicy : public InitialSplitPolicy {
+public:
+    static ShardDistributionSplitPolicy make(OperationContext* opCtx,
+                                             const ShardKeyPattern& shardKey,
+                                             std::vector<ShardKeyRange> shardDistribution,
+                                             boost::optional<std::vector<TagsType>> zones);
+
+    ShardDistributionSplitPolicy(std::vector<ShardKeyRange>& shardDistribution,
+                                 boost::optional<std::vector<TagsType>> zones);
+
+    ShardCollectionConfig createFirstChunks(OperationContext* opCtx,
+                                            const ShardKeyPattern& shardKeyPattern,
+                                            const SplitPolicyParams& params) override;
+
+private:
+    /**
+     * Given a splitPoint, create chunks from _shardDistribution until passing the splitPoint.
+     */
+    void _appendChunks(const SplitPolicyParams& params,
+                       const BSONObj& splitPoint,
+                       const KeyPattern& keyPattern,
+                       unsigned long& shardDistributionIdx,
+                       ChunkVersion& version,
+                       std::vector<ChunkType>& chunks);
+
+    /**
+     * Check the chunks created from command parameter "zones" and "shardDistribution" are
+     * satisfying the existing zone mapping rules in config.
+     */
+    void _checkShardsMatchZones(OperationContext* opCtx,
+                                const std::vector<ChunkType>& chunks,
+                                const std::vector<mongo::TagsType>& zones);
+    std::vector<ShardKeyRange> _shardDistribution;
+    boost::optional<std::vector<TagsType>> _zones;
+};
+
 }  // namespace mongo

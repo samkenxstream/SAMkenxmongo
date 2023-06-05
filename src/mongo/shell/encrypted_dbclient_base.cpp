@@ -167,7 +167,7 @@ BSONObj EncryptedDBClientBase::encryptDecryptCommand(const BSONObj& object,
     }
     invariant(frameStack.size() == 1);
     // Append '$db' which shouldn't contain tenantid.
-    frameStack.top().second.append("$db", dbName.toString());
+    frameStack.top().second.append("$db", dbName.toString_forTest());
     // If encrypt request, append '$tenant' which contains tenantid.
     if (encrypt && dbName.tenantId() && !object.hasField("$tenant")) {
         dbName.tenantId()->serializeToBSON("$tenant", &frameStack.top().second);
@@ -240,8 +240,9 @@ EncryptedDBClientBase::RunCommandReturn EncryptedDBClientBase::handleEncryptionR
     auto& request = params.request;
     auto commandName = request.getCommandName().toString();
     const DatabaseName dbName = request.body.hasField("$tenant")
-        ? DatabaseName(TenantId(request.body["$tenant"].OID()), request.getDatabase())
-        : DatabaseName(boost::none, request.getDatabase());
+        ? DatabaseNameUtil::deserialize(TenantId(request.body["$tenant"].OID()),
+                                        request.getDatabase())
+        : DatabaseName::createDatabaseName_forTest(boost::none, request.getDatabase());
 
     if (std::find(kEncryptedCommands.begin(), kEncryptedCommands.end(), StringData(commandName)) ==
         std::end(kEncryptedCommands)) {
@@ -548,7 +549,7 @@ boost::optional<EncryptedFieldConfig> EncryptedDBClientBase::getEncryptedFieldCo
     const NamespaceString& nss) {
     auto collsList = _conn->getCollectionInfos(nss.dbName(), BSON("name" << nss.coll()));
     uassert(ErrorCodes::BadValue,
-            str::stream() << "Namespace not found: " << nss.toString(),
+            str::stream() << "Namespace not found: " << nss.toStringForErrorMsg(),
             !collsList.empty());
     auto info = collsList.front();
     auto opts = info.getField("options");
@@ -607,9 +608,10 @@ void EncryptedDBClientBase::cleanup(JSContext* cx, JS::CallArgs args) {
     builder.append("cleanupTokens",
                    efc ? FLEClientCrypto::generateCompactionTokens(*efc, this) : BSONObj());
 
-    // TODO SERVER-72937: Add call to cleanup function
-    mozjs::ValueReader(cx, args.rval()).fromBSON(BSONObj(), nullptr, false);
-    return;
+    BSONObj reply;
+    runCommand(nss.dbName(), builder.obj(), reply, 0);
+    reply = reply.getOwned();
+    mozjs::ValueReader(cx, args.rval()).fromBSON(reply, nullptr, false);
 }
 
 void EncryptedDBClientBase::trace(JSTracer* trc) {
@@ -840,7 +842,7 @@ void createCollectionObject(JSContext* cx,
     collectionArgs[0].setObject(client.toObject());
     collectionArgs[1].setObject(*databaseObj);
     mozjs::ValueReader(cx, collectionArgs[2]).fromStringData(ns.coll());
-    mozjs::ValueReader(cx, collectionArgs[3]).fromStringData(ns.ns());
+    mozjs::ValueReader(cx, collectionArgs[3]).fromStringData(ns.toString_forTest());
 
     scope->getProto<mozjs::DBCollectionInfo>().newInstance(collectionArgs, collection);
 }

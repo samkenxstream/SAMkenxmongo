@@ -1,7 +1,9 @@
 /**
  * Tests that MovePrimaryRecipient commands work as intended.
  *
- * @tags: [featureFlagOnlineMovePrimaryLifecycle]
+ *  @tags: [
+ *    featureFlagOnlineMovePrimaryLifecycle
+ * ]
  */
 (function() {
 'use strict';
@@ -10,18 +12,29 @@ load("jstests/libs/collection_drop_recreate.js");
 
 const st = new ShardingTest({mongos: 1, shards: 2});
 
+if (!FeatureFlagUtil.isEnabled(st.s.getDB(jsTestName()), "OnlineMovePrimaryLifecycle")) {
+    jsTestLog('Skipping test because the featureFlagOnlineMovePrimaryLifecycle is disabled.');
+    st.stop();
+    return;
+}
+
 const mongos = st.s0;
 const donor = st.shard0;
 const recipient = st.shard1;
 
 const dbName = jsTestName();
 const testDB = donor.getDB(dbName);
-assert.commandWorked(testDB.dropDatabase());
+const collName = 'testcoll0';
 
 assert.commandWorked(mongos.adminCommand({enableSharding: dbName, primaryShard: donor.shardName}));
 
-const coll0 = assertDropAndRecreateCollection(testDB, 'testcoll0');
-assert.commandWorked(coll0.insert([{a: 1}, {b: 1}]));
+const donorColl0 = assertDropAndRecreateCollection(testDB, collName);
+const recipientColl0 = recipient.getDB(dbName).getCollection(collName);
+
+assert.commandWorked(donorColl0.insert([{a: 1}, {b: 1}]));
+
+assert.eq(2, donorColl0.find().itcount(), "Donor does not have data before move");
+assert.eq(0, recipientColl0.find().itcount(), "Recipient has data before move");
 
 function runRecipientSyncDataCmds(uuid) {
     assert.commandWorked(recipient.adminCommand({
@@ -44,8 +57,8 @@ function runRecipientSyncDataCmds(uuid) {
 
 // Test that _movePrimaryRecipientSyncData commands work followed by
 // _movePrimaryRecipientForgetMigration.
-let uuid = UUID();
 
+let uuid = UUID();
 runRecipientSyncDataCmds(uuid);
 
 assert.commandWorked(recipient.adminCommand({
@@ -55,6 +68,8 @@ assert.commandWorked(recipient.adminCommand({
     fromShardName: donor.shardName,
     toShardName: recipient.shardName
 }));
+
+assert.eq(2, recipientColl0.count(), "Data has not been cloned to the Recipient correctly");
 
 // Test that _movePrimaryRecipientForgetMigration called on an already forgotten migration succeeds
 assert.commandWorked(recipient.adminCommand({
@@ -66,6 +81,7 @@ assert.commandWorked(recipient.adminCommand({
 }));
 
 // Test that _movePrimaryRecipientAbortMigration command aborts an ongoing movePrimary op.
+assertDropCollection(recipient.getDB(dbName), collName);
 uuid = UUID();
 
 runRecipientSyncDataCmds(uuid);
@@ -87,7 +103,11 @@ assert.commandWorked(recipient.adminCommand({
     toShardName: recipient.shardName
 }));
 
-// TODO SERVER-74707: Verify documents are cloned after integrating offline cloner.
+assert.eq(0, recipientColl0.count(), "Recipient has orphaned collections");
+
+// Cleanup to prevent metadata inconsistencies as we are not committing config changes.
+assert.commandWorked(recipient.getDB(dbName).dropDatabase());
+assert.commandWorked(donor.getDB(dbName).dropDatabase());
 
 st.stop();
 })();

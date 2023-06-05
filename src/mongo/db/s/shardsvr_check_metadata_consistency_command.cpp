@@ -35,7 +35,6 @@
 #include "mongo/db/s/ddl_lock_manager.h"
 #include "mongo/db/s/metadata_consistency_util.h"
 #include "mongo/db/s/operation_sharding_state.h"
-#include "mongo/db/s/sharding_ddl_coordinator_service.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
@@ -70,17 +69,13 @@ std::vector<DatabaseType> getDatabasesThisShardIsPrimaryFor(OperationContext* op
         databases.emplace_back(
             DatabaseType::parseOwned(IDLParserContext("DatabaseType"), std::move(rawDb)));
     }
-    return databases;
-}
-
-MetadataConsistencyCommandLevelEnum getCommandLevel(const NamespaceString& nss) {
-    if (nss.isAdminDB()) {
-        return MetadataConsistencyCommandLevelEnum::kClusterLevel;
-    } else if (nss.isCollectionlessCursorNamespace()) {
-        return MetadataConsistencyCommandLevelEnum::kDatabaseLevel;
-    } else {
-        return MetadataConsistencyCommandLevelEnum::kCollectionLevel;
+    if (thisShardId == ShardId::kConfigServerId) {
+        // Config database
+        databases.emplace_back(DatabaseName::kConfig.db().toString(),
+                               ShardId::kConfigServerId,
+                               DatabaseVersion::makeFixed());
     }
+    return databases;
 }
 
 class ShardsvrCheckMetadataConsistencyCommand final
@@ -114,20 +109,14 @@ public:
             uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
             opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
-            // This commands uses DDL locks to serialize with concurrent DDL operations.
-            // Since we are not using the ShardingDDLCoordinator infrastructure we need to
-            // explicitely wait for all DDL coordinators to be recovered and to have re-acquired
-            // their DDL locks before to proceed.
-            ShardingDDLCoordinatorService::getService(opCtx)->waitForRecoveryCompletion(opCtx);
-
             const auto nss = ns();
-            switch (getCommandLevel(nss)) {
+            switch (metadata_consistency_util::getCommandLevel(nss)) {
                 case MetadataConsistencyCommandLevelEnum::kClusterLevel:
                     return _runClusterLevel(opCtx, nss);
                 case MetadataConsistencyCommandLevelEnum::kDatabaseLevel:
                     return _runDatabaseLevel(opCtx, nss);
                 case MetadataConsistencyCommandLevelEnum::kCollectionLevel:
-                    return _runCollectionLevel(nss);
+                    return _runCollectionLevel(opCtx, nss);
                 default:
                     MONGO_UNREACHABLE;
             }
@@ -135,10 +124,12 @@ public:
 
     private:
         Response _runClusterLevel(OperationContext* opCtx, const NamespaceString& nss) {
-            uassert(
-                ErrorCodes::InvalidNamespace,
-                "cluster level mode must be run against the 'admin' database with {aggregate: 1}",
-                nss.isCollectionlessCursorNamespace());
+            uassert(ErrorCodes::InvalidNamespace,
+                    str::stream() << Request::kCommandName
+                                  << " command on admin database can only be run without "
+                                     "collection name. Found unexpected collection name: "
+                                  << nss.coll(),
+                    nss.isCollectionlessCursorNamespace());
 
             std::vector<RemoteCursor> cursors;
 
@@ -172,13 +163,12 @@ public:
             return _mergeCursors(opCtx, nss, _establishCursorOnParticipants(opCtx, nss));
         }
 
-        Response _runCollectionLevel(const NamespaceString& nss) {
-            uasserted(ErrorCodes::NotImplemented,
-                      "collection level mode command is not implemented");
+        Response _runCollectionLevel(OperationContext* opCtx, const NamespaceString& nss) {
+            return _mergeCursors(opCtx, nss, _establishCursorOnParticipants(opCtx, nss));
         }
 
         /*
-         * Forwards metadata consitency command to all participants to establish remote cursors.
+         * Forwards metadata consistency command to all participants to establish remote cursors.
          * Forwarding is done under the DDL lock to serialize with concurrent DDL operations.
          */
         std::vector<RemoteCursor> _establishCursorOnParticipants(OperationContext* opCtx,
@@ -186,18 +176,24 @@ public:
             std::vector<std::pair<ShardId, BSONObj>> requests;
 
             // Shard requests
+            const auto shardOpKey = UUID::gen();
             ShardsvrCheckMetadataConsistencyParticipant participantRequest{nss};
+            participantRequest.setCommonFields(request().getCommonFields());
             participantRequest.setPrimaryShardId(ShardingState::get(opCtx)->shardId());
             participantRequest.setCursor(request().getCursor());
             const auto participants = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+            auto participantRequestWithOpKey =
+                appendOpKey(shardOpKey, participantRequest.toBSON({}));
             for (const auto& shardId : participants) {
-                requests.emplace_back(shardId, participantRequest.toBSON({}));
+                requests.emplace_back(shardId, participantRequestWithOpKey.getOwned());
             }
 
             // Config server request
+            const auto configOpKey = UUID::gen();
             ConfigsvrCheckMetadataConsistency configRequest{nss};
             participantRequest.setCursor(request().getCursor());
-            requests.emplace_back(ShardId::kConfigServerId, configRequest.toBSON({}));
+            requests.emplace_back(ShardId::kConfigServerId,
+                                  appendOpKey(configOpKey, configRequest.toBSON({})));
 
             // Take a DDL lock on the database
             static constexpr StringData kLockReason{"checkMetadataConsistency"_sd};
@@ -213,7 +209,8 @@ public:
                                     ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                                     requests,
                                     false /* allowPartialResults */,
-                                    Shard::RetryPolicy::kIdempotentOrCursorInvalidated);
+                                    Shard::RetryPolicy::kIdempotentOrCursorInvalidated,
+                                    {shardOpKey, configOpKey});
         }
 
         CursorInitialReply _mergeCursors(OperationContext* opCtx,

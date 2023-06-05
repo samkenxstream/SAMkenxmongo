@@ -43,9 +43,8 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/balancer/auto_merger_policy.h"
-#include "mongo/db/s/balancer/balancer_chunk_selection_policy_impl.h"
 #include "mongo/db/s/balancer/balancer_commands_scheduler_impl.h"
-#include "mongo/db/s/balancer/balancer_defragmentation_policy_impl.h"
+#include "mongo/db/s/balancer/balancer_defragmentation_policy.h"
 #include "mongo/db/s/balancer/cluster_statistics_impl.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/sharding_config_server_parameters_gen.h"
@@ -293,12 +292,10 @@ Balancer* Balancer::get(OperationContext* operationContext) {
 
 Balancer::Balancer()
     : _balancedLastTime(0),
-      _random(std::random_device{}()),
-      _clusterStats(std::make_unique<ClusterStatisticsImpl>(_random)),
-      _chunkSelectionPolicy(
-          std::make_unique<BalancerChunkSelectionPolicyImpl>(_clusterStats.get(), _random)),
+      _clusterStats(std::make_unique<ClusterStatisticsImpl>()),
+      _chunkSelectionPolicy(std::make_unique<BalancerChunkSelectionPolicy>(_clusterStats.get())),
       _commandScheduler(std::make_unique<BalancerCommandsSchedulerImpl>()),
-      _defragmentationPolicy(std::make_unique<BalancerDefragmentationPolicyImpl>(
+      _defragmentationPolicy(std::make_unique<BalancerDefragmentationPolicy>(
           _clusterStats.get(), [this]() { _onActionsStreamPolicyStateUpdate(); })),
       _autoMergerPolicy(
           std::make_unique<AutoMergerPolicy>([this]() { _onActionsStreamPolicyStateUpdate(); })),
@@ -441,10 +438,14 @@ void Balancer::_consumeActionStreamLoop() {
     });
 
     Client::initThread("BalancerSecondary");
+
+    // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+    {
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationUnkillableByStepdown(lk);
+    }
+
     auto opCtx = cc().makeOperationContext();
-    // This thread never refreshes balancerConfig - instead, it relies on the requests
-    // performed by _mainThread() on each round to eventually see updated information.
-    auto balancerConfig = Grid::get(opCtx.get())->getBalancerConfiguration();
     executor::ScopedTaskExecutor executor(
         Grid::get(opCtx.get())->getExecutorPool()->getFixedExecutor());
 
@@ -454,6 +455,13 @@ void Balancer::_consumeActionStreamLoop() {
                                         ActionsStreamPolicy* policy) {
         invariant(_outstandingStreamingOps.addAndFetch(-1) >= 0);
         ThreadClient tc("BalancerSecondaryThread::applyActionResponse", getGlobalServiceContext());
+
+        // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+        {
+            stdx::lock_guard<Client> lk(*tc.get());
+            tc.get()->setSystemOperationUnkillableByStepdown(lk);
+        }
+
         auto opCtx = tc->makeOperationContext();
         policy->applyActionResult(opCtx.get(), action, response);
     };
@@ -510,11 +518,12 @@ void Balancer::_consumeActionStreamLoop() {
 
         // Get active streams
         auto activeStreams = [&]() -> std::vector<ActionsStreamPolicy*> {
+            auto balancerConfig = Grid::get(opCtx.get())->getBalancerConfiguration();
             std::vector<ActionsStreamPolicy*> streams;
-            if (_autoMergerPolicy->isEnabled()) {
+            if (balancerConfig->shouldBalanceForAutoMerge() && _autoMergerPolicy->isEnabled()) {
                 streams.push_back(_autoMergerPolicy.get());
             }
-            if (balancerConfig->shouldBalanceForAutoSplit()) {
+            if (balancerConfig->shouldBalance()) {
                 streams.push_back(_defragmentationPolicy.get());
             }
             return streams;
@@ -523,7 +532,8 @@ void Balancer::_consumeActionStreamLoop() {
         // Get next action from a random stream together with its stream
         auto [nextAction, sourcedStream] =
             [&]() -> std::tuple<boost::optional<BalancerStreamAction>, ActionsStreamPolicy*> {
-            std::shuffle(activeStreams.begin(), activeStreams.end(), _random);
+            auto client = opCtx->getClient();
+            std::shuffle(activeStreams.begin(), activeStreams.end(), client->getPrng().urbg());
             for (auto stream : activeStreams) {
                 try {
                     auto action = stream->getNextStreamingAction(opCtx.get());
@@ -628,6 +638,13 @@ void Balancer::_mainThread() {
     });
 
     Client::initThread("Balancer");
+
+    // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+    {
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationUnkillableByStepdown(lk);
+    }
+
     auto opCtx = cc().makeOperationContext();
     auto shardingContext = Grid::get(opCtx.get());
 

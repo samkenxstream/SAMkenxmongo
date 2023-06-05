@@ -111,14 +111,11 @@ public:
     void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
         // Explain is never allowed in multi-document transactions.
         const bool inMultiDocumentTransaction = false;
-        // TODO SERVER-68655 pass _dbName directly to commandCanRunHere
         uassert(50746,
                 "Explain's child command cannot run on this node. "
                 "Are you explaining a write command on a secondary?",
-                commandCanRunHere(opCtx,
-                                  _dbName.toStringWithTenantId(),
-                                  _innerInvocation->definition(),
-                                  inMultiDocumentTransaction));
+                commandCanRunHere(
+                    opCtx, _dbName, _innerInvocation->definition(), inMultiDocumentTransaction));
         _innerInvocation->explain(opCtx, _verbosity, result);
     }
 
@@ -167,7 +164,7 @@ std::unique_ptr<CommandInvocation> CmdExplain::parse(OperationContext* opCtx,
         IDLParserContext(ExplainCommandRequest::kCommandName,
                          APIParameters::get(opCtx).getAPIStrict().value_or(false)),
         request);
-    std::string dbname = cmdObj.getDbName().toString();
+    auto const dbName = cmdObj.getDbName();
     ExplainOptions::Verbosity verbosity = cmdObj.getVerbosity();
     auto explainedObj = cmdObj.getCommandParameter();
 
@@ -179,10 +176,13 @@ std::unique_ptr<CommandInvocation> CmdExplain::parse(OperationContext* opCtx,
     }
 
     if (auto innerDb = explainedObj["$db"]) {
+        auto innerDbName =
+            DatabaseNameUtil::deserialize(dbName.tenantId(), innerDb.checkAndGetStringData());
         uassert(ErrorCodes::InvalidNamespace,
-                str::stream() << "Mismatched $db in explain command. Expected " << dbname
-                              << " but got " << innerDb.checkAndGetStringData(),
-                innerDb.checkAndGetStringData() == dbname);
+                str::stream() << "Mismatched $db in explain command. Expected "
+                              << dbName.toStringForErrorMsg() << " but got "
+                              << innerDbName.toStringForErrorMsg(),
+                innerDbName == dbName);
     }
     auto explainedCommand = CommandHelpers::findCommand(explainedObj.firstElementFieldName());
     uassert(ErrorCodes::CommandNotFound,
@@ -190,8 +190,8 @@ std::unique_ptr<CommandInvocation> CmdExplain::parse(OperationContext* opCtx,
                           << explainedObj.firstElementFieldName(),
             explainedCommand);
     auto innerRequest =
-        std::make_unique<OpMsgRequest>(OpMsgRequest::fromDBAndBody(dbname, explainedObj));
-    innerRequest->validatedTenancyScope = request.validatedTenancyScope;
+        std::make_unique<OpMsgRequest>(OpMsgRequestBuilder::createWithValidatedTenancyScope(
+            dbName, request.validatedTenancyScope, explainedObj));
     auto innerInvocation = explainedCommand->parseForExplain(opCtx, *innerRequest, verbosity);
     return std::make_unique<Invocation>(
         this, request, std::move(verbosity), std::move(innerRequest), std::move(innerInvocation));

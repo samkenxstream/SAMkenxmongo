@@ -29,10 +29,12 @@
 
 #include "mongo/db/pipeline/process_interface/non_shardsvr_process_interface.h"
 
+#include "mongo/base/error_codes.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/list_indexes.h"
 #include "mongo/db/catalog/rename_collection.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
@@ -106,13 +108,13 @@ boost::optional<Document> NonShardServerProcessInterface::lookupSingleDocument(
     return lookedUpDocument;
 }
 
-Status NonShardServerProcessInterface::insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                              const NamespaceString& ns,
-                                              std::vector<BSONObj>&& objs,
-                                              const WriteConcernOptions& wc,
-                                              boost::optional<OID> targetEpoch) {
-    auto writeResults = write_ops_exec::performInserts(
-        expCtx->opCtx, buildInsertOp(ns, std::move(objs), expCtx->bypassDocumentValidation));
+Status NonShardServerProcessInterface::insert(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& ns,
+    std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
+    const WriteConcernOptions& wc,
+    boost::optional<OID> targetEpoch) {
+    auto writeResults = write_ops_exec::performInserts(expCtx->opCtx, *insertCommand);
 
     // Need to check each result in the batch since the writes are unordered.
     for (const auto& result : writeResults.results) {
@@ -123,16 +125,32 @@ Status NonShardServerProcessInterface::insert(const boost::intrusive_ptr<Express
     return Status::OK();
 }
 
+Status NonShardServerProcessInterface::insertTimeseries(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& ns,
+    std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
+    const WriteConcernOptions& wc,
+    boost::optional<OID> targetEpoch) {
+    try {
+        auto insertReply = write_ops_exec::performTimeseriesWrites(expCtx->opCtx, *insertCommand);
+
+        checkWriteErrors(insertReply.getWriteCommandReplyBase());
+    } catch (DBException& ex) {
+        ex.addContext(str::stream() << "time-series insert failed: " << ns.ns());
+        throw;
+    }
+    return Status::OK();
+}
+
 StatusWith<MongoProcessInterface::UpdateResult> NonShardServerProcessInterface::update(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const NamespaceString& ns,
-    BatchedObjects&& batch,
+    std::unique_ptr<write_ops::UpdateCommandRequest> updateCommand,
     const WriteConcernOptions& wc,
     UpsertType upsert,
     bool multi,
     boost::optional<OID> targetEpoch) {
-    auto writeResults = write_ops_exec::performUpdates(
-        expCtx->opCtx, buildUpdateOp(expCtx, ns, std::move(batch), upsert, multi));
+    auto writeResults = write_ops_exec::performUpdates(expCtx->opCtx, *updateCommand);
 
     // Need to check each result in the batch since the writes are unordered.
     UpdateResult updateResult;
@@ -152,19 +170,22 @@ void NonShardServerProcessInterface::createIndexesOnEmptyCollection(
     AutoGetCollection autoColl(opCtx, ns, MODE_X);
     CollectionWriter collection(opCtx, autoColl);
     writeConflictRetry(
-        opCtx, "CommonMongodProcessInterface::createIndexesOnEmptyCollection", ns.ns(), [&] {
+        opCtx, "CommonMongodProcessInterface::createIndexesOnEmptyCollection", ns, [&] {
             uassert(ErrorCodes::DatabaseDropPending,
-                    str::stream() << "The database is in the process of being dropped " << ns.db(),
+                    str::stream() << "The database is in the process of being dropped "
+                                  << ns.dbName().toStringForErrorMsg(),
                     autoColl.getDb() && !autoColl.getDb()->isDropPending(opCtx));
 
             uassert(ErrorCodes::NamespaceNotFound,
                     str::stream() << "Failed to create indexes for aggregation because collection "
                                      "does not exist: "
-                                  << ns << ": " << BSON("indexes" << indexSpecs),
+                                  << ns.toStringForErrorMsg() << ": "
+                                  << BSON("indexes" << indexSpecs),
                     collection.get());
 
             invariant(collection->isEmpty(opCtx),
-                      str::stream() << "Expected empty collection for index creation: " << ns
+                      str::stream() << "Expected empty collection for index creation: "
+                                    << ns.toStringForErrorMsg()
                                     << ": numRecords: " << collection->numRecords(opCtx) << ": "
                                     << BSON("indexes" << indexSpecs));
 
@@ -198,6 +219,17 @@ void NonShardServerProcessInterface::renameIfOptionsAndIndexesHaveNotChanged(
     // skip sharding validation on non sharded servers
     doLocalRenameIfOptionsAndIndexesHaveNotChanged(
         opCtx, sourceNs, targetNs, options, originalIndexes, originalCollectionOptions);
+}
+
+void NonShardServerProcessInterface::createTimeseriesView(OperationContext* opCtx,
+                                                          const NamespaceString& ns,
+                                                          const BSONObj& cmdObj,
+                                                          const TimeseriesOptions& userOpts) {
+    try {
+        uassertStatusOK(mongo::createTimeseries(opCtx, ns, cmdObj));
+    } catch (DBException& ex) {
+        _handleTimeseriesCreateError(ex, opCtx, ns, userOpts);
+    }
 }
 
 void NonShardServerProcessInterface::createCollection(OperationContext* opCtx,

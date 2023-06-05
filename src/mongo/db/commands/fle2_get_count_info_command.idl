@@ -31,8 +31,33 @@ global:
 
 imports:
     - "mongo/db/basic_types.idl"
+    - "mongo/crypto/fle_stats.idl"
 
 structs:
+    ESCPositionsPair:
+        description: "A pair of non-anchor and anchor positions"
+        strict: true
+        fields:
+          cpos:
+            description: "non-anchor position"
+            type: long
+          apos:
+            description: "anchor position"
+            type: long
+
+    ESCOptionalPositionsPair:
+        description: "A pair of optional non-anchor and anchor positions"
+        strict: true
+        fields:
+          cpos:
+            description: "non-anchor position"
+            type: long
+            optional: true
+          apos:
+            description: "anchor position"
+            type: long
+            optional: true
+
     QECountInfoReplyTokens:
         description: "A tokens of ESC information"
         strict: true
@@ -49,6 +74,20 @@ structs:
             description: "EDCDerivedFromDataTokenAndContentionFactorToken"
             type: bindata_generic
             cpp_name: EDCDerivedFromDataTokenAndContentionFactorToken
+            optional: true
+          spos:
+            description: "positions returned from emuBinary"
+            type: ESCOptionalPositionsPair
+            cpp_name: SearchedPositions
+            optional: true
+          npos:
+            description: "position pair retrieved from the null anchor"
+            type: ESCPositionsPair
+            cpp_name: NullAnchorPositions
+            optional: true
+          stats:
+            description: "stats returned for compaction or cleanup algorithms"
+            type: ECStats
             optional: true
 
     QECountInfoReplyTokenSet:
@@ -87,6 +126,15 @@ structs:
         fields:
             counts: array<QECountInfoReplyTokenSet>
 
+enums:
+    QECountInfoQueryType:
+        description: "query types"
+        type: string
+        values:
+            Insert: "insert"
+            Query: "query"
+            Compact: "compact"
+            Cleanup: "cleanup"
 
 commands:
     getQueryableEncryptionCountInfo:
@@ -100,6 +148,7 @@ commands:
             tokens:
                 description: "Array of tokens to fetch"
                 type: array<QECountInfoRequestTokenSet>
-            forInsert:
-                description: Whether to return a count for insert or query
-                type: bool
+            queryType:
+                description: "Purpose of command, either for insert, query, compact, or cleanup"
+                type: QECountInfoQueryType
+

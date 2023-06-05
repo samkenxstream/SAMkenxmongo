@@ -54,7 +54,8 @@ ConfigServerOpObserver::~ConfigServerOpObserver() = default;
 void ConfigServerOpObserver::onDelete(OperationContext* opCtx,
                                       const CollectionPtr& coll,
                                       StmtId stmtId,
-                                      const OplogDeleteEntryArgs& args) {
+                                      const OplogDeleteEntryArgs& args,
+                                      OpStateAccumulator* opAccumulator) {
     if (coll->ns() == VersionType::ConfigNS) {
         if (!repl::ReplicationCoordinator::get(opCtx)->getMemberState().rollback()) {
             uasserted(40302, "cannot delete config.version document while in --configsvr mode");
@@ -72,7 +73,8 @@ repl::OpTime ConfigServerOpObserver::onDropCollection(OperationContext* opCtx,
                                                       const NamespaceString& collectionName,
                                                       const UUID& uuid,
                                                       std::uint64_t numRecords,
-                                                      const CollectionDropType dropType) {
+                                                      const CollectionDropType dropType,
+                                                      bool markFromMigrate) {
     if (collectionName == VersionType::ConfigNS) {
         if (!repl::ReplicationCoordinator::get(opCtx)->getMemberState().rollback()) {
             uasserted(40303, "cannot drop config.version document while in --configsvr mode");
@@ -88,8 +90,8 @@ repl::OpTime ConfigServerOpObserver::onDropCollection(OperationContext* opCtx,
     return {};
 }
 
-void ConfigServerOpObserver::_onReplicationRollback(OperationContext* opCtx,
-                                                    const RollbackObserverInfo& rbInfo) {
+void ConfigServerOpObserver::onReplicationRollback(OperationContext* opCtx,
+                                                   const RollbackObserverInfo& rbInfo) {
     if (rbInfo.configServerConfigVersionRolledBack) {
         // Throw out any cached information related to the cluster ID.
         ShardingCatalogManager::get(opCtx)->discardCachedConfigDatabaseInitializationState();
@@ -110,7 +112,8 @@ void ConfigServerOpObserver::onInserts(OperationContext* opCtx,
                                        std::vector<InsertStatement>::const_iterator begin,
                                        std::vector<InsertStatement>::const_iterator end,
                                        std::vector<bool> fromMigrate,
-                                       bool defaultFromMigrate) {
+                                       bool defaultFromMigrate,
+                                       InsertsOpStateAccumulator* opAccumulator) {
     if (coll->ns().isServerConfigurationCollection()) {
         auto idElement = begin->doc["_id"];
         if (idElement.type() == BSONType::String &&
@@ -155,7 +158,9 @@ void ConfigServerOpObserver::onInserts(OperationContext* opCtx,
     }
 }
 
-void ConfigServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
+void ConfigServerOpObserver::onUpdate(OperationContext* opCtx,
+                                      const OplogUpdateEntryArgs& args,
+                                      OpStateAccumulator* opAccumulator) {
     if (args.coll->ns().isServerConfigurationCollection()) {
         auto idElement = args.updateArgs->updatedDoc["_id"];
         if (idElement.type() == BSONType::String &&

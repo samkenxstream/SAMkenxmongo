@@ -55,7 +55,7 @@ TEST(StaleExceptionTest, StaleConfigInfoSerializationTest) {
 }
 
 TEST(StaleExceptionTest, StaleEpochInfoSerializationTest) {
-    StaleEpochInfo info(kNss);
+    StaleEpochInfo info(kNss, ShardVersion::UNSHARDED(), ShardVersion::UNSHARDED());
 
     // Serialize
     BSONObjBuilder bob;
@@ -65,7 +65,9 @@ TEST(StaleExceptionTest, StaleEpochInfoSerializationTest) {
     auto deserializedInfo =
         std::static_pointer_cast<const StaleEpochInfo>(StaleEpochInfo::parse(bob.obj()));
 
-    ASSERT_EQUALS(deserializedInfo->getNss(), kNss);
+    ASSERT_EQ(deserializedInfo->getNss(), kNss);
+    ASSERT_EQ(deserializedInfo->getVersionReceived(), ShardVersion::UNSHARDED());
+    ASSERT_EQ(deserializedInfo->getVersionWanted(), ShardVersion::UNSHARDED());
 }
 
 }  // namespace

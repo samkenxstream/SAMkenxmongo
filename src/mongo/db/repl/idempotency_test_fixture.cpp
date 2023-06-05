@@ -360,7 +360,7 @@ std::vector<CollectionState> IdempotencyTest::validateAllCollections() {
     auto dbNames = catalog->getAllDbNames();
     for (auto& dbName : dbNames) {
         // Skip local database.
-        if (dbName.db() != "local") {
+        if (dbName.db() != DatabaseName::kLocal.db()) {
             std::vector<NamespaceString> collectionNames;
             {
                 Lock::DBLock lk(_opCtx.get(), dbName, MODE_S);
@@ -459,7 +459,7 @@ template OplogEntry IdempotencyTest::update<const char*>(char const* _id, const 
 BSONObj makeInsertApplyOpsEntry(const NamespaceString& nss, const UUID& uuid, const BSONObj& doc) {
     return BSON("op"
                 << "i"
-                << "ns" << nss.toString() << "ui" << uuid << "o" << doc);
+                << "ns" << nss.toString_forTest() << "ui" << uuid << "o" << doc);
 }
 }  // namespace repl
 }  // namespace mongo

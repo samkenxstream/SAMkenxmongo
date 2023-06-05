@@ -44,6 +44,30 @@
 
 namespace mongo {
 namespace {
+/**
+ * This function replaces field names in *replace* with those from the object
+ * *fieldNames*, preserving field ordering.  Both objects must have the same
+ * number of fields.
+ *
+ * Example:
+ *
+ *     replaceBSONKeyNames({ 'a': 1, 'b' : 1 }, { '': 'foo', '', 'bar' }) =>
+ *
+ *         { 'a' : 'foo' }, { 'b' : 'bar' }
+ */
+BSONObj replaceBSONFieldNames(const BSONObj& replace, const BSONObj& fieldNames) {
+    invariant(replace.nFields() == fieldNames.nFields());
+
+    BSONObjBuilder bob;
+    auto iter = fieldNames.begin();
+
+    for (const BSONElement& el : replace) {
+        bob.appendAs(el, (*iter++).fieldNameStringData());
+    }
+
+    return bob.obj();
+}
+
 void statsToBSON(const QuerySolutionNode* node,
                  BSONObjBuilder* bob,
                  const BSONObjBuilder* topLevelBob) {
@@ -56,7 +80,13 @@ void statsToBSON(const QuerySolutionNode* node,
         return;
     }
 
-    bob->append("stage", stageTypeToString(node->getType()));
+    StageType nodeType = node->getType();
+    if ((nodeType == STAGE_COLLSCAN) &&
+        static_cast<const CollectionScanNode*>(node)->doSbeClusteredCollectionScan()) {
+        bob->append("stage", sbeClusteredCollectionScanToString());
+    } else {
+        bob->append("stage", stageTypeToString(node->getType()));
+    }
     bob->appendNumber("planNodeId", static_cast<long long>(node->nodeId()));
 
     // Display the BSON representation of the filter, if there is one.
@@ -75,6 +105,34 @@ void statsToBSON(const QuerySolutionNode* node,
             if (csn->maxRecord) {
                 csn->maxRecord->appendToBSONAs(bob, "maxRecord");
             }
+            break;
+        }
+        case STAGE_COUNT_SCAN: {
+            auto csn = static_cast<const CountScanNode*>(node);
+
+            bob->append("keyPattern", csn->index.keyPattern);
+            bob->append("indexName", csn->index.identifier.catalogName);
+            auto collation =
+                csn->index.infoObj.getObjectField(IndexDescriptor::kCollationFieldName);
+            if (!collation.isEmpty()) {
+                bob->append("collation", collation);
+            }
+            bob->appendBool("isMultiKey", csn->index.multikey);
+            if (!csn->index.multikeyPaths.empty()) {
+                appendMultikeyPaths(csn->index.keyPattern, csn->index.multikeyPaths, bob);
+            }
+            bob->appendBool("isUnique", csn->index.unique);
+            bob->appendBool("isSparse", csn->index.sparse);
+            bob->appendBool("isPartial", csn->index.filterExpr != nullptr);
+            bob->append("indexVersion", static_cast<int>(csn->index.version));
+
+            BSONObjBuilder indexBoundsBob(bob->subobjStart("indexBounds"));
+            indexBoundsBob.append("startKey",
+                                  replaceBSONFieldNames(csn->startKey, csn->index.keyPattern));
+            indexBoundsBob.append("startKeyInclusive", csn->startKeyInclusive);
+            indexBoundsBob.append("endKey",
+                                  replaceBSONFieldNames(csn->endKey, csn->index.keyPattern));
+            indexBoundsBob.append("endKeyInclusive", csn->endKeyInclusive);
             break;
         }
         case STAGE_GEO_NEAR_2D: {
@@ -477,28 +535,6 @@ std::vector<PlanExplainer::PlanStatsDetails> PlanExplainerSBE::getRejectedPlansS
         res.push_back(buildPlanStatsDetails(
             candidate.solution.get(), *stats, execPlanDebugInfo, boost::none, verbosity));
     }
-    return res;
-}
-
-std::vector<PlanExplainer::PlanStatsDetails> PlanExplainerSBE::getCachedPlanStats(
-    const plan_cache_debug_info::DebugInfo& debugInfo, ExplainOptions::Verbosity verbosity) const {
-    const auto& decision = *debugInfo.decision;
-    std::vector<PlanStatsDetails> res;
-
-    auto&& stats = decision.getStats<mongo::sbe::PlanStageStats>();
-    if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-        for (auto&& planStats : stats.candidatePlanStats) {
-            invariant(planStats);
-            res.push_back(
-                buildPlanStatsDetails(nullptr, *planStats, boost::none, boost::none, verbosity));
-        }
-    } else {
-        // At the "queryPlanner" verbosity we only need to provide details about the winning plan
-        // when explaining from the plan cache.
-        invariant(verbosity == ExplainOptions::Verbosity::kQueryPlanner);
-        res.push_back({stats.serializedWinningPlan, boost::none});
-    }
-
     return res;
 }
 

@@ -42,7 +42,11 @@ const stParams = {
     name: jsTestName(),
     keyFile: key,
     shards: 3,
-    rs: {nodes: 1, setParameter: {internalQueryExecYieldIterations: 1}}
+    rs: {nodes: 1, setParameter: {internalQueryExecYieldIterations: 1}},
+    other: {
+        mongosOptions:
+            {setParameter: {'failpoint.skipClusterParameterRefresh': "{'mode':'alwaysOn'}"}}
+    }
 };
 
 // Create a new sharded cluster for testing. We set the internalQueryExecYieldIterations
@@ -63,7 +67,7 @@ shardConn.waitForClusterTime(60);
 let shardTestDB = shardConn.getDB(jsTestName());
 let shardAdminDB = shardConn.getDB("admin");
 
-function createUsers(conn) {
+function createUsers(conn, grantDirectShardOperationsRole) {
     let adminDB = conn.getDB("admin");
 
     // Create an admin user, one user with the inprog privilege, and one without.
@@ -76,20 +80,31 @@ function createUsers(conn) {
         privileges: [{resource: {cluster: true}, actions: ["inprog"]}]
     }));
 
-    assert.commandWorked(adminDB.runCommand(
-        {createUser: "user_inprog", pwd: "pwd", roles: ["readWriteAnyDatabase", "role_inprog"]}));
+    let rolesUserInprog = ["readWriteAnyDatabase", "role_inprog"];
+    if (grantDirectShardOperationsRole)
+        rolesUserInprog.push("directShardOperations");
+    assert.commandWorked(
+        adminDB.runCommand({createUser: "user_inprog", pwd: "pwd", roles: rolesUserInprog}));
 
-    assert.commandWorked(adminDB.runCommand(
-        {createUser: "user_no_inprog", pwd: "pwd", roles: ["readWriteAnyDatabase"]}));
+    let rolesUserNoInprog = ["readWriteAnyDatabase"];
+    if (grantDirectShardOperationsRole)
+        rolesUserNoInprog.push("directShardOperations");
+
+    assert.commandWorked(
+        adminDB.runCommand({createUser: "user_no_inprog", pwd: "pwd", roles: rolesUserNoInprog}));
 }
 
 // Create necessary users at both cluster and shard-local level.
-if (!TestData.catalogShard) {
-    // In catalog shard mode, the first shard is the config server, so creating the users via mongos
+if (!TestData.configShard) {
+    // In config shard mode, the first shard is the config server, so creating the users via mongos
     // below will also create them on the shard.
-    createUsers(shardConn);
+    createUsers(shardConn, /* grantDirectShardOperationsRole */ true);
+    createUsers(mongosConn, /* grantDirectShardOperationsRole */ false);
+} else {
+    // Since this is making the user on both the config server and the shard, grant it direct shard
+    // operations role.
+    createUsers(mongosConn, /* grantDirectShardOperationsRole */ true);
 }
-createUsers(mongosConn);
 
 // Create a test database and some dummy data on rs0.
 assert(clusterAdminDB.auth("admin", "pwd"));
@@ -479,7 +494,7 @@ assert.commandFailedWithCode(clusterAdminDB.currentOp({$ownOps: true}), ErrorCod
 assert(clusterAdminDB.logout());
 assert(clusterAdminDB.auth("user_inprog", "pwd"));
 
-const expectedOutput = TestData.catalogShard ?
+const expectedOutput = TestData.configShard ?
 [
     {_id: {shard: "aggregation_currentop-rs1", host: st.rs1.getPrimary().host}},
     {_id: {shard: "aggregation_currentop-rs2", host: st.rs2.getPrimary().host}},

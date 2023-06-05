@@ -81,13 +81,18 @@ public:
         OperationContext* opCtx,
         const OpMsgRequest& opMsgRequest,
         boost::optional<ExplainOptions::Verbosity> explainVerbosity) override {
+
+        SerializationContext serializationCtx = SerializationContext::stateCommandRequest();
+        serializationCtx.setTenantIdSource(opMsgRequest.getValidatedTenantId() != boost::none);
+
         const auto aggregationRequest = aggregation_request_helper::parseFromBSON(
             opCtx,
             DatabaseNameUtil::deserialize(opMsgRequest.getValidatedTenantId(),
                                           opMsgRequest.getDatabase()),
             opMsgRequest.body,
             explainVerbosity,
-            APIParameters::get(opCtx).getAPIStrict().value_or(false));
+            APIParameters::get(opCtx).getAPIStrict().value_or(false),
+            serializationCtx);
 
         auto privileges = uassertStatusOK(
             auth::getPrivilegesForAggregate(AuthorizationSession::get(opCtx->getClient()),
@@ -125,6 +130,14 @@ public:
               _liteParsedPipeline(_aggregationRequest),
               _privileges(std::move(privileges)) {
             auto externalDataSources = _aggregationRequest.getExternalDataSources();
+            // Support collection-less aggregate commands without $_externalDataSources.
+            if (_aggregationRequest.getNamespace().isCollectionlessAggregateNS()) {
+                uassert(7604400,
+                        "$_externalDataSources can't be used with the collectionless aggregate",
+                        !externalDataSources.has_value());
+                return;
+            }
+
             uassert(7039000,
                     "Either $_externalDataSources must always be present when enableComputeMode="
                     "true or must not when enableComputeMode=false",
@@ -230,7 +243,8 @@ public:
             if (!_aggregationRequest.getExplain() && !_aggregationRequest.getExchange()) {
                 query_request_helper::validateCursorResponse(
                     reply->getBodyBuilder().asTempObj(),
-                    _aggregationRequest.getNamespace().tenantId());
+                    _aggregationRequest.getNamespace().tenantId(),
+                    _aggregationRequest.getSerializationContext());
             }
         }
 

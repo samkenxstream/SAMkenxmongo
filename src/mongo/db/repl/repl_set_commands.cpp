@@ -281,8 +281,8 @@ HostAndPort someHostAndPortForMe() {
     // We are listening externally, but we don't have a definite hostname.
     // Ask the OS.
     std::string h = getHostName();
-    verify(!h.empty());
-    verify(h != "localhost");
+    MONGO_verify(!h.empty());
+    MONGO_verify(h != "localhost");
     return HostAndPort(h, serverGlobalParams.port);
 }
 
@@ -733,7 +733,7 @@ bool replHasDatabases(OperationContext* opCtx) {
     if (dbNames.size() >= 2)
         return true;
     if (dbNames.size() == 1) {
-        if (dbNames[0].db() != "local")
+        if (dbNames[0].db() != DatabaseName::kLocal.db())
             return true;
 
         // we have a local database.  return true if oplog isn't empty

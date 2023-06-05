@@ -56,7 +56,8 @@ void SessionsCollectionConfigServer::_shardCollectionIfNeeded(OperationContext* 
 
     // If we don't have any shards, we can't set up this collection yet.
     uassert(ErrorCodes::ShardNotFound,
-            str::stream() << "Failed to create " << NamespaceString::kLogicalSessionsNamespace
+            str::stream() << "Failed to create "
+                          << NamespaceString::kLogicalSessionsNamespace.toStringForErrorMsg()
                           << ": cannot create the collection until there are shards",
             Grid::get(opCtx)->shardRegistry()->getNumShards(opCtx) != 0);
 
@@ -64,7 +65,7 @@ void SessionsCollectionConfigServer::_shardCollectionIfNeeded(OperationContext* 
     CreateCollectionRequest requestParamsObj;
     requestParamsObj.setShardKey(BSON("_id" << 1));
     shardsvrCollRequest.setCreateCollectionRequest(std::move(requestParamsObj));
-    shardsvrCollRequest.setDbName(NamespaceString::kLogicalSessionsNamespace.db());
+    shardsvrCollRequest.setDbName(NamespaceString::kLogicalSessionsNamespace.dbName());
 
     cluster::createCollection(opCtx, shardsvrCollRequest);
 }
@@ -99,8 +100,10 @@ void SessionsCollectionConfigServer::_generateIndexesIfNeeded(OperationContext* 
                 SessionsCollection::generateCreateIndexesCmd(),
                 ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                 Shard::RetryPolicy::kNoRetry,
-                BSONObj() /* query */,
-                BSONObj() /* collation */);
+                BSONObj() /*query*/,
+                BSONObj() /*collation*/,
+                boost::none /*letParameters*/,
+                boost::none /*runtimeConstants*/);
         });
 
     for (auto& shardResult : shardResults) {
@@ -128,8 +131,7 @@ void SessionsCollectionConfigServer::setupSessionsCollection(OperationContext* o
             BSON("_id" << NamespaceString::kLogicalSessionsNamespace.ns()
                        << CollectionType::kMaxChunkSizeBytesFieldName << BSON("$exists" << false));
         auto updateQuery = BSON("$set" << BSON(CollectionType::kMaxChunkSizeBytesFieldName
-                                               << logical_sessions::kMaxChunkSizeBytes
-                                               << CollectionType::kNoAutoSplitFieldName << true));
+                                               << logical_sessions::kMaxChunkSizeBytes));
 
         const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
         uassertStatusOK(

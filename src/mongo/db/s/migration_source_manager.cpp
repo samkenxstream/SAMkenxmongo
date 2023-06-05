@@ -143,6 +143,17 @@ std::shared_ptr<MigrationChunkClonerSource> MigrationSourceManager::getCurrentCl
     return msm->_cloneDriver;
 }
 
+// static
+bool MigrationSourceManager::isMigrating(OperationContext* opCtx,
+                                         NamespaceString const& nss,
+                                         BSONObj const& docToDelete) {
+    const auto scopedCsr =
+        CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, nss);
+    auto cloner = MigrationSourceManager::getCurrentCloner(*scopedCsr);
+
+    return cloner && cloner->isDocumentInMigratingChunk(docToDelete);
+}
+
 MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
                                                ShardsvrMoveRange&& request,
                                                WriteConcernOptions&& writeConcern,
@@ -160,7 +171,7 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
                           << _args.getToShard())),
       _moveTimingHelper(_opCtx,
                         "from",
-                        _args.getCommandParameter().ns(),
+                        NamespaceStringUtil::serialize(_args.getCommandParameter()),
                         _args.getMin(),
                         _args.getMax(),
                         6,  // Total number of steps
@@ -294,7 +305,7 @@ void MigrationSourceManager::startClone() {
     uassertStatusOK(ShardingLogging::get(_opCtx)->logChangeChecked(
         _opCtx,
         "moveChunk.start",
-        nss().ns(),
+        NamespaceStringUtil::serialize(nss()),
         BSON("min" << *_args.getMin() << "max" << *_args.getMax() << "from" << _args.getFromShard()
                    << "to" << _args.getToShard()),
         ShardingCatalogClient::kMajorityWriteConcern));
@@ -419,7 +430,7 @@ void MigrationSourceManager::enterCriticalSection() {
     uassertStatusOKWithContext(
         shardmetadatautil::updateShardCollectionsEntry(
             _opCtx,
-            BSON(ShardCollectionType::kNssFieldName << nss().ns()),
+            BSON(ShardCollectionType::kNssFieldName << NamespaceStringUtil::serialize(nss())),
             BSON("$inc" << BSON(ShardCollectionType::kEnterCriticalSectionCounterFieldName << 1)),
             false /*upsert*/),
         "Persist critical section signal for secondaries");
@@ -609,7 +620,7 @@ void MigrationSourceManager::commitChunkMetadataOnConfig() {
     ShardingLogging::get(_opCtx)->logChange(
         _opCtx,
         "moveChunk.commit",
-        nss().ns(),
+        NamespaceStringUtil::serialize(nss()),
         BSON("min" << *_args.getMin() << "max" << *_args.getMax() << "from" << _args.getFromShard()
                    << "to" << _args.getToShard() << "counts" << *_recipientCloneCounts),
         ShardingCatalogClient::kMajorityWriteConcern);
@@ -617,8 +628,8 @@ void MigrationSourceManager::commitChunkMetadataOnConfig() {
     const ChunkRange range(*_args.getMin(), *_args.getMax());
 
     std::string orphanedRangeCleanUpErrMsg = str::stream()
-        << "Moved chunks successfully but failed to clean up " << nss() << " range "
-        << redact(range.toString()) << " due to: ";
+        << "Moved chunks successfully but failed to clean up " << nss().toStringForErrorMsg()
+        << " range " << redact(range.toString()) << " due to: ";
 
     if (_args.getWaitForDelete()) {
         LOGV2(22019,
@@ -652,7 +663,7 @@ void MigrationSourceManager::_cleanupOnError() noexcept {
     ShardingLogging::get(_opCtx)->logChange(
         _opCtx,
         "moveChunk.error",
-        _args.getCommandParameter().ns(),
+        NamespaceStringUtil::serialize(_args.getCommandParameter()),
         BSON("min" << *_args.getMin() << "max" << *_args.getMax() << "from" << _args.getFromShard()
                    << "to" << _args.getToShard()),
         ShardingCatalogClient::kMajorityWriteConcern);
@@ -743,10 +754,6 @@ void MigrationSourceManager::_cleanup(bool completeMigration) noexcept {
             }
 
             auto newClient = _opCtx->getServiceContext()->makeClient("MigrationCoordinator");
-            {
-                stdx::lock_guard<Client> lk(*newClient.get());
-                newClient->setSystemOperationKillableByStepdown(lk);
-            }
             AlternativeClientRegion acr(newClient);
             auto newOpCtxPtr = cc().makeOperationContext();
             auto newOpCtx = newOpCtxPtr.get();

@@ -82,7 +82,6 @@ struct WiredTigerBackup {
     WT_CURSOR* dupCursor = nullptr;
     std::set<std::string> logFilePathsSeenByExtendBackupCursor;
     std::set<std::string> logFilePathsSeenByGetNextBatch;
-    BackupBlock::IdentToNamespaceAndUUIDMap identToNamespaceAndUUIDMap;
 
     // 'wtBackupCursorMutex' provides concurrency control between beginNonBlockingBackup(),
     // endNonBlockingBackup(), and getNextBatch() because we stream the output of the backup cursor.
@@ -349,7 +348,7 @@ public:
      * Returns the minimum possible Timestamp value in the oplog that replication may need for
      * recovery in the event of a rollback. This value depends on the timestamp passed to
      * `setStableTimestamp` and on the set of active MongoDB transactions. Returns an error if it
-     * times out querying the active transctions.
+     * times out querying the active transactions.
      */
     StatusWith<Timestamp> getOplogNeededForRollback() const;
 

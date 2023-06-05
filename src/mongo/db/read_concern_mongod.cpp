@@ -287,11 +287,11 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
                               const repl::ReadConcernArgs& readConcernArgs,
                               const DatabaseName& dbName,
                               bool allowAfterClusterTime) {
-    // If we are in a direct client within a transaction, then we may be holding locks, so it is
-    // illegal to wait for read concern. This is fine, since the outer operation should have handled
-    // waiting for read concern. We don't want to ignore prepare conflicts because reads in
-    // transactions should block on prepared transactions.
-    if (opCtx->getClient()->isInDirectClient() && opCtx->inMultiDocumentTransaction()) {
+    // If we are in a direct client that's holding a global lock, then this means it is illegal to
+    // wait for read concern. This is fine, since the outer operation should have handled waiting
+    // for read concern. We don't want to ignore prepare conflicts because reads in transactions
+    // should block on prepared transactions.
+    if (opCtx->getClient()->isInDirectClient() && opCtx->lockState()->isLocked()) {
         return Status::OK();
     }
 
@@ -461,6 +461,11 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
 
 Status waitForLinearizableReadConcernImpl(OperationContext* opCtx,
                                           const Milliseconds readConcernTimeout) {
+    // If we are in a direct client that's holding a global lock, then this means this is a
+    // sub-operation of the parent. In this case we delegate the wait to the parent.
+    if (opCtx->getClient()->isInDirectClient() && opCtx->lockState()->isLocked()) {
+        return Status::OK();
+    }
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &hangBeforeLinearizableReadConcern, opCtx, "hangBeforeLinearizableReadConcern", [opCtx]() {
             LOGV2(20994,
@@ -473,7 +478,7 @@ Status waitForLinearizableReadConcernImpl(OperationContext* opCtx,
 
     {
         AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
-        if (!replCoord->canAcceptWritesForDatabase(opCtx, "admin")) {
+        if (!replCoord->canAcceptWritesForDatabase(opCtx, DatabaseName::kAdmin)) {
             return {ErrorCodes::NotWritablePrimary,
                     "No longer primary when waiting for linearizable read concern"};
         }
@@ -489,10 +494,7 @@ Status waitForLinearizableReadConcernImpl(OperationContext* opCtx,
         }
 
         writeConflictRetry(
-            opCtx,
-            "waitForLinearizableReadConcern",
-            NamespaceString::kRsOplogNamespace.ns(),
-            [&opCtx] {
+            opCtx, "waitForLinearizableReadConcern", NamespaceString::kRsOplogNamespace, [&opCtx] {
                 WriteUnitOfWork uow(opCtx);
                 opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(
                     opCtx,
@@ -516,6 +518,12 @@ Status waitForLinearizableReadConcernImpl(OperationContext* opCtx,
 Status waitForSpeculativeMajorityReadConcernImpl(
     OperationContext* opCtx, repl::SpeculativeMajorityReadInfo speculativeReadInfo) {
     invariant(speculativeReadInfo.isSpeculativeRead());
+
+    // If we are in a direct client that's holding a global lock, then this means this is a
+    // sub-operation of the parent. In this case we delegate the wait to the parent.
+    if (opCtx->getClient()->isInDirectClient() && opCtx->lockState()->isLocked()) {
+        return Status::OK();
+    }
 
     // Select the timestamp to wait on. A command may have selected a specific timestamp to wait on.
     // If not, then we use the timestamp selected by the read source.

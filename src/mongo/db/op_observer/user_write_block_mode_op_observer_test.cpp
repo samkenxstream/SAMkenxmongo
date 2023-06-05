@@ -91,7 +91,7 @@ protected:
 
         AutoGetCollection autoColl(opCtx, nss, MODE_IX);
         if (!autoColl)
-            FAIL(str::stream() << "Collection " << nss << " doesn't exist");
+            FAIL(str::stream() << "Collection " << nss.toStringForErrorMsg() << " doesn't exist");
 
         UserWriteBlockModeOpObserver opObserver;
         std::vector<InsertStatement> inserts;
@@ -153,19 +153,48 @@ protected:
                 opObserver.onCreateCollection(
                     opCtx, CollectionPtr(), nss, {}, BSONObj(), OplogSlot(), false);
                 opObserver.onCollMod(opCtx, nss, uuid, BSONObj(), {}, boost::none);
-                opObserver.onDropDatabase(opCtx, DatabaseName(boost::none, nss.db()));
+                opObserver.onDropDatabase(opCtx, nss.dbName());
                 opObserver.onDropCollection(
                     opCtx,
                     nss,
                     uuid,
                     0,
-                    UserWriteBlockModeOpObserver::CollectionDropType::kOnePhase);
+                    UserWriteBlockModeOpObserver::CollectionDropType::kOnePhase,
+                    /*markFromMigrate=*/false);
                 opObserver.onDropIndex(opCtx, nss, uuid, "", BSONObj());
                 // For renames, make sure we check both from and to for the given namespace
-                opObserver.preRenameCollection(opCtx, nss, adminNss, uuid, boost::none, 0, false);
-                opObserver.preRenameCollection(opCtx, adminNss, nss, uuid, boost::none, 0, false);
-                opObserver.onRenameCollection(opCtx, nss, adminNss, uuid, boost::none, 0, false);
-                opObserver.onRenameCollection(opCtx, adminNss, nss, uuid, boost::none, 0, false);
+                opObserver.preRenameCollection(opCtx,
+                                               nss,
+                                               adminNss,
+                                               uuid,
+                                               boost::none,
+                                               0,
+                                               /*stayTemp=*/false,
+                                               /*markFromMigrate=*/false);
+                opObserver.preRenameCollection(opCtx,
+                                               adminNss,
+                                               nss,
+                                               uuid,
+                                               boost::none,
+                                               0,
+                                               /*stayTemp=*/false,
+                                               /*markFromMigrate=*/false);
+                opObserver.onRenameCollection(opCtx,
+                                              nss,
+                                              adminNss,
+                                              uuid,
+                                              boost::none,
+                                              0,
+                                              /*stayTemp=*/false,
+                                              /*markFromMigrate=*/false);
+                opObserver.onRenameCollection(opCtx,
+                                              adminNss,
+                                              nss,
+                                              uuid,
+                                              boost::none,
+                                              0,
+                                              /*stayTemp=*/false,
+                                              /*markFromMigrate=*/false);
                 opObserver.onImportCollection(opCtx, uuid, nss, 0, 0, BSONObj(), BSONObj(), false);
             } catch (...) {
                 // Make it easier to see that this is where we failed.
@@ -182,29 +211,53 @@ protected:
                           AssertionException);
             ASSERT_THROWS(opObserver.onCollMod(opCtx, nss, uuid, BSONObj(), {}, boost::none),
                           AssertionException);
-            ASSERT_THROWS(opObserver.onDropDatabase(opCtx, DatabaseName(boost::none, nss.db())),
-                          AssertionException);
+            ASSERT_THROWS(opObserver.onDropDatabase(opCtx, nss.dbName()), AssertionException);
             ASSERT_THROWS(opObserver.onDropCollection(
                               opCtx,
                               nss,
                               uuid,
                               0,
-                              UserWriteBlockModeOpObserver::CollectionDropType::kOnePhase),
+                              UserWriteBlockModeOpObserver::CollectionDropType::kOnePhase,
+                              /*markFromMigrate=*/false),
                           AssertionException);
             ASSERT_THROWS(opObserver.onDropIndex(opCtx, nss, uuid, "", BSONObj()),
                           AssertionException);
-            ASSERT_THROWS(
-                opObserver.preRenameCollection(opCtx, nss, adminNss, uuid, boost::none, 0, false),
-                AssertionException);
-            ASSERT_THROWS(
-                opObserver.preRenameCollection(opCtx, adminNss, nss, uuid, boost::none, 0, false),
-                AssertionException);
-            ASSERT_THROWS(
-                opObserver.onRenameCollection(opCtx, nss, adminNss, uuid, boost::none, 0, false),
-                AssertionException);
-            ASSERT_THROWS(
-                opObserver.onRenameCollection(opCtx, adminNss, nss, uuid, boost::none, 0, false),
-                AssertionException);
+            ASSERT_THROWS(opObserver.preRenameCollection(opCtx,
+                                                         nss,
+                                                         adminNss,
+                                                         uuid,
+                                                         boost::none,
+                                                         0,
+                                                         /*stayTemp=*/false,
+                                                         /*markFromMigrate=*/false),
+                          AssertionException);
+            ASSERT_THROWS(opObserver.preRenameCollection(opCtx,
+                                                         adminNss,
+                                                         nss,
+                                                         uuid,
+                                                         boost::none,
+                                                         0,
+                                                         /*stayTemp=*/false,
+                                                         /*markFromMigrate=*/false),
+                          AssertionException);
+            ASSERT_THROWS(opObserver.onRenameCollection(opCtx,
+                                                        nss,
+                                                        adminNss,
+                                                        uuid,
+                                                        boost::none,
+                                                        0,
+                                                        /*stayTemp=*/false,
+                                                        /*markFromMigrate=*/false),
+                          AssertionException);
+            ASSERT_THROWS(opObserver.onRenameCollection(opCtx,
+                                                        adminNss,
+                                                        nss,
+                                                        uuid,
+                                                        boost::none,
+                                                        0,
+                                                        /*stayTemp=*/false,
+                                                        /*markFromMigrate=*/false),
+                          AssertionException);
             ASSERT_THROWS(
                 opObserver.onImportCollection(opCtx, uuid, nss, 0, 0, BSONObj(), BSONObj(), false),
                 AssertionException);

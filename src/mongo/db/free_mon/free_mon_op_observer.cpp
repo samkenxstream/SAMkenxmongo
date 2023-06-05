@@ -47,7 +47,7 @@ bool isStandaloneOrPrimary(OperationContext* opCtx) {
          repl::MemberState::RS_PRIMARY);
 }
 
-const auto getFreeMonDeleteState = OperationContext::declareDecoration<bool>();
+const auto getFreeMonDeleteState = OplogDeleteEntryArgs::declareDecoration<bool>();
 
 }  // namespace
 
@@ -59,7 +59,8 @@ repl::OpTime FreeMonOpObserver::onDropCollection(OperationContext* opCtx,
                                                  const NamespaceString& collectionName,
                                                  const UUID& uuid,
                                                  std::uint64_t numRecords,
-                                                 const CollectionDropType dropType) {
+                                                 const CollectionDropType dropType,
+                                                 bool markFromMigrate) {
     if (collectionName == NamespaceString::kServerConfigurationNamespace) {
         auto controller = FreeMonController::get(opCtx->getServiceContext());
 
@@ -76,7 +77,8 @@ void FreeMonOpObserver::onInserts(OperationContext* opCtx,
                                   std::vector<InsertStatement>::const_iterator begin,
                                   std::vector<InsertStatement>::const_iterator end,
                                   std::vector<bool> fromMigrate,
-                                  bool defaultFromMigrate) {
+                                  bool defaultFromMigrate,
+                                  InsertsOpStateAccumulator* opAccumulator) {
     if (coll->ns() != NamespaceString::kServerConfigurationNamespace) {
         return;
     }
@@ -100,7 +102,9 @@ void FreeMonOpObserver::onInserts(OperationContext* opCtx,
     }
 }
 
-void FreeMonOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
+void FreeMonOpObserver::onUpdate(OperationContext* opCtx,
+                                 const OplogUpdateEntryArgs& args,
+                                 OpStateAccumulator* opAccumulator) {
     if (args.coll->ns() != NamespaceString::kServerConfigurationNamespace) {
         return;
     }
@@ -120,20 +124,23 @@ void FreeMonOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntry
 
 void FreeMonOpObserver::aboutToDelete(OperationContext* opCtx,
                                       const CollectionPtr& coll,
-                                      const BSONObj& doc) {
+                                      const BSONObj& doc,
+                                      OplogDeleteEntryArgs* args,
+                                      OpStateAccumulator* opAccumulator) {
 
     bool isFreeMonDoc = (coll->ns() == NamespaceString::kServerConfigurationNamespace) &&
         (doc["_id"].str() == FreeMonStorage::kFreeMonDocIdKey);
 
     // Set a flag that indicates whether the document to be delete is the free monitoring state
     // document
-    getFreeMonDeleteState(opCtx) = isFreeMonDoc;
+    getFreeMonDeleteState(args) = isFreeMonDoc;
 }
 
 void FreeMonOpObserver::onDelete(OperationContext* opCtx,
                                  const CollectionPtr& coll,
                                  StmtId stmtId,
-                                 const OplogDeleteEntryArgs& args) {
+                                 const OplogDeleteEntryArgs& args,
+                                 OpStateAccumulator* opAccumulator) {
     if (coll->ns() != NamespaceString::kServerConfigurationNamespace) {
         return;
     }
@@ -142,7 +149,7 @@ void FreeMonOpObserver::onDelete(OperationContext* opCtx,
         return;
     }
 
-    if (getFreeMonDeleteState(opCtx) == true) {
+    if (getFreeMonDeleteState(args) == true) {
         auto controller = FreeMonController::get(opCtx->getServiceContext());
 
         if (controller != nullptr) {
@@ -151,8 +158,8 @@ void FreeMonOpObserver::onDelete(OperationContext* opCtx,
     }
 }
 
-void FreeMonOpObserver::_onReplicationRollback(OperationContext* opCtx,
-                                               const RollbackObserverInfo& rbInfo) {
+void FreeMonOpObserver::onReplicationRollback(OperationContext* opCtx,
+                                              const RollbackObserverInfo& rbInfo) {
     // Invalidate any in-memory auth data if necessary.
     const auto& rollbackNamespaces = rbInfo.rollbackNamespaces;
     if (rollbackNamespaces.count(NamespaceString::kServerConfigurationNamespace) == 1) {

@@ -27,9 +27,6 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/repl/tenant_oplog_applier.h"
 
 #include <algorithm>
@@ -37,7 +34,6 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog_raii.h"
-#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
@@ -61,12 +57,48 @@
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
 
-
 namespace mongo {
 namespace repl {
 
 MONGO_FAIL_POINT_DEFINE(hangInTenantOplogApplication);
 MONGO_FAIL_POINT_DEFINE(fpBeforeTenantOplogApplyingBatch);
+
+enum OplogEntryType {
+    kOplogEntryTypeTransaction,
+    kOplogEntryTypePartialTransaction,
+    kOplogEntryTypeRetryableWrite,
+    kOplogEntryTypeRetryableWritePrePostImage,
+    kOplogEntryTypePreviouslyWrappedRetryableWrite,
+};
+OplogEntryType getOplogEntryType(const OplogEntry& entry) {
+    // Final applyOp for a transaction.
+    if (entry.getTxnNumber() && !entry.isPartialTransaction() &&
+        (entry.getCommandType() == repl::OplogEntry::CommandType::kCommitTransaction ||
+         entry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps)) {
+        return OplogEntryType::kOplogEntryTypeTransaction;
+    }
+
+    // If it has a statement id but isn't a transaction, it's a retryable write.
+    const auto isRetryableWriteEntry =
+        !entry.getStatementIds().empty() && !SessionUpdateTracker::isTransactionEntry(entry);
+
+    // There are two types of no-ops we expect here. One is pre/post image, which will have an empty
+    // o2 field. The other is previously transformed retryable write entries from earlier
+    // migrations, which we should avoid re-wrapping.
+    if (isRetryableWriteEntry && entry.getOpType() == repl::OpTypeEnum::kNoop) {
+        if (entry.getObject2()) {
+            return OplogEntryType::kOplogEntryTypePreviouslyWrappedRetryableWrite;
+        }
+
+        return OplogEntryType::kOplogEntryTypeRetryableWritePrePostImage;
+    }
+
+    if (isRetryableWriteEntry) {
+        return OplogEntryType::kOplogEntryTypeRetryableWrite;
+    }
+
+    return OplogEntryType::kOplogEntryTypePartialTransaction;
+};
 
 TenantOplogApplier::TenantOplogApplier(const UUID& migrationUuid,
                                        const MigrationProtocolEnum& protocol,
@@ -247,8 +279,6 @@ bool TenantOplogApplier::_shouldIgnore(const OplogEntry& entry) {
         return false;
     }
 
-    // TODO SERVER-62491: Update this code path to handle TenantId::kSystemTenantId for internal
-    // collections.
     const auto tenantId =
         tenant_migration_access_blocker::parseTenantIdFromDatabaseName(entry.getNss().dbName());
     tenant_migration_access_blocker::validateNssIsBeingMigrated(
@@ -432,6 +462,202 @@ bool isResumeTokenNoop(const OplogEntry& entry) {
 }
 }  // namespace
 
+void TenantOplogApplier::_writeRetryableWriteEntryNoOp(
+    OperationContext* opCtx,
+    MutableOplogEntry& noopEntry,
+    const OplogEntry& entry,
+    const boost::optional<MutableOplogEntry>& prePostImageEntry,
+    const OpTime& originalPrePostImageOpTime) {
+
+    auto sessionId = *entry.getSessionId();
+    auto txnNumber = *entry.getTxnNumber();
+    auto stmtIds = entry.getStatementIds();
+    LOGV2_DEBUG(5351000,
+                2,
+                "Tenant Oplog Applier processing retryable write",
+                "entry"_attr = redact(entry.toBSONForLogging()),
+                "sessionId"_attr = sessionId,
+                "txnNumber"_attr = txnNumber,
+                "statementIds"_attr = stmtIds,
+                "protocol"_attr = _protocol,
+                "migrationId"_attr = _migrationUuid);
+
+    const auto hasPreOrPostImageOpTime = entry.getPreImageOpTime() || entry.getPostImageOpTime();
+    if (prePostImageEntry && entry.getPreImageOpTime()) {
+        uassert(5351002,
+                str::stream()
+                    << "Tenant oplog application cannot apply retryable write with txnNumber  "
+                    << txnNumber << " statementNumber " << stmtIds.front() << " on session "
+                    << sessionId << " because the preImage op time "
+                    << originalPrePostImageOpTime.toString()
+                    << " does not match the expected optime "
+                    << entry.getPreImageOpTime()->toString(),
+                originalPrePostImageOpTime == entry.getPreImageOpTime());
+        noopEntry.setPreImageOpTime(prePostImageEntry->getOpTime());
+    } else if (prePostImageEntry && entry.getPostImageOpTime()) {
+        uassert(5351007,
+                str::stream()
+                    << "Tenant oplog application cannot apply retryable write with txnNumber  "
+                    << txnNumber << " statementNumber " << stmtIds.front() << " on session "
+                    << sessionId << " because the postImage op time "
+                    << originalPrePostImageOpTime.toString()
+                    << " does not match the expected optime "
+                    << entry.getPostImageOpTime()->toString(),
+                originalPrePostImageOpTime == entry.getPostImageOpTime());
+        noopEntry.setPostImageOpTime(prePostImageEntry->getOpTime());
+    } else if (!prePostImageEntry && hasPreOrPostImageOpTime) {
+        LOGV2(5535302,
+              "Tenant Oplog Applier omitting pre- or post- image for findAndModify",
+              "entry"_attr = redact(entry.toBSONForLogging()),
+              "protocol"_attr = _protocol,
+              "migrationId"_attr = _migrationUuid);
+    }
+
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    uassert(5350900,
+            str::stream() << "Tenant oplog application failed to get retryable write "
+                             "for transaction "
+                          << txnNumber << " on session " << sessionId,
+            txnParticipant);
+    // beginOrContinue throws on failure, which will abort the migration. Failure should
+    // only result from out-of-order processing, which should not happen.
+    TxnNumberAndRetryCounter txnNumberAndRetryCounter{txnNumber};
+    txnParticipant.beginOrContinue(opCtx,
+                                   txnNumberAndRetryCounter,
+                                   boost::none /* autocommit */,
+                                   boost::none /* startTransaction */);
+
+    // We could have an existing lastWriteOpTime for the same retryable write chain from a
+    // previously aborted migration. This could also happen if the tenant being migrated has
+    // previously resided in this replica set. So we want to start a new history chain
+    // instead of linking the newly generated no-op to the existing chain before the current
+    // migration starts. Otherwise, we could have duplicate entries for the same stmtId.
+    invariant(!_cloneFinishedRecipientOpTime.isNull());
+    if (txnParticipant.getLastWriteOpTime() > _cloneFinishedRecipientOpTime) {
+        noopEntry.setPrevWriteOpTimeInTransaction(txnParticipant.getLastWriteOpTime());
+    } else {
+        noopEntry.setPrevWriteOpTimeInTransaction(OpTime());
+
+        // Before we start a new history chain, reset the in-memory retryable write
+        // state in the txnParticipant so it can be built up from scratch again with
+        // the new chain.
+        LOGV2_DEBUG(5709800,
+                    2,
+                    "Tenant oplog applier resetting existing retryable write state",
+                    "lastWriteOpTime"_attr = txnParticipant.getLastWriteOpTime(),
+                    "_cloneFinishedRecipientOpTime"_attr = _cloneFinishedRecipientOpTime,
+                    "sessionId"_attr = sessionId,
+                    "txnNumber"_attr = txnNumber,
+                    "statementIds"_attr = stmtIds,
+                    "protocol"_attr = _protocol,
+                    "migrationId"_attr = _migrationUuid);
+        txnParticipant.invalidate(opCtx);
+        txnParticipant.refreshFromStorageIfNeededNoOplogEntryFetch(opCtx);
+        TxnNumberAndRetryCounter txnNumberAndRetryCounter{txnNumber};
+        txnParticipant.beginOrContinue(opCtx,
+                                       txnNumberAndRetryCounter,
+                                       boost::none /* autocommit */,
+                                       boost::none /* startTransaction */);
+    }
+
+    // We should never process the same donor statement twice, except in failover
+    // cases where we'll also have "forgotten" the statement was executed.
+    uassert(5350902,
+            str::stream() << "Tenant oplog application processed same retryable write "
+                             "twice for transaction "
+                          << txnNumber << " statement " << stmtIds.front() << " on session "
+                          << sessionId,
+            !txnParticipant.checkStatementExecutedNoOplogEntryFetch(opCtx, stmtIds.front()));
+
+    // Set sessionId, txnNumber, and statementId for all ops in a retryable write.
+    noopEntry.setSessionId(sessionId);
+    noopEntry.setTxnNumber(txnNumber);
+    noopEntry.setStatementIds(stmtIds);
+
+    // set fromMigrate on the no-op so the session update tracker recognizes it.
+    noopEntry.setFromMigrate(true);
+
+    // Use the same wallclock time as the noop entry.  The lastWriteOpTime will be filled
+    // in after the no-op is written.
+    auto sessionTxnRecord =
+        SessionTxnRecord{sessionId, txnNumber, OpTime(), noopEntry.getWallClockTime()};
+
+    // If we have a prePostImage no-op without the original entry, do not write it. This can
+    // happen in some very unlikely rollback situations.
+    auto isValidPrePostImageEntry = prePostImageEntry && hasPreOrPostImageOpTime;
+
+    _writeSessionNoOp(opCtx,
+                      noopEntry,
+                      sessionTxnRecord,
+                      stmtIds,
+                      isValidPrePostImageEntry ? prePostImageEntry : boost::none);
+}
+
+void TenantOplogApplier::_writeTransactionEntryNoOp(OperationContext* opCtx,
+                                                    MutableOplogEntry& noopEntry,
+                                                    const OplogEntry& entry) {
+    auto sessionId = *entry.getSessionId();
+    auto txnNumber = *entry.getTxnNumber();
+    auto optTxnRetryCounter = entry.getOperationSessionInfo().getTxnRetryCounter();
+    uassert(ErrorCodes::InvalidOptions,
+            "txnRetryCounter is only supported in sharded clusters",
+            !optTxnRetryCounter.has_value());
+
+    LOGV2_DEBUG(5351502,
+                1,
+                "Tenant Oplog Applier committing transaction",
+                "sessionId"_attr = sessionId,
+                "txnNumber"_attr = txnNumber,
+                "txnRetryCounter"_attr = optTxnRetryCounter,
+                "protocol"_attr = _protocol,
+                "migrationId"_attr = _migrationUuid,
+                "op"_attr = redact(entry.toBSONForLogging()));
+
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    uassert(5351500,
+            str::stream() << "Tenant oplog application failed to get transaction participant "
+                             "for transaction "
+                          << txnNumber << " on session " << sessionId,
+            txnParticipant);
+    // We should only write the noop entry for this transaction commit once.
+    uassert(5351501,
+            str::stream() << "Tenant oplog application cannot apply transaction " << txnNumber
+                          << " on session " << sessionId
+                          << " because the transaction with txnNumberAndRetryCounter "
+                          << txnParticipant.getActiveTxnNumberAndRetryCounter().toBSON()
+                          << " has already started",
+            txnParticipant.getActiveTxnNumberAndRetryCounter().getTxnNumber() < txnNumber);
+    txnParticipant.beginOrContinueTransactionUnconditionally(opCtx,
+                                                             {txnNumber, optTxnRetryCounter});
+
+    // Only set sessionId, txnNumber and txnRetryCounter for the final applyOp in a
+    // transaction.
+    noopEntry.setSessionId(sessionId);
+    noopEntry.setTxnNumber(txnNumber);
+    noopEntry.getOperationSessionInfo().setTxnRetryCounter(optTxnRetryCounter);
+
+    // Write a fake applyOps with the tenantId as the namespace so that this will be picked
+    // up by the committed transaction prefetch pipeline in subsequent migrations.
+    //
+    // Unlike MTM, shard merge copies all tenants from the donor. This means that merge does
+    // not need to filter prefetched committed transactions by tenantId. As a result,
+    // setting a nss containing the tenantId for the fake transaction applyOps entry isn't
+    // necessary.
+    if (_protocol != MigrationProtocolEnum::kShardMerge) {
+        noopEntry.setObject(
+            BSON("applyOps" << BSON_ARRAY(BSON(OplogEntry::kNssFieldName
+                                               << NamespaceString(*_tenantId + "_", "").ns()))));
+    }
+
+    // Use the same wallclock time as the noop entry.
+    auto sessionTxnRecord =
+        SessionTxnRecord{sessionId, txnNumber, OpTime(), noopEntry.getWallClockTime()};
+    sessionTxnRecord.setState(DurableTxnStateEnum::kCommitted);
+    sessionTxnRecord.setTxnRetryCounter(optTxnRetryCounter);
+
+    _writeSessionNoOp(opCtx, noopEntry, sessionTxnRecord);
+}
+
 TenantOplogApplier::OpTimePair TenantOplogApplier::_writeNoOpEntries(
     OperationContext* opCtx, const TenantOplogBatch& batch) {
     auto* opObserver = cc().getServiceContext()->getOpObserver();
@@ -469,6 +695,12 @@ TenantOplogApplier::OpTimePair TenantOplogApplier::_writeNoOpEntries(
         }
         // Group oplog entries from the same session for noop writes.
         if (auto sessionId = op.entry.getOperationSessionInfo().getSessionId()) {
+            uassert(ErrorCodes::RetryableInternalTransactionNotSupported,
+                    str::stream() << "Tenant migration doesn't support retryable retryable "
+                                     "internal transaction. SessionId:: "
+                                  << sessionId->toBSON(),
+                    _protocol == MigrationProtocolEnum::kShardMerge ||
+                        !isInternalSessionForRetryableWrite(*sessionId));
             sessionOps[*sessionId].emplace_back(&op.entry, slotIter);
         } else {
             nonSessionOps.emplace_back(&op.entry, slotIter);
@@ -504,7 +736,7 @@ TenantOplogApplier::OpTimePair TenantOplogApplier::_writeNoOpEntries(
         if (thread == numOplogThreads - 1) {
             numOps = numOpsRemaining;
         }
-        _writerPool->schedule([=, &status = statusVector.at(thread)](auto scheduleStatus) {
+        _writerPool->schedule([=, this, &status = statusVector.at(thread)](auto scheduleStatus) {
             if (!scheduleStatus.isOK()) {
                 status = scheduleStatus;
             } else {
@@ -523,18 +755,19 @@ TenantOplogApplier::OpTimePair TenantOplogApplier::_writeNoOpEntries(
     // Dispatch noop writes for oplog entries from the same session into the same writer thread.
     size_t sessionThreadNum = 0;
     for (const auto& s : sessionOps) {
-        _writerPool->schedule([=, &status = statusVector.at(numOplogThreads + sessionThreadNum)](
-                                  auto scheduleStatus) {
-            if (!scheduleStatus.isOK()) {
-                status = scheduleStatus;
-            } else {
-                try {
-                    _writeSessionNoOpsForRange(s.second.begin(), s.second.end());
-                } catch (const DBException& e) {
-                    status = e.toStatus();
+        _writerPool->schedule(
+            [=, this, &status = statusVector.at(numOplogThreads + sessionThreadNum)](
+                auto scheduleStatus) {
+                if (!scheduleStatus.isOK()) {
+                    status = scheduleStatus;
+                } else {
+                    try {
+                        _writeSessionNoOpsForRange(s.second.begin(), s.second.end());
+                    } catch (const DBException& e) {
+                        status = e.toStatus();
+                    }
                 }
-            }
-        });
+            });
         sessionThreadNum++;
     }
 
@@ -552,6 +785,42 @@ TenantOplogApplier::OpTimePair TenantOplogApplier::_writeNoOpEntries(
         uassertStatusOK(status);
     }
     return {batch.ops.back().entry.getOpTime(), greatestOplogSlotUsed};
+}
+
+void TenantOplogApplier::_writeSessionNoOp(OperationContext* opCtx,
+                                           MutableOplogEntry& noopEntry,
+                                           boost::optional<SessionTxnRecord> sessionTxnRecord,
+                                           std::vector<StmtId> stmtIds,
+                                           boost::optional<MutableOplogEntry> prePostImageEntry) {
+    LOGV2_DEBUG(5535700,
+                2,
+                "Tenant Oplog Applier writing session no-op",
+                "protocol"_attr = _protocol,
+                "migrationId"_attr = _migrationUuid,
+                "op"_attr = redact(noopEntry.toBSON()));
+
+    AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+    boost::optional<Lock::TenantLock> tenantLock;
+    if (auto tid = noopEntry.getTid()) {
+        tenantLock.emplace(opCtx, *tid, MODE_IX);
+    }
+
+    writeConflictRetry(opCtx, "writeTenantNoOps", NamespaceString::kRsOplogNamespace, [&] {
+        WriteUnitOfWork wuow(opCtx);
+
+        // Write the pre/post image entry, if it exists.
+        if (prePostImageEntry)
+            repl::logOp(opCtx, &*prePostImageEntry);
+        // Write the noop entry and update config.transactions.
+        auto oplogOpTime = repl::logOp(opCtx, &noopEntry);
+        if (sessionTxnRecord) {
+            sessionTxnRecord->setLastWriteOpTime(oplogOpTime);
+            TransactionParticipant::get(opCtx).onWriteOpCompletedOnPrimary(
+                opCtx, {stmtIds}, *sessionTxnRecord);
+        }
+
+        wuow.commit();
+    });
 }
 
 void TenantOplogApplier::_writeSessionNoOpsForRange(
@@ -597,311 +866,103 @@ void TenantOplogApplier::_writeSessionNoOpsForRange(
         noopEntry.setObject2(entry.getEntry().toBSON());
         noopEntry.setOpTime(*iter->second);
         noopEntry.setWallClockTime(opCtx->getServiceContext()->getFastClockSource()->now());
-        noopEntry.setTid(entry.getTid());
 
-        boost::optional<SessionTxnRecord> sessionTxnRecord;
-        std::vector<StmtId> stmtIds;
-        boost::optional<OpTime> prevWriteOpTime = boost::none;
-        if (entry.getTxnNumber() && !entry.isPartialTransaction() &&
-            (entry.getCommandType() == repl::OplogEntry::CommandType::kCommitTransaction ||
-             entry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps)) {
-            // Final applyOp for a transaction.
-            auto sessionId = *entry.getSessionId();
-            auto txnNumber = *entry.getTxnNumber();
-            auto optTxnRetryCounter = entry.getOperationSessionInfo().getTxnRetryCounter();
-            uassert(ErrorCodes::InvalidOptions,
-                    "txnRetryCounter is only supported in sharded clusters",
-                    !optTxnRetryCounter.has_value());
-            {
-                auto lk = stdx::lock_guard(*opCtx->getClient());
-                opCtx->setLogicalSessionId(sessionId);
-                opCtx->setTxnNumber(txnNumber);
-                opCtx->setInMultiDocumentTransaction();
-            }
-            LOGV2_DEBUG(5351502,
-                        1,
-                        "Tenant Oplog Applier committing transaction",
-                        "sessionId"_attr = sessionId,
-                        "txnNumber"_attr = txnNumber,
-                        "txnRetryCounter"_attr = optTxnRetryCounter,
-                        "protocol"_attr = _protocol,
-                        "migrationId"_attr = _migrationUuid,
-                        "op"_attr = redact(entry.toBSONForLogging()));
-
-            // Check out the session.
-            if (!scopedSession) {
-                auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx.get());
-                scopedSession = mongoDSessionCatalog->checkOutSessionWithoutOplogRead(opCtx.get());
-            }
-
-            auto txnParticipant = TransactionParticipant::get(opCtx.get());
-            uassert(
-                5351500,
-                str::stream() << "Tenant oplog application failed to get transaction participant "
-                                 "for transaction "
-                              << txnNumber << " on session " << sessionId,
-                txnParticipant);
-            // We should only write the noop entry for this transaction commit once.
-            uassert(5351501,
-                    str::stream() << "Tenant oplog application cannot apply transaction "
-                                  << txnNumber << " on session " << sessionId
-                                  << " because the transaction with txnNumberAndRetryCounter "
-                                  << txnParticipant.getActiveTxnNumberAndRetryCounter().toBSON()
-                                  << " has already started",
-                    txnParticipant.getActiveTxnNumberAndRetryCounter().getTxnNumber() < txnNumber);
-            txnParticipant.beginOrContinueTransactionUnconditionally(
-                opCtx.get(), {txnNumber, optTxnRetryCounter});
-
-            // Only set sessionId, txnNumber and txnRetryCounter for the final applyOp in a
-            // transaction.
-            noopEntry.setSessionId(sessionId);
-            noopEntry.setTxnNumber(txnNumber);
-            noopEntry.getOperationSessionInfo().setTxnRetryCounter(optTxnRetryCounter);
-
-            // Write a fake applyOps with the tenantId as the namespace so that this will be picked
-            // up by the committed transaction prefetch pipeline in subsequent migrations.
-            //
-            // Unlike MTM, shard merge copies all tenants from the donor. This means that merge does
-            // not need to filter prefetched committed transactions by tenantId. As a result,
-            // setting a nss containing the tenantId for the fake transaction applyOps entry isn't
-            // necessary.
-            if (_protocol != MigrationProtocolEnum::kShardMerge) {
-                noopEntry.setObject(BSON(
-                    "applyOps" << BSON_ARRAY(BSON(OplogEntry::kNssFieldName
-                                                  << NamespaceString(*_tenantId + "_", "").ns()))));
-            }
-
-            // Use the same wallclock time as the noop entry.
-            sessionTxnRecord.emplace(sessionId, txnNumber, OpTime(), noopEntry.getWallClockTime());
-            sessionTxnRecord->setState(DurableTxnStateEnum::kCommitted);
-            sessionTxnRecord->setTxnRetryCounter(optTxnRetryCounter);
-
-            // If we have a prePostImage no-op here, it is orphaned; this can happen in some
-            // very unlikely rollback situations.
-            prePostImageEntry = boost::none;
-        } else if (!entry.getStatementIds().empty() &&
-                   !SessionUpdateTracker::isTransactionEntry(entry)) {
-            // If it has a statement id but isn't a transaction, it's a retryable write.
-            auto sessionId = *entry.getSessionId();
-            auto txnNumber = *entry.getTxnNumber();
-            auto entryStmtIds = entry.getStatementIds();
-            LOGV2_DEBUG(5351000,
-                        2,
-                        "Tenant Oplog Applier processing retryable write",
-                        "entry"_attr = redact(entry.toBSONForLogging()),
-                        "sessionId"_attr = sessionId,
-                        "txnNumber"_attr = txnNumber,
-                        "statementIds"_attr = entryStmtIds,
-                        "protocol"_attr = _protocol,
-                        "migrationId"_attr = _migrationUuid);
-            if (entry.getOpType() == repl::OpTypeEnum::kNoop) {
-                // There are two types of no-ops we expect here.  One is pre/post image, which
-                // will have an empty o2 field.  The other is previously transformed oplog
-                // entries from earlier migrations.
-
-                // We don't wrap the no-ops in another no-op.
-                // If object2 is missing, this is a preImage/postImage.
-                if (!entry.getObject2()) {
-                    // *noopEntry.getObject2() is the original migrated no-op in BSON format.
-                    prePostImageEntry =
-                        uassertStatusOK(MutableOplogEntry::parse(*noopEntry.getObject2()));
-                    originalPrePostImageOpTime = entry.getOpTime();
-                    prePostImageEntry->setOpTime(noopEntry.getOpTime());
-                    prePostImageEntry->setWallClockTime(noopEntry.getWallClockTime());
-                    prePostImageEntry->setFromMigrate(true);
-                    // Clear the old tenant migration UUID.
-                    prePostImageEntry->setFromTenantMigration(boost::none);
-                    // Don't write the no-op entry.
-                    continue;
-                } else {
-                    // Otherwise this is a previously migrated retryable write.  Avoid
-                    // re-wrapping it.
-                    uassert(5351003,
-                            str::stream() << "Tenant Oplog Applier received unexpected Empty o2 "
-                                             "field (original oplog entry) in migrated noop: "
-                                          << redact(entry.toBSONForLogging()),
-                            !entry.getObject2()->isEmpty());
-                    // *noopEntry.getObject2() is the original migrated no-op in BSON format.
-                    noopEntry = uassertStatusOK(MutableOplogEntry::parse(*noopEntry.getObject2()));
-                    noopEntry.setOpTime(*iter->second);
-                    noopEntry.setWallClockTime(
-                        opCtx->getServiceContext()->getFastClockSource()->now());
-                    // Clear the old tenant migration UUID.
-                    noopEntry.setFromTenantMigration(boost::none);
-
-                    // Set the inner 'o2' optime to the donor entry's optime because the recipient
-                    // uses the timestamp in 'o2' to determine where to resume applying from.
-                    auto o2Entry = uassertStatusOK(MutableOplogEntry::parse(*entry.getObject2()));
-                    o2Entry.setOpTime(entry.getOpTime());
-                    o2Entry.setWallClockTime(entry.getWallClockTime());
-                    noopEntry.setObject2(o2Entry.toBSON());
-                }
-            }
-            stmtIds.insert(stmtIds.end(), entryStmtIds.begin(), entryStmtIds.end());
-
-            if (!prePostImageEntry && (entry.getPreImageOpTime() || entry.getPostImageOpTime())) {
-                LOGV2(5535302,
-                      "Tenant Oplog Applier omitting pre- or post- image for findAndModify",
-                      "entry"_attr = redact(entry.toBSONForLogging()),
-                      "protocol"_attr = _protocol,
-                      "migrationId"_attr = _migrationUuid);
-            } else if (entry.getPreImageOpTime()) {
-                uassert(
-                    5351002,
-                    str::stream()
-                        << "Tenant oplog application cannot apply retryable write with txnNumber  "
-                        << txnNumber << " statementNumber " << stmtIds.front() << " on session "
-                        << sessionId << " because the preImage op time "
-                        << originalPrePostImageOpTime.toString()
-                        << " does not match the expected optime "
-                        << entry.getPreImageOpTime()->toString(),
-                    originalPrePostImageOpTime == entry.getPreImageOpTime());
-                noopEntry.setPreImageOpTime(prePostImageEntry->getOpTime());
-            } else if (entry.getPostImageOpTime()) {
-                uassert(
-                    5351007,
-                    str::stream()
-                        << "Tenant oplog application cannot apply retryable write with txnNumber  "
-                        << txnNumber << " statementNumber " << stmtIds.front() << " on session "
-                        << sessionId << " because the postImage op time "
-                        << originalPrePostImageOpTime.toString()
-                        << " does not match the expected optime "
-                        << entry.getPostImageOpTime()->toString(),
-                    originalPrePostImageOpTime == entry.getPostImageOpTime());
-                noopEntry.setPostImageOpTime(prePostImageEntry->getOpTime());
-            } else {
-                // Got a prePostImage no-op without the original entry; this can happen in some
-                // very unlikely rollback situations.
-                prePostImageEntry = boost::none;
-            }
-
-            {
-                auto lk = stdx::lock_guard(*opCtx->getClient());
-                opCtx->setLogicalSessionId(sessionId);
-                opCtx->setTxnNumber(txnNumber);
-            }
-            if (!scopedSession) {
-                auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx.get());
-                scopedSession = mongoDSessionCatalog->checkOutSessionWithoutOplogRead(opCtx.get());
-            }
-
-            auto txnParticipant = TransactionParticipant::get(opCtx.get());
-            uassert(5350900,
-                    str::stream() << "Tenant oplog application failed to get retryable write "
-                                     "for transaction "
-                                  << txnNumber << " on session " << sessionId,
-                    txnParticipant);
-            // beginOrContinue throws on failure, which will abort the migration. Failure should
-            // only result from out-of-order processing, which should not happen.
-            TxnNumberAndRetryCounter txnNumberAndRetryCounter{txnNumber};
-            txnParticipant.beginOrContinue(opCtx.get(),
-                                           txnNumberAndRetryCounter,
-                                           boost::none /* autocommit */,
-                                           boost::none /* startTransaction */);
-
-            // We could have an existing lastWriteOpTime for the same retryable write chain from a
-            // previously aborted migration. This could also happen if the tenant being migrated has
-            // previously resided in this replica set. So we want to start a new history chain
-            // instead of linking the newly generated no-op to the existing chain before the current
-            // migration starts. Otherwise, we could have duplicate entries for the same stmtId.
-            invariant(!_cloneFinishedRecipientOpTime.isNull());
-            if (txnParticipant.getLastWriteOpTime() > _cloneFinishedRecipientOpTime) {
-                prevWriteOpTime = txnParticipant.getLastWriteOpTime();
-            } else {
-                prevWriteOpTime = OpTime();
-
-                // Before we start a new history chain, reset the in-memory retryable write
-                // state in the txnParticipant so it can be built up from scratch again with
-                // the new chain.
-                LOGV2_DEBUG(5709800,
-                            2,
-                            "Tenant oplog applier resetting existing retryable write state",
-                            "lastWriteOpTime"_attr = txnParticipant.getLastWriteOpTime(),
-                            "_cloneFinishedRecipientOpTime"_attr = _cloneFinishedRecipientOpTime,
-                            "sessionId"_attr = sessionId,
-                            "txnNumber"_attr = txnNumber,
-                            "statementIds"_attr = entryStmtIds,
-                            "protocol"_attr = _protocol,
-                            "migrationId"_attr = _migrationUuid);
-                txnParticipant.invalidate(opCtx.get());
-                txnParticipant.refreshFromStorageIfNeededNoOplogEntryFetch(opCtx.get());
-                TxnNumberAndRetryCounter txnNumberAndRetryCounter{txnNumber};
-                txnParticipant.beginOrContinue(opCtx.get(),
-                                               txnNumberAndRetryCounter,
-                                               boost::none /* autocommit */,
-                                               boost::none /* startTransaction */);
-            }
-
-            // We should never process the same donor statement twice, except in failover
-            // cases where we'll also have "forgotten" the statement was executed.
-            uassert(5350902,
-                    str::stream() << "Tenant oplog application processed same retryable write "
-                                     "twice for transaction "
-                                  << txnNumber << " statement " << entryStmtIds.front()
-                                  << " on session " << sessionId,
-                    !txnParticipant.checkStatementExecutedNoOplogEntryFetch(opCtx.get(),
-                                                                            entryStmtIds.front()));
-
-            // Set sessionId, txnNumber, and statementId for all ops in a retryable write.
-            noopEntry.setSessionId(sessionId);
-            noopEntry.setTxnNumber(txnNumber);
-            noopEntry.setStatementIds(entryStmtIds);
-
-            // set fromMigrate on the no-op so the session update tracker recognizes it.
-            noopEntry.setFromMigrate(true);
-
-            // Use the same wallclock time as the noop entry.  The lastWriteOpTime will be filled
-            // in after the no-op is written.
-            sessionTxnRecord.emplace(sessionId, txnNumber, OpTime(), noopEntry.getWallClockTime());
-        } else {
-            // This is a partial transaction oplog entry.
-
-            // If we have a prePostImage no-op here, it is orphaned; this can happen in some
-            // very unlikely rollback situations.
-            prePostImageEntry = boost::none;
-        }
-
-        noopEntry.setPrevWriteOpTimeInTransaction(prevWriteOpTime);
-
-        LOGV2_DEBUG(5535700,
-                    2,
-                    "Tenant Oplog Applier writing session no-op",
-                    "protocol"_attr = _protocol,
-                    "migrationId"_attr = _migrationUuid,
-                    "op"_attr = redact(noopEntry.toBSON()));
-
-        AutoGetOplog oplogWrite(opCtx.get(), OplogAccessMode::kWrite);
-        boost::optional<Lock::TenantLock> tenantLock;
         boost::optional<TenantId> tenantId = [&]() -> boost::optional<TenantId> {
-            if (_tenantId) {
+            if (_protocol == MigrationProtocolEnum::kMultitenantMigrations && _tenantId) {
                 return TenantId{OID::createFromString(*_tenantId)};
             }
-            if (entry.getTid()) {
+            if (_protocol == MigrationProtocolEnum::kShardMerge && entry.getTid()) {
                 return *entry.getTid();
             }
             return boost::none;
         }();
-        if (tenantId) {
-            tenantLock.emplace(opCtx.get(), *tenantId, MODE_IX);
-        }
+        noopEntry.setTid(tenantId);
 
-        writeConflictRetry(
-            opCtx.get(), "writeTenantNoOps", NamespaceString::kRsOplogNamespace.ns(), [&] {
-                WriteUnitOfWork wuow(opCtx.get());
+        switch (getOplogEntryType(entry)) {
+            case OplogEntryType::kOplogEntryTypeRetryableWritePrePostImage: {
+                // entry.getEntry().toBSON() is the pre- or post-image in BSON format.
+                prePostImageEntry =
+                    uassertStatusOK(MutableOplogEntry::parse(entry.getEntry().toBSON()));
+                originalPrePostImageOpTime = entry.getOpTime();
+                prePostImageEntry->setOpTime(*iter->second);
+                prePostImageEntry->setWallClockTime(
+                    opCtx->getServiceContext()->getFastClockSource()->now());
+                prePostImageEntry->setFromMigrate(true);
+                // Clear the old tenant migration UUID.
+                prePostImageEntry->setFromTenantMigration(boost::none);
+                // Don't write the no-op entry, both the no-op entry and prePostImage entry will be
+                // written on the next iteration.
+                continue;
+            }
+            case OplogEntryType::kOplogEntryTypePreviouslyWrappedRetryableWrite: {
+                uassert(5351003,
+                        str::stream() << "Tenant Oplog Applier received unexpected Empty o2 "
+                                         "field (original oplog entry) in migrated noop: "
+                                      << redact(entry.toBSONForLogging()),
+                        !entry.getObject2()->isEmpty());
+                // entry.getEntry().toBSON() is the original migrated no-op in BSON format.
+                noopEntry = uassertStatusOK(MutableOplogEntry::parse(entry.getEntry().toBSON()));
+                noopEntry.setOpTime(*iter->second);
+                noopEntry.setWallClockTime(opCtx->getServiceContext()->getFastClockSource()->now());
+                // Clear the old tenant migration UUID.
+                noopEntry.setFromTenantMigration(boost::none);
 
-                // Write the pre/post image entry, if it exists.
-                if (prePostImageEntry)
-                    repl::logOp(opCtx.get(), &*prePostImageEntry);
-                // Write the noop entry and update config.transactions.
-                auto oplogOpTime = repl::logOp(opCtx.get(), &noopEntry);
-                if (sessionTxnRecord) {
-                    sessionTxnRecord->setLastWriteOpTime(oplogOpTime);
-                    TransactionParticipant::get(opCtx.get())
-                        .onWriteOpCompletedOnPrimary(opCtx.get(), {stmtIds}, *sessionTxnRecord);
+                // Set the inner 'o2' optime to the donor entry's optime because the recipient
+                // uses the timestamp in 'o2' to determine where to resume applying from.
+                auto o2Entry = uassertStatusOK(MutableOplogEntry::parse(*entry.getObject2()));
+                o2Entry.setOpTime(entry.getOpTime());
+                o2Entry.setWallClockTime(entry.getWallClockTime());
+                noopEntry.setObject2(o2Entry.toBSON());
+
+                // Handle as for kOplogEntryTypeRetryableWrite after extracting original op.
+                [[fallthrough]];
+            }
+            case OplogEntryType::kOplogEntryTypeRetryableWrite: {
+                {
+                    auto lk = stdx::lock_guard(*opCtx->getClient());
+                    opCtx->setLogicalSessionId(*entry.getSessionId());
+                    opCtx->setTxnNumber(*entry.getTxnNumber());
                 }
 
-                wuow.commit();
-            });
+                if (!scopedSession) {
+                    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx.get());
+                    scopedSession =
+                        mongoDSessionCatalog->checkOutSessionWithoutOplogRead(opCtx.get());
+                }
+
+                _writeRetryableWriteEntryNoOp(
+                    opCtx.get(), noopEntry, entry, prePostImageEntry, originalPrePostImageOpTime);
+                break;
+            }
+            case OplogEntryType::kOplogEntryTypePartialTransaction: {
+                _writeSessionNoOp(opCtx.get(), noopEntry);
+                break;
+            }
+            case OplogEntryType::kOplogEntryTypeTransaction: {
+                {
+                    auto lk = stdx::lock_guard(*opCtx->getClient());
+                    opCtx->setLogicalSessionId(*entry.getSessionId());
+                    opCtx->setTxnNumber(*entry.getTxnNumber());
+                    opCtx->setInMultiDocumentTransaction();
+                }
+
+                // Check out the session.
+                if (!scopedSession) {
+                    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx.get());
+                    scopedSession =
+                        mongoDSessionCatalog->checkOutSessionWithoutOplogRead(opCtx.get());
+                }
+
+                _writeTransactionEntryNoOp(opCtx.get(), noopEntry, entry);
+                break;
+            }
+            default:
+                MONGO_UNREACHABLE;
+        }
+
+        // If we have a prePostImage no-op here that hasn't already been logged, it is orphaned;
+        // this can happen in some very unlikely rollback situations. Otherwise, the image entry
+        // should have been written at this point so we need to reset it for the next iteration.
         prePostImageEntry = boost::none;
 
         // Invalidate in-memory state so that the next time the session is checked out, it
@@ -933,36 +994,35 @@ void TenantOplogApplier::_writeNoOpsForRange(OpObserver* opObserver,
     AutoGetOplog oplogWrite(opCtx.get(), OplogAccessMode::kWrite);
     auto tenantLocks = _acquireIntentExclusiveTenantLocks(opCtx.get(), begin, end);
 
-    writeConflictRetry(
-        opCtx.get(), "writeTenantNoOps", NamespaceString::kRsOplogNamespace.ns(), [&] {
-            WriteUnitOfWork wuow(opCtx.get());
-            for (auto iter = begin; iter != end; iter++) {
-                const auto& entry = *iter->first;
-                if (isResumeTokenNoop(entry)) {
-                    // We don't want to write noops for resume token noop oplog entries. They would
-                    // not be applied in a change stream anyways.
-                    continue;
-                }
-                // We don't need to link no-ops entries for operations done outside of a session.
-                const boost::optional<OpTime> preImageOpTime = boost::none;
-                const boost::optional<OpTime> postImageOpTime = boost::none;
-                const boost::optional<OpTime> prevWriteOpTimeInTransaction = boost::none;
-                opObserver->onInternalOpMessage(
-                    opCtx.get(),
-                    entry.getNss(),
-                    entry.getUuid(),
-                    {},  // Empty 'o' field.
-                    entry.getEntry().toBSON(),
-                    // We link the no-ops together by recipient op time the same way the actual ops
-                    // were linked together by donor op time.  This is to allow retryable writes
-                    // and changestreams to find the ops they need.
-                    preImageOpTime,
-                    postImageOpTime,
-                    prevWriteOpTimeInTransaction,
-                    *iter->second);
+    writeConflictRetry(opCtx.get(), "writeTenantNoOps", NamespaceString::kRsOplogNamespace, [&] {
+        WriteUnitOfWork wuow(opCtx.get());
+        for (auto iter = begin; iter != end; iter++) {
+            const auto& entry = *iter->first;
+            if (isResumeTokenNoop(entry)) {
+                // We don't want to write noops for resume token noop oplog entries. They would
+                // not be applied in a change stream anyways.
+                continue;
             }
-            wuow.commit();
-        });
+            // We don't need to link no-ops entries for operations done outside of a session.
+            const boost::optional<OpTime> preImageOpTime = boost::none;
+            const boost::optional<OpTime> postImageOpTime = boost::none;
+            const boost::optional<OpTime> prevWriteOpTimeInTransaction = boost::none;
+            opObserver->onInternalOpMessage(
+                opCtx.get(),
+                entry.getNss(),
+                entry.getUuid(),
+                {},  // Empty 'o' field.
+                entry.getEntry().toBSON(),
+                // We link the no-ops together by recipient op time the same way the actual ops
+                // were linked together by donor op time.  This is to allow retryable writes
+                // and changestreams to find the ops they need.
+                preImageOpTime,
+                postImageOpTime,
+                prevWriteOpTimeInTransaction,
+                *iter->second);
+        }
+        wuow.commit();
+    });
 }
 std::vector<Lock::TenantLock> TenantOplogApplier::_acquireIntentExclusiveTenantLocks(
     OperationContext* opCtx,
@@ -1040,6 +1100,7 @@ std::vector<std::vector<ApplierOperation>> TenantOplogApplier::_fillWriterVector
                     isTransactionWithCommand = true;
                 }
             }
+
             if (op.ignore) {
                 continue;
             }

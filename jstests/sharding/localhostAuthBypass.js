@@ -27,9 +27,9 @@ var createUser = function(mongo) {
 };
 
 var addUsersToEachShard = function(st) {
-    // In catalog shard mode skip the first shard because it is also the config server and will
+    // In config shard mode skip the first shard because it is also the config server and will
     // already have a user made on it through mongos.
-    for (var i = TestData.catalogShard ? 1 : 0; i < numShards; i++) {
+    for (var i = TestData.configShard ? 1 : 0; i < numShards; i++) {
         print("============ adding a user to shard " + i);
         var d = st["shard" + i];
         d.getDB("admin").createUser({user: username, pwd: password, roles: jsTest.adminUserRoles});
@@ -38,7 +38,7 @@ var addUsersToEachShard = function(st) {
 
 var addShard = function(st, shouldPass) {
     adhocShard++;
-    var rs =
+    const rs =
         new ReplSetTest({nodes: 1, host: 'localhost', name: 'localhostAuthShard-' + adhocShard});
     rs.startSet({shardsvr: "", keyFile: keyfile, auth: ""});
     rs.initiate();

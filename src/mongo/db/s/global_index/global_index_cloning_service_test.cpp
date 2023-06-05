@@ -307,10 +307,10 @@ public:
         replaceFetcherResultList(std::move(fetcherResults));
 
         CreateGlobalIndex createGlobalIndex(_indexCollectionUUID);
-        createGlobalIndex.setDbName({boost::none, "admin"});
+        createGlobalIndex.setDbName(DatabaseName::kAdmin);
         BSONObj cmdResult;
         auto success =
-            client.runCommand({boost::none, "admin"}, createGlobalIndex.toBSON({}), cmdResult);
+            client.runCommand(DatabaseName::kAdmin, createGlobalIndex.toBSON({}), cmdResult);
         ASSERT(success) << "createGlobalIndex cmd failed with result: " << cmdResult;
     }
 

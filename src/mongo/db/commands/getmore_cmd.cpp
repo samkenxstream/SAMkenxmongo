@@ -56,6 +56,7 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/resource_consumption_metrics.h"
@@ -164,13 +165,14 @@ void validateAuthorization(const OperationContext* opCtx, const ClientCursor& cu
  */
 void validateNamespace(const NamespaceString& commandNss, const ClientCursor& cursor) {
     uassert(ErrorCodes::Unauthorized,
-            str::stream() << "Requested getMore on namespace '" << commandNss.ns()
-                          << "', but cursor belongs to a different namespace " << cursor.nss().ns(),
+            str::stream() << "Requested getMore on namespace '" << commandNss.toStringForErrorMsg()
+                          << "', but cursor belongs to a different namespace "
+                          << cursor.nss().toStringForErrorMsg(),
             commandNss == cursor.nss());
 
     if (commandNss.isOplog() && MONGO_unlikely(rsStopGetMoreCmd.shouldFail())) {
         uasserted(ErrorCodes::CommandFailed,
-                  str::stream() << "getMore on " << commandNss.ns()
+                  str::stream() << "getMore on " << commandNss.toStringForErrorMsg()
                                 << " rejected due to active fail point rsStopGetMoreCmd");
     }
 }
@@ -325,7 +327,7 @@ public:
             NamespaceString nss(NamespaceStringUtil::parseNamespaceFromRequest(
                 _cmd.getDbName(), _cmd.getCollection()));
             uassert(ErrorCodes::InvalidNamespace,
-                    str::stream() << "Invalid namespace for getMore: " << nss.ns(),
+                    str::stream() << "Invalid namespace for getMore: " << nss.toStringForErrorMsg(),
                     nss.isValid());
         }
 
@@ -587,6 +589,12 @@ public:
                 curOp->setGenericCursor_inlock(cursorPin->toGenericCursor());
             }
 
+            // If this is a change stream cursor, check whether the tenant has migrated elsewhere.
+            if (cursorPin->getExecutor()->getPostBatchResumeToken()["_data"]) {
+                tenant_migration_access_blocker::assertCanGetMoreChangeStream(opCtx,
+                                                                              _cmd.getDbName());
+            }
+
             // If the 'failGetMoreAfterCursorCheckout' failpoint is enabled, throw an exception with
             // the given 'errorCode' value, or ErrorCodes::InternalError if 'errorCode' is omitted.
             failGetMoreAfterCursorCheckout.executeIf(
@@ -687,15 +695,17 @@ public:
                 curOp->debug().cursorExhausted = true;
             }
 
-            nextBatch.done(respondWithId, nss);
+            nextBatch.done(respondWithId,
+                           nss,
+                           SerializationContext::stateCommandReply(_cmd.getSerializationContext()));
 
             // Increment this metric once we have generated a response and we know it will return
             // documents.
             auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
             metricsCollector.incrementDocUnitsReturned(curOp->getNS(), docUnitsReturned);
             curOp->debug().additiveMetrics.nBatches = 1;
-
-            collectTelemetryMongod(opCtx, cursorPin, numResults);
+            curOp->setEndOfOpMetrics(numResults);
+            collectQueryStatsMongod(opCtx, cursorPin);
 
             if (respondWithId) {
                 cursorDeleter.dismiss();
@@ -789,9 +799,14 @@ public:
 
         void validateResult(rpc::ReplyBuilderInterface* reply, boost::optional<TenantId> tenantId) {
             auto ret = reply->getBodyBuilder().asTempObj();
-            CursorGetMoreReply::parse(
-                IDLParserContext{"CursorGetMoreReply", false /* apiStrict */, tenantId},
-                ret.removeField("ok"));
+
+            // We need to copy the serialization context from the request to the reply object
+            CursorGetMoreReply::parse(IDLParserContext("CursorGetMoreReply",
+                                                       false /* apiStrict */,
+                                                       tenantId,
+                                                       SerializationContext::stateCommandReply(
+                                                           _cmd.getSerializationContext())),
+                                      ret.removeField("ok"));
         }
 
         const GetMoreCommandRequest _cmd;

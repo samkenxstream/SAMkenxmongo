@@ -33,6 +33,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/expressions/runtime_environment.h"
 #include "mongo/db/exec/sbe/vm/vm.h"
 #include "mongo/db/exec/sbe/vm/vm_printer.h"
 
@@ -42,10 +43,10 @@
 #include "mongo/db/client.h"
 #include "mongo/db/exec/js_function.h"
 #include "mongo/db/exec/sbe/accumulator_sum_value_enum.h"
+#include "mongo/db/exec/sbe/makeobj_spec.h"
 #include "mongo/db/exec/sbe/values/arith_common.h"
 #include "mongo/db/exec/sbe/values/bson.h"
 #include "mongo/db/exec/sbe/values/columnar.h"
-#include "mongo/db/exec/sbe/values/makeobj_spec.h"
 #include "mongo/db/exec/sbe/values/sbe_pattern_value_cmp.h"
 #include "mongo/db/exec/sbe/values/sort_spec.h"
 #include "mongo/db/exec/sbe/values/util.h"
@@ -77,6 +78,8 @@ namespace vm {
 int Instruction::stackOffset[Instruction::Tags::lastInstruction] = {
     1,   // pushConstVal
     1,   // pushAccessVal
+    1,   // pushOwnedAccessorVal
+    1,   // pushEnvAccessorVal
     1,   // pushMoveVal
     1,   // pushLocalVal
     1,   // pushMoveLocalVal
@@ -480,8 +483,15 @@ void CodeFragment::appendConstVal(value::TypeTags tag, value::Value val) {
 
 void CodeFragment::appendAccessVal(value::SlotAccessor* accessor) {
     Instruction i;
-    i.tag = Instruction::pushAccessVal;
+    i.tag = [](value::SlotAccessor* accessor) {
+        if (accessor->is<value::OwnedValueAccessor>()) {
+            return Instruction::pushOwnedAccessorVal;
+        } else if (accessor->is<RuntimeEnvironment::Accessor>()) {
+            return Instruction::pushEnvAccessorVal;
+        }
 
+        return Instruction::pushAccessVal;
+    }(accessor);
     auto offset = allocateSpace(sizeof(Instruction) + sizeof(accessor));
 
     offset += writeToMemory(offset, i);
@@ -2027,9 +2037,8 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinNewArray(ArityTy
     if (arity) {
         arr->reserve(arity);
         for (ArityType idx = 0; idx < arity; ++idx) {
-            auto [owned, tag, val] = getFromStack(idx);
-            auto [tagCopy, valCopy] = value::copyValue(tag, val);
-            arr->push_back(tagCopy, valCopy);
+            auto [tag, val] = moveOwnedFromStack(idx);
+            arr->push_back(tag, val);
         }
     }
 
@@ -2434,11 +2443,7 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinFloor(ArityType 
 }
 
 FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinTrunc(ArityType arity) {
-    invariant(arity == 1);
-
-    auto [_, tagOperand, valOperand] = getFromStack(0);
-
-    return genericTrunc(tagOperand, valOperand);
+    return genericRoundTrunc("$trunc", Decimal128::kRoundTowardZero, arity);
 }
 
 FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinExp(ArityType arity) {
@@ -3877,7 +3882,8 @@ static int32_t convertNumericToInt32(const value::TypeTags tag, const value::Val
     }
 }
 
-FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinRound(ArityType arity) {
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::genericRoundTrunc(
+    std::string funcName, Decimal128::RoundingMode roundingMode, ArityType arity) {
     invariant(arity == 1 || arity == 2);
     int32_t place = 0;
     const auto [numOwn, numTag, numVal] = getFromStack(0);
@@ -3896,7 +3902,7 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinRound(ArityType 
         case value::TypeTags::NumberDecimal: {
             auto dec = value::bitcastTo<Decimal128>(numVal);
             if (!dec.isInfinite()) {
-                dec = dec.quantize(quantum, Decimal128::kRoundTiesToEven);
+                dec = dec.quantize(quantum, roundingMode);
             }
             auto [resultTag, resultValue] = value::makeCopyDecimal(dec);
             return {true, resultTag, resultValue};
@@ -3904,7 +3910,7 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinRound(ArityType 
         case value::TypeTags::NumberDouble: {
             auto asDec = Decimal128(value::bitcastTo<double>(numVal), Decimal128::kRoundTo34Digits);
             if (!asDec.isInfinite()) {
-                asDec = asDec.quantize(quantum, Decimal128::kRoundTiesToEven);
+                asDec = asDec.quantize(quantum, roundingMode);
             }
             return {
                 false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(asDec.toDouble())};
@@ -3917,11 +3923,11 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinRound(ArityType 
             auto numericArgll = numTag == value::TypeTags::NumberInt32
                 ? static_cast<int64_t>(value::bitcastTo<int32_t>(numVal))
                 : value::bitcastTo<int64_t>(numVal);
-            auto out = Decimal128(numericArgll).quantize(quantum, Decimal128::kRoundTiesToEven);
+            auto out = Decimal128(numericArgll).quantize(quantum, roundingMode);
             uint32_t flags = 0;
             auto outll = out.toLong(&flags);
             uassert(5155302,
-                    "Invalid conversion to long during $round.",
+                    "Invalid conversion to long during " + funcName + ".",
                     !Decimal128::hasFlag(flags, Decimal128::kInvalid));
             if (numTag == value::TypeTags::NumberInt64 ||
                 outll > std::numeric_limits<int32_t>::max()) {
@@ -3935,6 +3941,10 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinRound(ArityType 
         default:
             return {false, value::TypeTags::Nothing, 0};
     }
+}
+
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinRound(ArityType arity) {
+    return genericRoundTrunc("$round", Decimal128::kRoundTiesToEven, arity);
 }
 
 FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinConcat(ArityType arity) {
@@ -5286,131 +5296,210 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinSortKeyComponent
     return {false, outTag, outVal};
 }
 
-std::pair<value::TypeTags, value::Value> ByteCode::produceBsonObject(const value::MakeObjSpec* mos,
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinSortKeyComponentVectorToArray(
+    ArityType arity) {
+    invariant(arity == 1);
+
+    auto [sortVecOwned, sortVecTag, sortVecVal] = getFromStack(0);
+    if (sortVecTag != value::TypeTags::sortKeyComponentVector) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto* sortVec = value::getSortKeyComponentVectorView(sortVecVal);
+
+    if (sortVec->elts.size() == 1) {
+        auto [tag, val] = sortVec->elts[0];
+        auto [copyTag, copyVal] = value::copyValue(tag, val);
+        return {true, copyTag, copyVal};
+    } else {
+        auto [arrayTag, arrayVal] = value::makeNewArray();
+        value::ValueGuard arrayGuard{arrayTag, arrayVal};
+        auto array = value::getArrayView(arrayVal);
+        array->reserve(sortVec->elts.size());
+        for (size_t i = 0; i < sortVec->elts.size(); ++i) {
+            auto [tag, val] = sortVec->elts[i];
+            auto [copyTag, copyVal] = value::copyValue(tag, val);
+            array->push_back(copyTag, copyVal);
+        }
+        arrayGuard.reset();
+        return {true, arrayTag, arrayVal};
+    }
+}
+
+std::pair<value::TypeTags, value::Value> ByteCode::produceBsonObject(const MakeObjSpec* spec,
                                                                      value::TypeTags rootTag,
                                                                      value::Value rootVal,
-                                                                     const size_t startIdx) {
-    auto& allFieldsMap = mos->allFieldsMap;
-    auto& fieldBehavior = mos->fieldBehavior;
-    auto& fields = mos->fields;
-    auto& projects = mos->projects;
+                                                                     int stackOffset) {
+    auto& fieldNames = spec->fieldNames;
 
-    const bool isInclusion = fieldBehavior == value::MakeObjSpec::FieldBehavior::keep;
+    const bool isInclusion = spec->fieldBehavior == MakeObjSpec::FieldBehavior::keep;
+    const size_t numFields = fieldNames.size();
+    const size_t numKeepOrDrops = spec->numKeepOrDrops;
+    const size_t numComputedFields = numFields - numKeepOrDrops;
 
-    auto isFieldProjectedOrRestricted = [&](StringData sv) {
-        // If 'bloomFilter' is initialized, check to see if it can answer our query.
-        if (allFieldsMap.size() <= 64) {
-            size_t bloomIdx = mos->computeBloomIdx1(sv.rawData(), sv.size());
-            size_t fieldIdx = mos->bloomFilter[bloomIdx];
-            size_t k = 0;
+    // The "visited" array keeps track of which computed fields have been visited so far so that
+    // later we can append the non-visited computed fields to the end of the object.
+    char* visited = nullptr;
+    char localVisitedArr[64];
+    std::unique_ptr<char[]> allocatedVisitedArr;
+    if (MONGO_unlikely(numComputedFields > 64)) {
+        allocatedVisitedArr = std::make_unique<char[]>(numComputedFields);
+        visited = allocatedVisitedArr.get();
+    } else {
+        visited = &localVisitedArr[0];
+    }
 
-            for (;; ++k) {
-                if (MONGO_likely(fieldIdx >= 2)) {
-                    // If fieldIdx >= 2, that means that we may have a match. If 'sv' matches a
-                    // string in 'fields', then we return '!isInclusion' (because if isInclusion is
-                    // true then the field is not restricted or projected, and if isInclusion is
-                    // false then the field is restricted). If 'sv' matches a string in 'projects',
-                    // we return 'true' (because the field is projected).
-                    //
-                    // If 'sv' doesn't match any of the strings in 'fields' or 'projects', then we
-                    // return 'isInclusion' (because if isInclusion is true then the field is
-                    // restricted, and if isInclusion is false then the field not restricted or
-                    // projected).
-                    auto singleName = (fieldIdx - 2 >= mos->fields.size())
-                        ? StringData(mos->projects[fieldIdx - 2 - mos->fields.size()])
-                        : StringData(mos->fields[fieldIdx - 2]);
-
-                    return sv == singleName ? (!isInclusion || fieldIdx - 2 >= mos->fields.size())
-                                            : isInclusion;
-                } else if (MONGO_likely(fieldIdx == 0)) {
-                    // If fieldIdx == 0, then we can deduce that 'sv' is not present in either
-                    // vector and we return 'isInclusion'.
-                    return isInclusion;
-                }
-
-                // If fieldIdx == 1, then we can't determine if 'sv' is present in either vector.
-                if (k == 0) {
-                    // If this was our first attempt, try again using computeBloomIdx2().
-                    bloomIdx = mos->computeBloomIdx2(sv.rawData(), sv.size(), bloomIdx);
-                    fieldIdx = mos->bloomFilter[bloomIdx];
-                } else {
-                    // After two attempts, give up and search for 'sv' in 'allFieldsMap'.
-                    break;
-                }
-            }
-        }
-
-        auto key = StringMapHasher{}.hashed_key(sv);
-
-        bool foundKey = false;
-        bool projected = false;
-        bool restricted = false;
-
-        if (auto it = allFieldsMap.find(key); it != allFieldsMap.end()) {
-            foundKey = true;
-            projected = it->second != std::numeric_limits<size_t>::max();
-            restricted = !isInclusion;
-        }
-
-        if (!foundKey) {
-            restricted = isInclusion;
-        }
-
-        return projected || restricted;
-    };
+    memset(visited, 0, numComputedFields);
 
     UniqueBSONObjBuilder bob;
 
+    size_t numFieldsRemaining = numFields;
+    size_t numComputedFieldsRemaining = numComputedFields;
+
+    const size_t numFieldsRemainingThreshold = isInclusion ? 1 : 0;
+
     if (value::isObject(rootTag)) {
-        size_t nFieldsIfInclusion = fields.size();
-
         if (rootTag == value::TypeTags::bsonObject) {
-            if (!(nFieldsIfInclusion == 0 && isInclusion)) {
-                auto be = value::bitcastTo<const char*>(rootVal);
-                const auto end = be + ConstDataView(be).read<LittleEndian<uint32_t>>();
+            auto be = value::bitcastTo<const char*>(rootVal);
+            const auto end = be + ConstDataView(be).read<LittleEndian<uint32_t>>();
 
-                // Skip document length.
-                be += 4;
+            // Skip document length.
+            be += 4;
+
+            // Let N = the # of "computed" fields, and let K = (isInclusion && N > 0 ? N-1 : N).
+            //
+            // When we have seen all of the "keepOrDrop" fields and when we have seen K of the
+            // "computed" fields, we can break out of this loop, ignore or copy the remaining
+            // fields from 'rootVal' (depending on whether 'isInclusion' is true or false), and
+            // then finally append the remaining computed field (if there is one) to the output
+            // object.
+            //
+            // (When isInclusion == true and a single "computed" field remains, it's okay to stop
+            // scanning 'rootVal' and append the remaining computed field to the end of the output
+            // object because it will have no observable effect on field order.)
+            if (numFieldsRemaining > numFieldsRemainingThreshold ||
+                numFieldsRemaining != numComputedFieldsRemaining) {
                 while (be != end - 1) {
                     auto sv = bson::fieldNameAndLength(be);
                     auto nextBe = bson::advance(be, sv.size());
+                    size_t pos = fieldNames.findPos(sv);
 
-                    if (!isFieldProjectedOrRestricted(sv)) {
-                        bob.append(BSONElement(be, sv.size() + 1, nextBe - be));
-                        --nFieldsIfInclusion;
+                    if (pos == IndexedStringVector::npos) {
+                        if (!isInclusion) {
+                            bob.append(BSONElement(be, sv.size() + 1, nextBe - be));
+                        }
+                    } else if (pos < numKeepOrDrops) {
+                        --numFieldsRemaining;
+
+                        if (isInclusion) {
+                            bob.append(BSONElement(be, sv.size() + 1, nextBe - be));
+                        }
+                    } else {
+                        --numFieldsRemaining;
+                        --numComputedFieldsRemaining;
+
+                        auto projectIdx = pos - numKeepOrDrops;
+                        visited[projectIdx] = 1;
+
+                        size_t argIdx = stackOffset + projectIdx;
+                        auto [_, tag, val] = getFromStack(argIdx);
+                        bson::appendValueToBsonObj(bob, fieldNames[pos], tag, val);
                     }
 
-                    if (nFieldsIfInclusion == 0 && isInclusion) {
+                    be = nextBe;
+
+                    if (numFieldsRemaining <= numFieldsRemainingThreshold &&
+                        numFieldsRemaining == numComputedFieldsRemaining) {
                         break;
                     }
+                }
+            }
+
+            // If isInclusion == false and 'be' has not reached the end of 'rootVal', copy over
+            // the remaining fields from 'rootVal' to the output object.
+            if (!isInclusion) {
+                while (be != end - 1) {
+                    auto sv = bson::fieldNameAndLength(be);
+                    auto nextBe = bson::advance(be, sv.size());
+                    bob.append(BSONElement(be, sv.size() + 1, nextBe - be));
 
                     be = nextBe;
                 }
             }
         } else if (rootTag == value::TypeTags::Object) {
-            if (!(nFieldsIfInclusion == 0 && isInclusion)) {
-                auto objRoot = value::getObjectView(rootVal);
-                for (size_t idx = 0; idx < objRoot->size(); ++idx) {
-                    auto sv = StringData(objRoot->field(idx));
+            auto objRoot = value::getObjectView(rootVal);
+            size_t idx = 0;
 
-                    if (!isFieldProjectedOrRestricted(sv)) {
-                        auto [tag, val] = objRoot->getAt(idx);
-                        bson::appendValueToBsonObj(bob, objRoot->field(idx), tag, val);
-                        --nFieldsIfInclusion;
+            // Let N = number of "computed" fields, and let K = (isInclusion && N > 0 ? N-1 : N).
+            //
+            // When we have seen all of the "keepOrDrop" fields and when we have seen K of the
+            // "computed" fields, we can break out of this loop, ignore or copy the remaining
+            // fields from 'rootVal' (depending on whether 'isInclusion' is true or false), and
+            // then finally append the remaining computed field (if there is one) to the output
+            // object.
+            //
+            // (When isInclusion == true and a single "computed" field remains, it's okay to stop
+            // scanning 'rootVal' and append the remaining computed field to the end of the output
+            // object because it will have no observable effect on field order.)
+            if (numFieldsRemaining > numFieldsRemainingThreshold ||
+                numFieldsRemaining != numComputedFieldsRemaining) {
+                for (; idx < objRoot->size(); ++idx) {
+                    auto sv = StringData(objRoot->field(idx));
+                    size_t pos = fieldNames.findPos(sv);
+
+                    if (pos == IndexedStringVector::npos) {
+                        if (!isInclusion) {
+                            auto [tag, val] = objRoot->getAt(idx);
+                            bson::appendValueToBsonObj(bob, objRoot->field(idx), tag, val);
+                        }
+                    } else if (pos < numKeepOrDrops) {
+                        --numFieldsRemaining;
+
+                        if (isInclusion) {
+                            auto [tag, val] = objRoot->getAt(idx);
+                            bson::appendValueToBsonObj(bob, objRoot->field(idx), tag, val);
+                        }
+                    } else {
+                        --numFieldsRemaining;
+                        --numComputedFieldsRemaining;
+
+                        auto projectIdx = pos - numKeepOrDrops;
+                        visited[projectIdx] = 1;
+
+                        size_t argIdx = stackOffset + projectIdx;
+                        auto [_, tag, val] = getFromStack(argIdx);
+                        bson::appendValueToBsonObj(bob, fieldNames[pos], tag, val);
                     }
 
-                    if (nFieldsIfInclusion == 0 && isInclusion) {
+                    if (numFieldsRemaining <= numFieldsRemainingThreshold &&
+                        numFieldsRemaining == numComputedFieldsRemaining) {
+                        ++idx;
                         break;
                     }
+                }
+            }
+
+            // If isInclusion == false and 'be' has not reached the end of 'rootVal', copy over
+            // the remaining fields from 'rootVal' to the output object.
+            if (!isInclusion) {
+                for (; idx < objRoot->size(); ++idx) {
+                    auto sv = StringData(objRoot->field(idx));
+                    auto [fieldTag, fieldVal] = objRoot->getAt(idx);
+                    bson::appendValueToBsonObj(bob, sv, fieldTag, fieldVal);
                 }
             }
         }
     }
 
-    for (size_t idx = 0; idx < projects.size(); ++idx) {
-        auto argIdx = startIdx + idx;
-        auto [_, tag, val] = getFromStack(argIdx);
-        bson::appendValueToBsonObj(bob, projects[idx], tag, val);
+    // Append the remaining computed fields (if any) to the output object.
+    if (numComputedFieldsRemaining > 0) {
+        for (size_t pos = numKeepOrDrops; pos < fieldNames.size(); ++pos) {
+            auto projectIdx = pos - numKeepOrDrops;
+            if (!visited[projectIdx]) {
+                size_t argIdx = stackOffset + projectIdx;
+                auto [_, tag, val] = getFromStack(argIdx);
+                bson::appendValueToBsonObj(bob, fieldNames[pos], tag, val);
+            }
+        }
     }
 
     bob.doneFast();
@@ -5432,9 +5521,9 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinMakeBsonObj(Arit
 
     auto mos = value::getMakeObjSpecView(mosVal);
 
-    const size_t startIdx = 2;
+    const int stackOffset = 2;
 
-    auto [tag, val] = produceBsonObject(mos, objTag, objVal, startIdx);
+    auto [tag, val] = produceBsonObject(mos, objTag, objVal, stackOffset);
 
     return {true, tag, val};
 }
@@ -5799,9 +5888,6 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinObjectToArray(Ar
 
         objectEnumerator.advance();
     }
-    if (objOwned) {
-        value::releaseValue(objTag, objVal);
-    }
     arrGuard.reset();
     return {true, arrTag, arrVal};
 }
@@ -5824,9 +5910,6 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinArrayToObject(Ar
 
     // return empty object for empty array
     if (arrayEnumerator.atEnd()) {
-        if (arrOwned) {
-            value::releaseValue(arrTag, arrVal);
-        }
         objGuard.reset();
         return {true, objTag, objVal};
     }
@@ -5886,8 +5969,6 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinArrayToObject(Ar
             auto [valueCopyTag, valueCopyVal] = value::copyValue(valueTag, valueVal);
             if (keyMap.contains(keyStringData)) {
                 auto idx = keyMap[keyStringData];
-                auto oldVal = object->getAt(idx);
-                value::ValueGuard guard{oldVal};
                 object->setAt(idx, valueCopyTag, valueCopyVal);
             } else {
                 keyMap[keyStringData] = object->size();
@@ -5943,8 +6024,6 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinArrayToObject(Ar
             auto [valueCopyTag, valueCopyVal] = value::copyValue(valueTag, valueVal);
             if (keyMap.contains(keyStringData)) {
                 auto idx = keyMap[keyStringData];
-                auto oldVal = object->getAt(idx);
-                value::ValueGuard guard{oldVal};
                 object->setAt(idx, valueCopyTag, valueCopyVal);
             } else {
                 keyMap[keyStringData] = object->size();
@@ -5953,11 +6032,542 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinArrayToObject(Ar
         }
         arrayEnumerator.advance();
     }
-    if (arrOwned) {
-        value::releaseValue(arrTag, arrVal);
-    }
     objGuard.reset();
     return {true, objTag, objVal};
+}
+
+std::tuple<value::Array*, value::Array*, size_t, size_t, int32_t, int32_t> multiAccState(
+    value::TypeTags stateTag, value::Value stateVal) {
+    uassert(
+        7548600, "The accumulator state should be an array", stateTag == value::TypeTags::Array);
+    auto state = value::getArrayView(stateVal);
+
+    uassert(7548601,
+            "The accumulator state should have correct number of elements",
+            state->size() == static_cast<size_t>(AggMultiElems::kSizeOfArray));
+
+    auto [arrayTag, arrayVal] = state->getAt(static_cast<size_t>(AggMultiElems::kInternalArr));
+    uassert(7548602,
+            "Internal array component is not of correct type",
+            arrayTag == value::TypeTags::Array);
+    auto array = value::getArrayView(arrayVal);
+
+    auto [startIndexTag, startIndexVal] =
+        state->getAt(static_cast<size_t>(AggMultiElems::kStartIdx));
+    uassert(7548700,
+            "Index component be a 64-bit integer",
+            startIndexTag == value::TypeTags::NumberInt64);
+
+    auto [maxSizeTag, maxSize] = state->getAt(static_cast<size_t>(AggMultiElems::kMaxSize));
+    uassert(7548603,
+            "MaxSize component should be a 64-bit integer",
+            maxSizeTag == value::TypeTags::NumberInt64);
+
+    auto [memUsageTag, memUsage] = state->getAt(static_cast<size_t>(AggMultiElems::kMemUsage));
+    uassert(7548612,
+            "MemUsage component should be a 32-bit integer",
+            memUsageTag == value::TypeTags::NumberInt32);
+
+    auto [memLimitTag, memLimit] = state->getAt(static_cast<size_t>(AggMultiElems::kMemLimit));
+    uassert(7548613,
+            "MemLimit component should be a 32-bit integer",
+            memLimitTag == value::TypeTags::NumberInt32);
+
+    return {state, array, startIndexVal, maxSize, memUsage, memLimit};
+}
+
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinAggFirstNNeedsMoreInput(
+    ArityType arity) {
+    auto [stateOwned, stateTag, stateVal] = getFromStack(0);
+    uassert(7695200, "Unexpected accumulator state ownership", !stateOwned);
+
+    auto state = value::getArrayView(stateVal);
+    uassert(
+        7695201, "The accumulator state should be an array", stateTag == value::TypeTags::Array);
+
+    auto [arrayTag, arrayVal] = state->getAt(static_cast<size_t>(AggMultiElems::kInternalArr));
+    uassert(7695202,
+            "Internal array component is not of correct type",
+            arrayTag == value::TypeTags::Array);
+    auto array = value::getArrayView(arrayVal);
+
+    auto [maxSizeTag, maxSize] = state->getAt(static_cast<size_t>(AggMultiElems::kMaxSize));
+    uassert(7695203,
+            "MaxSize component should be a 64-bit integer",
+            maxSizeTag == value::TypeTags::NumberInt64);
+
+    bool needMoreInput = (array->size() < maxSize);
+    return {false, value::TypeTags::Boolean, value::bitcastFrom<bool>(needMoreInput)};
+}
+
+int32_t updateAndCheckMemUsage(value::Array* state,
+                               int32_t memUsage,
+                               int32_t memAdded,
+                               int32_t memLimit) {
+    memUsage += memAdded;
+    uassert(ErrorCodes::ExceededMemoryLimit,
+            str::stream()
+                << "Accumulator used too much memory and spilling to disk cannot reduce memory "
+                   "consumption any further. Memory limit: "
+                << memLimit << " bytes",
+            memUsage < memLimit);
+    state->setAt(
+        static_cast<size_t>(AggMultiElems::kMemUsage), value::TypeTags::NumberInt32, memUsage);
+    return memUsage;
+}
+
+size_t updateStartIdx(value::Array* state, size_t startIdx, size_t arrSize) {
+    startIdx = (startIdx + 1) % arrSize;
+    state->setAt(
+        static_cast<size_t>(AggMultiElems::kStartIdx), value::TypeTags::NumberInt64, startIdx);
+    return startIdx;
+}
+
+int32_t aggFirstN(value::Array* state,
+                  value::Array* array,
+                  size_t maxSize,
+                  int32_t memUsage,
+                  int32_t memLimit,
+                  value::TypeTags fieldTag,
+                  value::Value fieldVal) {
+    value::ValueGuard fieldGuard{fieldTag, fieldVal};
+    if (array->size() < maxSize) {
+        memUsage = updateAndCheckMemUsage(
+            state, memUsage, value::getApproximateSize(fieldTag, fieldVal), memLimit);
+
+        // add to array
+        fieldGuard.reset();
+        array->push_back(fieldTag, fieldVal);
+    }
+    return memUsage;
+}
+
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinAggFirstN(ArityType arity) {
+    auto [stateTag, stateVal] = moveOwnedFromStack(0);
+    value::ValueGuard stateGuard{stateTag, stateVal};
+
+    auto [state, array, startIdx, maxSize, memUsage, memLimit] = multiAccState(stateTag, stateVal);
+
+    auto [fieldTag, fieldVal] = moveOwnedFromStack(1);
+    aggFirstN(state, array, maxSize, memUsage, memLimit, fieldTag, fieldVal);
+
+    stateGuard.reset();
+    return {true, stateTag, stateVal};
+}
+
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinAggFirstNMerge(ArityType arity) {
+    auto [mergeStateTag, mergeStateVal] = moveOwnedFromStack(0);
+    value::ValueGuard mergeStateGuard{mergeStateTag, mergeStateVal};
+
+    auto [stateTag, stateVal] = moveOwnedFromStack(1);
+    value::ValueGuard stateGuard{stateTag, stateVal};
+
+    auto [mergeState, mergeArray, mergeStartIdx, mergeMaxSize, mergeMemUsage, mergeMemLimit] =
+        multiAccState(mergeStateTag, mergeStateVal);
+    auto [state, array, accStartIdx, accMaxSize, accMemUsage, accMemLimit] =
+        multiAccState(stateTag, stateVal);
+    uassert(7548604,
+            "Two arrays to merge should have the same MaxSize component",
+            accMaxSize == mergeMaxSize);
+
+    for (size_t i = 0; i < array->size(); ++i) {
+        if (mergeArray->size() == mergeMaxSize) {
+            break;
+        }
+
+        auto [tag, val] = array->swapAt(i, value::TypeTags::Null, 0);
+        mergeMemUsage =
+            aggFirstN(mergeState, mergeArray, mergeMaxSize, mergeMemUsage, mergeMemLimit, tag, val);
+    }
+
+    mergeStateGuard.reset();
+    return {true, mergeStateTag, mergeStateVal};
+}
+
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinAggFirstNFinalize(ArityType arity) {
+    auto [stateTag, stateVal] = moveOwnedFromStack(0);
+    value::ValueGuard guard{stateTag, stateVal};
+
+    uassert(7548605, "expected an array", stateTag == value::TypeTags::Array);
+    auto state = value::getArrayView(stateVal);
+
+    auto [outputTag, outputVal] =
+        state->swapAt(static_cast<size_t>(AggMultiElems::kInternalArr), value::TypeTags::Null, 0);
+    return {true, outputTag, outputVal};
+}
+
+std::pair<size_t, int32_t> aggLastN(value::Array* state,
+                                    value::Array* array,
+                                    size_t startIdx,
+                                    size_t maxSize,
+                                    int32_t memUsage,
+                                    int32_t memLimit,
+                                    value::TypeTags fieldTag,
+                                    value::Value fieldVal) {
+    value::ValueGuard guard{fieldTag, fieldVal};
+    if (array->size() < maxSize) {
+        invariant(startIdx == 0);
+        guard.reset();
+        array->push_back(fieldTag, fieldVal);
+    } else {
+        invariant(array->size() == maxSize);
+        guard.reset();
+        auto [oldFieldTag, oldFieldVal] = array->swapAt(startIdx, fieldTag, fieldVal);
+        memUsage -= value::getApproximateSize(oldFieldTag, oldFieldVal);
+        value::releaseValue(oldFieldTag, oldFieldVal);
+        startIdx = updateStartIdx(state, startIdx, maxSize);
+    }
+    memUsage = updateAndCheckMemUsage(
+        state, memUsage, value::getApproximateSize(fieldTag, fieldVal), memLimit);
+    return {startIdx, memUsage};
+}
+
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinAggLastN(ArityType arity) {
+    auto [stateTag, stateVal] = moveOwnedFromStack(0);
+    value::ValueGuard stateGuard{stateTag, stateVal};
+
+    auto [state, array, startIdx, maxSize, memUsage, memLimit] = multiAccState(stateTag, stateVal);
+
+    auto [fieldTag, fieldVal] = moveOwnedFromStack(1);
+    aggLastN(state, array, startIdx, maxSize, memUsage, memLimit, fieldTag, fieldVal);
+
+    stateGuard.reset();
+    return {true, stateTag, stateVal};
+}
+
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinAggLastNMerge(ArityType arity) {
+    auto [mergeStateTag, mergeStateVal] = moveOwnedFromStack(0);
+    value::ValueGuard mergeStateGuard{mergeStateTag, mergeStateVal};
+
+    auto [stateTag, stateVal] = moveOwnedFromStack(1);
+    value::ValueGuard stateGuard{stateTag, stateVal};
+
+    auto [mergeState, mergeArray, mergeStartIdx, mergeMaxSize, mergeMemUsage, mergeMemLimit] =
+        multiAccState(mergeStateTag, mergeStateVal);
+    auto [state, array, startIdx, maxSize, memUsage, memLimit] = multiAccState(stateTag, stateVal);
+    uassert(7548703,
+            "Two arrays to merge should have the same MaxSize component",
+            maxSize == mergeMaxSize);
+
+    if (array->size() < maxSize) {
+        // add values from accArr to mergeArray
+        for (size_t i = 0; i < array->size(); ++i) {
+            auto [tag, val] = array->swapAt(i, value::TypeTags::Null, 0);
+            std::tie(mergeStartIdx, mergeMemUsage) = aggLastN(mergeState,
+                                                              mergeArray,
+                                                              mergeStartIdx,
+                                                              mergeMaxSize,
+                                                              mergeMemUsage,
+                                                              mergeMemLimit,
+                                                              tag,
+                                                              val);
+        }
+        mergeStateGuard.reset();
+        return {true, mergeStateTag, mergeStateVal};
+    } else {
+        // return accArray since it contains last n values
+        invariant(array->size() == maxSize);
+        stateGuard.reset();
+        return {true, stateTag, stateVal};
+    }
+}
+
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinAggLastNFinalize(ArityType arity) {
+    auto [stateTag, stateVal] = moveOwnedFromStack(0);
+    value::ValueGuard guard{stateTag, stateVal};
+
+    auto [state, arr, startIdx, maxSize, memUsage, memLimit] = multiAccState(stateTag, stateVal);
+    if (startIdx == 0) {
+        auto [outputTag, outputVal] = state->swapAt(0, value::TypeTags::Null, 0);
+        return {true, outputTag, outputVal};
+    }
+
+    invariant(arr->size() == maxSize);
+    auto [outArrayTag, outArrayVal] = value::makeNewArray();
+    auto outArray = value::getArrayView(outArrayVal);
+    outArray->reserve(maxSize);
+    for (size_t i = 0; i < maxSize; ++i) {
+        auto srcIdx = (i + startIdx) % maxSize;
+        auto [elemTag, elemVal] = arr->swapAt(srcIdx, value::TypeTags::Null, 0);
+        outArray->push_back(elemTag, elemVal);
+    }
+    return {true, outArrayTag, outArrayVal};
+}
+
+template <typename Less>
+int32_t aggTopBottomNAdd(value::Array* state,
+                         value::Array* array,
+                         size_t maxSize,
+                         int32_t memUsage,
+                         int32_t memLimit,
+                         const value::SortSpec* sortSpec,
+                         std::pair<value::TypeTags, value::Value> key,
+                         std::pair<value::TypeTags, value::Value> output) {
+    auto memAdded = [](std::pair<value::TypeTags, value::Value> key,
+                       std::pair<value::TypeTags, value::Value> output) {
+        return value::getApproximateSize(key.first, key.second) +
+            value::getApproximateSize(output.first, output.second);
+    };
+
+    value::ValueGuard keyGuard{key.first, key.second};
+    value::ValueGuard outputGuard{output.first, output.second};
+    auto less = Less(sortSpec);
+    auto keyLess = PairKeyComp(less);
+    auto& heap = array->values();
+
+    if (array->size() < maxSize) {
+        auto [pairTag, pairVal] = value::makeNewArray();
+        value::ValueGuard pairGuard{pairTag, pairVal};
+        auto pair = value::getArrayView(pairVal);
+        pair->reserve(2);
+        keyGuard.reset();
+        pair->push_back(key.first, key.second);
+        outputGuard.reset();
+        pair->push_back(output.first, output.second);
+
+        memUsage = updateAndCheckMemUsage(state, memUsage, memAdded(key, output), memLimit);
+
+        pairGuard.reset();
+        array->push_back(pairTag, pairVal);
+        std::push_heap(heap.begin(), heap.end(), keyLess);
+    } else {
+        tassert(5807005,
+                "Heap should contain same number of elements as MaxSize",
+                array->size() == maxSize);
+
+        auto [worstTag, worstVal] = heap.front();
+        auto worst = value::getArrayView(worstVal);
+        auto worstKey = worst->getAt(0);
+        if (less(key, worstKey)) {
+            memUsage = updateAndCheckMemUsage(state,
+                                              memUsage,
+                                              -memAdded(worst->getAt(0), worst->getAt(1)) +
+                                                  memAdded(key, output),
+                                              memLimit);
+
+            std::pop_heap(heap.begin(), heap.end(), keyLess);
+            keyGuard.reset();
+            worst->setAt(0, key.first, key.second);
+            outputGuard.reset();
+            worst->setAt(1, output.first, output.second);
+            std::push_heap(heap.begin(), heap.end(), keyLess);
+        }
+    }
+
+    return memUsage;
+}
+
+template <typename Less>
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinAggTopBottomN(ArityType arity) {
+    auto [sortSpecOwned, sortSpecTag, sortSpecVal] = getFromStack(3);
+    tassert(5807024, "Argument must be of sortSpec type", sortSpecTag == value::TypeTags::sortSpec);
+    auto sortSpec = value::getSortSpecView(sortSpecVal);
+
+    auto [stateTag, stateVal] = moveOwnedFromStack(0);
+    value::ValueGuard stateGuard{stateTag, stateVal};
+    auto [state, array, startIdx, maxSize, memUsage, memLimit] = multiAccState(stateTag, stateVal);
+    auto key = moveOwnedFromStack(1);
+    auto output = moveOwnedFromStack(2);
+
+    aggTopBottomNAdd<Less>(state, array, maxSize, memUsage, memLimit, sortSpec, key, output);
+
+    stateGuard.reset();
+    return {true, stateTag, stateVal};
+}
+
+template <typename Less>
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinAggTopBottomNMerge(
+    ArityType arity) {
+    auto [sortSpecOwned, sortSpecTag, sortSpecVal] = getFromStack(2);
+    tassert(5807025, "Argument must be of sortSpec type", sortSpecTag == value::TypeTags::sortSpec);
+    auto sortSpec = value::getSortSpecView(sortSpecVal);
+
+    auto [stateTag, stateVal] = moveOwnedFromStack(1);
+    value::ValueGuard stateGuard{stateTag, stateVal};
+    auto [mergeStateTag, mergeStateVal] = moveOwnedFromStack(0);
+    value::ValueGuard mergeStateGuard{mergeStateTag, mergeStateVal};
+    auto [mergeState, mergeArray, mergeStartIx, mergeMaxSize, mergeMemUsage, mergeMemLimit] =
+        multiAccState(mergeStateTag, mergeStateVal);
+    auto [state, array, startIdx, maxSize, memUsage, memLimit] = multiAccState(stateTag, stateVal);
+    tassert(5807008,
+            "Two arrays to merge should have the same MaxSize component",
+            maxSize == mergeMaxSize);
+
+    for (auto [pairTag, pairVal] : array->values()) {
+        auto pair = value::getArrayView(pairVal);
+        auto key = pair->swapAt(0, value::TypeTags::Null, 0);
+        auto output = pair->swapAt(1, value::TypeTags::Null, 0);
+        mergeMemUsage = aggTopBottomNAdd<Less>(mergeState,
+                                               mergeArray,
+                                               mergeMaxSize,
+                                               mergeMemUsage,
+                                               mergeMemLimit,
+                                               sortSpec,
+                                               key,
+                                               output);
+    }
+
+    mergeStateGuard.reset();
+    return {true, mergeStateTag, mergeStateVal};
+}
+
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinAggTopBottomNFinalize(
+    ArityType arity) {
+    auto [sortSpecOwned, sortSpecTag, sortSpecVal] = getFromStack(1);
+    tassert(5807026, "Argument must be of sortSpec type", sortSpecTag == value::TypeTags::sortSpec);
+    auto sortSpec = value::getSortSpecView(sortSpecVal);
+
+    auto [stateTag, stateVal] = moveOwnedFromStack(0);
+    value::ValueGuard stateGuard{stateTag, stateVal};
+    auto [state, array, startIdx, maxSize, memUsage, memLimit] = multiAccState(stateTag, stateVal);
+
+    auto [outputArrayTag, outputArrayVal] = value::makeNewArray();
+    value::ValueGuard outputArrayGuard{outputArrayTag, outputArrayVal};
+    auto outputArray = value::getArrayView(outputArrayVal);
+    outputArray->reserve(array->size());
+
+    // We always output result in the order of sort pattern in according to MQL semantics.
+    auto less = SortPatternLess(sortSpec);
+    auto keyLess = PairKeyComp(less);
+    std::sort(array->values().begin(), array->values().end(), keyLess);
+    for (size_t i = 0; i < array->size(); ++i) {
+        auto pair = value::getArrayView(array->getAt(i).second);
+        auto [outputTag, outputVal] = pair->swapAt(1, value::TypeTags::Null, 0);
+        outputArray->push_back(outputTag, outputVal);
+    }
+
+    outputArrayGuard.reset();
+    return {true, outputArrayTag, outputArrayVal};
+}
+
+template <bool less>
+int32_t aggMinMaxN(value::Array* state,
+                   value::Array* array,
+                   size_t maxSize,
+                   int32_t memUsage,
+                   int32_t memLimit,
+                   const CollatorInterface* collator,
+                   value::TypeTags fieldTag,
+                   value::Value fieldVal) {
+    value::ValueGuard guard{fieldTag, fieldVal};
+    auto& heap = array->values();
+    ValueCompare<less> comp{collator};
+
+    if (array->size() < maxSize) {
+        memUsage = updateAndCheckMemUsage(
+            state, memUsage, value::getApproximateSize(fieldTag, fieldVal), memLimit);
+        guard.reset();
+
+        array->push_back(fieldTag, fieldVal);
+        std::push_heap(heap.begin(), heap.end(), comp);
+    } else {
+        uassert(7548800,
+                "Heap should contain same number of elements as MaxSize",
+                array->size() == maxSize);
+
+        auto heapRoot = heap.front();
+        if (comp({fieldTag, fieldVal}, heapRoot)) {
+            memUsage =
+                updateAndCheckMemUsage(state,
+                                       memUsage,
+                                       -value::getApproximateSize(heapRoot.first, heapRoot.second) +
+                                           value::getApproximateSize(fieldTag, fieldVal),
+                                       memLimit);
+            std::pop_heap(heap.begin(), heap.end(), comp);
+            guard.reset();
+            array->setAt(maxSize - 1, fieldTag, fieldVal);
+            std::push_heap(heap.begin(), heap.end(), comp);
+        }
+    }
+
+    return memUsage;
+}
+
+template <bool less>
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinAggMinMaxN(ArityType arity) {
+    invariant(arity == 2 || arity == 3);
+
+    auto [stateTag, stateVal] = moveOwnedFromStack(0);
+    value::ValueGuard stateGuard{stateTag, stateVal};
+
+    auto [fieldTag, fieldVal] = moveOwnedFromStack(1);
+    value::ValueGuard fieldGuard{fieldTag, fieldVal};
+
+    if (value::isNullish(fieldTag)) {
+        stateGuard.reset();
+        return {true, stateTag, stateVal};
+    }
+
+    auto [state, array, startIdx, maxSize, memUsage, memLimit] = multiAccState(stateTag, stateVal);
+
+    CollatorInterface* collator = nullptr;
+    if (arity == 3) {
+        auto [collOwned, collTag, collVal] = getFromStack(2);
+        uassert(7548802, "expected a collator argument", collTag == value::TypeTags::collator);
+        collator = value::getCollatorView(collVal);
+    }
+    fieldGuard.reset();
+    aggMinMaxN<less>(state, array, maxSize, memUsage, memLimit, collator, fieldTag, fieldVal);
+
+    stateGuard.reset();
+    return {true, stateTag, stateVal};
+}
+
+template <bool less>
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinAggMinMaxNMerge(ArityType arity) {
+    invariant(arity == 2 || arity == 3);
+
+    auto [mergeStateTag, mergeStateVal] = moveOwnedFromStack(0);
+    value::ValueGuard mergeStateGuard{mergeStateTag, mergeStateVal};
+
+    auto [stateTag, stateVal] = moveOwnedFromStack(1);
+    value::ValueGuard stateGuard{stateTag, stateVal};
+
+    auto [mergeState, mergeArray, mergeStartIdx, mergeMaxSize, mergeMemUsage, mergeMemLimit] =
+        multiAccState(mergeStateTag, mergeStateVal);
+    auto [state, array, startIdx, maxSize, memUsage, memLimit] = multiAccState(stateTag, stateVal);
+    uassert(7548801,
+            "Two arrays to merge should have the same MaxSize component",
+            maxSize == mergeMaxSize);
+
+    CollatorInterface* collator = nullptr;
+    if (arity == 3) {
+        auto [collOwned, collTag, collVal] = getFromStack(2);
+        uassert(7548803, "expected a collator argument", collTag == value::TypeTags::collator);
+        collator = value::getCollatorView(collVal);
+    }
+
+    for (size_t i = 0; i < array->size(); ++i) {
+        auto [tag, val] = array->swapAt(i, value::TypeTags::Null, 0);
+        mergeMemUsage = aggMinMaxN<less>(
+            mergeState, mergeArray, mergeMaxSize, mergeMemUsage, mergeMemLimit, collator, tag, val);
+    }
+
+    mergeStateGuard.reset();
+    return {true, mergeStateTag, mergeStateVal};
+}
+
+template <bool less>
+FastTuple<bool, value::TypeTags, value::Value> ByteCode::builtinAggMinMaxNFinalize(
+    ArityType arity) {
+    invariant(arity == 2 || arity == 1);
+    auto [stateTag, stateVal] = moveOwnedFromStack(0);
+    value::ValueGuard stateGuard{stateTag, stateVal};
+
+    auto [state, array, startIdx, maxSize, memUsage, memLimit] = multiAccState(stateTag, stateVal);
+
+    CollatorInterface* collator = nullptr;
+    if (arity == 2) {
+        auto [collOwned, collTag, collVal] = getFromStack(1);
+        uassert(7548804, "expected a collator argument", collTag == value::TypeTags::collator);
+        collator = value::getCollatorView(collVal);
+    }
+
+    ValueCompare<less> comp{collator};
+    std::sort(array->values().begin(), array->values().end(), comp);
+    auto [arrayTag, arrayVal] =
+        state->swapAt(static_cast<size_t>(AggMultiElems::kInternalArr), value::TypeTags::Null, 0);
+    return {true, arrayTag, arrayVal};
 }
 
 FastTuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builtin f,
@@ -6187,6 +6797,8 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builtin
             return builtinGenerateCheapSortKey(arity);
         case Builtin::sortKeyComponentVectorGetElement:
             return builtinSortKeyComponentVectorGetElement(arity);
+        case Builtin::sortKeyComponentVectorToArray:
+            return builtinSortKeyComponentVectorToArray(arity);
         case Builtin::makeBsonObj:
             return builtinMakeBsonObj(arity);
         case Builtin::tsSecond:
@@ -6224,6 +6836,44 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builtin
             return builtinObjectToArray(arity);
         case Builtin::arrayToObject:
             return builtinArrayToObject(arity);
+        case Builtin::aggFirstNNeedsMoreInput:
+            return builtinAggFirstNNeedsMoreInput(arity);
+        case Builtin::aggFirstN:
+            return builtinAggFirstN(arity);
+        case Builtin::aggFirstNMerge:
+            return builtinAggFirstNMerge(arity);
+        case Builtin::aggFirstNFinalize:
+            return builtinAggFirstNFinalize(arity);
+        case Builtin::aggLastN:
+            return builtinAggLastN(arity);
+        case Builtin::aggLastNMerge:
+            return builtinAggLastNMerge(arity);
+        case Builtin::aggLastNFinalize:
+            return builtinAggLastNFinalize(arity);
+        case Builtin::aggTopN:
+            return builtinAggTopBottomN<SortPatternLess>(arity);
+        case Builtin::aggTopNMerge:
+            return builtinAggTopBottomNMerge<SortPatternLess>(arity);
+        case Builtin::aggTopNFinalize:
+            return builtinAggTopBottomNFinalize(arity);
+        case Builtin::aggBottomN:
+            return builtinAggTopBottomN<SortPatternGreater>(arity);
+        case Builtin::aggBottomNMerge:
+            return builtinAggTopBottomNMerge<SortPatternGreater>(arity);
+        case Builtin::aggBottomNFinalize:
+            return builtinAggTopBottomNFinalize(arity);
+        case Builtin::aggMaxN:
+            return builtinAggMinMaxN<false /* less */>(arity);
+        case Builtin::aggMaxNMerge:
+            return builtinAggMinMaxNMerge<false /* less */>(arity);
+        case Builtin::aggMaxNFinalize:
+            return builtinAggMinMaxNFinalize<false /* less */>(arity);
+        case Builtin::aggMinN:
+            return builtinAggMinMaxN<true /* less */>(arity);
+        case Builtin::aggMinNMerge:
+            return builtinAggMinMaxNMerge<true /* less */>(arity);
+        case Builtin::aggMinNFinalize:
+            return builtinAggMinMaxNFinalize<true /* less */>(arity);
     }
 
     MONGO_UNREACHABLE;
@@ -6456,6 +7106,8 @@ std::string builtinToString(Builtin b) {
             return "generateCheapSortKey";
         case Builtin::sortKeyComponentVectorGetElement:
             return "sortKeyComponentVectorGetElement";
+        case Builtin::sortKeyComponentVectorToArray:
+            return "sortKeyComponentVectorToArray";
         case Builtin::makeBsonObj:
             return "makeBsonObj";
         case Builtin::tsSecond:
@@ -6494,6 +7146,44 @@ std::string builtinToString(Builtin b) {
             return "objectToArray";
         case Builtin::arrayToObject:
             return "arrayToObject";
+        case Builtin::aggFirstNNeedsMoreInput:
+            return "aggFirstNNeedsMoreInput";
+        case Builtin::aggFirstN:
+            return "aggFirstN";
+        case Builtin::aggFirstNMerge:
+            return "aggFirstNMerge";
+        case Builtin::aggFirstNFinalize:
+            return "aggFirstNFinalize";
+        case Builtin::aggLastN:
+            return "aggLastN";
+        case Builtin::aggLastNMerge:
+            return "aggLastNMerge";
+        case Builtin::aggLastNFinalize:
+            return "aggLastNFinalize";
+        case Builtin::aggTopN:
+            return "aggTopN";
+        case Builtin::aggTopNMerge:
+            return "aggTopNMerge";
+        case Builtin::aggTopNFinalize:
+            return "aggTopNFinalize";
+        case Builtin::aggBottomN:
+            return "aggBottomN";
+        case Builtin::aggBottomNMerge:
+            return "aggBottomNMerge";
+        case Builtin::aggBottomNFinalize:
+            return "aggBottomNFinalize";
+        case Builtin::aggMaxN:
+            return "aggMaxN";
+        case Builtin::aggMaxNMerge:
+            return "aggMaxNMerge";
+        case Builtin::aggMaxNFinalize:
+            return "aggMaxNFinalize";
+        case Builtin::aggMinN:
+            return "aggMinN";
+        case Builtin::aggMinNMerge:
+            return "aggMinNMerge";
+        case Builtin::aggMinNFinalize:
+            return "aggMinNFinalize";
         default:
             MONGO_UNREACHABLE;
     }
@@ -6587,6 +7277,24 @@ void ByteCode::runInternal(const CodeFragment* code, int64_t position) {
             }
             case Instruction::pushAccessVal: {
                 auto accessor = readFromMemory<value::SlotAccessor*>(pcPointer);
+                pcPointer += sizeof(accessor);
+
+                auto [tag, val] = accessor->getViewOfValue();
+                pushStack(false, tag, val);
+
+                break;
+            }
+            case Instruction::pushOwnedAccessorVal: {
+                auto accessor = readFromMemory<value::OwnedValueAccessor*>(pcPointer);
+                pcPointer += sizeof(accessor);
+
+                auto [tag, val] = accessor->getViewOfValue();
+                pushStack(false, tag, val);
+
+                break;
+            }
+            case Instruction::pushEnvAccessorVal: {
+                auto accessor = readFromMemory<RuntimeEnvironment::Accessor*>(pcPointer);
                 pcPointer += sizeof(accessor);
 
                 auto [tag, val] = accessor->getViewOfValue();

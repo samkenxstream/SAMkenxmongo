@@ -2,13 +2,12 @@
  * Tests that FCV downgrade will reach the transitional kDowngrading state quickly (within a few
  * seconds).
  *
- * Catalog shard incompatible because we do not currently allow downgrading FCV with a catalog
- * shard. TODO SERVER-73279: Enable in catalog shard mode when it supports FCV downgrade.
+ * Config shard incompatible because we do not currently allow downgrading FCV with a catalog
+ * shard.
  * @tags: [
  *   requires_fcv_70,
  *   multiversion_incompatible,
  *   does_not_support_stepdowns,
- *   catalog_shard_incompatible,
  * ]
  */
 (function() {
@@ -32,12 +31,17 @@ function runStandaloneTest() {
     jsTestLog("current FCV (should be latest): " + tojson(fcvDoc));
     checkFCV(adminDB, latestFCV);
 
-    assert.commandWorked(
-        conn.adminCommand({configureFailPoint: 'failDowngrading', mode: "alwaysOn"}));
+    const hangAtSetFCVStartFailpoint = configureFailPoint(conn, "hangAtSetFCVStart");
+    assert.commandWorked(conn.adminCommand(
+        {configureFailPoint: 'failAfterReachingTransitioningState', mode: "alwaysOn"}));
 
     const parallelShell = startParallelShell(function() {
         db.getSiblingDB("admin").runCommand({setFeatureCompatibilityVersion: lastLTSFCV});
     }, conn.port);
+
+    // Make sure the setFCV command has started running.
+    hangAtSetFCVStartFailpoint.wait();
+    hangAtSetFCVStartFailpoint.off();
 
     // Check that we reach the downgrading FCV state within a few seconds.
     assert.soon(
@@ -63,12 +67,17 @@ function runReplicaSetTest() {
     jsTestLog("current FCV (should be latest): " + tojson(fcvDoc));
     checkFCV(primaryAdminDB, latestFCV);
 
-    assert.commandWorked(
-        primary.adminCommand({configureFailPoint: 'failDowngrading', mode: "alwaysOn"}));
+    const hangAtSetFCVStartFailpoint = configureFailPoint(primary, "hangAtSetFCVStart");
+    assert.commandWorked(primary.adminCommand(
+        {configureFailPoint: 'failAfterReachingTransitioningState', mode: "alwaysOn"}));
 
     const parallelShell = startParallelShell(function() {
         db.getSiblingDB("admin").runCommand({setFeatureCompatibilityVersion: lastLTSFCV});
     }, primary.port);
+
+    // Make sure the setFCV command has started running.
+    hangAtSetFCVStartFailpoint.wait();
+    hangAtSetFCVStartFailpoint.off();
 
     // Check that we reach the downgrading FCV state within a few seconds.
     assert.soon(
@@ -100,14 +109,17 @@ function runShardingTest() {
     checkFCV(shard0PrimaryAdminDB, latestFCV);
     checkFCV(shard1PrimaryAdminDB, latestFCV);
 
-    assert.commandWorked(
-        shard0Primary.adminCommand({configureFailPoint: 'failDowngrading', mode: "alwaysOn"}));
-    assert.commandWorked(
-        shard1Primary.adminCommand({configureFailPoint: 'failDowngrading', mode: "alwaysOn"}));
+    const hangAtSetFCVStartFailpoint = configureFailPoint(configPrimary, "hangAtSetFCVStart");
+    assert.commandWorked(configPrimary.adminCommand(
+        {configureFailPoint: 'failAfterSendingShardsToDowngradingOrUpgrading', mode: "alwaysOn"}));
 
     const parallelShell = startParallelShell(function() {
         db.getSiblingDB("admin").runCommand({setFeatureCompatibilityVersion: lastLTSFCV});
     }, st.s.port);
+
+    // Make sure the setFCV command has started running.
+    hangAtSetFCVStartFailpoint.wait();
+    hangAtSetFCVStartFailpoint.off();
 
     // Check that we reach the downgrading FCV state within a few seconds.
     assert.soon(

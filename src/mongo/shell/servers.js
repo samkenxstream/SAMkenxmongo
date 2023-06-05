@@ -743,7 +743,6 @@ MongoRunner.mongodOptions = function(opts = {}) {
     _removeSetParameterIfBeforeVersion(
         opts, "enableDefaultWriteConcernUpdatesForInitiate", "5.0.0");
     _removeSetParameterIfBeforeVersion(opts, "enableReconfigRollbackCommittedWritesCheck", "5.0.0");
-    _removeSetParameterIfBeforeVersion(opts, "featureFlagRetryableFindAndModify", "5.0.0");
     _removeSetParameterIfBeforeVersion(opts, "allowMultipleArbiters", "5.3.0");
     _removeSetParameterIfBeforeVersion(
         opts, "internalQueryDisableExclusionProjectionFastPath", "6.2.0");
@@ -893,6 +892,8 @@ MongoRunner.mongosOptions = function(opts) {
 
     _removeSetParameterIfBeforeVersion(
         opts, "mongosShutdownTimeoutMillisForSignaledShutdown", "4.5.0", true);
+    _removeSetParameterIfBeforeVersion(
+        opts, "failpoint.skipClusterParameterRefresh", "7.1.0", true);
 
     return opts;
 };
@@ -1435,16 +1436,6 @@ function appendSetParameterArgs(argArray) {
                 argArray.push(...["--setParameter", "backtraceLogFile=" + backtraceLogFilePath]);
             }
 
-            // When launching a 5.0 mongod, if we're mentioning the
-            // `storeFindAndModifyImagesInSideCollection` setParameter and the corresponding feature
-            // flag is not set, add it for good measure.
-            if (programMajorMinorVersion === 500 &&
-                isSetParameterMentioned(jsTest.options().setParameters,
-                                        "storeFindAndModifyImagesInSideCollection") &&
-                !argArrayContainsSetParameterValue("featureFlagRetryableFindAndModify=")) {
-                argArray.push(...['--setParameter', "featureFlagRetryableFindAndModify=true"]);
-            }
-
             // New mongod-specific option in 4.9.x.
             if (programMajorMinorVersion >= 490) {
                 const parameters = jsTest.options().setParameters;
@@ -1518,11 +1509,16 @@ function appendSetParameterArgs(argArray) {
                 }
             }
 
-            // TODO: Make this unconditional in 3.8.
-            if (programMajorMinorVersion > 340) {
-                if (!argArrayContainsSetParameterValue('orphanCleanupDelaySecs=')) {
-                    argArray.push(...['--setParameter', 'orphanCleanupDelaySecs=1']);
-                }
+            // Reduce the default value for `orphanCleanupDelaySecs` to 1 sec to speed up jstests.
+            if (!argArrayContainsSetParameterValue('orphanCleanupDelaySecs=')) {
+                argArray.push(...['--setParameter', 'orphanCleanupDelaySecs=1']);
+            }
+
+            // Increase the default value for `receiveChunkWaitForRangeDeleterTimeoutMS` to 90
+            // seconds to prevent failures due to occasional slow range deletions
+            if (!argArrayContainsSetParameterValue('receiveChunkWaitForRangeDeleterTimeoutMS=')) {
+                argArray.push(
+                    ...['--setParameter', 'receiveChunkWaitForRangeDeleterTimeoutMS=90000']);
             }
 
             if (programMajorMinorVersion >= 360) {

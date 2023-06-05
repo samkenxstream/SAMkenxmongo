@@ -78,13 +78,39 @@ var $config = (function() {
                 tid = Random.randInt(this.threadCount);
 
             const targetThreadColl = threadCollectionName(collName, tid);
-            const coll = db[threadCollectionName(collName, tid)];
+            const coll = db[targetThreadColl];
             const fullNs = coll.getFullName();
             jsTestLog('create state tid:' + tid + ' currentTid:' + this.tid +
                       ' collection:' + targetThreadColl);
-            assertAlways.commandWorked(
-                db.adminCommand({shardCollection: fullNs, key: {_id: 1}, unique: false}));
-            jsTestLog('create state finished');
+            // Add necessary indexes for resharding.
+            assertAlways.commandWorked(db.adminCommand({
+                createIndexes: targetThreadColl,
+                indexes: [
+                    {key: {[`tid_${tid}_0`]: 1}, name: `tid_${tid}_0_1`, unique: false},
+                    {key: {[`tid_${tid}_1`]: 1}, name: `tid_${tid}_1_1`, unique: false}
+                ],
+                writeConcern: {w: 'majority'}
+            }));
+            try {
+                assertAlways.commandWorked(db.adminCommand(
+                    {shardCollection: fullNs, key: {[`tid_${tid}_0`]: 1}, unique: false}));
+            } catch (e) {
+                const exceptionCode = e.code;
+                if (exceptionCode) {
+                    if (exceptionCode == ErrorCodes.AlreadyInitialized ||
+                        exceptionCode == ErrorCodes.InvalidOptions) {
+                        // It is fine for a shardCollection to throw AlreadyInitialized, a
+                        // resharding state might have changed the shard key for the namespace. It
+                        // is also fine to fail with InvalidOptions, a drop state could've removed
+                        // the indexes and the CRUD state might have added some documents, forcing
+                        // the need to manually create indexes.
+                        return;
+                    }
+                }
+                throw e;
+            } finally {
+                jsTestLog('create state finished');
+            }
         },
         drop: function(db, collName, connCache) {
             let tid = this.tid;
@@ -155,12 +181,54 @@ var $config = (function() {
                 jsTestLog('rename state finished');
             }
         },
+        resharding: function(db, collName, connCache) {
+            let tid = this.tid;
+            // Pick a tid at random until we pick one that doesn't target this thread's collection.
+            while (tid === this.tid)
+                tid = Random.randInt(this.threadCount);
+            const fullNs = db[threadCollectionName(collName, tid)].getFullName();
+            let newKey = 'tid_' + tid + '_' + Random.randInt(2);
+            try {
+                jsTestLog('resharding state tid:' + tid + ' currentTid:' + this.tid +
+                          ' collection:' + fullNs + ' newKey ' + newKey);
+                assertAlways.commandWorked(
+                    db.adminCommand({reshardCollection: fullNs, key: {[`${newKey}`]: 1}}));
+            } catch (e) {
+                const exceptionCode = e.code;
+                if (exceptionCode == ErrorCodes.ConflictingOperationInProgress ||
+                    exceptionCode == ErrorCodes.NamespaceNotSharded) {
+                    // It is fine for a resharding operation to throw ConflictingOperationInProgress
+                    // if a concurrent resharding with the same collection is ongoing.
+                    // It is also fine for a resharding operation to throw NamespaceNotSharded,
+                    // because a drop state could've happend recently.
+                    return;
+                }
+                throw e;
+            } finally {
+                jsTestLog('resharding state finished');
+            }
+        },
         checkDatabaseMetadataConsistency: function(db, collName, connCache) {
             if (this.skipMetadataChecks) {
                 return;
             }
             jsTestLog('Check database metadata state');
             const inconsistencies = db.checkMetadataConsistency().toArray();
+            assertAlways.eq(0, inconsistencies.length, tojson(inconsistencies));
+        },
+        checkCollectionMetadataConsistency: function(db, collName, connCache) {
+            if (this.skipMetadataChecks) {
+                return;
+            }
+
+            let tid = this.tid;
+            while (tid === this.tid)
+                tid = Random.randInt(this.threadCount);
+
+            const targetThreadColl = threadCollectionName(collName, tid);
+            jsTestLog('Check collection metadata state tid:' + tid + ' currentTid:' + this.tid +
+                      ' collection:' + targetThreadColl);
+            const inconsistencies = db[targetThreadColl].checkMetadataConsistency().toArray();
             assertAlways.eq(0, inconsistencies.length, tojson(inconsistencies));
         },
         CRUD: function(db, collName, connCache) {
@@ -173,7 +241,6 @@ var $config = (function() {
             jsTestLog('CRUD state tid:' + tid + ' currentTid:' + this.tid +
                       ' collection:' + targetThreadColl);
             const coll = db[targetThreadColl];
-            const fullNs = coll.getFullName();
 
             const generation = new Date().getTime();
             // Insert Data
@@ -181,7 +248,8 @@ var $config = (function() {
 
             let insertBulkOp = coll.initializeUnorderedBulkOp();
             for (let i = 0; i < numDocs; ++i) {
-                insertBulkOp.insert({generation: generation, count: i, tid: tid});
+                insertBulkOp.insert(
+                    {generation: generation, count: i, [`tid_${tid}_0`]: i, [`tid_${tid}_1`]: i});
             }
 
             mutexLock(db, tid, targetThreadColl);
@@ -232,9 +300,7 @@ var $config = (function() {
     let setup = function(db, collName, cluster) {
         this.skipMetadataChecks =
             // TODO SERVER-70396: remove this flag
-            !FeatureFlagUtil.isEnabled(db.getMongo(), 'CheckMetadataConsistency') ||
-            // TODO SERVER-74445: re-enable metadata checks on catalog shard deployments
-            cluster.hasCatalogShard();
+            !FeatureFlagUtil.isEnabled(db.getMongo(), 'CheckMetadataConsistency');
 
         for (let tid = 0; tid < this.threadCount; ++tid) {
             db[data.CRUDMutex].insert({tid: tid, mutex: 0});

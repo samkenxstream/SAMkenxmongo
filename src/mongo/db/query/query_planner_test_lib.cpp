@@ -1415,13 +1415,14 @@ Status QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
                                   << testSoln.toString()};
         }
 
-        if (expectedForeignCollection.str() != actualEqLookupNode->foreignCollection.toString()) {
+        if (expectedForeignCollection.str() !=
+            actualEqLookupNode->foreignCollection.toString_forTest()) {
             return {
                 ErrorCodes::Error{6267502},
                 str::stream() << "Test solution 'foreignCollection' does not match actual; test "
                                  ""
                               << expectedForeignCollection.str() << " != actual "
-                              << actualEqLookupNode->foreignCollection};
+                              << actualEqLookupNode->foreignCollection.toStringForErrorMsg()};
         }
 
         auto expectedLocalField = expectedEqLookupSoln["joinFieldLocal"];

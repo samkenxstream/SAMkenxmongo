@@ -71,6 +71,7 @@ MONGO_FAIL_POINT_DEFINE(hangIndexBuildAfterSignalPrimaryForCommitReadiness);
 MONGO_FAIL_POINT_DEFINE(hangBeforeRunningIndexBuild);
 MONGO_FAIL_POINT_DEFINE(hangIndexBuildBeforeSignalingPrimaryForAbort);
 MONGO_FAIL_POINT_DEFINE(hangIndexBuildBeforeTransitioningReplStateTokAwaitPrimaryAbort);
+MONGO_FAIL_POINT_DEFINE(hangBeforeVoteCommitIndexBuild);
 
 const StringData kMaxNumActiveUserIndexBuildsServerParameterName = "maxNumActiveUserIndexBuilds"_sd;
 
@@ -92,6 +93,9 @@ ThreadPool::Options makeDefaultThreadPoolOptions() {
     // Ensure all threads have a client.
     options.onCreateThread = [](const std::string& threadName) {
         Client::initThread(threadName.c_str());
+
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationUnkillableByStepdown(lk);
     };
 
     return options;
@@ -417,7 +421,7 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
                           startPromise = std::move(startPromise),
                           startTimestamp,
                           shardVersion = oss.getShardVersion(nss),
-                          dbVersion = oss.getDbVersion(dbName.toStringWithTenantId()),
+                          dbVersion = oss.getDbVersion(DatabaseNameUtil::serialize(dbName)),
                           resumeInfo,
                           impersonatedClientAttrs = std::move(impersonatedClientAttrs),
                           forwardableOpMetadata =
@@ -460,12 +464,12 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
             sleepmillis(100);
         }
 
-        // Start collecting metrics for the index build. The metrics for this operation will only be
-        // aggregated globally if the node commits or aborts while it is primary.
+        // Start collecting metrics for the index build. The metrics for this operation will
+        // only be aggregated globally if the node commits or aborts while it is primary.
         auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx.get());
-        if (ResourceConsumption::shouldCollectMetricsForDatabase(dbName.toStringWithTenantId()) &&
+        if (ResourceConsumption::shouldCollectMetricsForDatabase(dbName) &&
             ResourceConsumption::isMetricsCollectionEnabled()) {
-            metricsCollector.beginScopedCollecting(opCtx.get(), dbName.toStringWithTenantId());
+            metricsCollector.beginScopedCollecting(opCtx.get(), dbName);
         }
 
         // Index builds should never take the PBWM lock, even on a primary. This allows the
@@ -489,16 +493,16 @@ IndexBuildsCoordinatorMongod::_startIndexBuild(OperationContext* opCtx,
 
         hangBeforeRunningIndexBuild.pauseWhileSet();
 
-        // Runs the remainder of the index build. Sets the promise result and cleans up the index
-        // build.
+        // Runs the remainder of the index build. Sets the promise result and cleans up the
+        // index build.
         _runIndexBuild(opCtx.get(), buildUUID, indexBuildOptions, resumeInfo);
 
         // Do not exit with an incomplete future.
         invariant(replState->sharedPromise.getFuture().isReady());
 
         try {
-            // Logs the index build statistics if it took longer than the server parameter `slowMs`
-            // to complete.
+            // Logs the index build statistics if it took longer than the server parameter
+            // `slowMs` to complete.
             CurOp::get(opCtx.get())
                 ->completeAndLogOperation(MONGO_LOGV2_DEFAULT_COMPONENT,
                                           CollectionCatalog::get(opCtx.get())
@@ -554,6 +558,8 @@ Status IndexBuildsCoordinatorMongod::voteAbortIndexBuild(OperationContext* opCtx
 Status IndexBuildsCoordinatorMongod::voteCommitIndexBuild(OperationContext* opCtx,
                                                           const UUID& buildUUID,
                                                           const HostAndPort& votingNode) {
+    hangBeforeVoteCommitIndexBuild.pauseWhileSet(opCtx);
+
     auto swReplState = _getIndexBuild(buildUUID);
     if (!swReplState.isOK()) {
         // Index build might have got torn down.
@@ -675,29 +681,17 @@ bool IndexBuildsCoordinatorMongod::_signalIfCommitQuorumNotEnabled(
 }
 
 void IndexBuildsCoordinatorMongod::_signalPrimaryForAbortAndWaitForExternalAbort(
-    OperationContext* opCtx, ReplIndexBuildState* replState, const Status& abortStatus) {
-
+    OperationContext* opCtx, ReplIndexBuildState* replState) {
     hangIndexBuildBeforeTransitioningReplStateTokAwaitPrimaryAbort.pauseWhileSet(opCtx);
 
+    const auto abortStatus = replState->getAbortStatus();
     LOGV2(7419402,
           "Index build: signaling primary to abort index build",
           "buildUUID"_attr = replState->buildUUID,
           logAttrs(replState->dbName),
           "collectionUUID"_attr = replState->collectionUUID,
           "reason"_attr = abortStatus);
-    const auto transitionedToWaitForAbort = replState->requestAbortFromPrimary(abortStatus);
-
-    if (!transitionedToWaitForAbort) {
-        // The index build has likely been aborted externally (e.g. its underlying collection was
-        // dropped), and it's in the midst of tearing down. There's nothing else to do here.
-        LOGV2(7530800,
-              "Index build: the build is already in aborted state; not signaling primary to abort",
-              "buildUUID"_attr = replState->buildUUID,
-              "db"_attr = replState->dbName,
-              "collectionUUID"_attr = replState->collectionUUID,
-              "reason"_attr = abortStatus);
-        return;
-    }
+    replState->requestAbortFromPrimary();
 
     hangIndexBuildBeforeSignalingPrimaryForAbort.pauseWhileSet(opCtx);
 
@@ -778,8 +772,27 @@ void IndexBuildsCoordinatorMongod::_signalPrimaryForCommitReadiness(
     // Before voting see if we are eligible to skip voting and signal
     // to commit index build if the node is primary.
     if (_signalIfCommitQuorumNotEnabled(opCtx, replState)) {
+        LOGV2(7568001,
+              "Index build: skipping vote for commit readiness",
+              "buildUUID"_attr = replState->buildUUID,
+              logAttrs(replState->dbName),
+              "collectionUUID"_attr = replState->collectionUUID);
         return;
     }
+
+    LOGV2(7568000,
+          "Index build: vote for commit readiness",
+          "buildUUID"_attr = replState->buildUUID,
+          logAttrs(replState->dbName),
+          "collectionUUID"_attr = replState->collectionUUID);
+
+    // Indicate that the index build in this node has already tried to vote for commit readiness.
+    // We do not try to determine whether the vote has actually succeeded or not, as it is
+    // challenging due to the asynchronous request and potential concurrent interrupts. After this
+    // point, the node cannot vote to abort this index build, and if it needs to abort the index
+    // build it must try to do so independently. Meaning, as a primary it will succeed, but as a
+    // secondary it will fassert.
+    replState->setVotedForCommitReadiness(opCtx);
 
     const auto generateCmd = [](const UUID& uuid, const std::string& address) {
         return BSON("voteCommitIndexBuild" << uuid << "hostAndPort" << address << "writeConcern"
@@ -950,7 +963,7 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
         return Status(ErrorCodes::IndexNotFound,
                       str::stream()
                           << "Cannot set a new commit quorum on an index build in collection '"
-                          << nss << "' without providing any indexes.");
+                          << nss.toStringForErrorMsg() << "' without providing any indexes.");
     }
 
     // Take the MODE_IX lock now, so that when we actually persist the value later, we don't need to
@@ -958,7 +971,8 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
     AutoGetCollection collection(opCtx, nss, MODE_IX);
     if (!collection) {
         return Status(ErrorCodes::NamespaceNotFound,
-                      str::stream() << "Collection '" << nss << "' was not found.");
+                      str::stream()
+                          << "Collection '" << nss.toStringForErrorMsg() << "' was not found.");
     }
 
     UUID collectionUUID = collection->uuid();
@@ -978,13 +992,14 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
     auto collIndexBuilds = activeIndexBuilds.filterIndexBuilds(pred);
     if (collIndexBuilds.empty()) {
         return Status(ErrorCodes::IndexNotFound,
-                      str::stream() << "Cannot find an index build on collection '" << nss
-                                    << "' with the provided index names");
+                      str::stream()
+                          << "Cannot find an index build on collection '"
+                          << nss.toStringForErrorMsg() << "' with the provided index names");
     }
     invariant(
         1U == collIndexBuilds.size(),
         str::stream() << "Found multiple index builds with the same index names on collection "
-                      << nss << " (" << collectionUUID
+                      << nss.toStringForErrorMsg() << " (" << collectionUUID
                       << "): first index name: " << indexNames.front());
 
     replState = collIndexBuilds.front();
@@ -1004,18 +1019,19 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
         return Status(ErrorCodes::IndexNotFound,
                       str::stream()
                           << "Index build not yet started for the provided indexes in collection '"
-                          << nss << "'.");
+                          << nss.toStringForErrorMsg() << "'.");
     }
 
     auto currentCommitQuorum = invariantStatusOK(swOnDiskCommitQuorum);
     if (currentCommitQuorum.numNodes == CommitQuorumOptions::kDisabled ||
         newCommitQuorum.numNodes == CommitQuorumOptions::kDisabled) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "Commit quorum value can be changed only for index builds "
-                                    << "with commit quorum enabled, nss: '" << nss
-                                    << "' first index name: '" << indexNames.front()
-                                    << "' currentCommitQuorum: " << currentCommitQuorum.toBSON()
-                                    << " providedCommitQuorum: " << newCommitQuorum.toBSON());
+                      str::stream()
+                          << "Commit quorum value can be changed only for index builds "
+                          << "with commit quorum enabled, nss: '" << nss.toStringForErrorMsg()
+                          << "' first index name: '" << indexNames.front()
+                          << "' currentCommitQuorum: " << currentCommitQuorum.toBSON()
+                          << " providedCommitQuorum: " << newCommitQuorum.toBSON());
     }
 
     invariant(opCtx->lockState()->isRSTLLocked());

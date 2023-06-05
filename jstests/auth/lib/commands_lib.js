@@ -425,25 +425,25 @@ export const authCommandsLib = {
           ]
         },
         {
-          testname: 'transitionToCatalogShard',
-          command: {transitionToCatalogShard: 1},
+          testname: 'transitionFromDedicatedConfigServer',
+          command: {transitionFromDedicatedConfigServer: 1},
           skipUnlessSharded: true,
           skipTest: (conn) => {
             return !TestData.setParameters.featureFlagCatalogShard;
           },
           testcases: [
             {
-              runOnDb: adminDbName, 
-              roles: roles_clusterManager, 
-              privileges: [{resource: {cluster: true}, actions: ["transitionToCatalogShard"]}]
+              runOnDb: adminDbName,
+              roles: roles_clusterManager,
+              privileges: [{resource: {cluster: true}, actions: ["transitionFromDedicatedConfigServer"]}]
             },
             {runOnDb: firstDbName, roles: {}},
             {runOnDb: secondDbName, roles: {}}
           ]
         },
         {
-          testname: "_configsvrTransitionToCatalogShard",
-          command: {_configsvrTransitionToCatalogShard: 1},
+          testname: "_configsvrTransitionFromDedicatedConfigServer",
+          command: {_configsvrTransitionFromDedicatedConfigServer: 1},
           skipSharded: true,
           skipTest: (conn) => {
             return !TestData.setParameters.featureFlagCatalogShard;
@@ -3075,6 +3075,43 @@ export const authCommandsLib = {
           ]
         },
         {
+          testname: "cleanupStructuredEncryptionData",
+          command: {cleanupStructuredEncryptionData: "foo", cleanupTokens : {}},
+          skipSharded: true,
+          skipUnlessReplicaSet: true,
+          setup: function(db) {
+              assert.commandWorked(db.createCollection("foo", {
+                encryptedFields: {
+                    "fields": [
+                        {
+                            "path": "firstName",
+                            "keyId": UUID("11d58b8a-0c6c-4d69-a0bd-70c6d9befae9"),
+                            "bsonType": "string",
+                            "queries": {"queryType": "equality"}
+                        },
+                    ]
+                }
+              }));
+          },
+          teardown: function(db) {
+              assert.commandWorked(db.dropDatabase());
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: { readWrite : 1, readWriteAnyDatabase : 1, dbOwner : 1, root : 1, __system : 1 },
+                privileges:
+                    [{resource: {db: firstDbName, collection: "foo"}, actions: ["cleanupStructuredEncryptionData"]}]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: { readWriteAnyDatabase : 1, root : 1, __system : 1 },
+                privileges:
+                    [{resource: {db: secondDbName, collection: "foo"}, actions: ["cleanupStructuredEncryptionData"]}]
+              }
+          ]
+        },
+        {
           testname: "connectionStatus",
           command: {connectionStatus: 1},
           testcases: [
@@ -3262,6 +3299,148 @@ export const authCommandsLib = {
           skipSharded: true,
           testcases: [
               {runOnDb: adminDbName, roles: {__system: 1}, expectFail: true},
+          ]
+        },
+        {
+          testname: "checkClusterMetadataConsistency",
+          command: {checkMetadataConsistency: 1},
+          skipUnlessSharded: true,
+          setup: function(db) {
+              assert.commandWorked(db.getSiblingDB("test").createCollection("coll"));
+          },
+          teardown: function(db) {
+              assert.commandWorked(db.getSiblingDB("test").dropDatabase());
+          },
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {clusterManager: 1, clusterAdmin: 1, root: 1, __system: 1}
+              },
+              {
+                runOnDb: adminDbName,
+                privileges: [{resource: {cluster: true}, actions: ["checkMetadataConsistency"]}]
+              },
+              {
+                runOnDb: adminDbName,
+                privileges: [
+                    {resource: {db: "", collection: ""}, actions: ["checkMetadataConsistency"]}
+                ],
+                expectAuthzFailure: true
+              },
+              {
+                runOnDb: adminDbName,
+                privileges: [{
+                    resource: {db: adminDbName, collection: ""},
+                    actions: ["checkMetadataConsistency"]
+                }],
+                expectAuthzFailure: true
+              },
+              {
+                runOnDb: adminDbName,
+                privileges: [{
+                    resource: {db: adminDbName, collection: "coll"},
+                    actions: ["checkMetadataConsistency"]
+                }],
+                expectAuthzFailure: true
+              },
+              {
+                runOnDb: adminDbName,
+                privileges: [{resource: {cluster: true}, actions: ["allCollectionStats"]}],
+                expectAuthzFailure: true
+              }
+          ]
+        },
+        {
+          testname: "checkDatabaseMetadataConsistency",
+          command: {checkMetadataConsistency: 1},
+          skipUnlessSharded: true,
+          setup: function(db) {
+              assert.commandWorked(db.getSiblingDB("test").createCollection("coll"));
+          },
+          teardown: function(db) {
+              assert.commandWorked(db.getSiblingDB("test").dropDatabase());
+          },
+          testcases: [
+              {
+                runOnDb: "test",
+                roles: {clusterManager: 1, clusterAdmin: 1, root: 1, __system: 1}
+              },
+              {
+                runOnDb: "test",
+                privileges: [{resource: {cluster: true}, actions: ["checkMetadataConsistency"]}]
+              },
+              {
+                runOnDb: "test",
+                privileges: [
+                    {resource: {db: "", collection: ""}, actions: ["checkMetadataConsistency"]}
+                ]
+              },
+              {
+                runOnDb: "test",
+                privileges: [{
+                    resource: {db: "test", collection: ""},
+                    actions: ["checkMetadataConsistency"]
+                }]
+              },
+              {
+                runOnDb: "test",
+                privileges: [{
+                    resource: {db: "test", collection: "coll"},
+                    actions: ["checkMetadataConsistency"]
+                }],
+                expectAuthzFailure: true
+              },
+              {
+                runOnDb: "test",
+                privileges: [{resource: {cluster: true}, actions: ["allCollectionStats"]}],
+                expectAuthzFailure: true
+              }
+          ]
+        },
+        {
+          testname: "checkCollectionMetadataConsistency",
+          command: {checkMetadataConsistency: "coll"},
+          skipUnlessSharded: true,
+          setup: function(db) {
+              assert.commandWorked(db.getSiblingDB("test").createCollection("coll"));
+          },
+          teardown: function(db) {
+              assert.commandWorked(db.getSiblingDB("test").dropDatabase());
+          },
+          testcases: [
+              {
+                runOnDb: "test",
+                roles: {clusterManager: 1, clusterAdmin: 1, root: 1, __system: 1}
+              },
+              {
+                runOnDb: "test",
+                privileges: [{resource: {cluster: true}, actions: ["checkMetadataConsistency"]}]
+              },
+              {
+                runOnDb: "test",
+                privileges: [
+                    {resource: {db: "", collection: ""}, actions: ["checkMetadataConsistency"]}
+                ]
+              },
+              {
+                runOnDb: "test",
+                privileges: [{
+                    resource: {db: "test", collection: ""},
+                    actions: ["checkMetadataConsistency"]
+                }]
+              },
+              {
+                runOnDb: "test",
+                privileges: [{
+                    resource: {db: "test", collection: "coll"},
+                    actions: ["checkMetadataConsistency"]
+                }]
+              },
+              {
+                runOnDb: "test",
+                privileges: [{resource: {cluster: true}, actions: ["allCollectionStats"]}],
+                expectAuthzFailure: true
+              }
           ]
         },
         {
@@ -4744,7 +4923,7 @@ export const authCommandsLib = {
             tokens: [
                 {tokens: [{"s": BinData(0, "lUBO7Mov5Sb+c/D4cJ9whhhw/+PZFLCk/AQU2+BpumQ=")}]},
             ],
-            "forInsert": true,
+            "queryType": "insert",
         },
           skipTest: (conn) => {
               return !TestData.setParameters.featureFlagFLE2ProtocolVersion2;
@@ -5523,8 +5702,38 @@ export const authCommandsLib = {
           ]
         },
         {
+          testname: "s_moveRange",
+          command: {moveRange: "test.x", min: {x:1}, toShard:"a"},
+          skipUnlessSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: roles_clusterManager,
+                privileges: [{resource: {db: "test", collection: "x"}, actions: ["moveChunk"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "d_moveRange",
+          command: {_shardsvrMoveRange: "test.x", fromShard: "a", toShard: "b", min: {}, max: {}, maxChunkSizeBytes: 1024},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
           testname: "movePrimary",
-          command: {movePrimary: "x"},
+          command: {movePrimary: "x", to: "a"},
           skipUnlessSharded: true,
           testcases: [
               {
@@ -5558,8 +5767,7 @@ export const authCommandsLib = {
           // Only enterprise knows of this command.
           skipTest:
               (conn) => {
-                return !getBuildInfo().modules.includes("enterprise")
-                        || !TestData.setParameters.featureFlagOIDC;
+                return !getBuildInfo().modules.includes("enterprise");
               },
           testcases: [
             {
@@ -5576,8 +5784,7 @@ export const authCommandsLib = {
           // Only enterprise knows of this command.
           skipTest:
               (conn) => {
-                return !getBuildInfo().modules.includes("enterprise")
-                    || !TestData.setParameters.featureFlagOIDC;
+                return !getBuildInfo().modules.includes("enterprise");
               },
           testcases: [
             {
@@ -5958,9 +6165,9 @@ export const authCommandsLib = {
           skipUnlessSharded: true,
           testcases: [
             {
-              runOnDb: adminDbName, 
-              roles: roles_clusterManager, 
-              expectFail: true, 
+              runOnDb: adminDbName,
+              roles: roles_clusterManager,
+              expectFail: true,
               privileges: [{resource: {cluster: true}, actions: ["transitionToDedicatedConfigServer"]}]
             },
             {runOnDb: firstDbName, roles: {}},
@@ -6422,12 +6629,12 @@ export const authCommandsLib = {
           ]
         },
         {
-            // Test that only clusterManager has permission to run $telemetry
+            // Test that only clusterManager has permission to run $queryStats
             testname: "testTelemetryReadPrivilege",
-            command: {aggregate: 1, pipeline: [{$telemetry: {}}], cursor: {}},
+            command: {aggregate: 1, pipeline: [{$queryStats: {}}], cursor: {}},
             skipSharded: false,
             skipTest: (conn) => {
-                return !TestData.setParameters.featureFlagTelemetry;
+                return !TestData.setParameters.featureFlagQueryStats;
             },
             testcases: [{runOnDb: adminDbName, roles: roles_clusterManager}]
         },

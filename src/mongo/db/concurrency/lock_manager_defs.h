@@ -168,6 +168,13 @@ enum ResourceType {
     RESOURCE_METADATA,
 
     /**
+     * Resource DDL types used for multi-granularity locking on DDL operations.
+     * These resources are not related to the storage hierarchy.
+     */
+    RESOURCE_DDL_DATABASE,
+    RESOURCE_DDL_COLLECTION,
+
+    /**
      * Resource type used for locking general resources not related to the storage hierarchy. These
      * can't be created manually, use Lock::ResourceMutex::ResourceMutex() instead.
      */
@@ -193,8 +200,15 @@ enum class ResourceGlobalId : uint8_t {
 /**
  * Maps the resource id to a human-readable string.
  */
-static const char* ResourceTypeNames[] = {
-    "Invalid", "Global", "Tenant", "Database", "Collection", "Metadata", "Mutex"};
+static const char* ResourceTypeNames[] = {"Invalid",
+                                          "Global",
+                                          "Tenant",
+                                          "Database",
+                                          "Collection",
+                                          "Metadata",
+                                          "DDLDatabase",
+                                          "DDLCollection",
+                                          "Mutex"};
 
 /**
  * Maps the global resource id to a human-readable string.
@@ -232,22 +246,21 @@ static const char* resourceGlobalIdName(ResourceGlobalId id) {
  * Uniquely identifies a lockable resource.
  */
 class ResourceId {
-    // We only use 3 bits for the resource type in the ResourceId hash
-    enum { resourceTypeBits = 3 };
+    // We only use 4 bits for the resource type in the ResourceId hash
+    enum { resourceTypeBits = 4 };
     MONGO_STATIC_ASSERT(ResourceTypesCount <= (1 << resourceTypeBits));
 
 public:
     ResourceId() : _fullHash(0) {}
     ResourceId(ResourceType type, const NamespaceString& nss)
-        : _fullHash(fullHash(type, hashStringData(nss.toStringWithTenantId()))) {
+        : _fullHash(fullHash(type, hashStringData(nss.toStringForResourceId()))) {
         verifyNoResourceMutex(type);
     }
     ResourceId(ResourceType type, const DatabaseName& dbName)
-        : _fullHash(fullHash(type, hashStringData(dbName.toStringWithTenantId()))) {
+        : _fullHash(fullHash(type, hashStringData(dbName.toStringForResourceId()))) {
         verifyNoResourceMutex(type);
     }
-    ResourceId(ResourceType type, const std::string& str)
-        : _fullHash(fullHash(type, hashStringData(str))) {
+    ResourceId(ResourceType type, StringData str) : _fullHash(fullHash(type, hashStringData(str))) {
         // Resources of type database, collection, or tenant must never be passed as a raw string.
         invariant(type != RESOURCE_DATABASE && type != RESOURCE_COLLECTION &&
                   type != RESOURCE_TENANT);
@@ -290,13 +303,10 @@ public:
     }
 
 private:
-    ResourceId(uint64_t fullHash) : _fullHash(fullHash) {}
+    friend class ResourceCatalog;
+    friend class ResourceIdTest;
 
-    // Used to allow Lock::ResourceMutex to create ResourceIds with RESOURCE_MUTEX type
-    static ResourceId makeMutexResourceId(uint64_t hashId) {
-        return ResourceId(fullHash(ResourceType::RESOURCE_MUTEX, hashId));
-    }
-    friend class Lock;
+    ResourceId(uint64_t fullHash) : _fullHash(fullHash) {}
 
     void verifyNoResourceMutex(ResourceType type) {
         invariant(

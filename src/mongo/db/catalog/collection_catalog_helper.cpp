@@ -43,7 +43,8 @@ Status checkIfNamespaceExists(OperationContext* opCtx, const NamespaceString& ns
     auto catalog = CollectionCatalog::get(opCtx);
     if (catalog->lookupCollectionByNamespace(opCtx, nss)) {
         return Status(ErrorCodes::NamespaceExists,
-                      str::stream() << "Collection " << nss.ns() << " already exists.");
+                      str::stream()
+                          << "Collection " << nss.toStringForErrorMsg() << " already exists.");
     }
 
     auto view = catalog->lookupView(opCtx, nss);
@@ -52,11 +53,12 @@ Status checkIfNamespaceExists(OperationContext* opCtx, const NamespaceString& ns
 
     if (view->timeseries()) {
         return Status(ErrorCodes::NamespaceExists,
-                      str::stream() << "A timeseries collection already exists. NS: " << nss);
+                      str::stream() << "A timeseries collection already exists. NS: "
+                                    << nss.toStringForErrorMsg());
     }
 
     return Status(ErrorCodes::NamespaceExists,
-                  str::stream() << "A view already exists. NS: " << nss);
+                  str::stream() << "A view already exists. NS: " << nss.toStringForErrorMsg());
 }
 
 
@@ -67,11 +69,9 @@ void forEachCollectionFromDb(OperationContext* opCtx,
                              CollectionCatalog::CollectionInfoFn predicate) {
 
     auto catalogForIteration = CollectionCatalog::get(opCtx);
-    for (auto collectionIt = catalogForIteration->begin(opCtx, dbName);
-         collectionIt != catalogForIteration->end(opCtx);) {
-        auto uuid = collectionIt.uuid();
+    for (auto&& coll : catalogForIteration->range(dbName)) {
+        auto uuid = coll->uuid();
         if (predicate && !catalogForIteration->checkIfCollectionSatisfiable(uuid, predicate)) {
-            ++collectionIt;
             continue;
         }
 
@@ -94,10 +94,6 @@ void forEachCollectionFromDb(OperationContext* opCtx,
             // Failed: collection got renamed before locking it, so unlock and try again.
             clk.reset();
         }
-
-        // Increment iterator before calling callback. This allows for collection deletion inside
-        // this callback even if we are in batched inplace mode.
-        ++collectionIt;
 
         // The NamespaceString couldn't be resolved from the uuid, so the collection was dropped.
         if (!collection)

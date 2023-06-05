@@ -32,10 +32,6 @@ if (!isShardMergeEnabled(recipientPrimary.getDB("admin"))) {
     quit();
 }
 
-const kDataDir =
-    `${recipientPrimary.dbpath}/migrationTmpFiles.${extractUUIDFromObject(migrationId)}`;
-assert.eq(runNonMongoProgram("mkdir", "-p", kDataDir), 0);
-
 const tenantId = ObjectId();
 const dbName = `${tenantId.str}_myDatabase`;
 
@@ -70,8 +66,7 @@ const migrationOpts = {
     migrationIdString: extractUUIDFromObject(migrationId),
     tenantIds: [tenantId]
 };
-TenantMigrationTest.assertCommitted(
-    tenantMigrationTest.runMigration(migrationOpts, {enableDonorStartMigrationFsync: true}));
+TenantMigrationTest.assertCommitted(tenantMigrationTest.runMigration(migrationOpts));
 
 tenantMigrationTest.getRecipientRst().nodes.forEach(node => {
     for (let collectionName of ["myCollection", "myCappedCollection"]) {

@@ -61,12 +61,14 @@ void OperationShardingState::setShardRole(OperationContext* opCtx,
     auto& oss = OperationShardingState::get(opCtx);
 
     if (shardVersion) {
-        auto emplaceResult = oss._shardVersions.try_emplace(nss.ns(), *shardVersion);
+        auto emplaceResult =
+            oss._shardVersions.try_emplace(NamespaceStringUtil::serialize(nss), *shardVersion);
         auto& tracker = emplaceResult.first->second;
         if (!emplaceResult.second) {
             uassert(640570,
                     str::stream() << "Illegal attempt to change the expected shard version for "
-                                  << nss << " from " << tracker.v << " to " << *shardVersion,
+                                  << nss.toStringForErrorMsg() << " from " << tracker.v << " to "
+                                  << *shardVersion,
                     tracker.v == *shardVersion);
         }
         invariant(++tracker.recursion > 0);
@@ -78,8 +80,8 @@ void OperationShardingState::setShardRole(OperationContext* opCtx,
         if (!emplaceResult.second) {
             uassert(640571,
                     str::stream() << "Illegal attempt to change the expected database version for "
-                                  << nss.db() << " from " << tracker.v << " to "
-                                  << *databaseVersion,
+                                  << nss.dbName().toStringForErrorMsg() << " from " << tracker.v
+                                  << " to " << *databaseVersion,
                     tracker.v == *databaseVersion);
         }
         invariant(++tracker.recursion > 0);
@@ -90,7 +92,7 @@ void OperationShardingState::unsetShardRoleForLegacyDDLOperationsSentWithShardVe
     OperationContext* opCtx, const NamespaceString& nss) {
     auto& oss = OperationShardingState::get(opCtx);
 
-    auto it = oss._shardVersions.find(nss.ns());
+    auto it = oss._shardVersions.find(NamespaceStringUtil::serialize(nss));
     if (it != oss._shardVersions.end()) {
         auto& tracker = it->second;
         tassert(6848500,
@@ -103,7 +105,7 @@ void OperationShardingState::unsetShardRoleForLegacyDDLOperationsSentWithShardVe
 }
 
 boost::optional<ShardVersion> OperationShardingState::getShardVersion(const NamespaceString& nss) {
-    const auto it = _shardVersions.find(nss.ns());
+    const auto it = _shardVersions.find(NamespaceStringUtil::serialize(nss));
     if (it != _shardVersions.end()) {
         return it->second.v;
     }
@@ -168,17 +170,19 @@ using ScopedAllowImplicitCollectionCreate_UNSAFE =
     OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE;
 
 ScopedAllowImplicitCollectionCreate_UNSAFE::ScopedAllowImplicitCollectionCreate_UNSAFE(
-    OperationContext* opCtx)
+    OperationContext* opCtx, bool forceCSRAsUnknownAfterCollectionCreation)
     : _opCtx(opCtx) {
     auto& oss = get(_opCtx);
     invariant(!oss._allowCollectionCreation);
     oss._allowCollectionCreation = true;
+    oss._forceCSRAsUnknownAfterCollectionCreation = forceCSRAsUnknownAfterCollectionCreation;
 }
 
 ScopedAllowImplicitCollectionCreate_UNSAFE::~ScopedAllowImplicitCollectionCreate_UNSAFE() {
     auto& oss = get(_opCtx);
     invariant(oss._allowCollectionCreation);
     oss._allowCollectionCreation = false;
+    oss._forceCSRAsUnknownAfterCollectionCreation = false;
 }
 
 ScopedSetShardRole::ScopedSetShardRole(OperationContext* opCtx,

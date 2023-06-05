@@ -1,13 +1,15 @@
 /**
  * Tests adding shard to sharded cluster will fail if the implicitDefaultWriteConcern is
  * w:1 and CWWC is not set.
- *
- * For some reason fails in the check shard filtering metadata hook when shutting down the cluster.
- * @tags: [temporary_catalog_shard_incompatible]
  */
 
 (function() {
 "use strict";
+
+// Adds a shard near the end of the test that won't have metadata for the sessions collection during
+// test shutdown. This is only a problem with a config shard because otherwise there are no shards
+// so the sessions collection can't be created.
+TestData.skipCheckShardFilteringMetadata = TestData.configShard;
 
 load("jstests/replsets/rslib.js");  // For reconfig and isConfigCommitted.
 
@@ -41,7 +43,7 @@ function testAddShard(CWWCSet, isPSASet, fixAddShard) {
     shardServer.initiate();
 
     const st = new ShardingTest({
-        shards: TestData.catalogShard ? 1 : 0,
+        shards: TestData.configShard ? 1 : 0,
         mongos: 1,
     });
     var admin = st.getDB('admin');

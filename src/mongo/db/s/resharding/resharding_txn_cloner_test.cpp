@@ -108,10 +108,6 @@ class ReshardingTxnClonerTest : public ShardServerTestFixture {
         // onStepUp() relies on the storage interface to create the config.transactions table.
         repl::StorageInterface::set(getServiceContext(),
                                     std::make_unique<repl::StorageInterfaceImpl>());
-        MongoDSessionCatalog::set(
-            getServiceContext(),
-            std::make_unique<MongoDSessionCatalog>(
-                std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
         auto mongoDSessionCatalog = MongoDSessionCatalog::get(operationContext());
         mongoDSessionCatalog->onStepUp(operationContext());
         LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
@@ -154,7 +150,8 @@ class ReshardingTxnClonerTest : public ShardServerTestFixture {
                 const NamespaceString& nss,
                 const repl::ReadConcernArgs& readConcern) override {
                 uasserted(ErrorCodes::NamespaceNotFound,
-                          str::stream() << "Collection " << nss.ns() << " not found");
+                          str::stream()
+                              << "Collection " << nss.toStringForErrorMsg() << " not found");
             }
 
         private:
@@ -340,11 +337,6 @@ protected:
             Client::initThread(threadName.c_str());
             auto* client = Client::getCurrent();
             AuthorizationSession::get(*client)->grantInternalAuthorization(client);
-
-            {
-                stdx::lock_guard<Client> lk(*client);
-                client->setSystemOperationKillableByStepdown(lk);
-            }
         };
 
         auto hookList = std::make_unique<rpc::EgressMetadataHookList>();

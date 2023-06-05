@@ -140,7 +140,7 @@ public:
     /**
      * Increments the global transactions histogram.
      */
-    void incrementGlobalTransactionLatencyStats(uint64_t latency);
+    void incrementGlobalTransactionLatencyStats(OperationContext* opCtx, uint64_t latency);
 
     /**
      * Appends the global latency statistics.
@@ -166,7 +166,7 @@ private:
                              OperationLatencyHistogram* histogram,
                              Command::ReadWriteType readWriteType);
 
-    mutable SimpleMutex _lock;
+    Mutex _lock = MONGO_MAKE_LATCH("Top::_lock");
     OperationLatencyHistogram _globalHistogramStats;
     UsageMap _usage;
 };

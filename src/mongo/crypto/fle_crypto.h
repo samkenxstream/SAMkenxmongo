@@ -331,7 +331,7 @@ struct ESCDocument {
  */
 class FLETagQueryInterface {
 public:
-    enum class TagQueryType { kInsert, kQuery };
+    enum class TagQueryType { kInsert, kQuery, kCompact, kCleanup };
 
     virtual ~FLETagQueryInterface();
 
@@ -386,6 +386,8 @@ public:
     virtual bool existsById(PrfBlock block) const {
         return !getById(block).isEmpty();
     }
+
+    virtual ECStats getStats() const = 0;
 };
 
 class ESCCollection {
@@ -514,10 +516,6 @@ public:
      *    (x > 0) means non-null anchors exist without a null anchor OR new non-null anchors
      *            have been added since the last-recorded apos in the null anchor.
      */
-    struct EmuBinaryResult {
-        boost::optional<uint64_t> cpos;
-        boost::optional<uint64_t> apos;
-    };
     static EmuBinaryResult emuBinaryV2(const FLEStateCollectionReader& reader,
                                        const ESCTwiceDerivedTagToken& tagToken,
                                        const ESCTwiceDerivedValueToken& valueToken);
@@ -1328,6 +1326,15 @@ public:
      * in the encrypted field config
      */
     static void validateCompactionTokens(const EncryptedFieldConfig& efc, BSONObj compactionTokens);
+
+    /**
+     * Validates the compaction tokens BSON contains an element for each field
+     * in the encrypted field config
+     */
+    static void validateCleanupTokens(const EncryptedFieldConfig& efc, BSONObj cleanupTokens);
+
+private:
+    static void _validateTokens(const EncryptedFieldConfig& efc, BSONObj tokens, StringData cmd);
 };
 
 /**
@@ -1544,6 +1551,8 @@ public:
     static PrfBlock prf(ConstDataRange key, ConstDataRange cdr);
 
     static PrfBlock prf(ConstDataRange key, uint64_t value);
+
+    static void checkEFCForECC(const EncryptedFieldConfig& efc);
 
     /**
      * Decrypt AES-256-CTR encrypted data. Exposed for benchmarking purposes.

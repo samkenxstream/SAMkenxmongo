@@ -36,7 +36,6 @@
 #include "mongo/db/s/shard_key_index_util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/analyze_shard_key_cmd_gen.h"
-#include "mongo/s/analyze_shard_key_feature_flag_gen.h"
 #include "mongo/s/analyze_shard_key_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
@@ -71,7 +70,7 @@ public:
                     "analyzeShardKey command is not supported on a standalone mongod",
                     repl::ReplicationCoordinator::get(opCtx)->isReplEnabled());
             uassert(ErrorCodes::IllegalOperation,
-                    "configQueryAnalyzer command is not supported on a multitenant replica set",
+                    "analyzeShardKey command is not supported on a multitenant replica set",
                     !gMultitenancySupport);
             uassert(ErrorCodes::IllegalOperation,
                     "analyzeShardKey command is not supported on a configsvr mongod",
@@ -80,7 +79,7 @@ public:
             const auto& nss = ns();
             const auto& key = request().getKey();
             uassertStatusOK(validateNamespace(nss));
-            const auto collUuid = uassertStatusOK(validateCollectionOptionsLocally(opCtx, nss));
+            const auto collUuid = uassertStatusOK(validateCollectionOptions(opCtx, nss));
 
             LOGV2(6875001, "Start analyzing shard key", logAttrs(nss), "shardKey"_attr = key);
 
@@ -145,10 +144,7 @@ public:
     std::string help() const override {
         return "Returns metrics for evaluating a shard key for a collection.";
     }
-};
-
-MONGO_REGISTER_FEATURE_FLAGGED_COMMAND(AnalyzeShardKeyCmd,
-                                       analyze_shard_key::gFeatureFlagAnalyzeShardKey);
+} analyzeShardKeyCmd;
 
 }  // namespace
 

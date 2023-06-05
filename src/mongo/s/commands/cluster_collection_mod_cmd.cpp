@@ -98,7 +98,7 @@ public:
                     "command"_attr = redact(cmdObj));
 
         auto swDbInfo = Grid::get(opCtx)->catalogCache()->getDatabase(
-            opCtx, cmd.getDbName().toStringWithTenantId());
+            opCtx, DatabaseNameUtil::serializeForCatalog(cmd.getDbName()));
         if (swDbInfo == ErrorCodes::NamespaceNotFound) {
             uassert(
                 CollectionUUIDMismatchInfo(
@@ -112,7 +112,8 @@ public:
             // Check for config.settings in the user command since a validator is allowed
             // internally on this collection but the user may not modify the validator.
             uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "Document validators not allowed on system collection " << nss,
+                    str::stream() << "Document validators not allowed on system collection "
+                                  << nss.toStringForErrorMsg(),
                     nss != NamespaceString::kConfigSettingsNamespace);
         }
 
@@ -122,7 +123,7 @@ public:
         auto cmdResponse =
             uassertStatusOK(executeCommandAgainstDatabasePrimary(
                                 opCtx,
-                                dbName.toStringWithTenantId(),
+                                DatabaseNameUtil::serialize(dbName),
                                 dbInfo,
                                 CommandHelpers::appendMajorityWriteConcern(
                                     collModCommand.toBSON({}), opCtx->getWriteConcern()),

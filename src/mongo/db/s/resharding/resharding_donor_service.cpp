@@ -55,6 +55,7 @@
 #include "mongo/db/s/sharding_index_catalog_ddl_util.h"
 #include "mongo/db/s/sharding_recovery_service.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/db/write_block_bypass.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/logv2/log.h"
@@ -89,14 +90,14 @@ Date_t getCurrentTime() {
 Timestamp generateMinFetchTimestamp(OperationContext* opCtx, const NamespaceString& sourceNss) {
     // Do a no-op write and use the OpTime as the minFetchTimestamp
     writeConflictRetry(
-        opCtx, "resharding donor minFetchTimestamp", NamespaceString::kRsOplogNamespace.ns(), [&] {
+        opCtx, "resharding donor minFetchTimestamp", NamespaceString::kRsOplogNamespace, [&] {
             AutoGetDb db(opCtx, sourceNss.dbName(), MODE_IX);
             Lock::CollectionLock collLock(opCtx, sourceNss, MODE_S);
 
             AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
 
             const std::string msg = str::stream()
-                << "All future oplog entries on the namespace " << sourceNss.ns()
+                << "All future oplog entries on the namespace " << sourceNss.toStringForErrorMsg()
                 << " must include a 'destinedRecipient' field";
             WriteUnitOfWork wuow(opCtx);
             opCtx->getClient()->getServiceContext()->getOpObserver()->onInternalOpMessage(
@@ -233,7 +234,8 @@ ReshardingDonorService::DonorStateMachine::DonorStateMachine(
       }())),
       _critSecReason(BSON("command"
                           << "resharding_donor"
-                          << "collection" << _metadata.getSourceNss().toString())),
+                          << "collection"
+                          << NamespaceStringUtil::serialize(_metadata.getSourceNss()))),
       _isAlsoRecipient([&] {
           auto myShardId = _externalState->myShardId(_serviceContext);
           return std::find(_recipientShardIds.begin(), _recipientShardIds.end(), myShardId) !=
@@ -626,7 +628,7 @@ void ReshardingDonorService::DonorStateMachine::
 
         auto oplog = generateOplogEntry();
         writeConflictRetry(
-            rawOpCtx, "ReshardingBeginOplog", NamespaceString::kRsOplogNamespace.ns(), [&] {
+            rawOpCtx, "ReshardingBeginOplog", NamespaceString::kRsOplogNamespace, [&] {
                 AutoGetOplog oplogWrite(rawOpCtx, OplogAccessMode::kWrite);
                 WriteUnitOfWork wunit(rawOpCtx);
                 const auto& oplogOpTime = repl::logOp(rawOpCtx, &oplog);
@@ -725,9 +727,9 @@ void ReshardingDonorService::DonorStateMachine::
             oplog.setOpType(repl::OpTypeEnum::kNoop);
             oplog.setUuid(_metadata.getSourceUUID());
             oplog.setDestinedRecipient(destinedRecipient);
-            oplog.setObject(
-                BSON("msg" << fmt::format("Writes to {} are temporarily blocked for resharding.",
-                                          _metadata.getSourceNss().toString())));
+            oplog.setObject(BSON(
+                "msg" << fmt::format("Writes to {} are temporarily blocked for resharding.",
+                                     NamespaceStringUtil::serialize(_metadata.getSourceNss()))));
             oplog.setObject2(BSON("type" << resharding::kReshardFinalOpLogType << "reshardingUUID"
                                          << _metadata.getReshardingUUID()));
             oplog.setOpTime(OplogSlot());
@@ -743,7 +745,7 @@ void ReshardingDonorService::DonorStateMachine::
                 writeConflictRetry(
                     rawOpCtx,
                     "ReshardingBlockWritesOplog",
-                    NamespaceString::kRsOplogNamespace.ns(),
+                    NamespaceString::kRsOplogNamespace,
                     [&] {
                         AutoGetOplog oplogWrite(rawOpCtx, OplogAccessMode::kWrite);
                         WriteUnitOfWork wunit(rawOpCtx);
@@ -995,16 +997,22 @@ void ReshardingDonorService::DonorStateMachine::_updateDonorDocument(
     auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
     const auto& nss = NamespaceString::kDonorReshardingOperationsNamespace;
 
-    writeConflictRetry(opCtx.get(), "DonorStateMachine::_updateDonorDocument", nss.toString(), [&] {
-        AutoGetCollection coll(opCtx.get(), nss, MODE_X);
+    writeConflictRetry(opCtx.get(), "DonorStateMachine::_updateDonorDocument", nss, [&] {
+        auto coll = acquireCollection(
+            opCtx.get(),
+            CollectionAcquisitionRequest(nss,
+                                         PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                         repl::ReadConcernArgs::get(opCtx.get()),
+                                         AcquisitionPrerequisites::kWrite),
+            MODE_X);
 
         uassert(ErrorCodes::NamespaceNotFound,
-                str::stream() << nss.toString() << " does not exist",
-                coll);
+                str::stream() << nss.toStringForErrorMsg() << " does not exist",
+                coll.exists());
 
         WriteUnitOfWork wuow(opCtx.get());
         Helpers::update(opCtx.get(),
-                        nss,
+                        coll,
                         BSON(ReshardingDonorDocument::kReshardingUUIDFieldName
                              << _metadata.getReshardingUUID()),
                         BSON("$set" << BSON(ReshardingDonorDocument::kMutableStateFieldName
@@ -1021,10 +1029,16 @@ void ReshardingDonorService::DonorStateMachine::_removeDonorDocument(
     auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
 
     const auto& nss = NamespaceString::kDonorReshardingOperationsNamespace;
-    writeConflictRetry(opCtx.get(), "DonorStateMachine::_removeDonorDocument", nss.toString(), [&] {
-        AutoGetCollection coll(opCtx.get(), nss, MODE_X);
+    writeConflictRetry(opCtx.get(), "DonorStateMachine::_removeDonorDocument", nss, [&] {
+        const auto coll = acquireCollection(
+            opCtx.get(),
+            CollectionAcquisitionRequest(nss,
+                                         PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                         repl::ReadConcernArgs::get(opCtx.get()),
+                                         AcquisitionPrerequisites::kWrite),
+            MODE_X);
 
-        if (!coll) {
+        if (!coll.exists()) {
             return;
         }
 
@@ -1037,8 +1051,7 @@ void ReshardingDonorService::DonorStateMachine::_removeDonorDocument(
             });
 
         deleteObjects(opCtx.get(),
-                      *coll,
-                      nss,
+                      coll,
                       BSON(ReshardingDonorDocument::kReshardingUUIDFieldName
                            << _metadata.getReshardingUUID()),
                       true /* justOne */);

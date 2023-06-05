@@ -38,14 +38,14 @@ namespace mongo {
 namespace ExpressionTests {
 namespace {
 
-std::string redactFieldNameForTest(StringData s) {
+std::string applyHmacForTest(StringData s) {
     return str::stream() << "HASH<" << s << ">";
 }
 
 TEST(RedactionTest, ExpressionLet) {
     SerializationOptions options;
-    options.identifierRedactionPolicy = redactFieldNameForTest;
-    options.redactIdentifiers = true;
+    options.transformIdentifiersCallback = applyHmacForTest;
+    options.transformIdentifiers = true;
 
     auto expCtx = ExpressionContextForTest{};
 

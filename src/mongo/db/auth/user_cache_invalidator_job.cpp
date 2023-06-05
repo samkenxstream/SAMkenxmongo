@@ -145,7 +145,9 @@ void UserCacheInvalidator::start(ServiceContext* serviceCtx, OperationContext* o
     PeriodicRunner::PeriodicJob job(
         "UserCacheInvalidator",
         [serviceCtx](Client* client) { getUserCacheInvalidator(serviceCtx)->run(); },
-        loadInterval());
+        loadInterval(),
+        // TODO(SERVER-74660): Please revisit if this periodic job could be made killable.
+        false /*isKillableByStepdown*/);
 
     invalidator->_job =
         std::make_unique<PeriodicJobAnchor>(periodicRunner->makeJob(std::move(job)));
@@ -197,7 +199,7 @@ void UserCacheInvalidator::run() {
                           "users in cache",
                           "error"_attr = refreshStatus);
             try {
-                _authzManager->invalidateUsersFromDB(opCtx.get(), "$external"_sd);
+                _authzManager->invalidateUsersFromDB(opCtx.get(), DatabaseName::kExternal);
             } catch (const DBException& e) {
                 LOGV2_WARNING(5914805,
                               "Error invalidating $external users from user cache",

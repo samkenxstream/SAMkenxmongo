@@ -87,10 +87,6 @@ void runWithoutSession(OperationContext* opCtx, Callable callable) {
 
 void MigrationBatchInserter::onCreateThread(const std::string& threadName) {
     Client::initThread(threadName, getGlobalServiceContext(), nullptr);
-    {
-        stdx::lock_guard<Client> lk(cc());
-        cc().setSystemOperationKillableByStepdown(lk);
-    }
 }
 
 void MigrationBatchInserter::run(Status status) const try {
@@ -165,6 +161,7 @@ void MigrationBatchInserter::run(Status status) const try {
             repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp());
 
         ShardingStatistics::get(opCtx).countDocsClonedOnRecipient.addAndFetch(batchNumCloned);
+        ShardingStatistics::get(opCtx).countBytesClonedOnRecipient.addAndFetch(batchClonedBytes);
         LOGV2(6718408,
               "Incrementing numCloned count by {batchNumCloned} and numClonedBytes by "
               "{batchClonedBytes}",

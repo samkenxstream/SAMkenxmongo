@@ -23,8 +23,6 @@ from pkg_resources import parse_version
 
 import SCons
 import SCons.Script
-from mongo_tooling_metrics.client import get_mongo_metrics_client
-from mongo_tooling_metrics.errors import ExternalHostException
 from mongo_tooling_metrics.lib.top_level_metrics import SConsToolingMetrics
 from site_scons.mongo import build_profiles
 
@@ -593,8 +591,8 @@ add_option(
 
 add_option(
     "cxx-std",
-    choices=["17", "20"],
-    default="17",
+    choices=["20"],
+    default="20",
     help="Select the C++ language standard to build with",
 )
 
@@ -614,6 +612,13 @@ add_option(
     default=build_profile.variables_files,
     action="append",
     help="Specify variables files to load.",
+)
+
+add_option(
+    'streams-release-build',
+    default=False,
+    action='store_true',
+    help='If set, will include the enterprise streams module in a release build.',
 )
 
 link_model_choices = ['auto', 'object', 'static', 'dynamic', 'dynamic-strict', 'dynamic-sdk']
@@ -910,6 +915,7 @@ def variable_tools_converter(val):
         "mongo_integrationtest",
         "mongo_unittest",
         "mongo_libfuzzer",
+        "mongo_pretty_printer_tests",
         "textfile",
     ]
 
@@ -1634,6 +1640,8 @@ envDict = dict(
     # TODO: Move unittests.txt to $BUILD_DIR, but that requires
     # changes to MCI.
     UNITTEST_LIST='$BUILD_ROOT/unittests.txt',
+    PRETTY_PRINTER_TEST_ALIAS='install-pretty-printer-tests',
+    PRETTY_PRINTER_TEST_LIST='$BUILD_ROOT/pretty_printer_tests.txt',
     LIBFUZZER_TEST_ALIAS='install-fuzzertests',
     LIBFUZZER_TEST_LIST='$BUILD_ROOT/libfuzzer_tests.txt',
     INTEGRATION_TEST_ALIAS='install-integration-tests',
@@ -1659,22 +1667,13 @@ env.AddMethod(lambda env, name, **kwargs: add_option(name, **kwargs), 'AddOption
 
 # The placement of this is intentional. Here we setup an atexit method to store tooling metrics.
 # We should only register this function after env, env_vars and the parser have been properly initialized.
-try:
-    metrics_client = get_mongo_metrics_client()
-    metrics_client.register_metrics(
-        SConsToolingMetrics,
-        utc_starttime=datetime.utcnow(),
-        artifact_dir=env.Dir('$BUILD_DIR').get_abspath(),
-        env_vars=env_vars,
-        env=env,
-        parser=_parser,
-    )
-except ExternalHostException as _:
-    pass
-except Exception as _:
-    print(
-        "This MongoDB Virtual Workstation could not connect to the internal cluster\nThis is a non-issue, but if this message persists feel free to reach out in #server-dev-platform"
-    )
+SConsToolingMetrics.register_metrics(
+    utc_starttime=datetime.utcnow(),
+    artifact_dir=env.Dir('$BUILD_DIR').get_abspath(),
+    env_vars=env_vars,
+    env=env,
+    parser=_parser,
+)
 
 if get_option('build-metrics'):
     env['BUILD_METRICS_ARTIFACTS_DIR'] = '$BUILD_ROOT/$VARIANT_DIR'
@@ -2021,12 +2020,16 @@ if env.get('ENABLE_OOM_RETRY'):
                 ': out of memory',
                 'virtual memory exhausted: Cannot allocate memory',
                 ': fatal error: Killed signal terminated program cc1',
+                # TODO: SERVER-77322 remove this non memory related ICE.
+                r'during IPA pass: cp.+g\+\+: internal compiler error',
+                'ld terminated with signal 9',
             ]
         elif env.ToolchainIs('msvc'):
             env['OOM_RETRY_MESSAGES'] = [
                 'LNK1102: out of memory',
                 'C1060: compiler is out of heap space',
-                'LNK1171: unable to load mspdbcore.dll',
+                'c1xx : fatal error C1063: INTERNAL COMPILER ERROR',
+                r'LNK1171: unable to load mspdbcore\.dll',
                 "LNK1201: error writing to program database ''",
             ]
             env['OOM_RETRY_RETURNCODES'] = [1102]
@@ -3666,6 +3669,9 @@ def doConfigure(myenv):
         # Don't issue warnings about potentially evaluated expressions
         myenv.AddToCCFLAGSIfSupported("-Wno-potentially-evaluated-expression")
 
+        # SERVER-76472 we don't try to maintain ABI so disable warnings about possible ABI issues.
+        myenv.AddToCCFLAGSIfSupported("-Wno-psabi")
+
         # Warn about moves of prvalues, which can inhibit copy elision.
         myenv.AddToCXXFLAGSIfSupported("-Wpessimizing-move")
 
@@ -3704,15 +3710,6 @@ def doConfigure(myenv):
         # likely to catch these errors early, add the (currently clang
         # only) flag that turns it on.
         myenv.AddToCXXFLAGSIfSupported("-Wunused-exception-parameter")
-
-        # TODO(SERVER-60151): Avoid the dilemma identified in
-        # https://gcc.gnu.org/bugzilla/show_bug.cgi?id=100493. Unfortunately,
-        # we don't have a more targeted warning suppression we can use
-        # other than disabling all deprecation warnings. We will
-        # revisit this once we are fully on C++20 and can commit the
-        # C++20 style code.
-        if get_option('cxx-std') == "20":
-            myenv.AddToCXXFLAGSIfSupported('-Wno-deprecated')
 
         # TODO SERVER-58675 - Remove this suppression after abseil is upgraded
         myenv.AddToCXXFLAGSIfSupported("-Wno-deprecated-builtins")
@@ -3827,6 +3824,9 @@ def doConfigure(myenv):
 
     usingLibStdCxx = False
     if has_option('libc++'):
+        # TODO SERVER-54659 - ASIO depends on std::result_of which was removed in C++ 20
+        myenv.Append(CPPDEFINES=["ASIO_HAS_STD_INVOKE_RESULT"])
+
         if not myenv.ToolchainIs('clang'):
             myenv.FatalError('libc++ is currently only supported for clang')
         if myenv.AddToCXXFLAGSIfSupported('-stdlib=libc++'):
@@ -3859,37 +3859,18 @@ def doConfigure(myenv):
         conf.Finish()
 
     if myenv.ToolchainIs('msvc'):
-        if get_option('cxx-std') == "17":
-            myenv.AppendUnique(CCFLAGS=['/std:c++17',
-                                        '/Zc:lambda'])  # /Zc:lambda is implied by /std:c++20
-        elif get_option('cxx-std') == "20":
+        if get_option('cxx-std') == "20":
             myenv.AppendUnique(CCFLAGS=['/std:c++20'])
     else:
-        if get_option('cxx-std') == "17":
-            if not myenv.AddToCXXFLAGSIfSupported('-std=c++17'):
-                myenv.ConfError('Compiler does not honor -std=c++17')
-        elif get_option('cxx-std') == "20":
+        if get_option('cxx-std') == "20":
             if not myenv.AddToCXXFLAGSIfSupported('-std=c++20'):
                 myenv.ConfError('Compiler does not honor -std=c++20')
 
         if not myenv.AddToCFLAGSIfSupported('-std=c11'):
-            myenv.ConfError("C++17 mode selected for C++ files, but can't enable C11 for C files")
+            myenv.ConfError("C++20 mode selected for C++ files, but can't enable C11 for C files")
 
     if using_system_version_of_cxx_libraries():
-        print('WARNING: System versions of C++ libraries must be compiled with C++17 support')
-
-    def CheckCxx17(context):
-        test_body = """
-        #if __cplusplus < 201703L
-        #error
-        #endif
-        namespace NestedNamespaceDecls::AreACXX17Feature {};
-        """
-
-        context.Message('Checking for C++17... ')
-        ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
-        context.Result(ret)
-        return ret
+        print('WARNING: System versions of C++ libraries must be compiled with C++20 support')
 
     def CheckCxx20(context):
         test_body = """
@@ -3909,15 +3890,12 @@ def doConfigure(myenv):
         myenv,
         help=False,
         custom_tests={
-            'CheckCxx17': CheckCxx17,
             'CheckCxx20': CheckCxx20,
         },
     )
 
-    if get_option('cxx-std') == "17" and not conf.CheckCxx17():
-        myenv.ConfError('C++17 support is required to build MongoDB')
-    elif get_option('cxx-std') == "20" and not conf.CheckCxx20():
-        myenv.ConfError('C++20 support was not detected')
+    if get_option('cxx-std') == "20" and not conf.CheckCxx20():
+        myenv.ConfError('C++20 support is required to build MongoDB')
 
     conf.Finish()
 
@@ -4402,7 +4380,7 @@ def doConfigure(myenv):
             # reporting thread leaks, which we have because we don't
             # do a clean shutdown of the ServiceContext.
             #
-            tsan_options = f"halt_on_error=1:report_thread_leaks=0:die_after_fork=0:suppressions={myenv.File('#etc/tsan.suppressions').abspath}"
+            tsan_options = f"abort_on_error=1:disable_coredump=0:handle_abort=1:halt_on_error=1:report_thread_leaks=0:die_after_fork=0:suppressions={myenv.File('#etc/tsan.suppressions').abspath}"
             myenv['ENV']['TSAN_OPTIONS'] = tsan_options + symbolizer_option
             myenv.AppendUnique(CPPDEFINES=['THREAD_SANITIZER'])
 
@@ -6038,7 +6016,33 @@ env.AddPackageNameAlias(
     name="mh-debugsymbols",
 )
 
+env.AutoInstall(
+    target='$PREFIX',
+    source='$PRETTY_PRINTER_TEST_LIST',
+    AIB_ROLE='runtime',
+    AIB_COMPONENT='pretty-printer-tests',
+    AIB_COMPONENTS_EXTRA=['dist-test'],
+)
+
 env['RPATH_ESCAPED_DOLLAR_ORIGIN'] = '\\$$$$ORIGIN'
+
+
+def isSupportedStreamsPlatform(thisEnv):
+    # TODO https://jira.mongodb.org/browse/SERVER-74961: Support other platforms.
+    return thisEnv.TargetOSIs(
+        'linux') and thisEnv['TARGET_ARCH'] == 'x86_64' and ssl_provider == 'openssl'
+
+
+def shouldBuildStreams(thisEnv):
+    if releaseBuild:
+        # The streaming enterprise module and dependencies are only included in release builds.
+        # when streams-release-build is set.
+        return get_option('streams-release-build') and isSupportedStreamsPlatform(thisEnv)
+    else:
+        return isSupportedStreamsPlatform(thisEnv)
+
+
+env.AddMethod(shouldBuildStreams, 'ShouldBuildStreams')
 
 
 def prefix_libdir_rpath_generator(env, source, target, for_signature):
@@ -6364,7 +6368,7 @@ if get_option('ninja') == 'disabled':
     compileCommands = env.CompilationDatabase('compile_commands.json')
     # Initialize generated-sources Alias as a placeholder so that it can be used as a
     # dependency for compileCommands. This Alias will be properly updated in other SConscripts.
-    env.Requires(compileCommands, env.Alias("generated-sources"))
+    env.Depends(compileCommands, env.Alias("generated-sources"))
     compileDb = env.Alias("compiledb", compileCommands)
 
 msvc_version = ""
@@ -6425,6 +6429,41 @@ if env.get('UNITTESTS_COMPILE_CONCURRENCY'):
         builders={'Object': c_suffixes, 'SharedObject': c_suffixes},
         source_file_regex=r"^.*_test\.cpp$",
     )
+
+first_half_flag = False
+
+
+def half_source_emitter(target, source, env):
+    global first_half_flag
+    if first_half_flag:
+        first_half_flag = False
+        if not 'conftest' in str(target[0]) and not str(source[0]).endswith('_test.cpp'):
+            env.Alias('compile_first_half_non_test_source', target)
+    else:
+        first_half_flag = True
+    return target, source
+
+
+# Cribbed from Tool/cc.py and Tool/c++.py. It would be better if
+# we could obtain this from SCons.
+_CSuffixes = [".c"]
+if not SCons.Util.case_sensitive_suffixes(".c", ".C"):
+    _CSuffixes.append(".C")
+
+_CXXSuffixes = [".cpp", ".cc", ".cxx", ".c++", ".C++"]
+if SCons.Util.case_sensitive_suffixes(".c", ".C"):
+    _CXXSuffixes.append(".C")
+
+for object_builder in SCons.Tool.createObjBuilders(env):
+    emitterdict = object_builder.builder.emitter
+    for suffix in emitterdict.keys():
+        if not suffix in _CSuffixes + _CXXSuffixes:
+            continue
+        base = emitterdict[suffix]
+        emitterdict[suffix] = SCons.Builder.ListEmitter([
+            base,
+            half_source_emitter,
+        ])
 
 # Keep this late in the game so that we can investigate attributes set by all the tools that have run.
 if has_option("cache"):

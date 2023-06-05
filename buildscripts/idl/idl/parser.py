@@ -132,6 +132,8 @@ def _generic_parser(
                 if ctxt.is_mapping_node(second_node, first_name):
                     syntax_node.__dict__[first_name] = rule_desc.mapping_parser_func(
                         ctxt, second_node)
+            elif rule_desc.node_type == "required_bool_scalar":
+                syntax_node.__dict__[first_name] = ctxt.get_required_bool(second_node)
             else:
                 raise errors.IDLError(
                     "Unknown node_type '%s' for parser rule" % (rule_desc.node_type))
@@ -147,7 +149,7 @@ def _generic_parser(
 
         # A bool is never "None" like other types, it simply defaults to "false".
         # It means "if bool is None" will always return false and there is no support for required
-        # 'bool' at this time.
+        # 'bool' at this time. Use the node type 'required_bool_scalar' if this behavior is not desired.
         if not rule_desc.node_type == 'bool_scalar':
             if syntax_node.__dict__[name] is None:
                 ctxt.add_missing_required_field_error(node, syntax_node_name, name)
@@ -404,6 +406,8 @@ def _parse_field(ctxt, name, node):
                 _RuleDesc('bool_scalar'),
             "forward_from_shards":
                 _RuleDesc('bool_scalar'),
+            "query_shape":
+                _RuleDesc('scalar'),
         })
 
     return field
@@ -575,6 +579,8 @@ def _parse_struct(ctxt, spec, name, node):
             "cpp_validator_func": _RuleDesc('scalar'),
             "is_command_reply": _RuleDesc('bool_scalar'),
             "is_generic_cmd_list": _RuleDesc('scalar'),
+            "query_shape_component": _RuleDesc('bool_scalar'),
+            "unsafe_dangerous_disable_extra_field_duplicate_checks": _RuleDesc("bool_scalar"),
         })
 
     # PyLint has difficulty with some iterables: https://github.com/PyCQA/pylint/issues/3105
@@ -978,6 +984,9 @@ def _parse_feature_flag(ctxt, spec, name, node):
                           mapping_parser_func=_parse_expression),
             "version":
                 _RuleDesc('scalar'),
+            "shouldBeFCVGated":
+                _RuleDesc('scalar_or_mapping', _RuleDesc.REQUIRED,
+                          mapping_parser_func=_parse_expression),
         })
 
     spec.feature_flags.append(param)

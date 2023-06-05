@@ -7,7 +7,6 @@
  * @tags: [
  *   requires_fcv_63,
  *   featureFlagUpdateOneWithoutShardKey,
- *   temporary_catalog_shard_incompatible,
  * ]
  */
 (function() {
@@ -105,7 +104,7 @@ function testCommandUnshardedCollection(testCase) {
         startTransaction: true,
         autocommit: false
     };
-    assert.commandFailedWithCode(mongosConn.runCommand(cmdObj), ErrorCodes.InvalidOptions);
+    assert.commandFailedWithCode(mongosConn.runCommand(cmdObj), ErrorCodes.NamespaceNotSharded);
 }
 
 function testCommandShardedCollectionOnSingleShard(testCase) {
@@ -191,11 +190,9 @@ function testCommandShardedCollectionOnMultipleShards(testCase) {
     // _id, but the way the test is structured, the _id and the shard key have the same value when
     // inserted.
     if (res.targetDoc["_id"] < splitPoint) {
-        let hostname = st.shard0.host.split("/")[0];
-        assert.eq(res.shardId, hostname);
+        assert.eq(res.shardId, st.shard0.shardName);
     } else {
-        let hostname = st.shard1.host.split("/")[0];
-        assert.eq(res.shardId, hostname);
+        assert.eq(res.shardId, st.shard1.shardName);
     }
 
     // Check that no modifications were made to the documents.

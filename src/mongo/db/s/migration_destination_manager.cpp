@@ -70,7 +70,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/session/logical_session_id_helpers.h"
 #include "mongo/db/session/session_catalog_mongod.h"
-#include "mongo/db/storage/remove_saver.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/db/write_block_bypass.h"
@@ -261,7 +261,7 @@ bool opReplicatedEnough(OperationContext* opCtx,
  */
 BSONObj createMigrateCloneRequest(const NamespaceString& nss, const MigrationSessionId& sessionId) {
     BSONObjBuilder builder;
-    builder.append("_migrateClone", nss.ns());
+    builder.append("_migrateClone", NamespaceStringUtil::serialize(nss));
     sessionId.append(&builder);
     return builder.obj();
 }
@@ -273,7 +273,7 @@ BSONObj createMigrateCloneRequest(const NamespaceString& nss, const MigrationSes
  */
 BSONObj createTransferModsRequest(const NamespaceString& nss, const MigrationSessionId& sessionId) {
     BSONObjBuilder builder;
-    builder.append("_transferMods", nss.ns());
+    builder.append("_transferMods", NamespaceStringUtil::serialize(nss));
     sessionId.append(&builder);
     return builder.obj();
 }
@@ -435,7 +435,7 @@ void MigrationDestinationManager::report(BSONObjBuilder& b,
         b.append("sessionId", _sessionId->toString());
     }
 
-    b.append("ns", _nss.ns());
+    b.append("ns", NamespaceStringUtil::serialize(_nss));
     b.append("from", _fromShardConnString.toString());
     b.append("fromShardId", _fromShard.toString());
     b.append("min", _min);
@@ -595,11 +595,6 @@ repl::OpTime MigrationDestinationManager::fetchAndApplyBatch(
 
     stdx::thread applicationThread{[&] {
         Client::initThread("batchApplier", opCtx->getServiceContext(), nullptr);
-        auto client = Client::getCurrent();
-        {
-            stdx::lock_guard lk(*client);
-            client->setSystemOperationKillableByStepdown(lk);
-        }
         auto executor =
             Grid::get(opCtx->getServiceContext())->getExecutorPool()->getFixedExecutor();
         auto applicationOpCtx = CancelableOperationContext(
@@ -843,10 +838,9 @@ MigrationDestinationManager::IndexesAndIdIndex MigrationDestinationManager::getC
     auto indexes = uassertStatusOK(
         fromShard->runExhaustiveCursorCommand(opCtx,
                                               ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                                              nssOrUUID.db().toString(),
+                                              DatabaseNameUtil::serialize(nssOrUUID.dbName()),
                                               cmd,
                                               Milliseconds(-1)));
-
     for (auto&& spec : indexes.docs) {
         if (spec[IndexDescriptor::kClusteredFieldName]) {
             // The 'clustered' index is implicitly created upon clustered collection creation.
@@ -889,15 +883,15 @@ MigrationDestinationManager::getCollectionOptions(OperationContext* opCtx,
     auto infosRes = uassertStatusOK(
         fromShard->runExhaustiveCursorCommand(opCtx,
                                               ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                                              nssOrUUID.db().toString(),
+                                              DatabaseNameUtil::serialize(nssOrUUID.dbName()),
                                               cmd,
                                               Milliseconds(-1)));
 
     auto infos = infosRes.docs;
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "expected listCollections against the primary shard for "
-                          << nssOrUUID.toString() << " to return 1 entry, but got " << infos.size()
-                          << " entries",
+                          << nssOrUUID.toStringForErrorMsg() << " to return 1 entry, but got "
+                          << infos.size() << " entries",
             infos.size() == 1);
 
 
@@ -918,8 +912,9 @@ MigrationDestinationManager::getCollectionOptions(OperationContext* opCtx,
 
     uassert(ErrorCodes::InvalidUUID,
             str::stream() << "The from shard did not return a UUID for collection "
-                          << nssOrUUID.toString() << " as part of its listCollections response: "
-                          << entry << ", but this node expects to see a UUID.",
+                          << nssOrUUID.toStringForErrorMsg()
+                          << " as part of its listCollections response: " << entry
+                          << ", but this node expects to see a UUID.",
             !info["uuid"].eoo());
 
     auto fromUUID = info["uuid"].uuid();
@@ -994,19 +989,19 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
         // Checks that the collection's UUID matches the donor's.
         auto checkUUIDsMatch = [&](const Collection* collection) {
             uassert(ErrorCodes::NotWritablePrimary,
-                    str::stream() << "Unable to create collection " << nss.ns()
+                    str::stream() << "Unable to create collection " << nss.toStringForErrorMsg()
                                   << " because the node is not primary",
                     repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss));
 
             uassert(ErrorCodes::InvalidUUID,
                     str::stream()
-                        << "Cannot create collection " << nss.ns()
+                        << "Cannot create collection " << nss.toStringForErrorMsg()
                         << " because we already have an identically named collection with UUID "
                         << collection->uuid() << ", which differs from the donor's UUID "
                         << collectionOptionsAndIndexes.uuid
                         << ". Manually drop the collection on this shard if it contains data from "
                            "a previous incarnation of "
-                        << nss.ns(),
+                        << nss.toStringForErrorMsg(),
                     collection->uuid() == collectionOptionsAndIndexes.uuid);
         };
 
@@ -1055,16 +1050,15 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
                     opCtx, collectionOptionsAndIndexes.uuid)) {
                 uasserted(5860300,
                           str::stream()
-                              << "Cannot create collection " << nss << " with UUID "
-                              << collectionOptionsAndIndexes.uuid
+                              << "Cannot create collection " << nss.toStringForErrorMsg()
+                              << " with UUID " << collectionOptionsAndIndexes.uuid
                               << " because it conflicts with the UUID of an existing collection "
-                              << collectionByUUID->ns());
+                              << collectionByUUID->ns().toStringForErrorMsg());
             }
 
-            // We do not have a collection by this name. Create the collection with the donor's
-            // options.
+            // We do not have a collection by this name. Create it with the donor's options.
             OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
-                unsafeCreateCollection(opCtx);
+                unsafeCreateCollection(opCtx, /* forceCSRAsUnknownAfterCollectionCreation */ true);
             WriteUnitOfWork wuow(opCtx);
             CollectionOptions collectionOptions = uassertStatusOK(
                 CollectionOptions::parse(collectionOptionsAndIndexes.options,
@@ -1097,11 +1091,6 @@ void MigrationDestinationManager::_migrateThread(CancellationToken cancellationT
 
     Client::initThread("migrateThread");
     auto client = Client::getCurrent();
-    {
-        stdx::lock_guard lk(*client);
-        client->setSystemOperationKillableByStepdown(lk);
-    }
-
     bool recovering = false;
     while (true) {
         const auto executor =
@@ -1191,8 +1180,15 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
     boost::optional<Timer> timeInCriticalSection;
 
     if (!skipToCritSecTaken) {
-        timing.emplace(
-            outerOpCtx, "to", _nss.ns(), _min, _max, 8 /* steps */, &_errmsg, _toShard, _fromShard);
+        timing.emplace(outerOpCtx,
+                       "to",
+                       NamespaceStringUtil::serialize(_nss),
+                       _min,
+                       _max,
+                       8 /* steps */,
+                       &_errmsg,
+                       _toShard,
+                       _fromShard);
 
         LOGV2(
             22000,
@@ -1295,11 +1291,6 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
         outerOpCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
         {
             auto newClient = outerOpCtx->getServiceContext()->makeClient("MigrationCoordinator");
-            {
-                stdx::lock_guard<Client> lk(*newClient.get());
-                newClient->setSystemOperationKillableByStepdown(lk);
-            }
-
             AlternativeClientRegion acr(newClient);
             auto executor =
                 Grid::get(outerOpCtx->getServiceContext())->getExecutorPool()->getFixedExecutor();
@@ -1360,10 +1351,6 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
         }
 
         auto newClient = outerOpCtx->getServiceContext()->makeClient("MigrationCoordinator");
-        {
-            stdx::lock_guard<Client> lk(*newClient.get());
-            newClient->setSystemOperationKillableByStepdown(lk);
-        }
         AlternativeClientRegion acr(newClient);
         auto executor =
             Grid::get(outerOpCtx->getServiceContext())->getExecutorPool()->getFixedExecutor();
@@ -1440,6 +1427,8 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
                 if (!_applyMigrateOp(opCtx, nextBatch)) {
                     return true;
                 }
+                ShardingStatistics::get(opCtx).countBytesClonedOnCatchUpOnRecipient.addAndFetch(
+                    nextBatch["size"].number());
 
                 const int maxIterations = 3600 * 50;
 
@@ -1631,10 +1620,6 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
     } else {
         outerOpCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
         auto newClient = outerOpCtx->getServiceContext()->makeClient("MigrationCoordinator");
-        {
-            stdx::lock_guard<Client> lk(*newClient.get());
-            newClient->setSystemOperationKillableByStepdown(lk);
-        }
         AlternativeClientRegion acr(newClient);
         auto executor =
             Grid::get(outerOpCtx->getServiceContext())->getExecutorPool()->getFixedExecutor();
@@ -1664,10 +1649,6 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
 
     outerOpCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
     auto newClient = outerOpCtx->getServiceContext()->makeClient("MigrationCoordinator");
-    {
-        stdx::lock_guard<Client> lk(*newClient.get());
-        newClient->setSystemOperationKillableByStepdown(lk);
-    }
     AlternativeClientRegion acr(newClient);
     auto executor =
         Grid::get(outerOpCtx->getServiceContext())->getExecutorPool()->getFixedExecutor();
@@ -1695,21 +1676,24 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx,
 bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx, const BSONObj& xfer) {
     bool didAnything = false;
     long long changeInOrphans = 0;
+    long long totalDocs = 0;
 
     // Deleted documents
     if (xfer["deleted"].isABSONObj()) {
-        boost::optional<RemoveSaver> rs;
-        if (serverGlobalParams.moveParanoia) {
-            rs.emplace("moveChunk", _nss.ns(), "removedDuring");
-        }
-
         BSONObjIterator i(xfer["deleted"].Obj());
         while (i.more()) {
-            AutoGetCollection autoColl(opCtx, _nss, MODE_IX);
+            totalDocs++;
+            const auto collection = acquireCollection(
+                opCtx,
+                CollectionAcquisitionRequest(_nss,
+                                             AcquisitionPrerequisites::kPretendUnsharded,
+                                             repl::ReadConcernArgs::get(opCtx),
+                                             AcquisitionPrerequisites::kWrite),
+                MODE_IX);
             uassert(ErrorCodes::ConflictingOperationInProgress,
-                    str::stream() << "Collection " << _nss.ns()
+                    str::stream() << "Collection " << _nss.toStringForErrorMsg()
                                   << " was dropped in the middle of the migration",
-                    autoColl.getCollection());
+                    collection.exists());
 
             BSONObj id = i.next().Obj();
 
@@ -1724,14 +1708,9 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx, const
                 }
             }
 
-            if (rs) {
-                uassertStatusOK(rs->goingToDelete(fullObj));
-            }
-
-            writeConflictRetry(opCtx, "transferModsDeletes", _nss.ns(), [&] {
+            writeConflictRetry(opCtx, "transferModsDeletes", _nss, [&] {
                 deleteObjects(opCtx,
-                              autoColl.getCollection(),
-                              _nss,
+                              collection,
                               id,
                               true /* justOne */,
                               false /* god */,
@@ -1747,11 +1726,18 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx, const
     if (xfer["reload"].isABSONObj()) {
         BSONObjIterator i(xfer["reload"].Obj());
         while (i.more()) {
-            AutoGetCollection autoColl(opCtx, _nss, MODE_IX);
+            totalDocs++;
+            auto collection = acquireCollection(
+                opCtx,
+                CollectionAcquisitionRequest(_nss,
+                                             AcquisitionPrerequisites::kPretendUnsharded,
+                                             repl::ReadConcernArgs::get(opCtx),
+                                             AcquisitionPrerequisites::kWrite),
+                MODE_IX);
             uassert(ErrorCodes::ConflictingOperationInProgress,
-                    str::stream() << "Collection " << _nss.ns()
+                    str::stream() << "Collection " << _nss.toStringForErrorMsg()
                                   << " was dropped in the middle of the migration",
-                    autoColl.getCollection());
+                    collection.exists());
 
             BSONObj updatedDoc = i.next().Obj();
 
@@ -1780,8 +1766,8 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx, const
             }
 
             // We are in write lock here, so sure we aren't killing
-            writeConflictRetry(opCtx, "transferModsUpdates", _nss.ns(), [&] {
-                auto res = Helpers::upsert(opCtx, _nss, updatedDoc, true);
+            writeConflictRetry(opCtx, "transferModsUpdates", _nss, [&] {
+                auto res = Helpers::upsert(opCtx, collection, updatedDoc, true);
                 if (!res.upsertedId.isEmpty()) {
                     changeInOrphans++;
                 }
@@ -1794,6 +1780,9 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx, const
     if (changeInOrphans != 0) {
         persistUpdatedNumOrphans(opCtx, *_collectionUuid, ChunkRange(_min, _max), changeInOrphans);
     }
+
+    ShardingStatistics::get(opCtx).countDocsClonedOnCatchUpOnRecipient.addAndFetch(totalDocs);
+
     return didAnything;
 }
 

@@ -42,6 +42,7 @@
 
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/query/serialization_options.h"
 #include "mongo/db/sorter/sorter_gen.h"
 #include "mongo/db/sorter/sorter_stats.h"
 #include "mongo/platform/atomic_word.h"
@@ -230,8 +231,22 @@ public:
     // Unowned objects are only valid until next call to any method
 
     virtual bool more() = 0;
+    /**
+     * Returns the new key-value pair.
+     */
     virtual std::pair<Key, Value> next() = 0;
-    virtual const std::pair<Key, Value>& current() = 0;
+
+    /**
+     * The following two methods are used together. nextWithDeferredValue() returns the next key. It
+     * must be followed by a call to getDeferredValue(), to return the pending deferred value,
+     * before calling next() or nextWithDeferredValue() again. This is intended specifically to
+     * avoid allocating memory for the value if the caller eventually decides to abandon the
+     * iterator and never consume any more values from it.
+     */
+    virtual Key nextWithDeferredValue() = 0;
+    virtual Value getDeferredValue() = 0;
+
+    virtual const Key& current() = 0;
 
     virtual ~SortIteratorInterface() {}
 
@@ -451,7 +466,7 @@ public:
     virtual std::pair<Key, Value> next() = 0;
 
     // Serialize the bound for explain output
-    virtual Document serializeBound() const = 0;
+    virtual Document serializeBound(SerializationOptions opts) const = 0;
 
     virtual size_t limit() const = 0;
 
@@ -530,8 +545,8 @@ public:
     std::pair<Key, Value> next();
 
     // Serialize the bound for explain output
-    Document serializeBound() const {
-        return {makeBound.serialize()};
+    Document serializeBound(SerializationOptions opts) const {
+        return {makeBound.serialize(opts)};
     };
 
     size_t limit() const {

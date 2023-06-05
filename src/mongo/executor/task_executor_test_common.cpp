@@ -287,7 +287,8 @@ EventChainAndWaitingTest::~EventChainAndWaitingTest() {
 }
 
 void EventChainAndWaitingTest::run() {
-    executor->onEvent(goEvent, [=](const TaskExecutor::CallbackArgs& cbData) { onGo(cbData); })
+    executor
+        ->onEvent(goEvent, [=, this](const TaskExecutor::CallbackArgs& cbData) { onGo(cbData); })
         .status_with_transitional_ignore();
     executor->signalEvent(goEvent);
     executor->waitForEvent(goEvent);
@@ -340,8 +341,9 @@ void EventChainAndWaitingTest::onGo(const TaskExecutor::CallbackArgs& cbData) {
         return;
     }
 
-    cbHandle = executor->onEvent(
-        goEvent, [=](const TaskExecutor::CallbackArgs& cbData) { onGoAfterTriggered(cbData); });
+    cbHandle = executor->onEvent(goEvent, [=, this](const TaskExecutor::CallbackArgs& cbData) {
+        onGoAfterTriggered(cbData);
+    });
     if (!cbHandle.isOK()) {
         status1 = cbHandle.getStatus();
         executor->shutdown();
@@ -1104,7 +1106,7 @@ COMMON_EXECUTOR_TEST(ScheduleExhaustRemoteCommandFutureIsResolvedWithErrorOnCanc
     net->exitNetwork();
     // Response should be cancelled.
     ASSERT_EQUALS(responseFuture.getNoThrow().getStatus().code(), ErrorCodes::CallbackCanceled);
-    ASSERT_EQUALS(numTimesCallbackCalled, 1);
+    ASSERT_EQUALS(numTimesCallbackCalled, 2);
 
     shutdownExecutorThread();
     joinExecutorThread();

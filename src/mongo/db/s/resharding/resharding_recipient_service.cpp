@@ -56,6 +56,7 @@
 #include "mongo/db/s/sharding_index_catalog_ddl_util.h"
 #include "mongo/db/s/sharding_recovery_service.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/db/write_block_bypass.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/thread_pool_task_executor.h"
@@ -229,7 +230,8 @@ ReshardingRecipientService::RecipientStateMachine::RecipientStateMachine(
       _dataReplicationFactory{std::move(dataReplicationFactory)},
       _critSecReason(BSON("command"
                           << "resharding_recipient"
-                          << "collection" << _metadata.getSourceNss().toString())),
+                          << "collection"
+                          << NamespaceStringUtil::serialize(_metadata.getSourceNss()))),
       _isAlsoDonor([&]() {
           auto myShardId = _externalState->myShardId(_serviceContext);
           return std::find_if(_donorShards.begin(),
@@ -809,7 +811,7 @@ void ReshardingRecipientService::RecipientStateMachine::_writeStrictConsistencyO
 
     auto oplog = generateOplogEntry();
     writeConflictRetry(
-        rawOpCtx, "ReshardDoneCatchUpOplog", NamespaceString::kRsOplogNamespace.ns(), [&] {
+        rawOpCtx, "ReshardDoneCatchUpOplog", NamespaceString::kRsOplogNamespace, [&] {
             AutoGetOplog oplogWrite(rawOpCtx, OplogAccessMode::kWrite);
             WriteUnitOfWork wunit(rawOpCtx);
             const auto& oplogOpTime = repl::logOp(rawOpCtx, &oplog);
@@ -1119,30 +1121,34 @@ void ReshardingRecipientService::RecipientStateMachine::_removeRecipientDocument
     auto opCtx = factory.makeOperationContext(&cc());
 
     const auto& nss = NamespaceString::kRecipientReshardingOperationsNamespace;
-    writeConflictRetry(
-        opCtx.get(), "RecipientStateMachine::_removeRecipientDocument", nss.toString(), [&] {
-            AutoGetCollection coll(opCtx.get(), nss, MODE_IX);
+    writeConflictRetry(opCtx.get(), "RecipientStateMachine::_removeRecipientDocument", nss, [&] {
+        const auto coll = acquireCollection(
+            opCtx.get(),
+            CollectionAcquisitionRequest(nss,
+                                         PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                         repl::ReadConcernArgs::get(opCtx.get()),
+                                         AcquisitionPrerequisites::kWrite),
+            MODE_IX);
 
-            if (!coll) {
-                return;
-            }
+        if (!coll.exists()) {
+            return;
+        }
 
-            WriteUnitOfWork wuow(opCtx.get());
+        WriteUnitOfWork wuow(opCtx.get());
 
-            opCtx->recoveryUnit()->onCommit([this](OperationContext*, boost::optional<Timestamp>) {
-                stdx::lock_guard<Latch> lk(_mutex);
-                _completionPromise.emplaceValue();
-            });
-
-            deleteObjects(opCtx.get(),
-                          *coll,
-                          nss,
-                          BSON(ReshardingRecipientDocument::kReshardingUUIDFieldName
-                               << _metadata.getReshardingUUID()),
-                          true /* justOne */);
-
-            wuow.commit();
+        opCtx->recoveryUnit()->onCommit([this](OperationContext*, boost::optional<Timestamp>) {
+            stdx::lock_guard<Latch> lk(_mutex);
+            _completionPromise.emplaceValue();
         });
+
+        deleteObjects(opCtx.get(),
+                      coll,
+                      BSON(ReshardingRecipientDocument::kReshardingUUIDFieldName
+                           << _metadata.getReshardingUUID()),
+                      true /* justOne */);
+
+        wuow.commit();
+    });
 }
 
 ExecutorFuture<void> ReshardingRecipientService::RecipientStateMachine::_startMetrics(

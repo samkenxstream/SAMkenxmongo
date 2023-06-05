@@ -41,6 +41,7 @@
 #include "mongo/db/session/logical_session_id.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/executor/task_executor_cursor_parameters_gen.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/future.h"
 
@@ -53,8 +54,8 @@ namespace executor {
  *
  * The main differentiator for this type over DBClientCursor is the use of a task executor (which
  * provides access to a different connection pool, as well as interruptibility) and the ability to
- * overlap getMores.  This starts fetching the next batch as soon as one is exhausted (rather than
- * on a call to getNext()).
+ * overlap getMores.  This starts fetching the next batch as soon as the previous one is received
+ * (rather than on a call to 'getNext()').
  */
 class TaskExecutorCursor {
 public:
@@ -68,6 +69,17 @@ public:
 
     struct Options {
         boost::optional<int64_t> batchSize;
+        bool pinConnection{gPinTaskExecCursorConns.load()};
+        // If true, we will fetch the next batch as soon as the current one is recieved.
+        // If false, we will fetch the next batch when the current batch is exhausted and
+        // 'getNext()' is invoked.
+        bool preFetchNextBatch{true};
+
+        // This function, if specified, may modify a getMore request to include additional
+        // information.
+        std::function<void(BSONObjBuilder& bob)> getMoreAugmentationWriter;
+
+        Options() {}
     };
 
     /**
@@ -78,7 +90,7 @@ public:
      * opCtx - The Logical Session Id from the initial command is carried over in all later stages.
      *         NOTE - the actual command must not include the lsid
      */
-    explicit TaskExecutorCursor(executor::TaskExecutor* executor,
+    explicit TaskExecutorCursor(std::shared_ptr<executor::TaskExecutor> executor,
                                 const RemoteCommandRequest& rcr,
                                 Options&& options = {});
 
@@ -87,8 +99,11 @@ public:
      * The executor is used for subsequent getMore calls. Uses the original RemoteCommandRequest
      * to build subsequent commands. Takes ownership of the CursorResponse and gives it to the new
      * cursor.
+     * If the cursor should reuse the original transport connection that opened the original
+     * cursor, make sure the pinning executor that was used to open that cursor is provided.
      */
-    TaskExecutorCursor(executor::TaskExecutor* executor,
+    TaskExecutorCursor(std::shared_ptr<executor::TaskExecutor> executor,
+                       std::shared_ptr<executor::TaskExecutor> underlyingExec,
                        CursorResponse&& response,
                        RemoteCommandRequest& rcr,
                        Options&& options = {});
@@ -158,16 +173,6 @@ public:
         return _additionalCursors.size();
     }
 
-    /**
-     * Return the callback that this cursor is waiting on. Can be used to block on getting a
-     * response to this request. Can be boost::none.
-     */
-    boost::optional<TaskExecutor::CallbackHandle> getCallbackHandle() {
-        if (_cmdState)
-            return _cmdState->cbHandle;
-        return {};
-    }
-
 private:
     /**
      * Runs a remote command and pipes the output back to this object
@@ -175,14 +180,13 @@ private:
     void _runRemoteCommand(const RemoteCommandRequest& rcr);
 
     /**
-     * Gets the next batch with interruptibility via the opCtx
+     * Gets the next batch with interruptibility via the opCtx.
      */
     void _getNextBatch(OperationContext* opCtx);
 
     /**
      * Helper for '_getNextBatch' that handles the reading of the 'CursorResponse' object and
-     * storing of relevant values. This is also responsible for issuing a getMore request if it
-     * is required to populate the next batch.
+     * storing of relevant values.
      */
     void _processResponse(OperationContext* opCtx, CursorResponse&& response);
 
@@ -191,7 +195,19 @@ private:
      */
     const RemoteCommandRequest& _createRequest(OperationContext* opCtx, const BSONObj& cmd);
 
-    executor::TaskExecutor* const _executor;
+    /**
+     * Schedules a 'GetMore' request to run asyncronously.
+     * This function can only be invoked when:
+     * - There is no in-flight request ('_cmdState' is null).
+     * - We have an open '_cursorId'.
+     */
+    void _scheduleGetMore(OperationContext* opCtx);
+
+    std::shared_ptr<executor::TaskExecutor> _executor;
+    // If we are pinning connections, we need to keep a separate reference to the
+    // non-pinning, normal executor, so that we can shut down the pinned executor
+    // out-of-line.
+    std::shared_ptr<executor::TaskExecutor> _underlyingExecutor;
 
     // Used as a scratch pad for the successive scheduleRemoteCommand calls
     RemoteCommandRequest _rcr;

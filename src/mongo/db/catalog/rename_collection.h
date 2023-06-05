@@ -93,9 +93,11 @@ Status renameCollectionForRollback(OperationContext* opCtx,
 /**
  * Performs validation checks to ensure source and target namespaces are eligible for rename.
  */
-void validateNamespacesForRenameCollection(OperationContext* opCtx,
-                                           const NamespaceString& source,
-                                           const NamespaceString& target);
+void validateNamespacesForRenameCollection(
+    OperationContext* opCtx,
+    const NamespaceString& source,
+    const NamespaceString& target,
+    const RenameCollectionOptions& options = RenameCollectionOptions());
 
 /**
  * Runs renameCollection() with preliminary validation checks to ensure source

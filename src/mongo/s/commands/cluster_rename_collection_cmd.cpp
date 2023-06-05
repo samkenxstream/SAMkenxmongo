@@ -66,11 +66,11 @@ public:
             auto toNss = request().getTo();
 
             uassert(ErrorCodes::InvalidNamespace,
-                    str::stream() << "Invalid source namespace: " << fromNss.ns(),
+                    str::stream() << "Invalid source namespace: " << fromNss.toStringForErrorMsg(),
                     fromNss.isValid());
 
             uassert(ErrorCodes::InvalidNamespace,
-                    str::stream() << "Invalid target namespace: " << toNss.ns(),
+                    str::stream() << "Invalid target namespace: " << toNss.toStringForErrorMsg(),
                     toNss.isValid());
 
             uassert(ErrorCodes::IllegalOperation,
@@ -91,7 +91,7 @@ public:
                 request().getDropTarget());
 
             ShardsvrRenameCollection renameCollRequest(fromNss);
-            renameCollRequest.setDbName(fromNss.db());
+            renameCollRequest.setDbName(fromNss.dbName());
             renameCollRequest.setRenameCollectionRequest(renameCollReq);
             renameCollRequest.setAllowEncryptedCollectionRename(
                 AuthorizationSession::get(opCtx->getClient())
@@ -139,7 +139,7 @@ public:
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
             uassertStatusOK(rename_collection::checkAuthForRenameCollectionCommand(
-                opCtx->getClient(), ns().db().toString(), request().toBSON(BSONObj())));
+                opCtx->getClient(), request()));
         }
 
         bool supportsWriteConcern() const override {

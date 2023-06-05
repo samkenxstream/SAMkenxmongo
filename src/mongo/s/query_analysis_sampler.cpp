@@ -36,6 +36,7 @@
 #include "mongo/s/analyze_shard_key_util.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/is_mongos.h"
+#include "mongo/s/query_analysis_client.h"
 #include "mongo/s/query_analysis_sample_tracker.h"
 #include "mongo/s/refresh_query_analyzer_configuration_cmd_gen.h"
 #include "mongo/util/net/socket_utils.h"
@@ -86,7 +87,7 @@ StatusWith<std::vector<CollectionQueryAnalyzerConfiguration>> executeRefreshComm
         }
         resObj = swResponse.getValue().response;
     } else if (serverGlobalParams.clusterRole.has(ClusterRole::None)) {
-        resObj = executeCommandOnPrimary(
+        resObj = QueryAnalysisClient::get(opCtx).executeCommandOnPrimary(
             opCtx, DatabaseName::kAdmin, cmd.toBSON({}), [&](const BSONObj& resObj) {});
         if (auto status = getStatusFromCommandResult(resObj); !status.isOK()) {
             return status;
@@ -107,7 +108,7 @@ QueryAnalysisSampler& QueryAnalysisSampler::get(OperationContext* opCtx) {
 }
 
 QueryAnalysisSampler& QueryAnalysisSampler::get(ServiceContext* serviceContext) {
-    invariant(analyze_shard_key::supportsSamplingQueries(serviceContext, true /* ignoreFCV */));
+    invariant(analyze_shard_key::supportsSamplingQueries(serviceContext));
     return getQueryAnalysisSampler(serviceContext);
 }
 
@@ -116,10 +117,14 @@ void QueryAnalysisSampler::onStartup() {
     auto periodicRunner = serviceContext->getPeriodicRunner();
     invariant(periodicRunner);
 
+    stdx::lock_guard<Latch> lk(_mutex);
+
     PeriodicRunner::PeriodicJob queryStatsRefresherJob(
         "QueryAnalysisQueryStatsRefresher",
         [this](Client* client) { _refreshQueryStats(); },
-        Seconds(1));
+        Seconds(1),
+        // TODO(SERVER-74662): Please revisit if this periodic job could be made killable.
+        false /*isKillableByStepdown*/);
     _periodicQueryStatsRefresher = periodicRunner->makeJob(std::move(queryStatsRefresherJob));
     _periodicQueryStatsRefresher.start();
 
@@ -136,7 +141,9 @@ void QueryAnalysisSampler::onStartup() {
                       "error"_attr = redact(ex));
             }
         },
-        Seconds(gQueryAnalysisSamplerConfigurationRefreshSecs));
+        Seconds(gQueryAnalysisSamplerConfigurationRefreshSecs),
+        // TODO(SERVER-74662): Please revisit if this periodic job could be made killable.
+        false /*isKillableByStepdown*/);
     _periodicConfigurationsRefresher =
         periodicRunner->makeJob(std::move(configurationsRefresherJob));
     _periodicConfigurationsRefresher.start();
@@ -218,7 +225,7 @@ void QueryAnalysisSampler::SampleRateLimiter::_refill(double numTokensPerSecond,
         _lastRefillTimeTicks = currTicks;
 
         LOGV2_DEBUG(7372303,
-                    2,
+                    3,
                     "Refilled the bucket",
                     logAttrs(_nss),
                     "collectionUUID"_attr = _collUuid,
@@ -236,7 +243,7 @@ bool QueryAnalysisSampler::SampleRateLimiter::tryConsume() {
     if (_lastNumTokens >= 1) {
         _lastNumTokens -= 1;
         LOGV2_DEBUG(7372304,
-                    2,
+                    3,
                     "Successfully consumed one token",
                     logAttrs(_nss),
                     "collectionUUID"_attr = _collUuid,
@@ -247,7 +254,7 @@ bool QueryAnalysisSampler::SampleRateLimiter::tryConsume() {
         // if there is nearly one.
         _lastNumTokens = 0;
         LOGV2_DEBUG(7372305,
-                    2,
+                    3,
                     "Successfully consumed approximately one token",
                     logAttrs(_nss),
                     "collectionUUID"_attr = _collUuid,
@@ -255,7 +262,7 @@ bool QueryAnalysisSampler::SampleRateLimiter::tryConsume() {
         return true;
     }
     LOGV2_DEBUG(7372306,
-                2,
+                3,
                 "Failed to consume one token",
                 logAttrs(_nss),
                 "collectionUUID"_attr = _collUuid,
@@ -328,11 +335,6 @@ void QueryAnalysisSampler::_refreshConfigurations(OperationContext* opCtx) {
                                                          configuration.getSampleRate()});
         } else {
             auto rateLimiter = it->second;
-            if (it->second.getNss() != configuration.getNs()) {
-                // Nss changed due to collection rename.
-                // TODO SERVER-73990: Test collection renaming during query sampling
-                it->second.setNss(configuration.getNs());
-            }
             rateLimiter.refreshRate(configuration.getSampleRate());
             sampleRateLimiters.emplace(configuration.getNs(), std::move(rateLimiter));
         }

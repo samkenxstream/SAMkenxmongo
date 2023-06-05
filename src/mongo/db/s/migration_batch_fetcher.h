@@ -145,7 +145,7 @@ private:
     // Only should be created once for the lifetime of the object.
     BSONObj _createMigrateCloneRequest() const {
         BSONObjBuilder builder;
-        builder.append("_migrateClone", _nss.ns());
+        builder.append("_migrateClone", NamespaceStringUtil::serialize(_nss));
         _sessionId.append(&builder);
         return builder.obj();
     }
@@ -161,10 +161,6 @@ private:
 
     static void onCreateThread(const std::string& threadName) {
         Client::initThread(threadName, getGlobalServiceContext(), nullptr);
-        {
-            stdx::lock_guard<Client> lk(cc());
-            cc().setSystemOperationKillableByStepdown(lk);
-        }
     }
 
 };  // namespace mongo

@@ -2,7 +2,7 @@
  * Tests that the configureQueryAnalyzer command uses database versioning when running the
  * listCollections command to validate the collection options.
  *
- * @tags: [requires_fcv_70, featureFlagAnalyzeShardKey]
+ * @tags: [requires_fcv_70]
  */
 (function() {
 "use strict";
@@ -26,7 +26,7 @@ assert.commandWorked(mongos0Coll.insert([{x: -1}, {x: 1}]));
 const configureCmdObj = {
     configureQueryAnalyzer: ns,
     mode: "full",
-    sampleRate: 100
+    sampleRate: 1
 };
 
 // Run the configureQueryAnalyzer command.

@@ -75,7 +75,9 @@ void generateNewDocumentFromSuppliedDoc(OperationContext* opCtx,
     UpdateDriver replacementDriver(nullptr);
 
     // Create a new replacement-style update from the supplied document.
-    replacementDriver.parse(write_ops::UpdateModification::parseFromClassicUpdate(suppliedDoc), {});
+    replacementDriver.parse(
+        write_ops::UpdateModification(suppliedDoc, write_ops::UpdateModification::ReplacementTag{}),
+        {});
     replacementDriver.setLogOp(false);
 
     // We do not validate for storage, as we will validate the full document before inserting.
@@ -98,7 +100,7 @@ void produceDocumentForUpsert(OperationContext* opCtx,
     // First: populate the document's immutable paths with equality predicate values from the query,
     // if available. This generates the pre-image document that we will run the update against.
     if (auto* cq = canonicalQuery) {
-        uassertStatusOK(driver->populateDocumentWithQueryFields(*cq, immutablePaths, doc));
+        uassertStatusOK(driver->populateDocumentWithQueryFields(*cq->root(), immutablePaths, doc));
     } else {
         fassert(17354, CanonicalQuery::isSimpleIdQuery(request->getQuery()));
         fassert(17352, doc.root().appendElement(request->getQuery()[idFieldName]));
@@ -165,9 +167,7 @@ void makeUpdateRequest(OperationContext* opCtx,
     requestOut->setMulti(false);
     requestOut->setExplain(explain);
 
-    requestOut->setYieldPolicy(opCtx->inMultiDocumentTransaction()
-                                   ? PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY
-                                   : PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
+    requestOut->setYieldPolicy(PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
 }
 
 }  // namespace update

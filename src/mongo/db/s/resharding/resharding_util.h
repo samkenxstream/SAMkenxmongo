@@ -257,7 +257,15 @@ void checkForOverlappingZones(std::vector<ReshardingZoneType>& zones);
  * Builds documents to insert into config.tags from zones provided to reshardCollection cmd.
  */
 std::vector<BSONObj> buildTagsDocsFromZones(const NamespaceString& tempNss,
-                                            const std::vector<ReshardingZoneType>& zones);
+                                            std::vector<ReshardingZoneType>& zones,
+                                            const ShardKeyPattern& shardKey);
+
+/**
+ * Create an array of resharding zones from the existing collection. This is used for forced
+ * same-key resharding.
+ */
+std::vector<ReshardingZoneType> getZonesFromExistingCollection(OperationContext* opCtx,
+                                                               const NamespaceString& sourceNss);
 
 /**
  * Creates a pipeline that can be serialized into a query for fetching oplog entries. `startAfter`
@@ -320,6 +328,19 @@ std::vector<std::shared_ptr<Instance>> getReshardingStateMachines(OperationConte
     }
     return result;
 }
+
+/**
+ * Validate the shardDistribution parameter in reshardCollection cmd, which should satisfy the
+ * following properties:
+ * - The shardKeyRanges should be continuous and cover the full data range.
+ * - Every shardKeyRange should be on the same key.
+ * - A shardKeyRange should either have no min/max or have a min/max pair.
+ * - All shardKeyRanges in the array should have the same min/max pattern.
+ * Not satisfying the rules above will cause an uassert failure.
+ */
+void validateShardDistribution(const std::vector<ShardKeyRange>& shardDistribution,
+                               OperationContext* opCtx,
+                               const ShardKeyPattern& keyPattern);
 
 }  // namespace resharding
 }  // namespace mongo

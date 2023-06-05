@@ -51,10 +51,6 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/net/socket_exception.h"
 
-#if !defined(__has_feature)
-#define __has_feature(x) 0
-#endif
-
 #if __has_feature(address_sanitizer)
 #include <sanitizer/lsan_interface.h>
 #endif
@@ -201,7 +197,7 @@ DBClientBase* PoolForHost::get(DBConnectionPool* pool, double socketTimeout) {
             continue;
         }
 
-        verify(sc.conn->getSoTimeout() == socketTimeout);
+        MONGO_verify(sc.conn->getSoTimeout() == socketTimeout);
 #ifdef MONGO_CONFIG_SSL
         invariant(!sc.conn->isUsingTransientSSLParams());
 #endif
@@ -658,7 +654,7 @@ bool DBConnectionPool::serverNameCompare::operator()(const string& a, const stri
         ++ap;
         ++bp;
     }
-    verify(false);
+    MONGO_verify(false);
 }
 
 bool DBConnectionPool::poolKeyCompare::operator()(const PoolKey& a, const PoolKey& b) const {

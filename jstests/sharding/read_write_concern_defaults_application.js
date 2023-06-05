@@ -33,6 +33,7 @@
 
 load('jstests/libs/profiler.js');
 load('jstests/sharding/libs/last_lts_mongod_commands.js');
+load('jstests/sharding/libs/last_lts_mongos_commands.js');
 
 // TODO SERVER-50144 Remove this and allow orphan checking.
 // This test calls removeShard which can leave docs in config.rangeDeletions in state "pending",
@@ -114,14 +115,16 @@ let testCases = {
     _configsvrRenameCollection: {skip: "internal command"},
     _configsvrRenameCollectionMetadata: {skip: "internal command"},
     _configsvrRepairShardedCollectionChunksHistory: {skip: "internal command"},
+    _configsvrResetPlacementHistory: {skip: "internal command"},
     _configsvrReshardCollection: {skip: "internal command"},
     _configsvrRunRestore: {skip: "internal command"},
     _configsvrSetAllowMigrations: {skip: "internal command"},
     _configsvrSetClusterParameter: {skip: "internal command"},
     _configsvrSetUserWriteBlockMode: {skip: "internal command"},
-    _configsvrTransitionToCatalogShard: {skip: "internal command"},
+    _configsvrTransitionFromDedicatedConfigServer: {skip: "internal command"},
     _configsvrTransitionToDedicatedConfigServer: {skip: "internal command"},
     _configsvrUpdateZoneKeyRange: {skip: "internal command"},
+    _dropConnectionsToMongot: {skip: "internal command"},
     _flushDatabaseCacheUpdates: {skip: "internal command"},
     _flushDatabaseCacheUpdatesWithWriteConcern: {skip: "internal command"},
     _flushReshardingStateChange: {skip: "internal command"},
@@ -135,6 +138,7 @@ let testCases = {
     _killOperations: {skip: "internal command"},
     _mergeAuthzCollections: {skip: "internal command"},
     _migrateClone: {skip: "internal command"},
+    _mongotConnPoolStats: {skip: "internal command"},
     _movePrimaryRecipientSyncData: {skip: "internal command"},
     _movePrimaryRecipientAbortMigration: {skip: "internal command"},
     _movePrimaryRecipientForgetMigration: {skip: "internal command"},
@@ -150,6 +154,7 @@ let testCases = {
     _shardsvrRegisterIndex: {skip: "internal command"},
     _shardsvrCheckMetadataConsistency: {skip: "internal command"},
     _shardsvrCheckMetadataConsistencyParticipant: {skip: "internal command"},
+    _shardsvrCleanupStructuredEncryptionData: {skip: "internal command"},
     _shardsvrCommitIndexParticipant: {skip: "internal command"},
     _shardsvrCommitReshardCollection: {skip: "internal command"},
     _shardsvrCompactStructuredEncryptionData: {skip: "internal command"},
@@ -195,7 +200,13 @@ let testCases = {
     _shardsvrCollMod: {skip: "internal command"},
     _shardsvrCollModParticipant: {skip: "internal command"},
     _shardsvrParticipantBlock: {skip: "internal command"},
-    _startStreamProcessor: {skip: "internal command"},
+    streams_startStreamProcessor: {skip: "internal command"},
+    streams_startStreamSample: {skip: "internal command"},
+    streams_stopStreamProcessor: {skip: "internal command"},
+    streams_listStreamProcessors: {skip: "internal command"},
+    streams_getMoreStreamSample: {skip: "internal command"},
+    streams_getStats: {skip: "internal command"},
+    streams_testOnlyInsert: {skip: "internal command"},
     _transferMods: {skip: "internal command"},
     _vectorClockPersist: {skip: "internal command"},
     abortReshardCollection: {skip: "does not accept read or write concern"},
@@ -259,6 +270,7 @@ let testCases = {
     checkShardingIndex: {skip: "does not accept read or write concern"},
     cleanupOrphaned: {skip: "only on shard server"},
     cleanupReshardCollection: {skip: "does not accept read or write concern"},
+    cleanupStructuredEncryptionData: {skip: "does not accept read or write concern"},
     clearJumboFlag: {skip: "does not accept read or write concern"},
     clearLog: {skip: "does not accept read or write concern"},
     clone: {skip: "deprecated"},
@@ -507,23 +519,7 @@ let testCases = {
     getLog: {skip: "does not accept read or write concern"},
     getMore: {skip: "does not accept read or write concern"},
     getParameter: {skip: "does not accept read or write concern"},
-    getQueryableEncryptionCountInfo: {
-        // TODO SERVER-75631 - Enable this test once the feature flag is gone
-        skip: "requires feature flag"
-        // setUp: function(conn) {
-        //     assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));
-        // },
-        // command: {
-        //     getQueryableEncryptionCountInfo: coll,
-        //     tokens: [
-        //         {tokens: [{"s": BinData(0, "lUBO7Mov5Sb+c/D4cJ9whhhw/+PZFLCk/AQU2+BpumQ=")}]},
-        //     ],
-        //     "forInsert": true,
-        // },
-        // checkReadConcern: true,
-        // checkWriteConcern: false,
-        // useLogs: true,
-    },
+    getQueryableEncryptionCountInfo: {skip: "not profiled or logged"},
     getShardMap: {skip: "internal command"},
     getShardVersion: {skip: "internal command"},
     getnonce: {skip: "removed in v6.3"},
@@ -668,6 +664,7 @@ let testCases = {
     replSetTest: {skip: "does not accept read or write concern"},
     replSetTestEgress: {skip: "does not accept read or write concern"},
     replSetUpdatePosition: {skip: "does not accept read or write concern"},
+    resetPlacementHistory: {skip: "does not accept read or write concern"},
     reshardCollection: {skip: "does not accept read or write concern"},
     resync: {skip: "does not accept read or write concern"},
     revokePrivilegesFromRole: {
@@ -760,7 +757,7 @@ let testCases = {
     testVersions1And2: {skip: "does not accept read or write concern"},
     testVersion2: {skip: "does not accept read or write concern"},
     top: {skip: "does not accept read or write concern"},
-    transitionToCatalogShard: {skip: "does not accept read or write concern"},
+    transitionFromDedicatedConfigServer: {skip: "does not accept read or write concern"},
     transitionToDedicatedConfigServer: {skip: "does not accept read or write concern"},
     update: {
         setUp: function(conn) {
@@ -810,6 +807,10 @@ let testCases = {
 };
 
 commandsRemovedFromMongodSinceLastLTS.forEach(function(cmd) {
+    testCases[cmd] = {skip: "must define test coverage for backwards compatibility"};
+});
+
+commandsRemovedFromMongosSinceLastLTS.forEach(function(cmd) {
     testCases[cmd] = {skip: "must define test coverage for backwards compatibility"};
 });
 

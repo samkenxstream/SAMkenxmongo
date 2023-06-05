@@ -65,8 +65,15 @@ intrusive_ptr<DocumentSource> DocumentSourceCollStats::createFromBson(
     uassert(40166,
             str::stream() << "$collStats must take a nested object but found: " << specElem,
             specElem.type() == BSONType::Object);
-    auto spec =
-        DocumentSourceCollStatsSpec::parse(IDLParserContext(kStageName), specElem.embeddedObject());
+
+    // TODO SERVER-77056: add assertion to validate pExpCtx->serializationCtxt != stateDefault()
+
+    auto spec = DocumentSourceCollStatsSpec::parse(
+        IDLParserContext(kStageName,
+                         false /* apiStrict */,
+                         pExpCtx->ns.tenantId(),
+                         SerializationContext::stateCommandReply(pExpCtx->serializationCtxt)),
+        specElem.embeddedObject());
 
     return make_intrusive<DocumentSourceCollStats>(pExpCtx, std::move(spec));
 }
@@ -78,7 +85,12 @@ BSONObj DocumentSourceCollStats::makeStatsForNs(
     const boost::optional<BSONObj>& filterObj) {
     BSONObjBuilder builder;
 
-    builder.append("ns", NamespaceStringUtil::serialize(nss));
+    // We need to use the serialization context from the request when calling
+    // NamespaceStringUtil to build the reply.
+    builder.append(
+        "ns",
+        NamespaceStringUtil::serialize(
+            nss, SerializationContext::stateCommandReply(spec.getSerializationContext())));
 
     auto shardName = expCtx->mongoProcessInterface->getShardName(expCtx->opCtx);
 
@@ -90,8 +102,11 @@ BSONObj DocumentSourceCollStats::makeStatsForNs(
     builder.appendDate("localTime", jsTime());
 
     if (auto latencyStatsSpec = spec.getLatencyStats()) {
+        // getRequestOnTimeseriesView is set to true if collstats is called on the view.
+        auto resolvedNss =
+            spec.getRequestOnTimeseriesView() ? nss.getTimeseriesViewNamespace() : nss;
         expCtx->mongoProcessInterface->appendLatencyStats(
-            expCtx->opCtx, nss, latencyStatsSpec->getHistograms(), &builder);
+            expCtx->opCtx, resolvedNss, latencyStatsSpec->getHistograms(), &builder);
     }
 
     if (auto storageStats = spec.getStorageStats()) {
@@ -129,10 +144,7 @@ DocumentSource::GetNextResult DocumentSourceCollStats::doGetNext() {
 }
 
 Value DocumentSourceCollStats::serialize(SerializationOptions opts) const {
-    if (opts.redactIdentifiers || opts.replacementForLiteralArgs) {
-        MONGO_UNIMPLEMENTED_TASSERT(7484352);
-    }
-    return Value(Document{{getSourceName(), _collStatsSpec.toBSON()}});
+    return Value(Document{{getSourceName(), _collStatsSpec.toBSON(opts)}});
 }
 
 }  // namespace mongo

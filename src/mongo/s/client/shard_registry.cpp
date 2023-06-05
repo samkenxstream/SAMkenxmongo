@@ -190,7 +190,7 @@ ShardRegistry::Cache::LookupResult ShardRegistry::_lookup(OperationContext* opCt
 
         auto name = shard->getConnString().getSetName();
         if (shardId != ShardId::kConfigServerId) {
-            // Don't remove the catalog shard's RSM because it is used to target the config server.
+            // Don't remove the config shard's RSM because it is used to target the config server.
             ReplicaSetMonitor::remove(name);
         }
         _removeReplicaSet(name);
@@ -462,18 +462,15 @@ void ShardRegistry::updateReplicaSetOnConfigServer(ServiceContext* serviceContex
                                                    const ConnectionString& connStr) noexcept {
     ThreadClient tc("UpdateReplicaSetOnConfigServer", serviceContext);
 
+    // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+    {
+        stdx::lock_guard<Client> lk(*tc.get());
+        tc.get()->setSystemOperationUnkillableByStepdown(lk);
+    }
+
     auto opCtx = tc->makeOperationContext();
     auto const grid = Grid::get(opCtx.get());
     auto sr = grid->shardRegistry();
-
-    // First check if this is a config shard lookup.
-    {
-        stdx::lock_guard<Latch> lk(sr->_mutex);
-        if (auto shard = sr->_configShardData.findByRSName(connStr.getSetName())) {
-            // No need to tell the config servers their own connection string.
-            return;
-        }
-    }
 
     auto swRegistryData = sr->_getDataAsync().getNoThrow(opCtx.get());
     if (!swRegistryData.isOK()) {
@@ -500,7 +497,7 @@ void ShardRegistry::updateReplicaSetOnConfigServer(ServiceContext* serviceContex
         NamespaceString::kConfigsvrShardsNamespace,
         BSON(ShardType::name(shard->getId().toString())),
         BSON("$set" << BSON(ShardType::host(connStr.toString()))),
-        false,
+        false /* upsert */,
         ShardingCatalogClient::kMajorityWriteConcern);
     auto status = swWasUpdated.getStatus();
     if (!status.isOK()) {

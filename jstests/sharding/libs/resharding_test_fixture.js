@@ -37,7 +37,9 @@ var ReshardingTest = class {
         oplogSize: oplogSize = undefined,
         maxNumberOfTransactionOperationsInSingleOplogEntry:
             maxNumberOfTransactionOperationsInSingleOplogEntry = undefined,
-        catalogShard: catalogShard = false,
+        configShard: configShard = false,
+        wiredTigerConcurrentWriteTransactions: wiredTigerConcurrentWriteTransactions = undefined,
+        reshardingOplogBatchTaskCount: reshardingOplogBatchTaskCount = undefined,
     } = {}) {
         // The @private JSDoc comments cause VS Code to not display the corresponding properties and
         // methods in its autocomplete list. This makes it simpler for test authors to know what the
@@ -69,7 +71,9 @@ var ReshardingTest = class {
         this._oplogSize = oplogSize;
         this._maxNumberOfTransactionOperationsInSingleOplogEntry =
             maxNumberOfTransactionOperationsInSingleOplogEntry;
-        this._catalogShard = catalogShard || jsTestOptions().catalogShard;
+        this._configShard = configShard || jsTestOptions().configShard;
+        this._wiredTigerConcurrentWriteTransactions = wiredTigerConcurrentWriteTransactions;
+        this._reshardingOplogBatchTaskCount = reshardingOplogBatchTaskCount;
 
         // Properties set by setup().
         /** @private */
@@ -106,8 +110,8 @@ var ReshardingTest = class {
 
     setup() {
         const mongosOptions = {setParameter: {}};
-        const configOptions = {setParameter: {}};
-        const rsOptions = {
+        let configOptions = {setParameter: {}};
+        let rsOptions = {
             setParameter: {
                 storeFindAndModifyImagesInSideCollection:
                     this._storeFindAndModifyImagesInSideCollection
@@ -119,8 +123,8 @@ var ReshardingTest = class {
         const configReplSetTestOptions = {};
 
         let nodesPerShard = 2;
-        // Use the shard default in catalog shard mode since the config server will be a shard.
-        let nodesPerConfigRs = this._catalogShard ? 2 : 1;
+        // Use the shard default in config shard mode since the config server will be a shard.
+        let nodesPerConfigRs = this._configShard ? 2 : 1;
 
         if (this._enableElections) {
             nodesPerShard = 3;
@@ -177,6 +181,27 @@ var ReshardingTest = class {
                 this._maxNumberOfTransactionOperationsInSingleOplogEntry;
         }
 
+        if (this._configShard) {
+            // ShardingTest does not currently support deep merging of options, so merge the set
+            // parameters for config and replica sets here.
+            rsOptions.setParameter =
+                Object.merge(rsOptions.setParameter, configOptions.setParameter);
+            configOptions.setParameter =
+                Object.merge(configOptions.setParameter, rsOptions.setParameter);
+        }
+
+        if (this._wiredTigerConcurrentWriteTransactions !== undefined) {
+            rsOptions.setParameter.storageEngineConcurrencyAdjustmentAlgorithm =
+                "fixedConcurrentTransactions";
+            rsOptions.setParameter.wiredTigerConcurrentWriteTransactions =
+                this._wiredTigerConcurrentWriteTransactions;
+        }
+
+        if (this._reshardingOplogBatchTaskCount !== undefined) {
+            rsOptions.setParameter.reshardingOplogBatchTaskCount =
+                this._reshardingOplogBatchTaskCount;
+        }
+
         this._st = new ShardingTest({
             mongos: 1,
             mongosOptions,
@@ -187,7 +212,7 @@ var ReshardingTest = class {
             rsOptions,
             configReplSetTestOptions,
             manualAddShard: true,
-            catalogShard: this._catalogShard,
+            configShard: this._configShard,
         });
 
         for (let i = 0; i < this._numShards; ++i) {
@@ -210,8 +235,9 @@ var ReshardingTest = class {
             }
 
             const shard = this._st[`shard${i}`];
-            if (this._catalogShard && i == 0) {
-                assert.commandWorked(this._st.s.adminCommand({transitionToCatalogShard: 1}));
+            if (this._configShard && i == 0) {
+                assert.commandWorked(
+                    this._st.s.adminCommand({transitionFromDedicatedConfigServer: 1}));
                 shard.shardName = "config";
             } else {
                 const res = assert.commandWorked(

@@ -398,7 +398,7 @@ Status insertDocuments(OperationContext* opCtx,
             return Status(ErrorCodes::InternalError,
                           str::stream()
                               << "Collection::insertDocument got document without _id for ns:"
-                              << nss.toString());
+                              << nss.toStringForErrorMsg());
         }
 
         auto status = collection->checkValidationAndParseResult(opCtx, it->doc);
@@ -499,6 +499,7 @@ void updateDocument(OperationContext* opCtx,
                     const Snapshotted<BSONObj>& oldDoc,
                     const BSONObj& newDoc,
                     const BSONObj* opDiff,
+                    bool* indexesAffected,
                     OpDebug* opDebug,
                     CollectionUpdateArgs* args) {
     {
@@ -584,6 +585,9 @@ void updateDocument(OperationContext* opCtx,
                                                                     oldLocation,
                                                                     &keysInserted,
                                                                     &keysDeleted));
+        if (indexesAffected) {
+            *indexesAffected = (keysInserted > 0 || keysDeleted > 0);
+        }
 
         if (opDebug) {
             opDebug->additiveMetrics.incrementKeysInserted(keysInserted);
@@ -612,6 +616,7 @@ StatusWith<BSONObj> updateDocumentWithDamages(OperationContext* opCtx,
                                               const char* damageSource,
                                               const mutablebson::DamageVector& damages,
                                               const BSONObj* opDiff,
+                                              bool* indexesAffected,
                                               OpDebug* opDebug,
                                               CollectionUpdateArgs* args) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_IX));
@@ -663,6 +668,9 @@ StatusWith<BSONObj> updateDocumentWithDamages(OperationContext* opCtx,
                                                                     loc,
                                                                     &keysInserted,
                                                                     &keysDeleted));
+        if (indexesAffected) {
+            *indexesAffected = (keysInserted > 0 || keysDeleted > 0);
+        }
 
         if (opDebug) {
             opDebug->additiveMetrics.incrementKeysInserted(keysInserted);
@@ -727,27 +735,27 @@ void deleteDocument(OperationContext* opCtx,
         Lock::ResourceLock heldUntilEndOfWUOW{opCtx, ResourceId(RESOURCE_METADATA, nss), MODE_X};
     }
 
-    std::vector<OplogSlot> oplogSlots;
-    auto retryableFindAndModifyLocation = RetryableFindAndModifyLocation::kNone;
-    if (storeDeletedDoc == StoreDeletedDoc::On && retryableWrite == RetryableWrite::kYes) {
-        retryableFindAndModifyLocation = RetryableFindAndModifyLocation::kSideCollection;
-        oplogSlots = reserveOplogSlotsForRetryableFindAndModify(opCtx);
-    }
-    OplogDeleteEntryArgs deleteArgs{nullptr /* deletedDoc */,
-                                    fromMigrate,
-                                    collection->isChangeStreamPreAndPostImagesEnabled(),
-                                    retryableFindAndModifyLocation,
-                                    oplogSlots};
+    OplogDeleteEntryArgs deleteArgs;
+    opCtx->getServiceContext()->getOpObserver()->aboutToDelete(
+        opCtx, collection, doc.value(), &deleteArgs);
 
-    opCtx->getServiceContext()->getOpObserver()->aboutToDelete(opCtx, collection, doc.value());
+    deleteArgs.deletedDoc = nullptr;
+    deleteArgs.fromMigrate = fromMigrate;
+    deleteArgs.changeStreamPreAndPostImagesEnabledForCollection =
+        collection->isChangeStreamPreAndPostImagesEnabled();
+
+    const bool shouldRecordPreImageForRetryableWrite =
+        storeDeletedDoc == StoreDeletedDoc::On && retryableWrite == RetryableWrite::kYes;
+    if (shouldRecordPreImageForRetryableWrite) {
+        deleteArgs.retryableFindAndModifyLocation = RetryableFindAndModifyLocation::kSideCollection;
+        deleteArgs.oplogSlots = reserveOplogSlotsForRetryableFindAndModify(opCtx);
+    }
 
     boost::optional<BSONObj> deletedDoc;
-    const bool isRecordingPreImageForRetryableWrite =
-        retryableFindAndModifyLocation != RetryableFindAndModifyLocation::kNone;
     const bool isTimeseriesCollection =
         collection->getTimeseriesOptions() || nss.isTimeseriesBucketsCollection();
 
-    if (isRecordingPreImageForRetryableWrite ||
+    if (shouldRecordPreImageForRetryableWrite ||
         collection->isChangeStreamPreAndPostImagesEnabled() ||
         (isTimeseriesCollection &&
          feature_flags::gTimeseriesScalabilityImprovements.isEnabled(

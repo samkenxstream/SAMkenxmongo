@@ -138,9 +138,11 @@ KeyStringIndexConsistency::KeyStringIndexConsistency(
     CollectionValidation::ValidateState* validateState,
     const size_t numHashBuckets)
     : IndexConsistency(opCtx, validateState, numHashBuckets) {
-    for (const auto& index : _validateState->getIndexes()) {
-        const auto descriptor = index->descriptor();
-        IndexAccessMethod* accessMethod = const_cast<IndexAccessMethod*>(index->accessMethod());
+    for (const auto& indexIdent : _validateState->getIndexIdents()) {
+        const IndexDescriptor* descriptor =
+            validateState->getCollection()->getIndexCatalog()->findIndexByIdent(opCtx, indexIdent);
+        IndexAccessMethod* accessMethod =
+            const_cast<IndexAccessMethod*>(descriptor->getEntry()->accessMethod());
         _indexesInfo.emplace(descriptor->indexName(), IndexInfo(descriptor, accessMethod));
     }
 }
@@ -198,26 +200,17 @@ bool KeyStringIndexConsistency::haveEntryMismatch() const {
 
 void KeyStringIndexConsistency::repairIndexEntries(OperationContext* opCtx,
                                                    ValidateResults* results) {
-    invariant(_validateState->getIndexes().size() > 0);
-    std::shared_ptr<const IndexCatalogEntry> index = _validateState->getIndexes().front();
+    invariant(_validateState->getIndexIdents().size() > 0);
     for (auto it = _missingIndexEntries.begin(); it != _missingIndexEntries.end();) {
         const KeyString::Value& ks = it->second.keyString;
         const KeyFormat keyFormat = _validateState->getCollection()->getRecordStore()->keyFormat();
 
         const std::string& indexName = it->first.first;
-        if (indexName != index->descriptor()->indexName()) {
-            // Assuming that _missingIndexEntries is sorted by indexName, this lookup should not
-            // happen often.
-            for (const auto& currIndex : _validateState->getIndexes()) {
-                if (currIndex->descriptor()->indexName() == indexName) {
-                    index = currIndex;
-                    break;
-                }
-            }
-        }
-
+        const IndexDescriptor* descriptor =
+            _validateState->getCollection()->getIndexCatalog()->findIndexByName(opCtx, indexName);
+        const IndexCatalogEntry* entry = descriptor->getEntry();
         int64_t numInserted = index_repair::repairMissingIndexEntry(opCtx,
-                                                                    index,
+                                                                    entry,
                                                                     ks,
                                                                     keyFormat,
                                                                     _validateState->nss(),
@@ -241,7 +234,7 @@ void KeyStringIndexConsistency::repairIndexEntries(OperationContext* opCtx,
                                     << results->numDocumentsMovedToLostAndFound +
                                         results->numOutdatedMissingIndexEntry
                                     << " missing index entries. Removed documents can be found in '"
-                                    << lostAndFoundNss.ns() << "'.");
+                                    << lostAndFoundNss.toStringForErrorMsg() << "'.");
     }
 }
 
@@ -300,6 +293,8 @@ void KeyStringIndexConsistency::addIndexEntryErrors(OperationContext* opCtx,
 
             missingIndexEntrySizeLimitWarning = true;
         }
+
+        _printMetadata(opCtx, results, entryInfo);
 
         std::string indexName = entry["indexName"].String();
         if (!results->indexResultsMap.at(indexName).valid) {
@@ -444,16 +439,11 @@ void KeyStringIndexConsistency::addDocKey(OperationContext* opCtx,
         invariant(_missingIndexEntries.count(key) == 0);
         _missingIndexEntries.insert(
             std::make_pair(key, IndexEntryInfo(*indexInfo, recordId, idKeyBuilder.obj(), ks)));
-
-        // Prints the collection document's and index entry's metadata.
-        _validateState->getCollection()->getRecordStore()->printRecordMetadata(
-            opCtx, recordId, &(results->recordTimestamps));
-        indexInfo->accessMethod->asSortedData()->getSortedDataInterface()->printIndexEntryMetadata(
-            opCtx, ks);
     }
 }
 
 void KeyStringIndexConsistency::addIndexKey(OperationContext* opCtx,
+                                            const IndexCatalogEntry* entry,
                                             const KeyString::Value& ks,
                                             IndexInfo* indexInfo,
                                             const RecordId& recordId,
@@ -501,13 +491,12 @@ void KeyStringIndexConsistency::addIndexKey(OperationContext* opCtx,
                 InsertDeleteOptions options;
                 options.dupsAllowed = !indexInfo->unique;
                 int64_t numDeleted = 0;
-                writeConflictRetry(
-                    opCtx, "removingExtraIndexEntries", _validateState->nss().ns(), [&] {
-                        WriteUnitOfWork wunit(opCtx);
-                        Status status = indexInfo->accessMethod->asSortedData()->removeKeys(
-                            opCtx, {ks}, options, &numDeleted);
-                        wunit.commit();
-                    });
+                writeConflictRetry(opCtx, "removingExtraIndexEntries", _validateState->nss(), [&] {
+                    WriteUnitOfWork wunit(opCtx);
+                    Status status = indexInfo->accessMethod->asSortedData()->removeKeys(
+                        opCtx, entry, {ks}, options, &numDeleted);
+                    wunit.commit();
+                });
                 auto& indexResults = results->indexResultsMap[indexInfo->indexName];
                 indexResults.keysTraversed -= numDeleted;
                 results->numRemovedExtraIndexEntries += numDeleted;
@@ -743,7 +732,7 @@ int64_t KeyStringIndexConsistency::traverseIndex(OperationContext* opCtx,
                                                  const IndexCatalogEntry* index,
                                                  ProgressMeterHolder& _progress,
                                                  ValidateResults* results) {
-    const auto descriptor = index->descriptor();
+    const IndexDescriptor* descriptor = index->descriptor();
     const auto indexName = descriptor->indexName();
     auto& indexResults = results->indexResultsMap[indexName];
     IndexInfo& indexInfo = this->getIndexInfo(indexName);
@@ -809,7 +798,7 @@ int64_t KeyStringIndexConsistency::traverseIndex(OperationContext* opCtx,
         } else {
             try {
                 this->addIndexKey(
-                    opCtx, indexEntry->keyString, &indexInfo, indexEntry->loc, results);
+                    opCtx, index, indexEntry->keyString, &indexInfo, indexEntry->loc, results);
             } catch (const DBException& e) {
                 StringBuilder ss;
                 ss << "Parsing index key for " << indexInfo.indexName << " recId "
@@ -829,7 +818,16 @@ int64_t KeyStringIndexConsistency::traverseIndex(OperationContext* opCtx,
         if (numKeys % kInterruptIntervalNumRecords == 0) {
             // Periodically checks for interrupts and yields.
             opCtx->checkForInterrupt();
+
+            const std::string indexIdent = index->getIdent();
             _validateState->yield(opCtx);
+
+            // After yielding, the latest instance of the collection is fetched and can be different
+            // from the collection instance prior to yielding. For this reason we need to refresh
+            // the index entry pointer.
+            descriptor = _validateState->getCollection()->getIndexCatalog()->findIndexByIdent(
+                opCtx, indexIdent);
+            index = descriptor->getEntry();
         }
 
         try {
@@ -875,7 +873,7 @@ int64_t KeyStringIndexConsistency::traverseIndex(OperationContext* opCtx,
             // 2. This index was built before 3.4, and there is no multikey path information for
             // the index. We can effectively 'upgrade' the index so that it does not need to be
             // rebuilt to update this information.
-            writeConflictRetry(opCtx, "updateMultikeyPaths", _validateState->nss().ns(), [&]() {
+            writeConflictRetry(opCtx, "updateMultikeyPaths", _validateState->nss(), [&]() {
                 WriteUnitOfWork wuow(opCtx);
                 auto writeableIndex = const_cast<IndexCatalogEntry*>(index);
                 const bool isMultikey = true;
@@ -902,7 +900,7 @@ int64_t KeyStringIndexConsistency::traverseIndex(OperationContext* opCtx,
             // This makes an improvement in the case that no documents make the index multikey and
             // the flag can be unset entirely. This may be due to a change in the data or historical
             // multikey bugs that have persisted incorrect multikey infomation.
-            writeConflictRetry(opCtx, "unsetMultikeyPaths", _validateState->nss().ns(), [&]() {
+            writeConflictRetry(opCtx, "unsetMultikeyPaths", _validateState->nss(), [&]() {
                 WriteUnitOfWork wuow(opCtx);
                 auto writeableIndex = const_cast<IndexCatalogEntry*>(index);
                 const bool isMultikey = false;
@@ -940,6 +938,7 @@ void KeyStringIndexConsistency::traverseRecord(OperationContext* opCtx,
 
     iam->getKeys(opCtx,
                  coll,
+                 index,
                  pool,
                  recordBson,
                  InsertDeleteOptions::ConstraintEnforcementMode::kEnforceConstraints,
@@ -976,7 +975,7 @@ void KeyStringIndexConsistency::traverseRecord(OperationContext* opCtx,
 
     if (!index->isMultikey(opCtx, coll) && shouldBeMultikey) {
         if (_validateState->fixErrors()) {
-            writeConflictRetry(opCtx, "setIndexAsMultikey", coll->ns().ns(), [&] {
+            writeConflictRetry(opCtx, "setIndexAsMultikey", coll->ns(), [&] {
                 WriteUnitOfWork wuow(opCtx);
                 coll->getIndexCatalog()->setMultikeyPaths(
                     opCtx, coll, descriptor, *multikeyMetadataKeys, *documentMultikeyPaths);
@@ -986,7 +985,7 @@ void KeyStringIndexConsistency::traverseRecord(OperationContext* opCtx,
             LOGV2(4614700,
                   "Index set to multikey",
                   "indexName"_attr = descriptor->indexName(),
-                  "collection"_attr = coll->ns().ns());
+                  "collection"_attr = coll->ns());
             results->warnings.push_back(str::stream() << "Index " << descriptor->indexName()
                                                       << " set to multikey.");
             results->repaired = true;
@@ -1013,7 +1012,7 @@ void KeyStringIndexConsistency::traverseRecord(OperationContext* opCtx,
         const MultikeyPaths& indexPaths = index->getMultikeyPaths(opCtx, coll);
         if (!MultikeyPathTracker::covers(indexPaths, *documentMultikeyPaths.get())) {
             if (_validateState->fixErrors()) {
-                writeConflictRetry(opCtx, "increaseMultikeyPathCoverage", coll->ns().ns(), [&] {
+                writeConflictRetry(opCtx, "increaseMultikeyPathCoverage", coll->ns(), [&] {
                     WriteUnitOfWork wuow(opCtx);
                     coll->getIndexCatalog()->setMultikeyPaths(
                         opCtx, coll, descriptor, *multikeyMetadataKeys, *documentMultikeyPaths);
@@ -1023,7 +1022,7 @@ void KeyStringIndexConsistency::traverseRecord(OperationContext* opCtx,
                 LOGV2(4614701,
                       "Multikey paths updated to cover multikey document",
                       "indexName"_attr = descriptor->indexName(),
-                      "collection"_attr = coll->ns().ns());
+                      "collection"_attr = coll->ns());
                 results->warnings.push_back(str::stream() << "Index " << descriptor->indexName()
                                                           << " multikey paths updated.");
                 results->repaired = true;
@@ -1087,4 +1086,16 @@ uint32_t KeyStringIndexConsistency::_hashKeyString(const KeyString::Value& ks,
                                                    const uint32_t indexNameHash) const {
     return ks.hash(indexNameHash);
 }
+
+void KeyStringIndexConsistency::_printMetadata(OperationContext* opCtx,
+                                               ValidateResults* results,
+                                               const IndexEntryInfo& entryInfo) {
+    _validateState->getCollection()->getRecordStore()->printRecordMetadata(
+        opCtx, entryInfo.recordId, &(results->recordTimestamps));
+    getIndexInfo(entryInfo.indexName)
+        .accessMethod->asSortedData()
+        ->getSortedDataInterface()
+        ->printIndexEntryMetadata(opCtx, entryInfo.keyString);
+}
+
 }  // namespace mongo

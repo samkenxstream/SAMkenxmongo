@@ -35,6 +35,7 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/repl/repl_set_config.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/logv2/log_debug.h"
 
 namespace mongo {
@@ -153,19 +154,26 @@ repl::ReplSetConfig makeSplitConfig(const repl::ReplSetConfig& config,
 
 Status insertStateDoc(OperationContext* opCtx, const ShardSplitDonorDocument& stateDoc) {
     const auto nss = NamespaceString::kShardSplitDonorsNamespace;
-    AutoGetCollection collection(opCtx, nss, MODE_IX);
+    auto collection = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
 
     uassert(ErrorCodes::PrimarySteppedDown,
             str::stream() << "No longer primary while attempting to insert shard split"
                              " state document",
             repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss));
 
-    return writeConflictRetry(opCtx, "insertShardSplitStateDoc", nss.ns(), [&]() -> Status {
+    return writeConflictRetry(opCtx, "insertShardSplitStateDoc", nss, [&]() -> Status {
         const auto filter = BSON(ShardSplitDonorDocument::kIdFieldName
                                  << stateDoc.getId() << ShardSplitDonorDocument::kExpireAtFieldName
                                  << BSON("$exists" << false));
         const auto updateMod = BSON("$setOnInsert" << stateDoc.toBSON());
-        auto updateResult = Helpers::upsert(opCtx, nss, filter, updateMod, /*fromMigrate=*/false);
+        auto updateResult =
+            Helpers::upsert(opCtx, collection, filter, updateMod, /*fromMigrate=*/false);
 
         invariant(!updateResult.numDocsModified);
         if (updateResult.upsertedId.isEmpty()) {
@@ -179,15 +187,22 @@ Status insertStateDoc(OperationContext* opCtx, const ShardSplitDonorDocument& st
 
 Status updateStateDoc(OperationContext* opCtx, const ShardSplitDonorDocument& stateDoc) {
     const auto nss = NamespaceString::kShardSplitDonorsNamespace;
-    AutoGetCollection collection(opCtx, nss, MODE_IX);
+    auto collection = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
 
-    if (!collection) {
+    if (!collection.exists()) {
         return Status(ErrorCodes::NamespaceNotFound,
-                      str::stream() << nss.ns() << " does not exist");
+                      str::stream() << nss.toStringForErrorMsg() << " does not exist");
     }
 
-    return writeConflictRetry(opCtx, "updateShardSplitStateDoc", nss.ns(), [&]() -> Status {
-        auto updateResult = Helpers::upsert(opCtx, nss, stateDoc.toBSON(), /*fromMigrate=*/false);
+    return writeConflictRetry(opCtx, "updateShardSplitStateDoc", nss, [&]() -> Status {
+        auto updateResult =
+            Helpers::upsert(opCtx, collection, stateDoc.toBSON(), /*fromMigrate=*/false);
         if (updateResult.numMatched == 0) {
             return {ErrorCodes::NoSuchKey,
                     str::stream() << "Existing shard split state document not found for id: "
@@ -200,16 +215,21 @@ Status updateStateDoc(OperationContext* opCtx, const ShardSplitDonorDocument& st
 
 StatusWith<bool> deleteStateDoc(OperationContext* opCtx, const UUID& shardSplitId) {
     const auto nss = NamespaceString::kShardSplitDonorsNamespace;
-    AutoGetCollection collection(opCtx, nss, MODE_IX);
+    const auto collection = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(nss,
+                                     PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
 
-    if (!collection) {
+    if (!collection.exists()) {
         return Status(ErrorCodes::NamespaceNotFound,
-                      str::stream() << nss.ns() << " does not exist");
+                      str::stream() << nss.toStringForErrorMsg() << " does not exist");
     }
     auto query = BSON(ShardSplitDonorDocument::kIdFieldName << shardSplitId);
-    return writeConflictRetry(opCtx, "ShardSplitDonorDeleteStateDoc", nss.ns(), [&]() -> bool {
-        auto nDeleted =
-            deleteObjects(opCtx, collection.getCollection(), nss, query, true /* justOne */);
+    return writeConflictRetry(opCtx, "ShardSplitDonorDeleteStateDoc", nss, [&]() -> bool {
+        auto nDeleted = deleteObjects(opCtx, collection, query, true /* justOne */);
         return nDeleted > 0;
     });
 }

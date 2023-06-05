@@ -2,7 +2,7 @@
  * Tests that writing an invalid config.queryAnalyzers or config.mongos document only causes the
  * write to fail (i.e. doesn't cause the server to crash).
  *
- * @tags: [requires_fcv_70, featureFlagAnalyzeShardKey]
+ * @tags: [requires_fcv_70]
  */
 
 (function() {
@@ -10,12 +10,13 @@
 
 function runAnalyzerDocTest(conn) {
     const configColl = conn.getCollection("config.queryAnalyzers");
-    assert.commandFailedWithCode(configColl.insert({_id: UUID(), unknownField: 0}),
-                                 40414 /* IDL required field error */);
-
     const dbName = "testDb";
     const collName = "testColl";
     const ns = dbName + "." + collName;
+
+    assert.commandFailedWithCode(configColl.insert({_id: ns, unknownField: 0}),
+                                 40414 /* IDL required field error */);
+
     assert.commandWorked(conn.getDB(dbName).createCollection(collName));
     assert.commandWorked(
         conn.adminCommand({configureQueryAnalyzer: ns, mode: "full", sampleRate: 1}));
@@ -26,6 +27,13 @@ function runAnalyzerDocTest(conn) {
 function runMongosDocTest(conn) {
     const configColl = conn.getCollection("config.mongos");
     assert.commandFailedWithCode(configColl.insert({_id: "mongos0"}), ErrorCodes.NoSuchKey);
+
+    jsTest.log("Wait for the mongos to report its uptime, i.e. for its config.mongos document " +
+               "to exist. Otherwise, the update below would be a no-op and not fail");
+    assert.soon(() => {
+        return configColl.find().itcount() == 1;
+    });
+
     assert.commandFailedWithCode(configColl.update({}, {unknownField: 0}), ErrorCodes.NoSuchKey);
 }
 

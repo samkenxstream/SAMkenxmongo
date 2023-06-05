@@ -80,7 +80,7 @@ void AccumulatorN::processInternal(const Value& input, bool merging) {
 
     if (merging) {
         tassert(5787803, "input must be an array when 'merging' is true", input.isArray());
-        auto array = input.getArray();
+        const auto& array = input.getArray();
         for (auto&& val : array) {
             _processValue(val);
         }
@@ -168,7 +168,6 @@ template <MinMaxSense s>
 AccumulationExpression AccumulatorMinMaxN::parseMinMaxN(ExpressionContext* const expCtx,
                                                         BSONElement elem,
                                                         VariablesParseState vps) {
-    expCtx->sbeGroupCompatibility = SbeCompatibility::notCompatible;
     auto name = [] {
         if constexpr (s == MinMaxSense::kMin) {
             return AccumulatorMinN::getName();
@@ -255,7 +254,6 @@ template <FirstLastSense v>
 AccumulationExpression AccumulatorFirstLastN::parseFirstLastN(ExpressionContext* const expCtx,
                                                               BSONElement elem,
                                                               VariablesParseState vps) {
-    expCtx->sbeGroupCompatibility = SbeCompatibility::notCompatible;
     auto name = [] {
         if constexpr (v == Sense::kFirst) {
             return AccumulatorFirstN::getName();
@@ -484,12 +482,13 @@ Document AccumulatorTopBottomN<sense, single>::serialize(
 }
 
 template <TopBottomSense sense>
-std::pair<SortPattern, BSONArray> parseAccumulatorTopBottomNSortBy(ExpressionContext* const expCtx,
-                                                                   BSONObj sortBy) {
+std::tuple<SortPattern, BSONArray, bool> parseAccumulatorTopBottomNSortBy(
+    ExpressionContext* const expCtx, BSONObj sortBy) {
 
     SortPattern sortPattern(sortBy, expCtx);
     BSONArrayBuilder sortFieldsExpBab;
     BSONObjIterator sortByBoi(sortBy);
+    bool hasMeta = false;
     for (const auto& part : sortPattern) {
         const auto fieldName = sortByBoi.next().fieldNameStringData();
         if (part.expression) {
@@ -500,11 +499,12 @@ std::pair<SortPattern, BSONArray> parseAccumulatorTopBottomNSortBy(ExpressionCon
             // sortFields array contains the data we need for sorting.
             const auto serialized = part.expression->serialize(false);
             sortFieldsExpBab.append(serialized.getDocument().toBson());
+            hasMeta = true;
         } else {
             sortFieldsExpBab.append((StringBuilder() << "$" << fieldName).str());
         }
     }
-    return {sortPattern, sortFieldsExpBab.arr()};
+    return {sortPattern, sortFieldsExpBab.arr(), hasMeta};
 }
 
 template <TopBottomSense sense, bool single>
@@ -513,7 +513,12 @@ AccumulationExpression AccumulatorTopBottomN<sense, single>::parseTopBottomN(
     auto name = AccumulatorTopBottomN<sense, single>::getName();
     const auto [n, output, sortBy] =
         accumulatorNParseArgs<single>(expCtx, elem, name.rawData(), true, vps);
-    auto [sortPattern, sortFieldsExp] = parseAccumulatorTopBottomNSortBy<sense>(expCtx, *sortBy);
+    auto [sortPattern, sortFieldsExp, hasMeta] =
+        parseAccumulatorTopBottomNSortBy<sense>(expCtx, *sortBy);
+
+    if (hasMeta) {
+        expCtx->sbeGroupCompatibility = SbeCompatibility::notCompatible;
+    }
 
     // Construct argument expression. If given sortBy: {field1: 1, field2: 1} it will be shaped like
     // {output: <output expression>, sortFields: ["$field1", "$field2"]}. This projects out only the
@@ -533,7 +538,7 @@ template <TopBottomSense sense, bool single>
 boost::intrusive_ptr<AccumulatorState> AccumulatorTopBottomN<sense, single>::create(
     ExpressionContext* expCtx, BSONObj sortBy, bool isRemovable) {
     return make_intrusive<AccumulatorTopBottomN<sense, single>>(
-        expCtx, parseAccumulatorTopBottomNSortBy<sense>(expCtx, sortBy).first, isRemovable);
+        expCtx, std::get<0>(parseAccumulatorTopBottomNSortBy<sense>(expCtx, sortBy)), isRemovable);
 }
 
 template <TopBottomSense sense, bool single>
@@ -680,17 +685,17 @@ Value AccumulatorTopBottomN<sense, single>::getValueConst(bool toBeMerged) const
     };
 
     if constexpr (!single) {
-        return Value(result);
+        return Value(std::move(result));
     } else {
         if (toBeMerged) {
-            return Value(result);
+            return Value(std::move(result));
         } else {
             if (result.empty()) {
                 // This only occurs in a window function scenario, an accumulator will always have
                 // at least one value processed.
                 return Value(BSONNULL);
             }
-            return Value(result[0]);
+            return Value(std::move(result[0]));
         }
     }
 }

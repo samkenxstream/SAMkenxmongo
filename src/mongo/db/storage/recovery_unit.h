@@ -77,6 +77,22 @@ enum class PrepareConflictBehavior {
 };
 
 /**
+ * DataCorruptionDetectionMode determines how we handle the discovery of evidence of data
+ * corruption.
+ */
+enum class DataCorruptionDetectionMode {
+    /**
+     * Always throw a DataCorruptionDetected error when evidence of data corruption is detected.
+     */
+    kThrow,
+    /**
+     * When evidence of data corruption is decected, log an entry to the health log and the server
+     * logs, but do not throw an error. Continue attempting to return results.
+     */
+    kLogAndContinue,
+};
+
+/**
  * A RecoveryUnit is responsible for ensuring that data is persisted.
  * All on-disk information must be mutated through this interface.
  */
@@ -399,29 +415,6 @@ public:
     virtual Timestamp getPrepareTimestamp() const {
         uasserted(ErrorCodes::CommandNotSupported,
                   "This storage engine does not support prepared transactions");
-    }
-
-    /**
-     * Sets catalog conflicting timestamp.
-     * This can only be called while the RecoveryUnit is in an inactive state.
-     *
-     * This value must be set when both of the following conditions are true:
-     * - A storage engine snapshot is opened without a read timestamp
-     * (RecoveryUnit::ReadSource::kNoTimestamp).
-     * - The transaction may touch collections it does not yet have locks for.
-     * In this circumstance, the catalog conflicting timestamp serves as a substitute for a read
-     * timestamp. This value must be set to a valid (i.e: no-holes) read timestamp prior to
-     * acquiring a storage engine snapshot. This timestamp will be used to determine if any changes
-     * had happened to the in-memory catalog after a storage engine snapshot got opened for that
-     * transaction.
-     */
-    virtual void setCatalogConflictingTimestamp(Timestamp timestamp) {}
-
-    /**
-     * Returns the catalog conflicting timestamp.
-     */
-    virtual Timestamp getCatalogConflictingTimestamp() const {
-        return {};
     }
 
     /**
@@ -807,6 +800,14 @@ public:
         return _noEvictionAfterRollback;
     }
 
+    void setDataCorruptionDetectionMode(DataCorruptionDetectionMode mode) {
+        _dataCorruptionDetectionMode = mode;
+    }
+
+    DataCorruptionDetectionMode getDataCorruptionDetectionMode() const {
+        return _dataCorruptionDetectionMode;
+    }
+
     /**
      * Returns true if this is an instance of RecoveryUnitNoop.
      */
@@ -866,6 +867,8 @@ protected:
     bool _noEvictionAfterRollback = false;
 
     AbandonSnapshotMode _abandonSnapshotMode = AbandonSnapshotMode::kAbort;
+
+    DataCorruptionDetectionMode _dataCorruptionDetectionMode = DataCorruptionDetectionMode::kThrow;
 
 private:
     // Sets the snapshot associated with this RecoveryUnit to a new globally unique id number.

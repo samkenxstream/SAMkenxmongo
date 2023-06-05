@@ -50,6 +50,7 @@
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/sort.h"
 #include "mongo/db/exec/subplan.h"
+#include "mongo/db/exec/timeseries_modify.h"
 #include "mongo/db/exec/trial_stage.h"
 #include "mongo/db/exec/update_stage.h"
 #include "mongo/db/exec/working_set.h"
@@ -63,6 +64,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
@@ -90,9 +92,10 @@ namespace {
 /**
  * Constructs a PlanYieldPolicy based on 'policy'.
  */
-std::unique_ptr<PlanYieldPolicy> makeYieldPolicy(PlanExecutorImpl* exec,
-                                                 PlanYieldPolicy::YieldPolicy policy,
-                                                 const Yieldable* yieldable) {
+std::unique_ptr<PlanYieldPolicy> makeYieldPolicy(
+    PlanExecutorImpl* exec,
+    PlanYieldPolicy::YieldPolicy policy,
+    stdx::variant<const Yieldable*, PlanYieldPolicy::YieldThroughAcquisitions> yieldable) {
     switch (policy) {
         case PlanYieldPolicy::YieldPolicy::YIELD_AUTO:
         case PlanYieldPolicy::YieldPolicy::YIELD_MANUAL:
@@ -104,11 +107,11 @@ std::unique_ptr<PlanYieldPolicy> makeYieldPolicy(PlanExecutorImpl* exec,
         }
         case PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT: {
             return std::make_unique<AlwaysTimeOutYieldPolicy>(
-                exec->getOpCtx()->getServiceContext()->getFastClockSource());
+                exec->getOpCtx(), exec->getOpCtx()->getServiceContext()->getFastClockSource());
         }
         case PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED: {
             return std::make_unique<AlwaysPlanKilledYieldPolicy>(
-                exec->getOpCtx()->getServiceContext()->getFastClockSource());
+                exec->getOpCtx(), exec->getOpCtx()->getServiceContext()->getFastClockSource());
         }
         default:
             MONGO_UNREACHABLE;
@@ -122,7 +125,7 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
                                    unique_ptr<QuerySolution> qs,
                                    unique_ptr<CanonicalQuery> cq,
                                    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                   const CollectionPtr& collection,
+                                   VariantCollectionPtrOrAcquisition collection,
                                    bool returnOwnedBson,
                                    NamespaceString nss,
                                    PlanYieldPolicy::YieldPolicy yieldPolicy)
@@ -138,11 +141,15 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
     invariant(!_expCtx || _expCtx->opCtx == _opCtx);
     invariant(!_cq || !_expCtx || _cq->getExpCtx() == _expCtx);
 
+    const CollectionPtr* collectionPtr = &collection.getCollectionPtr();
+    invariant(collectionPtr);
+    const bool collectionExists = static_cast<bool>(*collectionPtr);
+
     // If we don't yet have a namespace string, then initialize it from either 'collection' or
     // '_cq'.
     if (_nss.isEmpty()) {
-        if (collection) {
-            _nss = collection->ns();
+        if (collectionExists) {
+            _nss = (*collectionPtr)->ns();
         } else {
             invariant(_cq);
             _nss =
@@ -151,10 +158,22 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
     }
 
     // There's no point in yielding if the collection doesn't exist.
-    _yieldPolicy =
-        makeYieldPolicy(this,
-                        collection ? yieldPolicy : PlanYieldPolicy::YieldPolicy::NO_YIELD,
-                        collection ? &collection : nullptr);
+    const stdx::variant<const Yieldable*, PlanYieldPolicy::YieldThroughAcquisitions> yieldable =
+        stdx::visit(
+            OverloadedVisitor{[](const CollectionPtr* coll) {
+                                  return stdx::variant<const Yieldable*,
+                                                       PlanYieldPolicy::YieldThroughAcquisitions>(
+                                      *coll ? coll : nullptr);
+                              },
+                              [](const ScopedCollectionAcquisition* coll) {
+                                  return stdx::variant<const Yieldable*,
+                                                       PlanYieldPolicy::YieldThroughAcquisitions>(
+                                      PlanYieldPolicy::YieldThroughAcquisitions{});
+                              }},
+            collection.get());
+
+    _yieldPolicy = makeYieldPolicy(
+        this, collectionExists ? yieldPolicy : PlanYieldPolicy::YieldPolicy::NO_YIELD, yieldable);
 
     uassertStatusOK(_pickBestPlan());
 
@@ -252,7 +271,10 @@ void PlanExecutorImpl::saveState() {
     if (!isMarkedAsKilled()) {
         _root->saveState();
     }
-    _yieldPolicy->setYieldable(nullptr);
+
+    if (!_yieldPolicy->usesCollectionAcquisitions()) {
+        _yieldPolicy->setYieldable(nullptr);
+    }
     _currentState = kSaved;
 }
 
@@ -272,7 +294,9 @@ void PlanExecutorImpl::restoreStateWithoutRetrying(const RestoreContext& context
                                                    const Yieldable* yieldable) {
     invariant(_currentState == kSaved);
 
-    _yieldPolicy->setYieldable(yieldable);
+    if (!_yieldPolicy->usesCollectionAcquisitions()) {
+        _yieldPolicy->setYieldable(yieldable);
+    }
     if (!isMarkedAsKilled()) {
         _root->restoreState(context);
     }
@@ -353,11 +377,10 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
     // Capped insert data; declared outside the loop so we hold a shared pointer to the capped
     // insert notifier the entire time we are in the loop.  Holding a shared pointer to the
     // capped insert notifier is necessary for the notifierVersion to advance.
-    insert_listener::CappedInsertNotifierData cappedInsertNotifierData;
+    std::unique_ptr<insert_listener::Notifier> notifier;
     if (insert_listener::shouldListenForInserts(_opCtx, _cq.get())) {
-        // We always construct the CappedInsertNotifier for awaitData cursors.
-        cappedInsertNotifierData.notifier =
-            insert_listener::getCappedInsertNotifier(_opCtx, _nss, _yieldPolicy.get());
+        // We always construct the insert_listener::Notifier for awaitData cursors.
+        notifier = insert_listener::getCappedInsertNotifier(_opCtx, _nss, _yieldPolicy.get());
     }
     for (;;) {
         // These are the conditions which can cause us to yield:
@@ -456,7 +479,7 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
                     _opCtx,
                     tempUnavailErrorsInARow,
                     "plan executor",
-                    _nss.ns(),
+                    NamespaceStringOrUUID(_nss),
                     TemporarilyUnavailableException(
                         Status(ErrorCodes::TemporarilyUnavailable, "temporarily unavailable")));
             } else {
@@ -469,7 +492,8 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
 
                 CurOp::get(_opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
                 writeConflictsInARow++;
-                logWriteConflictAndBackoff(writeConflictsInARow, "plan execution", _nss.ns());
+                logWriteConflictAndBackoff(
+                    writeConflictsInARow, "plan execution", ""_sd, NamespaceStringOrUUID(_nss));
             }
 
             // Yield next time through the loop.
@@ -481,11 +505,8 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
             invariant(PlanStage::IS_EOF == code);
             if (MONGO_unlikely(planExecutorHangBeforeShouldWaitForInserts.shouldFail(
                     [this](const BSONObj& data) {
-                        if (data.hasField("namespace") &&
-                            _nss != NamespaceString(data.getStringField("namespace"))) {
-                            return false;
-                        }
-                        return true;
+                        auto fpNss = NamespaceStringUtil::parseFailPointData(data, "namespace"_sd);
+                        return fpNss.isEmpty() || fpNss == _nss;
                     }))) {
                 LOGV2(20946,
                       "PlanExecutor - planExecutorHangBeforeShouldWaitForInserts fail point "
@@ -497,7 +518,7 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
                 return PlanExecutor::IS_EOF;
             }
 
-            insert_listener::waitForInserts(_opCtx, _yieldPolicy.get(), &cappedInsertNotifierData);
+            insert_listener::waitForInserts(_opCtx, _yieldPolicy.get(), notifier);
 
             // There may be more results, keep going.
             continue;
@@ -571,24 +592,45 @@ UpdateResult PlanExecutorImpl::getUpdateResult() const {
     }
 
     // If the collection exists, then we expect the root of the plan tree to either be an update
-    // stage, or (for findAndModify) a projection stage wrapping an update stage.
-    switch (_root->stageType()) {
-        case StageType::STAGE_PROJECTION_DEFAULT:
-        case StageType::STAGE_PROJECTION_COVERED:
-        case StageType::STAGE_PROJECTION_SIMPLE: {
-            invariant(_root->getChildren().size() == 1U);
-            invariant(StageType::STAGE_UPDATE == _root->child()->stageType());
-            const SpecificStats* stats = _root->child()->getSpecificStats();
+    // stage, or (for findAndModify) a projection stage wrapping an update / TS_MODIFY stage.
+    const auto updateStage = [&] {
+        switch (_root->stageType()) {
+            case StageType::STAGE_PROJECTION_DEFAULT:
+            case StageType::STAGE_PROJECTION_COVERED:
+            case StageType::STAGE_PROJECTION_SIMPLE: {
+                tassert(7314604,
+                        "Unexpected number of children: {}"_format(_root->getChildren().size()),
+                        _root->getChildren().size() == 1U);
+                auto childStage = _root->child().get();
+                tassert(7314605,
+                        "Unexpected child stage type: {}"_format(childStage->stageType()),
+                        StageType::STAGE_UPDATE == childStage->stageType() ||
+                            StageType::STAGE_TIMESERIES_MODIFY == childStage->stageType());
+                return childStage;
+            }
+            default:
+                return _root.get();
+        }
+    }();
+    switch (updateStage->stageType()) {
+        case StageType::STAGE_TIMESERIES_MODIFY: {
+            const auto& stats =
+                static_cast<const TimeseriesModifyStats&>(*updateStage->getSpecificStats());
+            return UpdateResult(
+                stats.nMeasurementsModified > 0 /* Did we update at least one obj? */,
+                stats.isModUpdate /* Is this a $mod update? */,
+                stats.nMeasurementsModified /* number of modified docs, no no-ops */,
+                stats.nMeasurementsMatched /* # of docs matched/updated, even no-ops */,
+                stats.objInserted /* objInserted */,
+                static_cast<TimeseriesModifyStage*>(updateStage)->containsDotsAndDollarsField());
+        }
+        case StageType::STAGE_UPDATE: {
+            const auto& stats = static_cast<const UpdateStats&>(*updateStage->getSpecificStats());
             return updateStatsToResult(
-                static_cast<const UpdateStats&>(*stats),
-                static_cast<UpdateStage*>(_root->child().get())->containsDotsAndDollarsField());
+                stats, static_cast<UpdateStage*>(updateStage)->containsDotsAndDollarsField());
         }
         default:
-            invariant(StageType::STAGE_UPDATE == _root->stageType());
-            const auto stats = _root->getSpecificStats();
-            return updateStatsToResult(
-                static_cast<const UpdateStats&>(*stats),
-                static_cast<UpdateStage*>(_root.get())->containsDotsAndDollarsField());
+            MONGO_UNREACHABLE_TASSERT(7314606);
     }
 }
 
@@ -602,27 +644,40 @@ long long PlanExecutorImpl::executeDelete() {
     }
 
     // If the collection exists, the delete plan may either have a delete stage at the root, or
-    // (for findAndModify) a projection stage wrapping a delete stage.
-    switch (_root->stageType()) {
-        case StageType::STAGE_PROJECTION_DEFAULT:
-        case StageType::STAGE_PROJECTION_COVERED:
-        case StageType::STAGE_PROJECTION_SIMPLE: {
-            invariant(_root->getChildren().size() == 1U);
-            invariant(StageType::STAGE_DELETE == _root->child()->stageType());
-            const SpecificStats* stats = _root->child()->getSpecificStats();
-            return static_cast<const DeleteStats*>(stats)->docsDeleted;
+    // (for findAndModify) a projection stage wrapping a delete / TS_MODIFY stage.
+    const auto deleteStage = [&] {
+        switch (_root->stageType()) {
+            case StageType::STAGE_PROJECTION_DEFAULT:
+            case StageType::STAGE_PROJECTION_COVERED:
+            case StageType::STAGE_PROJECTION_SIMPLE: {
+                tassert(7308302,
+                        "Unexpected number of children: {}"_format(_root->getChildren().size()),
+                        _root->getChildren().size() == 1U);
+                auto childStage = _root->child().get();
+                tassert(7308303,
+                        "Unexpected child stage type: {}"_format(childStage->stageType()),
+                        StageType::STAGE_DELETE == childStage->stageType() ||
+                            StageType::STAGE_TIMESERIES_MODIFY == childStage->stageType());
+                return childStage;
+            }
+            default:
+                return _root.get();
         }
+    }();
+    switch (deleteStage->stageType()) {
         case StageType::STAGE_TIMESERIES_MODIFY: {
-            const auto* tsModifyStats =
-                static_cast<const TimeseriesModifyStats*>(_root->getSpecificStats());
-            return tsModifyStats->nMeasurementsDeleted;
+            const auto& tsModifyStats =
+                static_cast<const TimeseriesModifyStats&>(*deleteStage->getSpecificStats());
+            return tsModifyStats.nMeasurementsModified;
         }
-        default: {
-            invariant(StageType::STAGE_DELETE == _root->stageType() ||
-                      StageType::STAGE_BATCHED_DELETE == _root->stageType());
-            const auto* deleteStats = static_cast<const DeleteStats*>(_root->getSpecificStats());
-            return deleteStats->docsDeleted;
+        case StageType::STAGE_DELETE:
+        case StageType::STAGE_BATCHED_DELETE: {
+            const auto& deleteStats =
+                static_cast<const DeleteStats&>(*deleteStage->getSpecificStats());
+            return deleteStats.docsDeleted;
         }
+        default:
+            MONGO_UNREACHABLE_TASSERT(7308306);
     }
 }
 

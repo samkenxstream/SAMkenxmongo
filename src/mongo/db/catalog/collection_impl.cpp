@@ -97,17 +97,17 @@ Status checkValidatorCanBeUsedOnNs(const BSONObj& validator,
 
     if (nss.isSystem() && !nss.isDropPendingNamespace()) {
         return {ErrorCodes::InvalidOptions,
-                str::stream() << "Document validators not allowed on system collection " << nss
-                              << " with UUID " << uuid};
+                str::stream() << "Document validators not allowed on system collection "
+                              << nss.toStringForErrorMsg() << " with UUID " << uuid};
     }
 
     // Allow schema on config.settings. This is created internally, and user changes to this
     // validator are disallowed in the createCollection and collMod commands.
     if (nss.isOnInternalDb() && nss != NamespaceString::kConfigSettingsNamespace) {
         return {ErrorCodes::InvalidOptions,
-                str::stream() << "Document validators are not allowed on collection " << nss.ns()
-                              << " with UUID " << uuid << " in the " << nss.db()
-                              << " internal database"};
+                str::stream() << "Document validators are not allowed on collection "
+                              << nss.toStringForErrorMsg() << " with UUID " << uuid << " in the "
+                              << nss.dbName().toStringForErrorMsg() << " internal database"};
     }
     return Status::OK();
 }
@@ -136,7 +136,7 @@ Status validateIsNotInDbs(const NamespaceString& ns,
     if (std::find(disallowedDbs.begin(), disallowedDbs.end(), ns.dbName()) != disallowedDbs.end()) {
         return {ErrorCodes::InvalidOptions,
                 str::stream() << optionName << " collection option is not supported on the "
-                              << ns.db() << " database"};
+                              << ns.dbName().toStringForErrorMsg() << " database"};
     }
 
     return Status::OK();
@@ -361,7 +361,9 @@ SharedCollectionDecorations* CollectionImpl::getSharedDecorations() const {
 }
 
 void CollectionImpl::init(OperationContext* opCtx) {
-    _metadata = DurableCatalog::get(opCtx)->getMetaData(opCtx, getCatalogId());
+    const auto catalogEntry =
+        DurableCatalog::get(opCtx)->getParsedCatalogEntry(opCtx, getCatalogId());
+    _metadata = catalogEntry->metadata;
     const auto& collectionOptions = _metadata->options;
 
     _initShared(opCtx, collectionOptions);
@@ -409,7 +411,6 @@ Status CollectionImpl::initFromExisting(OperationContext* opCtx,
     // When initializing a collection from an earlier point-in-time, we don't know when the last DDL
     // operation took place at that point-in-time. We conservatively set the minimum valid snapshot
     // to the read point-in-time.
-    _minVisibleSnapshot = readTimestamp;
     _minValidSnapshot = readTimestamp;
 
     _initCommon(opCtx);
@@ -450,10 +451,9 @@ Status CollectionImpl::initFromExisting(OperationContext* opCtx,
     // objects from existing indexes to prevent the index idents from being dropped by the drop
     // pending ident reaper while this collection is still using them.
     for (const auto& sharedIdent : sharedIdents) {
-        auto desc = getIndexCatalog()->findIndexByName(opCtx, sharedIdent.first);
-        invariant(desc);
-        auto entry = getIndexCatalog()->getEntryShared(desc);
-        entry->setIdent(sharedIdent.second);
+        auto writableEntry = getIndexCatalog()->getWritableEntryByName(opCtx, sharedIdent.first);
+        invariant(writableEntry);
+        writableEntry->setIdent(sharedIdent.second);
     }
 
     _initialized = true;
@@ -550,7 +550,7 @@ std::unique_ptr<SeekableRecordCursor> CollectionImpl::getCursor(OperationContext
                 CollectionCatalog::hasExclusiveAccessToCollection(opCtx, ns()) || snapshot,
                 fmt::format("Capped visibility snapshot was not initialized before reading from "
                             "collection non-exclusively: {}",
-                            _ns.ns()));
+                            _ns.toStringForErrorMsg()));
         } else {
             // We can lazily initialize the capped snapshot because no storage snapshot has been
             // opened yet.
@@ -793,12 +793,6 @@ bool CollectionImpl::isCappedAndNeedsDelete(OperationContext* opCtx) const {
     return false;
 }
 
-void CollectionImpl::setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) {
-    if (!_minVisibleSnapshot || (newMinimumVisibleSnapshot > _minVisibleSnapshot.value())) {
-        _minVisibleSnapshot = newMinimumVisibleSnapshot;
-    }
-}
-
 void CollectionImpl::setMinimumValidSnapshot(Timestamp newMinimumValidSnapshot) {
     if (!_minValidSnapshot || (newMinimumValidSnapshot > _minValidSnapshot.value())) {
         _minValidSnapshot = newMinimumValidSnapshot;
@@ -898,7 +892,8 @@ Status CollectionImpl::updateCappedSize(OperationContext* opCtx,
 
     if (!_shared->_isCapped) {
         return Status(ErrorCodes::InvalidNamespace,
-                      str::stream() << "Cannot update size on a non-capped collection " << ns());
+                      str::stream() << "Cannot update size on a non-capped collection "
+                                    << ns().toStringForErrorMsg());
     }
 
     if (ns().isOplog() && newCappedSize) {
@@ -1067,9 +1062,18 @@ uint64_t CollectionImpl::getIndexSize(OperationContext* opCtx,
 }
 
 uint64_t CollectionImpl::getIndexFreeStorageBytes(OperationContext* const opCtx) const {
+    // Unfinished index builds are excluded to avoid a potential deadlock when trying to collect
+    // statistics from the index table while the index build is in the bulk load phase. See
+    // SERVER-77018. This should not be too impactful as:
+    // - During the collection scan phase, the index table is unused.
+    // - During the bulk load phase, getFreeStorageBytes will probably return EBUSY, as the ident is
+    //  in use by the index builder. (And worst case results in the deadlock).
+    // - It might be possible to return meaningful data post bulk-load, but reusable bytes should be
+    //  low anyways as the collection has been bulk loaded. Additionally, this would be a inaccurate
+    //  anyways as the build is in progress.
+    // - Once the index build is finished, this will be eventually accounted for.
     const auto idxCatalog = getIndexCatalog();
-    auto indexIt = idxCatalog->getIndexIterator(
-        opCtx, IndexCatalog::InclusionPolicy::kReady | IndexCatalog::InclusionPolicy::kUnfinished);
+    auto indexIt = idxCatalog->getIndexIterator(opCtx, IndexCatalog::InclusionPolicy::kReady);
 
     uint64_t totalSize = 0;
     while (indexIt->more()) {
@@ -1543,7 +1547,9 @@ bool CollectionImpl::isIndexMultikey(OperationContext* opCtx,
     // We need to read from the durable catalog if there are concurrent multikey writers to avoid
     // reading between the multikey write committing in the storage engine but before its onCommit
     // handler made the write visible for readers.
-    auto snapshotMetadata = DurableCatalog::get(opCtx)->getMetaData(opCtx, getCatalogId());
+    const auto catalogEntry =
+        DurableCatalog::get(opCtx)->getParsedCatalogEntry(opCtx, getCatalogId());
+    const auto snapshotMetadata = catalogEntry->metadata;
     int snapshotOffset = snapshotMetadata->findIndexOffset(indexName);
     invariant(snapshotOffset >= 0,
               str::stream() << "cannot get multikey for index " << indexName << " @ "
@@ -1648,7 +1654,9 @@ bool CollectionImpl::setIndexIsMultikey(OperationContext* opCtx,
         // collection. We cannot use the cached metadata in this collection as we may have just
         // committed a multikey change concurrently to the storage engine without being able to
         // observe it if its onCommit handlers haven't run yet.
-        auto metadataLocal = *DurableCatalog::get(opCtx)->getMetaData(opCtx, getCatalogId());
+        const auto catalogEntry =
+            DurableCatalog::get(opCtx)->getParsedCatalogEntry(opCtx, getCatalogId());
+        auto metadataLocal = *catalogEntry->metadata;
         // When reading from the durable catalog the index offsets are different because when
         // removing indexes in-memory just zeros out the slot instead of actually removing it. We
         // must adjust the entries so they match how they are stored in _metadata so we can rely on

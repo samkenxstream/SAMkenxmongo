@@ -3,11 +3,12 @@
  * distribution metrics, but on replica sets it does not since query sampling is only supported on
  * sharded clusters at this point.
  *
- * @tags: [requires_fcv_63, featureFlagAnalyzeShardKey, featureFlagUpdateOneWithoutShardKey]
+ * @tags: [requires_fcv_70, featureFlagUpdateOneWithoutShardKey]
  */
 (function() {
 "use strict";
 
+load("jstests/libs/fail_point_util.js");
 load("jstests/sharding/analyze_shard_key/libs/analyze_shard_key_util.js");
 load("jstests/sharding/analyze_shard_key/libs/query_sampling_util.js");
 
@@ -116,11 +117,19 @@ function assertMetricsNonEmptySampleSize(actual, expected, isHashed) {
         actual.writeDistribution, expected.writeDistribution, isHashed);
 }
 
-function assertNoConfigSplitPointsCollection(conn) {
-    assert.eq(conn.getDB("config")
-                  .getCollectionInfos({name: {$regex: "^analyzeShardKey.splitPoints."}})
-                  .length,
-              0);
+function assertSoonNoConfigSplitPointDocuments(conn) {
+    const coll = conn.getCollection("config.analyzeShardKeySplitPoints");
+
+    let numTries;
+    assert.soon(() => {
+        numTries++;
+        if (numTries % 100 == 0) {
+            const docs = coll.find().toArray();
+            jsTest.log("Waiting for the spit point documents to get deleted " +
+                       tojson({numTries, docs}));
+        }
+        return coll.find().itcount() === 0;
+    });
 }
 
 const readCmdNames = ["find", "aggregate", "count", "distinct"];
@@ -472,6 +481,8 @@ function runTest(fixture, {isShardedColl, shardKeyField, isHashed}) {
         docs.push({_id: i, x: i, y: i, ts: new Date()});
     }
     assert.commandWorked(sampledColl.insert(docs));
+    const sampledCollUuid =
+        QuerySamplingUtil.getCollectionUuid(fixture.conn.getDB(dbName), sampledCollName);
 
     // Verify that the analyzeShardKey command returns zeros for the read and write sample size
     // when there are no sampled queries.
@@ -482,7 +493,7 @@ function runTest(fixture, {isShardedColl, shardKeyField, isHashed}) {
     // Turn on query sampling and wait for sampling to become active.
     assert.commandWorked(
         fixture.conn.adminCommand({configureQueryAnalyzer: sampledNs, mode: "full", sampleRate}));
-    fixture.waitForActiveSamplingFn();
+    fixture.waitForActiveSamplingFn(sampledNs, sampledCollUuid);
 
     // Create and run test queries.
     const testCase = makeTestCase(
@@ -495,13 +506,10 @@ function runTest(fixture, {isShardedColl, shardKeyField, isHashed}) {
     // getting sampled.
     assert.commandWorked(
         fixture.conn.adminCommand({configureQueryAnalyzer: sampledNs, mode: "off"}));
-    fixture.waitForInactiveSamplingFn();
+    fixture.waitForInactiveSamplingFn(sampledNs, sampledCollUuid);
 
     res = waitForSampledQueries(fixture.conn, sampledNs, shardKey, testCase);
-    fixture.assertNoConfigSplitPointsCollFn();
-
-    // Verify that the metrics are as expected and that the temporary collections for storing
-    // the split points have been dropped.
+    // Verify that the metrics are as expected.
     assertMetricsNonEmptySampleSize(res, testCase.metrics, isHashed);
 
     assert(notSampledColl.drop());
@@ -525,11 +533,17 @@ const mongodSetParameterOpts = {
     queryAnalysisSamplerConfigurationRefreshSecs,
     queryAnalysisWriterIntervalSecs,
     analyzeShardKeyNumRanges,
-    logComponentVerbosity: tojson({sharding: 2})
+    logComponentVerbosity: tojson({sharding: 2}),
+    // To speed up the test, make the split point documents expire right away. To prevent the split
+    // point documents from being deleted while the analyzeShardKey command is still running, make
+    // the TTL monitor have a large sleep interval at first and then lower it at the end of the test
+    // when verifying that the documents do get deleted by the TTL monitor.
+    analyzeShardKeySplitPointExpirationSecs: 1,
+    ttlMonitorSleepSecs: 60 * 60,
 };
 const mongosSetParametersOpts = {
     queryAnalysisSamplerConfigurationRefreshSecs,
-    logComponentVerbosity: tojson({sharding: 2})
+    logComponentVerbosity: tojson({sharding: 3})
 };
 
 {
@@ -543,17 +557,12 @@ const mongosSetParametersOpts = {
         mongos: numMongoses,
         shards: numShards,
         rs: {nodes: 2, setParameter: mongodSetParameterOpts},
-        mongosOptions: {setParameter: mongosSetParametersOpts},
-        other: {
-            configOptions: {
-                setParameter: {
-                    // This test expects every query to get sampled regardless of which mongos or
-                    // mongod routes it.
-                    "failpoint.queryAnalysisCoordinatorDistributeSampleRateEqually":
-                        tojson({mode: "alwaysOn"})
-                }
-            }
-        },
+        mongosOptions: {setParameter: mongosSetParametersOpts}
+    });
+
+    // This test expects every query to get sampled regardless of which mongos or mongod routes it.
+    st.configRS.nodes.forEach(node => {
+        configureFailPoint(node, "queryAnalysisCoordinatorDistributeSampleRateEqually");
     });
 
     const fixture = {
@@ -578,10 +587,8 @@ const mongosSetParametersOpts = {
                     st.s0.adminCommand({moveChunk: ns, find: {x: 1000}, to: st.shard2.shardName}));
             }
         },
-        waitForActiveSamplingFn: () => {
-            for (let i = 0; i < numMongoses; i++) {
-                QuerySamplingUtil.waitForActiveSampling(st["s" + String(i)]);
-            }
+        waitForActiveSamplingFn: (ns, collUuid) => {
+            QuerySamplingUtil.waitForActiveSamplingShardedCluster(st, ns, collUuid);
         },
         runCmdsFn: (dbName, cmdObjs) => {
             for (let i = 0; i < cmdObjs.length; i++) {
@@ -589,16 +596,8 @@ const mongosSetParametersOpts = {
                 assert.commandWorked(db.runCommand(cmdObjs[i]));
             }
         },
-        waitForInactiveSamplingFn: () => {
-            for (let i = 0; i < numMongoses; i++) {
-                QuerySamplingUtil.waitForInactiveSampling(st["s" + String(i)]);
-            }
-            QuerySamplingUtil.waitForInactiveSamplingOnAllShards(st);
-        },
-        assertNoConfigSplitPointsCollFn: () => {
-            st._rs.forEach(rs => {
-                assertNoConfigSplitPointsCollection(rs.test.getPrimary());
-            });
+        waitForInactiveSamplingFn: (ns, collUuid) => {
+            QuerySamplingUtil.waitForInactiveSamplingShardedCluster(st, ns, collUuid);
         }
     };
 
@@ -611,6 +610,13 @@ const mongosSetParametersOpts = {
     runTest(fixture, {isShardedColl: true, shardKeyField: "y", isHashed: false});
     runTest(fixture, {isShardedColl: true, shardKeyField: "y", isHashed: true});
 
+    // Verify the split point documents are eventually deleted by the TTL monitor.
+    st._rs.forEach(rs => {
+        const primary = rs.test.getPrimary();
+        assert.commandWorked(primary.adminCommand({setParameter: 1, ttlMonitorSleepSecs: 1}));
+        assertSoonNoConfigSplitPointDocuments(primary);
+    });
+
     st.stop();
 }
 
@@ -618,30 +624,23 @@ const mongosSetParametersOpts = {
     jsTest.log("Verify that on a replica set the analyzeShardKey command returns correct read " +
                "and write distribution metrics");
 
-    const rst = new ReplSetTest({
-        nodes: 2,
-        nodeOptions: {
-            setParameter: Object.assign({}, mongodSetParameterOpts, {
-                // This test expects every query to get sampled regardless of which mongod it runs
-                // on.
-                "failpoint.queryAnalysisCoordinatorDistributeSampleRateEqually":
-                    tojson({mode: "alwaysOn"})
-            })
-        }
-    });
+    const rst = new ReplSetTest({nodes: 2, nodeOptions: {setParameter: mongodSetParameterOpts}});
     rst.startSet();
     rst.initiate();
     const primary = rst.getPrimary();
+
+    // This test expects every query to get sampled regardless of which mongod it runs against.
+    rst.nodes.forEach(node => {
+        configureFailPoint(node, "queryAnalysisCoordinatorDistributeSampleRateEqually");
+    });
 
     const fixture = {
         conn: primary,
         setUpCollectionFn: (dbName, collName, isShardedColl) => {
             // No setup is needed.
         },
-        waitForActiveSamplingFn: () => {
-            rst.nodes.forEach(node => {
-                QuerySamplingUtil.waitForActiveSampling(node);
-            });
+        waitForActiveSamplingFn: (ns, collUuid) => {
+            QuerySamplingUtil.waitForActiveSamplingReplicaSet(rst, ns, collUuid);
         },
         runCmdsFn: (dbName, cmdObjs) => {
             for (let i = 0; i < cmdObjs.length; i++) {
@@ -649,18 +648,17 @@ const mongosSetParametersOpts = {
                 assert.commandWorked(node.getDB(dbName).runCommand(cmdObjs[i]));
             }
         },
-        waitForInactiveSamplingFn: () => {
-            rst.nodes.forEach(node => {
-                QuerySamplingUtil.waitForInactiveSampling(node);
-            });
-        },
-        assertNoConfigSplitPointsCollFn: () => {
-            assertNoConfigSplitPointsCollection(primary);
+        waitForInactiveSamplingFn: (ns, collUuid) => {
+            QuerySamplingUtil.waitForInactiveSamplingReplicaSet(rst, ns, collUuid);
         }
     };
 
     runTest(fixture, {isShardedColl: false, shardKeyField: "x", isHashed: false});
     runTest(fixture, {isShardedColl: false, shardKeyField: "x", isHashed: true});
+
+    // Verify the split point documents are eventually deleted by the TTL monitor.
+    assert.commandWorked(primary.adminCommand({setParameter: 1, ttlMonitorSleepSecs: 1}));
+    assertSoonNoConfigSplitPointDocuments(primary);
 
     rst.stopSet();
 }

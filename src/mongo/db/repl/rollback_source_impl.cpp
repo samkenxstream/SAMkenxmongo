@@ -43,12 +43,8 @@ namespace repl {
 
 RollbackSourceImpl::RollbackSourceImpl(GetConnectionFn getConnection,
                                        const HostAndPort& source,
-                                       const std::string& collectionName,
                                        int batchSize)
-    : _getConnection(getConnection),
-      _source(source),
-      _collectionName(collectionName),
-      _oplog(source, getConnection, collectionName, batchSize) {}
+    : _getConnection(getConnection), _source(source), _oplog(source, getConnection, batchSize) {}
 
 const OplogInterface& RollbackSourceImpl::getOplog() const {
     return _oplog;
@@ -61,13 +57,12 @@ const HostAndPort& RollbackSourceImpl::getSource() const {
 
 int RollbackSourceImpl::getRollbackId() const {
     bo info;
-    _getConnection()->runCommand(
-        DatabaseName(boost::none, "admin"), BSON("replSetGetRBID" << 1), info);
+    _getConnection()->runCommand(DatabaseName::kAdmin, BSON("replSetGetRBID" << 1), info);
     return info["rbid"].numberInt();
 }
 
 BSONObj RollbackSourceImpl::getLastOperation() const {
-    FindCommandRequest findCmd{NamespaceString{_collectionName}};
+    FindCommandRequest findCmd{NamespaceString::kRsOplogNamespace};
     findCmd.setSort(BSON("$natural" << -1));
     findCmd.setReadConcern(ReadConcernArgs::kLocal);
     return _getConnection()->findOne(std::move(findCmd),
@@ -108,10 +103,10 @@ StatusWith<BSONObj> RollbackSourceImpl::getCollectionInfoByUUID(const DatabaseNa
     std::list<BSONObj> info =
         _getConnection()->getCollectionInfos(dbName, BSON("info.uuid" << uuid));
     if (info.empty()) {
-        return StatusWith<BSONObj>(ErrorCodes::NoSuchKey,
-                                   str::stream()
-                                       << "No collection info found for collection with uuid: "
-                                       << uuid.toString() << " in db: " << dbName.db());
+        return StatusWith<BSONObj>(
+            ErrorCodes::NoSuchKey,
+            str::stream() << "No collection info found for collection with uuid: "
+                          << uuid.toString() << " in db: " << dbName.toStringForErrorMsg());
     }
     invariant(info.size() == 1U);
     return info.front();
@@ -122,7 +117,8 @@ StatusWith<BSONObj> RollbackSourceImpl::getCollectionInfo(const NamespaceString&
         _getConnection()->getCollectionInfos(nss.dbName(), BSON("name" << nss.coll()));
     if (info.empty()) {
         return StatusWith<BSONObj>(ErrorCodes::NoSuchKey,
-                                   str::stream() << "no collection info found: " << nss.ns());
+                                   str::stream() << "no collection info found: "
+                                                 << nss.toStringForErrorMsg());
     }
     invariant(info.size() == 1U);
     return info.front();

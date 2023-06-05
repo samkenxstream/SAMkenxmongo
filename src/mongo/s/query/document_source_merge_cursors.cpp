@@ -117,11 +117,7 @@ DocumentSource::GetNextResult DocumentSourceMergeCursors::doGetNext() {
 Value DocumentSourceMergeCursors::serialize(SerializationOptions opts) const {
     invariant(!_blockingResultsMerger);
     invariant(_armParams);
-    if (opts.redactIdentifiers || opts.replacementForLiteralArgs) {
-        MONGO_UNIMPLEMENTED_TASSERT(7484301);
-    }
-
-    return Value(Document{{kStageName, _armParams->toBSON()}});
+    return Value(Document{{kStageName, _armParams->toBSON(opts)}});
 }
 
 boost::intrusive_ptr<DocumentSource> DocumentSourceMergeCursors::createFromBson(

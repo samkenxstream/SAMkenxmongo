@@ -116,8 +116,8 @@ TEST_F(UpdateArrayNodeTest, UpdateIsAppliedToAllMatchingElements) {
     mutablebson::Document doc(fromjson("{a: [0, 1, 0]}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [2, 1, 2]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -166,8 +166,8 @@ TEST_F(UpdateArrayNodeTest, UpdateForEmptyIdentifierIsAppliedToAllArrayElements)
     mutablebson::Document doc(fromjson("{a: [0, 0, 0]}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [1, 1, 1]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -215,8 +215,8 @@ TEST_F(UpdateArrayNodeTest, ApplyMultipleUpdatesToArrayElement) {
     mutablebson::Document doc(fromjson("{a: [{b: 0, c: 0, d: 0}]}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{b: 1, c: 1, d: 1}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -255,8 +255,8 @@ TEST_F(UpdateArrayNodeTest, ApplyMultipleUpdatesToArrayElementsUsingMergedChildr
     mutablebson::Document doc(fromjson("{a: [{b: 0, c: 0}, {b: 0, c: 0}]}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{b: 1, c: 1}, {b: 1, c: 1}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -304,8 +304,8 @@ TEST_F(UpdateArrayNodeTest, ApplyMultipleUpdatesToArrayElementsWithoutMergedChil
     mutablebson::Document doc(fromjson("{a: [{b: 0, c: 0, d: 1}, {b: 1, c: 0, d: 0}]}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{b: 2, c: 2, d: 1}, {b: 1, c: 2, d: 2}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -335,8 +335,8 @@ TEST_F(UpdateArrayNodeTest, ApplyMultipleUpdatesToArrayElementWithEmptyIdentifie
     mutablebson::Document doc(fromjson("{a: [{b: 0, c: 0}]}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{b: 1, c: 1}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -381,8 +381,8 @@ TEST_F(UpdateArrayNodeTest, ApplyNestedArrayUpdates) {
     mutablebson::Document doc(fromjson("{a: [{x: 0, b: [{c: 0, d: 0}]}]}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{x: 0, b: [{c: 1, d: 1}]}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -524,8 +524,8 @@ TEST_F(UpdateArrayNodeTest, NoArrayElementsMatch) {
     mutablebson::Document doc(fromjson("{a: [2, 2, 2]}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
-    ASSERT_FALSE(result.indexesAffected);
     ASSERT_TRUE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [2, 2, 2]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -552,8 +552,8 @@ TEST_F(UpdateArrayNodeTest, UpdatesToAllArrayElementsAreNoops) {
     mutablebson::Document doc(fromjson("{a: [1, 1, 1]}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
-    ASSERT_FALSE(result.indexesAffected);
     ASSERT_TRUE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [1, 1, 1]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -580,8 +580,10 @@ TEST_F(UpdateArrayNodeTest, NoArrayElementAffectsIndexes) {
     mutablebson::Document doc(fromjson("{a: [{c: 0}, {c: 0}, {c: 0}]}"));
     addIndexedPath("a.c");
     auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
-    ASSERT_FALSE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
+    // TODO: SERVER-77344 detection of index related changes is tricked into thinking this is
+    // affected.
+    // ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{c: 0, b: 0}, {c: 0, b: 0}, {c: 0, b: 0}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 
@@ -609,8 +611,8 @@ TEST_F(UpdateArrayNodeTest, WhenOneElementIsMatchedLogElementUpdateDirectly) {
     mutablebson::Document doc(fromjson("{a: [{c: 1}, {c: 0}, {c: 1}]}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{c: 1}, {c: 0, b: 0}, {c: 1}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 
@@ -637,8 +639,8 @@ TEST_F(UpdateArrayNodeTest, WhenOneElementIsModifiedLogElement) {
     mutablebson::Document doc(fromjson("{a: [{c: 0, b: 0}, {c: 0}, {c: 1}]}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{c: 0, b: 0}, {c: 0, b: 0}, {c: 1}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 
@@ -662,8 +664,8 @@ TEST_F(UpdateArrayNodeTest, ArrayUpdateOnEmptyArrayIsANoop) {
     mutablebson::Document doc(fromjson("{a: []}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
-    ASSERT_FALSE(result.indexesAffected);
     ASSERT_TRUE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: []}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -691,8 +693,8 @@ TEST_F(UpdateArrayNodeTest, ApplyPositionalInsideArrayUpdate) {
     addIndexedPath("a");
     setMatchedField("1");
     auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [{b: [0, 1], c: 0}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -720,8 +722,8 @@ TEST_F(UpdateArrayNodeTest, ApplyArrayUpdateFromReplication) {
     addIndexedPath("a");
     setFromOplogApplication(true);
     auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
-    ASSERT_FALSE(result.indexesAffected);
     ASSERT_TRUE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [0]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 
@@ -772,8 +774,8 @@ TEST_F(UpdateArrayNodeTest, ApplyArrayUpdateWithoutLogBuilderOrIndexData) {
     mutablebson::Document doc(fromjson("{a: [0]}"));
     setLogBuilderToNull();
     auto result = root.apply(getApplyParams(doc.root()), getUpdateNodeApplyParams());
-    ASSERT_FALSE(result.indexesAffected);
     ASSERT_FALSE(result.noop);
+    ASSERT_FALSE(getIndexAffectedFromLogEntry());
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS("{a.0}", getModifiedPaths());

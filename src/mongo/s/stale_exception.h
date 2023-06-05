@@ -82,7 +82,7 @@ public:
     void serialize(BSONObjBuilder* bob) const;
     static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj& obj);
 
-protected:
+private:
     NamespaceString _nss;
     ShardVersion _received;
     boost::optional<ShardVersion> _wanted;
@@ -93,14 +93,25 @@ protected:
     boost::optional<OperationType> _duringOperationType;
 };
 
+// TODO (SERVER-75888): Rename the StaleEpoch code to StaleUpstreamRouter and the info to
+// StaleUpstreamRouterInfo
 class StaleEpochInfo final : public ErrorExtraInfo {
 public:
     static constexpr auto code = ErrorCodes::StaleEpoch;
 
-    StaleEpochInfo(NamespaceString nss) : _nss(std::move(nss)) {}
+    StaleEpochInfo(NamespaceString nss, ShardVersion received, ShardVersion wanted)
+        : _nss(std::move(nss)), _received(received), _wanted(wanted) {}
 
     const auto& getNss() const {
         return _nss;
+    }
+
+    const auto& getVersionReceived() const {
+        return _received;
+    }
+
+    const auto& getVersionWanted() const {
+        return _wanted;
     }
 
     void serialize(BSONObjBuilder* bob) const;
@@ -108,9 +119,10 @@ public:
 
 private:
     NamespaceString _nss;
-};
 
-using StaleConfigException = ExceptionFor<ErrorCodes::StaleConfig>;
+    ShardVersion _received;
+    ShardVersion _wanted;
+};
 
 class StaleDbRoutingVersion final : public ErrorExtraInfo {
 public:

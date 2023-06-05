@@ -3,7 +3,7 @@
  * command, and that the number of queries sampled by each mongos or shardsvr mongod in a sharded
  * cluster is proportional to the number of queries it executes.
  *
- * @tags: [requires_fcv_63, featureFlagAnalyzeShardKey]
+ * @tags: [requires_fcv_70]
  */
 (function() {
 "use strict";
@@ -46,11 +46,16 @@ const st = new ShardingTest({
         setParameter: {
             queryAnalysisSamplerConfigurationRefreshSecs,
             queryAnalysisWriterIntervalSecs,
-            logComponentVerbosity: tojson({sharding: 2})
+            logComponentVerbosity: tojson({sharding: 3})
         }
     },
     configOptions: {
-        setParameter: {queryAnalysisSamplerInActiveThresholdSecs: 3},
+        setParameter: {
+            queryAnalysisSamplerInActiveThresholdSecs: 3,
+            queryAnalysisSamplerConfigurationRefreshSecs,
+            queryAnalysisWriterIntervalSecs,
+            logComponentVerbosity: tojson({sharding: 3})
+        },
     }
 });
 
@@ -164,27 +169,39 @@ function testQuerySampling(dbName, collNameNotSampled, collNameSampled) {
         }
         return true;
     });
-    jsTest.log("Finished waiting for sampled queries: " + tojsononeline({sampleSize}));
+    jsTest.log("Finished waiting for sampled queries: " +
+               tojsononeline({actualSampleSize: sampleSize}));
 
     // Verify that the difference between the actual and expected number of samples is within the
     // expected threshold.
     const expectedTotalCount = durationSecs * sampleRate;
-    const expectedFindCount = (actualNumFindPerSec / actualTotalQueriesPerSec) * expectedTotalCount;
-    const expectedDeleteCount =
-        (actualNumDeletePerSec / actualTotalQueriesPerSec) * expectedTotalCount;
-    const expectedAggCount = (actualNumAggPerSec / actualTotalQueriesPerSec) * expectedTotalCount;
+    const expectedFindPercentage =
+        AnalyzeShardKeyUtil.calculatePercentage(actualNumFindPerSec, actualTotalQueriesPerSec);
+    const expectedDeletePercentage =
+        AnalyzeShardKeyUtil.calculatePercentage(actualNumDeletePerSec, actualTotalQueriesPerSec);
+    const expectedAggPercentage =
+        AnalyzeShardKeyUtil.calculatePercentage(actualNumAggPerSec, actualTotalQueriesPerSec);
     jsTest.log("Checking that the number of sampled queries is within the threshold: " +
-               tojsononeline(
-                   {expectedTotalCount, expectedFindCount, expectedDeleteCount, expectedAggCount}));
+               tojsononeline({
+                   expectedSampleSize: {
+                       total: expectedTotalCount,
+                       find: expectedFindPercentage * expectedTotalCount / 100,
+                       delete: expectedDeletePercentage * expectedTotalCount / 100,
+                       aggregate: expectedAggPercentage * expectedTotalCount / 100
+                   }
+               }));
 
     AnalyzeShardKeyUtil.assertDiffPercentage(
         sampleSize.total, expectedTotalCount, 10 /* maxDiffPercentage */);
-    AnalyzeShardKeyUtil.assertDiffPercentage(
-        sampleSize.find, expectedFindCount, 15 /* maxDiffPercentage */);
-    AnalyzeShardKeyUtil.assertDiffPercentage(
-        sampleSize.delete, expectedDeleteCount, 15 /* maxDiffPercentage */);
-    AnalyzeShardKeyUtil.assertDiffPercentage(
-        sampleSize.aggregate, expectedAggCount, 15 /* maxDiffPercentage */);
+    const actualFindPercentage =
+        AnalyzeShardKeyUtil.calculatePercentage(sampleSize.find, sampleSize.total);
+    assertDiffWindow(actualFindPercentage, expectedFindPercentage, 5 /* maxDiff */);
+    const actualDeletePercentage =
+        AnalyzeShardKeyUtil.calculatePercentage(sampleSize.delete, sampleSize.total);
+    assertDiffWindow(actualDeletePercentage, expectedDeletePercentage, 5 /* maxDiff */);
+    const actualAggPercentage =
+        AnalyzeShardKeyUtil.calculatePercentage(sampleSize.aggregate, sampleSize.total);
+    assertDiffWindow(actualAggPercentage, expectedAggPercentage, 5 /* maxDiff */);
 
     QuerySamplingUtil.clearSampledQueryCollectionOnAllShards(st);
 }

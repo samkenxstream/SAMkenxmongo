@@ -1504,6 +1504,58 @@ TEST_F(DocumentSourceLookUpTest, IncrementNestedAggregateOpCounterOnCreateButNot
     testOpCounter(NamespaceString::createNamespaceString_forTest("local", "testColl"), 0);
 }
 
+TEST_F(DocumentSourceLookUpTest, RedactsCorrectlyWithPipeline) {
+    auto expCtx = getExpCtx();
+    auto fromNs = NamespaceString::createNamespaceString_forTest(expCtx->ns.dbName(), "coll");
+    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+        {fromNs.coll().toString(), {fromNs, std::vector<BSONObj>()}}});
+
+    BSONArrayBuilder pipeline;
+    pipeline << BSON("$match" << BSON("a"
+                                      << "myStr"));
+    pipeline << BSON("$project" << BSON("_id" << 0 << "a" << 1));
+    auto docSource = DocumentSourceLookUp::createFromBson(
+        BSON("$lookup" << BSON("from" << fromNs.coll() << "localField"
+                                      << "foo"
+                                      << "foreignField"
+                                      << "bar"
+                                      << "let"
+                                      << BSON("var1"
+                                              << "$x")
+                                      << "pipeline" << pipeline.arr() << "as"
+                                      << "out"))
+            .firstElement(),
+        expCtx);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$lookup": {
+                "from": "HASH<coll>",
+                "as": "HASH<out>",
+                "localField": "HASH<foo>",
+                "foreignField": "HASH<bar>",
+                "let": {
+                    "HASH<var1>": "$HASH<x>"
+                },
+                "pipeline": [
+                    {
+                        "$match": {
+                            "HASH<a>": {
+                                "$eq": "?string"
+                            }
+                        }
+                    },
+                    {
+                        "$project": {
+                            "HASH<a>": true,
+                            "HASH<_id>": false
+                        }
+                    }
+                ]
+            }
+        })",
+        redact(*docSource));
+}
+
 using DocumentSourceLookUpServerlessTest = ServerlessAggregationContextFixture;
 
 TEST_F(DocumentSourceLookUpServerlessTest,
@@ -1608,9 +1660,8 @@ TEST_F(DocumentSourceLookUpServerlessTest,
                         << "as"
                         << "lookup1"));
 
-    // TODO SERVER-62491 Use system tenantId to construct nss.
     NamespaceString nss = NamespaceString::createNamespaceString_forTest(
-        boost::none, expCtx->ns.dbName().toString(), _targetColl);
+        boost::none, expCtx->ns.dbName().toString_forTest(), _targetColl);
 
     for (bool flagStatus : {false, true}) {
         RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID",

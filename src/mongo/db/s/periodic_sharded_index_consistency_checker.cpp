@@ -162,7 +162,8 @@ void PeriodicShardedIndexConsistencyChecker::_launchShardedIndexConsistencyCheck
 
                             // Stop counting if the agg command failed for one of the collections
                             // to avoid recording a false count.
-                            uassertStatusOKWithContext(status, str::stream() << "nss " << nss);
+                            uassertStatusOKWithContext(
+                                status, str::stream() << "nss " << nss.toStringForErrorMsg());
 
                             if (!responseBuilder.obj()["cursor"]["firstBatch"].Array().empty()) {
                                 numShardedCollsWithInconsistentIndexes++;
@@ -194,7 +195,9 @@ void PeriodicShardedIndexConsistencyChecker::_launchShardedIndexConsistencyCheck
                       "error"_attr = ex.toStatus());
             }
         },
-        Milliseconds(shardedIndexConsistencyCheckIntervalMS));
+        Milliseconds(shardedIndexConsistencyCheckIntervalMS),
+        // TODO(SERVER-74658): Please revisit if this periodic job could be made killable.
+        false /*isKillableByStepdown*/);
     _shardedIndexConsistencyChecker = periodicRunner->makeJob(std::move(job));
     _shardedIndexConsistencyChecker.start();
 }

@@ -38,6 +38,7 @@
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/reshard_collection_gen.h"
+#include "mongo/s/resharding/resharding_feature_flag_gen.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -52,13 +53,14 @@ void notifyChangeStreamsOnReshardCollectionComplete(OperationContext* opCtx,
                                                     const UUID& reshardUUID) {
 
     const std::string oMessage = str::stream()
-        << "Reshard collection " << collNss << " with shard key " << doc.getKey().toString();
+        << "Reshard collection " << collNss.toStringForErrorMsg() << " with shard key "
+        << doc.getKey().toString();
 
     BSONObjBuilder cmdBuilder;
     tassert(6590800, "Did not set old collectionUUID", doc.getOldCollectionUUID());
     tassert(6590801, "Did not set old ShardKey", doc.getOldShardKey());
     UUID collUUID = *doc.getOldCollectionUUID();
-    cmdBuilder.append("reshardCollection", collNss.ns());
+    cmdBuilder.append("reshardCollection", NamespaceStringUtil::serialize(collNss));
     reshardUUID.appendToBuilder(&cmdBuilder, "reshardUUID");
     cmdBuilder.append("shardKey", doc.getKey());
     cmdBuilder.append("oldShardKey", *doc.getOldShardKey());
@@ -83,7 +85,7 @@ void notifyChangeStreamsOnReshardCollectionComplete(OperationContext* opCtx,
 
     const auto cmd = cmdBuilder.obj();
 
-    writeConflictRetry(opCtx, "ReshardCollection", NamespaceString::kRsOplogNamespace.ns(), [&] {
+    writeConflictRetry(opCtx, "ReshardCollection", NamespaceString::kRsOplogNamespace, [&] {
         AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
         WriteUnitOfWork uow(opCtx);
         serviceContext->getOpObserver()->onInternalOpMessage(opCtx,
@@ -129,76 +131,77 @@ ExecutorFuture<void> ReshardCollectionCoordinator::_runImpl(
     std::shared_ptr<executor::ScopedTaskExecutor> executor,
     const CancellationToken& token) noexcept {
     return ExecutorFuture<void>(**executor)
-        .then(_buildPhaseHandler(
-            Phase::kReshard,
-            [this, anchor = shared_from_this()] {
-                auto opCtxHolder = cc().makeOperationContext();
-                auto* opCtx = opCtxHolder.get();
-                getForwardableOpMetadata().setOn(opCtx);
+        .then(_buildPhaseHandler(Phase::kReshard, [this, anchor = shared_from_this()] {
+            auto opCtxHolder = cc().makeOperationContext();
+            auto* opCtx = opCtxHolder.get();
+            getForwardableOpMetadata().setOn(opCtx);
 
-                {
-                    AutoGetCollection coll{
-                        opCtx,
-                        nss(),
-                        MODE_IS,
-                        AutoGetCollection::Options{}
-                            .viewMode(auto_get_collection::ViewMode::kViewsPermitted)
-                            .expectedUUID(_doc.getCollectionUUID())};
-                }
+            {
+                AutoGetCollection coll{opCtx,
+                                       nss(),
+                                       MODE_IS,
+                                       AutoGetCollection::Options{}
+                                           .viewMode(auto_get_collection::ViewMode::kViewsPermitted)
+                                           .expectedUUID(_doc.getCollectionUUID())};
+            }
 
-                const auto cmOld =
-                    uassertStatusOK(
-                        Grid::get(opCtx)
-                            ->catalogCache()
-                            ->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx, nss()))
-                        .cm;
+            const auto cmOld =
+                uassertStatusOK(
+                    Grid::get(opCtx)
+                        ->catalogCache()
+                        ->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx, nss()))
+                    .cm;
 
-                StateDoc newDoc(_doc);
-                newDoc.setOldShardKey(cmOld.getShardKeyPattern().getKeyPattern().toBSON());
-                newDoc.setOldCollectionUUID(cmOld.getUUID());
-                _updateStateDocument(opCtx, std::move(newDoc));
+            StateDoc newDoc(_doc);
+            newDoc.setOldShardKey(cmOld.getShardKeyPattern().getKeyPattern().toBSON());
+            newDoc.setOldCollectionUUID(cmOld.getUUID());
+            _updateStateDocument(opCtx, std::move(newDoc));
 
-                ConfigsvrReshardCollection configsvrReshardCollection(nss(), _doc.getKey());
-                configsvrReshardCollection.setDbName(nss().db());
-                configsvrReshardCollection.setUnique(_doc.getUnique());
-                configsvrReshardCollection.setCollation(_doc.getCollation());
-                configsvrReshardCollection.set_presetReshardedChunks(
-                    _doc.get_presetReshardedChunks());
-                configsvrReshardCollection.setZones(_doc.getZones());
-                configsvrReshardCollection.setNumInitialChunks(_doc.getNumInitialChunks());
+            ConfigsvrReshardCollection configsvrReshardCollection(nss(), _doc.getKey());
+            configsvrReshardCollection.setDbName(nss().dbName());
+            configsvrReshardCollection.setUnique(_doc.getUnique());
+            configsvrReshardCollection.setCollation(_doc.getCollation());
+            configsvrReshardCollection.set_presetReshardedChunks(_doc.get_presetReshardedChunks());
+            configsvrReshardCollection.setZones(_doc.getZones());
+            configsvrReshardCollection.setNumInitialChunks(_doc.getNumInitialChunks());
 
-                const auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+            if (!resharding::gFeatureFlagReshardingImprovements.isEnabled(
+                    serverGlobalParams.featureCompatibility)) {
+                uassert(
+                    ErrorCodes::InvalidOptions,
+                    "Resharding improvements is not enabled, reject shardDistribution parameter",
+                    !_doc.getShardDistribution().has_value());
+                uassert(
+                    ErrorCodes::InvalidOptions,
+                    "Resharding improvements is not enabled, reject forceRedistribution parameter",
+                    !_doc.getForceRedistribution().has_value());
+            }
+            configsvrReshardCollection.setShardDistribution(_doc.getShardDistribution());
+            configsvrReshardCollection.setForceRedistribution(_doc.getForceRedistribution());
 
-                const auto cmdResponse =
-                    uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
-                        opCtx,
-                        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                        DatabaseName::kAdmin.toString(),
-                        CommandHelpers::appendMajorityWriteConcern(
-                            configsvrReshardCollection.toBSON({}), opCtx->getWriteConcern()),
-                        Shard::RetryPolicy::kIdempotent));
-                uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(std::move(cmdResponse)));
+            const auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
 
-                // Report command completion to the oplog.
-                const auto cm =
-                    uassertStatusOK(
-                        Grid::get(opCtx)
-                            ->catalogCache()
-                            ->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx, nss()))
-                        .cm;
+            const auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
+                opCtx,
+                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                DatabaseName::kAdmin.toString(),
+                CommandHelpers::appendMajorityWriteConcern(configsvrReshardCollection.toBSON({}),
+                                                           opCtx->getWriteConcern()),
+                Shard::RetryPolicy::kIdempotent));
+            uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(std::move(cmdResponse)));
 
-                if (_doc.getOldCollectionUUID() && _doc.getOldCollectionUUID() != cm.getUUID()) {
-                    notifyChangeStreamsOnReshardCollectionComplete(
-                        opCtx, nss(), _doc, cm.getUUID());
-                }
-            }))
-        .onError([this, anchor = shared_from_this()](const Status& status) {
-            LOGV2_ERROR(6206401,
-                        "Error running reshard collection",
-                        logAttrs(nss()),
-                        "error"_attr = redact(status));
-            return status;
-        });
+            // Report command completion to the oplog.
+            const auto cm =
+                uassertStatusOK(
+                    Grid::get(opCtx)
+                        ->catalogCache()
+                        ->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx, nss()))
+                    .cm;
+
+            if (_doc.getOldCollectionUUID() && _doc.getOldCollectionUUID() != cm.getUUID()) {
+                notifyChangeStreamsOnReshardCollectionComplete(opCtx, nss(), _doc, cm.getUUID());
+            }
+        }));
 }
 
 }  // namespace mongo

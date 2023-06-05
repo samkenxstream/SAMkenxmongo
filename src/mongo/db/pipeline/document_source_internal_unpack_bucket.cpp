@@ -168,18 +168,8 @@ boost::intrusive_ptr<DocumentSourceSort> createMetadataSortForReorder(
         : sort.getSortKeyPattern();
     std::vector<SortPattern::SortPatternPart> updatedPattern;
 
-    if (groupIdField) {
-        auto groupId = FieldPath(groupIdField.value());
-        SortPattern::SortPatternPart patternPart;
-        patternPart.isAscending = !flipSort;
-        patternPart.fieldPath = groupId;
-        updatedPattern.push_back(patternPart);
-    }
-
-
     for (const auto& entry : sortPattern) {
         updatedPattern.push_back(entry);
-
         if (lastpointTimeField && entry.fieldPath->fullPath() == lastpointTimeField.value()) {
             updatedPattern.back().fieldPath =
                 FieldPath((entry.isAscending ? timeseries::kControlMinFieldNamePrefix
@@ -199,6 +189,33 @@ boost::intrusive_ptr<DocumentSourceSort> createMetadataSortForReorder(
             updatedPattern.back().fieldPath = updated;
         }
     }
+    // After the modifications of the sortPattern are completed, for the lastPoint
+    // optimizations, the group field needs to be added to the beginning of the sort pattern.
+    // Do note that the modified sort pattern is for sorting within a group (within the bucket)
+    // and the plan is to do the grouping and sort within on go.
+    // If the group field is already in the sortPattern then it needs to moved to the first
+    // position. A flip in the later case is not necessary anymore as the sort order was
+    // already flipped.
+    // Example 1: $group: {a:1}, $sort{b: 1, a: -1} --> modifiedPattern: {a: -1, b: 1}
+    // Example 2: $group: {c:1}, $sort{d: -1, e: 1} --> modifiedPattern: {c: 1, d: -1, e: 1}
+    if (groupIdField) {
+        const auto groupId = FieldPath(groupIdField.value());
+        SortPattern::SortPatternPart patternPart;
+        patternPart.fieldPath = groupId;
+        const auto pattern =
+            std::find_if(updatedPattern.begin(),
+                         updatedPattern.end(),
+                         [&groupId](const SortPattern::SortPatternPart& s) -> bool {
+                             return s.fieldPath->fullPath().compare(groupId.fullPath()) == 0;
+                         });
+        if (pattern != updatedPattern.end()) {
+            patternPart.isAscending = pattern->isAscending;
+            updatedPattern.erase(pattern);
+        } else {
+            patternPart.isAscending = !flipSort;
+        }
+        updatedPattern.insert(updatedPattern.begin(), patternPart);
+    }
 
     boost::optional<uint64_t> maxMemoryUsageBytes;
     if (auto sortStatsPtr = dynamic_cast<const SortStats*>(sort.getSpecificStats())) {
@@ -206,7 +223,7 @@ boost::intrusive_ptr<DocumentSourceSort> createMetadataSortForReorder(
     }
 
     return DocumentSourceSort::create(
-        sort.getContext(), SortPattern{updatedPattern}, 0, maxMemoryUsageBytes);
+        sort.getContext(), SortPattern{std::move(updatedPattern)}, 0, maxMemoryUsageBytes);
 }
 
 /**
@@ -226,7 +243,7 @@ boost::intrusive_ptr<DocumentSourceGroup> createBucketGroupForReorder(
             expCtx.get(), field.firstElement(), expCtx->variablesParseState));
     };
 
-    return DocumentSourceGroup::create(expCtx, groupByExpr, accumulators);
+    return DocumentSourceGroup::create(expCtx, groupByExpr, std::move(accumulators));
 }
 
 // Optimize the section of the pipeline before the $_internalUnpackBucket stage.
@@ -724,7 +741,6 @@ BucketSpec::BucketPredicate DocumentSourceInternalUnpackBucket::createPredicates
         matchExpr,
         _bucketUnpacker.bucketSpec(),
         _bucketMaxSpanSeconds,
-        pExpCtx->collationMatchesDefault,
         pExpCtx,
         haveComputedMetaField(),
         _bucketUnpacker.includeMetaField(),
@@ -747,6 +763,15 @@ std::pair<BSONObj, bool> DocumentSourceInternalUnpackBucket::extractProjectForPu
 std::pair<bool, Pipeline::SourceContainer::iterator>
 DocumentSourceInternalUnpackBucket::rewriteGroupByMinMax(Pipeline::SourceContainer::iterator itr,
                                                          Pipeline::SourceContainer* container) {
+    // The computed min/max for each bucket uses the default collation. If the collation of the
+    // query doesn't match the default we cannot rely on the computed values as they might differ
+    // (e.g. numeric and lexicographic collations compare "5" and "10" in opposite order).
+    // NB: Unfortuntealy, this means we have to forgo the optimization even if the source field is
+    // numeric and not affected by the collation as we cannot know the data type until runtime.
+    if (pExpCtx->collationMatchesDefault == ExpressionContext::CollationMatchesDefault::kNo) {
+        return {};
+    }
+
     const auto* groupPtr = dynamic_cast<DocumentSourceGroup*>(std::next(itr)->get());
     if (groupPtr == nullptr) {
         return {};

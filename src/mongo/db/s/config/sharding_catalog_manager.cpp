@@ -52,6 +52,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/s/config/index_on_config.h"
+#include "mongo/db/s/config/placement_history_cleaner.h"
 #include "mongo/db/s/sharding_util.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/logv2/log.h"
@@ -148,10 +149,6 @@ BSONObj commitOrAbortTransaction(OperationContext* opCtx,
     // that have been run on this opCtx would have set the timeout in the locker on the opCtx, but
     // commit should not have a lock timeout.
     auto newClient = getGlobalServiceContext()->makeClient("ShardingCatalogManager");
-    {
-        stdx::lock_guard<Client> lk(*newClient);
-        newClient->setSystemOperationKillableByStepdown(lk);
-    }
     AlternativeClientRegion acr(newClient);
     auto newOpCtx = cc().makeOperationContext();
     newOpCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
@@ -252,24 +249,6 @@ Status createIndexesForConfigChunks(OperationContext* opCtx) {
     }
 
     return Status::OK();
-}
-
-Status createIndexForConfigPlacementHistory(OperationContext* opCtx, bool waitForMajority) {
-    auto status = createIndexOnConfigCollection(
-        opCtx,
-        NamespaceString::kConfigsvrPlacementHistoryNamespace,
-        BSON(NamespacePlacementType::kNssFieldName
-             << 1 << NamespacePlacementType::kTimestampFieldName << -1),
-        true /*unique*/);
-    if (status.isOK() && waitForMajority) {
-        auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
-        WriteConcernResult unusedResult;
-        status = waitForWriteConcern(opCtx,
-                                     replClient.getLastOp(),
-                                     ShardingCatalogClient::kMajorityWriteConcern,
-                                     &unusedResult);
-    }
-    return status;
 }
 
 // creates a vector of a vector of BSONObj (one for each batch) from the docs vector
@@ -515,6 +494,81 @@ AggregateCommandRequest createInitPlacementHistoryAggregationRequest(
     return pipeline.buildAsAggregateCommandRequest();
 }
 
+void setInitializationTimeOnPlacementHistory(
+    OperationContext* opCtx,
+    Timestamp initializationTime,
+    std::vector<ShardId> placementResponseForPreInitQueries) {
+    /*
+     * The initialization metadata of config.placementHistory is composed by two special docs,
+     * identified by kConfigPlacementHistoryInitializationMarker:
+     * - initializationTimeInfo: contains the time of the initialization and an empty set of shards.
+     *   It will allow ShardingCatalogClient to serve accurate responses to historical placement
+     *   queries within the [initializationTime, +inf) range.
+     * - approximatedPlacementForPreInitQueries:  contains the cluster topology at the time of the
+     *   initialization and is marked with Timestamp(0,1).
+     *   It will be used by ShardingCatalogClient to serve approximated responses to historical
+     *   placement queries within the [-inf, initializationTime) range.
+     */
+    NamespacePlacementType initializationTimeInfo;
+    initializationTimeInfo.setNss(
+        ShardingCatalogClient::kConfigPlacementHistoryInitializationMarker);
+    initializationTimeInfo.setTimestamp(initializationTime);
+    initializationTimeInfo.setShards({});
+
+    NamespacePlacementType approximatedPlacementForPreInitQueries;
+    approximatedPlacementForPreInitQueries.setNss(
+        ShardingCatalogClient::kConfigPlacementHistoryInitializationMarker);
+    approximatedPlacementForPreInitQueries.setTimestamp(Timestamp(0, 1));
+    approximatedPlacementForPreInitQueries.setShards(placementResponseForPreInitQueries);
+
+    auto transactionChain = [initializationTimeInfo = std::move(initializationTimeInfo),
+                             approximatedPlacementForPreInitQueries =
+                                 std::move(approximatedPlacementForPreInitQueries)](
+                                const txn_api::TransactionClient& txnClient,
+                                ExecutorPtr txnExec) -> SemiFuture<void> {
+        // Delete the current initialization metadata
+        write_ops::DeleteCommandRequest deleteRequest(
+            NamespaceString::kConfigsvrPlacementHistoryNamespace);
+        write_ops::DeleteOpEntry entryDelMarker;
+        entryDelMarker.setQ(
+            BSON(NamespacePlacementType::kNssFieldName
+                 << ShardingCatalogClient::kConfigPlacementHistoryInitializationMarker.ns()));
+        entryDelMarker.setMulti(true);
+        deleteRequest.setDeletes({entryDelMarker});
+
+        return txnClient.runCRUDOp(deleteRequest, {})
+            .thenRunOn(txnExec)
+            .then([&](const BatchedCommandResponse& _) {
+                // Insert the new initialization metadata
+                write_ops::InsertCommandRequest insertMarkerRequest(
+                    NamespaceString::kConfigsvrPlacementHistoryNamespace);
+                insertMarkerRequest.setDocuments({initializationTimeInfo.toBSON(),
+                                                  approximatedPlacementForPreInitQueries.toBSON()});
+                return txnClient.runCRUDOp(insertMarkerRequest, {});
+            })
+            .thenRunOn(txnExec)
+            .then([&](const BatchedCommandResponse& _) { return; })
+            .semi();
+    };
+
+    WriteConcernOptions originalWC = opCtx->getWriteConcern();
+    opCtx->setWriteConcern(WriteConcernOptions{WriteConcernOptions::kMajority,
+                                               WriteConcernOptions::SyncMode::UNSET,
+                                               WriteConcernOptions::kNoTimeout});
+
+    ScopeGuard resetWriteConcerGuard([opCtx, &originalWC] { opCtx->setWriteConcern(originalWC); });
+
+    auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
+    auto& executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+
+    txn_api::SyncTransactionWithRetries txn(
+        opCtx, executor, nullptr /* resourceYielder */, inlineExecutor);
+    txn.run(opCtx, transactionChain);
+
+    LOGV2(7068807,
+          "Initialization metadata of placement.history have been updated",
+          "initializationTime"_attr = initializationTime);
+}
 }  // namespace
 
 void ShardingCatalogManager::create(ServiceContext* serviceContext,
@@ -561,7 +615,8 @@ ShardingCatalogManager::ShardingCatalogManager(
       _localCatalogClient(std::move(localCatalogClient)),
       _kShardMembershipLock("shardMembershipLock"),
       _kChunkOpLock("chunkOpLock"),
-      _kZoneOpLock("zoneOpLock") {
+      _kZoneOpLock("zoneOpLock"),
+      _kPlacementHistoryInitializationLock("placementHistoryInitializationOpLock") {
     startup();
 }
 
@@ -585,7 +640,6 @@ void ShardingCatalogManager::startup() {
 
 void ShardingCatalogManager::shutDown() {
     Grid::get(_serviceContext)->setCustomConnectionPoolStatsFn(nullptr);
-
     _executorForAddShard->shutdown();
     _executorForAddShard->join();
 }
@@ -609,11 +663,9 @@ Status ShardingCatalogManager::initializeConfigDatabaseIfNeeded(OperationContext
         return status;
     }
 
-    if (feature_flags::gConfigSettingsSchema.isEnabled(serverGlobalParams.featureCompatibility)) {
-        status = _initConfigSettings(opCtx);
-        if (!status.isOK()) {
-            return status;
-        }
+    status = _initConfigSettings(opCtx);
+    if (!status.isOK()) {
+        return status;
     }
 
     // Make sure to write config.version last since we detect rollbacks of config.version and
@@ -628,10 +680,6 @@ Status ShardingCatalogManager::initializeConfigDatabaseIfNeeded(OperationContext
     _configInitialized = true;
 
     return Status::OK();
-}
-
-Status ShardingCatalogManager::upgradeConfigSettings(OperationContext* opCtx) {
-    return _initConfigSettings(opCtx);
 }
 
 ShardingCatalogClient* ShardingCatalogManager::localCatalogClient() {
@@ -697,18 +745,23 @@ Status ShardingCatalogManager::_initConfigIndexes(OperationContext* opCtx) {
 
     if (feature_flags::gGlobalIndexesShardingCatalog.isEnabled(
             serverGlobalParams.featureCompatibility)) {
-        result = sharding_util::createShardingIndexCatalogIndexes(opCtx);
+        result = sharding_util::createShardingIndexCatalogIndexes(
+            opCtx, NamespaceString::kConfigsvrIndexCatalogNamespace);
         if (!result.isOK()) {
             return result;
         }
     }
 
-    if (feature_flags::gHistoricalPlacementShardingCatalog.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
-        result = createIndexForConfigPlacementHistory(opCtx, false /*waitForMajority*/);
-        if (!result.isOK()) {
-            return result;
-        }
+    auto status = createIndexOnConfigCollection(
+        opCtx,
+        NamespaceString::kConfigsvrPlacementHistoryNamespace,
+        BSON(NamespacePlacementType::kNssFieldName
+             << 1 << NamespacePlacementType::kTimestampFieldName << -1),
+        true /*unique*/);
+
+    if (!result.isOK()) {
+        return result.withContext(
+            "couldn't create nss_1_timestamp_-1 index on config.placementHistory");
     }
 
     return Status::OK();
@@ -743,8 +796,8 @@ Status ShardingCatalogManager::_initConfigSettings(OperationContext* opCtx) {
      *   oneOf: [
      *       {"properties": {_id: {enum: ["chunksize"]}},
      *                      {value: {bsonType: "number", minimum: 1, maximum: 1024}}},
-     *       {"properties": {_id: {enum: ["balancer", "autosplit", "ReadWriteConcernDefaults",
-     *                                    "audit"]}}}
+     *       {"properties": {_id: {enum: ["balancer", "automerge" "ReadWriteConcernDefaults",
+     * "audit"]}}}
      *   ]
      * }
      *
@@ -764,7 +817,7 @@ Status ShardingCatalogManager::_initConfigSettings(OperationContext* opCtx) {
         BSON("properties" << BSON(
                  "_id" << BSON("enum" << BSON_ARRAY(
                                    BalancerSettingsType::kKey
-                                   << AutoSplitSettingsType::kKey << AutoMergeSettingsType::kKey
+                                   << AutoMergeSettingsType::kKey
                                    << ReadWriteConcernDefaults::kPersistedDocumentId << "audit"))));
     const auto fullValidator =
         BSON("$jsonSchema" << BSON("oneOf" << BSON_ARRAY(chunkSizeValidator << noopValidator)));
@@ -902,6 +955,11 @@ Status ShardingCatalogManager::_notifyClusterOnNewDatabases(
         // Setup an AlternativeClientRegion and a non-interruptible Operation Context to ensure that
         // the notification may be also sent out while the node is stepping down.
         auto altClient = opCtx->getServiceContext()->makeClient("_notifyClusterOnNewDatabases");
+        // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+        {
+            mongo::stdx::lock_guard<mongo::Client> lk(*altClient.get());
+            altClient.get()->setSystemOperationUnkillableByStepdown(lk);
+        }
         AlternativeClientRegion acr(altClient);
         auto altOpCtxHolder = cc().makeOperationContext();
         auto altOpCtx = altOpCtxHolder.get();
@@ -1057,11 +1115,10 @@ void ShardingCatalogManager::withTransactionAPI(OperationContext* opCtx,
                                                 const NamespaceString& namespaceForInitialFind,
                                                 txn_api::Callback callback) {
     auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
-    auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(
-        Grid::get(opCtx)->getExecutorPool()->getFixedExecutor());
+    auto& executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
 
     auto txn = txn_api::SyncTransactionWithRetries(
-        opCtx, sleepInlineExecutor, nullptr /* resourceYielder */, inlineExecutor);
+        opCtx, executor, nullptr /* resourceYielder */, inlineExecutor);
     txn.run(opCtx,
             [innerCallback = std::move(callback),
              namespaceForInitialFind](const txn_api::TransactionClient& txnClient,
@@ -1097,10 +1154,6 @@ void ShardingCatalogManager::withTransaction(
 
     AlternativeSessionRegion asr(opCtx);
     auto* const client = asr.opCtx()->getClient();
-    {
-        stdx::lock_guard<Client> lk(*client);
-        client->setSystemOperationKillableByStepdown(lk);
-    }
     asr.opCtx()->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
     AuthorizationSession::get(client)->grantInternalAuthorization(client);
     TxnNumber txnNumber = 0;
@@ -1183,11 +1236,7 @@ void ShardingCatalogManager::withTransaction(
     }
 }
 
-
 void ShardingCatalogManager::initializePlacementHistory(OperationContext* opCtx) {
-    // Initialize the collection.
-    uassertStatusOK(createIndexForConfigPlacementHistory(opCtx, true /*waitForMajority*/));
-
     /**
      * This function will establish an initialization time to collect a consistent description of
      * the placement of each existing namespace through a snapshot read of the sharding catalog.
@@ -1201,6 +1250,42 @@ void ShardingCatalogManager::initializePlacementHistory(OperationContext* opCtx)
      * - incoming (or not yet materialized) DDLs will insert more recent placement information,
      *   which will have the effect of "updating" the snapshot produced by this function.
      */
+    Lock::ExclusiveLock lk(opCtx, _kPlacementHistoryInitializationLock);
+
+    // Suspend the periodic cleanup job that runs in background.
+    ScopeGuard restartHistoryCleaner(
+        [opCtx]() { PlacementHistoryCleaner::get(opCtx)->resume(opCtx); });
+
+    PlacementHistoryCleaner::get(opCtx)->pause();
+
+    // Delete any existing document that has been already majority committed.
+    {
+        repl::ReadConcernArgs::get(opCtx) =
+            repl::ReadConcernArgs(repl::ReadConcernLevel::kMajorityReadConcern);
+
+        write_ops::DeleteCommandRequest deleteOp(
+            NamespaceString::kConfigsvrPlacementHistoryNamespace);
+        deleteOp.setDeletes({[&] {
+            write_ops::DeleteOpEntry entry;
+            entry.setQ({});
+            entry.setMulti(true);
+            return entry;
+        }()});
+
+        uassertStatusOK(_localConfigShard->runCommandWithFixedRetryAttempts(
+            opCtx,
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            NamespaceString::kConfigsvrPlacementHistoryNamespace.db().toString(),
+            deleteOp.toBSON(BSON(WriteConcernOptions::kWriteConcernField
+                                 << ShardingCatalogClient::kLocalWriteConcern.toBSON())),
+            Shard::RetryPolicy::kNotIdempotent));
+
+        const auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
+        auto awaitReplicationResult = repl::ReplicationCoordinator::get(opCtx)->awaitReplication(
+            opCtx, replClient.getLastOp(), ShardingCatalogClient::kMajorityWriteConcern);
+    }
+
+    // Set the time of the initialization.
     Timestamp initializationTime;
     std::vector<ShardId> shardsAtInitializationTime;
     {
@@ -1238,6 +1323,11 @@ void ShardingCatalogManager::initializePlacementHistory(OperationContext* opCtx)
     // internal client credentials).
     {
         auto altClient = opCtx->getServiceContext()->makeClient("initializePlacementHistory");
+        // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+        {
+            stdx::lock_guard<Client> lk(*altClient.get());
+            altClient.get()->setSystemOperationUnkillableByStepdown(lk);
+        }
         AuthorizationSession::get(altClient.get())->grantInternalAuthorization(altClient.get());
         AlternativeClientRegion acr(altClient);
         auto executor =
@@ -1262,66 +1352,116 @@ void ShardingCatalogManager::initializePlacementHistory(OperationContext* opCtx)
     }
 
     /*
-     * config.placementHistory has now a full representation of the cluster at initializationTime,
-     * while earlier points in time have no consistent placement data persisted.
-     *
-     * As a final step, two extra "metadata documents" (identified by
-     * kConfigsvrPlacementHistoryFcvMarkerNamespace) are inserted to describe the operation
-     * boundaries of config.placementHistory:
-     * - initializationTimeInfo: contains the time of the initialization and an empty set of shards.
-     *   It will allow ShardingCatalogClient to serve accurate responses to historical placement
-     *   queries within the [initializationTime, +inf) range.
-     * - approximatedPlacementData: contains the cluster topology at the time of the
-     *   initialization and is marked with Timestamp(0,1).
-     *   It will be used by ShardingCatalogClient to serve approximated responses to historical
-     *   placement queries within the [-inf, initializationTime) range.
+     * config.placementHistory has now a full representation of the cluster at initializationTime.
+     * As a final step, persist also the initialization metadata so that the whole content may be
+     * consistently queried.
      */
-    auto transactionChain = [initializationTime,
-                             shardsAtInitializationTime = std::move(shardsAtInitializationTime)](
-                                const txn_api::TransactionClient& txnClient, ExecutorPtr txnExec) {
-        NamespacePlacementType approximatedPlacementData(
-            NamespaceString::kConfigsvrPlacementHistoryFcvMarkerNamespace,
-            Timestamp(0, 1),
-            std::move(shardsAtInitializationTime));
-        NamespacePlacementType initializationTimeInfo(
-            NamespaceString::kConfigsvrPlacementHistoryFcvMarkerNamespace, initializationTime, {});
-        write_ops::UpdateCommandRequest upsertInitializationMetadata(
-            NamespaceString::kConfigsvrPlacementHistoryNamespace);
-        auto buildOpEntryFor = [](const NamespacePlacementType& descriptor) {
-            write_ops::UpdateOpEntry entry;
-            entry.setUpsert(true);
-            entry.setQ(BSON(NamespacePlacementType::kNssFieldName
-                            << descriptor.getNss().ns()
-                            << NamespacePlacementType::kTimestampFieldName
-                            << descriptor.getTimestamp()));
-            entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(descriptor.toBSON()));
-            return entry;
-        };
+    setInitializationTimeOnPlacementHistory(
+        opCtx, initializationTime, std::move(shardsAtInitializationTime));
+}
 
-        upsertInitializationMetadata.setUpdates(
-            {buildOpEntryFor(approximatedPlacementData), buildOpEntryFor(initializationTimeInfo)});
-        return txnClient.runCRUDOp(upsertInitializationMetadata, {} /*stmtIds*/)
-            .thenRunOn(txnExec)
-            .then([&](const BatchedCommandResponse& insertPlacementEntryResponse) {
-                uassertStatusOK(insertPlacementEntryResponse.toStatus());
-            })
-            .semi();
+void ShardingCatalogManager::cleanUpPlacementHistory(OperationContext* opCtx,
+                                                     const Timestamp& earliestClusterTime) {
+    LOGV2(
+        7068803, "Cleaning up placement history", "earliestClusterTime"_attr = earliestClusterTime);
+    /*
+     * The method implements the following optimistic approach for data cleanup:
+     * 1. Set earliestOpTime as the new initialization time of config.placementHistory;
+     this will have the effect of hiding older(deletable) documents when the collection is queried
+     by the ShardingCatalogClient.*/
+    auto allShardIds = [&] {
+        const auto clusterPlacementAtEarliestClusterTime =
+            _localCatalogClient->getShardsThatOwnDataAtClusterTime(opCtx, earliestClusterTime);
+        return clusterPlacementAtEarliestClusterTime.getShards();
+    }();
+
+    setInitializationTimeOnPlacementHistory(opCtx, earliestClusterTime, std::move(allShardIds));
+
+    /*
+     * 2. Build up and execute the delete request to remove the disposable documents. This
+     * operation is not atomic and it may be interrupted by a stepdown event, but we rely on the
+     * fact that the cleanup is periodically invoked to ensure that the content in excess will be
+     *    eventually deleted.
+     *
+     * 2.1 For each namespace represented in config.placementHistory, collect the timestamp of its
+     *     most recent placement doc (initialization markers are not part of the output).
+     *
+     *     config.placementHistory.aggregate([
+     *      {
+     *          $group : {
+     *              _id : "$nss",
+     *              mostRecentTimestamp: {$max : "$timestamp"},
+     *          }
+     *      },
+     *      {
+     *          $match : {
+     *              _id : { $ne : "kConfigPlacementHistoryInitializationMarker"}
+     *          }
+     *      }
+     *  ])
+     */
+    auto pipeline = PipelineBuilder(opCtx,
+                                    NamespaceString::kConfigsvrPlacementHistoryNamespace,
+                                    {NamespaceString::kConfigsvrPlacementHistoryNamespace});
+
+    pipeline.addStage<DocumentSourceGroup>(
+        BSON("_id"
+             << "$" + NamespacePlacementType::kNssFieldName << "mostRecentTimestamp"
+             << BSON("$max"
+                     << "$" + NamespacePlacementType::kTimestampFieldName)));
+    pipeline.addStage<DocumentSourceMatch>(BSON(
+        "_id" << BSON(
+            "$ne" << ShardingCatalogClient::kConfigPlacementHistoryInitializationMarker.ns())));
+
+    auto aggRequest = pipeline.buildAsAggregateCommandRequest();
+
+    repl::ReadConcernArgs readConcernArgs(repl::ReadConcernLevel::kMajorityReadConcern);
+    aggRequest.setReadConcern(readConcernArgs.toBSONInner());
+
+    /*
+     * 2.2 For each namespace found, compose a delete statement.
+     */
+    std::vector<write_ops::DeleteOpEntry> deleteStatements;
+    auto callback = [&deleteStatements,
+                     &earliestClusterTime](const std::vector<BSONObj>& batch,
+                                           const boost::optional<BSONObj>& postBatchResumeToken) {
+        for (const auto& obj : batch) {
+            const auto nss = NamespaceString(obj["_id"].String());
+            const auto timeOfMostRecentDoc = obj["mostRecentTimestamp"].timestamp();
+            write_ops::DeleteOpEntry stmt;
+
+            const auto minTimeToPreserve = std::min(timeOfMostRecentDoc, earliestClusterTime);
+            stmt.setQ(BSON(NamespacePlacementType::kNssFieldName
+                           << nss.ns() << NamespacePlacementType::kTimestampFieldName
+                           << BSON("$lt" << minTimeToPreserve)));
+            stmt.setMulti(true);
+            deleteStatements.emplace_back(std::move(stmt));
+        }
+        return true;
     };
 
-    WriteConcernOptions originalWC = opCtx->getWriteConcern();
-    opCtx->setWriteConcern(WriteConcernOptions{WriteConcernOptions::kMajority,
-                                               WriteConcernOptions::SyncMode::UNSET,
-                                               WriteConcernOptions::kNoTimeout});
+    uassertStatusOK(_localConfigShard->runAggregation(opCtx, aggRequest, callback));
 
-    ScopeGuard resetWriteConcerGuard([opCtx, &originalWC] { opCtx->setWriteConcern(originalWC); });
+    LOGV2_DEBUG(7068806,
+                2,
+                "Cleaning up placement history - about to clean entries",
+                "timestamp"_attr = earliestClusterTime,
+                "numNssToClean"_attr = deleteStatements.size());
 
-    auto& executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
-    auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
-    auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(executor);
+    /*
+     * Send the delete request.
+     */
+    write_ops::DeleteCommandRequest deleteRequest(
+        NamespaceString::kConfigsvrPlacementHistoryNamespace);
+    deleteRequest.setDeletes(std::move(deleteStatements));
+    uassertStatusOK(_localConfigShard->runCommandWithFixedRetryAttempts(
+        opCtx,
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        NamespaceString::kConfigsvrPlacementHistoryNamespace.db().toString(),
+        deleteRequest.toBSON({}),
+        Shard::RetryPolicy::kIdempotent));
 
-    txn_api::SyncTransactionWithRetries txn(
-        opCtx, sleepInlineExecutor, nullptr /*resourceYielder*/, inlineExecutor);
-    txn.run(opCtx, transactionChain);
+    LOGV2_DEBUG(7068808, 2, "Cleaning up placement history - done deleting entries");
 }
 
 void ShardingCatalogManager::_performLocalNoopWriteWithWAllWriteConcern(OperationContext* opCtx,

@@ -1,9 +1,9 @@
 /**
  * Tests that the configureQueryAnalyzer command persists the configuration in a document
  * in config.queryAnalyzers and that the document is deleted when the associated collection
- * is dropped.
+ * is dropped or renamed.
  *
- * @tags: [requires_fcv_63, featureFlagAnalyzeShardKey]
+ * @tags: [requires_fcv_70]
  */
 
 (function() {
@@ -15,15 +15,15 @@ load("jstests/sharding/analyze_shard_key/libs/query_sampling_util.js");
 function assertConfigQueryAnalyzerResponse(res, newConfig, oldConfig) {
     assert.eq(res.newConfiguration, newConfig, res);
     if (oldConfig) {
-        assert.eq(res.oldConfiguration, oldConfig);
+        assert.eq(res.oldConfiguration, oldConfig, res);
     } else {
-        assert(!res.hasOwnProperty("oldConfiguration"), oldConfig);
+        assert(!res.hasOwnProperty("oldConfiguration"), res);
     }
 }
 
 function assertQueryAnalyzerConfigDoc(conn, ns, collUuid, mode, sampleRate, startTime, stopTime) {
-    const doc = conn.getCollection("config.queryAnalyzers").findOne({_id: collUuid});
-    assert.eq(doc.ns, ns, doc);
+    const doc = conn.getCollection("config.queryAnalyzers").findOne({_id: ns});
+    assert.eq(doc.collUuid, collUuid, doc);
     assert.eq(doc.mode, mode, doc);
     assert.eq(doc.sampleRate, sampleRate, doc);
     assert(doc.hasOwnProperty("startTime"), doc);
@@ -37,34 +37,51 @@ function assertQueryAnalyzerConfigDoc(conn, ns, collUuid, mode, sampleRate, star
     return doc;
 }
 
-function assertNoQueryAnalyzerConfigDoc(conn, collUuid) {
-    const doc = conn.getCollection("config.queryAnalyzers").findOne({_id: collUuid});
+function assertNoQueryAnalyzerConfigDoc(conn, ns) {
+    const doc = conn.getCollection("config.queryAnalyzers").findOne({_id: ns});
     assert.eq(doc, null, doc);
 }
 
-function testPersistingConfiguration(conn) {
+function setUpCollection(conn, {isShardedColl, st}) {
     const dbName = "testDb-" + extractUUIDFromObject(UUID());
-    const collName = "testColl";
+    const collName = isShardedColl ? "testCollSharded" : "testCollUnsharded";
     const ns = dbName + "." + collName;
     const db = conn.getDB(dbName);
 
     assert.commandWorked(db.createCollection(collName));
-    const collUuid = QuerySamplingUtil.getCollectionUuid(db, collName);
+    if (isShardedColl) {
+        assert(st);
+        assert.commandWorked(st.s0.adminCommand({enableSharding: dbName}));
+        st.ensurePrimaryShard(dbName, st.shard0.name);
+        assert.commandWorked(st.s0.adminCommand({shardCollection: ns, key: {x: 1}}));
+        assert.commandWorked(st.s0.adminCommand({split: ns, middle: {x: 0}}));
+        assert.commandWorked(
+            st.s0.adminCommand({moveChunk: ns, find: {x: 0}, to: st.shard1.shardName}));
+    }
+
+    return {dbName, collName};
+}
+
+function testPersistingConfiguration(conn) {
+    const {dbName, collName} = setUpCollection(conn, {isShardedColl: false});
+    const ns = dbName + "." + collName;
+    const db = conn.getDB(dbName);
+    let collUuid = QuerySamplingUtil.getCollectionUuid(db, collName);
 
     jsTest.log(
         `Testing that the configureQueryAnalyzer command persists the configuration correctly ${
             tojson({dbName, collName, collUuid})}`);
 
     // Run a configureQueryAnalyzer command to disable query sampling. Verify that the command
-    // fails since query sampling is not even active.
+    // does not fail although query sampling is not even active.
     const mode0 = "off";
-    assert.commandFailedWithCode(conn.adminCommand({configureQueryAnalyzer: ns, mode: mode0}),
-                                 ErrorCodes.IllegalOperation);
-    assertNoQueryAnalyzerConfigDoc(conn, collUuid);
+    const res0 = assert.commandWorked(conn.adminCommand({configureQueryAnalyzer: ns, mode: mode0}));
+    assertConfigQueryAnalyzerResponse(res0, {mode: mode0} /* newConfig */);
+    assertNoQueryAnalyzerConfigDoc(conn, ns);
 
     // Run a configureQueryAnalyzer command to enable query sampling.
     const mode1 = "full";
-    const sampleRate1 = 100;
+    const sampleRate1 = 50;
     const res1 = assert.commandWorked(
         conn.adminCommand({configureQueryAnalyzer: ns, mode: mode1, sampleRate: sampleRate1}));
     const doc1 = assertQueryAnalyzerConfigDoc(conn, ns, collUuid, mode1, sampleRate1);
@@ -110,47 +127,43 @@ function testPersistingConfiguration(conn) {
                                       {mode: mode4, sampleRate: sampleRate4} /* newConfig */,
                                       {mode: mode4, sampleRate: sampleRate4} /* oldConfig */);
 
+    assert(db.getCollection(collName).drop());
+    assert.commandWorked(db.createCollection(collName));
+    collUuid = QuerySamplingUtil.getCollectionUuid(db, collName);
+
+    // Run a configureQueryAnalyzer command to re-enable query sampling after dropping the
+    // collection. Verify that the 'startTime' is new, and "oldConfiguration" is not returned.
+    const mode5 = "full";
+    const sampleRate5 = 0.1;
+    const res5 = assert.commandWorked(
+        conn.adminCommand({configureQueryAnalyzer: ns, mode: mode5, sampleRate: sampleRate5}));
+    const doc5 = assertQueryAnalyzerConfigDoc(conn, ns, collUuid, mode5, sampleRate5);
+    assert.gt(doc5.startTime, doc4.startTime, doc5);
+    assertConfigQueryAnalyzerResponse(res5, {mode: mode5, sampleRate: sampleRate5} /* newConfig */);
+
     // Run a configureQueryAnalyzer command to disable query sampling. Verify that the 'sampleRate'
     // doesn't get unset.
-    const mode5 = "off";
-    const res5 = assert.commandWorked(conn.adminCommand({configureQueryAnalyzer: ns, mode: mode5}));
-    const doc5 =
-        assertQueryAnalyzerConfigDoc(conn, ns, collUuid, mode5, sampleRate4, doc4.startTime);
-    assertConfigQueryAnalyzerResponse(res5,
-                                      {mode: mode5} /* newConfig */,
-                                      {mode: mode4, sampleRate: sampleRate4} /* oldConfig */);
+    const mode6 = "off";
+    const res6 = assert.commandWorked(conn.adminCommand({configureQueryAnalyzer: ns, mode: mode6}));
+    const doc6 =
+        assertQueryAnalyzerConfigDoc(conn, ns, collUuid, mode6, sampleRate5, doc5.startTime);
+    assertConfigQueryAnalyzerResponse(res6,
+                                      {mode: mode6} /* newConfig */,
+                                      {mode: mode5, sampleRate: sampleRate5} /* oldConfig */);
 
-    // Retry the previous configureQueryAnalyzer command. Verify that the 'stopTime' remains the
-    // same.
-    assert.commandFailedWithCode(conn.adminCommand({configureQueryAnalyzer: ns, mode: mode5}),
-                                 ErrorCodes.IllegalOperation);
+    // Retry the previous configureQueryAnalyzer command. Verify that the retry does not fail and
+    // that the 'stopTime' remains the same.
+    assert.commandWorked(conn.adminCommand({configureQueryAnalyzer: ns, mode: mode6}));
     assertQueryAnalyzerConfigDoc(
-        conn, ns, collUuid, mode5, sampleRate4, doc4.startTime, doc5.stopTime);
+        conn, ns, collUuid, mode6, sampleRate5, doc5.startTime, doc6.stopTime);
 }
 
-function testDeletingConfigurations(conn, {dropDatabase, dropCollection, isShardedColl, st}) {
-    assert(dropDatabase || dropCollection, "Expected the test to drop the database or collection");
-    assert(!dropDatabase || !dropCollection);
-    assert(!isShardedColl || st);
-
-    const dbName = "testDb-" + extractUUIDFromObject(UUID());
-    const collName = isShardedColl ? "testCollSharded" : "testCollUnsharded";
+function testConfigurationDeletionDropCollection(conn, {isShardedColl, rst, st}) {
+    const {dbName, collName} = setUpCollection(conn, {isShardedColl, rst, st});
     const ns = dbName + "." + collName;
-    const db = conn.getDB(dbName);
-    const coll = db.getCollection(collName);
-    jsTest.log(`Testing configuration deletion ${
-        tojson({dbName, collName, isShardedColl, dropDatabase, dropCollection})}`);
-
-    assert.commandWorked(db.createCollection(collName));
-    if (isShardedColl) {
-        assert.commandWorked(st.s0.adminCommand({enableSharding: dbName}));
-        st.ensurePrimaryShard(dbName, st.shard0.name);
-        assert.commandWorked(st.s0.adminCommand({shardCollection: ns, key: {x: 1}}));
-        assert.commandWorked(st.s0.adminCommand({split: ns, middle: {x: 0}}));
-        assert.commandWorked(
-            st.s0.adminCommand({moveChunk: ns, find: {x: 0}, to: st.shard1.shardName}));
-    }
-    const collUuid = QuerySamplingUtil.getCollectionUuid(db, collName);
+    const collUuid = QuerySamplingUtil.getCollectionUuid(conn.getDB(dbName), collName);
+    jsTest.log(`Testing configuration deletion upon dropCollection ${
+        tojson({dbName, collName, isShardedColl})}`);
 
     const mode = "full";
     const sampleRate = 0.5;
@@ -159,25 +172,101 @@ function testDeletingConfigurations(conn, {dropDatabase, dropCollection, isShard
     assertConfigQueryAnalyzerResponse(res, {mode, sampleRate});
     assertQueryAnalyzerConfigDoc(conn, ns, collUuid, mode, sampleRate);
 
-    if (dropDatabase) {
-        assert.commandWorked(db.dropDatabase());
-    } else if (dropCollection) {
-        assert(coll.drop());
+    assert(conn.getDB(dbName).getCollection(collName).drop());
+    if (st) {
+        assertNoQueryAnalyzerConfigDoc(conn, ns);
+    } else {
+        // TODO (SERVER-76443): Make sure that dropCollection on replica set delete the
+        // config.queryAnalyzers doc for the collection being dropped.
+        assertQueryAnalyzerConfigDoc(conn, ns, collUuid, mode, sampleRate);
     }
+}
 
-    assertNoQueryAnalyzerConfigDoc(conn, collUuid);
+function testConfigurationDeletionDropDatabase(conn, {isShardedColl, rst, st}) {
+    const {dbName, collName} = setUpCollection(conn, {isShardedColl, rst, st});
+    const ns = dbName + "." + collName;
+    const collUuid = QuerySamplingUtil.getCollectionUuid(conn.getDB(dbName), collName);
+    jsTest.log(`Testing configuration deletion upon dropDatabase ${
+        tojson({dbName, collName, isShardedColl})}`);
+
+    const mode = "full";
+    const sampleRate = 0.5;
+    const res =
+        assert.commandWorked(conn.adminCommand({configureQueryAnalyzer: ns, mode, sampleRate}));
+    assertConfigQueryAnalyzerResponse(res, {mode, sampleRate});
+    assertQueryAnalyzerConfigDoc(conn, ns, collUuid, mode, sampleRate);
+
+    assert.commandWorked(conn.getDB(dbName).dropDatabase());
+    if (st) {
+        assertNoQueryAnalyzerConfigDoc(conn, ns);
+    } else {
+        // TODO (SERVER-76443): Make sure that dropDatabase on replica set delete the
+        // config.queryAnalyzers docs for all collections in the database being dropped.
+        assertQueryAnalyzerConfigDoc(conn, ns, collUuid, mode, sampleRate);
+    }
+}
+
+function testConfigurationDeletionRenameCollection(conn, {sameDatabase, isShardedColl, rst, st}) {
+    const {dbName, collName} = setUpCollection(conn, {isShardedColl, rst, st});
+
+    const srcDbName = dbName;
+    const srcCollName = collName;
+    const srcNs = srcDbName + "." + srcCollName;
+    const srcDb = conn.getDB(srcDbName);
+    const srcCollUuid = QuerySamplingUtil.getCollectionUuid(srcDb, srcCollName);
+
+    const dstDbName = sameDatabase ? srcDbName : (srcDbName + "New");
+    const dstCollName = sameDatabase ? (srcCollName + "New") : srcCollName;
+    const dstNs = dstDbName + "." + dstCollName;
+    const dstDb = conn.getDB(dstDbName);
+    assert.commandWorked(dstDb.createCollection(dstCollName));
+    if (!sameDatabase && st) {
+        // On a sharded cluster, the src and dst collections must be on same shard.
+        st.ensurePrimaryShard(dstDbName, st.getPrimaryShardIdForDatabase(srcDbName));
+    }
+    const dstCollUuid = QuerySamplingUtil.getCollectionUuid(dstDb, dstCollName);
+
+    jsTest.log(`Testing configuration deletion upon renameCollection ${
+        tojson({sameDatabase, srcDbName, srcCollName, dstDbName, dstCollName, isShardedColl})}`);
+
+    const mode = "full";
+    const sampleRate = 0.5;
+
+    const srcRes =
+        assert.commandWorked(conn.adminCommand({configureQueryAnalyzer: srcNs, mode, sampleRate}));
+    assertConfigQueryAnalyzerResponse(srcRes, {mode, sampleRate});
+    assertQueryAnalyzerConfigDoc(conn, srcNs, srcCollUuid, mode, sampleRate);
+
+    const dstRes =
+        assert.commandWorked(conn.adminCommand({configureQueryAnalyzer: dstNs, mode, sampleRate}));
+    assertConfigQueryAnalyzerResponse(dstRes, {mode, sampleRate});
+    assertQueryAnalyzerConfigDoc(conn, dstNs, dstCollUuid, mode, sampleRate);
+
+    assert.commandWorked(conn.adminCommand({renameCollection: srcNs, to: dstNs, dropTarget: true}));
+    if (st) {
+        assertNoQueryAnalyzerConfigDoc(conn, srcNs);
+        assertNoQueryAnalyzerConfigDoc(conn, dstNs);
+    } else {
+        // TODO (SERVER-76443): Make sure that renameCollection on replica set delete the
+        // config.queryAnalyzers doc for the collection being renamed.
+        assertQueryAnalyzerConfigDoc(conn, srcNs, srcCollUuid, mode, sampleRate);
+        assertQueryAnalyzerConfigDoc(conn, dstNs, dstCollUuid, mode, sampleRate);
+    }
 }
 
 {
     const st = new ShardingTest({shards: 2, rs: {nodes: 1}});
 
     testPersistingConfiguration(st.s);
-    // TODO (SERVER-70479): Make sure that dropDatabase and dropCollection delete the
-    // config.queryAnalyzers doc for the collection being dropped.
-    // testDeletingConfigurations(st.s, {dropDatabase: true, isShardedColl: false, st});
-    testDeletingConfigurations(st.s, {dropDatabase: true, isShardedColl: true, st});
-    testDeletingConfigurations(st.s, {dropCollection: true, isShardedColl: false, st});
-    testDeletingConfigurations(st.s, {dropCollection: true, isShardedColl: true, st});
+    for (let isShardedColl of [true, false]) {
+        testConfigurationDeletionDropCollection(st.s, {st, isShardedColl});
+        testConfigurationDeletionDropDatabase(st.s, {st, isShardedColl});
+        testConfigurationDeletionRenameCollection(st.s, {st, sameDatabase: true, isShardedColl});
+    }
+    // During renameCollection, the source database is only allowed to be different from the
+    // destination database when the collection being renamed is unsharded.
+    testConfigurationDeletionRenameCollection(st.s,
+                                              {st, sameDatabase: false, isShardedColl: false});
 
     st.stop();
 }
@@ -189,10 +278,10 @@ function testDeletingConfigurations(conn, {dropDatabase, dropCollection, isShard
     const primary = rst.getPrimary();
 
     testPersistingConfiguration(primary);
-    // TODO (SERVER-70479): Make sure that dropDatabase and dropCollection delete the
-    // config.queryAnalyzers doc for the collection being dropped.
-    // testDeletingConfigurations(primary, {dropDatabase: true, isShardedColl: false});
-    // testDeletingConfigurations(primary, {dropCollection: true, isShardedColl: false});
+    testConfigurationDeletionDropCollection(primary, {rst});
+    testConfigurationDeletionDropDatabase(primary, {rst});
+    testConfigurationDeletionRenameCollection(primary, {rst, sameDatabase: false});
+    testConfigurationDeletionRenameCollection(primary, {rst, sameDatabase: true});
 
     rst.stopSet();
 }

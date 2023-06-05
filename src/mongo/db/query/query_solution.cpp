@@ -324,6 +324,11 @@ CollectionScanNode::CollectionScanNode()
 void CollectionScanNode::computeProperties() {
     if (clusteredIndex && hasCompatibleCollation) {
         auto sort = clustered_util::getSortPattern(*clusteredIndex);
+        if (direction == -1) {
+            // If we are scanning the collection in the descending direction, we provide the reverse
+            // sort order.
+            sort = QueryPlannerCommon::reverseSortObj(sort);
+        }
         sortSet = ProvidedSortSet(sort);
     }
 }
@@ -347,6 +352,8 @@ std::unique_ptr<QuerySolutionNode> CollectionScanNode::clone() const {
     copy->name = this->name;
     copy->tailable = this->tailable;
     copy->direction = this->direction;
+    copy->isClustered = this->isClustered;
+    copy->isOplog = this->isOplog;
     copy->shouldTrackLatestOplogTimestamp = this->shouldTrackLatestOplogTimestamp;
     copy->assertTsHasNotFallenOff = this->assertTsHasNotFallenOff;
     copy->shouldWaitForOplogVisibility = this->shouldWaitForOplogVisibility;
@@ -1695,7 +1702,7 @@ void EqLookupNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "EQ_LOOKUP\n";
     addIndent(ss, indent + 1);
-    *ss << "from = " << foreignCollection << "\n";
+    *ss << "from = " << toStringForLogging(foreignCollection) << "\n";
     addIndent(ss, indent + 1);
     *ss << "as = " << joinField.fullPath() << "\n";
     addIndent(ss, indent + 1);

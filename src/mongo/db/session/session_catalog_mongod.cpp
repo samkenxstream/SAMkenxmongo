@@ -45,6 +45,7 @@
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/session/internal_transactions_reap_service.h"
 #include "mongo/db/session/session_txn_record_gen.h"
 #include "mongo/db/session/sessions_collection.h"
 #include "mongo/db/transaction/transaction_participant.h"
@@ -110,6 +111,13 @@ void killSessionTokens(OperationContext* opCtx,
             invariant(status);
 
             ThreadClient tc("Kill-Sessions", service);
+
+            // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+            {
+                stdx::lock_guard<Client> lk(*tc.get());
+                tc.get()->setSystemOperationUnkillableByStepdown(lk);
+            }
+
             auto uniqueOpCtx = tc->makeOperationContext();
             const auto opCtx = uniqueOpCtx.get();
             const auto catalog = SessionCatalog::get(opCtx);
@@ -126,9 +134,10 @@ void disallowDirectWritesUnderSession(OperationContext* opCtx) {
     bool isReplSet = replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
     if (isReplSet) {
         uassert(40528,
-                str::stream() << "Direct writes against "
-                              << NamespaceString::kSessionTransactionsTableNamespace
-                              << " cannot be performed using a transaction or on a session.",
+                str::stream()
+                    << "Direct writes against "
+                    << NamespaceString::kSessionTransactionsTableNamespace.toStringForErrorMsg()
+                    << " cannot be performed using a transaction or on a session.",
                 !opCtx->getLogicalSessionId());
     }
 }
@@ -377,11 +386,12 @@ void createTransactionTable(OperationContext* opCtx) {
         // empty collection. This can happen after a failover because the collection and index
         // creation are recorded as separate oplog entries.
     } else {
-        uassertStatusOKWithContext(createCollectionStatus,
-                                   str::stream()
-                                       << "Failed to create the "
-                                       << NamespaceString::kSessionTransactionsTableNamespace.ns()
-                                       << " collection");
+        uassertStatusOKWithContext(
+            createCollectionStatus,
+            str::stream()
+                << "Failed to create the "
+                << NamespaceString::kSessionTransactionsTableNamespace.toStringForErrorMsg()
+                << " collection");
     }
 
     auto indexSpec = MongoDSessionCatalog::getConfigTxnPartialIndexSpec();
@@ -391,7 +401,8 @@ void createTransactionTable(OperationContext* opCtx) {
     uassertStatusOKWithContext(
         createIndexStatus,
         str::stream() << "Failed to create partial index for the "
-                      << NamespaceString::kSessionTransactionsTableNamespace.ns() << " collection");
+                      << NamespaceString::kSessionTransactionsTableNamespace.toStringForErrorMsg()
+                      << " collection");
 }
 
 void createRetryableFindAndModifyTable(OperationContext* opCtx) {
@@ -404,9 +415,10 @@ void createRetryableFindAndModifyTable(OperationContext* opCtx) {
     }
 
     uassertStatusOKWithContext(status,
-                               str::stream() << "Failed to create the "
-                                             << NamespaceString::kConfigImagesNamespace.ns()
-                                             << " collection");
+                               str::stream()
+                                   << "Failed to create the "
+                                   << NamespaceString::kConfigImagesNamespace.toStringForErrorMsg()
+                                   << " collection");
 }
 
 
@@ -469,6 +481,16 @@ MongoDSessionCatalog* MongoDSessionCatalog::get(ServiceContext* service) {
 void MongoDSessionCatalog::set(ServiceContext* service,
                                std::unique_ptr<MongoDSessionCatalog> sessionCatalog) {
     getMongoDSessionCatalog(service) = std::move(sessionCatalog);
+
+    // Set mongod specific behaviors on the SessionCatalog.
+    SessionCatalog::get(service)->setEagerReapSessionsFns(
+        InternalTransactionsReapService::onEagerlyReapedSessions,
+        [](ServiceContext* service,
+           TxnNumber clientTxnNumberStarted,
+           SessionCatalog::Provenance provenance) {
+            return MongoDSessionCatalog::get(service)->makeSessionWorkerFnForEagerReap(
+                clientTxnNumberStarted, provenance);
+        });
 }
 
 BSONObj MongoDSessionCatalog::getConfigTxnPartialIndexSpec() {
@@ -510,6 +532,12 @@ void MongoDSessionCatalog::onStepUp(OperationContext* opCtx) {
     {
         // Create a new opCtx because we need an empty locker to refresh the locks.
         auto newClient = opCtx->getServiceContext()->makeClient("restore-prepared-txn");
+
+        {
+            stdx::lock_guard<Client> lk(*newClient.get());
+            newClient.get()->setSystemOperationUnkillableByStepdown(lk);
+        }
+
         AlternativeClientRegion acr(newClient);
         for (const auto& sessionInfo : sessionsToReacquireLocks) {
             auto newOpCtx = cc().makeOperationContext();
@@ -548,11 +576,7 @@ void MongoDSessionCatalog::onStepUp(OperationContext* opCtx) {
     abortInProgressTransactions(opCtx, this, _ti.get());
 
     createTransactionTable(opCtx);
-    // (Ignore FCV check): This is intentional to try creating the image_collection collection if
-    // the feature flag is ever enabled.
-    if (repl::feature_flags::gFeatureFlagRetryableFindAndModify.isEnabledAndIgnoreFCVUnsafe()) {
-        createRetryableFindAndModifyTable(opCtx);
-    }
+    createRetryableFindAndModifyTable(opCtx);
 }
 
 boost::optional<UUID> MongoDSessionCatalog::getTransactionTableUUID(OperationContext* opCtx) {
@@ -634,7 +658,7 @@ int MongoDSessionCatalog::reapSessionsOlderThan(OperationContext* opCtx,
     // around the fact that the logical sessions cache is not registered to listen for replication
     // state changes.
     const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    if (!replCoord->canAcceptWritesForDatabase_UNSAFE(opCtx, DatabaseName::kConfig.toString()))
+    if (!replCoord->canAcceptWritesForDatabase_UNSAFE(opCtx, DatabaseName::kConfig))
         return 0;
 
     return removeExpiredTransactionSessionsFromDisk(
@@ -679,6 +703,11 @@ void MongoDSessionCatalog::checkInUnscopedSession(OperationContext* opCtx,
 
 void MongoDSessionCatalog::checkOutUnscopedSession(OperationContext* opCtx) {
     _checkOutUnscopedSession(opCtx, _ti.get());
+}
+
+SessionCatalog::ScanSessionsCallbackFn MongoDSessionCatalog::makeSessionWorkerFnForEagerReap(
+    TxnNumber clientTxnNumberStarted, SessionCatalog::Provenance provenance) {
+    return _ti->makeSessionWorkerFnForEagerReap(clientTxnNumberStarted, provenance);
 }
 
 MongoDOperationContextSession::MongoDOperationContextSession(

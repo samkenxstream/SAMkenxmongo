@@ -327,14 +327,19 @@ class _StructTypeInfo(StructTypeInfoBase):
 
     def get_serializer_method(self):
         # type: () -> MethodInfo
+        args = ['BSONObjBuilder* builder']
+        if self._struct.query_shape_component:
+            args.append("SerializationOptions options = {}")
         return MethodInfo(
-            common.title_case(self._struct.cpp_name), 'serialize', ['BSONObjBuilder* builder'],
-            'void', const=True)
+            common.title_case(self._struct.cpp_name), 'serialize', args, 'void', const=True)
 
     def get_to_bson_method(self):
         # type: () -> MethodInfo
+        args = []
+        if self._struct.query_shape_component:
+            args.append("SerializationOptions options = {}")
         return MethodInfo(
-            common.title_case(self._struct.cpp_name), 'toBSON', [], 'BSONObj', const=True)
+            common.title_case(self._struct.cpp_name), 'toBSON', args, 'BSONObj', const=True)
 
     def get_op_msg_request_serializer_method(self):
         # type: () -> Optional[MethodInfo]
@@ -580,7 +585,14 @@ class _CommandWithNamespaceTypeInfo(_CommandBaseTypeInfo):
         indented_writer.write_line('invariant(_nss.isEmpty());')
         allow_global = 'true' if self._struct.allow_global_collection_name else 'false'
         indented_writer.write_line(
-            '_nss = ctxt.parseNSCollectionRequired(%s, %s, %s);' % (db_name, element, allow_global))
+            'auto collectionName = ctxt.checkAndAssertCollectionName(%s, %s);' % (element,
+                                                                                  allow_global))
+        indented_writer.write_line(
+            '_nss = NamespaceStringUtil::parseNamespaceFromRequest(%s, collectionName);' %
+            (db_name))
+        indented_writer.write_line(
+            'uassert(ErrorCodes::InvalidNamespace, str::stream() << "Invalid namespace specified: "'
+            ' << _nss.toStringForErrorMsg(), _nss.isValid());')
 
 
 class _CommandWithUUIDNamespaceTypeInfo(_CommandBaseTypeInfo):
@@ -653,7 +665,15 @@ class _CommandWithUUIDNamespaceTypeInfo(_CommandBaseTypeInfo):
     def gen_namespace_check(self, indented_writer, db_name, element):
         # type: (writer.IndentedTextWriter, str, str) -> None
         indented_writer.write_line('invariant(_nssOrUUID.nss() || _nssOrUUID.uuid());')
-        indented_writer.write_line('_nssOrUUID = ctxt.parseNsOrUUID(%s, %s);' % (db_name, element))
+        indented_writer.write_line(
+            'auto collOrUUID = ctxt.checkAndAssertCollectionNameOrUUID(%s);' % (element))
+        indented_writer.write_line(
+            '_nssOrUUID = stdx::holds_alternative<StringData>(collOrUUID) ? NamespaceStringUtil::parseNamespaceFromRequest(%s, stdx::get<StringData>(collOrUUID)) : NamespaceStringOrUUID(%s, stdx::get<UUID>(collOrUUID));'
+            % (db_name, db_name))
+        indented_writer.write_line(
+            'uassert(ErrorCodes::InvalidNamespace, str::stream() << "Invalid namespace specified: "'
+            ' << _nssOrUUID.nss()->toStringForErrorMsg()'
+            ', _nssOrUUID.nss() ? _nssOrUUID.nss()->isValid() : true);')
 
 
 def get_struct_info(struct):

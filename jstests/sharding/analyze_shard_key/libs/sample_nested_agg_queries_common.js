@@ -29,15 +29,15 @@ const outerAggTestCases = [
             ];
         },
         requireShardToRouteFunc: (db, collName, isShardedColl) => {
-            // When SBE is enabled, if the collection is not sharded and not clustered, the shard
-            // will not create a separate pipeline to execute the inner side of a $lookup stage so
-            // there is no nested aggregate query to route.
             const listCollectionRes =
                 assert.commandWorked(db.runCommand({listCollections: 1, filter: {name: collName}}));
             const isClusteredColl =
                 listCollectionRes.cursor.firstBatch[0].options.hasOwnProperty("clusteredIndex");
-            const isEligibleForSBELookupPushdown =
-                checkSBEEnabled(db) && !isShardedColl && !isClusteredColl;
+
+            // When SBE is used, the shard will not create a separate pipeline to execute the inner
+            // side of a $lookup stage so there is no nested aggregate query to route, because SBE
+            // does $lookup pushdown whereas Classic does not.
+            const isEligibleForSBELookupPushdown = !isShardedColl && checkSBEEnabled(db);
             return !isEligibleForSBELookupPushdown;
         }
     },

@@ -100,8 +100,8 @@ TEST(ChangeStreamEventTransformTest, TestDefaultUpdateTransform) {
 }
 
 TEST(ChangeStreamEventTransformTest, TestCreateViewTransform) {
-    const NamespaceString systemViewNss =
-        NamespaceString::makeSystemDotViewsNamespace({boost::none, "viewDB"});
+    const NamespaceString systemViewNss = NamespaceString::makeSystemDotViewsNamespace(
+        DatabaseName::createDatabaseName_forTest(boost::none, "viewDB"));
     const NamespaceString viewNss =
         NamespaceString::createNamespaceString_forTest(boost::none, "viewDB.view.name");
     const auto viewPipeline =
@@ -109,7 +109,7 @@ TEST(ChangeStreamEventTransformTest, TestCreateViewTransform) {
     const auto opDescription = Document{{"viewOn", "baseColl"_sd}, {"pipeline", viewPipeline}};
     auto oplogEntry = makeOplogEntry(repl::OpTypeEnum::kInsert,  // op type
                                      systemViewNss,              // namespace
-                                     BSON("_id" << viewNss.toString() << "viewOn"
+                                     BSON("_id" << viewNss.toString_forTest() << "viewOn"
                                                 << "baseColl"
                                                 << "pipeline" << viewPipeline),  // o
                                      testUuid(),                                 // uuid
@@ -128,20 +128,21 @@ TEST(ChangeStreamEventTransformTest, TestCreateViewTransform) {
          Document{{"db", viewNss.db()}, {"coll", viewNss.coll()}}},
         {DocumentSourceChangeStream::kOperationDescriptionField, opDescription}};
 
-    ASSERT_DOCUMENT_EQ(applyTransformation(oplogEntry,
-                                           NamespaceString::makeCollectionlessAggregateNSS(
-                                               DatabaseName(boost::none, "viewDB"))),
-                       expectedDoc);
+    ASSERT_DOCUMENT_EQ(
+        applyTransformation(oplogEntry,
+                            NamespaceString::makeCollectionlessAggregateNSS(
+                                DatabaseName::createDatabaseName_forTest(boost::none, "viewDB"))),
+        expectedDoc);
 }
 
 TEST(ChangeStreamEventTransformTest, TestCreateViewOnSingleCollection) {
-    const NamespaceString systemViewNss =
-        NamespaceString::makeSystemDotViewsNamespace({boost::none, "viewDB"});
+    const NamespaceString systemViewNss = NamespaceString::makeSystemDotViewsNamespace(
+        DatabaseName::createDatabaseName_forTest(boost::none, "viewDB"));
     const NamespaceString viewNss =
         NamespaceString::createNamespaceString_forTest(boost::none, "viewDB.view.name");
     const auto viewPipeline =
         Value(fromjson("[{$match: {field: 'value'}}, {$project: {field: 1}}]"));
-    const auto document = BSON("_id" << viewNss.toString() << "viewOn"
+    const auto document = BSON("_id" << viewNss.toString_forTest() << "viewOn"
                                      << "baseColl"
                                      << "pipeline" << viewPipeline);
     const auto documentKey = Value(Document{{"_id", document["_id"]}});
@@ -227,12 +228,13 @@ TEST(ChangeStreamEventTransformTest, TestRenameTransformWithTenantId) {
     NamespaceString renameTo =
         NamespaceString::createNamespaceString_forTest(tenantId, "unittests.rename_coll");
 
-    auto renameField = makeOplogEntry(
-        repl::OpTypeEnum::kCommand,  // op type
-        renameFrom.getCommandNS(),   // namespace
-        BSON("renameCollection" << renameFrom.toString() << "to" << renameTo.toString()),  // o
-        testUuid()                                                                         // uuid
-    );
+    auto renameField =
+        makeOplogEntry(repl::OpTypeEnum::kCommand,  // op type
+                       renameFrom.getCommandNS(),   // namespace
+                       BSON("renameCollection" << renameFrom.toString_forTest() << "to"
+                                               << renameTo.toString_forTest()),  // o
+                       testUuid()                                                // uuid
+        );
 
     Document expectedDoc{{DocumentSourceChangeStream::kNamespaceField,
                           Document{{"db", renameFrom.dbName().db()}, {"coll", renameFrom.coll()}}},
@@ -257,12 +259,13 @@ TEST(ChangeStreamEventTransformTest, TestRenameTransformWithTenantId) {
     // in the oplog entry. It should still not be a part of the db name in the change event.
     RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", true);
 
-    auto oplogEntry = makeOplogEntry(
-        repl::OpTypeEnum::kCommand,  // op type
-        renameFrom.getCommandNS(),   // namespace
-        BSON("renameCollection" << renameFrom.toString() << "to" << renameTo.toString()),  // o
-        testUuid()                                                                         // uuid
-    );
+    auto oplogEntry =
+        makeOplogEntry(repl::OpTypeEnum::kCommand,  // op type
+                       renameFrom.getCommandNS(),   // namespace
+                       BSON("renameCollection" << renameFrom.toString_forTest() << "to"
+                                               << renameTo.toString_forTest()),  // o
+                       testUuid()                                                // uuid
+        );
 
     changeStreamDoc = applyTransformation(oplogEntry, renameFrom);
     renameDoc = Document{
@@ -363,8 +366,8 @@ TEST(ChangeStreamEventTransformTest, TestCreateViewTransformWithTenantId) {
 
     const auto tenantId = TenantId(OID::gen());
 
-    const NamespaceString systemViewNss =
-        NamespaceString::makeSystemDotViewsNamespace({tenantId, "viewDB"});
+    const NamespaceString systemViewNss = NamespaceString::makeSystemDotViewsNamespace(
+        DatabaseName::createDatabaseName_forTest(tenantId, "viewDB"));
     const NamespaceString viewNss =
         NamespaceString::createNamespaceString_forTest(tenantId, "viewDB.view.name");
     const auto viewPipeline =
@@ -372,7 +375,7 @@ TEST(ChangeStreamEventTransformTest, TestCreateViewTransformWithTenantId) {
     const auto opDescription = Document{{"viewOn", "baseColl"_sd}, {"pipeline", viewPipeline}};
     auto createView = makeOplogEntry(repl::OpTypeEnum::kInsert,  // op type
                                      systemViewNss,              // namespace
-                                     BSON("_id" << viewNss.toString() << "viewOn"
+                                     BSON("_id" << viewNss.toString_forTest() << "viewOn"
                                                 << "baseColl"
                                                 << "pipeline" << viewPipeline),  // o
                                      testUuid());                                // uuid
@@ -391,7 +394,7 @@ TEST(ChangeStreamEventTransformTest, TestCreateViewTransformWithTenantId) {
 
     auto oplogEntry = makeOplogEntry(repl::OpTypeEnum::kInsert,  // op type
                                      systemViewNss,              // namespace
-                                     BSON("_id" << viewNss.toString() << "viewOn"
+                                     BSON("_id" << viewNss.toString_forTest() << "viewOn"
                                                 << "baseColl"
                                                 << "pipeline" << viewPipeline),  // o
                                      testUuid());

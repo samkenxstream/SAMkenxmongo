@@ -644,7 +644,7 @@ static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
     {"abs", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::abs, false}},
     {"ceil", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::ceil, false}},
     {"floor", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::floor, false}},
-    {"trunc", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::trunc, false}},
+    {"trunc", BuiltinFn{[](size_t n) { return n == 1 || n == 2; }, vm::Builtin::trunc, false}},
     {"exp", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::exp, false}},
     {"ln", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::ln, false}},
     {"log10", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::log10, false}},
@@ -767,6 +767,8 @@ static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
     {"sortKeyComponentVectorGetElement",
      BuiltinFn{
          [](size_t n) { return n == 2; }, vm::Builtin::sortKeyComponentVectorGetElement, false}},
+    {"sortKeyComponentVectorToArray",
+     BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::sortKeyComponentVectorToArray, false}},
     {"tsSecond", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::tsSecond, false}},
     {"tsIncrement", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::tsIncrement, false}},
     {"typeMatch", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::typeMatch, false}},
@@ -779,6 +781,37 @@ static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
      BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::objectToArray, false}},
     {"arrayToObject",
      BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::arrayToObject, false}},
+    {"array", BuiltinFn{kAnyNumberOfArgs, vm::Builtin::newArray, false}},
+    {"aggFirstNNeedsMoreInput",
+     BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::aggFirstNNeedsMoreInput, false}},
+    {"aggFirstN", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::aggFirstN, false}},
+    {"aggFirstNMerge",
+     BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::aggFirstNMerge, true}},
+    {"aggFirstNFinalize",
+     BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::aggFirstNFinalize, false}},
+    {"aggLastN", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::aggLastN, true}},
+    {"aggLastNMerge", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::aggLastNMerge, true}},
+    {"aggLastNFinalize",
+     BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::aggLastNFinalize, false}},
+    {"aggTopN", BuiltinFn{[](size_t n) { return n == 3; }, vm::Builtin::aggTopN, true}},
+    {"aggTopNMerge", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::aggTopNMerge, true}},
+    {"aggTopNFinalize",
+     BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::aggTopNFinalize, false}},
+    {"aggBottomN", BuiltinFn{[](size_t n) { return n == 3; }, vm::Builtin::aggBottomN, true}},
+    {"aggBottomNMerge",
+     BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::aggBottomNMerge, true}},
+    {"aggBottomNFinalize",
+     BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::aggBottomNFinalize, false}},
+    {"aggMaxN", BuiltinFn{[](size_t n) { return n == 1 || n == 2; }, vm::Builtin::aggMaxN, true}},
+    {"aggMaxNMerge",
+     BuiltinFn{[](size_t n) { return n == 1 || n == 2; }, vm::Builtin::aggMaxNMerge, true}},
+    {"aggMaxNFinalize",
+     BuiltinFn{[](size_t n) { return n == 1 || n == 2; }, vm::Builtin::aggMaxNFinalize, false}},
+    {"aggMinN", BuiltinFn{[](size_t n) { return n == 1 || n == 2; }, vm::Builtin::aggMinN, true}},
+    {"aggMinNMerge",
+     BuiltinFn{[](size_t n) { return n == 1 || n == 2; }, vm::Builtin::aggMinNMerge, true}},
+    {"aggMinNFinalize",
+     BuiltinFn{[](size_t n) { return n == 1 || n == 2; }, vm::Builtin::aggMinNFinalize, false}},
 };
 
 /**
@@ -1117,6 +1150,18 @@ vm::CodeFragment EFunction::compileDirect(CompileCtx& ctx) const {
         }
 
         return (it->second.generate)(ctx, _nodes, it->second.aggregate);
+    }
+
+    if (_name == "aggState") {
+        uassert(7695204,
+                "aggregate function call: aggState occurs in the non-aggregate context.",
+                ctx.aggExpression && ctx.accumulator);
+        uassert(7695205,
+                str::stream() << "function call: aggState has wrong arity: " << _nodes.size(),
+                _nodes.size() == 0);
+        vm::CodeFragment code;
+        code.appendMoveVal(ctx.accumulator);
+        return code;
     }
 
     uasserted(4822847, str::stream() << "unknown function call: " << _name);

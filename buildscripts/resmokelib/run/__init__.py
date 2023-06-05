@@ -260,20 +260,30 @@ class TestRunner(Subcommand):
     def _log_local_resmoke_invocation(self):
         """Log local resmoke invocation example."""
         local_args = to_local_args()
+        local_args = strip_fuzz_config_params(local_args)
         local_resmoke_invocation = (
             f"{os.path.join('buildscripts', 'resmoke.py')} {' '.join(local_args)}")
 
+        using_config_fuzzer = False
         if config.FUZZ_MONGOD_CONFIGS:
-            local_args = strip_fuzz_config_params(local_args)
-            local_resmoke_invocation = (
-                f"{os.path.join('buildscripts', 'resmoke.py')} {' '.join(local_args)}"
-                f" --fuzzMongodConfigs={config.FUZZ_MONGOD_CONFIGS} --configFuzzSeed={str(config.CONFIG_FUZZ_SEED)}"
-            )
+            using_config_fuzzer = True
+            local_resmoke_invocation += f" --fuzzMongodConfigs={config.FUZZ_MONGOD_CONFIGS}"
 
             self._resmoke_logger.info("Fuzzed mongodSetParameters:\n%s",
                                       config.MONGOD_SET_PARAMETERS)
             self._resmoke_logger.info("Fuzzed wiredTigerConnectionString: %s",
                                       config.WT_ENGINE_CONFIG)
+
+        if config.FUZZ_MONGOS_CONFIGS:
+            using_config_fuzzer = True
+            local_resmoke_invocation += f" --fuzzMongosConfigs={config.FUZZ_MONGOS_CONFIGS}"
+
+            self._resmoke_logger.info("Fuzzed mongosSetParameters:\n%s",
+                                      config.MONGOS_SET_PARAMETERS)
+
+        if using_config_fuzzer:
+            local_resmoke_invocation += f" --configFuzzSeed={str(config.CONFIG_FUZZ_SEED)}"
+
         resmoke_env_options = ''
         if os.path.exists('resmoke_env_options.txt'):
             with open('resmoke_env_options.txt') as fin:
@@ -442,6 +452,9 @@ class TestRunner(Subcommand):
             self._resmoke_logger.error("Failed to parse YAML suite definition: %s", str(err))
             self.list_suites()
             self.exit(1)
+        except errors.InvalidMatrixSuiteError as err:
+            self._resmoke_logger.error("Failed to get matrix suite: %s", str(err))
+            self.exit(1)
         except errors.ResmokeError as err:
             self._resmoke_logger.error(
                 "Cannot run excluded test in suite config. Use '--force-excluded-tests' to override: %s",
@@ -498,24 +511,11 @@ class TestRunnerEvg(TestRunner):
     additional options for running unreliable tests in Evergreen.
     """
 
-    UNRELIABLE_TAG = _TagInfo(
-        tag_name="unreliable",
-        evergreen_aware=True,
-        suite_options=config.SuiteOptions.ALL_INHERITED._replace(  # type: ignore
-            report_failure_status="silentfail"))
-
     RESOURCE_INTENSIVE_TAG = _TagInfo(
         tag_name="resource_intensive",
         evergreen_aware=False,
         suite_options=config.SuiteOptions.ALL_INHERITED._replace(  # type: ignore
             num_jobs=1))
-
-    RETRY_ON_FAILURE_TAG = _TagInfo(
-        tag_name="retry_on_failure",
-        evergreen_aware=True,
-        suite_options=config.SuiteOptions.ALL_INHERITED._replace(  # type: ignore
-            fail_fast=False, num_repeat_suites=2, num_repeat_tests=1,
-            report_failure_status="silentfail"))
 
     @staticmethod
     def _make_evergreen_aware_tags(tag_name):
@@ -551,29 +551,8 @@ class TestRunnerEvg(TestRunner):
 
         combinations = []
 
-        if config.EVERGREEN_PATCH_BUILD:
-            combinations.append(("unreliable and resource intensive",
-                                 ((cls.UNRELIABLE_TAG, True), (cls.RESOURCE_INTENSIVE_TAG, True))))
-            combinations.append(("unreliable and not resource intensive",
-                                 ((cls.UNRELIABLE_TAG, True), (cls.RESOURCE_INTENSIVE_TAG, False))))
-            combinations.append(("reliable and resource intensive",
-                                 ((cls.UNRELIABLE_TAG, False), (cls.RESOURCE_INTENSIVE_TAG, True))))
-            combinations.append(("reliable and not resource intensive",
-                                 ((cls.UNRELIABLE_TAG, False), (cls.RESOURCE_INTENSIVE_TAG,
-                                                                False))))
-        else:
-            combinations.append(("retry on failure and resource intensive",
-                                 ((cls.RETRY_ON_FAILURE_TAG, True), (cls.RESOURCE_INTENSIVE_TAG,
-                                                                     True))))
-            combinations.append(("retry on failure and not resource intensive",
-                                 ((cls.RETRY_ON_FAILURE_TAG, True), (cls.RESOURCE_INTENSIVE_TAG,
-                                                                     False))))
-            combinations.append(("run once and resource intensive",
-                                 ((cls.RETRY_ON_FAILURE_TAG, False), (cls.RESOURCE_INTENSIVE_TAG,
-                                                                      True))))
-            combinations.append(("run once and not resource intensive",
-                                 ((cls.RETRY_ON_FAILURE_TAG, False), (cls.RESOURCE_INTENSIVE_TAG,
-                                                                      False))))
+        combinations.append(("resource intensive", [(cls.RESOURCE_INTENSIVE_TAG, True)]))
+        combinations.append(("not resource intensive", [(cls.RESOURCE_INTENSIVE_TAG, False)]))
 
         return combinations
 
@@ -751,6 +730,11 @@ class RunPlugin(PluginInterface):
                   " own MongoDB deployment to dispatch tests to."))
 
         parser.set_defaults(logger_file="console")
+
+        parser.add_argument(
+            "--shellSeed", action="store", dest="shell_seed", default=None,
+            help=("Sets the seed for replset and sharding fixtures to use. "
+                  "This only works when only one test is input into resmoke."))
 
         parser.add_argument(
             "--mongocryptdSetParameters", dest="mongocryptd_set_parameters", action="append",
@@ -962,18 +946,23 @@ class RunPlugin(PluginInterface):
 
         mongodb_server_options.add_argument(
             "--fuzzMongodConfigs", dest="fuzz_mongod_configs",
-            help="Randomly chooses server parameters that were not specified. Use 'stress' to fuzz "
+            help="Randomly chooses mongod parameters that were not specified. Use 'stress' to fuzz "
             "all configs including stressful storage configurations that may significantly "
             "slow down the server. Use 'normal' to only fuzz non-stressful configurations. ",
             metavar="MODE", choices=('normal', 'stress'))
 
-        mongodb_server_options.add_argument("--configFuzzSeed", dest="config_fuzz_seed",
-                                            metavar="PATH",
-                                            help="Sets the seed used by storage config fuzzer")
+        mongodb_server_options.add_argument(
+            "--fuzzMongosConfigs", dest="fuzz_mongos_configs",
+            help="Randomly chooses mongos parameters that were not specified", metavar="MODE",
+            choices=('normal', ))
 
         mongodb_server_options.add_argument(
-            "--catalogShard", dest="catalog_shard", metavar="CONFIG",
-            help="If set, specifies which node is the catalog shard. Can also be set to 'any'.")
+            "--configFuzzSeed", dest="config_fuzz_seed", metavar="PATH",
+            help="Sets the seed used by mongod and mongos config fuzzers")
+
+        mongodb_server_options.add_argument(
+            "--configShard", dest="config_shard", metavar="CONFIG",
+            help="If set, specifies which node is the config shard. Can also be set to 'any'.")
 
         internal_options = parser.add_argument_group(
             title=_INTERNAL_OPTIONS_TITLE,
@@ -1011,13 +1000,6 @@ class RunPlugin(PluginInterface):
         internal_options.add_argument("--cedarReportFile", dest="cedar_report_file",
                                       metavar="CEDAR_REPORT",
                                       help="Writes a JSON file with performance test results.")
-
-        internal_options.add_argument(
-            "--reportFailureStatus", action="store", dest="report_failure_status",
-            choices=("fail", "silentfail"), metavar="STATUS",
-            help="Controls if the test failure status should be reported as failed"
-            " or be silently ignored (STATUS=silentfail). Dynamic test failures will"
-            " never be silently ignored. Defaults to STATUS=%(default)s.")
 
         internal_options.add_argument(
             "--reportFile", dest="report_file", metavar="REPORT",
@@ -1322,7 +1304,7 @@ def strip_fuzz_config_params(input_args):
 
     ret = []
     for arg in input_args:
-        if "--fuzzMongodConfigs" not in arg and "--fuzzConfigSeed" not in arg:
+        if not arg.startswith(("--fuzzMongodConfigs", "--fuzzMongosConfigs", "--configFuzzSeed")):
             ret.append(arg)
 
     return ret

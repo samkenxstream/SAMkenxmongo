@@ -565,8 +565,7 @@ public:
                    const write_ops::UpdateModification& updateSpec,
                    StringData matchedField = StringData(),
                    std::vector<BSONObj> arrayFilterSpec = {},
-                   bool fromOplog = false,
-                   UpdateIndexData* indexData = nullptr) {
+                   bool fromOplog = false) {
         boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
         _driver = std::make_unique<UpdateDriver>(expCtx);
         std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
@@ -579,7 +578,6 @@ public:
         }
 
         _driver->setFromOplogApplication(fromOplog);
-        _driver->refreshIndexKeys(indexData);
         _driver->parse(updateSpec, arrayFilters);
 
         const bool validateForStorage = true;
@@ -681,51 +679,18 @@ TEST_F(ModifiedPathsTestFixture, ReplaceFullDocumentAlwaysAffectsIndex) {
     ASSERT_EQ(_modifiedPaths, "{}");
 }
 
-
-TEST_F(ModifiedPathsTestFixture, PipelineUpdatesAlwaysAffectsIndex) {
-    BSONObj spec = fromjson("{$set: {'a.1.b': 1}}");
-    mutablebson::Document doc(fromjson("{a: [{b: 0}]}"));
-    runUpdate(&doc, std::vector<BSONObj>{spec});
-    ASSERT(_driver->modsAffectIndices());
+TEST_F(ModifiedPathsTestFixture, NeedsMatchDetailsIsTrueForPositionalUpdate) {
+    BSONObj spec = fromjson("{$set: {'a.$': 1}}");
+    mutablebson::Document doc(fromjson("{a: [0, 1, 2]}"));
+    runUpdate(&doc, makeUpdateMod(spec), "0"_sd);
+    ASSERT_EQ(true, _driver->needMatchDetails());
 }
 
-TEST_F(ModifiedPathsTestFixture, DeltaUpdateNotAffectingIndex) {
-    BSONObj spec = fromjson("{d: {a: false}}");
-    mutablebson::Document doc(fromjson("{a: [{b: 0}]}"));
-    runUpdate(&doc,
-              write_ops::UpdateModification::parseFromV2Delta(
-                  spec, write_ops::UpdateModification::DiffOptions{}),
-              ""_sd,
-              {},
-              true /* fromOplog */);
-    ASSERT(!_driver->modsAffectIndices());
-
-    UpdateIndexData indexData;
-    indexData.addPath(FieldRef("p"));
-    runUpdate(&doc,
-              write_ops::UpdateModification::parseFromV2Delta(
-                  spec, write_ops::UpdateModification::DiffOptions{}),
-              ""_sd,
-              {},
-              true /* fromOplog */,
-              &indexData);
-    ASSERT(!_driver->modsAffectIndices());
-}
-
-TEST_F(ModifiedPathsTestFixture, DeltaUpdateAffectingIndex) {
-    BSONObj spec = fromjson("{u: {a: 1}}");
-    mutablebson::Document doc(fromjson("{a: [{b: 0}]}"));
-    UpdateIndexData indexData;
-    indexData.addPath(FieldRef("q"));
-    indexData.addPath(FieldRef("a.p"));
-    runUpdate(&doc,
-              write_ops::UpdateModification::parseFromV2Delta(
-                  spec, write_ops::UpdateModification::DiffOptions{}),
-              ""_sd,
-              {},
-              true /* fromOplog */,
-              &indexData);
-    ASSERT(_driver->modsAffectIndices());
+TEST_F(ModifiedPathsTestFixture, NeedsMatchDetailsIsFalseForNonPositionalUpdate) {
+    BSONObj spec = fromjson("{$set: {a: 1}}");
+    mutablebson::Document doc(fromjson("{a: 0}"));
+    runUpdate(&doc, makeUpdateMod(spec));
+    ASSERT_EQ(false, _driver->needMatchDetails());
 }
 
 }  // namespace

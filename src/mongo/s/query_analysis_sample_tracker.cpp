@@ -29,8 +29,11 @@
 
 #include "mongo/s/query_analysis_sample_tracker.h"
 
+#include "mongo/logv2/log.h"
 #include "mongo/s/analyze_shard_key_common_gen.h"
 #include "mongo/s/is_mongos.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 namespace mongo {
 namespace analyze_shard_key {
@@ -59,6 +62,8 @@ void QueryAnalysisSampleTracker::refreshConfigurations(
         auto it = _trackers.find(configuration.getNs());
         if (it == _trackers.end() ||
             it->second->getCollUuid() != configuration.getCollectionUuid()) {
+            // There is no existing CollectionSampleTracker for the collection with this specific
+            // collection uuid so create one for it.
             newTrackers.emplace(std::make_pair(
                 configuration.getNs(),
                 std::make_shared<CollectionSampleTracker>(configuration.getNs(),
@@ -149,6 +154,8 @@ BSONObj QueryAnalysisSampleTracker::CollectionSampleTracker::reportForCurrentOp(
 }
 
 BSONObj QueryAnalysisSampleTracker::reportForServerStatus() const {
+    stdx::lock_guard<Latch> lk(_mutex);
+
     QueryAnalysisServerStatus res;
     res.setActiveCollections(static_cast<int64_t>(_trackers.size()));
     res.setTotalCollections(static_cast<int64_t>(_sampledNamespaces.size()));
@@ -159,6 +166,18 @@ BSONObj QueryAnalysisSampleTracker::reportForServerStatus() const {
         res.setTotalSampledWritesBytes(_totalSampledWritesBytes);
     }
     return res.toBSON();
+}
+
+bool QueryAnalysisSampleTracker::isSamplingActive(const NamespaceString& nss,
+                                                  const UUID& collUuid) {
+    stdx::lock_guard<Latch> lk(_mutex);
+
+    auto it = _trackers.find(nss);
+    if (it == _trackers.end()) {
+        return false;
+    }
+    auto& tracker = it->second;
+    return tracker->getCollUuid() == collUuid;
 }
 
 }  // namespace analyze_shard_key

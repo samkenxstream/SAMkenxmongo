@@ -292,7 +292,7 @@ public:
         BSONObj query = BSON("files_id" << jsobj["filemd5"] << "n" << GTE << n);
         BSONObj sort = BSON("files_id" << 1 << "n" << 1);
 
-        return writeConflictRetry(opCtx, "filemd5", dbName.toString(), [&] {
+        return writeConflictRetry(opCtx, "filemd5", NamespaceString(dbName), [&] {
             auto findCommand = std::make_unique<FindCommandRequest>(nss);
             findCommand->setFilter(query.getOwned());
             findCommand->setSort(sort.getOwned());
@@ -322,7 +322,7 @@ public:
                 BSONObj obj;
                 while (PlanExecutor::ADVANCED == exec->getNext(&obj, nullptr)) {
                     BSONElement ne = obj["n"];
-                    verify(ne.isNumber());
+                    MONGO_verify(ne.isNumber());
                     int myn = ne.numberInt();
                     if (n != myn) {
                         if (partialOk) {
@@ -366,7 +366,7 @@ public:
                     try {
                         // RELOCKED
                         ctx.reset(new AutoGetCollectionForReadCommand(opCtx, nss));
-                    } catch (const StaleConfigException&) {
+                    } catch (const ExceptionFor<ErrorCodes::StaleConfig>&) {
                         LOGV2_DEBUG(
                             20453,
                             1,

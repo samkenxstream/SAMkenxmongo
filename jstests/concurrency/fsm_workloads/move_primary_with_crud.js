@@ -167,7 +167,9 @@ const $config = (function() {
                     // Due to a stepdown of the donor during the cloning phase, the movePrimary
                     // operation failed. It is not automatically recovered, but any orphaned data on
                     // the recipient has been deleted.
-                    7120202
+                    7120202,
+                    // Same as the above, but due to a stepdown of the recipient.
+                    ErrorCodes.MovePrimaryAborted
                 ]);
         },
         checkDatabaseMetadataConsistency: function(db, collName, connCache) {
@@ -176,6 +178,15 @@ const $config = (function() {
             }
             jsTestLog('Executing checkMetadataConsistency state for database: ' + db.getName());
             const inconsistencies = db.checkMetadataConsistency().toArray();
+            assert.eq(0, inconsistencies.length, tojson(inconsistencies));
+        },
+        checkCollectionMetadataConsistency: function(db, collName, connCache) {
+            if (this.skipMetadataChecks) {
+                return;
+            }
+            let coll = db[this.collName];
+            jsTestLog(`Executing checkMetadataConsistency state for collection: ${coll}`);
+            const inconsistencies = coll.checkMetadataConsistency().toArray();
             assert.eq(0, inconsistencies.length, tojson(inconsistencies));
         },
         verifyDocuments: function(db, collName, connCache) {
@@ -209,9 +220,7 @@ const $config = (function() {
     let setup = function(db, collName, cluster) {
         this.skipMetadataChecks =
             // TODO SERVER-70396: remove this flag
-            !FeatureFlagUtil.isEnabled(db.getMongo(), 'CheckMetadataConsistency') ||
-            // TODO SERVER-74445: re-enable metadata checks on catalog shard deployments
-            cluster.hasCatalogShard();
+            !FeatureFlagUtil.isEnabled(db.getMongo(), 'CheckMetadataConsistency');
     };
 
     const standardTransition = {
@@ -219,7 +228,8 @@ const $config = (function() {
         update: 0.20,
         delete: 0.20,
         movePrimary: 0.12,
-        checkDatabaseMetadataConsistency: 0.08,
+        checkDatabaseMetadataConsistency: 0.04,
+        checkCollectionMetadataConsistency: 0.04,
         verifyDocuments: 0.20,
     };
 
@@ -230,6 +240,7 @@ const $config = (function() {
         delete: standardTransition,
         movePrimary: standardTransition,
         checkDatabaseMetadataConsistency: standardTransition,
+        checkCollectionMetadataConsistency: standardTransition,
         verifyDocuments: standardTransition
     };
 

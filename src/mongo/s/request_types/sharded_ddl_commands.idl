@@ -46,6 +46,7 @@ imports:
     - "mongo/s/resharding/common_types.idl"
     - "mongo/db/timeseries/timeseries.idl"
     - "mongo/db/query/cursor_response.idl"
+    - "mongo/db/metadata_consistency_types.idl"
 
 types:
     CollectionType:
@@ -230,6 +231,14 @@ structs:
             collectionUUID:
                 type: uuid
                 description: "The expected UUID of the collection."
+                optional: true
+            shardDistribution:
+                type: array<ShardKeyRange>
+                description: "The key ranges for the new shard key. This should be continuous and complete."
+                optional: true
+            forceRedistribution:
+                type: bool
+                description: "Whether initiate reshardCollection if the shardKey doesn't change."
                 optional: true
 
     SetAllowMigrationsRequest:
@@ -525,6 +534,9 @@ commands:
         api_version: ""
         reply_type: CursorInitialReply
         strict: false
+        inline_chained_structs: true
+        chained_structs:
+            CommonCheckMetadataRequestFields: commonFields
         fields:
             cursor:
                 type: SimpleCursorOptions
@@ -539,6 +551,9 @@ commands:
         api_version: ""
         reply_type: CursorInitialReply
         strict: false
+        inline_chained_structs: true
+        chained_structs:
+            CommonCheckMetadataRequestFields: commonFields
         fields:
             cursor:
                 type: SimpleCursorOptions

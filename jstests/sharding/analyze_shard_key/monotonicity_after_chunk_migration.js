@@ -2,7 +2,7 @@
  * Tests that the analyzeShardKey command returns the correct monotonicity in the case where the
  * collection has gone through a chunk migration.
  *
- * @tags: [requires_fcv_63, featureFlagAnalyzeShardKey]
+ * @tags: [requires_fcv_70]
  */
 (function() {
 "use strict";
@@ -12,7 +12,7 @@ load("jstests/sharding/analyze_shard_key/libs/analyze_shard_key_util.js");
 const st = new ShardingTest({
     shards: 2,
     rs: {
-        nodes: 2,
+        nodes: 1,
         setParameter: {
             "failpoint.analyzeShardKeySkipCalcalutingReadWriteDistributionMetrics":
                 tojson({mode: "alwaysOn"})

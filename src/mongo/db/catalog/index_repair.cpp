@@ -52,10 +52,10 @@ StatusWith<int> moveRecordToLostAndFound(OperationContext* opCtx,
     // Creates the collection if it doesn't exist.
     if (!localCollection) {
         Status status =
-            writeConflictRetry(opCtx, "createLostAndFoundCollection", lostAndFoundNss.ns(), [&]() {
+            writeConflictRetry(opCtx, "createLostAndFoundCollection", lostAndFoundNss, [&]() {
                 // Ensure the database exists.
                 auto db = autoColl.ensureDbExists(opCtx);
-                invariant(db, lostAndFoundNss.ns());
+                invariant(db, lostAndFoundNss.toStringForErrorMsg());
 
                 WriteUnitOfWork wuow(opCtx);
 
@@ -68,7 +68,7 @@ StatusWith<int> moveRecordToLostAndFound(OperationContext* opCtx,
                     CollectionPtr(db->createCollection(opCtx, lostAndFoundNss, collOptions));
 
                 // Ensure the collection exists.
-                invariant(localCollection, lostAndFoundNss.ns());
+                invariant(localCollection, lostAndFoundNss.toStringForErrorMsg());
 
                 wuow.commit();
                 return Status::OK();
@@ -81,7 +81,7 @@ StatusWith<int> moveRecordToLostAndFound(OperationContext* opCtx,
     localCollection.makeYieldable(opCtx, LockedCollectionYieldRestore(opCtx, localCollection));
 
     return writeConflictRetry(
-        opCtx, "writeDupDocToLostAndFoundCollection", nss.ns(), [&]() -> StatusWith<int> {
+        opCtx, "writeDupDocToLostAndFoundCollection", nss, [&]() -> StatusWith<int> {
             WriteUnitOfWork wuow(opCtx);
             Snapshotted<BSONObj> doc;
             int docSize = 0;
@@ -118,7 +118,7 @@ StatusWith<int> moveRecordToLostAndFound(OperationContext* opCtx,
 }
 
 int repairMissingIndexEntry(OperationContext* opCtx,
-                            std::shared_ptr<const IndexCatalogEntry>& index,
+                            const IndexCatalogEntry* index,
                             const KeyString::Value& ks,
                             const KeyFormat& keyFormat,
                             const NamespaceString& nss,
@@ -130,11 +130,12 @@ int repairMissingIndexEntry(OperationContext* opCtx,
     int64_t numInserted = 0;
 
     Status insertStatus = Status::OK();
-    writeConflictRetry(opCtx, "insertingMissingIndexEntries", nss.ns(), [&] {
+    writeConflictRetry(opCtx, "insertingMissingIndexEntries", nss, [&] {
         WriteUnitOfWork wunit(opCtx);
         insertStatus =
             accessMethod->insertKeysAndUpdateMultikeyPaths(opCtx,
                                                            coll,
+                                                           index,
                                                            {ks},
                                                            {},
                                                            {},
@@ -195,10 +196,10 @@ int repairMissingIndexEntry(OperationContext* opCtx,
                 // duplicate records is in the index, so we need to add the newer record to the
                 // index.
                 if (dupKeyRid && ridToMove == *dupKeyRid) {
-                    writeConflictRetry(opCtx, "insertingMissingIndexEntries", nss.ns(), [&] {
+                    writeConflictRetry(opCtx, "insertingMissingIndexEntries", nss, [&] {
                         WriteUnitOfWork wunit(opCtx);
                         insertStatus = accessMethod->insertKeysAndUpdateMultikeyPaths(
-                            opCtx, coll, {ks}, {}, {}, options, nullptr, nullptr);
+                            opCtx, coll, index, {ks}, {}, {}, options, nullptr, nullptr);
                         wunit.commit();
                     });
                     if (!insertStatus.isOK()) {
@@ -208,7 +209,7 @@ int repairMissingIndexEntry(OperationContext* opCtx,
                 }
             } else {
                 results->errors.push_back(str::stream() << "unable to move record " << rid << " to "
-                                                        << lostAndFoundNss.ns());
+                                                        << lostAndFoundNss.toStringForErrorMsg());
             }
         } else {
             // If the missing index entry does not exist in the record store, then it has

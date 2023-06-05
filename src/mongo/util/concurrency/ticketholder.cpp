@@ -28,12 +28,13 @@
  */
 
 #include "mongo/util/concurrency/ticketholder.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/storage/storage_engine_feature_flags_gen.h"
-#include "mongo/util/concurrency/admission_context.h"
 
 #include <iostream>
 
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/execution_control/concurrency_adjustment_parameters_gen.h"
+#include "mongo/db/storage/storage_engine_feature_flags_gen.h"
+#include "mongo/db/storage/storage_engine_parameters_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 
@@ -62,6 +63,22 @@ void updateQueueStatsOnTicketAcquisition(ServiceContext* serviceContext,
     queueStats.totalStartedProcessing.fetchAndAddRelaxed(1);
 }
 }  // namespace
+
+TicketHolder::TicketHolder(int32_t numTickets, ServiceContext* svcCtx)
+    : _outof(numTickets), _serviceContext(svcCtx) {
+
+    auto concurrencyAlgorithm = StorageEngineConcurrencyAdjustmentAlgorithm_parse(
+        IDLParserContext{"storageEngineConcurrencyAdjustmentAlgorithm"},
+        gStorageEngineConcurrencyAdjustmentAlgorithm);
+
+    // (Ignore FCV check): This feature flag doesn't have upgrade/downgrade concern.
+    _usingDynamicConcurrencyAdjustment =
+        (!feature_flags::gFeatureFlagExecutionControl.isEnabledAndIgnoreFCVUnsafe() ||
+         concurrencyAlgorithm ==
+             StorageEngineConcurrencyAdjustmentAlgorithmEnum::kFixedConcurrentTransactions)
+        ? false
+        : true;
+}
 
 void TicketHolder::resize(int32_t newSize) noexcept {
     stdx::lock_guard<Latch> lk(_resizeMutex);
@@ -150,8 +167,7 @@ int32_t TicketHolder::getAndResetPeakUsed() {
 }
 
 void TicketHolder::_updatePeakUsed() {
-    // (Ignore FCV check): This feature flag doesn't have upgrade/downgrade concern.
-    if (!feature_flags::gFeatureFlagExecutionControl.isEnabledAndIgnoreFCVUnsafe()) {
+    if (!_usingDynamicConcurrencyAdjustment) {
         return;
     }
 

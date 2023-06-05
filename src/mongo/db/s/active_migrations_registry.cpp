@@ -89,7 +89,7 @@ void ActiveMigrationsRegistry::lock(OperationContext* opCtx, StringData reason) 
         uassert(ErrorCodes::NotWritablePrimary,
                 "Cannot lock the registry while the node is in draining mode",
                 repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesForDatabase(
-                    opCtx, DatabaseName::kAdmin.toString()));
+                    opCtx, DatabaseName::kAdmin));
     }
 
     unblockMigrationsOnError.dismiss();
@@ -282,7 +282,7 @@ Status ActiveMigrationsRegistry::ActiveMoveChunkState::constructErrorStatus() co
         "'{}{}' for namespace {} to shard {}",
         (args.getMin() ? "min: " + args.getMin()->toString() + " - " : ""),
         (args.getMax() ? "max: " + args.getMax()->toString() : ""),
-        args.getCommandParameter().ns(),
+        args.getCommandParameter().toStringForErrorMsg(),
         args.getToShard().toString());
     return {ErrorCodes::ConflictingOperationInProgress, std::move(errMsg)};
 }
@@ -291,8 +291,8 @@ Status ActiveMigrationsRegistry::ActiveReceiveChunkState::constructErrorStatus()
     return {ErrorCodes::ConflictingOperationInProgress,
             str::stream() << "Unable to start new balancer operation because this shard is "
                              "currently receiving chunk "
-                          << range.toString() << " for namespace " << nss.ns() << " from "
-                          << fromShardId};
+                          << range.toString() << " for namespace " << nss.toStringForErrorMsg()
+                          << " from " << fromShardId};
 }
 
 ScopedDonateChunk::ScopedDonateChunk(ActiveMigrationsRegistry* registry,

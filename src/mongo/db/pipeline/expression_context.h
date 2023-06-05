@@ -112,7 +112,7 @@ public:
 
         boost::intrusive_ptr<ExpressionContext> _expCtx;
 
-        std::unique_ptr<CollatorInterface> _originalCollator;
+        std::shared_ptr<CollatorInterface> _originalCollator;
     };
 
     /**
@@ -125,6 +125,16 @@ public:
         StringMap<uint64_t> groupAccumulatorExprCountersMap;
         StringMap<uint64_t> windowAccumulatorExprCountersMap;
     };
+
+    /**
+     * Constructs an ExpressionContext to be used for find command parsing and evaluation.
+     */
+    ExpressionContext(OperationContext* opCtx,
+                      const FindCommandRequest& findCmd,
+                      std::unique_ptr<CollatorInterface> collator,
+                      bool mayDbProfile,
+                      boost::optional<ExplainOptions::Verbosity> verbosity = boost::none,
+                      bool allowDiskUseByDefault = false);
 
     /**
      * Constructs an ExpressionContext to be used for Pipeline parsing and evaluation.
@@ -158,7 +168,8 @@ public:
                       StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces,
                       boost::optional<UUID> collUUID,
                       const boost::optional<BSONObj>& letParameters = boost::none,
-                      bool mayDbProfile = true);
+                      bool mayDbProfile = true,
+                      const SerializationContext& serializationCtx = SerializationContext());
 
     /**
      * Constructs an ExpressionContext suitable for use outside of the aggregation system, including
@@ -171,6 +182,7 @@ public:
                       const NamespaceString& ns,
                       const boost::optional<LegacyRuntimeConstants>& runtimeConstants = boost::none,
                       const boost::optional<BSONObj>& letParameters = boost::none,
+                      bool allowDiskUse = false,
                       bool mayDbProfile = true,
                       boost::optional<ExplainOptions::Verbosity> explain = boost::none);
 
@@ -209,6 +221,10 @@ public:
         return _collator.get();
     }
 
+    std::shared_ptr<CollatorInterface> getCollatorShared() const {
+        return _collator;
+    }
+
     /**
      * Whether to track timing information and "work" counts in the agg layer.
      */
@@ -235,7 +251,7 @@ public:
      * Use with caution - '_collator' is used in the context of a Pipeline, and it is illegal
      * to change the collation once a Pipeline has been parsed with this ExpressionContext.
      */
-    void setCollator(std::unique_ptr<CollatorInterface> collator) {
+    void setCollator(std::shared_ptr<CollatorInterface> collator) {
         _collator = std::move(collator);
 
         // Document/Value comparisons must be aware of the collation.
@@ -411,13 +427,34 @@ public:
     void stopExpressionCounters();
 
     bool expressionCountersAreActive() {
-        return _expressionCounters.is_initialized();
+        return static_cast<bool>(_expressionCounters);
     }
 
     /**
      * Sets the value of the $$USER_ROLES system variable.
      */
     void setUserRoles();
+
+    /**
+     * Record that we have seen the given system variable in the query.
+     */
+    void setSystemVarReferencedInQuery(Variables::Id var) {
+        tassert(7612600,
+                "Cannot track references to user-defined variables.",
+                !Variables::isUserDefinedVariable(var));
+        _varsReferencedInQuery.insert(var);
+    }
+
+    /**
+     * Returns true if the given system variable is referenced in the query and false otherwise.
+     */
+    bool isSystemVarReferencedInQuery(Variables::Id var) const {
+        tassert(
+            7612601,
+            "Cannot access whether a variable is referenced to or not for a user-defined variable.",
+            !Variables::isUserDefinedVariable(var));
+        return _varsReferencedInQuery.count(var);
+    }
 
     // The explain verbosity requested by the user, or boost::none if no explain was requested.
     boost::optional<ExplainOptions::Verbosity> explain;
@@ -431,6 +468,8 @@ public:
     bool hasWhereClause = false;
 
     NamespaceString ns;
+
+    SerializationContext serializationCtxt;
 
     // If known, the UUID of the execution namespace for this aggregation command.
     boost::optional<UUID> uuid;
@@ -537,10 +576,42 @@ public:
         return _requiresTimeseriesExtendedRangeSupport;
     }
 
-    // Returns true if the resolved collation of the context is simple.
-    bool isResolvedCollationSimple() const {
-        return getCollatorBSON().woCompare(CollationSpec::kSimpleSpec) == 0;
-    }
+    // Forces the plan cache to be used even if there's only one solution available. Queries that
+    // are ineligible will still not be cached.
+    bool forcePlanCache = false;
+
+    // This is state that is to be shared between the DocumentInternalSearchMongotRemote and
+    // DocumentInternalSearchIdLookup stages (these stages are the result of desugaring $search)
+    // during runtime.
+    class SharedSearchState {
+    public:
+        SharedSearchState() {}
+
+        long long getDocsReturnedByIdLookup() const {
+            return _docsReturnedByIdLookup;
+        }
+
+        /**
+         * Sets the value of _docsReturnedByIdLookup to 0.
+         */
+        void resetDocsReturnedByIdLookup() {
+            _docsReturnedByIdLookup = 0;
+        }
+
+        /**
+         * Increments the value of _docsReturnedByIdLookup by 1.
+         */
+        void incrementDocsReturnedByIdLookup() {
+            _docsReturnedByIdLookup++;
+        }
+
+    private:
+        // When there is an extractable limit in the query, DocumentInternalSearchMongotRemote sends
+        // a getMore to mongot that specifies how many more documents it needs to fulfill that
+        // limit, and it incorporates the amount of documents returned by the
+        // DocumentInternalSearchIdLookup stage into that value.
+        long long _docsReturnedByIdLookup = 0;
+    } sharedSearchState;
 
 protected:
     static const int kInterruptCheckPeriod = 128;
@@ -552,7 +623,7 @@ protected:
     void checkForInterruptSlow();
 
     // Collator used for comparisons.
-    std::unique_ptr<CollatorInterface> _collator;
+    std::shared_ptr<CollatorInterface> _collator;
 
     // Used for all comparisons of Document/Value during execution of the aggregation operation.
     // Must not be changed after parsing a Pipeline with this ExpressionContext.
@@ -569,8 +640,12 @@ protected:
     bool _requiresTimeseriesExtendedRangeSupport = false;
 
 private:
-    boost::optional<ExpressionCounters> _expressionCounters = boost::none;
+    std::unique_ptr<ExpressionCounters> _expressionCounters;
     bool _gotTemporarilyUnavailableException = false;
+
+    // We use this set to indicate whether or not a system variable was referenced in the query that
+    // is being executed (if the variable was referenced, it is an element of this set).
+    stdx::unordered_set<Variables::Id> _varsReferencedInQuery;
 };
 
 }  // namespace mongo

@@ -85,7 +85,7 @@ public:
 
 
     Status createIndex(const CollectionPtr& collection, BSONObj indexSpec) {
-        return dbtests::createIndexFromSpec(_opCtx.get(), collection->ns().ns(), indexSpec);
+        return dbtests::createIndexFromSpec(_opCtx.get(), collection->ns().ns_forTest(), indexSpec);
     }
 
     void assertMultikeyPaths(const CollectionPtr& collection,
@@ -260,6 +260,7 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentUpdate) {
                 oldDoc,
                 BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3)),
                 collection_internal::kUpdateAllIndexes,
+                nullptr /* indexesAffected */,
                 opDebug,
                 &args);
             wuow.commit();
@@ -297,8 +298,8 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentUpdateWithDamages) {
 
         auto oldDoc = collection->docFor(_opCtx.get(), record->id);
         auto newDoc = BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3));
-        auto diffResult = doc_diff::computeOplogDiff(oldDoc.value(), newDoc, 0, nullptr);
-        auto damagesOutput = doc_diff::computeDamages(oldDoc.value(), diffResult->diff, false);
+        auto diffResult = doc_diff::computeOplogDiff(oldDoc.value(), newDoc, 0);
+        auto damagesOutput = doc_diff::computeDamages(oldDoc.value(), *diffResult, false);
         {
             WriteUnitOfWork wuow(_opCtx.get());
             OpDebug* opDebug = nullptr;
@@ -311,6 +312,7 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentUpdateWithDamages) {
                 damagesOutput.damageSource.get(),
                 damagesOutput.damages,
                 collection_internal::kUpdateAllIndexes,
+                nullptr /* indexesAffected */,
                 opDebug,
                 &args);
             ASSERT_TRUE(newDocResult.getValue().woCompare(newDoc) == 0);

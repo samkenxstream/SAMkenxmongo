@@ -3,8 +3,6 @@ test_kind: js_test
 selector:
   roots:
   - jstests/core/**/*.js
-  - jstests/fle2/**/*.js
-  - src/mongo/db/modules/*/jstests/fle2/**/*.js
   exclude_files:
   # Transactions do not support retryability of individual operations.
   # TODO: Remove this once it is supported (SERVER-33952).
@@ -74,6 +72,9 @@ selector:
   # TODO SERVER-61050
   - jstests/core/timeseries/timeseries_merge.js
 
+  # Explain doesn't support read concern majority in sharding.
+  - jstests/core/**/command_let_variables.js
+
   exclude_with_any_tags:
   - assumes_against_mongod_not_mongos
   - assumes_standalone_mongod
@@ -129,8 +130,6 @@ selector:
   - requires_dbstats
   # "Cowardly fail if collStats is run with a mongod that had an unclean shutdown: ..."
   - requires_collstats
-  # "Cowardly fail if unbounded dataSize is run with a mongod that had an unclean shutdown: ..."
-  - requires_datasize
   ## The next tag corresponds to long running-operations, as they may exhaust their number
   # of retries and result in a network error being thrown.
   - operations_longer_than_stepdown_interval
@@ -189,6 +188,7 @@ executor:
   - class: CheckReplOplogs
   - class: CheckReplDBHash
   - class: ValidateCollections
+  - class: CheckOrphansDeleted
   - class: CleanEveryN
     n: 20
   fixture:

@@ -30,6 +30,7 @@
 #include "mongo/db/catalog/collection_uuid_mismatch_info.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands/bulk_write.h"
 #include "mongo/db/commands/bulk_write_gen.h"
 #include "mongo/db/dbdirectclient.h"
@@ -37,8 +38,8 @@
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/shard_role.h"
 #include "mongo/s/shard_version_factory.h"
 #include "mongo/unittest/assert.h"
@@ -65,20 +66,19 @@ namespace {
 // | testDB1 | sharded.porcupine.tree  |     YES     |      dbV1     |       sV1     |
 // | testDB2 |       sharded.oasis     |     YES     |      dbV2     |       sV2     |
 // +---------+-------------------------+-------------+---------------+---------------+
-class BulkWriteShardTest : public ServiceContextMongoDTest {
+class BulkWriteShardTest : public ShardServerTestFixture {
 protected:
     OperationContext* opCtx() {
-        return _opCtx.get();
+        return operationContext();
     }
 
     void setUp() override;
-    void tearDown() override;
 
-    const ShardId thisShardId{"this"};
-
-    const DatabaseName dbNameTestDb1{"testDB1"};
+    const DatabaseName dbNameTestDb1 =
+        DatabaseName::createDatabaseName_forTest(boost::none, "testDB1");
     const DatabaseVersion dbVersionTestDb1{UUID::gen(), Timestamp(1, 0)};
-    const DatabaseName dbNameTestDb2{"testDB2"};
+    const DatabaseName dbNameTestDb2 =
+        DatabaseName::createDatabaseName_forTest(boost::none, "testDB2");
     const DatabaseVersion dbVersionTestDb2{UUID::gen(), Timestamp(2, 0)};
 
     const NamespaceString nssUnshardedCollection1 =
@@ -103,12 +103,11 @@ protected:
         ShardVersionFactory::make(ChunkVersion(CollectionGeneration{OID::gen(), Timestamp(12, 0)},
                                                CollectionPlacement(10, 1)),
                                   boost::optional<CollectionIndexes>(boost::none));
-
-private:
-    ServiceContext::UniqueOperationContext _opCtx;
 };
 
 void createTestCollection(OperationContext* opCtx, const NamespaceString& nss) {
+    OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
+        opCtx);
     uassertStatusOK(createCollection(opCtx, nss.dbName(), BSON("create" << nss.coll())));
 }
 
@@ -117,7 +116,7 @@ void installDatabaseMetadata(OperationContext* opCtx,
                              const DatabaseVersion& dbVersion) {
     AutoGetDb autoDb(opCtx, dbName, MODE_X);
     auto scopedDss = DatabaseShardingState::assertDbLockedAndAcquireExclusive(opCtx, dbName);
-    scopedDss->setDbInfo(opCtx, {dbName.db(), ShardId("this"), dbVersion});
+    scopedDss->setDbInfo(opCtx, {dbName.db().toString(), ShardId("this"), dbVersion});
 }
 
 void installUnshardedCollectionMetadata(OperationContext* opCtx, const NamespaceString& nss) {
@@ -177,21 +176,7 @@ UUID getCollectionUUID(OperationContext* opCtx, const NamespaceString& nss) {
 }
 
 void BulkWriteShardTest::setUp() {
-    ServiceContextMongoDTest::setUp();
-    _opCtx = getGlobalServiceContext()->makeOperationContext(&cc());
-    serverGlobalParams.clusterRole = ClusterRole::ShardServer;
-
-    const repl::ReplSettings replSettings = {};
-    repl::ReplicationCoordinator::set(
-        getGlobalServiceContext(),
-        std::unique_ptr<repl::ReplicationCoordinator>(
-            new repl::ReplicationCoordinatorMock(_opCtx->getServiceContext(), replSettings)));
-    ASSERT_OK(repl::ReplicationCoordinator::get(getGlobalServiceContext())
-                  ->setFollowerMode(repl::MemberState::RS_PRIMARY));
-
-    repl::createOplog(_opCtx.get());
-
-    ShardingState::get(getServiceContext())->setInitialized(ShardId("this"), OID::gen());
+    ShardServerTestFixture::setUp();
 
     // Setup test collections and metadata
     installDatabaseMetadata(opCtx(), dbNameTestDb1, dbVersionTestDb1);
@@ -203,7 +188,7 @@ void BulkWriteShardTest::setUp() {
 
     // Create nssShardedCollection1
     createTestCollection(opCtx(), nssShardedCollection1);
-    const auto uuidShardedCollection1 = getCollectionUUID(_opCtx.get(), nssShardedCollection1);
+    const auto uuidShardedCollection1 = getCollectionUUID(opCtx(), nssShardedCollection1);
     installShardedCollectionMetadata(
         opCtx(),
         nssShardedCollection1,
@@ -211,12 +196,12 @@ void BulkWriteShardTest::setUp() {
         {ChunkType(uuidShardedCollection1,
                    ChunkRange{BSON("skey" << MINKEY), BSON("skey" << MAXKEY)},
                    shardVersionShardedCollection1.placementVersion(),
-                   thisShardId)},
-        thisShardId);
+                   _myShardName)},
+        _myShardName);
 
     // Create nssShardedCollection2
     createTestCollection(opCtx(), nssShardedCollection2);
-    const auto uuidShardedCollection2 = getCollectionUUID(_opCtx.get(), nssShardedCollection2);
+    const auto uuidShardedCollection2 = getCollectionUUID(opCtx(), nssShardedCollection2);
     installShardedCollectionMetadata(
         opCtx(),
         nssShardedCollection2,
@@ -224,14 +209,8 @@ void BulkWriteShardTest::setUp() {
         {ChunkType(uuidShardedCollection2,
                    ChunkRange{BSON("skey" << MINKEY), BSON("skey" << MAXKEY)},
                    shardVersionShardedCollection2.placementVersion(),
-                   thisShardId)},
-        thisShardId);
-}
-
-void BulkWriteShardTest::tearDown() {
-    _opCtx.reset();
-    ServiceContextMongoDTest::tearDown();
-    repl::ReplicationCoordinator::set(getGlobalServiceContext(), nullptr);
+                   _myShardName)},
+        _myShardName);
 }
 
 NamespaceInfoEntry nsInfoWithShardDatabaseVersions(NamespaceString nss,
@@ -258,12 +237,14 @@ TEST_F(BulkWriteShardTest, ThreeSuccessfulInsertsOrdered) {
                 nssShardedCollection2, dbVersionTestDb2, shardVersionShardedCollection2),
         });
 
-    auto replyItems = bulk_write::performWrites(opCtx(), request);
+    const auto& [replyItems, retriedStmtIds, numErrors] =
+        bulk_write::performWrites(opCtx(), request);
 
     ASSERT_EQ(3, replyItems.size());
     for (const auto& reply : replyItems) {
         ASSERT_OK(reply.getStatus());
     }
+    ASSERT_EQ(0, numErrors);
 
     OperationShardingState::get(opCtx()).resetShardingOperationFailedStatus();
 }
@@ -278,10 +259,12 @@ TEST_F(BulkWriteShardTest, OneFailingShardedOneSkippedUnshardedSuccessInsertOrde
          nsInfoWithShardDatabaseVersions(
              nssUnshardedCollection1, dbVersionTestDb1, ShardVersion::UNSHARDED())});
 
-    auto replyItems = bulk_write::performWrites(opCtx(), request);
+    const auto& [replyItems, retriedStmtIds, numErrors] =
+        bulk_write::performWrites(opCtx(), request);
 
     ASSERT_EQ(1, replyItems.size());
     ASSERT_EQ(ErrorCodes::StaleConfig, replyItems.back().getStatus().code());
+    ASSERT_EQ(1, numErrors);
 
     OperationShardingState::get(opCtx()).resetShardingOperationFailedStatus();
 }
@@ -296,10 +279,12 @@ TEST_F(BulkWriteShardTest, TwoFailingShardedInsertsOrdered) {
                 nssShardedCollection1, dbVersionTestDb1, incorrectShardVersion),
         });
 
-    auto replyItems = bulk_write::performWrites(opCtx(), request);
+    const auto& [replyItems, retriedStmtIds, numErrors] =
+        bulk_write::performWrites(opCtx(), request);
 
     ASSERT_EQ(1, replyItems.size());
     ASSERT_EQ(ErrorCodes::StaleConfig, replyItems.back().getStatus().code());
+    ASSERT_EQ(1, numErrors);
 
     OperationShardingState::get(opCtx()).resetShardingOperationFailedStatus();
 }
@@ -314,11 +299,13 @@ TEST_F(BulkWriteShardTest, OneSuccessfulShardedOneFailingShardedOrdered) {
          nsInfoWithShardDatabaseVersions(
              nssShardedCollection2, dbVersionTestDb2, incorrectShardVersion)});
 
-    auto replyItems = bulk_write::performWrites(opCtx(), request);
+    const auto& [replyItems, retriedStmtIds, numErrors] =
+        bulk_write::performWrites(opCtx(), request);
 
     ASSERT_EQ(2, replyItems.size());
     ASSERT_OK(replyItems.front().getStatus());
     ASSERT_EQ(ErrorCodes::StaleConfig, replyItems.back().getStatus().code());
+    ASSERT_EQ(1, numErrors);
 
     OperationShardingState::get(opCtx()).resetShardingOperationFailedStatus();
 }
@@ -332,10 +319,12 @@ TEST_F(BulkWriteShardTest, OneFailingShardedOneSkippedShardedUnordered) {
             nssShardedCollection1, dbVersionTestDb1, incorrectShardVersion)});
     request.setOrdered(false);
 
-    auto replyItems = bulk_write::performWrites(opCtx(), request);
+    const auto& [replyItems, retriedStmtIds, numErrors] =
+        bulk_write::performWrites(opCtx(), request);
 
     ASSERT_EQ(1, replyItems.size());
     ASSERT_EQ(ErrorCodes::StaleConfig, replyItems.back().getStatus().code());
+    ASSERT_EQ(1, numErrors);
 
     OperationShardingState::get(opCtx()).resetShardingOperationFailedStatus();
 }
@@ -351,10 +340,12 @@ TEST_F(BulkWriteShardTest, OneSuccessfulShardedOneFailingShardedUnordered) {
              nssShardedCollection2, dbVersionTestDb2, shardVersionShardedCollection2)});
     request.setOrdered(false);
 
-    auto replyItems = bulk_write::performWrites(opCtx(), request);
+    const auto& [replyItems, retriedStmtIds, numErrors] =
+        bulk_write::performWrites(opCtx(), request);
 
     ASSERT_EQ(1, replyItems.size());
     ASSERT_EQ(ErrorCodes::StaleConfig, replyItems.back().getStatus().code());
+    ASSERT_EQ(1, numErrors);
 
     OperationShardingState::get(opCtx()).resetShardingOperationFailedStatus();
 }
@@ -373,12 +364,14 @@ TEST_F(BulkWriteShardTest, InsertsAndUpdatesSuccessOrdered) {
          nsInfoWithShardDatabaseVersions(
              nssUnshardedCollection1, dbVersionTestDb1, ShardVersion::UNSHARDED())});
 
-    auto replyItems = bulk_write::performWrites(opCtx(), request);
+    const auto& [replyItems, retriedStmtIds, numErrors] =
+        bulk_write::performWrites(opCtx(), request);
 
     ASSERT_EQ(4, replyItems.size());
     for (const auto& reply : replyItems) {
         ASSERT_OK(reply.getStatus());
     }
+    ASSERT_EQ(0, numErrors);
 
     OperationShardingState::get(opCtx()).resetShardingOperationFailedStatus();
 }
@@ -399,12 +392,14 @@ TEST_F(BulkWriteShardTest, InsertsAndUpdatesSuccessUnordered) {
 
     request.setOrdered(false);
 
-    auto replyItems = bulk_write::performWrites(opCtx(), request);
+    const auto& [replyItems, retriedStmtIds, numErrors] =
+        bulk_write::performWrites(opCtx(), request);
 
     ASSERT_EQ(4, replyItems.size());
     for (const auto& reply : replyItems) {
         ASSERT_OK(reply.getStatus());
     }
+    ASSERT_EQ(0, numErrors);
 
     OperationShardingState::get(opCtx()).resetShardingOperationFailedStatus();
 }
@@ -425,38 +420,64 @@ TEST_F(BulkWriteShardTest, InsertsAndUpdatesFailUnordered) {
 
     request.setOrdered(false);
 
-    auto replyItems = bulk_write::performWrites(opCtx(), request);
+    const auto& [replyItems, retriedStmtIds, numErrors] =
+        bulk_write::performWrites(opCtx(), request);
 
     ASSERT_EQ(2, replyItems.size());
     ASSERT_OK(replyItems.front().getStatus());
     ASSERT_EQ(ErrorCodes::StaleConfig, replyItems.back().getStatus().code());
+    ASSERT_EQ(1, numErrors);
 
     OperationShardingState::get(opCtx()).resetShardingOperationFailedStatus();
 }
 
-// TODO (SERVER-75202): Re-enable this test & write a test for deletes.
-// Unordered updates into different collections where some fail.
-// TEST_F(BulkWriteShardTest, UpdatesFailUnordered) {
-//     BulkWriteCommandRequest request(
-//         {
-//         BulkWriteUpdateOp(1, BSON("x" << BSON("$gt" << 0)), BSON("x" << -99)),
-//         BulkWriteUpdateOp(0, BSON("x" << BSON("$gt" << 0)), BSON("x" << -9)),
-//         BulkWriteInsertOp(1, BSON("x" << -1))},
-//         {nsInfoWithShardDatabaseVersions(
-//              nssShardedCollection1, dbVersionTestDb, incorrectShardVersion),
-//          nsInfoWithShardDatabaseVersions(
-//              nssShardedCollection2, dbVersionTestDb, shardVersionShardedCollection2)});
+// Ordered updates into different collections where some fail.
+TEST_F(BulkWriteShardTest, UpdatesFailOrdered) {
+    BulkWriteCommandRequest request(
+        {BulkWriteUpdateOp(1, BSON("x" << BSON("$gt" << 0)), BSON("x" << -99)),
+         BulkWriteUpdateOp(0, BSON("x" << BSON("$gt" << 0)), BSON("x" << -9)),
+         BulkWriteInsertOp(1, BSON("x" << -1))},
+        {nsInfoWithShardDatabaseVersions(
+             nssShardedCollection1, dbVersionTestDb1, incorrectShardVersion),
+         nsInfoWithShardDatabaseVersions(
+             nssShardedCollection2, dbVersionTestDb2, shardVersionShardedCollection2)});
 
-//     request.setOrdered(false);
+    request.setOrdered(true);
 
-//     auto replyItems = bulk_write::performWrites(opCtx(), request);
+    const auto& [replyItems, retriedStmtIds, numErrors] =
+        bulk_write::performWrites(opCtx(), request);
 
-//     ASSERT_EQ(2, replyItems.size());
-//     ASSERT_OK(replyItems.front().getStatus());
-//     ASSERT_EQ(ErrorCodes::StaleConfig, replyItems[1].getStatus().code());
+    ASSERT_EQ(2, replyItems.size());
+    ASSERT_OK(replyItems.front().getStatus());
+    ASSERT_EQ(ErrorCodes::StaleConfig, replyItems[1].getStatus().code());
+    ASSERT_EQ(1, numErrors);
 
-//     OperationShardingState::get(opCtx()).resetShardingOperationFailedStatus();
-// }
+    OperationShardingState::get(opCtx()).resetShardingOperationFailedStatus();
+}
+
+// Ordered deletes into different collections where some fail.
+TEST_F(BulkWriteShardTest, DeletesFailOrdered) {
+    BulkWriteCommandRequest request(
+        {BulkWriteInsertOp(1, BSON("x" << -1)),
+         BulkWriteDeleteOp(0, BSON("x" << BSON("$gt" << 0))),
+         BulkWriteInsertOp(1, BSON("x" << -1))},
+        {nsInfoWithShardDatabaseVersions(
+             nssShardedCollection1, dbVersionTestDb1, incorrectShardVersion),
+         nsInfoWithShardDatabaseVersions(
+             nssShardedCollection2, dbVersionTestDb2, shardVersionShardedCollection2)});
+
+    request.setOrdered(true);
+
+    const auto& [replyItems, retriedStmtIds, numErrors] =
+        bulk_write::performWrites(opCtx(), request);
+
+    ASSERT_EQ(2, replyItems.size());
+    ASSERT_OK(replyItems.front().getStatus());
+    ASSERT_EQ(ErrorCodes::StaleConfig, replyItems[1].getStatus().code());
+    ASSERT_EQ(1, numErrors);
+
+    OperationShardingState::get(opCtx()).resetShardingOperationFailedStatus();
+}
 
 // After the first insert fails due to an incorrect database version, the rest
 // of the writes are skipped when operations are ordered.
@@ -470,10 +491,12 @@ TEST_F(BulkWriteShardTest, FirstFailsRestSkippedStaleDbVersionOrdered) {
          nsInfoWithShardDatabaseVersions(
              nssShardedCollection2, dbVersionTestDb2, shardVersionShardedCollection2)});
 
-    auto replyItems = bulk_write::performWrites(opCtx(), request);
+    const auto& [replyItems, retriedStmtIds, numErrors] =
+        bulk_write::performWrites(opCtx(), request);
 
     ASSERT_EQ(1, replyItems.size());
     ASSERT_EQ(ErrorCodes::StaleDbVersion, replyItems.back().getStatus().code());
+    ASSERT_EQ(1, numErrors);
 
     OperationShardingState::get(opCtx()).resetShardingOperationFailedStatus();
 }
@@ -491,11 +514,13 @@ TEST_F(BulkWriteShardTest, FirstFailsRestSkippedStaleDbVersionUnordered) {
              nssShardedCollection2, dbVersionTestDb2, shardVersionShardedCollection2)});
 
     request.setOrdered(false);
-    auto replyItems = bulk_write::performWrites(opCtx(), request);
+    const auto& [replyItems, retriedStmtIds, numErrors] =
+        bulk_write::performWrites(opCtx(), request);
 
     ASSERT_EQ(2, replyItems.size());
     ASSERT_OK(replyItems.front().getStatus());
     ASSERT_EQ(ErrorCodes::StaleDbVersion, replyItems.back().getStatus().code());
+    ASSERT_EQ(1, numErrors);
 
     OperationShardingState::get(opCtx()).resetShardingOperationFailedStatus();
 }

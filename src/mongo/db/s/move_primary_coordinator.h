@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/s/move_primary/move_primary_donor_service.h"
 #include "mongo/db/s/move_primary_coordinator_document_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
 #include "mongo/s/client/shard.h"
@@ -62,6 +63,25 @@ private:
         std::shared_ptr<executor::ScopedTaskExecutor> executor,
         const CancellationToken& token) noexcept;
 
+    bool onlineClonerPossiblyNeverCreated() const;
+    bool onlineClonerPossiblyCleanedUp() const;
+    bool onlineClonerAllowedToBeMissing() const;
+    void recoverOnlineCloner(OperationContext* opCtx);
+    void createOnlineCloner(OperationContext* opCtx);
+
+    /**
+     * Clone data to the recipient without using the online cloning machinery.
+     */
+    void cloneDataLegacy(OperationContext* opCtx);
+
+    /**
+     * Clone data to the recipient using the online cloning machinery.
+     */
+    void cloneDataUntilReadyForCatchup(OperationContext* opCtx, const CancellationToken& token);
+
+    void informOnlineClonerOfBlockingWrites(OperationContext* opCtx);
+    void waitUntilOnlineClonerPrepared(const CancellationToken& token);
+
     /**
      * Logs in the `config.changelog` collection a specific event for `movePrimary` operations.
      */
@@ -73,7 +93,7 @@ private:
      * Returns the list of unsharded collections for the given database. These are the collections
      * the recipient is expected to clone.
      */
-    std::vector<NamespaceString> getUnshardedCollections(OperationContext* opCtx);
+    std::vector<NamespaceString> getUnshardedCollections(OperationContext* opCtx) const;
 
     /**
      * Ensures that there are no orphaned collections in the recipient's catalog data, asserting
@@ -81,6 +101,7 @@ private:
      */
     void assertNoOrphanedDataOnRecipient(
         OperationContext* opCtx, const std::vector<NamespaceString>& collectionsToClone) const;
+
 
     /**
      * Requests to the recipient to clone all the collections of the given database currently owned
@@ -169,16 +190,24 @@ private:
      * Requests the recipient to enter the critical section on the database, causing the database
      * metadata refreshes to block.
      */
-    void enterCriticalSectionOnRecipient(OperationContext* opCtx) const;
+    void enterCriticalSectionOnRecipient(OperationContext* opCtx);
 
     /**
      * Requests the recipient to exit the critical section on the database, causing the database
      * metadata refreshes to unblock.
      */
-    void exitCriticalSectionOnRecipient(OperationContext* opCtx) const;
+    void exitCriticalSectionOnRecipient(OperationContext* opCtx);
+
+    void cleanupOnlineCloner(OperationContext* opCtx, const CancellationToken& token);
+    void cleanupOnAbortWithoutOnlineCloner(OperationContext* opCtx,
+                                           std::shared_ptr<executor::ScopedTaskExecutor> executor);
+    void cleanupOnAbortWithOnlineCloner(OperationContext* opCtx,
+                                        const CancellationToken& token,
+                                        const Status& status);
 
     const DatabaseName _dbName;
     const BSONObj _csReason;
+    std::shared_ptr<MovePrimaryDonor> _onlineCloner;
 };
 
 }  // namespace mongo

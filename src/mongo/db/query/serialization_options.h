@@ -31,6 +31,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/query/explain_options.h"
@@ -41,15 +42,38 @@
 namespace mongo {
 namespace {
 // Should never be called, throw to ensure we catch this in tests.
-std::string defaultRedactionStrategy(StringData s) {
+std::string defaultHmacStrategy(StringData s) {
     MONGO_UNREACHABLE_TASSERT(7332410);
 }
 }  // namespace
 
 /**
+ * A policy enum for how to serialize literal values.
+ */
+enum class LiteralSerializationPolicy {
+    // The default way to serialize. Just serialize whatever literals were given if they are still
+    // available, or whatever you parsed them to. This is expected to be able to parse again, since
+    // it worked the first time.
+    kUnchanged,
+    // Serialize any literal value as "?number" or similar. For example "?bool" for any boolean. Use
+    // 'debugTypeString()' helper.
+    kToDebugTypeString,
+    // Serialize any literal value to one canonical value of the given type, with the constraint
+    // that the chosen representative value should be parseable in this context. There are some
+    // default implementations that will usually work (e.g. using the number 1 almost always works
+    // for numbers), but serializers should be careful to think about and test this if their parsers
+    // reject certain values.
+    kToRepresentativeParseableValue,
+};
+
+/**
  * A struct with options for how you want to serialize a match or aggregation expression.
  */
 struct SerializationOptions {
+    // The default serialization options for a query shape. No need to redact identifiers for the
+    // this purpose. We may do that on the $queryStats read path.
+    static const SerializationOptions kDefaultQueryShapeSerializeOptions;
+
     SerializationOptions() {}
 
     SerializationOptions(bool explain_)
@@ -63,32 +87,66 @@ struct SerializationOptions {
 
     SerializationOptions(ExplainOptions::Verbosity verbosity_) : verbosity(verbosity_) {}
 
-    SerializationOptions(std::function<std::string(StringData)> identifierRedactionPolicy_,
+    SerializationOptions(std::function<std::string(StringData)> transformIdentifiersCallback_,
                          boost::optional<StringData> replacementForLiteralArgs_)
         : replacementForLiteralArgs(replacementForLiteralArgs_),
-          redactIdentifiers(identifierRedactionPolicy_),
-          identifierRedactionPolicy(identifierRedactionPolicy_) {}
+          transformIdentifiers(transformIdentifiersCallback_),
+          transformIdentifiersCallback(transformIdentifiersCallback_) {}
 
-    // Helper function for redacting identifiable information (like collection/db names).
-    // Note: serializeFieldPath/serializeFieldPathFromString should be used for redacting field
+    SerializationOptions(std::function<std::string(StringData)> fieldNamesHmacPolicy_,
+                         LiteralSerializationPolicy policy)
+        : literalPolicy(policy),
+          transformIdentifiers(fieldNamesHmacPolicy_),
+          transformIdentifiersCallback(fieldNamesHmacPolicy_) {
+        // TODO SERVER-75400 Remove replacementForLiteralArgs
+        if (policy == LiteralSerializationPolicy::kToDebugTypeString) {
+            replacementForLiteralArgs = "?";
+        }
+    }
+
+    SerializationOptions(LiteralSerializationPolicy policy) : literalPolicy(policy) {
+        // TODO SERVER-75400 Remove replacementForLiteralArgs
+        if (policy == LiteralSerializationPolicy::kToDebugTypeString) {
+            replacementForLiteralArgs = "?";
+        }
+    }
+
+    /**
+     * Checks if this SerializationOptions represents the same options as another
+     * SerializationOptions. Note it cannot compare whether the two 'transformIdentifiersCallback's
+     * are the same - the language purposefully leaves the comparison operator undefined.
+     */
+    bool operator==(const SerializationOptions& other) const {
+        return this->transformIdentifiers == other.transformIdentifiers &&
+            this->includePath == other.includePath &&
+            this->replacementForLiteralArgs == other.replacementForLiteralArgs &&
+            // You cannot well determine std::function equivalence in C++, so this is the best we'll
+            // do.
+            (this->transformIdentifiersCallback == nullptr) ==
+            (other.transformIdentifiersCallback == nullptr) &&
+            this->literalPolicy == other.literalPolicy && this->verbosity == other.verbosity;
+    }
+
+    // Helper function for removing identifiable information (like collection/db names).
+    // Note: serializeFieldPath/serializeFieldPathFromString should be used for field
     // names.
     std::string serializeIdentifier(StringData str) const {
-        if (redactIdentifiers) {
-            return identifierRedactionPolicy(str);
+        if (transformIdentifiers) {
+            return transformIdentifiersCallback(str);
         }
         return str.toString();
     }
 
     std::string serializeFieldPath(FieldPath path) const {
-        if (redactIdentifiers) {
-            std::stringstream redacted;
+        if (transformIdentifiers) {
+            std::stringstream hmaced;
             for (size_t i = 0; i < path.getPathLength(); ++i) {
                 if (i > 0) {
-                    redacted << ".";
+                    hmaced << ".";
                 }
-                redacted << identifierRedactionPolicy(path.getFieldName(i));
+                hmaced << transformIdentifiersCallback(path.getFieldName(i));
             }
-            return redacted.str();
+            return hmaced.str();
         }
         return path.fullPath();
     }
@@ -97,20 +155,16 @@ struct SerializationOptions {
         return "$" + serializeFieldPath(path);
     }
 
-    std::string serializeFieldPathFromString(StringData path) const {
-        if (redactIdentifiers) {
-            // Some valid field names are considered invalid as a FieldPath (for example, fields
-            // like "foo.$bar" where a sub-component is prefixed with "$"). For now, if
-            // serializeFieldPath errors due to an "invalid" field name, we'll serialize that field
-            // name with this placeholder.
-            // TODO SERVER-75623 Implement full redaction for all field names and remove placeholder
-            try {
-                return serializeFieldPath(path);
-            } catch (DBException&) {
-                return serializeFieldPath("dollarPlaceholder");
-            }
+    std::string serializeFieldPathFromString(StringData path) const;
+
+    std::vector<std::string> serializeFieldPathFromString(
+        const std::vector<std::string>& paths) const {
+        std::vector<std::string> result;
+        result.reserve(paths.size());
+        for (auto& p : paths) {
+            result.push_back(serializeFieldPathFromString(p));
         }
-        return path.toString();
+        return result;
     }
 
     template <class T>
@@ -118,51 +172,78 @@ struct SerializationOptions {
         if (replacementForLiteralArgs) {
             return Value(*replacementForLiteralArgs);
         }
-        return Value(n);
+        return ImplicitValue(n);
     }
 
-    // Helper functions for redacting BSONObj. Does not take into account anything to do with MQL
-    // semantics, redacts all field names and literals in the passed in obj.
-    void redactArrayToBuilder(BSONArrayBuilder* bab, std::vector<BSONElement> array) {
+    Value serializeLiteralValue(int64_t n) const {
+        if (replacementForLiteralArgs) {
+            return Value(*replacementForLiteralArgs);
+        }
+        return Value((long long)n);
+    }
+
+    // Helper functions for applying hmac to BSONObj. Does not take into account anything to do with
+    // MQL semantics, removes all field names and literals in the passed in obj.
+    void addHmacedArrayToBuilder(BSONArrayBuilder* bab, std::vector<BSONElement> array) {
         for (const auto& elem : array) {
             if (elem.type() == BSONType::Object) {
                 BSONObjBuilder subObj(bab->subobjStart());
-                redactObjToBuilder(&subObj, elem.Obj());
+                addHmacedObjToBuilder(&subObj, elem.Obj());
                 subObj.done();
             } else if (elem.type() == BSONType::Array) {
                 BSONArrayBuilder subArr(bab->subarrayStart());
-                redactArrayToBuilder(&subArr, elem.Array());
+                addHmacedArrayToBuilder(&subArr, elem.Array());
                 subArr.done();
             } else {
-                if (replacementForLiteralArgs) {
-                    bab->append(replacementForLiteralArgs.get());
-                } else {
-                    bab->append(elem);
-                }
+                *bab << serializeLiteral(elem);
             }
         }
     }
 
-    void redactObjToBuilder(BSONObjBuilder* bob, BSONObj objToRedact) {
-        for (const auto& elem : objToRedact) {
+    void addHmacedObjToBuilder(BSONObjBuilder* bob, BSONObj objToHmac) {
+        for (const auto& elem : objToHmac) {
             auto fieldName = serializeFieldPath(elem.fieldName());
             if (elem.type() == BSONType::Object) {
                 BSONObjBuilder subObj(bob->subobjStart(fieldName));
-                redactObjToBuilder(&subObj, elem.Obj());
+                addHmacedObjToBuilder(&subObj, elem.Obj());
                 subObj.done();
             } else if (elem.type() == BSONType::Array) {
                 BSONArrayBuilder subArr(bob->subarrayStart(fieldName));
-                redactArrayToBuilder(&subArr, elem.Array());
+                addHmacedArrayToBuilder(&subArr, elem.Array());
                 subArr.done();
             } else {
-                if (replacementForLiteralArgs) {
-                    bob->append(fieldName, replacementForLiteralArgs.get());
-                } else {
-                    bob->appendAs(elem, fieldName);
-                }
+                appendLiteral(bob, fieldName, elem);
             }
         }
     }
+
+
+    /**
+     * Helper method to call 'serializeLiteral()' on 'e' and append the resulting value to 'bob'
+     * using the same name as 'e'.
+     */
+    void appendLiteral(BSONObjBuilder* bob, const BSONElement& e) const;
+    /**
+     * Helper method to call 'serializeLiteral()' on 'v' and append the result to 'bob' using field
+     * name 'fieldName'.
+     */
+    void appendLiteral(BSONObjBuilder* bob, StringData fieldName, const ImplicitValue& v) const;
+
+    /**
+     * This is the recommended API for adding any literals to serialization output. For example,
+     * BSON("myArg" << options.serializeLiteral(_myArg));
+     *
+     * Depending on the configured 'literalPolicy', it will do the right thing.
+     * - If 'literalPolicy' is 'kUnchanged', returns the input value unmodified.
+     * - If it is 'kToDebugTypeString', computes and returns the type string as a string Value.
+     * - If it is 'kToRepresentativeValue', it Returns an arbitrary value of the same type as the
+     *   one given. For any number, this will be the number 1. For any boolean this will be true.
+     *
+     *   TODO SERVER-XYZ If you need a different value to make sure it will parse, you should not
+     *   use this API - but use serializeConstrainedLiteral() instead.
+     */
+    Value serializeLiteral(const BSONElement& e) const;
+    Value serializeLiteral(const ImplicitValue& v) const;
 
     // 'replacementForLiteralArgs' is an independent option to serialize in a genericized format
     // with the aim of similar "shaped" queries serializing to the same object. For example, if
@@ -172,13 +253,25 @@ struct SerializationOptions {
     // "Literal" here is meant to stand in contrast to expression arguements, as in the $gt
     // expressions in {$and: [{a: {$gt: 3}}, {b: {$gt: 4}}]}. There the only literals are 3 and
     // 4, so the serialization expected would be {$and: [{a: {$gt: '?'}}, {b: {$lt: '?'}}]}.
+    //
+    // TODO SERVER-XXX remove this option in favor of 'literalPolicy' below.
     boost::optional<StringData> replacementForLiteralArgs = boost::none;
 
-    // If true the caller must set identifierRedactionPolicy. 'redactIdentifiers' if set along with
-    // a strategy the redaction strategy will be called on any personal identifiable information
-    // (e.g., field paths/names, collection names) encountered before serializing them.
-    bool redactIdentifiers = false;
-    std::function<std::string(StringData)> identifierRedactionPolicy = defaultRedactionStrategy;
+    // 'literalPolicy' is an independent option to serialize in a general format with the aim of
+    // similar "shaped" queries serializing to the same object. For example, if set to
+    // 'kToDebugTypeString', then the serialization of {a: {$gt: 2}} should result in {a: {$gt:
+    // '?number'}}, as will the serialization of {a: {$gt: 3}}.
+    //
+    // "Literal" here is meant to stand in contrast to expression arguments, as in the $gt
+    // expressions in {$and: [{a: {$gt: 3}}, {b: {$gt: 4}}]}. There the only literals are 3 and 4,
+    // so the serialization expected would be {$and: [{a: {$gt: '?'}}, {b: {$lt: '?'}}]}.
+    LiteralSerializationPolicy literalPolicy = LiteralSerializationPolicy::kUnchanged;
+
+    // If true the caller must set transformIdentifiersCallback. 'transformIdentifiers' if set along
+    // with a strategy the redaction strategy will be called on any personal identifiable
+    // information (e.g., field paths/names, collection names) encountered before serializing them.
+    bool transformIdentifiers = false;
+    std::function<std::string(StringData)> transformIdentifiersCallback = defaultHmacStrategy;
 
     // If set, serializes without including the path. For example {a: {$gt: 2}} would serialize
     // as just {$gt: 2}.

@@ -34,6 +34,7 @@
 #include <fmt/format.h>
 
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands/tenant_migration_recipient_cmds_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -133,6 +134,13 @@ void TenantFileImporterService::startMigration(const UUID& migrationId) {
 
     _workerThread = std::make_unique<stdx::thread>([this, migrationId] {
         Client::initThread("TenantFileImporterService");
+
+        // TODO(SERVER-74661): Please revisit if this thread could be made killable.
+        {
+            stdx::lock_guard<Client> lk(cc());
+            cc().setSystemOperationUnkillableByStepdown(lk);
+        }
+
         try {
             _handleEvents(migrationId);
         } catch (const DBException& err) {
@@ -209,7 +217,8 @@ void TenantFileImporterService::interruptAll() {
 }
 
 void TenantFileImporterService::_handleEvents(const UUID& migrationId) {
-    auto opCtx = cc().makeOperationContext();
+    auto uniqueOpCtx = cc().makeOperationContext();
+    OperationContext* opCtx = uniqueOpCtx.get();
 
     ON_BLOCK_EXIT([this, opId = opCtx->getOpID()] {
         stdx::lock_guard lk(_mutex);
@@ -224,7 +233,7 @@ void TenantFileImporterService::_handleEvents(const UUID& migrationId) {
                 str::stream() << "TenantFileImporterService was interrupted for migrationId=\""
                               << _migrationId << "\"",
                 migrationId == _migrationId && _state != State::kInterrupted);
-        _opCtx = opCtx.get();
+        _opCtx = opCtx;
     }
 
     LOGV2_INFO(6378904,
@@ -273,7 +282,7 @@ void TenantFileImporterService::_handleEvents(const UUID& migrationId) {
     while (true) {
         opCtx->checkForInterrupt();
 
-        auto event = eventQueue->pop(opCtx.get());
+        auto event = eventQueue->pop(opCtx);
 
         // Out-of-order events for a different migration are not permitted.
         invariant(event.migrationId == migrationId);
@@ -287,7 +296,7 @@ void TenantFileImporterService::_handleEvents(const UUID& migrationId) {
                 // connection for the first kLearnedFileName event.
                 setUpImporterResourcesIfNeeded(event.metadataDoc);
 
-                cloneFile(opCtx.get(),
+                cloneFile(opCtx,
                           donorConnection.get(),
                           writerPool.get(),
                           sharedData.get(),
@@ -295,8 +304,13 @@ void TenantFileImporterService::_handleEvents(const UUID& migrationId) {
                 continue;
             }
             case eventType::kLearnedAllFilenames:
-                importCopiedFiles(opCtx.get(), migrationId);
-                _voteImportedFiles(opCtx.get(), migrationId);
+                importCopiedFiles(opCtx, migrationId);
+                shard_merge_utils::createImportDoneMarkerLocalCollection(opCtx, migrationId);
+                // Take a stable checkpoint so that all the imported donor & marker collection
+                // metadata infos are persisted to disk.
+                opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable(opCtx,
+                                                                         /*stableCheckpoint*/ true);
+                _voteImportedFiles(opCtx, migrationId);
                 break;
         }
         break;
@@ -311,7 +325,7 @@ void TenantFileImporterService::_voteImportedFiles(OperationContext* opCtx,
 
     auto voteResponse = replCoord->runCmdOnPrimaryAndAwaitResponse(
         opCtx,
-        DatabaseName::kAdmin.db(),
+        DatabaseName::kAdmin.db().toString(),
         cmd.toBSON({}),
         [](executor::TaskExecutor::CallbackHandle handle) {},
         [](executor::TaskExecutor::CallbackHandle handle) {});

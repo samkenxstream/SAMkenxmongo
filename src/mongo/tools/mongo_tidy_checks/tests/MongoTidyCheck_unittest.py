@@ -131,6 +131,25 @@ class MongoTidyTests(unittest.TestCase):
 
         self.run_clang_tidy()
 
+    def test_MongoCxx20BannedIncludesCheck(self):
+
+        self.write_config(
+            textwrap.dedent("""\
+                    Checks: '-*,mongo-cxx20-banned-includes-check'
+                    WarningsAsErrors: '*'
+                    HeaderFilterRegex: '(mongo/.*)'
+                    """))
+
+        self.expected_output = [
+            "Use of prohibited <syncstream> header.",
+            "Use of prohibited <ranges> header.",
+            "Use of prohibited <barrier> header.",
+            "Use of prohibited <latch> header.",
+            "Use of prohibited <semaphore> header.",
+        ]
+
+        self.run_clang_tidy()
+
     def test_MongoStdOptionalCheck(self):
 
         self.write_config(
@@ -181,7 +200,7 @@ class MongoTidyTests(unittest.TestCase):
         ]
 
         self.run_clang_tidy()
-        
+
     def test_MongoStdAtomicCheck(self):
 
         self.write_config(
@@ -224,6 +243,71 @@ class MongoTidyTests(unittest.TestCase):
 
         self.expected_output = [
             "error: Illegal use of the bare assert function, use a function from assert_util.h instead",
+        ]
+
+        self.run_clang_tidy()
+
+    def test_MongoFCVConstantCheck(self):
+
+        self.write_config(
+            textwrap.dedent("""\
+                Checks: '-*,mongo-fcv-constant-check'
+                WarningsAsErrors: '*'
+                """))
+
+        self.expected_output = [
+            "error: Illegal use of FCV constant in FCV comparison check functions. FCV gating should be done through feature flags instead.",
+        ]
+
+        self.run_clang_tidy()
+
+    def test_MongoUnstructuredLogCheck(self):
+
+        self.write_config(
+            textwrap.dedent("""\
+                Checks: '-*,mongo-unstructured-log-check'
+                WarningsAsErrors: '*'
+                """))
+
+        self.expected_output = [
+            "error: Illegal use of unstructured logging, this is only for local development use and should not be committed [mongo-unstructured-log-check,-warnings-as-errors]\n    logd();",
+            "error: Illegal use of unstructured logging, this is only for local development use and should not be committed [mongo-unstructured-log-check,-warnings-as-errors]\n    doUnstructuredLogImpl();",
+        ]
+
+        self.run_clang_tidy()
+
+    def test_MongoConfigHeaderCheck(self):
+
+        self.write_config(
+            textwrap.dedent("""\
+                Checks: '-*,mongo-config-header-check'
+                WarningsAsErrors: '*'
+                HeaderFilterRegex: '(mongo/.*)'
+                """))
+
+        self.expected_output = [
+            "error: MONGO_CONFIG define used without prior inclusion of config.h [mongo-config-header-check,-warnings-as-errors]\n#define MONGO_CONFIG_TEST1 1",
+            "error: MONGO_CONFIG define used without prior inclusion of config.h [mongo-config-header-check,-warnings-as-errors]\n#ifdef MONGO_CONFIG_TEST1",
+            "error: MONGO_CONFIG define used without prior inclusion of config.h [mongo-config-header-check,-warnings-as-errors]\n#if MONGO_CONFIG_TEST1 == 1",
+            "error: MONGO_CONFIG define used without prior inclusion of config.h [mongo-config-header-check,-warnings-as-errors]\n#ifndef MONGO_CONFIG_TEST2",
+            "error: MONGO_CONFIG define used without prior inclusion of config.h [mongo-config-header-check,-warnings-as-errors]\n#if defined(MONGO_CONFIG_TEST1)",
+        ]
+        self.run_clang_tidy()
+
+    def test_MongoCollectionShardingRuntimeCheck(self):
+
+        self.write_config(
+            textwrap.dedent("""\
+                Checks: '-*,mongo-collection-sharding-runtime-check'
+                WarningsAsErrors: '*'
+                CheckOptions:
+                    - key:             mongo-collection-sharding-runtime-check.exceptionDirs
+                      value:           'src/mongo/db/s'
+                """))
+
+        self.expected_output = [
+            "error: Illegal use of CollectionShardingRuntime outside of mongo/db/s/; use CollectionShardingState instead; see src/mongo/db/s/collection_sharding_state.h for details. [mongo-collection-sharding-runtime-check,-warnings-as-errors]\n    CollectionShardingRuntime csr(5, \"Test\");",
+            "error: Illegal use of CollectionShardingRuntime outside of mongo/db/s/; use CollectionShardingState instead; see src/mongo/db/s/collection_sharding_state.h for details. [mongo-collection-sharding-runtime-check,-warnings-as-errors]\n    int result = CollectionShardingRuntime::functionTest(7, \"Test\");",
         ]
 
         self.run_clang_tidy()

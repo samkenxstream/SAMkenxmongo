@@ -29,7 +29,6 @@
 
 #include "mongo/db/query/cqf_command_utils.h"
 
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/exec/add_fields_projection_executor.h"
 #include "mongo/db/exec/exclusion_projection_executor.h"
 #include "mongo/db/exec/inclusion_projection_executor.h"
@@ -40,6 +39,7 @@
 #include "mongo/db/matcher/expression_expr.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/matcher/expression_internal_bucket_geo_within.h"
+#include "mongo/db/matcher/expression_internal_eq_hashed_key.h"
 #include "mongo/db/matcher/expression_internal_expr_comparison.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_text.h"
@@ -111,6 +111,7 @@
 #include "mongo/db/pipeline/document_source_operation_metrics.h"
 #include "mongo/db/pipeline/document_source_out.h"
 #include "mongo/db/pipeline/document_source_plan_cache_stats.h"
+#include "mongo/db/pipeline/document_source_query_stats.h"
 #include "mongo/db/pipeline/document_source_queue.h"
 #include "mongo/db/pipeline/document_source_redact.h"
 #include "mongo/db/pipeline/document_source_replace_root.h"
@@ -124,7 +125,6 @@
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/document_source_streaming_group.h"
 #include "mongo/db/pipeline/document_source_tee_consumer.h"
-#include "mongo/db/pipeline/document_source_telemetry.h"
 #include "mongo/db/pipeline/document_source_union_with.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
 #include "mongo/db/pipeline/visitors/document_source_visitor_registry_mongod.h"
@@ -217,6 +217,10 @@ public:
     }
 
     void visit(const InternalExprLTEMatchExpression* expr) override {
+        unsupportedExpression(expr);
+    }
+
+    void visit(const InternalEqHashedKey* expr) override {
         unsupportedExpression(expr);
     }
 
@@ -1104,21 +1108,8 @@ bool isEligibleCommon(const RequestType& request,
 }
 
 boost::optional<bool> shouldForceEligibility() {
-    // Without the feature flag set, no queries are eligible for Bonsai.
-    if (!serverGlobalParams.featureCompatibility.isVersionInitialized() ||
-        !feature_flags::gFeatureFlagCommonQueryFramework.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
-        LOGV2_DEBUG(7325100,
-                    4,
-                    "Bonsai will not be forced because FCV initialized={fcv} and CQF flag={cqf}",
-                    "Bonsai will not be forced because FCV isn't initialized or CQF isn't enabled.",
-                    "fcv"_attr = serverGlobalParams.featureCompatibility.isVersionInitialized(),
-                    "cqf"_attr = !serverGlobalParams.featureCompatibility.isVersionInitialized() ||
-                        feature_flags::gFeatureFlagCommonQueryFramework.isEnabled(
-                            serverGlobalParams.featureCompatibility));
-        return false;
-    }
-
+    // We don't need to consult the feature flag here, since the framework control knob can only
+    // be set to enable bonsai if featureFlagCommonQueryFramework is enabled.
     auto queryControl = ServerParameterSet::getNodeParameterSet()->get<QueryFrameworkControl>(
         "internalQueryFrameworkControl");
 
@@ -1137,8 +1128,7 @@ boost::optional<bool> shouldForceEligibility() {
             // classic engine.
             return boost::none;
         case QueryFrameworkControlEnum::kForceBonsai:
-            // This option is only supported with test commands enabled.
-            return getTestCommandsEnabled();
+            return true;
     }
 
     MONGO_UNREACHABLE;

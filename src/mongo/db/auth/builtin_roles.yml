@@ -51,6 +51,7 @@ roles:
             - matchType: database
               actions: &readWriteRoleActions
                 - *readRoleActions
+                - cleanupStructuredEncryptionData
                 - compactStructuredEncryptionData
                 - convertToCapped # db admin gets this also
                 - createCollection # db admin gets this also
@@ -352,9 +353,9 @@ roles:
                   - getClusterParameter
                   - setChangeStreamState
                   - getChangeStreamState
-                  - telemetryRead
+                  - queryStatsRead
                   - checkMetadataConsistency
-                  - transitionToCatalogShard
+                  - transitionFromDedicatedConfigServer
                   - transitionToDedicatedConfigServer
 
             - matchType: any_normal

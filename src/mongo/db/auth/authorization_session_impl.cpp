@@ -43,6 +43,7 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authz_session_external_state.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern_search_list.h"
 #include "mongo/db/auth/validated_tenancy_scope.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/client.h"
@@ -101,25 +102,17 @@ MONGO_INITIALIZER(ServerlessPrivilegePermittedMap)(InitializerContext*) try {
         auto matchTypeName = MatchType_serializer(matchType);
         auto dataObj = MatchType_get_extra_data(matchType);
         auto data = MatchTypeExtraData::parse(IDLParserContext{matchTypeName}, dataObj);
-        auto actionTypes = data.getServerlessActionTypes();
 
-        std::vector<std::string> actionsToParse;
-        std::transform(actionTypes.cbegin(),
-                       actionTypes.cend(),
-                       std::back_inserter(actionsToParse),
-                       [](const auto& at) { return at.toString(); });
-
-        ActionSet actions;
         std::vector<std::string> unknownActions;
-        auto status =
-            ActionSet::parseActionSetFromStringVector(actionsToParse, &actions, &unknownActions);
-        if (!status.isOK()) {
+        auto actions =
+            ActionSet::parseFromStringVector(data.getServerlessActionTypes(), &unknownActions);
+        if (!unknownActions.empty()) {
             StringBuilder sb;
             sb << "Unknown actions listed for match type '" << matchTypeName << "':";
             for (const auto& unknownAction : unknownActions) {
                 sb << " '" << unknownAction << "'";
             }
-            uassertStatusOK(status.withContext(sb.str()));
+            uasserted(ErrorCodes::FailedToParse, sb.str());
         }
 
         ret[matchType] = std::move(actions);
@@ -457,6 +450,7 @@ PrivilegeVector AuthorizationSessionImpl::_getDefaultPrivileges() {
         setupServerConfigActionSet.addAction(ActionType::addShard);
         setupServerConfigActionSet.addAction(ActionType::replSetConfigure);
         setupServerConfigActionSet.addAction(ActionType::replSetGetStatus);
+        setupServerConfigActionSet.addAction(ActionType::issueDirectShardOperations);
         Privilege setupServerConfigPrivilege =
             Privilege(ResourcePattern::forClusterResource(), setupServerConfigActionSet);
 
@@ -562,89 +556,6 @@ bool AuthorizationSessionImpl::isAuthorizedForActionsOnNamespace(const Namespace
     return isAuthorizedForPrivilege(Privilege(ResourcePattern::forExactNamespace(ns), actions));
 }
 
-constexpr int resourceSearchListCapacity = 7;
-/**
- * Builds from "target" an exhaustive list of all ResourcePatterns that match "target".
- *
- * Some resources are considered to be "normal resources", and are matched by the
- * forAnyNormalResource pattern. Collections which are not prefixed with "system.",
- * and which do not belong inside of the "local" or "config" databases are "normal".
- * Database other than "local" and "config" are normal.
- *
- * Most collections are matched by their database's resource. Collections prefixed with "system."
- * are not. Neither are collections on the "local" database, whose name are prefixed with "replset."
- *
- *
- * Stores the resulting list into resourceSearchList, and returns the length.
- *
- * The seach lists are as follows, depending on the type of "target":
- *
- * target is ResourcePattern::forAnyResource():
- *   searchList = { ResourcePattern::forAnyResource(), ResourcePattern::forAnyResource() }
- * target is the ResourcePattern::forClusterResource():
- *   searchList = { ResourcePattern::forAnyResource(), ResourcePattern::forClusterResource() }
- * target is a database, db:
- *   searchList = { ResourcePattern::forAnyResource(),
- *                  ResourcePattern::forAnyNormalResource(),
- *                  db }
- * target is a non-system collection, db.coll:
- *   searchList = { ResourcePattern::forAnyResource(),
- *                  ResourcePattern::forAnyNormalResource(),
- *                  db,
- *                  coll,
- *                  db.coll }
- * target is a system buckets collection, db.system.buckets.coll:
- *   searchList = { ResourcePattern::forAnyResource(),
- *                  ResourcePattern::forAnySystemBuckets(),
- *                  ResourcePattern::forAnySystemBucketsInDatabase("db"),
- *                  ResourcePattern::forAnySystemBucketsInAnyDatabase("coll"),
- *                  ResourcePattern::forExactSystemBucketsCollection("db", "coll"),
- *                  system.buckets.coll,
- *                  db.system.buckets.coll }
- * target is a system collection, db.system.coll:
- *   searchList = { ResourcePattern::forAnyResource(),
- *                  system.coll,
- *                  db.system.coll }
- */
-static int buildResourceSearchList(const ResourcePattern& target,
-                                   ResourcePattern resourceSearchList[resourceSearchListCapacity]) {
-    int size = 0;
-    resourceSearchList[size++] = ResourcePattern::forAnyResource();
-    if (target.isExactNamespacePattern()) {
-        // Normal collections can be matched by anyNormalResource, or their database's resource.
-        if (target.ns().isNormalCollection()) {
-            // But even normal collections in non-normal databases should not be matchable with
-            // ResourcePattern::forAnyNormalResource. 'local' and 'config' are
-            // used to store special system collections, which user level
-            // administrators should not be able to manipulate.
-            if (target.ns().db() != "local" && target.ns().db() != "config") {
-                resourceSearchList[size++] = ResourcePattern::forAnyNormalResource();
-            }
-            resourceSearchList[size++] = ResourcePattern::forDatabaseName(target.ns().db());
-        } else if (target.ns().coll().startsWith(SYSTEM_BUCKETS_PREFIX) &&
-                   target.ns().coll().size() > SYSTEM_BUCKETS_PREFIX.size()) {
-            auto bucketColl = target.ns().coll().substr(SYSTEM_BUCKETS_PREFIX.size());
-            resourceSearchList[size++] =
-                ResourcePattern::forExactSystemBucketsCollection(target.ns().db(), bucketColl);
-            resourceSearchList[size++] = ResourcePattern::forAnySystemBuckets();
-            resourceSearchList[size++] =
-                ResourcePattern::forAnySystemBucketsInDatabase(target.ns().db());
-            resourceSearchList[size++] =
-                ResourcePattern::forAnySystemBucketsInAnyDatabase(bucketColl);
-        }
-
-        // All collections can be matched by a collection resource for their name
-        resourceSearchList[size++] = ResourcePattern::forCollectionName(target.ns().coll());
-    } else if (target.isDatabasePattern()) {
-        if (target.ns().db() != "local" && target.ns().db() != "config") {
-            resourceSearchList[size++] = ResourcePattern::forAnyNormalResource();
-        }
-    }
-    resourceSearchList[size++] = target;
-    dassert(size <= resourceSearchListCapacity);
-    return size;
-}
-
 bool AuthorizationSessionImpl::isAuthorizedToChangeAsUser(const UserName& userName,
                                                           ActionType actionType) {
     _contract.addAccessCheck(AccessCheckEnum::kIsAuthorizedToChangeAsUser);
@@ -653,15 +564,11 @@ bool AuthorizationSessionImpl::isAuthorizedToChangeAsUser(const UserName& userNa
     if (!user) {
         return false;
     }
-    ResourcePattern resourceSearchList[resourceSearchListCapacity];
-    const int resourceSearchListLength = buildResourceSearchList(
-        ResourcePattern::forDatabaseName(userName.getDB()), resourceSearchList);
 
-    ActionSet actions;
-    for (int i = 0; i < resourceSearchListLength; ++i) {
-        actions.addAllActionsFromSet(user->getActionsForResource(resourceSearchList[i]));
-    }
-    return actions.contains(actionType);
+    auth::ResourcePatternSearchList search(ResourcePattern::forDatabaseName(userName.getDB()));
+    return std::any_of(search.cbegin(), search.cend(), [&user, &actionType](const auto& pattern) {
+        return user->getActionsForResource(pattern).contains(actionType);
+    });
 }
 
 StatusWith<PrivilegeVector> AuthorizationSessionImpl::checkAuthorizedToListCollections(
@@ -732,7 +639,8 @@ void AuthorizationSessionImpl::_refreshUserInfoAsNeeded(OperationContext* opCtx)
         // backing LDAP host, it should be cleared from _authenticatedUser. This
         // guarantees that no operations can be performed until the LDAP host comes back up.
         // TODO SERVER-72678 avoid this edge case hack when rearchitecting user acquisition.
-        if (name.getDB() == "$external"_sd && currentUser->getUserRequest().mechanismData.empty()) {
+        if (name.getDB() == DatabaseName::kExternal.db() &&
+            currentUser->getUserRequest().mechanismData.empty()) {
             clearUser();
             LOGV2(5914804,
                   "Removed external user from session cache of user information because of "
@@ -850,7 +758,7 @@ bool AuthorizationSessionImpl::isAuthorizedForAnyActionOnAnyResourceInDB(StringD
 
     // If the user is authorized for anyNormalResource, then they implicitly have access
     // to most databases.
-    if (db != "local" && db != "config" &&
+    if (db != DatabaseName::kLocal.db() && db != DatabaseName::kConfig.db() &&
         user->hasActionsForResource(ResourcePattern::forAnyNormalResource())) {
         return true;
     }
@@ -899,39 +807,26 @@ bool AuthorizationSessionImpl::isAuthorizedForAnyActionOnResource(const Resource
         return false;
     }
 
-    std::array<ResourcePattern, resourceSearchListCapacity> resourceSearchList;
-    const int resourceSearchListLength =
-        buildResourceSearchList(resource, resourceSearchList.data());
-
     const auto& user = _authenticatedUser.value();
-    for (int i = 0; i < resourceSearchListLength; ++i) {
-        if (user->hasActionsForResource(resourceSearchList[i])) {
-            return true;
-        }
-    }
-
-    return false;
+    auth::ResourcePatternSearchList search(resource);
+    return std::any_of(search.cbegin(), search.cend(), [&user](const auto& pattern) {
+        return user->hasActionsForResource(pattern);
+    });
 }
 
 
 bool AuthorizationSessionImpl::_isAuthorizedForPrivilege(const Privilege& privilege) {
     _contract.addPrivilege(privilege);
 
-    const ResourcePattern& target(privilege.getResourcePattern());
-
-    ResourcePattern resourceSearchList[resourceSearchListCapacity];
-    const int resourceSearchListLength = buildResourceSearchList(target, resourceSearchList);
-
+    auth::ResourcePatternSearchList search(privilege.getResourcePattern());
     ActionSet unmetRequirements = privilege.getActions();
     for (const auto& priv : _getDefaultPrivileges()) {
-        for (int i = 0; i < resourceSearchListLength; ++i) {
-            if (!(priv.getResourcePattern() == resourceSearchList[i])) {
+        for (auto patternIt = search.cbegin(); patternIt != search.cend(); ++patternIt) {
+            if (!priv.getResourcePattern().matchesIgnoringTenant(*patternIt)) {
                 continue;
             }
 
-            ActionSet userActions = priv.getActions();
-            unmetRequirements.removeAllActionsFromSet(userActions);
-
+            unmetRequirements.removeAllActionsFromSet(priv.getActions());
             if (unmetRequirements.empty()) {
                 return true;
             }
@@ -943,16 +838,10 @@ bool AuthorizationSessionImpl::_isAuthorizedForPrivilege(const Privilege& privil
     }
 
     const auto& user = _authenticatedUser.value();
-    for (int i = 0; i < resourceSearchListLength; ++i) {
-        ActionSet userActions = user->getActionsForResource(resourceSearchList[i]);
-        unmetRequirements.removeAllActionsFromSet(userActions);
-
-        if (unmetRequirements.empty()) {
-            return true;
-        }
-    }
-
-    return false;
+    return std::any_of(search.cbegin(), search.cend(), [&](const auto& pattern) {
+        unmetRequirements.removeAllActionsFromSet(user->getActionsForResource(pattern));
+        return unmetRequirements.empty();
+    });
 }
 
 void AuthorizationSessionImpl::setImpersonatedUserData(const UserName& username,

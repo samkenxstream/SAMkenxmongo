@@ -29,8 +29,6 @@
 
 #pragma once
 
-#include <climits>  // For UINT_MAX
-
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/util/timer.h"
@@ -39,6 +37,31 @@ namespace mongo {
 
 class Lock {
 public:
+    /**
+     * For use as general mutex or readers/writers lock, outside the general multi-granularity
+     * model. A ResourceMutex is not affected by yielding and two phase locking semantics inside
+     * WUOWs. Lock with ResourceLock, SharedLock or ExclusiveLock. Uses same fairness as other
+     * LockManager locks.
+     */
+    class ResourceMutex {
+    public:
+        ResourceMutex(std::string resourceLabel);
+
+        /**
+         * Each instantiation of this class allocates a new ResourceId.
+         */
+        ResourceId getRid() const {
+            return _rid;
+        }
+
+        bool isExclusivelyLocked(Locker* locker);
+
+        bool isAtLeastReadLocked(Locker* locker);
+
+    private:
+        const ResourceId _rid;
+    };
+
     /**
      * General purpose RAII wrapper for a resource managed by the lock manager
      *
@@ -103,57 +126,6 @@ public:
     };
 
     /**
-     * For use as general mutex or readers/writers lock, outside the general multi-granularity
-     * model. A ResourceMutex is not affected by yielding and two phase locking semantics inside
-     * WUOWs. Lock with ResourceLock, SharedLock or ExclusiveLock. Uses same fairness as other
-     * LockManager locks.
-     */
-    class ResourceMutex {
-    public:
-        ResourceMutex(std::string resourceLabel);
-
-        std::string getName() const {
-            return getName(_rid);
-        }
-
-        /**
-         * Each instantiation of this class allocates a new ResourceId.
-         */
-        ResourceId getRid() const {
-            return _rid;
-        }
-
-        static std::string getName(ResourceId resourceId);
-
-        bool isExclusivelyLocked(Locker* locker);
-
-        bool isAtLeastReadLocked(Locker* locker);
-
-    private:
-        const ResourceId _rid;
-
-        /**
-         * ResourceMutexes can be constructed during initialization, thus the code must ensure the
-         * vector of labels is constructed before items are added to it. This factory encapsulates
-         * all members that need to be initialized before first use.
-         */
-        class ResourceIdFactory {
-        public:
-            static ResourceId newResourceIdForMutex(std::string resourceLabel);
-
-            static std::string nameForId(ResourceId resourceId);
-
-        private:
-            static ResourceIdFactory& _resourceIdFactory();
-            ResourceId _newResourceIdForMutex(std::string resourceLabel);
-
-            std::uint64_t nextId = 0;
-            std::vector<std::string> labels;
-            Mutex labelsMutex = MONGO_MAKE_LATCH("ResourceIdFactory::labelsMutex");
-        };
-    };
-
-    /**
      * Obtains a ResourceMutex for exclusive use.
      */
     class ExclusiveLock : public ResourceLock {
@@ -161,21 +133,9 @@ public:
         ExclusiveLock(OperationContext* opCtx, ResourceMutex mutex)
             : ResourceLock(opCtx, mutex.getRid(), MODE_X) {}
 
-        ExclusiveLock(Locker* locker, ResourceMutex mutex)
-            : ResourceLock(locker, mutex.getRid(), MODE_X) {}
-
         // Lock/unlock overloads to allow ExclusiveLock to be used with condition_variable-like
         // utilities such as stdx::condition_variable_any and waitForConditionOrInterrupt
-
-        void lock() {
-            // The contract of the condition_variable-like utilities is that that the lock is
-            // returned in the locked state so the acquisition below must be guaranteed to always
-            // succeed.
-            invariant(_opCtx);
-            UninterruptibleLockGuard ulg(_opCtx->lockState());  // NOLINT.
-            _lock(MODE_X);
-        }
-
+        void lock();
         void unlock() {
             _unlock();
         }
@@ -194,9 +154,6 @@ public:
     public:
         SharedLock(OperationContext* opCtx, ResourceMutex mutex)
             : ResourceLock(opCtx, mutex.getRid(), MODE_IS) {}
-
-        SharedLock(Locker* locker, ResourceMutex mutex)
-            : ResourceLock(locker, mutex.getRid(), MODE_IS) {}
     };
 
     /**
@@ -246,24 +203,7 @@ public:
 
         GlobalLock(GlobalLock&&);
 
-        ~GlobalLock() {
-            // Preserve the original lock result which will be overridden by unlock().
-            auto lockResult = _result;
-            if (isLocked()) {
-                // Abandon our snapshot if destruction of the GlobalLock object results in actually
-                // unlocking the global lock. Recursive locking and the two-phase locking protocol
-                // may prevent lock release.
-                const bool willReleaseLock = _isOutermostLock &&
-                    !(_opCtx->lockState() && _opCtx->lockState()->inAWriteUnitOfWork());
-                if (willReleaseLock) {
-                    _opCtx->recoveryUnit()->abandonSnapshot();
-                }
-                _unlock();
-            }
-            if (!_skipRSTLLock && (lockResult == LOCK_OK || lockResult == LOCK_WAITING)) {
-                _opCtx->lockState()->unlock(resourceIdReplicationStateTransitionLock);
-            }
-        }
+        ~GlobalLock();
 
         bool isLocked() const {
             return _result == LOCK_OK;

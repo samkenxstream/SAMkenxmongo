@@ -130,15 +130,7 @@ public:
         MONGO_UNIMPLEMENTED;
     }
 
-    bool isReady(OperationContext* opCtx) const override {
-        MONGO_UNIMPLEMENTED;
-    }
-
-    bool isPresentInMySnapshot(OperationContext* opCtx) const override {
-        MONGO_UNIMPLEMENTED;
-    }
-
-    bool isReadyInMySnapshot(OperationContext* opCtx) const override {
+    bool isReady() const override {
         MONGO_UNIMPLEMENTED;
     }
 
@@ -147,14 +139,6 @@ public:
     }
 
     bool shouldValidateDocument() const override {
-        MONGO_UNIMPLEMENTED;
-    }
-
-    boost::optional<Timestamp> getMinimumVisibleSnapshot() const override {
-        MONGO_UNIMPLEMENTED;
-    }
-
-    void setMinimumVisibleSnapshot(Timestamp name) override {
         MONGO_UNIMPLEMENTED;
     }
 

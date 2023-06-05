@@ -59,7 +59,6 @@
 namespace mongo {
 namespace {
 
-constexpr auto kExternalDB = "$external"_sd;
 constexpr auto kDBFieldName = "db"_sd;
 
 /**
@@ -92,6 +91,12 @@ public:
         return "de-authenticate";
     }
 
+    // We should allow users to logout even if the user does not have the direct shard roles action
+    // type.
+    bool shouldSkipDirectConnectionChecks() const final {
+        return true;
+    }
+
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
@@ -106,8 +111,6 @@ public:
 
         void doCheckAuthorization(OperationContext*) const final {}
 
-        static constexpr auto kAdminDB = "admin"_sd;
-        static constexpr auto kLocalDB = "local"_sd;
         void typedRun(OperationContext* opCtx) {
             auto& logoutState = getLogoutCommandState(opCtx->getServiceContext());
             auto hasBeenInvoked = logoutState.markAsInvoked();
@@ -120,16 +123,17 @@ public:
             auto dbname = request().getDbName();
             auto* as = AuthorizationSession::get(opCtx->getClient());
 
-            as->logoutDatabase(
-                opCtx->getClient(), dbname.toStringWithTenantId(), "Logging out on user request");
-            if (getTestCommandsEnabled() && (dbname == kAdminDB)) {
+            as->logoutDatabase(opCtx->getClient(),
+                               DatabaseNameUtil::serializeForAuth(dbname),
+                               "Logging out on user request");
+            if (getTestCommandsEnabled() && (dbname.db() == DatabaseName::kAdmin.db())) {
                 // Allows logging out as the internal user against the admin database, however
                 // this actually logs out of the local database as well. This is to
                 // support the auth passthrough test framework on mongos (since you can't use the
                 // local database on a mongos, so you can't logout as the internal user
                 // without this).
                 as->logoutDatabase(opCtx->getClient(),
-                                   kLocalDB,
+                                   DatabaseName::kLocal.db(),
                                    "Logging out from local database for test purposes");
             }
         }
@@ -213,7 +217,7 @@ void _authenticateX509(OperationContext* opCtx, AuthenticationSession* session) 
 
     uassert(ErrorCodes::ProtocolError,
             "X.509 authentication must always use the $external database.",
-            userName.getDB() == kExternalDB);
+            userName.getDB() == DatabaseName::kExternal.db());
 
     auto isInternalClient = [&]() -> bool {
         return opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient;
@@ -229,15 +233,7 @@ void _authenticateX509(OperationContext* opCtx, AuthenticationSession* session) 
         uassertStatusOK(authorizationSession->addAndAuthorizeUser(opCtx, request, boost::none));
     };
 
-    const bool isClusterMember = ([&] {
-        const auto& requiredValue = sslGlobalParams.clusterAuthX509ExtensionValue;
-        if (requiredValue.empty()) {
-            return sslConfiguration.isClusterMember(clientName);
-        }
-        return sslPeerInfo.getClusterMembership() == requiredValue;
-    })();
-
-    if (isClusterMember) {
+    if (sslConfiguration.isClusterMember(clientName, sslPeerInfo.getClusterMembership())) {
         // Handle internal cluster member auth, only applies to server-server connections
         if (!clusterAuthMode.allowsX509()) {
             uassert(ErrorCodes::AuthenticationFailed,
@@ -255,8 +251,7 @@ void _authenticateX509(OperationContext* opCtx, AuthenticationSession* session) 
                     "with cluster membership");
             }
 
-            if (gEnforceUserClusterSeparation &&
-                !sslGlobalParams.clusterAuthX509ExtensionValue.empty()) {
+            if (gEnforceUserClusterSeparation && sslConfiguration.isClusterExtensionSet()) {
                 auto* am = AuthorizationManager::get(opCtx->getServiceContext());
                 BSONObj ignored;
                 const bool userExists =
@@ -405,7 +400,7 @@ void doSpeculativeAuthenticate(OperationContext* opCtx,
 
     if (!hasDBField) {
         // No "db" field was provided, so default to "$external"
-        cmd.append(AuthenticateCommand::kDbNameFieldName, kExternalDB);
+        cmd.append(AuthenticateCommand::kDbNameFieldName, DatabaseName::kExternal.db());
     }
 
     auto authCmdObj =

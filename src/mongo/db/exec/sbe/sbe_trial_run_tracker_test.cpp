@@ -47,21 +47,23 @@ using TrialRunTrackerTest = PlanStageTestFixture;
 
 TEST_F(TrialRunTrackerTest, TrackerAttachesToStreamingStage) {
     auto collUuid = UUID::parse("00000000-0000-0000-0000-000000000000").getValue();
-    auto scanStage = makeS<ScanStage>(collUuid,
-                                      generateSlotId(),
-                                      generateSlotId(),
-                                      generateSlotId(),
-                                      generateSlotId(),
-                                      generateSlotId(),
-                                      generateSlotId(),
-                                      boost::none,
-                                      std::vector<std::string>{"field"},
-                                      makeSV(generateSlotId()),
-                                      generateSlotId(),
-                                      true,
-                                      nullptr,
-                                      kEmptyPlanNodeId,
-                                      ScanCallbacks());
+    auto scanStage = makeS<sbe::ScanStage>(collUuid,
+                                           generateSlotId() /* recordSlot */,
+                                           generateSlotId() /* recordIdSlot */,
+                                           generateSlotId() /* snapshotIdSlot */,
+                                           generateSlotId() /* indexIdSlot */,
+                                           generateSlotId() /* indexKeySlot */,
+                                           generateSlotId() /* indexKeyPatternSlot */,
+                                           boost::none /* oplogTsSlot */,
+                                           std::vector<std::string>{"field"} /* scanFieldNames */,
+                                           makeSV(generateSlotId()) /* scanFieldSlots */,
+                                           generateSlotId() /* seekRecordIdSlot */,
+                                           generateSlotId() /* minRecordIdSlot */,
+                                           generateSlotId() /* maxRecordIdSlot */,
+                                           true /* forward */,
+                                           nullptr /* yieldPolicy */,
+                                           kEmptyPlanNodeId /* nodeId */,
+                                           ScanCallbacks());
 
     auto tracker = std::make_unique<TrialRunTracker>(size_t{0}, size_t{0});
     ON_BLOCK_EXIT([&]() { scanStage->detachFromTrialRunTracker(); });
@@ -91,21 +93,23 @@ TEST_F(TrialRunTrackerTest, TrackerAttachesToBlockingStage) {
 
 TEST_F(TrialRunTrackerTest, TrackerAttachesToBothBlockingAndStreamingStages) {
     auto collUuid = UUID::parse("00000000-0000-0000-0000-000000000000").getValue();
-    auto scanStage = makeS<ScanStage>(collUuid,
-                                      generateSlotId(),
-                                      generateSlotId(),
-                                      generateSlotId(),
-                                      generateSlotId(),
-                                      generateSlotId(),
-                                      generateSlotId(),
-                                      boost::none,
-                                      std::vector<std::string>{"field"},
-                                      makeSV(generateSlotId()),
-                                      generateSlotId(),
-                                      true,
-                                      nullptr,
-                                      kEmptyPlanNodeId,
-                                      ScanCallbacks());
+    auto scanStage = makeS<sbe::ScanStage>(collUuid,
+                                           generateSlotId() /* recordSlot */,
+                                           generateSlotId() /* recordIdSlot */,
+                                           generateSlotId() /* snapshotIdSlot */,
+                                           generateSlotId() /* indexIdSlot */,
+                                           generateSlotId() /* indexKeySlot */,
+                                           generateSlotId() /* indexKeyPatternSlot */,
+                                           boost::none /* oplogTsSlot */,
+                                           std::vector<std::string>{"field"} /* scanFieldNames */,
+                                           makeSV(generateSlotId()) /* scanFieldSlots */,
+                                           generateSlotId() /* seekRecordIdSlot */,
+                                           generateSlotId() /* minRecordIdSlot */,
+                                           generateSlotId() /* maxRecordIdSlot */,
+                                           true /* forward */,
+                                           nullptr /* yieldPolicy */,
+                                           kEmptyPlanNodeId /* nodeId */,
+                                           ScanCallbacks());
 
     auto rootSortStage = makeS<SortStage>(std::move(scanStage),
                                           makeSV(),
@@ -141,8 +145,9 @@ TEST_F(TrialRunTrackerTest, TrialEndsDuringOpenPhaseOfBlockingStage) {
     auto hashAggStage = makeS<HashAggStage>(
         std::move(scanStage),
         makeSV(scanSlot),
-        makeSlotExprPairVec(
+        makeAggExprVector(
             countsSlot,
+            nullptr,
             stage_builder::makeFunction(
                 "sum",
                 makeE<EConstant>(value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(1)))),
@@ -212,8 +217,9 @@ TEST_F(TrialRunTrackerTest, OnlyDeepestNestedBlockingStageHasTrialRunTracker) {
     auto hashAggStage = makeS<HashAggStage>(
         std::move(unionStage),
         makeSV(unionSlot),
-        makeSlotExprPairVec(
+        makeAggExprVector(
             countsSlot,
+            nullptr,
             stage_builder::makeFunction(
                 "sum",
                 makeE<EConstant>(value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(1)))),
@@ -281,8 +287,9 @@ TEST_F(TrialRunTrackerTest, SiblingBlockingStagesBothGetTrialRunTracker) {
         auto hashAggStage = makeS<HashAggStage>(
             std::move(scanStage),
             makeSV(scanSlot),
-            makeSlotExprPairVec(
+            makeAggExprVector(
                 countsSlot,
+                nullptr,
                 stage_builder::makeFunction("sum",
                                             makeE<EConstant>(value::TypeTags::NumberInt64,
                                                              value::bitcastFrom<int64_t>(1)))),
@@ -339,21 +346,23 @@ TEST_F(TrialRunTrackerTest, SiblingBlockingStagesBothGetTrialRunTracker) {
 
 TEST_F(TrialRunTrackerTest, TrialRunTrackingCanBeDisabled) {
     auto scanStage =
-        makeS<ScanStage>(UUID::parse("00000000-0000-0000-0000-000000000000").getValue(),
-                         generateSlotId(),
-                         generateSlotId(),
-                         generateSlotId(),
-                         generateSlotId(),
-                         generateSlotId(),
-                         generateSlotId(),
-                         boost::none,
-                         std::vector<std::string>{"field"},
-                         makeSV(generateSlotId()),
-                         generateSlotId(),
-                         true,
-                         nullptr,
-                         kEmptyPlanNodeId,
-                         ScanCallbacks());
+        makeS<sbe::ScanStage>(UUID::parse("00000000-0000-0000-0000-000000000000").getValue(),
+                              generateSlotId() /* recordSlot */,
+                              generateSlotId() /* recordIdSlot */,
+                              generateSlotId() /* snapshotIdSlot */,
+                              generateSlotId() /* indexIdSlot */,
+                              generateSlotId() /* indexKeySlot */,
+                              generateSlotId() /* indexKeyPatternSlot */,
+                              boost::none /* oplogTsSlot */,
+                              std::vector<std::string>{"field"} /* scanFieldNames */,
+                              makeSV(generateSlotId()) /* scanFieldSlots */,
+                              generateSlotId() /* seekRecordIdSlot */,
+                              generateSlotId() /* minRecordIdSlot */,
+                              generateSlotId() /* maxRecordIdSlot */,
+                              true /* forward */,
+                              nullptr /* yieldPolicy */,
+                              kEmptyPlanNodeId /* nodeId */,
+                              ScanCallbacks());
 
     scanStage->disableTrialRunTracking();
     auto tracker = std::make_unique<TrialRunTracker>(size_t{0}, size_t{0});
@@ -363,21 +372,23 @@ TEST_F(TrialRunTrackerTest, TrialRunTrackingCanBeDisabled) {
 
 TEST_F(TrialRunTrackerTest, DisablingTrackingForChildDoesNotInhibitTrackingForParent) {
     auto scanStage =
-        makeS<ScanStage>(UUID::parse("00000000-0000-0000-0000-000000000000").getValue(),
-                         generateSlotId(),
-                         generateSlotId(),
-                         generateSlotId(),
-                         generateSlotId(),
-                         generateSlotId(),
-                         generateSlotId(),
-                         boost::none,
-                         std::vector<std::string>{"field"},
-                         makeSV(generateSlotId()),
-                         generateSlotId(),
-                         true,
-                         nullptr,
-                         kEmptyPlanNodeId,
-                         ScanCallbacks());
+        makeS<sbe::ScanStage>(UUID::parse("00000000-0000-0000-0000-000000000000").getValue(),
+                              generateSlotId() /* recordSlot */,
+                              generateSlotId() /* recordIdSlot */,
+                              generateSlotId() /* snapshotIdSlot */,
+                              generateSlotId() /* indexIdSlot */,
+                              generateSlotId() /* indexKeySlot */,
+                              generateSlotId() /* indexKeyPatternSlot */,
+                              boost::none /* oplogTsSlot */,
+                              std::vector<std::string>{"field"} /* scanFieldNames */,
+                              makeSV(generateSlotId()) /* scanFieldSlots */,
+                              generateSlotId() /* seekRecordIdSlot */,
+                              generateSlotId() /* minRecordIdSlot */,
+                              generateSlotId() /* maxRecordIdSlot */,
+                              true /* forward */,
+                              nullptr /* yieldPolicy */,
+                              kEmptyPlanNodeId /* nodeId */,
+                              ScanCallbacks());
 
     // Disable tracking for 'scanStage'. We should still attach the tracker for 'rootSortStage'.
     scanStage->disableTrialRunTracking();
@@ -413,8 +424,9 @@ TEST_F(TrialRunTrackerTest, DisablingTrackingForAChildStagePreventsEarlyExit) {
         auto hashAggStage = makeS<HashAggStage>(
             std::move(scanStage),
             makeSV(scanSlot),
-            makeSlotExprPairVec(
+            makeAggExprVector(
                 countsSlot,
+                nullptr,
                 stage_builder::makeFunction("sum",
                                             makeE<EConstant>(value::TypeTags::NumberInt64,
                                                              value::bitcastFrom<int64_t>(1)))),

@@ -47,21 +47,25 @@
 #include "mongo/db/commands/server_status.h"
 #include "mongo/executor/connection_pool.h"
 #include "mongo/executor/connection_pool_stats.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/alarm.h"
 #include "mongo/util/alarm_runner_background_thread.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/bufreader.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/http_client.h"
+#include "mongo/util/net/http_client_options.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/strong_weak_finish_line.h"
 #include "mongo/util/system_clock_source.h"
 #include "mongo/util/timer.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 namespace mongo {
 
@@ -159,18 +163,38 @@ size_t WriteMemoryCallback(void* ptr, size_t size, size_t nmemb, void* data) {
  */
 size_t ReadMemoryCallback(char* buffer, size_t size, size_t nitems, void* instream) {
 
-    auto* cdrc = reinterpret_cast<ConstDataRangeCursor*>(instream);
+    auto* bufReader = reinterpret_cast<BufReader*>(instream);
 
     size_t ret = 0;
 
-    if (cdrc->length() > 0) {
-        size_t readSize = std::min(size * nitems, cdrc->length());
-        memcpy(buffer, cdrc->data(), readSize);
-        invariant(cdrc->advanceNoThrow(readSize).isOK());
+    if (bufReader->remaining() > 0) {
+        size_t readSize =
+            std::min(size * nitems, static_cast<unsigned long>(bufReader->remaining()));
+        auto buf = bufReader->readBytes(readSize);
+        memcpy(buffer, buf.rawData(), readSize);
         ret = readSize;
     }
 
     return ret;
+}
+
+/**
+ * Seek into for data to the remote side
+ */
+size_t SeekMemoryCallback(void* clientp, curl_off_t offset, int origin) {
+
+    // Curl will call this in readrewind but only to reset the stream to the beginning
+    // In other protocols (like FTP, SSH) or HTTP resumption they may ask for partial buffers which
+    // we do not support.
+    if (offset != 0 || origin != SEEK_SET) {
+        return CURL_SEEKFUNC_CANTSEEK;
+    }
+
+    auto* bufReader = reinterpret_cast<BufReader*>(clientp);
+
+    bufReader->rewindToStart();
+
+    return CURL_SEEKFUNC_OK;
 }
 
 struct CurlEasyCleanup {
@@ -194,6 +218,47 @@ using CurlSlist = std::unique_ptr<curl_slist, CurlSlistFreeAll>;
 
 long longSeconds(Seconds tm) {
     return static_cast<long>(durationCount<Seconds>(tm));
+}
+
+
+StringData enumToString(curl_infotype type) {
+    switch (type) {
+        case CURLINFO_TEXT:
+            return "TEXT"_sd;
+        case CURLINFO_HEADER_IN:
+            return "HEADER_IN"_sd;
+        case CURLINFO_HEADER_OUT:
+            return "HEADER_OUT"_sd;
+        case CURLINFO_DATA_IN:
+            return "DATA_IN"_sd;
+        case CURLINFO_DATA_OUT:
+            return "DATA_OUT"_sd;
+        case CURLINFO_SSL_DATA_IN:
+            return "SSL_DATA_IN"_sd;
+        case CURLINFO_SSL_DATA_OUT:
+            return "SSL_DATA_OUT"_sd;
+        default:
+            return "unknown"_sd;
+    }
+}
+
+int curlDebugCallback(CURL* handle, curl_infotype type, char* data, size_t size, void* clientp) {
+    switch (type) {
+        case CURLINFO_TEXT:
+        case CURLINFO_HEADER_IN:
+        case CURLINFO_HEADER_OUT:
+        case CURLINFO_DATA_IN:
+        case CURLINFO_DATA_OUT:
+            LOGV2_DEBUG(7661901,
+                        1,
+                        "Curl",
+                        "type"_attr = enumToString(type),
+                        "message"_attr = StringData(data, size));
+            [[fallthrough]];
+
+        default:
+            return 0;
+    }
 }
 
 CurlEasyHandle createCurlEasyHandle(Protocols protocol) {
@@ -226,9 +291,10 @@ CurlEasyHandle createCurlEasyHandle(Protocols protocol) {
     }
 
     // TODO: CURLOPT_EXPECT_100_TIMEOUT_MS?
-    // TODO: consider making this configurable, defaults to stderr
-    // curl_easy_setopt(handle.get(), CURLOPT_VERBOSE, 1);
-    // curl_easy_setopt(_handle.get(), CURLOPT_DEBUGFUNCTION , ???);
+    if (httpClientOptions.verboseLogging.loadRelaxed()) {
+        curl_easy_setopt(handle.get(), CURLOPT_VERBOSE, 1);
+        curl_easy_setopt(handle.get(), CURLOPT_DEBUGFUNCTION, curlDebugCallback);
+    }
 
     return handle;
 }
@@ -641,7 +707,7 @@ private:
 
         curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT, longSeconds(_connectTimeout));
 
-        ConstDataRangeCursor cdrc(cdr);
+        BufReader bufReader(cdr.data(), cdr.length());
         switch (method) {
             case HttpMethod::kGET:
                 uassert(ErrorCodes::BadValue,
@@ -656,16 +722,22 @@ private:
                 curl_easy_setopt(handle, CURLOPT_POST, 1);
 
                 curl_easy_setopt(handle, CURLOPT_READFUNCTION, ReadMemoryCallback);
-                curl_easy_setopt(handle, CURLOPT_READDATA, &cdrc);
-                curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, (long)cdrc.length());
+                curl_easy_setopt(handle, CURLOPT_READDATA, &bufReader);
+                curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, (long)bufReader.remaining());
+
+                curl_easy_setopt(handle, CURLOPT_SEEKFUNCTION, SeekMemoryCallback);
+                curl_easy_setopt(handle, CURLOPT_SEEKDATA, &bufReader);
                 break;
             case HttpMethod::kPUT:
                 curl_easy_setopt(handle, CURLOPT_POST, 0);
                 curl_easy_setopt(handle, CURLOPT_PUT, 1);
 
                 curl_easy_setopt(handle, CURLOPT_READFUNCTION, ReadMemoryCallback);
-                curl_easy_setopt(handle, CURLOPT_READDATA, &cdrc);
-                curl_easy_setopt(handle, CURLOPT_INFILESIZE_LARGE, (long)cdrc.length());
+                curl_easy_setopt(handle, CURLOPT_READDATA, &bufReader);
+                curl_easy_setopt(handle, CURLOPT_INFILESIZE_LARGE, (long)bufReader.remaining());
+
+                curl_easy_setopt(handle, CURLOPT_SEEKFUNCTION, SeekMemoryCallback);
+                curl_easy_setopt(handle, CURLOPT_SEEKDATA, &bufReader);
                 break;
             default:
                 MONGO_UNREACHABLE;

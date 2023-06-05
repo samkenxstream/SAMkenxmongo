@@ -2,8 +2,7 @@
  * Tests that the global indexes collections are dropped on FCV downgrade and recreated after
  * upgrading.
  *
- * @tags: [multiversion_incompatible, featureFlagGlobalIndexesShardingCatalog,
- * requires_fcv_70, temporary_catalog_shard_incompatible]
+ * @tags: [multiversion_incompatible, featureFlagGlobalIndexesShardingCatalog, requires_fcv_70]
  */
 
 (function() {

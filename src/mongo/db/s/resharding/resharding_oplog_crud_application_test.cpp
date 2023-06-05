@@ -31,6 +31,7 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/op_observer/oplog_writer_impl.h"
 #include "mongo/db/persistent_task_store.h"
@@ -40,7 +41,7 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/op_observer_sharding_impl.h"
+#include "mongo/db/s/migration_chunk_cloner_source_op_observer.h"
 #include "mongo/db/s/resharding/resharding_data_copy_util.h"
 #include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding/resharding_oplog_application.h"
@@ -90,14 +91,16 @@ public:
             mongoDSessionCatalog->onStepUp(opCtx.get());
             LogicalSessionCache::set(serviceContext, std::make_unique<LogicalSessionCacheNoop>());
 
-            // OpObserverShardingImpl is required for timestamping the writes from
+            // OpObserverImpl is required for timestamping the writes from
             // ReshardingOplogApplicationRules.
             auto opObserverRegistry =
                 dynamic_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
             invariant(opObserverRegistry);
 
             opObserverRegistry->addObserver(
-                std::make_unique<OpObserverShardingImpl>(std::make_unique<OplogWriterImpl>()));
+                std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
+            opObserverRegistry->addObserver(
+                std::make_unique<MigrationChunkClonerSourceOpObserver>());
         }
 
         {
@@ -200,7 +203,8 @@ public:
                                  const NamespaceString& nss,
                                  const std::vector<BSONObj>& documents) {
         AutoGetCollection coll(opCtx, nss, MODE_IS);
-        ASSERT_TRUE(bool(coll)) << "Collection '" << nss << "' does not exist";
+        ASSERT_TRUE(bool(coll)) << "Collection '" << nss.toStringForErrorMsg()
+                                << "' does not exist";
 
         auto exec = InternalPlanner::indexScan(opCtx,
                                                &*coll,
@@ -216,13 +220,15 @@ public:
         BSONObj obj;
         while (exec->getNext(&obj, nullptr) == PlanExecutor::ADVANCED) {
             ASSERT_LT(i, documents.size())
-                << "Found extra document in collection: " << nss << ": " << obj;
+                << "Found extra document in collection: " << nss.toStringForErrorMsg() << ": "
+                << obj;
             ASSERT_BSONOBJ_BINARY_EQ(obj, documents[i]);
             ++i;
         }
 
         if (i < documents.size()) {
-            FAIL("Didn't find document in collection: ") << nss << ": " << documents[i];
+            FAIL("Didn't find document in collection: ")
+                << nss.toStringForErrorMsg() << ": " << documents[i];
         }
     }
 

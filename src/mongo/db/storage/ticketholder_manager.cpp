@@ -28,6 +28,7 @@
  */
 
 #include "mongo/db/storage/ticketholder_manager.h"
+#include "mongo/db/storage/execution_control/concurrency_adjustment_parameters_gen.h"
 #include "mongo/db/storage/execution_control/throughput_probing.h"
 #include "mongo/db/storage/storage_engine_feature_flags_gen.h"
 #include "mongo/db/storage/storage_engine_parameters_gen.h"
@@ -58,11 +59,14 @@ TicketHolderManager::TicketHolderManager(ServiceContext* svcCtx,
           switch (StorageEngineConcurrencyAdjustmentAlgorithm_parse(
               IDLParserContext{"storageEngineConcurrencyAdjustmentAlgorithm"},
               gStorageEngineConcurrencyAdjustmentAlgorithm)) {
-              case StorageEngineConcurrencyAdjustmentAlgorithmEnum::kNone:
+              case StorageEngineConcurrencyAdjustmentAlgorithmEnum::kFixedConcurrentTransactions:
                   return nullptr;
               case StorageEngineConcurrencyAdjustmentAlgorithmEnum::kThroughputProbing:
                   return std::make_unique<execution_control::ThroughputProbing>(
-                      svcCtx, _readTicketHolder.get(), _writeTicketHolder.get(), Milliseconds{100});
+                      svcCtx,
+                      _readTicketHolder.get(),
+                      _writeTicketHolder.get(),
+                      Milliseconds{gStorageEngineConcurrencyAdjustmentIntervalMillis});
           }
           MONGO_UNREACHABLE;
       }()) {
@@ -72,13 +76,9 @@ TicketHolderManager::TicketHolderManager(ServiceContext* svcCtx,
 }
 
 Status TicketHolderManager::updateConcurrentWriteTransactions(const int32_t& newWriteTransactions) {
-    // (Ignore FCV check): This feature flag doesn't have upgrade/downgrade concern.
-    if (feature_flags::gFeatureFlagExecutionControl.isEnabledAndIgnoreFCVUnsafe() &&
-        !gStorageEngineConcurrencyAdjustmentAlgorithm.empty()) {
-        return {ErrorCodes::IllegalOperation,
-                "Cannot modify concurrent write transactions limit when it is being dynamically "
-                "adjusted"};
-    }
+    auto concurrencyAlgorithm = StorageEngineConcurrencyAdjustmentAlgorithm_parse(
+        IDLParserContext{"storageEngineConcurrencyAdjustmentAlgorithm"},
+        gStorageEngineConcurrencyAdjustmentAlgorithm);
 
     if (auto client = Client::getCurrent()) {
         auto ticketHolderManager = TicketHolderManager::get(client->getServiceContext());
@@ -90,6 +90,20 @@ Status TicketHolderManager::updateConcurrentWriteTransactions(const int32_t& new
                           "Attempting to modify write transactions limit on an instance without a "
                           "storage engine");
         }
+
+        auto& monitor = ticketHolderManager->_monitor;
+        // (Ignore FCV check): This feature flag doesn't have upgrade/downgrade concern.
+        if (monitor && feature_flags::gFeatureFlagExecutionControl.isEnabledAndIgnoreFCVUnsafe() &&
+            concurrencyAlgorithm ==
+                StorageEngineConcurrencyAdjustmentAlgorithmEnum::kThroughputProbing) {
+            // In order to manually set the number of read/write tickets, users must set the
+            // storageEngineConcurrencyAdjustmentAlgorithm to 'kFixedConcurrentTransactions'.
+            return {
+                ErrorCodes::IllegalOperation,
+                "Cannot modify concurrent write transactions limit when it is being dynamically "
+                "adjusted"};
+        }
+
         auto& writer = ticketHolderManager->_writeTicketHolder;
         if (writer) {
             writer->resize(newWriteTransactions);
@@ -106,13 +120,9 @@ Status TicketHolderManager::updateConcurrentWriteTransactions(const int32_t& new
 };
 
 Status TicketHolderManager::updateConcurrentReadTransactions(const int32_t& newReadTransactions) {
-    // (Ignore FCV check): This feature flag doesn't have upgrade/downgrade concern.
-    if (feature_flags::gFeatureFlagExecutionControl.isEnabledAndIgnoreFCVUnsafe() &&
-        !gStorageEngineConcurrencyAdjustmentAlgorithm.empty()) {
-        return {ErrorCodes::IllegalOperation,
-                "Cannot modify concurrent read transactions limit when it is being dynamically "
-                "adjusted"};
-    }
+    auto concurrencyAlgorithm = StorageEngineConcurrencyAdjustmentAlgorithm_parse(
+        IDLParserContext{"storageEngineConcurrencyAdjustmentAlgorithm"},
+        gStorageEngineConcurrencyAdjustmentAlgorithm);
 
     if (auto client = Client::getCurrent()) {
         auto ticketHolderManager = TicketHolderManager::get(client->getServiceContext());
@@ -124,6 +134,19 @@ Status TicketHolderManager::updateConcurrentReadTransactions(const int32_t& newR
                           "Attempting to modify read transactions limit on an instance without a "
                           "storage engine");
         }
+
+        auto& monitor = ticketHolderManager->_monitor;
+        // (Ignore FCV check): This feature flag doesn't have upgrade/downgrade concern.
+        if (monitor && feature_flags::gFeatureFlagExecutionControl.isEnabledAndIgnoreFCVUnsafe() &&
+            concurrencyAlgorithm ==
+                StorageEngineConcurrencyAdjustmentAlgorithmEnum::kThroughputProbing) {
+            // In order to manually set the number of read/write tickets, users must set the
+            // storageEngineConcurrencyAdjustmentAlgorithm to 'kFixedConcurrentTransactions'.
+            return {ErrorCodes::IllegalOperation,
+                    "Cannot modify concurrent read transactions limit when it is being dynamically "
+                    "adjusted"};
+        }
+
         auto& reader = ticketHolderManager->_readTicketHolder;
         if (reader) {
             reader->resize(newReadTransactions);
@@ -223,12 +246,4 @@ void TicketHolderManager::appendStats(BSONObjBuilder& b) {
     }
 }
 
-Status TicketHolderManager::validateConcurrencyAdjustmentAlgorithm(
-    const std::string& name, const boost::optional<TenantId>&) try {
-    StorageEngineConcurrencyAdjustmentAlgorithm_parse(
-        IDLParserContext{"storageEngineConcurrencyAdjustmentAlgorithm"}, name);
-    return Status::OK();
-} catch (const DBException& ex) {
-    return ex.toStatus();
-}
 }  // namespace mongo

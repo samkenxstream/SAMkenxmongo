@@ -820,7 +820,36 @@ public:
     }
 
     void visit(const ExpressionArray* expr) final {
-        unsupportedExpression(expr->getOpName());
+        auto arity = expr->getChildren().size();
+        _context->ensureArity(arity);
+
+        if (arity == 0) {
+            auto [emptyArrTag, emptyArrVal] = sbe::value::makeNewArray();
+            pushABT(makeABTConstant(emptyArrTag, emptyArrVal));
+            return;
+        }
+
+        std::vector<std::pair<optimizer::ProjectionName, optimizer::ABT>> binds;
+        for (size_t idx = 0; idx < arity; ++idx) {
+            binds.emplace_back(makeLocalVariableName(_context->state.frameId(), 0),
+                               _context->popABTExpr());
+        }
+        std::reverse(std::begin(binds), std::end(binds));
+
+        optimizer::ABTVector argVars;
+        for (auto& bind : binds) {
+            argVars.push_back(makeFillEmptyNull(makeVariable(bind.first)));
+        }
+
+        auto arrayExpr = optimizer::make<optimizer::FunctionCall>("newArray", std::move(argVars));
+
+        for (auto it = binds.begin(); it != binds.end(); it++) {
+            arrayExpr = optimizer::make<optimizer::Let>(
+                it->first, std::move(it->second), std::move(arrayExpr));
+        }
+
+        pushABT(std::move(arrayExpr));
+        return;
     }
     void visit(const ExpressionArrayElemAt* expr) final {
         unsupportedExpression(expr->getOpName());
@@ -1109,7 +1138,7 @@ public:
     void visit(const ExpressionDateDiff* expr) final {
         using namespace std::literals;
 
-        auto children = expr->getChildren();
+        const auto& children = expr->getChildren();
         invariant(children.size() == 5);
 
         auto startDateName = makeLocalVariableName(_context->state.frameId(), 0);
@@ -1140,7 +1169,7 @@ public:
         auto endDateExpression = _context->popABTExpr();
         auto startDateExpression = _context->popABTExpr();
 
-        auto timeZoneDBSlot = _context->state.data->env->getSlot("timeZoneDB"_sd);
+        auto timeZoneDBSlot = _context->state.env->getSlot("timeZoneDB"_sd);
         auto timeZoneDBName = _context->registerVariable(timeZoneDBSlot);
         auto timeZoneDBVar = makeVariable(timeZoneDBName);
 
@@ -1255,7 +1284,7 @@ public:
         pushABT(std::move(dateDiffExpression));
     }
     void visit(const ExpressionDateFromString* expr) final {
-        auto children = expr->getChildren();
+        const auto& children = expr->getChildren();
         invariant(children.size() == 5);
         _context->ensureArity(
             1 + (expr->isFormatSpecified() ? 1 : 0) + (expr->isTimezoneSpecified() ? 1 : 0) +
@@ -1279,7 +1308,7 @@ public:
         auto dateStringExpression = _context->popABTExpr();
         auto dateStringName = makeLocalVariableName(_context->state.frameId(), 0);
 
-        auto timeZoneDBSlot = _context->state.data->env->getSlot("timeZoneDB"_sd);
+        auto timeZoneDBSlot = _context->state.env->getSlot("timeZoneDB"_sd);
         auto timeZoneDBName = _context->registerVariable(timeZoneDBSlot);
 
         // Set parameters for an invocation of built-in "dateFromString" function.
@@ -1383,7 +1412,7 @@ public:
                         "$dateFromString parameter 'timezone' must be a string",
                         sbe::value::isString(timezoneTag));
                 auto [timezoneDBTag, timezoneDBVal] =
-                    _context->state.data->env->getAccessor(timeZoneDBSlot)->getViewOfValue();
+                    _context->state.env->getAccessor(timeZoneDBSlot)->getViewOfValue();
                 uassert(4997801,
                         "$dateFromString first argument must be a timezoneDB object",
                         timezoneDBTag == sbe::value::TypeTags::timeZoneDB);
@@ -1427,7 +1456,7 @@ public:
     void visit(const ExpressionDateFromParts* expr) final {
         // This expression can carry null children depending on the set of fields provided,
         // to compute a date from parts so we only need to pop if a child exists.
-        auto children = expr->getChildren();
+        const auto& children = expr->getChildren();
         invariant(children.size() == 11);
 
         boost::optional<optimizer::ABT> eTimezone;
@@ -1673,7 +1702,7 @@ public:
         // for datetime computation. This global object is registered as an unowned value in the
         // runtime environment so we pass the corresponding slot to the datePartsWeekYear and
         // dateParts functions as a variable.
-        auto timeZoneDBSlot = _context->state.data->env->getSlot("timeZoneDB"_sd);
+        auto timeZoneDBSlot = _context->state.env->getSlot("timeZoneDB"_sd);
         auto timeZoneDBName = _context->registerVariable(timeZoneDBSlot);
         auto computeDate = makeABTFunction(eIsoWeekYear ? "datePartsWeekYear" : "dateParts",
                                            makeVariable(timeZoneDBName),
@@ -1731,7 +1760,7 @@ public:
     }
 
     void visit(const ExpressionDateToParts* expr) final {
-        auto children = expr->getChildren();
+        const auto& children = expr->getChildren();
         auto dateName = makeLocalVariableName(_context->state.frameId(), 0);
         auto timezoneName = makeLocalVariableName(_context->state.frameId(), 0);
         auto isoflagName = makeLocalVariableName(_context->state.frameId(), 0);
@@ -1755,7 +1784,7 @@ public:
         }
         auto date = _context->popABTExpr();
 
-        auto timeZoneDBSlot = _context->state.data->env->getSlot("timeZoneDB"_sd);
+        auto timeZoneDBSlot = _context->state.env->getSlot("timeZoneDB"_sd);
         auto timeZoneDBName = _context->registerVariable(timeZoneDBSlot);
         auto timeZoneDBVar = makeVariable(timeZoneDBName);
 
@@ -1801,7 +1830,7 @@ public:
     }
 
     void visit(const ExpressionDateToString* expr) final {
-        auto children = expr->getChildren();
+        const auto& children = expr->getChildren();
         invariant(children.size() == 4);
         _context->ensureArity(1 + (expr->isFormatSpecified() ? 1 : 0) +
                               (expr->isTimezoneSpecified() ? 1 : 0) +
@@ -1819,11 +1848,11 @@ public:
             ? _context->popABTExpr()
             : optimizer::Constant::str("%Y-%m-%dT%H:%M:%S.%LZ"_sd);
 
-        auto timeZoneDBSlot = _context->state.data->env->getSlot("timeZoneDB"_sd);
+        auto timeZoneDBSlot = _context->state.env->getSlot("timeZoneDB"_sd);
         auto timeZoneDBName = _context->registerVariable(timeZoneDBSlot);
         auto timeZoneDBVar = makeVariable(timeZoneDBName);
         auto [timezoneDBTag, timezoneDBVal] =
-            _context->state.data->env->getAccessor(timeZoneDBSlot)->getViewOfValue();
+            _context->state.env->getAccessor(timeZoneDBSlot)->getViewOfValue();
         uassert(4997900,
                 "$dateToString first argument must be a timezoneDB object",
                 timezoneDBTag == sbe::value::TypeTags::timeZoneDB);
@@ -1919,7 +1948,7 @@ public:
                         std::move(inputValidationCases), optimizer::Constant::nothing())))));
     }
     void visit(const ExpressionDateTrunc* expr) final {
-        auto children = expr->getChildren();
+        const auto& children = expr->getChildren();
         invariant(children.size() == 5);
         _context->ensureArity(2 + (expr->isBinSizeSpecified() ? 1 : 0) +
                               (expr->isTimezoneSpecified() ? 1 : 0) +
@@ -1936,11 +1965,11 @@ public:
         auto unitExpression = _context->popABTExpr();
         auto dateExpression = _context->popABTExpr();
 
-        auto timeZoneDBSlot = _context->state.data->env->getSlot("timeZoneDB"_sd);
+        auto timeZoneDBSlot = _context->state.env->getSlot("timeZoneDB"_sd);
         auto timeZoneDBName = _context->registerVariable(timeZoneDBSlot);
         auto timeZoneDBVar = makeVariable(timeZoneDBName);
         auto [timezoneDBTag, timezoneDBVal] =
-            _context->state.data->env->getAccessor(timeZoneDBSlot)->getViewOfValue();
+            _context->state.env->getAccessor(timeZoneDBSlot)->getViewOfValue();
         tassert(7157927,
                 "$dateTrunc first argument must be a timezoneDB object",
                 timezoneDBTag == sbe::value::TypeTags::timeZoneDB);
@@ -2204,7 +2233,7 @@ public:
                         "Encountered unexpected system variable ID",
                         it != Variables::kIdToBuiltinVarName.end());
 
-                auto slot = _context->state.data->env->getSlotIfExists(it->second);
+                auto slot = _context->state.env->getSlotIfExists(it->second);
                 uassert(5611301,
                         str::stream()
                             << "Builtin variable '$$" << it->second << "' is not available",
@@ -2820,7 +2849,7 @@ public:
         auto [specTag, specVal] = makeValue(expr->getSortPattern());
         auto specConstant = makeABTConstant(specTag, specVal);
 
-        auto collatorSlot = _context->state.data->env->getSlotIfExists("collator"_sd);
+        auto collatorSlot = _context->state.env->getSlotIfExists("collator"_sd);
         auto collatorVar = collatorSlot.map(
             [&](auto slotId) { return _context->registerVariable(*collatorSlot); });
 
@@ -2852,42 +2881,7 @@ public:
         unsupportedExpression(expr->getOpName());
     }
     void visit(const ExpressionRound* expr) final {
-        invariant(expr->getChildren().size() == 1 || expr->getChildren().size() == 2);
-        const bool hasPlaceArg = expr->getChildren().size() == 2;
-        _context->ensureArity(expr->getChildren().size());
-
-        auto inputNumName = makeLocalVariableName(_context->state.frameId(), 0);
-        auto inputPlaceName = makeLocalVariableName(_context->state.frameId(), 0);
-
-        // We always need to validate the number parameter, since it will always exist.
-        std::vector<ABTCaseValuePair> inputValidationCases{
-            generateABTReturnNullIfNullOrMissing(makeVariable(inputNumName)),
-            ABTCaseValuePair{
-                generateABTNonNumericCheck(inputNumName),
-                makeABTFail(ErrorCodes::Error{5155300}, "$round only supports numeric types")}};
-        // Only add these cases if we have a "place" argument.
-        if (hasPlaceArg) {
-            inputValidationCases.emplace_back(
-                generateABTReturnNullIfNullOrMissing(makeVariable(inputPlaceName)));
-            inputValidationCases.emplace_back(
-                generateInvalidRoundPlaceArgCheck(inputPlaceName),
-                makeABTFail(ErrorCodes::Error{5155301},
-                            "$round requires \"place\" argument to be "
-                            "an integer between -20 and 100"));
-        }
-
-        auto roundExpr = buildABTMultiBranchConditionalFromCaseValuePairs(
-            std::move(inputValidationCases),
-            makeABTFunction("round"_sd, makeVariable(inputNumName), makeVariable(inputPlaceName)));
-
-        // "place" argument defaults to 0.
-        auto placeABT = hasPlaceArg ? _context->popABTExpr() : optimizer::Constant::int32(0);
-        auto inputABT = _context->popABTExpr();
-        pushABT(optimizer::make<optimizer::Let>(
-            std::move(inputNumName),
-            std::move(inputABT),
-            optimizer::make<optimizer::Let>(
-                std::move(inputPlaceName), std::move(placeABT), std::move(roundExpr))));
+        visitRoundTruncExpression(expr);
     }
     void visit(const ExpressionSplit* expr) final {
         invariant(expr->getChildren().size() == 2);
@@ -3034,7 +3028,7 @@ public:
         unsupportedExpression("$trim");
     }
     void visit(const ExpressionTrunc* expr) final {
-        unsupportedExpression(expr->getOpName());
+        visitRoundTruncExpression(expr);
     }
     void visit(const ExpressionType* expr) final {
         unsupportedExpression(expr->getOpName());
@@ -3275,6 +3269,56 @@ public:
 
 private:
     /**
+     * Shared logic for $round and $trunc expressions
+     */
+    template <typename ExprType>
+    void visitRoundTruncExpression(const ExprType* expr) {
+        const std::string opName(expr->getOpName());
+        invariant(opName == "$round" || opName == "$trunc");
+
+        const auto& children = expr->getChildren();
+        invariant(children.size() == 1 || children.size() == 2);
+        const bool hasPlaceArg = (children.size() == 2);
+        _context->ensureArity(children.size());
+
+        auto inputNumName = makeLocalVariableName(_context->state.frameId(), 0);
+        auto inputPlaceName = makeLocalVariableName(_context->state.frameId(), 0);
+
+        // We always need to validate the number parameter, since it will always exist.
+        std::vector<ABTCaseValuePair> inputValidationCases{
+            generateABTReturnNullIfNullOrMissing(makeVariable(inputNumName)),
+            ABTCaseValuePair{
+                generateABTNonNumericCheck(inputNumName),
+                makeABTFail(ErrorCodes::Error{5155300}, opName + " only supports numeric types")}};
+        // Only add these cases if we have a "place" argument.
+        if (hasPlaceArg) {
+            inputValidationCases.emplace_back(
+                generateABTReturnNullIfNullOrMissing(makeVariable(inputPlaceName)));
+            inputValidationCases.emplace_back(generateInvalidRoundPlaceArgCheck(inputPlaceName),
+                                              makeABTFail(ErrorCodes::Error{5155301},
+                                                          opName +
+                                                              " requires \"place\" argument to be "
+                                                              "an integer between -20 and 100"));
+        }
+
+        optimizer::ABT abtExpr = buildABTMultiBranchConditionalFromCaseValuePairs(
+            std::move(inputValidationCases),
+            makeABTFunction((opName == "$round" ? "round"_sd : "trunc"_sd),
+                            makeVariable(inputNumName),
+                            makeVariable(inputPlaceName)));
+
+        // "place" argument defaults to 0.
+        optimizer::ABT placeABT =
+            hasPlaceArg ? _context->popABTExpr() : optimizer::Constant::int32(0);
+        optimizer::ABT inputABT = _context->popABTExpr();
+        pushABT(optimizer::make<optimizer::Let>(
+            std::move(inputNumName),
+            std::move(inputABT),
+            optimizer::make<optimizer::Let>(
+                std::move(inputPlaceName), std::move(placeABT), std::move(abtExpr))));
+    }
+
+    /**
      * Shared logic for $and, $or. Converts each child into an EExpression that evaluates to Boolean
      * true or false, based on MQL rules for $and and $or branches, and then chains the branches
      * together using binary and/or EExpressions so that the result has MQL's short-circuit
@@ -3335,7 +3379,7 @@ private:
     }
 
     void generateDateExpressionAcceptingTimeZone(StringData exprName, const Expression* expr) {
-        auto children = expr->getChildren();
+        const auto& children = expr->getChildren();
         invariant(children.size() == 2);
 
         auto timezoneExpression =
@@ -3346,7 +3390,7 @@ private:
         auto dateName = makeLocalVariableName(_context->state.frameId(), 0);
         auto dateVar = makeVariable(dateName);
 
-        auto timeZoneDBSlot = _context->state.data->env->getSlot("timeZoneDB"_sd);
+        auto timeZoneDBSlot = _context->state.env->getSlot("timeZoneDB"_sd);
 
         // Set parameters for an invocation of the built-in function.
         optimizer::ABTVector arguments;
@@ -3364,7 +3408,7 @@ private:
         if (timezoneExpression.is<optimizer::Constant>()) {
             auto [timezoneTag, timezoneVal] = timezoneExpression.cast<optimizer::Constant>()->get();
             auto [timezoneDBTag, timezoneDBVal] =
-                _context->state.data->env->getAccessor(timeZoneDBSlot)->getViewOfValue();
+                _context->state.env->getAccessor(timeZoneDBSlot)->getViewOfValue();
             auto timezoneDB = sbe::value::getTimeZoneDBView(timezoneDBVal);
             uassert(5157900,
                     str::stream() << "$" << exprName.toString()
@@ -3600,7 +3644,7 @@ private:
     void visitIndexOfFunction(const Expression* expr,
                               ExpressionVisitorContext* _context,
                               const std::string& indexOfFunction) {
-        auto children = expr->getChildren();
+        const auto& children = expr->getChildren();
         auto operandSize = children.size() <= 3 ? 3 : 4;
         optimizer::ABTVector operands;
         operands.reserve(operandSize);
@@ -3734,7 +3778,7 @@ private:
         optimizer::ABTVector checkNulls;
         optimizer::ABTVector checkNotArrays;
 
-        auto collatorSlot = _context->state.data->env->getSlotIfExists("collator"_sd);
+        auto collatorSlot = _context->state.env->getSlotIfExists("collator"_sd);
 
         args.reserve(arity);
         argNames.reserve(arity);
@@ -4010,7 +4054,7 @@ private:
      */
     void generateDateArithmeticsExpression(const ExpressionDateArithmetics* expr,
                                            const std::string& dateExprName) {
-        auto children = expr->getChildren();
+        const auto& children = expr->getChildren();
         auto arity = children.size();
         invariant(arity == 4);
         auto timezoneExpr =
@@ -4043,7 +4087,7 @@ private:
             }
         }();
 
-        auto timeZoneDBSlot = _context->state.data->env->getSlot("timeZoneDB"_sd);
+        auto timeZoneDBSlot = _context->state.env->getSlot("timeZoneDB"_sd);
         auto timeZoneDBVar = makeVariable(_context->registerVariable(timeZoneDBSlot));
 
         optimizer::ABTVector checkNullArg;

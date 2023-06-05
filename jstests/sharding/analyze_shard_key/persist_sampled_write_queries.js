@@ -2,16 +2,13 @@
  * Tests that shardsvr mongods support persisting sampled write queries and that non-shardsvr
  * mongods don't support that.
  *
- * @tags: [requires_fcv_63, featureFlagAnalyzeShardKey]
+ * @tags: [requires_fcv_70]
  */
 (function() {
 "use strict";
 
-load("jstests/libs/catalog_shard_util.js");
+load("jstests/libs/config_shard_util.js");
 load("jstests/sharding/analyze_shard_key/libs/query_sampling_util.js");
-
-// Set this to allow sample ids to be set by an external client.
-TestData.enableTestCommands = true;
 
 const supportedTestCases = [
     {collectionExists: true, markForSampling: true, expectSampling: true},
@@ -223,13 +220,16 @@ function testInsertCmd(rst) {
     // allow the test helper to know if it should use "config" as the name for the test database.
     st.configRS.isConfigRS = true;
 
+    // Force samples to get persisted even though query sampling is not enabled.
+    QuerySamplingUtil.skipActiveSamplingCheckWhenPersistingSamples(st);
+
     testUpdateCmd(st.rs0, supportedTestCases);
     testDeleteCmd(st.rs0, supportedTestCases);
     testFindAndModifyCmd(st.rs0, supportedTestCases);
     testInsertCmd(st.rs0);
 
     const configTests =
-        CatalogShardUtil.isEnabledIgnoringFCV(st) ? supportedTestCases : unsupportedTestCases;
+        ConfigShardUtil.isEnabledIgnoringFCV(st) ? supportedTestCases : unsupportedTestCases;
     testUpdateCmd(st.configRS, configTests);
     testDeleteCmd(st.configRS, configTests);
     testFindAndModifyCmd(st.configRS, configTests);

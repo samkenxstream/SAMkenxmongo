@@ -73,7 +73,8 @@ bool collectionHasSimpleCollation(OperationContext* opCtx, const NamespaceString
     auto [sourceChunkMgr, _] = uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, nss));
 
     uassert(ErrorCodes::NamespaceNotSharded,
-            str::stream() << "Expected collection " << nss << " to be sharded",
+            str::stream() << "Expected collection " << nss.toStringForErrorMsg()
+                          << " to be sharded",
             sourceChunkMgr.isSharded());
 
     return !sourceChunkMgr.getDefaultCollator();
@@ -108,8 +109,8 @@ ReshardingCollectionCloner::makeRawPipeline(
 
     // Assume that the config.cache.chunks collection isn't a view either.
     auto tempNss = resharding::constructTemporaryReshardingNss(_sourceNss.db(), _sourceUUID);
-    auto tempCacheChunksNss =
-        NamespaceString::makeGlobalConfigCollection("cache.chunks." + tempNss.ns());
+    auto tempCacheChunksNss = NamespaceString::makeGlobalConfigCollection(
+        "cache.chunks." + NamespaceStringUtil::serialize(tempNss));
     resolvedNamespaces[tempCacheChunksNss.coll()] = {tempCacheChunksNss, std::vector<BSONObj>{}};
 
     // Pipeline::makePipeline() ignores the collation set on the AggregationRequest (or lack
@@ -218,8 +219,8 @@ std::unique_ptr<Pipeline, PipelineDeleter> ReshardingCollectionCloner::_restartP
     auto idToResumeFrom = [&] {
         AutoGetCollection outputColl(opCtx, _outputNss, MODE_IS);
         uassert(ErrorCodes::NamespaceNotFound,
-                str::stream() << "Resharding collection cloner's output collection '" << _outputNss
-                              << "' did not already exist",
+                str::stream() << "Resharding collection cloner's output collection '"
+                              << _outputNss.toStringForErrorMsg() << "' did not already exist",
                 outputColl);
         return resharding::data_copy::findHighestInsertedId(opCtx, *outputColl);
     }();
@@ -280,8 +281,8 @@ bool ReshardingCollectionCloner::doOneBatch(OperationContext* opCtx, Pipeline& p
     int bytesInserted = resharding::data_copy::withOneStaleConfigRetry(opCtx, [&] {
         // ReshardingOpObserver depends on the collection metadata being known when processing
         // writes to the temporary resharding collection. We attach shard version IGNORED to the
-        // insert operations and retry once on a StaleConfig exception to allow the collection
-        // metadata information to be recovered.
+        // insert operations and retry once on a StaleConfig error to allow the collection metadata
+        // information to be recovered.
         auto [_, sii] = uassertStatusOK(
             Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, _outputNss));
         ScopedSetShardRole scopedSetShardRole(
@@ -360,6 +361,12 @@ SemiFuture<void> ReshardingCollectionCloner::run(
             if (chainCtx->pipeline) {
                 auto client =
                     cc().getServiceContext()->makeClient("ReshardingCollectionClonerCleanupClient");
+
+                // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+                {
+                    stdx::lock_guard<Client> lk(*client.get());
+                    client.get()->setSystemOperationUnkillableByStepdown(lk);
+                }
 
                 AlternativeClientRegion acr(client);
                 auto opCtx = cc().makeOperationContext();

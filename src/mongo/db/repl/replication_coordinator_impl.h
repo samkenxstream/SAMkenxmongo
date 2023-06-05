@@ -149,8 +149,9 @@ public:
 
     virtual bool isWritablePrimaryForReportingPurposes();
 
-    virtual bool canAcceptWritesForDatabase(OperationContext* opCtx, StringData dbName);
-    virtual bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx, StringData dbName);
+    virtual bool canAcceptWritesForDatabase(OperationContext* opCtx, const DatabaseName& dbName);
+    virtual bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx,
+                                                   const DatabaseName& dbName);
 
     bool canAcceptWritesFor(OperationContext* opCtx,
                             const NamespaceStringOrUUID& nsorUUID) override;
@@ -179,7 +180,7 @@ public:
     virtual void setMyLastDurableOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime);
 
     virtual void setMyLastAppliedOpTimeAndWallTimeForward(
-        const OpTimeAndWallTime& opTimeAndWallTime);
+        const OpTimeAndWallTime& opTimeAndWallTime, bool advanceGlobalTimestamp);
     virtual void setMyLastDurableOpTimeAndWallTimeForward(
         const OpTimeAndWallTime& opTimeAndWallTime);
 
@@ -1849,7 +1850,7 @@ private:
     // The cached value of the 'counter' field in the server's TopologyVersion.
     AtomicWord<int64_t> _cachedTopologyVersionCounter;  // (S)
 
-    // This should be set during sharding initialization except on catalog shard.
+    // This should be set during sharding initialization except on config shard.
     boost::optional<bool> _wasCWWCSetOnConfigServerOnStartup;
 
     InitialSyncerInterface::OnCompletionFn _onCompletion;

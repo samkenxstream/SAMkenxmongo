@@ -189,6 +189,9 @@ __wt_verify(WT_SESSION_IMPL *session, const char *cfg[])
     const char *name;
     bool bm_start, quit, skip_hs;
 
+    WT_ASSERT_SPINLOCK_OWNED(session, &S2C(session)->checkpoint_lock);
+    WT_ASSERT_SPINLOCK_OWNED(session, &S2C(session)->schema_lock);
+
     btree = S2BT(session);
     bm = btree->bm;
     ckptbase = NULL;
@@ -277,6 +280,8 @@ __wt_verify(WT_SESSION_IMPL *session, const char *cfg[])
             WT_WITH_PAGE_INDEX(
               session, ret = __verify_tree(session, &btree->root, &addr_unpack, vs));
 
+/* FIXME-WT-10927 */
+#if 0
             /*
              * The checkpoints are in time-order, so the last one in the list is the most recent. If
              * this is the most recent checkpoint, verify the history store against it.
@@ -289,7 +294,7 @@ __wt_verify(WT_SESSION_IMPL *session, const char *cfg[])
                  * after that and unloading this checkpoint.
                  */
             }
-
+#endif
             /*
              * If the read_corrupt mode was turned on, we may have continued traversing and
              * verifying the pages of the tree despite encountering an error. Set the error.

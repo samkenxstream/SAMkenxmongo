@@ -53,7 +53,6 @@
 #include "mongo/stdx/type_traits.h"
 #include "mongo/util/allocator.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/concepts.h"
 #include "mongo/util/itoa.h"
 #include "mongo/util/shared_buffer.h"
 #include "mongo/util/shared_buffer_fragment.h"
@@ -380,8 +379,8 @@ public:
         appendNumImpl(high);
     }
 
-    REQUIRES_FOR_NON_TEMPLATE(!std::is_same_v<int64_t, long long>)
-    void appendNum(int64_t j) {
+    template <int...>
+    requires(!std::is_same_v<int64_t, long long>) void appendNum(int64_t j) {
         appendNumImpl(j);
     }
 
@@ -465,7 +464,8 @@ public:
      * Replaces the buffer backing this BufBuilder with the passed in SharedBuffer.
      * Only legal to call when this builder is empty and when the SharedBuffer isn't shared.
      */
-    REQUIRES_FOR_NON_TEMPLATE(std::is_same_v<BufferAllocator, SharedBufferAllocator>)
+    template <int...>
+    requires std::is_same_v<BufferAllocator, SharedBufferAllocator>
     void useSharedBuffer(SharedBuffer buf) {
         invariant(len() == 0);  // Can only do this while empty.
         invariant(reservedBytes() == 0);
@@ -737,8 +737,8 @@ public:
         const int maxSize = 32;
         char* start = _buf.grow(maxSize);
         int z = snprintf(start, maxSize, "%.16g", x);
-        verify(z >= 0);
-        verify(z < maxSize);
+        MONGO_verify(z >= 0);
+        MONGO_verify(z < maxSize);
         _buf.setlen(prev + z);
         if (strchr(start, '.') == nullptr && strchr(start, 'E') == nullptr &&
             strchr(start, 'N') == nullptr) {
@@ -805,8 +805,8 @@ private:
     StringBuilderImpl& SBNUM(T val, int maxSize, const char* macro) {
         int prev = _buf.len();
         int z = snprintf(_buf.grow(maxSize), maxSize, macro, (val));
-        verify(z >= 0);
-        verify(z < maxSize);
+        MONGO_verify(z >= 0);
+        MONGO_verify(z < maxSize);
         _buf.setlen(prev + z);
         return *this;
     }

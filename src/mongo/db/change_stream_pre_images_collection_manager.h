@@ -31,52 +31,188 @@
 
 #include <boost/optional/optional.hpp>
 
+#include "mongo/db/change_stream_pre_images_truncate_markers.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/change_stream_preimage_gen.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/util/background.h"
+#include "mongo/util/concurrent_shared_values_map.h"
 
 namespace mongo {
-namespace change_stream_pre_image_helpers {
-boost::optional<Date_t> getPreImageExpirationTime(OperationContext* opCtx, Date_t currentTime);
-
-Timestamp getPreImageTimestamp(const RecordId& rid);
-
-RecordId toRecordId(ChangeStreamPreImageId id);
-}  // namespace change_stream_pre_image_helpers
-
 /**
  * Manages the lifecycle of the change stream pre-images collection(s). Also is responsible for
  * inserting the pre-images into the pre-images collection.
  */
 class ChangeStreamPreImagesCollectionManager {
 public:
+    struct PurgingJobStats {
+        /**
+         * Total number of deletion passes completed by the purging job.
+         */
+        AtomicWord<int64_t> totalPass;
+
+        /**
+         * Cumulative number of pre-image documents deleted by the purging job.
+         */
+        AtomicWord<int64_t> docsDeleted;
+
+        /**
+         * Cumulative size in bytes of all deleted documents from all pre-image collections by the
+         * purging job.
+         */
+        AtomicWord<int64_t> bytesDeleted;
+
+        /**
+         * Cumulative number of pre-image collections scanned by the purging job. In single-tenant
+         * environments this is the same as totalPass as there is 1 pre-image collection per tenant.
+         */
+        AtomicWord<int64_t> scannedCollections;
+
+        /**
+         * Cumulative number of internal pre-image collections scanned by the purging job. Internal
+         * collections are the segments of actual pre-images of collections within system.preimages.
+         */
+        AtomicWord<int64_t> scannedInternalCollections;
+
+        /**
+         * Cumulative number of milliseconds elapsed since the first pass by the purging job.
+         */
+        AtomicWord<int64_t> timeElapsedMillis;
+
+        /**
+         * Maximum wall time from the first document of each pre-image collection.
+         */
+        AtomicWord<Date_t> maxStartWallTime;
+
+        /**
+         * Serializes the purging job statistics to the BSON object.
+         */
+        BSONObj toBSON() const;
+    };
+
+    explicit ChangeStreamPreImagesCollectionManager() {}
+
+    ~ChangeStreamPreImagesCollectionManager() = default;
+
+    /**
+     * Gets the instance of the class using the service context.
+     */
+    static ChangeStreamPreImagesCollectionManager& get(ServiceContext* service);
+
+    /**
+     * Gets the instance of the class using the operation context.
+     */
+    static ChangeStreamPreImagesCollectionManager& get(OperationContext* opCtx);
+
     /**
      * Creates the pre-images collection, clustered by the primary key '_id'. The collection is
      * created for the specific tenant if the 'tenantId' is specified.
      */
-    static void createPreImagesCollection(OperationContext* opCtx,
-                                          boost::optional<TenantId> tenantId);
+    void createPreImagesCollection(OperationContext* opCtx, boost::optional<TenantId> tenantId);
 
     /**
      * Drops the pre-images collection. The collection is dropped for the specific tenant if
      * the 'tenantId' is specified.
      */
-    static void dropPreImagesCollection(OperationContext* opCtx,
-                                        boost::optional<TenantId> tenantId);
+    void dropPreImagesCollection(OperationContext* opCtx, boost::optional<TenantId> tenantId);
 
     /**
      * Inserts the document into the pre-images collection. The document is inserted into the
      * tenant's pre-images collection if the 'tenantId' is specified.
      */
-    static void insertPreImage(OperationContext* opCtx,
-                               boost::optional<TenantId> tenantId,
-                               const ChangeStreamPreImage& preImage);
+    void insertPreImage(OperationContext* opCtx,
+                        boost::optional<TenantId> tenantId,
+                        const ChangeStreamPreImage& preImage);
 
     /**
      * Scans the system pre-images collection and deletes the expired pre-images from it.
      */
-    static void performExpiredChangeStreamPreImagesRemovalPass(Client* client);
+    void performExpiredChangeStreamPreImagesRemovalPass(Client* client);
+
+    const PurgingJobStats& getPurgingJobStats() {
+        return _purgingJobStats;
+    }
+
+private:
+    /**
+     * Scans the 'config.system.preimages' collection and deletes the expired pre-images from it.
+     *
+     * Pre-images are ordered by collection UUID, ie. if UUID of collection A is ordered before UUID
+     * of collection B, then pre-images of collection A will be stored before pre-images of
+     * collection B.
+     *
+     * Pre-images are considered expired based on expiration parameter. In case when expiration
+     * parameter is not set a pre-image is considered expired if its timestamp is smaller than the
+     * timestamp of the earliest oplog entry. In case when expiration parameter is specified, aside
+     * from timestamp check a check on the wall clock time of the pre-image recording
+     * ('operationTime') is performed. If the difference between 'currentTimeForTimeBasedExpiration'
+     * and 'operationTime' is larger than expiration parameter, the pre-image is considered expired.
+     * One of those two conditions must be true for a pre-image to be eligible for deletion.
+     *
+     *                               +-------------------------+
+     *                               | config.system.preimages |
+     *                               +------------+------------+
+     *                                            |
+     *             +--------------------+---------+---------+-----------------------+
+     *             |                    |                   |                       |
+     * +-----------+-------+ +----------+--------+ +--------+----------+ +----------+--------+
+     * |  collA.preImageA  | |  collA.preImageB  | |  collB.preImageC  | |  collB.preImageD  |
+     * +-----------+-------+ +----------+--------+ +---------+---------+ +----------+--------+
+     * |   timestamp: 1    | |   timestamp: 10   | |   timestamp: 5    | |   timestamp: 9    |
+     * |   applyIndex: 0   | |   applyIndex: 0   | |   applyIndex: 0   | |   applyIndex: 1   |
+     * +-------------------+ +-------------------+ +-------------------+ +-------------------+
+     */
+
+    /**
+     * Common logic for removing expired pre-images with a collection scan.
+     *
+     * Returns the number of pre-image documents removed.
+     */
+    size_t _deleteExpiredPreImagesWithCollScanCommon(
+        OperationContext* opCtx,
+        const ScopedCollectionAcquisition& preImageColl,
+        const MatchExpression* filterPtr,
+        Timestamp maxRecordIdTimestamp);
+
+    /**
+     * Removes expired pre-images in a single tenant environment.
+     *
+     * Returns the number of pre-image documents removed.
+     */
+    size_t _deleteExpiredPreImagesWithCollScan(OperationContext* opCtx,
+                                               Date_t currentTimeForTimeBasedExpiration);
+
+    /**
+     * Removes expired pre-images for the tenant with 'tenantId'.
+     *
+     * Returns the number of pre-image documents removed.
+     */
+    size_t _deleteExpiredPreImagesWithCollScanForTenants(OperationContext* opCtx,
+                                                         const TenantId& tenantId,
+                                                         Date_t currentTimeForTimeBasedExpiration);
+
+    /**
+     * Removes expired pre-images with truncate. Suitable for both serverless and single tenant
+     * environments. 'tenantId' is boost::none in a single tenant environment.
+     *
+     * If 'tenantId' is not yet registered with the '_truncateManager', performs lazy registration
+     * and initialisation of the tenant's corresponding truncate markers before removing expired
+     * pre-images.
+     *
+     * Returns the number of pre-image documents removed.
+     */
+    size_t _deleteExpiredPreImagesWithTruncate(OperationContext* opCtx,
+                                               boost::optional<TenantId> tenantId);
+
+    PurgingJobStats _purgingJobStats;
+
+    /**
+     * Manages truncate markers and truncation across tenants. Treats a single tenant environment
+     * the same as a multi-tenant environment, but with only one tenant of TenantId boost::none.
+     */
+    PreImagesTruncateManager _truncateManager;
 };
 }  // namespace mongo

@@ -32,6 +32,7 @@
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/transaction/transaction_api.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/async_requests_sender.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
@@ -78,7 +79,7 @@ void removeTagsMetadataFromConfig(OperationContext* opCtx,
  * Erase tags metadata from config server for the given namespace.
  */
 void removeTagsMetadataFromConfig_notIdempotent(OperationContext* opCtx,
-                                                Shard* configShard,
+                                                const std::shared_ptr<Shard>& configShard,
                                                 const NamespaceString& nss,
                                                 const WriteConcernOptions& writeConcern);
 
@@ -87,9 +88,15 @@ void removeTagsMetadataFromConfig_notIdempotent(OperationContext* opCtx,
  * Erase collection metadata from config server and invalidate the locally cached one.
  * In particular remove the collection and chunks metadata associated with the given namespace.
  */
-void removeCollAndChunksMetadataFromConfig(OperationContext* opCtx,
-                                           const CollectionType& coll,
-                                           const WriteConcernOptions& writeConcern);
+void removeCollAndChunksMetadataFromConfig(
+    OperationContext* opCtx,
+    const std::shared_ptr<Shard>& configShard,
+    ShardingCatalogClient* catalogClient,
+    const CollectionType& coll,
+    const WriteConcernOptions& writeConcern,
+    const OperationSessionInfo& osi,
+    bool useClusterTransaction,
+    const std::shared_ptr<executor::TaskExecutor>& executor = nullptr);
 
 /**
  * Erase collection metadata from config server and invalidate the locally cached one.
@@ -99,16 +106,15 @@ void removeCollAndChunksMetadataFromConfig(OperationContext* opCtx,
  * Returns true if the collection existed before being removed.
  */
 bool removeCollAndChunksMetadataFromConfig_notIdempotent(OperationContext* opCtx,
+                                                         const std::shared_ptr<Shard>& configShard,
                                                          ShardingCatalogClient* catalogClient,
                                                          const NamespaceString& nss,
                                                          const WriteConcernOptions& writeConcern);
 
 /**
- * Delete the config query analyzer document for the given collection, if it exists.
+ * Delete the query analyzer documents that match the given filter.
  */
-void removeQueryAnalyzerMetadataFromConfig(OperationContext* opCtx,
-                                           const NamespaceString& nss,
-                                           const boost::optional<UUID>& uuid);
+void removeQueryAnalyzerMetadataFromConfig(OperationContext* opCtx, const BSONObj& filter);
 
 /**
  * Rename sharded collection metadata as part of a renameCollection operation.
@@ -119,9 +125,9 @@ void removeQueryAnalyzerMetadataFromConfig(OperationContext* opCtx,
  * This function is idempotent and can just be invoked by the CSRS.
  */
 void shardedRenameMetadata(OperationContext* opCtx,
-                           Shard* configShard,
+                           const std::shared_ptr<Shard>& configShard,
                            ShardingCatalogClient* catalogClient,
-                           CollectionType& fromCollType,
+                           CollectionType fromCollType,
                            const NamespaceString& toNss,
                            const WriteConcernOptions& writeConcern);
 
@@ -177,7 +183,8 @@ boost::optional<CreateCollectionResponse> checkIfCollectionAlreadySharded(
  */
 void stopMigrations(OperationContext* opCtx,
                     const NamespaceString& nss,
-                    const boost::optional<UUID>& expectedCollectionUUID);
+                    const boost::optional<UUID>& expectedCollectionUUID,
+                    const boost::optional<OperationSessionInfo>& osi = boost::none);
 
 /**
  * Resume migrations and balancing rounds for the given nss.
@@ -186,7 +193,8 @@ void stopMigrations(OperationContext* opCtx,
  */
 void resumeMigrations(OperationContext* opCtx,
                       const NamespaceString& nss,
-                      const boost::optional<UUID>& expectedCollectionUUID);
+                      const boost::optional<UUID>& expectedCollectionUUID,
+                      const boost::optional<OperationSessionInfo>& osi = boost::none);
 
 /**
  * Calls to the config server primary to get the collection document for the given nss.
@@ -229,5 +237,17 @@ void sendDropCollectionParticipantCommandToShards(OperationContext* opCtx,
 
 BSONObj getCriticalSectionReasonForRename(const NamespaceString& from, const NamespaceString& to);
 
+/**
+ * Runs the given transaction chain on the catalog. Transaction will be remote if called by a shard.
+ * Important: StmtsIds must be set in the transactionChain if the OperationSessionId is not empty
+ * since we are spawning a transaction on behalf of a retryable operation.
+ */
+void runTransactionOnShardingCatalog(
+    OperationContext* opCtx,
+    txn_api::Callback&& transactionChain,
+    const WriteConcernOptions& writeConcern,
+    const OperationSessionInfo& osi,
+    bool useClusterTransaction,
+    const std::shared_ptr<executor::TaskExecutor>& inputExecutor = nullptr);
 }  // namespace sharding_ddl_util
 }  // namespace mongo

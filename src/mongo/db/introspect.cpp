@@ -35,7 +35,7 @@
 #include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/exception_util.h"
-#include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/concurrency/locker_impl.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
@@ -95,6 +95,13 @@ void profile(OperationContext* opCtx, NetworkOp op) {
         // killed or timed out. Those are the case we want to have profiling data.
         auto newClient = opCtx->getServiceContext()->makeClient("profiling");
         auto newCtx = newClient->makeOperationContext();
+
+        // TODO(SERVER-74657): Please revisit if this thread could be made killable.
+        {
+            stdx::lock_guard<Client> lk(*newClient.get());
+            newClient.get()->setSystemOperationUnkillableByStepdown(lk);
+        }
+
         // We swap the lockers as that way we preserve locks held in transactions and any other
         // options set for the locker like maxLockTimeout.
         auto oldLocker = opCtx->getClient()->swapLockState(
@@ -146,13 +153,14 @@ Status createProfileCollection(OperationContext* opCtx, Database* db) {
     // Checking the collection exists must also be done in the WCE retry loop. Only retrying
     // collection creation would endlessly throw errors because the collection exists: must check
     // and see the collection exists in order to break free.
-    return writeConflictRetry(opCtx, "createProfileCollection", dbProfilingNS.ns(), [&] {
+    return writeConflictRetry(opCtx, "createProfileCollection", dbProfilingNS, [&] {
         const Collection* collection =
             CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, dbProfilingNS);
         if (collection) {
             if (!collection->isCapped()) {
                 return Status(ErrorCodes::NamespaceExists,
-                              str::stream() << dbProfilingNS << " exists but isn't capped");
+                              str::stream() << dbProfilingNS.toStringForErrorMsg()
+                                            << " exists but isn't capped");
             }
 
             return Status::OK();

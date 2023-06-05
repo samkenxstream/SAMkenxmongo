@@ -49,6 +49,12 @@ struct ShardingStatistics {
     // (whether they succeeded or not).
     AtomicWord<long long> countDonorMoveChunkStarted{0};
 
+    // Cumulative, always-increasing counter of how many chunks this node successfully committed.
+    AtomicWord<long long> countDonorMoveChunkCommitted{0};
+
+    // Cumulative, always-increasing counter of how many move chunks this node aborted.
+    AtomicWord<long long> countDonorMoveChunkAborted{0};
+
     // Cumulative, always-increasing counter of how much time the entire move chunk operation took
     // (excluding range deletion).
     AtomicWord<long long> totalDonorMoveChunkTimeMillis{0};
@@ -61,13 +67,29 @@ struct ShardingStatistics {
     // recipient node.
     AtomicWord<long long> countDocsClonedOnRecipient{0};
 
+    // Cumulative, always-increasing counter of how many documents have been cloned on the catch up
+    // phase on the recipient node.
+    AtomicWord<long long> countDocsClonedOnCatchUpOnRecipient{0};
+
+    // Cumulative, always-increasing counter of how many bytes have been cloned on the catch up
+    // phase on the recipient node.
+    AtomicWord<long long> countBytesClonedOnCatchUpOnRecipient{0};
+
+    // Cumulative, always-increasing counter of how many bytes have been cloned on the
+    // recipient node.
+    AtomicWord<long long> countBytesClonedOnRecipient{0};
+
     // Cumulative, always-increasing counter of how many documents have been cloned on the donor
     // node.
     AtomicWord<long long> countDocsClonedOnDonor{0};
 
-    // Cumulative, always-increasing counter of how many documents have been deleted on the donor
-    // node by the rangeDeleter.
-    AtomicWord<long long> countDocsDeletedOnDonor{0};
+    // Cumulative, always-increasing counter of how many bytes have been cloned on the donor
+    // node.
+    AtomicWord<long long> countBytesClonedOnDonor{0};
+
+    // Cumulative, always-increasing counter of how many documents have been deleted by the
+    // rangeDeleter.
+    AtomicWord<long long> countDocsDeletedByRangeDeleter{0};
 
     // Cumulative, always-increasing counter of how many chunks this node started to receive
     // (whether the receiving succeeded or not)
@@ -107,6 +129,11 @@ struct ShardingStatistics {
     // Current number for chunkMigrationConcurrency that defines concurrent fetchers and inserters
     // used for _migrateClone(step 4) of chunk migration
     AtomicWord<int> chunkMigrationConcurrencyCnt{1};
+
+    // Total number of commands run directly against this shard without the directShardOperations
+    // role.
+    AtomicWord<long long> unauthorizedDirectShardOperations{0};
+
     /**
      * Obtains the per-process instance of the sharding statistics object.
      */

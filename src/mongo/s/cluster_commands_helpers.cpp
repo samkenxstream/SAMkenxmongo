@@ -31,6 +31,8 @@
 
 #include <boost/optional.hpp>
 
+#include "mongo/bson/mutable/algorithm.h"
+#include "mongo/bson/mutable/document.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/catalog/collection_uuid_mismatch_info.h"
 #include "mongo/db/commands.h"
@@ -42,6 +44,7 @@
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/write_concern_error_detail.h"
@@ -58,6 +61,9 @@
 #include "mongo/util/scopeguard.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
+using mongo::repl::ReadConcernArgs;
+using mongo::repl::ReadConcernLevel;
 
 namespace mongo {
 
@@ -132,7 +138,7 @@ namespace {
  * sample id for it.
  */
 std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShards(
-    OperationContext* opCtx,
+    boost::intrusive_ptr<ExpressionContext> expCtx,
     const NamespaceString& nss,
     const CollectionRoutingInfo& cri,
     const std::set<ShardId>& shardsToSkip,
@@ -140,6 +146,7 @@ std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShard
     const BSONObj& query,
     const BSONObj& collation,
     bool eligibleForSampling = false) {
+    auto opCtx = expCtx->opCtx;
 
     const auto& cm = cri.cm;
 
@@ -180,7 +187,6 @@ std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShard
             CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collation));
     }
 
-    auto expCtx = make_intrusive<ExpressionContext>(opCtx, std::move(collator), nss);
     getShardIdsForQuery(expCtx, query, collation, cm, &shardIds, nullptr /* info */);
 
     const auto targetedSampleId = eligibleForSampling
@@ -214,7 +220,7 @@ std::vector<AsyncRequestsSender::Response> gatherResponsesImpl(
     MultiStatementTransactionRequestsSender ars(
         opCtx,
         Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
-        dbName,
+        DatabaseNameUtil::deserialize(boost::none, dbName),
         requests,
         readPref,
         retryPolicy);
@@ -422,11 +428,37 @@ std::vector<AsyncRequestsSender::Response> scatterGatherVersionedTargetByRouting
     Shard::RetryPolicy retryPolicy,
     const BSONObj& query,
     const BSONObj& collation,
+    const boost::optional<BSONObj>& letParameters,
+    const boost::optional<LegacyRuntimeConstants>& runtimeConstants,
+    bool eligibleForSampling) {
+    auto expCtx = makeExpressionContextWithDefaultsForTargeter(
+        opCtx, nss, collation, boost::none /*explainVerbosity*/, letParameters, runtimeConstants);
+    return scatterGatherVersionedTargetByRoutingTable(expCtx,
+                                                      dbName,
+                                                      nss,
+                                                      cri,
+                                                      cmdObj,
+                                                      readPref,
+                                                      retryPolicy,
+                                                      query,
+                                                      collation,
+                                                      eligibleForSampling);
+}
+
+[[nodiscard]] std::vector<AsyncRequestsSender::Response> scatterGatherVersionedTargetByRoutingTable(
+    boost::intrusive_ptr<ExpressionContext> expCtx,
+    StringData dbName,
+    const NamespaceString& nss,
+    const CollectionRoutingInfo& cri,
+    const BSONObj& cmdObj,
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy,
+    const BSONObj& query,
+    const BSONObj& collation,
     bool eligibleForSampling) {
     const auto requests = buildVersionedRequestsForTargetedShards(
-        opCtx, nss, cri, {} /* shardsToSkip */, cmdObj, query, collation, eligibleForSampling);
-
-    return gatherResponses(opCtx, dbName, readPref, retryPolicy, requests);
+        expCtx, nss, cri, {} /* shardsToSkip */, cmdObj, query, collation, eligibleForSampling);
+    return gatherResponses(expCtx->opCtx, dbName, readPref, retryPolicy, requests);
 }
 
 std::vector<AsyncRequestsSender::Response>
@@ -440,9 +472,13 @@ scatterGatherVersionedTargetByRoutingTableNoThrowOnStaleShardVersionErrors(
     const ReadPreferenceSetting& readPref,
     Shard::RetryPolicy retryPolicy,
     const BSONObj& query,
-    const BSONObj& collation) {
+    const BSONObj& collation,
+    const boost::optional<BSONObj>& letParameters,
+    const boost::optional<LegacyRuntimeConstants>& runtimeConstants) {
+    auto expCtx = makeExpressionContextWithDefaultsForTargeter(
+        opCtx, nss, collation, boost::none /*explainVerbosity*/, letParameters, runtimeConstants);
     const auto requests = buildVersionedRequestsForTargetedShards(
-        opCtx, nss, cri, shardsToSkip, cmdObj, query, collation);
+        expCtx, nss, cri, shardsToSkip, cmdObj, query, collation);
 
     return gatherResponsesNoThrowOnStaleShardVersionErrors(
         opCtx, dbName, readPref, retryPolicy, requests);
@@ -477,6 +513,12 @@ AsyncRequestsSender::Response executeCommandAgainstShardWithMinKeyChunk(
     const BSONObj& cmdObj,
     const ReadPreferenceSetting& readPref,
     Shard::RetryPolicy retryPolicy) {
+    auto expCtx = makeExpressionContextWithDefaultsForTargeter(opCtx,
+                                                               nss,
+                                                               BSONObj() /*collation*/,
+                                                               boost::none /*explainVerbosity*/,
+                                                               boost::none /*letParameters*/,
+                                                               boost::none /*runtimeConstants*/);
 
     const auto query =
         cri.cm.isSharded() ? cri.cm.getShardKeyPattern().getKeyPattern().globalMin() : BSONObj();
@@ -487,7 +529,7 @@ AsyncRequestsSender::Response executeCommandAgainstShardWithMinKeyChunk(
         readPref,
         retryPolicy,
         buildVersionedRequestsForTargetedShards(
-            opCtx, nss, cri, {} /* shardsToSkip */, cmdObj, query, BSONObj() /* collation */));
+            expCtx, nss, cri, {} /* shardsToSkip */, cmdObj, query, BSONObj() /* collation */));
     return std::move(responses.front());
 }
 
@@ -670,10 +712,14 @@ std::vector<std::pair<ShardId, BSONObj>> getVersionedRequestsForTargetedShards(
     const CollectionRoutingInfo& cri,
     const BSONObj& cmdObj,
     const BSONObj& query,
-    const BSONObj& collation) {
+    const BSONObj& collation,
+    const boost::optional<BSONObj>& letParameters,
+    const boost::optional<LegacyRuntimeConstants>& runtimeConstants) {
+    auto expCtx = makeExpressionContextWithDefaultsForTargeter(
+        opCtx, nss, collation, boost::none /*explainVerbosity*/, letParameters, runtimeConstants);
     std::vector<std::pair<ShardId, BSONObj>> requests;
     auto ars_requests = buildVersionedRequestsForTargetedShards(
-        opCtx, nss, cri, {} /* shardsToSkip */, cmdObj, query, collation);
+        expCtx, nss, cri, {} /* shardsToSkip */, cmdObj, query, collation);
     std::transform(std::make_move_iterator(ars_requests.begin()),
                    std::make_move_iterator(ars_requests.end()),
                    std::back_inserter(requests),
@@ -715,6 +761,13 @@ StatusWith<Shard::QueryResponse> loadIndexesFromAuthoritativeShard(OperationCont
         const auto& [cm, sii] = cri;
         auto cmdNoVersion = applyReadWriteConcern(
             opCtx, true /* appendRC */, false /* appendWC */, BSON("listIndexes" << nss.coll()));
+
+        // force the read concern level to "local" as other values are not supported for listIndexes
+        BSONObjBuilder bob(cmdNoVersion.removeField(ReadConcernArgs::kReadConcernFieldName));
+        bob.append(ReadConcernArgs::kReadConcernFieldName,
+                   BSON(ReadConcernArgs::kLevelFieldName << repl::readConcernLevels::kLocalName));
+        cmdNoVersion = bob.obj();
+
         if (cm.isSharded()) {
             // For a sharded collection we must load indexes from a shard with chunks. For
             // consistency with cluster listIndexes, load from the shard that owns the minKey chunk.

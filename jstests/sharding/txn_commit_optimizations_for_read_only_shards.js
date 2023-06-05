@@ -6,7 +6,7 @@
  * no failures, a participant having failed over, a participant being unable to satisfy the client's
  * writeConcern, and an invalid client writeConcern.
  *
- * @tags: [uses_transactions, uses_multi_shard_transaction, temporary_catalog_shard_incompatible]
+ * @tags: [uses_transactions, uses_multi_shard_transaction]
  */
 
 (function() {
@@ -63,9 +63,12 @@ TestData.transactionLifetimeLimitSeconds = 30;
 let st = new ShardingTest({
     shards: 3,
     // Create shards with more than one node because we test for writeConcern majority failing.
-    config: 1,
+    config: TestData.configShard ? undefined : 1,
     other: {
-        mongosOptions: {verbose: 3},
+        mongosOptions: {
+            verbose: 3,
+            setParameter: {'failpoint.skipClusterParameterRefresh': "{'mode':'alwaysOn'}"}
+        },
         rs0: {nodes: [{}, {rsConfig: {priority: 0}}]},
         rs1: {nodes: [{}, {rsConfig: {priority: 0}}]},
         rs2: {nodes: [{}, {rsConfig: {priority: 0}}]},
@@ -342,6 +345,7 @@ const failureModes = {
     },
 };
 
+clearRawMongoProgramOutput();
 for (const failureModeName in failureModes) {
     for (const type in transactionTypes) {
         const lsid = getLSID();

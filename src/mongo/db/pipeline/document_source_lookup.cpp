@@ -117,7 +117,7 @@ NamespaceString parseLookupFromAndResolveNamespace(const BSONElement& elem,
     uassert(
         ErrorCodes::FailedToParse,
         str::stream() << "$lookup with syntax {from: {db:<>, coll:<>},..} is not supported for db: "
-                      << nss.db() << " and coll: " << nss.coll(),
+                      << nss.dbName().toStringForErrorMsg() << " and coll: " << nss.coll(),
         nss.isConfigDotCacheDotChunks() || nss == NamespaceString::kRsOplogNamespace ||
             nss == NamespaceString::kTenantMigrationOplogView ||
             nss == NamespaceString::kConfigsvrCollectionsNamespace);
@@ -361,7 +361,7 @@ std::unique_ptr<DocumentSourceLookUp::LiteParsed> DocumentSourceLookUp::LitePars
         fromNss = parseLookupFromAndResolveNamespace(fromElement, nss.dbName());
     }
     uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "invalid $lookup namespace: " << fromNss.ns(),
+            str::stream() << "invalid $lookup namespace: " << fromNss.toStringForErrorMsg(),
             fromNss.isValid());
 
     // Recursively lite parse the nested pipeline, if one exists.
@@ -450,7 +450,7 @@ StageConstraints DocumentSourceLookUp::constraints(Pipeline::SplitState pipeStat
         // is allowed.
         hostRequirement = HostTypeRequirement::kAnyShard;
     } else if (_fromNs == NamespaceString::kConfigsvrCollectionsNamespace &&
-               // (Ignore FCV check): If the catalog shard feature flag is enabled, the config
+               // (Ignore FCV check): If the config shard feature flag is enabled, the config
                // server should have the components necessary to handle a merge. Config servers are
                // upgraded first and downgraded last, so if any server is running the latest binary,
                // we can assume the conifg servers are too.
@@ -571,7 +571,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipelineFr
 
     // Resolve the view definition.
     auto pipeline = Pipeline::makePipelineFromViewDefinition(
-        _fromExpCtx, resolvedNamespace, serializedPipeline, opts);
+        _fromExpCtx, resolvedNamespace, std::move(serializedPipeline), opts);
 
     // Store the pipeline with resolved namespaces so that we only trigger this exception on the
     // first input document.
@@ -595,6 +595,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
     const Document& inputDoc) {
     // Copy all 'let' variables into the foreign pipeline's expression context.
     _variables.copyToExpCtx(_variablesParseState, _fromExpCtx.get());
+    _fromExpCtx->forcePlanCache = true;
 
     // Resolve the 'let' variables to values per the given input document.
     resolveLetVariables(inputDoc, &_fromExpCtx->variables);
@@ -670,7 +671,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
             // This exception returns the information we need to resolve a sharded view. Update the
             // pipeline with the resolved view definition.
             pipeline = buildPipelineFromViewDefinition(
-                serializedPipeline,
+                std::move(serializedPipeline),
                 ExpressionContext::ResolvedNamespace{e->getNamespace(), e->getPipeline()});
 
             // The serialized pipeline does not have a cache stage, so we will add it back to the
@@ -1023,47 +1024,59 @@ void DocumentSourceLookUp::appendSpecificExecStats(MutableDocument& doc) const {
 
 void DocumentSourceLookUp::serializeToArray(std::vector<Value>& array,
                                             SerializationOptions opts) const {
-    auto explain = opts.verbosity;
-    if (opts.redactIdentifiers || opts.replacementForLiteralArgs) {
-        MONGO_UNIMPLEMENTED_TASSERT(7484326);
-    }
-
     // Support alternative $lookup from config.cache.chunks* namespaces.
     //
     // Do not include the tenantId in serialized 'from' namespace.
     auto fromValue = (pExpCtx->ns.db() == _fromNs.db())
-        ? Value(_fromNs.coll())
-        : Value(Document{{"db", _fromNs.dbName().db()}, {"coll", _fromNs.coll()}});
+        ? Value(opts.serializeIdentifier(_fromNs.coll()))
+        : Value(Document{{"db", opts.serializeIdentifier(_fromNs.dbName().db())},
+                         {"coll", opts.serializeIdentifier(_fromNs.coll())}});
 
-    MutableDocument output(
-        Document{{getSourceName(), Document{{"from", fromValue}, {"as", _as.fullPath()}}}});
+    MutableDocument output(Document{
+        {getSourceName(), Document{{"from", fromValue}, {"as", opts.serializeFieldPath(_as)}}}});
 
     if (hasLocalFieldForeignFieldJoin()) {
-        output[getSourceName()]["localField"] = Value(_localField->fullPath());
-        output[getSourceName()]["foreignField"] = Value(_foreignField->fullPath());
+        output[getSourceName()]["localField"] = Value(opts.serializeFieldPath(_localField.value()));
+        output[getSourceName()]["foreignField"] =
+            Value(opts.serializeFieldPath(_foreignField.value()));
     }
 
     // Add a pipeline field if only-pipeline syntax was used (to ensure the output is valid $lookup
     // syntax) or if a $match was absorbed.
-    auto pipeline = _userPipeline.get_value_or(std::vector<BSONObj>());
+    auto serializedPipeline = [&]() -> std::vector<BSONObj> {
+        auto pipeline = _userPipeline.get_value_or(std::vector<BSONObj>());
+        if (opts.transformIdentifiers || opts.replacementForLiteralArgs) {
+            return Pipeline::parse(pipeline, _fromExpCtx)->serializeToBson(opts);
+        }
+        return pipeline;
+    }();
     if (_additionalFilter) {
-        pipeline.emplace_back(BSON("$match" << *_additionalFilter));
+        auto serializedFilter = [&]() -> BSONObj {
+            if (opts.transformIdentifiers || opts.replacementForLiteralArgs) {
+                auto filter =
+                    uassertStatusOK(MatchExpressionParser::parse(*_additionalFilter, pExpCtx));
+                return filter->serialize(opts);
+            }
+            return *_additionalFilter;
+        }();
+        serializedPipeline.emplace_back(BSON("$match" << serializedFilter));
     }
-    if (!hasLocalFieldForeignFieldJoin() || pipeline.size() > 0) {
+    if (!hasLocalFieldForeignFieldJoin() || serializedPipeline.size() > 0) {
         MutableDocument exprList;
         for (const auto& letVar : _letVariables) {
-            exprList.addField(letVar.name, letVar.expression->serialize(explain));
+            exprList.addField(opts.serializeFieldPathFromString(letVar.name),
+                              letVar.expression->serialize(opts));
         }
         output[getSourceName()]["let"] = Value(exprList.freeze());
 
-        output[getSourceName()]["pipeline"] = Value(pipeline);
+        output[getSourceName()]["pipeline"] = Value(serializedPipeline);
     }
 
     if (_hasExplicitCollation) {
         output[getSourceName()]["_internalCollation"] = Value(_fromExpCtx->getCollatorBSON());
     }
 
-    if (explain) {
+    if (opts.verbosity) {
         if (_unwindSrc) {
             const boost::optional<FieldPath> indexPath = _unwindSrc->indexPath();
             output[getSourceName()]["unwinding"] =
@@ -1072,7 +1085,7 @@ void DocumentSourceLookUp::serializeToArray(std::vector<Value>& array,
                           << (indexPath ? Value(indexPath->fullPath()) : Value())));
         }
 
-        if (explain.value() >= ExplainOptions::Verbosity::kExecStats) {
+        if (opts.verbosity.value() >= ExplainOptions::Verbosity::kExecStats) {
             appendSpecificExecStats(output);
         }
 
@@ -1111,7 +1124,19 @@ DepsTracker::State DocumentSourceLookUp::getDependencies(DepsTracker* deps) cons
     }
 
     if (hasLocalFieldForeignFieldJoin()) {
-        deps->fields.insert(_localField->fullPath());
+        const FieldRef ref(_localField->fullPath());
+        // We need everything up until the first numeric component. Otherwise, a projection could
+        // treat the numeric component as a field name rather than an index into an array.
+        size_t firstNumericIx;
+        for (firstNumericIx = 0; firstNumericIx < ref.numParts(); firstNumericIx++) {
+            // We are lenient with the component, because classic $lookup treats 0-prefixed numeric
+            // fields like "00" as both an index and a field name. Allowing it in a dependency would
+            // restrict the usage to only a field name.
+            if (ref.isNumericPathComponentLenient(firstNumericIx)) {
+                break;
+            }
+        }
+        deps->fields.insert(ref.dottedSubstring(0, firstNumericIx).toString());
     }
 
     // Purposely ignore '_matchSrc' and '_unwindSrc', since those should only be absorbed if we know

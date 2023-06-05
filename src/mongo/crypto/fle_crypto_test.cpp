@@ -606,6 +606,10 @@ public:
         return _docs.size();
     }
 
+    ECStats getStats() const override {
+        return ECStats();
+    }
+
     void setOverrideCount(int64_t count) {
         _overrideCount = count;
     }
@@ -663,14 +667,13 @@ std::tuple<ESCTwiceDerivedTagToken, ESCTwiceDerivedValueToken> generateEmuBinary
     return std::tie(escTwiceTag, escTwiceValue);
 }
 
-mongo::ESCCollection::EmuBinaryResult EmuBinaryV2Test(
-    boost::optional<std::pair<uint64_t, uint64_t>> nullAnchor,
-    uint64_t anchorStart,
-    uint64_t anchorCount,
-    uint64_t anchorCposStart,
-    uint64_t anchorCposEnd,
-    uint64_t nonAnchorStart,
-    uint64_t nonAnchorCount) {
+EmuBinaryResult EmuBinaryV2Test(boost::optional<std::pair<uint64_t, uint64_t>> nullAnchor,
+                                uint64_t anchorStart,
+                                uint64_t anchorCount,
+                                uint64_t anchorCposStart,
+                                uint64_t anchorCposEnd,
+                                uint64_t nonAnchorStart,
+                                uint64_t nonAnchorCount) {
 
     TestDocumentCollection coll;
     ConstDataRange value(testValue);
@@ -2839,7 +2842,7 @@ TEST(CompactionHelpersTest, validateCompactionTokensTest) {
         // validate fails until all fields are present
         ASSERT_THROWS_CODE(CompactionHelpers::validateCompactionTokens(efc, builder.asTempObj()),
                            DBException,
-                           6346806);
+                           7294900);
 
         // validate doesn't care about the value, so this is fine
         builder.append(field.getPath(), "foo");

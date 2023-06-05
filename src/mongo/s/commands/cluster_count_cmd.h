@@ -107,9 +107,11 @@ public:
         Impl::checkCanRunHere(opCtx);
 
         CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
-        const NamespaceString nss(parseNs({boost::none, dbname}, cmdObj));
+        const NamespaceString nss(
+            parseNs(DatabaseNameUtil::deserialize(boost::none, dbname), cmdObj));
         uassert(ErrorCodes::InvalidNamespace,
-                str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
+                str::stream() << "Invalid namespace specified '" << nss.toStringForErrorMsg()
+                              << "'",
                 nss.isValid());
 
         std::vector<AsyncRequestsSender::Response> shardResponses;
@@ -152,7 +154,9 @@ public:
                 Shard::RetryPolicy::kIdempotent,
                 countRequest.getQuery(),
                 collation,
-                true /* eligibleForSampling */);
+                boost::none /*letParameters*/,
+                boost::none /*runtimeConstants*/,
+                true /*eligibleForSampling*/);
         } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
             // Rewrite the count command as an aggregation.
             auto countRequest = CountCommandRequest::parse(IDLParserContext("count"), cmdObj);
@@ -227,9 +231,12 @@ public:
             return exceptionToStatus();
         }
 
-        const NamespaceString nss(parseNs(request.getDatabase(), cmdObj));
+        const NamespaceString nss = parseNs(
+            DatabaseNameUtil::deserialize(request.getValidatedTenantId(), request.getDatabase()),
+            cmdObj);
         uassert(ErrorCodes::InvalidNamespace,
-                str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
+                str::stream() << "Invalid namespace specified '" << nss.toStringForErrorMsg()
+                              << "'",
                 nss.isValid());
 
         // If the command has encryptionInformation, rewrite the query as necessary.
@@ -260,7 +267,9 @@ public:
                                                            ReadPreferenceSetting::get(opCtx),
                                                            Shard::RetryPolicy::kIdempotent,
                                                            targetingQuery,
-                                                           targetingCollation);
+                                                           targetingCollation,
+                                                           boost::none /*letParameters*/,
+                                                           boost::none /*runtimeConstants*/);
         } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
             CountCommandRequest countRequest(NamespaceStringOrUUID(NamespaceString{}));
             try {

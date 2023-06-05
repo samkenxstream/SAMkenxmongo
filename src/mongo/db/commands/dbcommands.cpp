@@ -132,8 +132,8 @@ public:
         }
         void doCheckAuthorization(OperationContext* opCtx) const final {
             uassert(ErrorCodes::Unauthorized,
-                    str::stream() << "Not authorized to drop database '" << request().getDbName()
-                                  << "'",
+                    str::stream() << "Not authorized to drop database '"
+                                  << request().getDbName().toStringForErrorMsg() << "'",
                     AuthorizationSession::get(opCtx->getClient())
                         ->isAuthorizedForActionsOnNamespace(ns(), ActionType::dropDatabase));
         }
@@ -151,7 +151,7 @@ public:
                  repl::ReplicationCoordinator::modeNone) &&
                 (dbName == DatabaseName::kLocal)) {
                 uasserted(ErrorCodes::IllegalOperation,
-                          str::stream() << "Cannot drop '" << dbName
+                          str::stream() << "Cannot drop '" << dbName.toStringForErrorMsg()
                                         << "' database while replication is active");
             }
 
@@ -199,7 +199,8 @@ public:
         void doCheckAuthorization(OperationContext* opCtx) const final {
             auto ns = request().getNamespace();
             uassert(ErrorCodes::Unauthorized,
-                    str::stream() << "Not authorized to drop collection '" << ns << "'",
+                    str::stream() << "Not authorized to drop collection '"
+                                  << ns.toStringForErrorMsg() << "'",
                     AuthorizationSession::get(opCtx->getClient())
                         ->isAuthorizedForActionsOnNamespace(ns, ActionType::dropCollection));
         }
@@ -219,7 +220,9 @@ public:
                     !storageEngine->supportsRecoveryTimestamp());
             }
 
-            Reply reply;
+            // We need to copy the serialization context from the request to the reply object
+            Reply reply(
+                SerializationContext::stateCommandReply(request().getSerializationContext()));
             uassertStatusOK(
                 dropCollection(opCtx,
                                request().getNamespace(),
@@ -456,7 +459,13 @@ public:
 
         uassert(ErrorCodes::OperationFailed, "No collection name specified", !nss.coll().empty());
 
-        result.append("ns", NamespaceStringUtil::serialize(nss));
+        // We need to use the serialization context from the request when calling
+        // NamespaceStringUtil to build the reply
+        result.append(
+            "ns",
+            NamespaceStringUtil::serialize(
+                nss, SerializationContext::stateCommandReply(cmd.getSerializationContext())));
+
         auto spec = StorageStatsSpec::parse(IDLParserContext("collStats"), cmdObj);
         Status status = appendCollectionStorageStats(opCtx, nss, spec, &result);
         if (!status.isOK() && (status.code() != ErrorCodes::NamespaceNotFound)) {
@@ -546,13 +555,14 @@ public:
             !cmd->getNamespace().isTimeseriesBucketsCollection());
 
         // Updating granularity on sharded time-series collections is not allowed.
-        if (Grid::get(opCtx)->catalogClient() && cmd->getTimeseries() &&
-            cmd->getTimeseries()->getGranularity()) {
+        auto catalogClient =
+            Grid::get(opCtx)->isInitialized() ? Grid::get(opCtx)->catalogClient() : nullptr;
+        if (catalogClient && cmd->getTimeseries() && cmd->getTimeseries()->getGranularity()) {
             auto& nss = cmd->getNamespace();
             auto bucketNss =
                 nss.isTimeseriesBucketsCollection() ? nss : nss.makeTimeseriesBucketsNamespace();
             try {
-                auto coll = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, bucketNss);
+                auto coll = catalogClient->getCollection(opCtx, bucketNss);
                 uassert(ErrorCodes::NotImplemented,
                         str::stream()
                             << "Cannot update granularity of a sharded time-series collection.",
@@ -567,7 +577,7 @@ public:
             // internally on this collection but the user may not modify the validator.
             uassert(ErrorCodes::InvalidOptions,
                     str::stream() << "Document validators not allowed on system collection "
-                                  << cmd->getNamespace(),
+                                  << cmd->getNamespace().toStringForErrorMsg(),
                     cmd->getNamespace() != NamespaceString::kConfigSettingsNamespace);
         }
 
@@ -626,7 +636,7 @@ public:
                 ErrorCodes::BadValue, "Scale factor must be greater than zero", cmd.getScale() > 0);
 
             uassert(ErrorCodes::InvalidNamespace,
-                    str::stream() << "Invalid db name: " << dbname,
+                    str::stream() << "Invalid db name: " << dbname.toStringForErrorMsg(),
                     NamespaceString::validDBName(dbname.db(),
                                                  NamespaceString::DollarInDbNameBehavior::Allow));
 
@@ -639,7 +649,8 @@ public:
             AutoGetDb autoDb(opCtx, dbname, MODE_IS);
             Database* db = autoDb.getDb();
 
-            Reply reply;
+            // We need to copy the serialization context from the request to the reply object
+            Reply reply(SerializationContext::stateCommandReply(cmd.getSerializationContext()));
             reply.setDB(dbname.db());
 
             if (!db) {

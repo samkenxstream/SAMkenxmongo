@@ -39,3 +39,4 @@ feature_flags:
         description: When enabled, uses improved machinery for movePrimary operation.
         cpp_varname: gFeatureFlagOnlineMovePrimaryLifecycle
         default: false
+        shouldBeFCVGated: true

@@ -39,6 +39,7 @@
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/db/shard_role.h"
 
 namespace mongo {
 
@@ -52,8 +53,7 @@ namespace mongo {
  * WriteConflictException.
  */
 template <typename F, typename H>
-auto handlePlanStageYield(
-    ExpressionContext* expCtx, StringData opStr, StringData ns, F&& f, H&& yieldHandler) {
+auto handlePlanStageYield(ExpressionContext* expCtx, StringData opStr, F&& f, H&& yieldHandler) {
     auto opCtx = expCtx->opCtx;
     invariant(opCtx);
     invariant(opCtx->lockState());
@@ -67,7 +67,7 @@ auto handlePlanStageYield(
         return PlanStage::NEED_YIELD;
     } catch (const TemporarilyUnavailableException& e) {
         if (opCtx->inMultiDocumentTransaction()) {
-            handleTemporarilyUnavailableExceptionInTransaction(opCtx, opStr, ns, e);
+            handleTemporarilyUnavailableExceptionInTransaction(opCtx, opStr, e);
         }
         expCtx->setTemporarilyUnavailableException(true);
         yieldHandler();
@@ -95,7 +95,7 @@ public:
                      std::unique_ptr<QuerySolution> qs,
                      std::unique_ptr<CanonicalQuery> cq,
                      const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                     const CollectionPtr& collection,
+                     VariantCollectionPtrOrAcquisition collection,
                      bool returnOwnedBson,
                      NamespaceString nss,
                      PlanYieldPolicy::YieldPolicy yieldPolicy);

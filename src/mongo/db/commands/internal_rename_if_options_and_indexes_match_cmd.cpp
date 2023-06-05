@@ -78,21 +78,33 @@ public:
             }
 
             // Check if the receiving shard is still the primary for the database
-            DatabaseShardingState::assertIsPrimaryShardForDb(opCtx, fromNss.db());
+            DatabaseShardingState::assertIsPrimaryShardForDb(opCtx, fromNss.dbName());
 
-            // Acquiring the local part of the distributed locks for involved namespaces allows:
-            // - Serialize with sharded DDLs, ensuring no concurrent modifications of the
-            // collections.
-            // - Check safely if the target collection is sharded or not.
+            /**
+             * Acquiring the local part of the distributed locks for involved namespaces allows:
+             * - Serialize with sharded DDLs, ensuring no concurrent modifications of the
+             * collections.
+             * - Check safely if the target collection is sharded or not.
+             */
             static constexpr StringData lockReason{"internalRenameCollection"_sd};
             auto ddlLockManager = DDLLockManager::get(opCtx);
             auto fromCollDDLLock = ddlLockManager->lock(
                 opCtx, fromNss.ns(), lockReason, DDLLockManager::kDefaultLockTimeout);
-            auto toCollDDLLock = ddlLockManager->lock(
-                opCtx, toNss.ns(), lockReason, DDLLockManager::kDefaultLockTimeout);
+
+            // If we are renaming a buckets collection in the $out stage, we must acquire a lock on
+            // the view namespace, instead of the buckets namespace. This lock avoids concurrent
+            // modifications, since users run operations on the view and not the buckets namespace
+            // and all time-series DDL operations take a lock on the view namespace.
+            auto toCollDDLLock = ddlLockManager->lock(opCtx,
+                                                      fromNss.isOutTmpBucketsCollection()
+                                                          ? toNss.getTimeseriesViewNamespace().ns()
+                                                          : toNss.ns(),
+                                                      lockReason,
+                                                      DDLLockManager::kDefaultLockTimeout);
 
             uassert(ErrorCodes::IllegalOperation,
-                    str::stream() << "cannot rename to sharded collection '" << toNss << "'",
+                    str::stream() << "cannot rename to sharded collection '"
+                                  << toNss.toStringForErrorMsg() << "'",
                     !isCollectionSharded(opCtx, toNss));
 
             _internalRun(opCtx, fromNss, toNss, indexList, collectionOptions);
@@ -112,7 +124,7 @@ public:
             options.dropTarget = true;
             options.stayTemp = false;
             doLocalRenameIfOptionsAndIndexesHaveNotChanged(
-                opCtx, fromNss, toNss, options, std::move(indexList), collectionOptions);
+                opCtx, fromNss, toNss, options, indexList, collectionOptions);
         }
 
         NamespaceString ns() const override {
@@ -127,17 +139,17 @@ public:
             auto from = thisRequest.getFrom();
             auto to = thisRequest.getTo();
             uassert(ErrorCodes::Unauthorized,
-                    str::stream() << "Unauthorized to rename " << from,
+                    str::stream() << "Unauthorized to rename " << from.toStringForErrorMsg(),
                     AuthorizationSession::get(opCtx->getClient())
                         ->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(from),
                                                            ActionType::renameCollection));
             uassert(ErrorCodes::Unauthorized,
-                    str::stream() << "Unauthorized to drop " << to,
+                    str::stream() << "Unauthorized to drop " << to.toStringForErrorMsg(),
                     AuthorizationSession::get(opCtx->getClient())
                         ->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(to),
                                                            ActionType::dropCollection));
             uassert(ErrorCodes::Unauthorized,
-                    str::stream() << "Unauthorized to insert into " << to,
+                    str::stream() << "Unauthorized to insert into " << to.toStringForErrorMsg(),
                     AuthorizationSession::get(opCtx->getClient())
                         ->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(to),
                                                            ActionType::insert));

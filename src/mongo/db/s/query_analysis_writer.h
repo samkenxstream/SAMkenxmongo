@@ -69,9 +69,15 @@ class QueryAnalysisWriter final : public std::enable_shared_from_this<QueryAnaly
 
 public:
     static const std::string kSampledQueriesTTLIndexName;
-    static const std::string kSampledQueriesDiffTTLIndexName;
     static BSONObj kSampledQueriesTTLIndexSpec;
+
+    static const std::string kSampledQueriesDiffTTLIndexName;
     static BSONObj kSampledQueriesDiffTTLIndexSpec;
+
+    static const std::string kAnalyzeShardKeySplitPointsTTLIndexName;
+    static BSONObj kAnalyzeShardKeySplitPointsTTLIndexSpec;
+
+    static const std::map<NamespaceString, BSONObj> kTTLIndexes;
 
     /**
      * Temporarily stores documents to be written to disk.
@@ -167,22 +173,28 @@ public:
                                           const BSONObj& filter,
                                           const BSONObj& collation);
 
-    ExecutorFuture<void> addUpdateQuery(const UUID& sampleId,
+    ExecutorFuture<void> addUpdateQuery(OperationContext* opCtx,
+                                        const UUID& sampleId,
                                         const write_ops::UpdateCommandRequest& updateCmd,
                                         int opIndex);
-    ExecutorFuture<void> addUpdateQuery(const write_ops::UpdateCommandRequest& updateCmd,
+    ExecutorFuture<void> addUpdateQuery(OperationContext* opCtx,
+                                        const write_ops::UpdateCommandRequest& updateCmd,
                                         int opIndex);
 
-    ExecutorFuture<void> addDeleteQuery(const UUID& sampleId,
+    ExecutorFuture<void> addDeleteQuery(OperationContext* opCtx,
+                                        const UUID& sampleId,
                                         const write_ops::DeleteCommandRequest& deleteCmd,
                                         int opIndex);
-    ExecutorFuture<void> addDeleteQuery(const write_ops::DeleteCommandRequest& deleteCmd,
+    ExecutorFuture<void> addDeleteQuery(OperationContext* opCtx,
+                                        const write_ops::DeleteCommandRequest& deleteCmd,
                                         int opIndex);
 
     ExecutorFuture<void> addFindAndModifyQuery(
-        const UUID& sampleId, const write_ops::FindAndModifyCommandRequest& findAndModifyCmd);
-    ExecutorFuture<void> addFindAndModifyQuery(
+        OperationContext* opCtx,
+        const UUID& sampleId,
         const write_ops::FindAndModifyCommandRequest& findAndModifyCmd);
+    ExecutorFuture<void> addFindAndModifyQuery(
+        OperationContext* opCtx, const write_ops::FindAndModifyCommandRequest& findAndModifyCmd);
 
     ExecutorFuture<void> addDiff(const UUID& sampleId,
                                  const NamespaceString& nss,

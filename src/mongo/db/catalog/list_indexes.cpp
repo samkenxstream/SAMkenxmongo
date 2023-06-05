@@ -61,9 +61,9 @@ StatusWith<std::list<BSONObj>> listIndexes(OperationContext* opCtx,
     AutoGetCollectionForReadCommandMaybeLockFree collection(opCtx, ns);
     auto nss = collection.getNss();
     if (!collection) {
-        return StatusWith<std::list<BSONObj>>(ErrorCodes::NamespaceNotFound,
-                                              str::stream() << "ns does not exist: "
-                                                            << collection.getNss().ns());
+        return StatusWith<std::list<BSONObj>>(
+            ErrorCodes::NamespaceNotFound,
+            str::stream() << "ns does not exist: " << collection.getNss().toStringForErrorMsg());
     }
     return StatusWith<std::list<BSONObj>>(
         listIndexesInLock(opCtx, collection.getCollection(), nss, additionalInclude));
@@ -154,6 +154,6 @@ std::list<BSONObj> listIndexesEmptyListIfMissing(OperationContext* opCtx,
                                                  const NamespaceStringOrUUID& nss,
                                                  ListIndexesInclude additionalInclude) {
     auto listStatus = listIndexes(opCtx, nss, additionalInclude);
-    return listStatus.isOK() ? listStatus.getValue() : std::list<BSONObj>();
+    return listStatus.isOK() ? std::move(listStatus.getValue()) : std::list<BSONObj>();
 }
 }  // namespace mongo

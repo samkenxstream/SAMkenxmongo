@@ -173,10 +173,31 @@ std::uint64_t interleaveWithZeros(std::uint32_t input) {
     word = (word ^ (word << 1)) & 0x5555555555555555;
     return word;
 }
+
+std::uint32_t deinterleaveZeros(std::uint64_t input) {
+    // The following example is an extension to 32-bits of the following bit manipulation for
+    // 16-bit numbers. Note that the following operations are a result of applying the inverse of
+    // interleaveWithZeros operations.
+    //
+    //    0a0b 0c0d 0e0f 0g0h  0i0j 0k0l 0m0n 0o0p
+    // -> 00ab 00cd 00ef 00gh  00ij 00kl 00mn 00op
+    // -> 0000 abcd 0000 efgh  0000 ijkl 0000 mnop
+    // -> 0000 0000 abcd efgh  0000 0000 ijkl mnop
+    // -> 0000 0000 0000 0000  abcd efgh ijkl mnop
+
+    uint64_t word = input;
+    word &= 0x5555555555555555;
+    word = (word ^ (word >> 1)) & 0x3333333333333333;
+    word = (word ^ (word >> 2)) & 0x0f0f0f0f0f0f0f0f;
+    word = (word ^ (word >> 4)) & 0x00ff00ff00ff00ff;
+    word = (word ^ (word >> 8)) & 0x0000ffff0000ffff;
+    word = (word ^ (word >> 16)) & 0x00000000ffffffff;
+    return word;
+}
 }  // namespace
 
 GeoHash::GeoHash(unsigned x, unsigned y, unsigned bits) {
-    verify(bits <= 32);
+    MONGO_verify(bits <= 32);
     _bits = bits;
     auto interleavedX = interleaveWithZeros(x);
     auto interleavedY = interleaveWithZeros(y);
@@ -196,95 +217,10 @@ GeoHash::GeoHash(long long hash, unsigned bits) : _hash(hash), _bits(bits) {
     clearUnusedBits();
 }
 
-/**
- * Explanation & Example:
- * bitset<64>(_hash) = "00000001 00000010 00000100 00001000 00010000 00100000 01000000 10000000";
- *
- * the reinterpret_cast() of _hash results in:
- * c[0] = 10000000 (the last 8 bits of _hash)
- * c[1] = 01000000 (the second to last 8 bits of _hash)
- * ...
- * c[6] = 00000010 (the second 8 bits of _hash)
- * c[7] = 00000001 (the first 8 bits of _hash)
- *
- * Calculating the Value of Y:
- * in the for loop,
- * t is c[i] but with all the even bits turned off:
- * t = 00000000 (when i is even)
- * t = 01000000 (i = 1)
- * t = 00010000 (i = 3)
- * t = 00000100 (i = 5)
- * t = 00000001 (i = 7)
- *
- * then for each t,
- * get the hashedToNormal(t):
- * hashedToNormal(t) = 0 = 00000000 (when i is even)
- * hashedToNormal(t) = 8 = 00001000 (i = 1)
- * hashedToNormal(t) = 4 = 00000100 (i = 3)
- * hashedToNormal(t) = 2 = 00000010 (i = 5)
- * hashedToNormal(t) = 1 = 00000001 (i = 7)
- * then shift it by (4 * i) (Little Endian) then
- * bitwise OR it with y
- *
- * visually, all together it looks like:
- * y =       00000000000000000000000000000000 (32 bits)
- * y |=                              00000000 (hashedToNormal(t) when i = 0)
- * y |=                          00001000     (hashedToNormal(t) when i = 1)
- * y |=                      00000000         (hashedToNormal(t) when i = 2)
- * y |=                  00000100             (hashedToNormal(t) when i = 3)
- * y |=              00000000                 (hashedToNormal(t) when i = 4)
- * y |=          00000010                     (hashedToNormal(t) when i = 5)
- * y |=      00000000                         (hashedToNormal(t) when i = 6)
- * y |=  00000001                             (hashedToNormal(t) when i = 7)
- * ---------------------------------------------
- * y =       00010000001000000100000010000000
- *
- * Calculating the Value of X:
- * in the for loop,
- * t is c[i] right shifted by 1 with all the even bits turned off:
- * t = 00000000 (when i is odd)
- * t = 01000000 (i = 0)
- * t = 00010000 (i = 2)
- * t = 00000100 (i = 4)
- * t = 00000001 (i = 6)
- *
- * then for each t,
- * get the hashedToNormal(t) and shift it by (4 * i) (Little Endian) then
- * bitwise OR it with x
- */
-void GeoHash::unhash_fast(unsigned* x, unsigned* y) const {
-    *x = 0;
-    *y = 0;
-    const char* c = reinterpret_cast<const char*>(&_hash);
-    for (int i = 0; i < 8; i++) {
-        // 0x55 in binary is "01010101",
-        // it's an odd bitmask that we use to turn off all the even bits
-        unsigned t = (unsigned)(c[i]) & 0x55;
-        const int leftShift = 4 * (kNativeLittle ? i : (7 - i));
-        *y |= geoBitSets.hashedToNormal[t] << leftShift;
-
-        t = ((unsigned)(c[i]) >> 1) & 0x55;
-        *x |= geoBitSets.hashedToNormal[t] << leftShift;
-    }
-}
-
-void GeoHash::unhash_slow(unsigned* x, unsigned* y) const {
-    *x = 0;
-    *y = 0;
-    for (unsigned i = 0; i < _bits; i++) {
-        if (getBitX(i))
-            *x |= mask32For(i);
-        if (getBitY(i))
-            *y |= mask32For(i);
-    }
-}
-
 void GeoHash::unhash(unsigned* x, unsigned* y) const {
-    if constexpr (kNativeLittle) {
-        unhash_fast(x, y);
-    } else {
-        unhash_slow(x, y);
-    }
+    // Order goes XYXYXY... Shift Xs to Y position as that's how the algorithm expects the input.
+    *x = deinterleaveZeros(_hash >> 1);
+    *y = deinterleaveZeros(_hash);
 }
 
 /** Is the 'bit'-th most significant bit set?  (NOT the least significant) */
@@ -298,7 +234,7 @@ GeoHash GeoHash::up() const {
 }
 
 bool GeoHash::hasPrefix(const GeoHash& other) const {
-    verify(other._bits <= _bits);
+    MONGO_verify(other._bits <= _bits);
     if (other._bits == 0)
         return true;
 
@@ -323,7 +259,7 @@ string GeoHash::toStringHex1() const {
 }
 
 void GeoHash::setBit(unsigned pos, bool value) {
-    verify(pos < _bits * 2);
+    MONGO_verify(pos < _bits * 2);
     const long long mask = mask64For(pos);
     if (value)
         _hash |= mask;
@@ -336,12 +272,12 @@ bool GeoHash::getBit(unsigned pos) const {
 }
 
 bool GeoHash::getBitX(unsigned pos) const {
-    verify(pos < 32);
+    MONGO_verify(pos < 32);
     return getBit(pos * 2);
 }
 
 bool GeoHash::getBitY(unsigned pos) const {
-    verify(pos < 32);
+    MONGO_verify(pos < 32);
     return getBit((pos * 2) + 1);
 }
 
@@ -351,7 +287,7 @@ BSONObj GeoHash::wrap(const char* name) const {
     appendHashMin(&b, name);
     BSONObj o = b.obj();
     if ('\0' == name[0])
-        verify(o.objsize() == 20);
+        MONGO_verify(o.objsize() == 20);
     return o;
 }
 
@@ -396,7 +332,7 @@ bool GeoHash::atMaxY() const {
 
 // TODO(hk): comment better
 void GeoHash::move(int x, int y) {
-    verify(_bits);
+    MONGO_verify(_bits);
     _move(0, x);
     _move(1, y);
 }
@@ -405,7 +341,7 @@ void GeoHash::move(int x, int y) {
 void GeoHash::_move(unsigned offset, int d) {
     if (d == 0)
         return;
-    verify(d <= 1 && d >= -1);  // TEMP
+    MONGO_verify(d <= 1 && d >= -1);  // TEMP
 
     bool from, to;
     if (d > 0) {
@@ -437,7 +373,7 @@ void GeoHash::_move(unsigned offset, int d) {
         pos -= 2;
     }
 
-    verify(0);
+    MONGO_verify(0);
 }
 
 GeoHash& GeoHash::operator=(const GeoHash& h) {
@@ -467,7 +403,7 @@ bool GeoHash::operator<(const GeoHash& h) const {
 GeoHash& GeoHash::operator+=(const char* s) {
     unsigned pos = _bits * 2;
     _bits += strlen(s) / 2;
-    verify(_bits <= 32);
+    MONGO_verify(_bits <= 32);
     while ('\0' != s[0]) {
         if (s[0] == '1')
             setBit(pos, 1);
@@ -600,7 +536,7 @@ GeoHash GeoHash::parent(unsigned int level) const {
 }
 
 GeoHash GeoHash::parent() const {
-    verify(_bits > 0);
+    MONGO_verify(_bits > 0);
     return GeoHash(_hash, _bits - 1);
 }
 
@@ -929,7 +865,7 @@ double GeoHashConverter::convertFromHashScale(unsigned in) const {
 
 // Convert from a double that is [min, max] to a double in [0, (max-min)*scaling]
 double GeoHashConverter::convertToDoubleHashScale(double in) const {
-    verify(in <= _params.max && in >= _params.min);
+    MONGO_verify(in <= _params.max && in >= _params.min);
 
     if (in == _params.max) {
         // prevent aliasing with _min by moving inside the "box"
@@ -938,7 +874,7 @@ double GeoHashConverter::convertToDoubleHashScale(double in) const {
     }
 
     in -= _params.min;
-    verify(in >= 0);
+    MONGO_verify(in >= 0);
     return in * _params.scaling;
 }
 

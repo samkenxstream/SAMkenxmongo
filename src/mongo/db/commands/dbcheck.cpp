@@ -71,7 +71,7 @@ repl::OpTime _logOp(OperationContext* opCtx,
     oplogEntry.setObject(obj);
     AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
     return writeConflictRetry(
-        opCtx, "dbCheck oplog entry", NamespaceString::kRsOplogNamespace.ns(), [&] {
+        opCtx, "dbCheck oplog entry", NamespaceString::kRsOplogNamespace, [&] {
             auto const clockSource = opCtx->getServiceContext()->getFastClockSource();
             oplogEntry.setWallClockTime(clockSource->now());
 
@@ -165,7 +165,7 @@ std::unique_ptr<DbCheckRun> singleCollectionRun(OperationContext* opCtx,
             agc.getCollection());
 
     uassert(40619,
-            "Cannot run dbCheck on " + nss.toString() + " because it is not replicated",
+            "Cannot run dbCheck on " + nss.toStringForErrorMsg() + " because it is not replicated",
             nss.isReplicated());
 
     uassert(6769500, "dbCheck no longer supports snapshotRead:false", invocation.getSnapshotRead());
@@ -199,10 +199,12 @@ std::unique_ptr<DbCheckRun> fullDatabaseRun(OperationContext* opCtx,
                                             const DbCheckAllInvocation& invocation) {
     uassert(ErrorCodes::InvalidNamespace,
             "Cannot run dbCheck on local database",
-            dbName.db() != "local");
+            dbName.db() != DatabaseName::kLocal.db());
 
     AutoGetDb agd(opCtx, dbName, MODE_IS);
-    uassert(ErrorCodes::NamespaceNotFound, "Database " + dbName.db() + " not found", agd.getDb());
+    uassert(ErrorCodes::NamespaceNotFound,
+            "Database " + dbName.toStringForErrorMsg() + " not found",
+            agd.getDb());
 
     uassert(6769501, "dbCheck no longer supports snapshotRead:false", invocation.getSnapshotRead());
 
@@ -290,7 +292,7 @@ std::shared_ptr<const CollectionCatalog> getConsistentCatalogAndSnapshot(Operati
 class DbCheckJob : public BackgroundJob {
 public:
     DbCheckJob(const DatabaseName& dbName, std::unique_ptr<DbCheckRun> run)
-        : BackgroundJob(true), _done(false), _dbName(dbName.toString()), _run(std::move(run)) {}
+        : BackgroundJob(true), _done(false), _run(std::move(run)) {}
 
 protected:
     virtual std::string name() const override {
@@ -300,12 +302,6 @@ protected:
     virtual void run() override {
         // Every dbCheck runs in its own client.
         ThreadClient tc(name(), getGlobalServiceContext());
-
-        {
-            stdx::lock_guard<Client> lk(*tc.get());
-            tc.get()->setSystemOperationKillableByStepdown(lk);
-        }
-
         auto uniqueOpCtx = tc->makeOperationContext();
         auto opCtx = uniqueOpCtx.get();
 
@@ -510,7 +506,6 @@ private:
 
     // Set if the job cannot proceed.
     bool _done;
-    std::string _dbName;
     std::unique_ptr<DbCheckRun> _run;
 
     StatusWith<BatchStats> _runBatch(OperationContext* opCtx,
@@ -530,23 +525,11 @@ private:
         Lock::GlobalLock glob(opCtx, MODE_IX);
 
         // The CollectionCatalog to use for lock-free reads with point-in-time catalog lookups.
-        std::shared_ptr<const CollectionCatalog> catalog;
-
-        boost::optional<AutoGetCollection> autoColl;
-        const Collection* collection = nullptr;
-        // (Ignore FCV check): This feature flag doesn't have any upgrade/downgrade concerns.
-        if (feature_flags::gPointInTimeCatalogLookups.isEnabledAndIgnoreFCVUnsafe()) {
-            // Make sure we get a CollectionCatalog in sync with our snapshot.
-            catalog = getConsistentCatalogAndSnapshot(opCtx);
-
-            collection = catalog->establishConsistentCollection(
-                opCtx,
-                {info.nss.db(), info.uuid},
-                opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx));
-        } else {
-            autoColl.emplace(opCtx, info.nss, MODE_IS);
-            collection = autoColl->getCollection().get();
-        }
+        std::shared_ptr<const CollectionCatalog> catalog = getConsistentCatalogAndSnapshot(opCtx);
+        const Collection* collection = catalog->establishConsistentCollection(
+            opCtx,
+            {info.nss.dbName(), info.uuid},
+            opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx));
 
         if (_stepdownHasOccurred(opCtx, info.nss)) {
             _done = true;
@@ -562,14 +545,6 @@ private:
         uassert(ErrorCodes::SnapshotUnavailable,
                 "No snapshot available yet for dbCheck",
                 readTimestamp);
-        auto minVisible = collection->getMinimumVisibleSnapshot();
-        if (minVisible && *readTimestamp < *collection->getMinimumVisibleSnapshot()) {
-            // (Ignore FCV check): This feature flag doesn't have any upgrade/downgrade concerns.
-            invariant(!feature_flags::gPointInTimeCatalogLookups.isEnabledAndIgnoreFCVUnsafe());
-            return {ErrorCodes::SnapshotUnavailable,
-                    str::stream() << "Unable to read from collection " << info.nss
-                                  << " due to pending catalog changes"};
-        }
 
         // The CollectionPtr needs to outlive the DbCheckHasher as it's used internally.
         const CollectionPtr collectionPtr(collection);

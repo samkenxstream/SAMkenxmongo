@@ -284,8 +284,8 @@ TEST_F(OplogApplierImplTestEnableSteadyStateConstraints,
 
 TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsDeleteDocumentCollectionAndDocExist) {
     // Setup the pre-images collection.
-    ChangeStreamPreImagesCollectionManager::createPreImagesCollection(_opCtx.get(),
-                                                                      boost::none /* tenantId */);
+    ChangeStreamPreImagesCollectionManager::get(_opCtx.get())
+        .createPreImagesCollection(_opCtx.get(), boost::none /* tenantId */);
     const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.t");
     createCollection(
         _opCtx.get(), nss, createRecordChangeStreamPreAndPostImagesCollectionOptions());
@@ -407,8 +407,8 @@ TEST_F(OplogApplierImplTestEnableSteadyStateConstraints,
 
 TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsDeleteDocumentCollectionLockedByUUID) {
     // Setup the pre-images collection.
-    ChangeStreamPreImagesCollectionManager::createPreImagesCollection(_opCtx.get(),
-                                                                      boost::none /* tenantId */);
+    ChangeStreamPreImagesCollectionManager::get(_opCtx.get())
+        .createPreImagesCollection(_opCtx.get(), boost::none /* tenantId */);
     const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.t");
     CollectionOptions options = createRecordChangeStreamPreAndPostImagesCollectionOptions();
     options.uuid = kUuid;
@@ -426,8 +426,8 @@ TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsDeleteDocumentCollec
 
 TEST_F(OplogApplierImplTest, applyOplogEntryToRecordChangeStreamPreImages) {
     // Setup the pre-images collection.
-    ChangeStreamPreImagesCollectionManager::createPreImagesCollection(_opCtx.get(),
-                                                                      boost::none /* tenantId */);
+    ChangeStreamPreImagesCollectionManager::get(_opCtx.get())
+        .createPreImagesCollection(_opCtx.get(), boost::none /* tenantId */);
 
     // Create the collection.
     const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.t");
@@ -589,11 +589,11 @@ TEST_F(OplogApplierImplTest, CreateCollectionCommandMultitenantRequireTenantIDFa
     auto tid{TenantId(OID::gen())};
     NamespaceString nss = NamespaceString::createNamespaceString_forTest(tid, "test.foo");
 
-    auto op =
-        BSON("op"
-             << "c"
-             << "ns" << nss.getCommandNS().toStringWithTenantId() << "wall" << Date_t() << "o"
-             << BSON("create" << nss.coll()) << "ts" << Timestamp(1, 1) << "ui" << UUID::gen());
+    auto op = BSON("op"
+                   << "c"
+                   << "ns" << nss.getCommandNS().toStringWithTenantId_forTest() << "wall"
+                   << Date_t() << "o" << BSON("create" << nss.coll()) << "ts" << Timestamp(1, 1)
+                   << "ui" << UUID::gen());
 
 
     bool applyCmdCalled = false;
@@ -687,8 +687,8 @@ TEST_F(OplogApplierImplTest, RenameCollectionCommandMultitenant) {
     const NamespaceString targetNss =
         NamespaceString::createNamespaceString_forTest(tid, "test.bar");
 
-    auto oRename = BSON("renameCollection" << sourceNss.toString() << "to" << targetNss.toString()
-                                           << "tid" << tid);
+    auto oRename = BSON("renameCollection" << sourceNss.toString_forTest() << "to"
+                                           << targetNss.toString_forTest() << "tid" << tid);
 
     repl::createCollection(_opCtx.get(), sourceNss, {});
     // createCollection uses an actual opTime, so we must generate an actually opTime in the future.
@@ -717,8 +717,8 @@ TEST_F(OplogApplierImplTest, RenameCollectionCommandMultitenantRequireTenantIDFa
     const NamespaceString targetNss =
         NamespaceString::createNamespaceString_forTest(tid, "test.bar");
 
-    auto oRename = BSON("renameCollection" << sourceNss.toStringWithTenantId() << "to"
-                                           << targetNss.toStringWithTenantId());
+    auto oRename = BSON("renameCollection" << sourceNss.toStringWithTenantId_forTest() << "to"
+                                           << targetNss.toStringWithTenantId_forTest());
 
     repl::createCollection(_opCtx.get(), sourceNss, {});
     // createCollection uses an actual opTime, so we must generate an actually opTime in the future.
@@ -748,12 +748,12 @@ TEST_F(OplogApplierImplTest, RenameCollectionCommandMultitenantAcrossTenantsRequ
     const NamespaceString targetNss =
         NamespaceString::createNamespaceString_forTest(tid, "test.bar");
     const NamespaceString wrongTargetNss =
-        NamespaceString::createNamespaceString_forTest(wrongTid, targetNss.toString());
+        NamespaceString::createNamespaceString_forTest(wrongTid, targetNss.toString_forTest());
 
     ASSERT_NE(sourceNss, wrongTargetNss);
 
-    auto oRename = BSON("renameCollection" << sourceNss.toStringWithTenantId() << "to"
-                                           << wrongTargetNss.toStringWithTenantId());
+    auto oRename = BSON("renameCollection" << sourceNss.toStringWithTenantId_forTest() << "to"
+                                           << wrongTargetNss.toStringWithTenantId_forTest());
 
     repl::createCollection(_opCtx.get(), sourceNss, {});
     // createCollection uses an actual opTime, so we must generate an actually opTime in the future.
@@ -1157,7 +1157,8 @@ TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsInsertDocumentIncorr
 TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsDeleteDocumentIncludesTenantId) {
     // Setup the pre-images collection.
     const TenantId tid(OID::gen());
-    ChangeStreamPreImagesCollectionManager::createPreImagesCollection(_opCtx.get(), tid);
+    ChangeStreamPreImagesCollectionManager::get(_opCtx.get())
+        .createPreImagesCollection(_opCtx.get(), tid);
     setServerParameter("multitenancySupport", true);
     setServerParameter("featureFlagRequireTenantID", true);
     const NamespaceString nss = NamespaceString::createNamespaceString_forTest(tid, "test.t");
@@ -1356,7 +1357,8 @@ protected:
                     // and there's no guarantee of the order.
                     _insertedDocs[nss].insert(docs.begin(), docs.end());
                 } else
-                    FAIL("Unexpected insert") << " into " << nss << " first doc: " << docs.front();
+                    FAIL("Unexpected insert")
+                        << " into " << nss.toStringForErrorMsg() << " first doc: " << docs.front();
             };
 
         _writerPool = makeReplWriterPool();
@@ -1712,7 +1714,7 @@ protected:
                 // there's no guarantee of the order.
                 (_docs[collNss]).push_back(BSON("create" << collNss.coll()));
             } else
-                FAIL("Unexpected create") << " on " << collNss;
+                FAIL("Unexpected create") << " on " << collNss.toStringForErrorMsg();
         };
 
         _opObserver->onInsertsFn = [&](OperationContext*,
@@ -1727,7 +1729,8 @@ protected:
                 // and there's no guarantee of the order.
                 (_docs[nss]).insert(_docs[nss].end(), docs.begin(), docs.end());
             } else
-                FAIL("Unexpected insert") << " into " << nss << " first doc: " << docs.front();
+                FAIL("Unexpected insert")
+                    << " into " << nss.toStringForErrorMsg() << " first doc: " << docs.front();
         };
 
         _writerPool = makeReplWriterPool();
@@ -1839,8 +1842,8 @@ TEST_F(MultiOplogEntryOplogApplierImplTestMultitenant,
         _cmdNss,
         BSON("applyOps" << BSON_ARRAY(BSON("op"
                                            << "c"
-                                           << "ns" << _nss.toStringWithTenantId() << "ui" << *_uuid
-                                           << "o" << BSON("create" << _nss.coll())))
+                                           << "ns" << _nss.toStringWithTenantId_forTest() << "ui"
+                                           << *_uuid << "o" << BSON("create" << _nss.coll())))
                         << "partialTxn" << true),
         _lsid,
         _txnNum,
@@ -1852,8 +1855,8 @@ TEST_F(MultiOplogEntryOplogApplierImplTestMultitenant,
         _cmdNss,
         BSON("applyOps" << BSON_ARRAY(BSON("op"
                                            << "i"
-                                           << "ns" << _nss.toStringWithTenantId() << "ui" << *_uuid
-                                           << "o" << BSON("_id" << 1)))
+                                           << "ns" << _nss.toStringWithTenantId_forTest() << "ui"
+                                           << *_uuid << "o" << BSON("_id" << 1)))
                         << "partialTxn" << true),
         _lsid,
         _txnNum,
@@ -2537,7 +2540,7 @@ protected:
                 // and there's no guarantee of the order.
                 _deletedDocs[nss]++;
             } else
-                FAIL("Unexpected delete") << " from " << nss;
+                FAIL("Unexpected delete") << " from " << nss.toStringForErrorMsg();
         };
     }
 
@@ -2555,8 +2558,6 @@ private:
 };
 
 TEST_F(MultiPreparedTransactionsInOneBatchTest, CommitAndAbortMultiPreparedTransactionsInOneBatch) {
-    RAIIServerParameterControllerForTest controller("featureFlagApplyPreparedTxnsInParallel", true);
-
     NoopOplogApplierObserver observer;
     OplogApplierImpl oplogApplier(
         nullptr,  // executor
@@ -3698,10 +3699,6 @@ public:
         // secondary index creation does not. We use an UnreplicatedWritesBlock to avoid
         // timestamping any of the catalog setup.
         repl::UnreplicatedWritesBlock noRep(_opCtx.get());
-        MongoDSessionCatalog::set(
-            _opCtx->getServiceContext(),
-            std::make_unique<MongoDSessionCatalog>(
-                std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
 
         auto mongoDSessionCatalog = MongoDSessionCatalog::get(_opCtx.get());
         mongoDSessionCatalog->onStepUp(_opCtx.get());
@@ -5136,8 +5133,6 @@ protected:
 };
 
 TEST_F(PreparedTxnSplitTest, MultiplePrepareTxnsInSameBatch) {
-    RAIIServerParameterControllerForTest controller("featureFlagApplyPreparedTxnsInParallel", true);
-
     // Scale the test by the number of writer threads, so it does not start failing if maxThreads
     // changes.
     const int kNumEntries = _writerPool->getStats().options.maxThreads * 1000;
@@ -5241,8 +5236,6 @@ TEST_F(PreparedTxnSplitTest, MultiplePrepareTxnsInSameBatch) {
 }
 
 TEST_F(PreparedTxnSplitTest, SingleEmptyPrepareTransaction) {
-    RAIIServerParameterControllerForTest controller("featureFlagApplyPreparedTxnsInParallel", true);
-
     std::vector<OplogEntry> prepareOps;
     prepareOps.push_back(makePrepareOplogEntry({}, {Timestamp(1, 1), 1}, _lsid1, _txnNum1));
 

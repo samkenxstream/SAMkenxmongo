@@ -66,7 +66,8 @@ void checkErrorStatusAndMaxRetries(const Status& status,
             error_details::ErrorExtraInfoForImpl<ErrorCodes::StaleDbVersion>::type>();
         invariant(staleInfo->getDb() == nss.db(),
                   str::stream() << "StaleDbVersion error on unexpected database. Expected "
-                                << nss.db() << ", received " << staleInfo->getDb());
+                                << nss.dbName().toStringForErrorMsg() << ", received "
+                                << staleInfo->getDb());
 
         // If the database version is stale, refresh its entry in the catalog cache.
         catalogCache->onStaleDatabaseVersion(staleInfo->getDb(), staleInfo->getVersionWanted());
@@ -81,8 +82,9 @@ void checkErrorStatusAndMaxRetries(const Status& status,
         // epoch refresh. If no shard is provided, then the epoch is stale and we must refresh.
         if (auto staleInfo = status.extraInfo<StaleConfigInfo>()) {
             invariant(staleInfo->getNss() == nss,
-                      str::stream() << "StaleConfig error on unexpected namespace. Expected " << nss
-                                    << ", received " << staleInfo->getNss());
+                      str::stream() << "StaleConfig error on unexpected namespace. Expected "
+                                    << nss.toStringForErrorMsg() << ", received "
+                                    << staleInfo->getNss().toStringForErrorMsg());
             catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
                 nss, staleInfo->getVersionWanted(), staleInfo->getShardId());
         } else {

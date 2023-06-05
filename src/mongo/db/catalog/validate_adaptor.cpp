@@ -539,12 +539,8 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
                                        long long* nNonCompliantDocuments,
                                        size_t* dataSize,
                                        ValidateResults* results) {
-    auto validateBSONMode = BSONValidateMode::kDefault;
-    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        feature_flags::gExtendValidateCommand.isEnabled(serverGlobalParams.featureCompatibility)) {
-        validateBSONMode = _validateState->getBSONValidateMode();
-    }
-    const Status status = validateBSON(record.data(), record.size(), validateBSONMode);
+    const Status status =
+        validateBSON(record.data(), record.size(), _validateState->getBSONValidateMode());
     if (!status.isOK()) {
         if (status.code() != ErrorCodes::NonConformantBSON) {
             return status;
@@ -576,13 +572,15 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
 
     SharedBufferFragmentBuilder pool(KeyString::HeapBuilder::kHeapAllocatorDefaultBytes);
 
-    for (const auto& index : _validateState->getIndexes()) {
-        const IndexDescriptor* descriptor = index->descriptor();
-        if (descriptor->isPartial() && !index->getFilterExpression()->matchesBSON(recordBson))
+    for (const auto& indexIdent : _validateState->getIndexIdents()) {
+        const IndexDescriptor* descriptor =
+            coll->getIndexCatalog()->findIndexByIdent(opCtx, indexIdent);
+        if (descriptor->isPartial() &&
+            !descriptor->getEntry()->getFilterExpression()->matchesBSON(recordBson))
             continue;
 
 
-        this->traverseRecord(opCtx, coll, index.get(), recordId, recordBson, results);
+        this->traverseRecord(opCtx, coll, descriptor->getEntry(), recordId, recordBson, results);
     }
     return Status::OK();
 }
@@ -669,12 +667,11 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
             }
 
             if (_validateState->fixErrors()) {
-                writeConflictRetry(
-                    opCtx, "corrupt record removal", _validateState->nss().ns(), [&] {
-                        WriteUnitOfWork wunit(opCtx);
-                        rs->deleteRecord(opCtx, record->id);
-                        wunit.commit();
-                    });
+                writeConflictRetry(opCtx, "corrupt record removal", _validateState->nss(), [&] {
+                    WriteUnitOfWork wunit(opCtx);
+                    rs->deleteRecord(opCtx, record->id);
+                    wunit.commit();
+                });
                 results->repaired = true;
                 results->numRemovedCorruptRecords++;
                 _numRecords--;
@@ -710,10 +707,7 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
 
                 nNonCompliantDocuments++;
                 schemaValidationFailed(_validateState, result.first, results);
-            } else if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-                       feature_flags::gExtendValidateCommand.isEnabled(
-                           serverGlobalParams.featureCompatibility) &&
-                       coll->getTimeseriesOptions()) {
+            } else if (coll->getTimeseriesOptions()) {
                 // Checks for time-series collection consistency.
                 Status bucketStatus =
                     _validateTimeSeriesBucketRecord(coll, record->data.toBson(), results);
@@ -752,9 +746,10 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
 
     const auto fastCount = coll->numRecords(opCtx);
     if (_validateState->shouldEnforceFastCount() && fastCount != _numRecords) {
-        results->errors.push_back(
-            str::stream() << "fast count (" << fastCount << ") does not match number of records ("
-                          << _numRecords << ") for collection '" << coll->ns() << "'");
+        results->errors.push_back(str::stream() << "fast count (" << fastCount
+                                                << ") does not match number of records ("
+                                                << _numRecords << ") for collection '"
+                                                << coll->ns().toStringForErrorMsg() << "'");
         results->valid = false;
     }
 

@@ -27,13 +27,7 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
-
-#include <functional>
-#include <memory>
 
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/hello_response.h"
@@ -46,7 +40,6 @@
 #include "mongo/db/repl/replication_recovery_mock.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/repl/topology_coordinator.h"
-#include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_mock.h"
@@ -57,7 +50,6 @@
 #include "mongo/util/fail_point.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
-
 
 namespace mongo {
 namespace repl {
@@ -116,7 +108,10 @@ void ReplCoordTest::addSelf(const HostAndPort& selfHost) {
 void ReplCoordTest::init() {
     invariant(!_repl);
     invariant(!_callShutdown);
-
+    {
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationUnkillableByStepdown(lk);
+    }
     auto service = getGlobalServiceContext();
     _storageInterface = new StorageInterfaceMock();
     StorageInterface::set(service, std::unique_ptr<StorageInterface>(_storageInterface));
@@ -160,6 +155,9 @@ void ReplCoordTest::init() {
     executor::ThreadPoolMock::Options tpOptions;
     tpOptions.onCreateThread = []() {
         Client::initThread("replexec");
+
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationUnkillableByStepdown(lk);
     };
     auto pool = std::make_unique<executor::ThreadPoolMock>(_net, seed, tpOptions);
     auto replExec =

@@ -28,7 +28,10 @@
  */
 
 #include "mongo/util/net/http_client.h"
+
 #include "mongo/base/status.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/util/ctype.h"
 
 namespace mongo {
 
@@ -43,8 +46,23 @@ void registerHTTPClientProvider(HttpClientProvider* factory) {
     _factory = factory;
 }
 
-Status HttpClient::endpointIsHTTPS(StringData url) {
-    if (url.startsWith("https://")) {
+Status HttpClient::endpointIsSecure(StringData url) {
+    bool isAcceptableLocalhost = [url]() mutable {
+        constexpr StringData localhostPrefix = "http://localhost"_sd;
+        if (!url.startsWith(localhostPrefix)) {
+            return false;
+        }
+        url = url.substr(localhostPrefix.size());
+        if (url[0] == ':') {
+            url = url.substr(1);
+            while (!url.empty() && ctype::isDigit(url[0])) {
+                url = url.substr(1);
+            }
+        }
+        return url.empty() || url[0] == '/';
+    }();
+
+    if (url.startsWith("https://") || (isAcceptableLocalhost && getTestCommandsEnabled())) {
         return Status::OK();
     }
     return Status(ErrorCodes::IllegalOperation, "Endpoint is not HTTPS");

@@ -40,6 +40,7 @@ class CollectionPtr;
 class Database;
 class OperationContext;
 class FindCommandRequest;
+class ScopedCollectionAcquisition;
 
 /**
  * db helpers are helper functions and classes that let us easily manipulate the local
@@ -121,7 +122,9 @@ struct Helpers {
      * Performs an upsert of "obj" into the collection "ns", with an empty update predicate.
      * Callers must have "ns" locked.
      */
-    static void putSingleton(OperationContext* opCtx, const NamespaceString& nss, BSONObj obj);
+    static void putSingleton(OperationContext* opCtx,
+                             ScopedCollectionAcquisition& coll,
+                             BSONObj obj);
 
     /**
      * Callers are expected to hold the collection lock.
@@ -129,7 +132,7 @@ struct Helpers {
      * o has to have an _id field or will assert
      */
     static UpdateResult upsert(OperationContext* opCtx,
-                               const NamespaceString& nss,
+                               ScopedCollectionAcquisition& coll,
                                const BSONObj& o,
                                bool fromMigrate = false);
 
@@ -140,7 +143,7 @@ struct Helpers {
      * on the same storage snapshot.
      */
     static UpdateResult upsert(OperationContext* opCtx,
-                               const NamespaceString& nss,
+                               ScopedCollectionAcquisition& coll,
                                const BSONObj& filter,
                                const BSONObj& updateMod,
                                bool fromMigrate = false);
@@ -152,7 +155,7 @@ struct Helpers {
      * on the same storage snapshot.
      */
     static void update(OperationContext* opCtx,
-                       const NamespaceString& nss,
+                       ScopedCollectionAcquisition& coll,
                        const BSONObj& filter,
                        const BSONObj& updateMod,
                        bool fromMigrate = false);
@@ -176,7 +179,7 @@ struct Helpers {
      * You do not need to set the database before calling.
      * Does not oplog the operation.
      */
-    static void emptyCollection(OperationContext* opCtx, const NamespaceString& nss);
+    static void emptyCollection(OperationContext* opCtx, const ScopedCollectionAcquisition& coll);
 
     /*
      * Finds the doc and then runs a no-op update by running an update using the doc just read. Used

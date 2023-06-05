@@ -45,9 +45,8 @@ namespace change_stream_serverless_helpers {
 
 namespace {
 bool isServerlessChangeStreamFeatureFlagEnabled() {
-    return serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        feature_flags::gFeatureFlagServerlessChangeStreams.isEnabled(
-            serverGlobalParams.featureCompatibility);
+    return feature_flags::gFeatureFlagServerlessChangeStreams.isEnabled(
+        serverGlobalParams.featureCompatibility);
 }
 }  // namespace
 
@@ -75,10 +74,10 @@ bool canInitializeServices() {
         return false;
     }
 
-    return canRunInTargetEnvironment();
+    return isServerlessEnvironment();
 }
 
-bool canRunInTargetEnvironment() {
+bool isServerlessEnvironment() {
     // A change stream services are enabled only in the multitenant serverless settings. For the
     // sharded cluster, 'internalChangeStreamUseTenantIdForTesting' maybe provided for the testing
     // purposes until the support is available.

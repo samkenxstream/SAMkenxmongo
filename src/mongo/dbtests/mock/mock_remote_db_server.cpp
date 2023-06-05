@@ -60,7 +60,7 @@ MockRemoteDBServer::CircularBSONIterator::CircularBSONIterator(
 }
 
 StatusWith<BSONObj> MockRemoteDBServer::CircularBSONIterator::next() {
-    verify(_iter != _replyObjs.end());
+    MONGO_verify(_iter != _replyObjs.end());
 
     StatusWith<BSONObj> reply = _iter->isOK() ? StatusWith(_iter->getValue().copy()) : *_iter;
     ++_iter;
@@ -127,22 +127,23 @@ void MockRemoteDBServer::setCommandReply(const string& cmdName,
 void MockRemoteDBServer::insert(const NamespaceString& nss, BSONObj obj) {
     scoped_spinlock sLock(_lock);
 
-    vector<BSONObj>& mockCollection = _dataMgr[nss.ns()];
+    vector<BSONObj>& mockCollection = _dataMgr[nss.toString_forTest()];
     mockCollection.push_back(obj.copy());
 }
 
 void MockRemoteDBServer::remove(const NamespaceString& nss, const BSONObj&) {
     scoped_spinlock sLock(_lock);
-    if (_dataMgr.count(nss.ns()) == 0) {
+    auto ns = nss.toString_forTest();
+    if (_dataMgr.count(ns) == 0) {
         return;
     }
 
-    _dataMgr.erase(nss.ns());
+    _dataMgr.erase(ns);
 }
 
-void MockRemoteDBServer::assignCollectionUuid(const std::string& ns, const mongo::UUID& uuid) {
+void MockRemoteDBServer::assignCollectionUuid(StringData ns, const mongo::UUID& uuid) {
     scoped_spinlock sLock(_lock);
-    _uuidToNs[uuid] = ns;
+    _uuidToNs[uuid] = ns.toString();
 }
 
 rpc::UniqueReply MockRemoteDBServer::runCommand(InstanceID id, const OpMsgRequest& request) {
@@ -213,7 +214,7 @@ mongo::BSONArray MockRemoteDBServer::findImpl(InstanceID id,
     scoped_spinlock sLock(_lock);
     _queryCount++;
 
-    auto ns = nsOrUuid.uuid() ? _uuidToNs[*nsOrUuid.uuid()] : nsOrUuid.nss()->ns();
+    auto ns = nsOrUuid.uuid() ? _uuidToNs[*nsOrUuid.uuid()] : nsOrUuid.nss()->toString_forTest();
     const vector<BSONObj>& coll = _dataMgr[ns];
     BSONArrayBuilder result;
     for (vector<BSONObj>::const_iterator iter = coll.begin(); iter != coll.end(); ++iter) {

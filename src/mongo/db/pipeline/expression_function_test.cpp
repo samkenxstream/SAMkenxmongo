@@ -40,7 +40,7 @@ namespace {
 /**
  * A default redaction strategy that generates easy to check results for testing purposes.
  */
-std::string redactFieldNameForTest(StringData s) {
+std::string applyHmacForTest(StringData s) {
     return str::stream() << "HASH<" << s << ">";
 }
 
@@ -49,9 +49,10 @@ TEST(ExpressionFunction, SerializeAndRedactArgs) {
 
     SerializationOptions options;
     std::string replacementChar = "?";
+    options.literalPolicy = LiteralSerializationPolicy::kToDebugTypeString;
     options.replacementForLiteralArgs = replacementChar;
-    options.redactIdentifiers = true;
-    options.identifierRedactionPolicy = redactFieldNameForTest;
+    options.transformIdentifiers = true;
+    options.transformIdentifiersCallback = applyHmacForTest;
 
     auto expCtx = ExpressionContextForTest();
     auto expr = BSON("$function" << BSON("body"
@@ -61,7 +62,7 @@ TEST(ExpressionFunction, SerializeAndRedactArgs) {
     VariablesParseState vps = expCtx.variablesParseState;
     auto exprFunc = ExpressionFunction::parse(&expCtx, expr.firstElement(), vps);
     ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
-        R"({"$function":{"body":"?","args":["$HASH<age>"],"lang":"js"}})",
+        R"({"$function":{"body":"?string","args":["$HASH<age>"],"lang":"js"}})",
         exprFunc->serialize(options).getDocument());
 }
 }  // namespace

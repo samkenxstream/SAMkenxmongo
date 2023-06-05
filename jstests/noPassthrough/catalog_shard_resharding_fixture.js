@@ -1,5 +1,5 @@
 /**
- * Test the ReshardingTest fixture can work with a catalogShard.
+ * Test the ReshardingTest fixture can work with a configShard.
  *
  * @tags: [
  *   requires_fcv_70,
@@ -8,17 +8,13 @@
  * ]
  */
 
-// TODO (SERVER-74534): Enable the metadata consistency check when it will work with co-located
-// configsvr.
-TestData.skipCheckMetadataConsistency = true;
-
 (function() {
 "use strict";
 
 load("jstests/sharding/libs/resharding_test_fixture.js");
 
 const reshardingTest =
-    new ReshardingTest({numDonors: 2, numRecipients: 2, reshardInPlace: true, catalogShard: true});
+    new ReshardingTest({numDonors: 2, numRecipients: 2, reshardInPlace: true, configShard: true});
 reshardingTest.setup();
 
 const ns = "reshardingDb.coll";

@@ -115,6 +115,12 @@ public:
     static IndexBuildsCoordinator* get(OperationContext* operationContext);
 
     /**
+     * Returns Status::OK if there is enough available disk space to start an index build. Will
+     * return OutOfDiskSpace otherwise, with the context string providing the details.
+     */
+    static Status checkDiskSpaceSufficientToStartIndexBuild(OperationContext* opCtx);
+
+    /**
      * Updates CurOp's 'op' type to 'command', the 'nss' field, and the 'opDescription' field with
      * 'createIndexes' command and index specs. Also ensures the timer is started. If provided,
      * 'curOpDesc' is used as the base description upon which to perform the updates. Otherwise, the
@@ -540,6 +546,8 @@ public:
             indexBuilds.append("total", registered.loadRelaxed());
             indexBuilds.append("killedDueToInsufficientDiskSpace",
                                killedDueToInsufficientDiskSpace.loadRelaxed());
+            indexBuilds.append("failedDueToDataCorruption",
+                               failedDueToDataCorruption.loadRelaxed());
 
             BSONObjBuilder phases;
             phases.append("scanCollection", scanCollection.loadRelaxed());
@@ -559,6 +567,7 @@ public:
 
         AtomicWord<int> registered;
         AtomicWord<int> killedDueToInsufficientDiskSpace;
+        AtomicWord<int> failedDueToDataCorruption;
         AtomicWord<int> scanCollection;
         AtomicWord<int> drainSideWritesTable;
         AtomicWord<int> drainSideWritesTablePreCommit;
@@ -615,7 +624,6 @@ protected:
     _acquireExclusiveLockWithRSTLRetry(OperationContext* opCtx,
                                        ReplIndexBuildState* replState,
                                        bool retry = true);
-
 
     /**
      * Sets up the in-memory state of the index build. Validates index specs and filters out
@@ -712,8 +720,7 @@ protected:
     void _cleanUpAfterFailure(OperationContext* opCtx,
                               const CollectionPtr& collection,
                               std::shared_ptr<ReplIndexBuildState> replState,
-                              const IndexBuildOptions& indexBuildOptions,
-                              const Status& status);
+                              const IndexBuildOptions& indexBuildOptions);
 
     /**
      * Cleans up a single-phase index build after a failure, only if non-shutdown related. This
@@ -722,8 +729,7 @@ protected:
     void _cleanUpSinglePhaseAfterNonShutdownFailure(OperationContext* opCtx,
                                                     const CollectionPtr& collection,
                                                     std::shared_ptr<ReplIndexBuildState> replState,
-                                                    const IndexBuildOptions& indexBuildOptions,
-                                                    const Status& status);
+                                                    const IndexBuildOptions& indexBuildOptions);
 
     /**
      * Cleans up a two-phase index build after a failure, only if non-shutdown related. This allows
@@ -732,8 +738,7 @@ protected:
     void _cleanUpTwoPhaseAfterNonShutdownFailure(OperationContext* opCtx,
                                                  const CollectionPtr& collection,
                                                  std::shared_ptr<ReplIndexBuildState> replState,
-                                                 const IndexBuildOptions& indexBuildOptions,
-                                                 const Status& status);
+                                                 const IndexBuildOptions& indexBuildOptions);
 
     /**
      * Performs last steps of aborting an index build.
@@ -741,12 +746,14 @@ protected:
     void _completeAbort(OperationContext* opCtx,
                         std::shared_ptr<ReplIndexBuildState> replState,
                         const CollectionPtr& indexBuildEntryCollection,
-                        IndexBuildAction signalAction,
-                        Status reason);
+                        IndexBuildAction signalAction);
+    void _completeExternalAbort(OperationContext* opCtx,
+                                std::shared_ptr<ReplIndexBuildState> replState,
+                                const CollectionPtr& indexBuildEntryCollection,
+                                IndexBuildAction signalAction);
     void _completeSelfAbort(OperationContext* opCtx,
                             std::shared_ptr<ReplIndexBuildState> replState,
-                            const CollectionPtr& indexBuildEntryCollection,
-                            Status reason);
+                            const CollectionPtr& indexBuildEntryCollection);
     void _completeAbortForShutdown(OperationContext* opCtx,
                                    std::shared_ptr<ReplIndexBuildState> replState,
                                    const CollectionPtr& collection);
@@ -823,8 +830,7 @@ protected:
      * the index build to be externally aborted.
      */
     virtual void _signalPrimaryForAbortAndWaitForExternalAbort(OperationContext* opCtx,
-                                                               ReplIndexBuildState* replState,
-                                                               const Status& abortStatus) = 0;
+                                                               ReplIndexBuildState* replState) = 0;
 
     /**
      * Signals the primary to commit the index build by sending "voteCommitIndexBuild" command

@@ -61,7 +61,7 @@ public:
         return "internal command usage only\n"
                "example:\n"
                " { splitChunk:\"db.foo\" , keyPattern: {a:1} , min : {a:100} , max: {a:200} { "
-               "splitKeys : [ {a:150} , ... ], fromChunkSplitter: <bool>}";
+               "splitKeys : [ {a:150} , ... ]}";
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -99,7 +99,8 @@ public:
                    BSONObjBuilder& result) override {
         uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
 
-        const NamespaceString nss(parseNs({boost::none, dbname}, cmdObj));
+        const NamespaceString nss(
+            parseNs(DatabaseNameUtil::deserialize(boost::none, dbname), cmdObj));
 
         // Check whether parameters passed to splitChunk are sound
         BSONObj keyPatternObj;
@@ -153,12 +154,6 @@ public:
                 cmdObj, "timestamp", expectedCollectionTimestamp.get_ptr()));
         }
 
-        bool fromChunkSplitter = [&]() {
-            bool field = false;
-            Status status = bsonExtractBooleanField(cmdObj, "fromChunkSplitter", &field);
-            return status.isOK() && field;
-        }();
-
         // Check that the preconditions for split chunk are met and throw StaleShardVersion
         // otherwise.
         {
@@ -178,8 +173,7 @@ public:
                                                    std::move(splitKeys),
                                                    shardName,
                                                    expectedCollectionEpoch,
-                                                   expectedCollectionTimestamp,
-                                                   fromChunkSplitter));
+                                                   expectedCollectionTimestamp));
 
         // Otherwise, we want to check whether or not top-chunk optimization should be performed. If
         // yes, then we should have a ChunkRange that was returned. Regardless of whether it should

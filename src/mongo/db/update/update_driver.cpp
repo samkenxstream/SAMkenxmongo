@@ -205,10 +205,10 @@ Status UpdateDriver::populateDocumentWithQueryFields(OperationContext* opCtx,
     }
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-    return populateDocumentWithQueryFields(*cq, immutablePaths, doc);
+    return populateDocumentWithQueryFields(*cq->root(), immutablePaths, doc);
 }
 
-Status UpdateDriver::populateDocumentWithQueryFields(const CanonicalQuery& query,
+Status UpdateDriver::populateDocumentWithQueryFields(const MatchExpression& query,
                                                      const FieldRefSet& immutablePaths,
                                                      mutablebson::Document& doc) const {
     EqualityMatches equalities;
@@ -216,11 +216,10 @@ Status UpdateDriver::populateDocumentWithQueryFields(const CanonicalQuery& query
 
     if (_updateType == UpdateType::kReplacement) {
         // Extract only immutable fields.
-        status =
-            pathsupport::extractFullEqualityMatches(*query.root(), immutablePaths, &equalities);
+        status = pathsupport::extractFullEqualityMatches(query, immutablePaths, &equalities);
     } else {
         // Extract all fields from op-style update.
-        status = pathsupport::extractEqualityMatches(*query.root(), &equalities);
+        status = pathsupport::extractEqualityMatches(query, &equalities);
     }
 
     if (!status.isOK())
@@ -241,8 +240,6 @@ Status UpdateDriver::update(OperationContext* opCtx,
                             FieldRefSetWithStorage* modifiedPaths) {
     // TODO: assert that update() is called at most once in a !_multi case.
 
-    _affectIndices = _updateType == UpdateType::kReplacement && _indexedFields != nullptr;
-
     _logDoc.reset();
 
     UpdateExecutor::ApplyParams applyParams(doc->root(), immutablePaths);
@@ -251,7 +248,6 @@ Status UpdateDriver::update(OperationContext* opCtx,
     applyParams.fromOplogApplication = _fromOplogApplication;
     applyParams.skipDotsDollarsCheck = _skipDotsDollarsCheck;
     applyParams.validateForStorage = validateForStorage;
-    applyParams.indexData = _indexedFields;
     applyParams.modifiedPaths = modifiedPaths;
     // The supplied 'modifiedPaths' must be an empty set.
     invariant(!modifiedPaths || modifiedPaths->empty());
@@ -273,9 +269,6 @@ Status UpdateDriver::update(OperationContext* opCtx,
 
     invariant(_updateExecutor);
     auto applyResult = _updateExecutor->applyUpdate(applyParams);
-    if (applyResult.indexesAffected) {
-        _affectIndices = true;
-    }
     if (docWasModified) {
         *docWasModified = !applyResult.noop;
     }

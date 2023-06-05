@@ -27,15 +27,11 @@
  *    it in the license file.
  */
 
+#include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 
-#include "mongo/platform/basic.h"
-
-#include <cstring>
-
-#include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
@@ -43,7 +39,6 @@
 #include "mongo/util/scopeguard.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
-
 
 namespace mongo {
 
@@ -193,6 +188,12 @@ void WiredTigerOplogManager::waitForAllEarlierOplogWritesToBeVisible(
 void WiredTigerOplogManager::_updateOplogVisibilityLoop(WiredTigerSessionCache* sessionCache,
                                                         WiredTigerRecordStore* oplogRecordStore) {
     Client::initThread("OplogVisibilityThread");
+
+    // TODO(SERVER-74657): Please revisit if this thread could be made killable.
+    {
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationUnkillableByStepdown(lk);
+    }
 
     // This thread updates the oplog read timestamp, the timestamp used to read from the oplog with
     // forward cursors. The timestamp is used to hide oplog entries that might be committed but have

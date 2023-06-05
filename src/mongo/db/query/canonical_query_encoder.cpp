@@ -231,6 +231,9 @@ const char* encodeMatchType(MatchExpression::MatchType mt) {
         case MatchExpression::INTERNAL_EXPR_LTE:
             return "ele";
 
+        case MatchExpression::INTERNAL_EQ_HASHED_KEY:
+            return "ieh";
+
         case MatchExpression::INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX:
             return "internalSchemaAllElemMatchFromIndex";
 
@@ -584,7 +587,7 @@ void encodeKeyForProj(const projection_ast::Projection* proj, StringBuilder* key
         return;
     }
 
-    auto requiredFields = proj->getRequiredFields();
+    const auto& requiredFields = proj->getRequiredFields();
 
     // If the only requirement is that $sortKey be included with some value, we just act as if the
     // entire document is needed.
@@ -665,10 +668,6 @@ CanonicalQuery::QueryShapeString encodeClassic(const CanonicalQuery& cq) {
     encodeKeyForSort(cq.getFindCommandRequest().getSort(), &keyBuilder);
     encodeKeyForProj(cq.getProj(), &keyBuilder);
     encodeCollation(cq.getCollator(), &keyBuilder);
-
-    // This encoding can be removed once the classic query engine reaches EOL and SBE is used
-    // exclusively for all query execution.
-    keyBuilder << kEncodeSectionDelimiter << (cq.getForceClassicEngine() ? "f" : "t");
 
     // The apiStrict flag can cause the query to see different set of indexes. For example, all
     // sparse indexes will be ignored with apiStrict is used.
@@ -832,9 +831,13 @@ public:
     void visit(const InternalExprLTEMatchExpression* expr) final {}
     void visit(const InternalExprLTMatchExpression* expr) final {}
 
+
     /**
      * These node types are not yet supported in SBE.
      */
+    void visit(const InternalEqHashedKey* expr) final {
+        MONGO_UNREACHABLE_TASSERT(7281402);
+    }
     void visit(const GeoMatchExpression* expr) final {
         MONGO_UNREACHABLE_TASSERT(6142111);
     }

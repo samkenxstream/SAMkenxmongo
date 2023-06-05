@@ -283,11 +283,11 @@ long long DBClientBase::count(const NamespaceStringOrUUID nsOrUuid,
                               int limit,
                               int skip,
                               boost::optional<BSONObj> readConcernObj) {
-    auto dbName = (nsOrUuid.uuid() ? nsOrUuid.dbName() : (*nsOrUuid.nss()).dbName());
+    auto dbName = nsOrUuid.dbName();
 
     BSONObj cmd = _countCmd(nsOrUuid, query, options, limit, skip, readConcernObj);
     BSONObj res;
-    if (!runCommand(*dbName, cmd, res, options)) {
+    if (!runCommand(dbName, cmd, res, options)) {
         auto status = getStatusFromCommandResult(res);
         uassertStatusOK(status.withContext("count fails:"));
     }
@@ -448,8 +448,7 @@ bool DBClientBase::auth(const string& dbname,
 }
 
 void DBClientBase::logout(const string& dbname, BSONObj& info) {
-    // TODO SERVER-72977: Use dbname which is DatabaseName object already.
-    runCommand(DatabaseName(boost::none, dbname), BSON("logout" << 1), info);
+    runCommand(DatabaseNameUtil::deserialize(boost::none, dbname), BSON("logout" << 1), info);
 }
 
 bool DBClientBase::isPrimary(bool& isPrimary, BSONObj* info) {
@@ -462,7 +461,7 @@ bool DBClientBase::isPrimary(bool& isPrimary, BSONObj* info) {
     BSONObj o;
     if (info == nullptr)
         info = &o;
-    bool ok = runCommand(DatabaseName(boost::none, "admin"), bob.obj(), *info);
+    bool ok = runCommand(DatabaseName::kAdmin, bob.obj(), *info);
     isPrimary =
         info->getField(_apiParameters.getVersion() ? "isWritablePrimary" : "ismaster").trueValue();
     return ok;
@@ -474,7 +473,7 @@ bool DBClientBase::createCollection(const NamespaceString& nss,
                                     int max,
                                     BSONObj* info,
                                     boost::optional<BSONObj> writeConcernObj) {
-    verify(!capped || size);
+    MONGO_verify(!capped || size);
     BSONObj o;
     if (info == nullptr)
         info = &o;
@@ -554,7 +553,7 @@ vector<BSONObj> DBClientBase::getDatabaseInfos(const BSONObj& filter,
     BSONObj cmd = bob.done();
 
     BSONObj res;
-    if (runCommand(DatabaseName(boost::none, "admin"), cmd, res, QueryOption_SecondaryOk)) {
+    if (runCommand(DatabaseName::kAdmin, cmd, res, QueryOption_SecondaryOk)) {
         BSONObj dbs = res["databases"].Obj();
         BSONObjIterator it(dbs);
         while (it.more()) {
@@ -779,10 +778,10 @@ std::list<BSONObj> DBClientBase::_getIndexSpecs(const NamespaceStringOrUUID& nsO
                                                 const BSONObj& cmd,
                                                 int options) {
     list<BSONObj> specs;
-    auto dbName = (nsOrUuid.uuid() ? nsOrUuid.dbName() : (*nsOrUuid.nss()).dbName());
+    auto dbName = nsOrUuid.dbName();
 
     BSONObj res;
-    if (runCommand(*dbName, cmd, res, options)) {
+    if (runCommand(dbName, cmd, res, options)) {
         BSONObj cursorObj = res["cursor"].Obj();
         BSONObjIterator i(cursorObj["firstBatch"].Obj());
         while (i.more()) {
@@ -796,7 +795,7 @@ std::list<BSONObj> DBClientBase::_getIndexSpecs(const NamespaceStringOrUUID& nsO
         const long long id = cursorObj["id"].Long();
         if (id != 0) {
             const auto cursorNs =
-                NamespaceStringUtil::deserialize(dbName->tenantId(), cursorObj["ns"].String());
+                NamespaceStringUtil::deserialize(dbName.tenantId(), cursorObj["ns"].String());
             if (nsOrUuid.nss()) {
                 invariant((*nsOrUuid.nss()) == cursorNs);
             }

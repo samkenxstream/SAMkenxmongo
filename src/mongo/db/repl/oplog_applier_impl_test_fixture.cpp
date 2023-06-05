@@ -60,7 +60,8 @@ void OplogApplierImplOpObserver::onInserts(OperationContext* opCtx,
                                            std::vector<InsertStatement>::const_iterator begin,
                                            std::vector<InsertStatement>::const_iterator end,
                                            std::vector<bool> fromMigrate,
-                                           bool defaultFromMigrate) {
+                                           bool defaultFromMigrate,
+                                           InsertsOpStateAccumulator* opAccumulator) {
     if (!onInsertsFn) {
         return;
     }
@@ -75,7 +76,8 @@ void OplogApplierImplOpObserver::onInserts(OperationContext* opCtx,
 void OplogApplierImplOpObserver::onDelete(OperationContext* opCtx,
                                           const CollectionPtr& coll,
                                           StmtId stmtId,
-                                          const OplogDeleteEntryArgs& args) {
+                                          const OplogDeleteEntryArgs& args,
+                                          OpStateAccumulator* opAccumulator) {
     if (!onDeleteFn) {
         return;
     }
@@ -83,7 +85,8 @@ void OplogApplierImplOpObserver::onDelete(OperationContext* opCtx,
 }
 
 void OplogApplierImplOpObserver::onUpdate(OperationContext* opCtx,
-                                          const OplogUpdateEntryArgs& args) {
+                                          const OplogUpdateEntryArgs& args,
+                                          OpStateAccumulator* opAccumulator) {
     if (!onUpdateFn) {
         return;
     }
@@ -109,12 +112,19 @@ void OplogApplierImplOpObserver::onRenameCollection(OperationContext* opCtx,
                                                     const UUID& uuid,
                                                     const boost::optional<UUID>& dropTargetUUID,
                                                     std::uint64_t numRecords,
-                                                    bool stayTemp) {
+                                                    bool stayTemp,
+                                                    bool markFromMigrate) {
     if (!onRenameCollectionFn) {
         return;
     }
-    onRenameCollectionFn(
-        opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
+    onRenameCollectionFn(opCtx,
+                         fromCollection,
+                         toCollection,
+                         uuid,
+                         dropTargetUUID,
+                         numRecords,
+                         stayTemp,
+                         markFromMigrate);
 }
 
 void OplogApplierImplOpObserver::onCreateIndex(OperationContext* opCtx,
@@ -422,7 +432,8 @@ StatusWith<BSONObj> CollectionReader::next() {
     auto state = _exec->getNext(&obj, nullptr);
     if (state == PlanExecutor::IS_EOF) {
         return {ErrorCodes::CollectionIsEmpty,
-                str::stream() << "no more documents in " << _collToScan.getNss()};
+                str::stream() << "no more documents in "
+                              << _collToScan.getNss().toStringForErrorMsg()};
     }
 
     // PlanExecutors that do not yield should only return ADVANCED or EOF.
@@ -496,7 +507,7 @@ CollectionOptions createRecordChangeStreamPreAndPostImagesCollectionOptions() {
 void createCollection(OperationContext* opCtx,
                       const NamespaceString& nss,
                       const CollectionOptions& options) {
-    writeConflictRetry(opCtx, "createCollection", nss.ns(), [&] {
+    writeConflictRetry(opCtx, "createCollection", nss, [&] {
         Lock::DBLock dbLk(opCtx, nss.dbName(), MODE_IX);
         Lock::CollectionLock collLk(opCtx, nss, MODE_X);
 
@@ -522,7 +533,7 @@ void createDatabase(OperationContext* opCtx, StringData dbName) {
     Lock::GlobalWrite globalLock(opCtx);
     bool justCreated;
     auto databaseHolder = DatabaseHolder::get(opCtx);
-    const DatabaseName tenantDbName(boost::none, dbName);
+    const DatabaseName tenantDbName = DatabaseName::createDatabaseName_forTest(boost::none, dbName);
     auto db = databaseHolder->openDb(opCtx, tenantDbName, &justCreated);
     ASSERT_TRUE(db);
     ASSERT_TRUE(justCreated);

@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/base/status_with.h"
+#include "mongo/db/commands/fle2_cleanup_gen.h"
 #include "mongo/db/commands/fle2_compact_gen.h"
 #include "mongo/db/fle_crud.h"
 
@@ -44,12 +45,20 @@ struct EncryptedStateCollectionsNamespaces {
     NamespaceString escNss;
     NamespaceString ecocNss;
     NamespaceString ecocRenameNss;
+    NamespaceString ecocLockNss;
+    NamespaceString escDeletesNss;
 };
 
 /**
  * Validate a compact request has the right encryption tokens.
  */
 void validateCompactRequest(const CompactStructuredEncryptionData& request, const Collection& edc);
+
+/**
+ * Validate a cleanup request has the right encryption tokens.
+ */
+void validateCleanupRequest(const CleanupStructuredEncryptionData& request, const Collection& edc);
+
 
 void processFLECompactV2(OperationContext* opCtx,
                          const CompactStructuredEncryptionData& request,
@@ -58,14 +67,21 @@ void processFLECompactV2(OperationContext* opCtx,
                          ECStats* escStats,
                          ECOCStats* ecocStats);
 
+void processFLECleanup(OperationContext* opCtx,
+                       const CleanupStructuredEncryptionData& request,
+                       GetTxnCallback getTxn,
+                       const EncryptedStateCollectionsNamespaces& namespaces,
+                       ECStats* escStats,
+                       ECOCStats* ecocStats);
+
 /**
  * Get all unique documents in the ECOC collection in their decrypted form.
  *
  * Used by unit tests.
  */
-stdx::unordered_set<ECOCCompactionDocumentV2> getUniqueCompactionDocumentsV2(
+stdx::unordered_set<ECOCCompactionDocumentV2> getUniqueCompactionDocuments(
     FLEQueryInterface* queryImpl,
-    const CompactStructuredEncryptionData& request,
+    BSONObj tokensObj,
     const NamespaceString& ecocNss,
     ECOCStats* ecocStats);
 
@@ -80,6 +96,19 @@ void compactOneFieldValuePairV2(FLEQueryInterface* queryImpl,
                                 const ECOCCompactionDocumentV2& ecocDoc,
                                 const NamespaceString& escNss,
                                 ECStats* escStats);
+
+
+/**
+ * Performs cleanup of the ESC entries for the encrypted field/value pair
+ * whose tokens are in the provided ECOC compaction document.
+ *
+ * Used by unit tests.
+ */
+void cleanupOneFieldValuePair(FLEQueryInterface* queryImpl,
+                              const ECOCCompactionDocumentV2& ecocDoc,
+                              const NamespaceString& escNss,
+                              const NamespaceString& escDeletesNss,
+                              ECStats* escStats);
 
 /**
  * Container for the _id values of ESC entries that are slated for deletion
@@ -112,13 +141,23 @@ FLECompactESCDeleteSet readRandomESCNonAnchorIds(OperationContext* opCtx,
                                                  ECStats* escStats);
 
 /**
- * Deletes from the ESC collection the non-anchor documents whose _id
- * appears in the list deleteIds
+ * Deletes from the ESC collection the non-anchor documents whose _ids
+ * appear in the list deleteIds
  */
 void cleanupESCNonAnchors(OperationContext* opCtx,
                           const NamespaceString& escNss,
                           const FLECompactESCDeleteSet& deleteSet,
                           size_t maxTagsPerDelete,
                           ECStats* escStats);
+
+/**
+ * Deletes from the ESC collection the anchor documents whose _ids
+ * appear in the collection escDeletesNss
+ */
+void cleanupESCAnchors(OperationContext* opCtx,
+                       const NamespaceString& escNss,
+                       const NamespaceString& escDeletesNss,
+                       size_t maxTagsPerDelete,
+                       ECStats* escStats);
 
 }  // namespace mongo

@@ -41,6 +41,7 @@
 #include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/db/transaction/retryable_writes_stats.h"
 #include "mongo/db/transaction/transaction_participant.h"
@@ -119,7 +120,7 @@ void createContainer(OperationContext* opCtx, const UUID& indexUUID) {
     LOGV2(6789200, "Create global index container", "indexUUID"_attr = indexUUID);
 
     // Create the container.
-    return writeConflictRetry(opCtx, "createGlobalIndexContainer", nss.ns(), [&]() {
+    return writeConflictRetry(opCtx, "createGlobalIndexContainer", nss, [&]() {
         const auto indexKeySpec =
             BSON("v" << 2 << "name" << kContainerIndexKeyFieldName.toString() + "_1"
                      << "key" << BSON(kContainerIndexKeyFieldName << 1) << "unique" << true);
@@ -164,7 +165,7 @@ void createContainer(OperationContext* opCtx, const UUID& indexUUID) {
                         indexKeySpec,
                         IndexCatalog::InclusionPolicy::kReady));
             tassert(6789206,
-                    str::stream() << "Collection with namespace " << nss.ns()
+                    str::stream() << "Collection with namespace " << nss.toStringForErrorMsg()
                                   << " already exists but it has inconsistent UUID "
                                   << autoColl->uuid().toString() << ".",
                     autoColl->uuid() == indexUUID);
@@ -187,7 +188,7 @@ void dropContainer(OperationContext* opCtx, const UUID& indexUUID) {
     LOGV2(6789300, "Drop global index container", "indexUUID"_attr = indexUUID);
 
     // Drop the container.
-    return writeConflictRetry(opCtx, "dropGlobalIndexContainer", nss.ns(), [&]() {
+    return writeConflictRetry(opCtx, "dropGlobalIndexContainer", nss, [&]() {
         AutoGetCollection autoColl(opCtx, nss, MODE_X);
         if (!autoColl) {
             // Idempotent command, return OK if the collection is non-existing.
@@ -229,7 +230,7 @@ void insertKey(OperationContext* opCtx,
     const auto indexEntry = buildIndexEntry(key, docKey);
 
     // Insert the index entry.
-    writeConflictRetry(opCtx, "insertGlobalIndexKey", ns.toString(), [&] {
+    writeConflictRetry(opCtx, "insertGlobalIndexKey", ns, [&] {
         WriteUnitOfWork wuow(opCtx);
         AutoGetCollection autoColl(opCtx, ns, MODE_IX);
         auto& container = autoColl.getCollection();
@@ -252,7 +253,7 @@ void insertKey(OperationContext* opCtx,
 }
 
 void deleteKey(OperationContext* opCtx,
-               const CollectionPtr& container,
+               const ScopedCollectionAcquisition& container,
                const BSONObj& key,
                const BSONObj& docKey) {
     const auto indexEntry = buildIndexEntry(key, docKey);
@@ -268,7 +269,7 @@ void deleteKey(OperationContext* opCtx,
     // is why we delete using a collection scan.
     auto planExecutor = InternalPlanner::deleteWithCollectionScan(
         opCtx,
-        &container,
+        container,
         std::move(deleteStageParams),
         PlanYieldPolicy::YieldPolicy::NO_YIELD,
         InternalPlanner::FORWARD,
@@ -283,7 +284,7 @@ void deleteKey(OperationContext* opCtx,
     // Return error if no document has been found or if the associated "key" does not match the key
     // provided as parameter.
     uassert(ErrorCodes::KeyNotFound,
-            str::stream() << "Global index container with UUID " << container->uuid()
+            str::stream() << "Global index container with UUID " << container.uuid()
                           << " does not contain specified entry. key:" << key
                           << ", docKey:" << docKey,
             execState == PlanExecutor::ExecState::ADVANCED &&
@@ -299,19 +300,21 @@ void deleteKey(OperationContext* opCtx,
     const auto ns = NamespaceString::makeGlobalIndexNSS(indexUUID);
 
     // Find and delete the index entry.
-    writeConflictRetry(opCtx, "deleteGlobalIndexKey", ns.toString(), [&] {
+    writeConflictRetry(opCtx, "deleteGlobalIndexKey", ns, [&] {
         WriteUnitOfWork wuow(opCtx);
 
-        AutoGetCollection autoColl(opCtx, ns, MODE_IX);
-        auto& container = autoColl.getCollection();
+        const auto coll = acquireCollection(
+            opCtx,
+            CollectionAcquisitionRequest::fromOpCtx(opCtx, ns, AcquisitionPrerequisites::kWrite),
+            MODE_IX);
         uassert(6924201,
                 str::stream() << "Global index container with UUID " << indexUUID
                               << " does not exist.",
-                container);
+                coll.exists());
 
         {
             repl::UnreplicatedWritesBlock unreplicatedWrites(opCtx);
-            deleteKey(opCtx, container, key, docKey);
+            deleteKey(opCtx, coll, key, docKey);
         }
 
         opCtx->getServiceContext()->getOpObserver()->onDeleteGlobalIndexKey(

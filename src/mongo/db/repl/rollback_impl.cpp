@@ -64,7 +64,6 @@
 #include "mongo/db/session/kill_sessions_local.h"
 #include "mongo/db/session/session_catalog_mongod.h"
 #include "mongo/db/session/session_txn_record_gen.h"
-#include "mongo/db/storage/historical_ident_tracker.h"
 #include "mongo/db/storage/remove_saver.h"
 #include "mongo/db/transaction/transaction_history_iterator.h"
 #include "mongo/logv2/log.h"
@@ -530,15 +529,23 @@ void RollbackImpl::_restoreTxnsTableEntryFromRetryableWrites(OperationContext* o
             sessionTxnRecord.setLastWriteDate(wallClockTime);
         }
         const auto nss = NamespaceString::kSessionTransactionsTableNamespace;
-        writeConflictRetry(opCtx, "updateSessionTransactionsTableInRollback", nss.ns(), [&] {
+        writeConflictRetry(opCtx, "updateSessionTransactionsTableInRollback", nss, [&] {
             opCtx->recoveryUnit()->allowOneUntimestampedWrite();
-            AutoGetCollection collection(opCtx, nss, MODE_IX);
+            auto collection =
+                acquireCollection(opCtx,
+                                  CollectionAcquisitionRequest(
+                                      nss,
+                                      PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                      repl::ReadConcernArgs::get(opCtx),
+                                      AcquisitionPrerequisites::kWrite),
+                                  MODE_IX);
             auto filter = BSON(SessionTxnRecord::kSessionIdFieldName << sessionId.toBSON());
             UnreplicatedWritesBlock uwb(opCtx);
             // Perform an untimestamped write so that it will not be rolled back on recovering
             // to the 'stableTimestamp' if we were to crash. This is safe because this update is
             // meant to be consistent with the 'stableTimestamp' and not the common point.
-            Helpers::upsert(opCtx, nss, filter, sessionTxnRecord.toBSON(), /*fromMigrate=*/false);
+            Helpers::upsert(
+                opCtx, collection, filter, sessionTxnRecord.toBSON(), /*fromMigrate=*/false);
         });
     }
     // Take a stable checkpoint so that writes to the 'config.transactions' table are
@@ -602,9 +609,6 @@ void RollbackImpl::_runPhaseFromAbortToReconstructPreparedTxns(
 
     _rollbackStats.stableTimestamp = stableTimestamp;
     _listener->onRecoverToStableTimestamp(stableTimestamp);
-
-    // Rollback historical ident entries.
-    HistoricalIdentTracker::get(opCtx).rollbackTo(stableTimestamp);
 
     // Log the total number of insert and update operations that have been rolled back as a
     // result of recovering to the stable timestamp.
@@ -722,8 +726,8 @@ void RollbackImpl::_correctRecordStoreCounts(OperationContext* opCtx) {
                   "uuid"_attr = uuid.toString());
             AutoGetCollectionForRead collToScan(opCtx, nss);
             invariant(coll == collToScan.getCollection().get(),
-                      str::stream() << "Catalog returned invalid collection: " << nss.ns() << " ("
-                                    << uuid.toString() << ")");
+                      str::stream() << "Catalog returned invalid collection: "
+                                    << nss.toStringForErrorMsg() << " (" << uuid.toString() << ")");
             auto exec = getCollectionScanExecutor(opCtx,
                                                   collToScan.getCollection(),
                                                   PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
@@ -1352,6 +1356,13 @@ Timestamp RollbackImpl::_recoverToStableTimestamp(OperationContext* opCtx) {
     // Recover to the stable timestamp while holding the global exclusive lock. This may throw,
     // which the caller must handle.
     Lock::GlobalWrite globalWrite(opCtx);
+
+    // Reset the drop pending reaper state prior to recovering to the stable timestamp, which
+    // re-opens the catalog and can add drop pending idents. This prevents collisions with idents
+    // already registered with the reaper.
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    storageEngine->clearDropPendingState(opCtx);
+
     return _storageInterface->recoverToStableTimestamp(opCtx);
 }
 
@@ -1360,7 +1371,15 @@ Status RollbackImpl::_triggerOpObserver(OperationContext* opCtx) {
         return Status(ErrorCodes::ShutdownInProgress, "rollback shutting down");
     }
     LOGV2(21610, "Triggering the rollback op observer");
-    opCtx->getServiceContext()->getOpObserver()->onReplicationRollback(opCtx, _observerInfo);
+
+    // Any exceptions thrown from onReplicationRollback() indicates a rollback failure that may
+    // have led us to some inconsistent on-disk or memory state, so we crash instead.
+    try {
+        opCtx->getServiceContext()->getOpObserver()->onReplicationRollback(opCtx, _observerInfo);
+    } catch (const DBException& ex) {
+        fassert(6050902, ex.toStatus());
+    }
+
     return Status::OK();
 }
 
@@ -1396,11 +1415,7 @@ void RollbackImpl::_resetDropPendingState(OperationContext* opCtx) {
     // replication subsystem or the storage engine.
     DropPendingCollectionReaper::get(opCtx)->clearDropPendingState();
 
-    // After recovering to a timestamp, the list of drop-pending idents maintained by the storage
-    // engine is no longer accurate and needs to be cleared.
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    storageEngine->clearDropPendingState();
-
     std::vector<DatabaseName> dbNames = storageEngine->listDatabases();
     for (const auto& dbName : dbNames) {
         Lock::DBLock dbLock(opCtx, dbName, MODE_X);

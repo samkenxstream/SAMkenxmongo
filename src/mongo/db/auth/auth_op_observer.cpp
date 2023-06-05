@@ -42,7 +42,7 @@ namespace mongo {
 
 namespace {
 
-const auto documentIdDecoration = OperationContext::declareDecoration<BSONObj>();
+const auto documentIdDecoration = OplogDeleteEntryArgs::declareDecoration<BSONObj>();
 
 }  // namespace
 
@@ -55,7 +55,8 @@ void AuthOpObserver::onInserts(OperationContext* opCtx,
                                std::vector<InsertStatement>::const_iterator first,
                                std::vector<InsertStatement>::const_iterator last,
                                std::vector<bool> fromMigrate,
-                               bool defaultFromMigrate) {
+                               bool defaultFromMigrate,
+                               InsertsOpStateAccumulator* opAccumulator) {
     for (auto it = first; it != last; it++) {
         audit::logInsertOperation(opCtx->getClient(), coll->ns(), it->doc);
         AuthorizationManager::get(opCtx->getServiceContext())
@@ -63,7 +64,9 @@ void AuthOpObserver::onInserts(OperationContext* opCtx,
     }
 }
 
-void AuthOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
+void AuthOpObserver::onUpdate(OperationContext* opCtx,
+                              const OplogUpdateEntryArgs& args,
+                              OpStateAccumulator* opAccumulator) {
     if (args.updateArgs->update.isEmpty()) {
         return;
     }
@@ -76,19 +79,22 @@ void AuthOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
 
 void AuthOpObserver::aboutToDelete(OperationContext* opCtx,
                                    const CollectionPtr& coll,
-                                   BSONObj const& doc) {
+                                   BSONObj const& doc,
+                                   OplogDeleteEntryArgs* args,
+                                   OpStateAccumulator* opAccumulator) {
     audit::logRemoveOperation(opCtx->getClient(), coll->ns(), doc);
 
     // Extract the _id field from the document. If it does not have an _id, use the
     // document itself as the _id.
-    documentIdDecoration(opCtx) = doc["_id"] ? doc["_id"].wrap() : doc;
+    documentIdDecoration(args) = doc["_id"] ? doc["_id"].wrap() : doc;
 }
 
 void AuthOpObserver::onDelete(OperationContext* opCtx,
                               const CollectionPtr& coll,
                               StmtId stmtId,
-                              const OplogDeleteEntryArgs& args) {
-    auto& documentId = documentIdDecoration(opCtx);
+                              const OplogDeleteEntryArgs& args,
+                              OpStateAccumulator* opAccumulator) {
+    auto& documentId = documentIdDecoration(args);
     invariant(!documentId.isEmpty());
     AuthorizationManager::get(opCtx->getServiceContext())
         ->logOp(opCtx, "d", coll->ns(), documentId, nullptr);
@@ -119,7 +125,7 @@ void AuthOpObserver::onCollMod(OperationContext* opCtx,
     const auto cmdNss = nss.getCommandNS();
 
     // Create the 'o' field object.
-    const auto cmdObj = repl::makeCollModCmdObj(collModCmd, oldCollOptions, indexInfo);
+    const auto cmdObj = makeCollModCmdObj(collModCmd, oldCollOptions, indexInfo);
 
     AuthorizationManager::get(opCtx->getServiceContext())
         ->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
@@ -137,7 +143,8 @@ repl::OpTime AuthOpObserver::onDropCollection(OperationContext* opCtx,
                                               const NamespaceString& collectionName,
                                               const UUID& uuid,
                                               std::uint64_t numRecords,
-                                              const CollectionDropType dropType) {
+                                              const CollectionDropType dropType,
+                                              bool markFromMigrate) {
     const auto cmdNss = collectionName.getCommandNS();
     const auto cmdObj = BSON("drop" << collectionName.coll());
 
@@ -187,7 +194,8 @@ void AuthOpObserver::onRenameCollection(OperationContext* const opCtx,
                                         const UUID& uuid,
                                         const boost::optional<UUID>& dropTargetUUID,
                                         std::uint64_t numRecords,
-                                        bool stayTemp) {
+                                        bool stayTemp,
+                                        bool markFromMigrate) {
     postRenameCollection(opCtx, fromCollection, toCollection, uuid, dropTargetUUID, stayTemp);
 }
 
@@ -222,8 +230,8 @@ void AuthOpObserver::onEmptyCapped(OperationContext* opCtx,
         ->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
 }
 
-void AuthOpObserver::_onReplicationRollback(OperationContext* opCtx,
-                                            const RollbackObserverInfo& rbInfo) {
+void AuthOpObserver::onReplicationRollback(OperationContext* opCtx,
+                                           const RollbackObserverInfo& rbInfo) {
     // Invalidate any in-memory auth data if necessary.
     const auto& rollbackNamespaces = rbInfo.rollbackNamespaces;
     if (rollbackNamespaces.count(NamespaceString::kServerConfigurationNamespace) == 1 ||

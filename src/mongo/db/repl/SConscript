@@ -82,7 +82,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/import_collection_oplog_entry',
         '$BUILD_DIR/mongo/db/catalog/index_build_oplog_entry',
         '$BUILD_DIR/mongo/db/catalog/local_oplog_info',
-        '$BUILD_DIR/mongo/db/catalog/multi_index_block',
         '$BUILD_DIR/mongo/db/change_stream_change_collection_manager',
         '$BUILD_DIR/mongo/db/change_stream_pre_images_collection_manager',
         '$BUILD_DIR/mongo/db/change_stream_serverless_helpers',
@@ -563,7 +562,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/serverless/serverless_lock',
         '$BUILD_DIR/mongo/db/session/kill_sessions_local',
         '$BUILD_DIR/mongo/db/session/session_catalog_mongod',
-        '$BUILD_DIR/mongo/db/storage/historical_ident_tracker',
+        '$BUILD_DIR/mongo/db/storage/remove_saver',
         '$BUILD_DIR/mongo/util/namespace_string_database_name_util',
         'drop_pending_collection_reaper',
     ],
@@ -693,8 +692,8 @@ env.Library(
         'split_horizon.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/mongo/util/concurrency/spin_lock',
         '$BUILD_DIR/mongo/util/net/network',
     ],
 )
@@ -1105,6 +1104,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/dbdirectclient',
         '$BUILD_DIR/mongo/db/ops/write_ops_exec',
         '$BUILD_DIR/mongo/db/shard_role_api',
+        '$BUILD_DIR/mongo/db/storage/durable_catalog',
         '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger_import',
         '$BUILD_DIR/mongo/idl/cluster_parameter_synchronization_helpers',
         '$BUILD_DIR/mongo/rpc/metadata',
@@ -1242,6 +1242,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/multitenancy',
         '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/db/server_feature_flags',
+        '$BUILD_DIR/mongo/util/namespace_string_database_name_util',
         'read_concern_args',
     ],
 )
@@ -1762,6 +1763,8 @@ if wiredtiger:
             'rollback_checker_test.cpp',
             'rollback_impl_test.cpp',
             'scatter_gather_test.cpp',
+            'shard_merge_recipient_op_observer_test.cpp',
+            'shard_merge_recipient_service_test.cpp',
             'speculative_majority_read_info_test.cpp',
             'split_horizon_test.cpp',
             'split_prepare_session_manager_test.cpp',
@@ -1779,7 +1782,6 @@ if wiredtiger:
             'tenant_migration_recipient_access_blocker_test.cpp',
             'tenant_migration_recipient_entry_helpers_test.cpp',
             'tenant_migration_recipient_service_test.cpp',
-            'tenant_migration_recipient_service_shard_merge_test.cpp',
         ],
         LIBDEPS=[
             '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
@@ -1789,6 +1791,7 @@ if wiredtiger:
             '$BUILD_DIR/mongo/db/catalog/catalog_helpers',
             '$BUILD_DIR/mongo/db/catalog/health_log',
             '$BUILD_DIR/mongo/db/change_stream_pre_images_collection_manager',
+            '$BUILD_DIR/mongo/db/commands/create_command',
             '$BUILD_DIR/mongo/db/commands/mongod_fcv',
             '$BUILD_DIR/mongo/db/commands/txn_cmd_request',
             '$BUILD_DIR/mongo/db/dbdirectclient',
@@ -1846,6 +1849,7 @@ if wiredtiger:
             'primary_only_service_test_fixture',
             'repl_coordinator_impl',
             'repl_server_parameters',
+            'replica_set_aware_service',
             'replica_set_messages',
             'replication_consistency_markers_impl',
             'replication_process',
@@ -1858,6 +1862,7 @@ if wiredtiger:
             'rollback_test_fixture',
             'rs_rollback',
             'scatter_gather',
+            'shard_merge_recipient_service',
             'speculative_majority_read_info',
             'split_horizon',
             'split_prepare_session_manager',
@@ -2029,8 +2034,13 @@ env.Library(
         'hello_command',
     ],
 )
-
-env.Library(
+wait_for_majority_service_env = env.Clone()
+# TODO(SERVER-77205): Review and Possibly Remove '-Wno-deprecated' After Mozjs Update
+wait_for_majority_service_env.Append(
+    CXXFLAGS=[] if wait_for_majority_service_env.TargetOSIs('windows') else [
+        '-Wno-deprecated',
+    ], )
+wait_for_majority_service_env.Library(
     target='wait_for_majority_service',
     source=[
         'wait_for_majority_service.cpp',
@@ -2125,5 +2135,36 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/session/logical_session_id',
         '$BUILD_DIR/mongo/db/session/logical_session_id_helpers',
+    ],
+)
+
+env.Benchmark(
+    target='oplog_application_bm',
+    source=[
+        'oplog_application_bm.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/auth/authmocks',
+        '$BUILD_DIR/mongo/db/catalog/catalog_helpers',
+        '$BUILD_DIR/mongo/db/catalog/catalog_impl',
+        '$BUILD_DIR/mongo/db/index_builds_coordinator_mongod',
+        '$BUILD_DIR/mongo/db/op_observer/op_observer_impl',
+        '$BUILD_DIR/mongo/db/op_observer/oplog_writer_impl',
+        '$BUILD_DIR/mongo/db/server_base',
+        '$BUILD_DIR/mongo/db/service_context_d',
+        '$BUILD_DIR/mongo/db/session/session_catalog_mongod',
+        '$BUILD_DIR/mongo/db/shard_role_api',
+        '$BUILD_DIR/mongo/db/storage/storage_control',
+        '$BUILD_DIR/mongo/db/storage/storage_options',
+        '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger',
+        '$BUILD_DIR/mongo/unittest/unittest',
+        '$BUILD_DIR/mongo/util/periodic_runner_factory',
+        'drop_pending_collection_reaper',
+        'repl_coordinator_impl',
+        'repl_coordinator_interface',
+        'replication_consistency_markers_impl',
+        'replication_recovery',
+        'replmocks',
+        'storage_interface_impl',
     ],
 )

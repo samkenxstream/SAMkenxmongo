@@ -115,21 +115,6 @@ TEST(CollectionOptions, CappedSizeNotRoundUpForAlignment) {
     ASSERT_EQUALS(options.cappedMaxDocs, 0);
 }
 
-TEST(CollectionOptions, CappedSizeRoundsUpForAlignment) {
-    serverGlobalParams.mutableFeatureCompatibility.setVersion(
-        multiversion::FeatureCompatibilityVersion::kVersion_6_0);
-    const long long kUnalignedCappedSize = 1000;
-    const long long kAlignedCappedSize = 1024;
-
-    // Check size rounds up to multiple of alignment.
-    auto options = assertGet(
-        CollectionOptions::parse((BSON("capped" << true << "size" << kUnalignedCappedSize))));
-
-    ASSERT_EQUALS(options.capped, true);
-    ASSERT_EQUALS(options.cappedSize, kAlignedCappedSize);
-    ASSERT_EQUALS(options.cappedMaxDocs, 0);
-}
-
 TEST(CollectionOptions, IgnoreSizeWrongType) {
     auto options =
         assertGet(CollectionOptions::parse(fromjson("{size: undefined, capped: undefined}")));
@@ -647,9 +632,6 @@ TEST(FLECollectionOptions, Equality_DisAllowedTypes) {
 
 
 TEST(FLECollectionOptions, Range_AllowedTypes) {
-    // TODO: SERVER-67760 remove feature flag
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2Range", true);
-
     ASSERT_OK(CollectionOptions::parse(fromjson(str::stream() << R"({
         encryptedFields: {
             "fields": [
@@ -744,9 +726,6 @@ TEST(FLECollectionOptions, Range_AllowedTypes) {
 
 
 TEST(FLECollectionOptions, Range_DisAllowedTypes) {
-    // TODO: SERVER-67760 remove feature flag
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2Range", true);
-
     std::vector<std::string> typesDisallowedIndexed({
         "array",
         "binData",
@@ -782,9 +761,6 @@ TEST(FLECollectionOptions, Range_DisAllowedTypes) {
 }
 
 TEST(FLECollectionOptions, Range_MissingFields) {
-    // TODO: SERVER-67760 remove feature flag
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2Range", true);
-
     ASSERT_STATUS_CODE(6775202, CollectionOptions::parse(fromjson(R"({
         encryptedFields: {
             "fields": [
@@ -826,9 +802,6 @@ TEST(FLECollectionOptions, Range_MissingFields) {
 }
 
 TEST(FLECollectionOptions, Equality_ExtraFields) {
-    // TODO: SERVER-67760 remove feature flag
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2Range", true);
-
     ASSERT_STATUS_CODE(6775205, CollectionOptions::parse(fromjson(R"({
         encryptedFields: {
             "fields": [
@@ -871,10 +844,6 @@ TEST(FLECollectionOptions, Equality_ExtraFields) {
 
 
 TEST(FLECollectionOptions, Range_MinMax) {
-    // TODO: SERVER-67760 remove feature flag
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2Range", true);
-
-
     {
         auto doc = BSON("encryptedFields"
                         << BSON("fields" << BSON_ARRAY(BSON("path"
@@ -1003,7 +972,6 @@ TEST(FLECollectionOptions, Range_MinMax) {
 }
 
 TEST(FLECollectionOptions, Range_BoundTypeMismatch) {
-    RAIIServerParameterControllerForTest featureFlagController("featureFlagFLE2Range", true);
     ASSERT_STATUS_CODE(7018200, CollectionOptions::parse(fromjson(str::stream() << R"({
         encryptedFields: {
             "fields": [

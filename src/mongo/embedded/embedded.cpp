@@ -27,9 +27,6 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/embedded/embedded.h"
 
 #include "mongo/base/initializer.h"
@@ -42,7 +39,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/fsync_locked.h"
-#include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/op_observer/op_observer_impl.h"
@@ -158,27 +155,34 @@ void shutdown(ServiceContext* srvContext) {
         auto const client = Client::getCurrent();
         auto const serviceContext = client->getServiceContext();
 
+        // TODO(SERVER-74659): Please revisit if this thread could be made killable.
+        {
+            stdx::lock_guard<Client> lk(*tc.get());
+            tc.get()->setSystemOperationUnkillableByStepdown(lk);
+        }
+
         serviceContext->setKillAllOperations();
 
         // We should always be able to acquire the global lock at shutdown.
         // Close all open databases, shutdown storage engine and run all deinitializers.
         auto shutdownOpCtx = serviceContext->makeOperationContext(client);
-        {
-            // TODO (SERVER-71610): Fix to be interruptible or document exception.
-            UninterruptibleLockGuard noInterrupt(shutdownOpCtx->lockState());  // NOLINT.
-            Lock::GlobalLock lk(shutdownOpCtx.get(), MODE_X);
-            auto databaseHolder = DatabaseHolder::get(shutdownOpCtx.get());
-            databaseHolder->closeAll(shutdownOpCtx.get());
+        // Service context is in shutdown mode, even new operation contexts are considered killed.
+        // Marking the opCtx as executing shutdown prevents this, and makes the opCtx ignore all
+        // interrupts.
+        shutdownOpCtx->setIsExecutingShutdown();
 
-            LogicalSessionCache::set(serviceContext, nullptr);
+        Lock::GlobalLock lk(shutdownOpCtx.get(), MODE_X);
+        auto databaseHolder = DatabaseHolder::get(shutdownOpCtx.get());
+        databaseHolder->closeAll(shutdownOpCtx.get());
 
-            repl::ReplicationCoordinator::get(serviceContext)->shutdown(shutdownOpCtx.get());
-            IndexBuildsCoordinator::get(serviceContext)->shutdown(shutdownOpCtx.get());
+        LogicalSessionCache::set(serviceContext, nullptr);
 
-            // Global storage engine may not be started in all cases before we exit
-            if (serviceContext->getStorageEngine()) {
-                shutdownGlobalStorageEngineCleanly(serviceContext);
-            }
+        repl::ReplicationCoordinator::get(serviceContext)->shutdown(shutdownOpCtx.get());
+        IndexBuildsCoordinator::get(serviceContext)->shutdown(shutdownOpCtx.get());
+
+        // Global storage engine may not be started in all cases before we exit
+        if (serviceContext->getStorageEngine()) {
+            shutdownGlobalStorageEngineCleanly(serviceContext);
         }
     }
     setGlobalServiceContext(nullptr);
@@ -202,6 +206,13 @@ ServiceContext* initialize(const char* yaml_config) {
     setGlobalServiceContext(ServiceContext::make());
 
     Client::initThread("initandlisten");
+
+    // TODO(SERVER-74659): Please revisit if this thread could be made killable.
+    {
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationUnkillableByStepdown(lk);
+    }
+
     // Make sure current thread have no client set in thread_local when we leave this function
     ScopeGuard clientGuard([] { Client::releaseCurrent(); });
 

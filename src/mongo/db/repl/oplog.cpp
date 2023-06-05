@@ -29,9 +29,6 @@
 
 #include "mongo/db/repl/oplog.h"
 
-#include <deque>
-#include <fmt/format.h>
-#include <memory>
 #include <set>
 #include <vector>
 
@@ -54,7 +51,6 @@
 #include "mongo/db/catalog/health_log_interface.h"
 #include "mongo/db/catalog/import_collection_oplog_entry_gen.h"
 #include "mongo/db/catalog/local_oplog_info.h"
-#include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/change_stream_change_collection_manager.h"
 #include "mongo/db/change_stream_pre_images_collection_manager.h"
@@ -93,6 +89,7 @@
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_index_catalog_ddl_util.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/server_write_concern_metrics.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -115,22 +112,12 @@
 
 namespace mongo {
 
-using std::endl;
-using std::string;
-using std::stringstream;
-using std::unique_ptr;
-using std::vector;
 using namespace std::string_literals;
 
 using IndexVersion = IndexDescriptor::IndexVersion;
 
 namespace repl {
 namespace {
-
-using namespace fmt::literals;
-
-MONGO_FAIL_POINT_DEFINE(addDestinedRecipient);
-MONGO_FAIL_POINT_DEFINE(sleepBetweenInsertOpTimeGenerationAndLogOp);
 
 // Failpoint to block after a write and its oplog entry have been written to the storage engine and
 // are visible, but before we have advanced 'lastApplied' for the write.
@@ -206,6 +193,28 @@ Status insertDocumentsForOplog(OperationContext* opCtx,
     return Status::OK();
 }
 
+void assertInitialSyncCanContinueDuringShardMerge(OperationContext* opCtx,
+                                                  const NamespaceString& nss,
+                                                  const OplogEntry& op) {
+    // Running shard merge during initial sync can lead to potential data loss on this node.
+    // So, we perform safety check during oplog catchup and at the end of initial sync
+    // recovery. (see recoverShardMergeRecipientAccessBlockers() for the detailed comment about the
+    // problematic scenario that can cause data loss.)
+    if (nss == NamespaceString::kShardMergeRecipientsNamespace) {
+        if (auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+            replCoord && replCoord->isReplEnabled() && replCoord->getMemberState().startup2()) {
+            BSONElement idField = op.getObject().getField("_id");
+            // If the 'o' field does not have an _id, then 'o2' should have it.
+            // Otherwise, the oplog entry is corrupted.
+            if (idField.eoo() && op.getObject2()) {
+                idField = op.getObject2()->getField("_id");
+            }
+            const auto& migrationId = uassertStatusOK(UUID::parse(idField));
+            tenant_migration_access_blocker::fassertOnUnsafeInitialSync(migrationId);
+        }
+    }
+}
+
 }  // namespace
 
 ApplyImportCollectionFn applyImportCollection = applyImportCollectionDefault;
@@ -226,7 +235,8 @@ void createIndexForApplyOps(OperationContext* opCtx,
     auto indexCollection = CollectionPtr(
         db ? CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, indexNss) : nullptr);
     uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "Failed to create index due to missing collection: " << indexNss.ns(),
+            str::stream() << "Failed to create index due to missing collection: "
+                          << indexNss.toStringForErrorMsg(),
             indexCollection);
 
     OpCounters* opCounters = opCtx->writesAreReplicated() ? &globalOpCounters : &replOpCounters;
@@ -242,12 +252,12 @@ void createIndexForApplyOps(OperationContext* opCtx,
     if (OplogApplication::Mode::kInitialSync == mode) {
         auto normalSpecs =
             indexBuildsCoordinator->normalizeIndexSpecs(opCtx, indexCollection, {indexSpec});
-        invariant(1U == normalSpecs.size(),
-                  str::stream() << "Unexpected result from normalizeIndexSpecs - ns: " << indexNss
-                                << "; uuid: " << indexCollection->uuid()
-                                << "; original index spec: " << indexSpec
-                                << "; normalized index specs: "
-                                << BSON("normalSpecs" << normalSpecs));
+        invariant(
+            1U == normalSpecs.size(),
+            str::stream() << "Unexpected result from normalizeIndexSpecs - ns: "
+                          << indexNss.toStringForErrorMsg() << "; uuid: " << indexCollection->uuid()
+                          << "; original index spec: " << indexSpec
+                          << "; normalized index specs: " << BSON("normalSpecs" << normalSpecs));
         auto indexCatalog = indexCollection->getIndexCatalog();
         auto prepareSpecResult =
             indexCatalog->prepareSpecForCreate(opCtx, indexCollection, normalSpecs[0], {});
@@ -265,8 +275,8 @@ void createIndexForApplyOps(OperationContext* opCtx,
     // the index build constraints to kRelax.
     invariant(ReplicationCoordinator::get(opCtx)->shouldRelaxIndexConstraints(opCtx, indexNss),
               str::stream() << "Unexpected result from shouldRelaxIndexConstraints - ns: "
-                            << indexNss << "; uuid: " << indexCollection->uuid()
-                            << "; original index spec: " << indexSpec);
+                            << indexNss.toStringForErrorMsg() << "; uuid: "
+                            << indexCollection->uuid() << "; original index spec: " << indexSpec);
     const auto constraints = IndexBuildsManager::IndexConstraints::kRelax;
 
     // Run single-phase builds synchronously with oplog batch application. For tenant migrations,
@@ -329,7 +339,13 @@ void writeToImageCollection(OperationContext* opCtx,
     // stronger lock acquisition is taken on this namespace is during step up to create the
     // collection.
     AllowLockAcquisitionOnTimestampedUnitOfWork allowLockAcquisition(opCtx->lockState());
-    AutoGetCollection autoColl(opCtx, NamespaceString::kConfigImagesNamespace, LockMode::MODE_IX);
+    auto collection = acquireCollection(
+        opCtx,
+        CollectionAcquisitionRequest(NamespaceString::kConfigImagesNamespace,
+                                     PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::kWrite),
+        MODE_IX);
     repl::ImageEntry imageEntry;
     imageEntry.set_id(sessionId);
     imageEntry.setTxnNumber(txnNum);
@@ -354,7 +370,7 @@ void writeToImageCollection(OperationContext* opCtx,
     request.setFromOplogApplication(true);
     try {
         // This code path can also be hit by things such as `applyOps` and tenant migrations.
-        ::mongo::update(opCtx, autoColl.getDb(), request);
+        ::mongo::update(opCtx, collection, request);
     } catch (const ExceptionFor<ErrorCodes::DuplicateKey>&) {
         // We can get a duplicate key when two upserts race on inserting a document.
         *upsertConfigImage = false;
@@ -380,26 +396,19 @@ void writeToImageCollection(OperationContext* opCtx,
 */
 
 
-/*
- * records - a vector of oplog records to be written.
- * timestamps - a vector of respective Timestamp objects for each oplog record.
- * oplogCollection - collection to be written to.
- * finalOpTime - the OpTime of the last oplog record.
- * wallTime - the wall clock time of the last oplog record.
- */
-void _logOpsInner(OperationContext* opCtx,
-                  const NamespaceString& nss,
-                  std::vector<Record>* records,
-                  const std::vector<Timestamp>& timestamps,
-                  const CollectionPtr& oplogCollection,
-                  OpTime finalOpTime,
-                  Date_t wallTime,
-                  bool isAbortIndexBuild) {
+void logOplogRecords(OperationContext* opCtx,
+                     const NamespaceString& nss,
+                     std::vector<Record>* records,
+                     const std::vector<Timestamp>& timestamps,
+                     const CollectionPtr& oplogCollection,
+                     OpTime finalOpTime,
+                     Date_t wallTime,
+                     bool isAbortIndexBuild) {
     auto replCoord = ReplicationCoordinator::get(opCtx);
     if (replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet &&
         !replCoord->canAcceptWritesFor(opCtx, nss)) {
         str::stream ss;
-        ss << "logOp() but can't accept write to collection " << nss;
+        ss << "logOp() but can't accept write to collection " << nss.toStringForErrorMsg();
         ss << ": entries: " << records->size() << ": [ ";
         for (const auto& record : *records) {
             ss << "(" << record.id << ", " << redact(record.data.toBson()) << ") ";
@@ -453,8 +462,14 @@ void _logOpsInner(OperationContext* opCtx,
                 hangBeforeLogOpAdvancesLastApplied.pauseWhileSet(opCtx);
             }
 
+            // As an optimization, we skip advancing the global timestamp. In this path on the
+            // primary, the caller will have already advanced the clock to at least this value when
+            // allocating the timestamp.
+            const bool advanceGlobalTimestamp = false;
+
             // Optimes on the primary should always represent consistent database states.
-            replCoord->setMyLastAppliedOpTimeAndWallTimeForward({finalOpTime, wallTime});
+            replCoord->setMyLastAppliedOpTimeAndWallTimeForward({finalOpTime, wallTime},
+                                                                advanceGlobalTimestamp);
 
             // We set the last op on the client to 'finalOpTime', because that contains the
             // timestamp of the operation that the client actually performed.
@@ -480,16 +495,22 @@ OpTime logOp(OperationContext* opCtx, MutableOplogEntry* oplogEntry) {
     if (replCoord->isOplogDisabledFor(opCtx, oplogEntry->getNss())) {
         uassert(ErrorCodes::IllegalOperation,
                 str::stream() << "retryable writes is not supported for unreplicated ns: "
-                              << oplogEntry->getNss().ns(),
+                              << oplogEntry->getNss().toStringForErrorMsg(),
                 oplogEntry->getStatementIds().empty());
         return {};
     }
     // If this oplog entry is from a tenant migration, include the tenant migration
-    // UUID.
-    const auto& recipientInfo = tenantMigrationInfo(opCtx);
-    if (recipientInfo) {
+    // UUID and optional donor timeline metadata.
+    if (const auto& recipientInfo = tenantMigrationInfo(opCtx)) {
         oplogEntry->setFromTenantMigration(recipientInfo->uuid);
+        if (oplogEntry->getTid() &&
+            change_stream_serverless_helpers::isChangeStreamEnabled(opCtx, *oplogEntry->getTid()) &&
+            recipientInfo->donorOplogEntryData) {
+            oplogEntry->setDonorOpTime(recipientInfo->donorOplogEntryData->donorOpTime);
+            oplogEntry->setDonorApplyOpsIndex(recipientInfo->donorOplogEntryData->applyOpsIndex);
+        }
     }
+
 
     // TODO SERVER-51301 to remove this block.
     if (oplogEntry->getOpType() == repl::OpTypeEnum::kNoop) {
@@ -531,126 +552,16 @@ OpTime logOp(OperationContext* opCtx, MutableOplogEntry* oplogEntry) {
     std::vector<Timestamp> timestamps{slot.getTimestamp()};
     const auto isAbortIndexBuild = oplogEntry->getOpType() == OpTypeEnum::kCommand &&
         parseCommandType(oplogEntry->getObject()) == OplogEntry::CommandType::kAbortIndexBuild;
-    _logOpsInner(opCtx,
-                 oplogEntry->getNss(),
-                 &records,
-                 timestamps,
-                 CollectionPtr(oplog),
-                 slot,
-                 wallClockTime,
-                 isAbortIndexBuild);
+    logOplogRecords(opCtx,
+                    oplogEntry->getNss(),
+                    &records,
+                    timestamps,
+                    CollectionPtr(oplog),
+                    slot,
+                    wallClockTime,
+                    isAbortIndexBuild);
     wuow.commit();
     return slot;
-}
-
-std::vector<OpTime> logInsertOps(
-    OperationContext* opCtx,
-    MutableOplogEntry* oplogEntryTemplate,
-    std::vector<InsertStatement>::const_iterator begin,
-    std::vector<InsertStatement>::const_iterator end,
-    std::vector<bool> fromMigrate,
-    std::function<boost::optional<ShardId>(const BSONObj& doc)> getDestinedRecipientFn,
-    const CollectionPtr& collectionPtr) {
-    invariant(begin != end);
-    invariant(std::distance(fromMigrate.begin(), fromMigrate.end()) == std::distance(begin, end),
-              oplogEntryTemplate->toReplOperation().toBSON().toString());
-
-    // If this oplog entry is from a tenant migration, include the tenant migration
-    // UUID.
-    const auto& recipientInfo = tenantMigrationInfo(opCtx);
-    if (recipientInfo) {
-        oplogEntryTemplate->setFromTenantMigration(recipientInfo->uuid);
-    }
-
-    auto nss = oplogEntryTemplate->getNss();
-    auto replCoord = ReplicationCoordinator::get(opCtx);
-    if (replCoord->isOplogDisabledFor(opCtx, nss)) {
-        invariant(!begin->stmtIds.empty());
-        uassert(ErrorCodes::IllegalOperation,
-                str::stream() << "retryable writes is not supported for unreplicated ns: "
-                              << nss.ns(),
-                begin->stmtIds.front() == kUninitializedStmtId);
-        return {};
-    }
-
-    const size_t count = end - begin;
-
-    // Use OplogAccessMode::kLogOp to avoid recursive locking.
-    AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kLogOp);
-    auto oplogInfo = oplogWrite.getOplogInfo();
-
-    WriteUnitOfWork wuow(opCtx);
-
-    std::vector<OpTime> opTimes(count);
-    std::vector<Timestamp> timestamps(count);
-    std::vector<BSONObj> bsonOplogEntries(count);
-    std::vector<Record> records(count);
-    for (size_t i = 0; i < count; i++) {
-        // Make a copy from the template for each insert oplog entry.
-        MutableOplogEntry oplogEntry = *oplogEntryTemplate;
-        // Make a mutable copy.
-        auto insertStatementOplogSlot = begin[i].oplogSlot;
-        // Fetch optime now, if not already fetched.
-        if (insertStatementOplogSlot.isNull()) {
-            insertStatementOplogSlot = oplogInfo->getNextOpTimes(opCtx, 1U)[0];
-        }
-        const auto docKey = getDocumentKey(opCtx, collectionPtr, begin[i].doc).getShardKeyAndId();
-        oplogEntry.setObject(begin[i].doc);
-        oplogEntry.setObject2(docKey);
-        oplogEntry.setOpTime(insertStatementOplogSlot);
-        oplogEntry.setDestinedRecipient(getDestinedRecipientFn(begin[i].doc));
-        addDestinedRecipient.execute([&](const BSONObj& data) {
-            auto recipient = data["destinedRecipient"].String();
-            oplogEntry.setDestinedRecipient(boost::make_optional<ShardId>({recipient}));
-        });
-
-        OplogLink oplogLink;
-        if (i > 0)
-            oplogLink.prevOpTime = opTimes[i - 1];
-
-        oplogEntry.setFromMigrateIfTrue(fromMigrate[i]);
-
-        appendOplogEntryChainInfo(opCtx, &oplogEntry, &oplogLink, begin[i].stmtIds);
-
-        opTimes[i] = insertStatementOplogSlot;
-        timestamps[i] = insertStatementOplogSlot.getTimestamp();
-        bsonOplogEntries[i] = oplogEntry.toBSON();
-        // The storage engine will assign the RecordId based on the "ts" field of the oplog entry,
-        // see record_id_helpers::extractKey.
-        records[i] = Record{
-            RecordId(), RecordData(bsonOplogEntries[i].objdata(), bsonOplogEntries[i].objsize())};
-    }
-
-    sleepBetweenInsertOpTimeGenerationAndLogOp.execute([&](const BSONObj& data) {
-        auto numMillis = data["waitForMillis"].numberInt();
-        LOGV2(21244,
-              "Sleeping for {sleepMillis}ms after receiving {numOpTimesReceived} optimes from "
-              "{firstOpTime} to "
-              "{lastOpTime}",
-              "Sleeping due to sleepBetweenInsertOpTimeGenerationAndLogOp failpoint",
-              "sleepMillis"_attr = numMillis,
-              "numOpTimesReceived"_attr = count,
-              "firstOpTime"_attr = opTimes.front(),
-              "lastOpTime"_attr = opTimes.back());
-        sleepmillis(numMillis);
-    });
-
-    invariant(!opTimes.empty());
-    auto lastOpTime = opTimes.back();
-    invariant(!lastOpTime.isNull());
-    const Collection* oplog = oplogInfo->getCollection();
-    auto wallClockTime = oplogEntryTemplate->getWallClockTime();
-    const bool isAbortIndexBuild = false;
-    _logOpsInner(opCtx,
-                 nss,
-                 &records,
-                 timestamps,
-                 CollectionPtr(oplog),
-                 lastOpTime,
-                 wallClockTime,
-                 isAbortIndexBuild);
-    wuow.commit();
-    return opTimes;
 }
 
 void appendOplogEntryChainInfo(OperationContext* opCtx,
@@ -808,7 +719,7 @@ void createOplog(OperationContext* opCtx,
     options.cappedSize = sz;
     options.autoIndexId = CollectionOptions::NO;
 
-    writeConflictRetry(opCtx, "createCollection", oplogCollectionName.ns(), [&] {
+    writeConflictRetry(opCtx, "createCollection", oplogCollectionName, [&] {
         WriteUnitOfWork uow(opCtx);
         invariant(ctx.db()->createCollection(opCtx, oplogCollectionName, options));
         acquireOplogCollectionForLogging(opCtx);
@@ -921,6 +832,22 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
           // any temporarily renamed aside collections to be sorted out by the time replay is
           // complete.
           const bool allowRenameOutOfTheWay = (mode != repl::OplogApplication::Mode::kSecondary);
+
+          // Check whether there is an open but empty database where the name conflicts with the new
+          // collection's database name. It is possible for a secondary's in-memory database state
+          // to diverge from the primary's, if the primary rolls back the dropDatabase oplog entry
+          // after closing its own in-memory database state. In this case, the primary may accept
+          // creating a new database with a conflicting name to what the secondary still has open.
+          // It is okay to simply close the empty database on the secondary in this case.
+          auto duplicates = DatabaseHolder::get(opCtx)->getNamesWithConflictingCasing(nss.dbName());
+          if (duplicates.size() == 1) {
+              auto dupDatabaseIt = duplicates.begin();
+              if (CollectionCatalog::get(opCtx)
+                      ->getAllCollectionUUIDsFromDb(*dupDatabaseIt)
+                      .size() == 0) {
+                  fassert(7727801, dropDatabaseForApplyOps(opCtx, *dupDatabaseIt).isOK());
+              }
+          }
 
           Lock::DBLock dbLock(opCtx, nss.dbName(), MODE_IX);
           if (auto idIndexElem = cmd["idIndex"]) {
@@ -1067,10 +994,12 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
           const auto& cmd = entry.getObject();
           auto opMsg = OpMsgRequestBuilder::create(entry.getNss().dbName(), cmd);
 
-          auto collModCmd = CollMod::parse(IDLParserContext("collModOplogEntry",
-                                                            false /* apiStrict */,
-                                                            entry.getNss().tenantId()),
-                                           opMsg.body);
+          auto collModCmd =
+              CollMod::parse(IDLParserContext("collModOplogEntry",
+                                              false /* apiStrict */,
+                                              entry.getNss().tenantId(),
+                                              SerializationContext::stateStorageRequest()),
+                             opMsg.body);
           const auto nssOrUUID([&collModCmd, &entry, mode]() -> NamespaceStringOrUUID {
               // Oplog entries from secondary oplog application will allways have the Uuid set and
               // it is only invocations of applyOps directly that may omit it
@@ -1174,8 +1103,10 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
           -> Status {
           const auto& entry = *op;
           auto importEntry = mongo::ImportCollectionOplogEntry::parse(
-              IDLParserContext(
-                  "importCollectionOplogEntry", false /* apiStrict */, entry.getNss().tenantId()),
+              IDLParserContext("importCollectionOplogEntry",
+                               false /* apiStrict */,
+                               entry.getNss().tenantId(),
+                               SerializationContext::stateStorageRequest()),
               entry.getObject());
           applyImportCollection(opCtx,
                                 importEntry.getImportUUID(),
@@ -1316,18 +1247,34 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
 };
 
 // Writes a change stream pre-image 'preImage' associated with oplog entry 'oplogEntry' and a write
-// operation to collection 'collection' with "applyOpsIndex" 0.
+// operation to collection 'collection'. If we are writing the pre-image during oplog application
+// on a secondary for a serverless tenant migration, we will use the timestamp and applyOpsIndex
+// from the donor timeline. If we are applying this entry on a primary during tenant oplog
+// application, we skip writing of the pre-image. The op observer will handle inserting the
+// correct pre-image on the primary in this case.
 void writeChangeStreamPreImage(OperationContext* opCtx,
                                const CollectionPtr& collection,
                                const mongo::repl::OplogEntry& oplogEntry,
                                const BSONObj& preImage) {
-    ChangeStreamPreImageId preImageId{collection->uuid(),
-                                      oplogEntry.getTimestampForPreImage(),
-                                      static_cast<int64_t>(oplogEntry.getApplyOpsIndex())};
+    Timestamp timestamp;
+    int64_t applyOpsIndex;
+    // If donorOpTime is set on the oplog entry, this is a write that is being applied on a
+    // secondary during the oplog catchup phase of a tenant migration. Otherwise, we are either
+    // applying a steady state write operation on a secondary or applying a write on the primary
+    // during tenant migration oplog catchup.
+    if (const auto& donorOpTime = oplogEntry.getDonorOpTime()) {
+        timestamp = donorOpTime->getTimestamp();
+        applyOpsIndex = oplogEntry.getDonorApplyOpsIndex().get_value_or(0);
+    } else {
+        timestamp = oplogEntry.getTimestampForPreImage();
+        applyOpsIndex = oplogEntry.getApplyOpsIndex();
+    }
+
+    ChangeStreamPreImageId preImageId{collection->uuid(), timestamp, applyOpsIndex};
     ChangeStreamPreImage preImageDocument{
         std::move(preImageId), oplogEntry.getWallClockTimeForPreImage(), preImage};
 
-    ChangeStreamPreImagesCollectionManager::insertPreImage(
+    ChangeStreamPreImagesCollectionManager::get(opCtx).insertPreImage(
         opCtx, oplogEntry.getTid(), preImageDocument);
 }
 }  // namespace
@@ -1374,18 +1321,31 @@ StatusWith<OplogApplication::Mode> OplogApplication::parseMode(const std::string
 }
 
 void OplogApplication::checkOnOplogFailureForRecovery(OperationContext* opCtx,
+                                                      const mongo::NamespaceString& nss,
                                                       const mongo::BSONObj& oplogEntry,
                                                       const std::string& errorMsg) {
     const bool isReplicaSet =
         repl::ReplicationCoordinator::get(opCtx->getServiceContext())->getReplicationMode() ==
         repl::ReplicationCoordinator::modeReplSet;
-    // Relax the constraints of oplog application if the node is not a replica set member.
-    if (!isReplicaSet) {
+    // Relax the constraints of oplog application if the node is not a replica set member or the
+    // node is in the middle of a backup and restore process.
+    if (!isReplicaSet || storageGlobalParams.restore) {
         return;
     }
 
-    // Only fassert in test environment.
-    if (getTestCommandsEnabled()) {
+    // During the recovery process, certain configuration collections such as
+    // 'config.image_collections' are handled differently, which may result in encountering oplog
+    // application failures in common scenarios, and therefore assert statements are not used.
+    if (nss.isConfigDB()) {
+        LOGV2_DEBUG(
+            5415002,
+            1,
+            "Error applying operation while recovering from stable checkpoint. This is related to "
+            "one of the configuration collections so this error might be benign.",
+            "oplogEntry"_attr = oplogEntry,
+            "error"_attr = errorMsg);
+    } else if (getTestCommandsEnabled()) {
+        // Only fassert in test environment.
         LOGV2_FATAL(5415000,
                     "Error applying operation while recovering from stable "
                     "checkpoint. This can lead to data corruption.",
@@ -1433,7 +1393,7 @@ void logOplogConstraintViolation(OperationContext* opCtx,
 // @return failure status if an update should have happened and the document DNE.
 // See replset initial sync code.
 Status applyOperation_inlock(OperationContext* opCtx,
-                             Database* db,
+                             ScopedCollectionAcquisition& collectionAcquisition,
                              const OplogEntryOrGroupedInserts& opOrGroupedInserts,
                              bool alwaysUpsert,
                              OplogApplication::Mode mode,
@@ -1467,14 +1427,14 @@ Status applyOperation_inlock(OperationContext* opCtx,
 
     const bool inStableRecovery = mode == OplogApplication::Mode::kStableRecovering;
     NamespaceString requestNss;
-    CollectionPtr collection;
     if (auto uuid = op.getUuid()) {
         auto catalog = CollectionCatalog::get(opCtx);
-        collection = CollectionPtr(catalog->lookupCollectionByUUID(opCtx, uuid.value()));
+        const auto collection = CollectionPtr(catalog->lookupCollectionByUUID(opCtx, uuid.value()));
         if (!collection && inStableRecovery) {
             repl::OplogApplication::checkOnOplogFailureForRecovery(
                 opCtx,
-                redact(opOrGroupedInserts.toBSON()),
+                op.getNss(),
+                redact(op.toBSONForLogging()),
                 str::stream()
                     << "(NamespaceNotFound): Failed to apply operation due to missing collection ("
                     << uuid.value() << ")");
@@ -1489,7 +1449,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     "mode should be in initialSync or recovering",
                     mode == OplogApplication::Mode::kInitialSync ||
                         OplogApplication::inRecovering(mode));
-            writeConflictRetry(opCtx, "applyOps_imageInvalidation", op.getNss().toString(), [&] {
+            writeConflictRetry(opCtx, "applyOps_imageInvalidation", op.getNss(), [&] {
                 WriteUnitOfWork wuow(opCtx);
                 bool upsertConfigImage = true;
                 writeToImageCollection(opCtx,
@@ -1508,15 +1468,18 @@ Status applyOperation_inlock(OperationContext* opCtx,
                               << uuid.value() << "): " << redact(opOrGroupedInserts.toBSON()),
                 collection);
         requestNss = collection->ns();
+        dassert(requestNss == collectionAcquisition.nss());
         dassert(opCtx->lockState()->isCollectionLockedForMode(requestNss, MODE_IX));
     } else {
         requestNss = op.getNss();
         invariant(requestNss.coll().size());
         dassert(opCtx->lockState()->isCollectionLockedForMode(requestNss, MODE_IX),
-                requestNss.ns());
-        collection = CollectionPtr(
-            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, requestNss));
+                requestNss.toStringForErrorMsg());
     }
+
+    const CollectionPtr& collection = collectionAcquisition.getCollectionPtr();
+
+    assertInitialSyncCanContinueDuringShardMerge(opCtx, requestNss, op);
 
     BSONObj o = op.getObject();
 
@@ -1541,7 +1504,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
     const IndexCatalog* indexCatalog = !collection ? nullptr : collection->getIndexCatalog();
     const bool haveWrappingWriteUnitOfWork = opCtx->lockState()->inAWriteUnitOfWork();
     uassert(ErrorCodes::CommandNotSupportedOnView,
-            str::stream() << "applyOps not supported on view: " << requestNss.ns(),
+            str::stream() << "applyOps not supported on view: " << requestNss.toStringForErrorMsg(),
             collection || !CollectionCatalog::get(opCtx)->lookupView(opCtx, requestNss));
 
     // Decide whether to timestamp the write with the 'ts' field found in the operation. In general,
@@ -1591,6 +1554,15 @@ Status applyOperation_inlock(OperationContext* opCtx,
             !op.getFromMigrate().get_value_or(false) &&
             !requestNss.isTemporaryReshardingCollection();
     };
+
+
+    // We are applying this entry on the primary during tenant oplog application. Decorate the opCtx
+    // with donor timeline metadata so that it will be available in the op observer and available
+    // for use here when oplog entries are logged.
+    if (auto& recipientInfo = tenantMigrationInfo(opCtx)) {
+        recipientInfo->donorOplogEntryData =
+            DonorOplogEntryData(op.getOpTime(), op.getApplyOpsIndex());
+    }
 
     switch (opType) {
         case OpTypeEnum::kInsert: {
@@ -1744,7 +1716,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                             }
                         } else if (inStableRecovery) {
                             repl::OplogApplication::checkOnOplogFailureForRecovery(
-                                opCtx, redact(op.toBSONForLogging()), redact(status));
+                                opCtx, op.getNss(), redact(op.toBSONForLogging()), redact(status));
                         }
                         // Continue to the next block to retry the operation as an upsert.
                         needToDoUpsert = true;
@@ -1769,15 +1741,14 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     request.setUpsert();
                     request.setFromOplogApplication(true);
 
-                    const StringData ns = op.getNss().ns();
-                    writeConflictRetry(opCtx, "applyOps_upsert", ns, [&] {
+                    writeConflictRetry(opCtx, "applyOps_upsert", op.getNss(), [&] {
                         WriteUnitOfWork wuow(opCtx);
                         // If `haveWrappingWriteUnitOfWork` is true, do not timestamp the write.
                         if (assignOperationTimestamp && timestamp != Timestamp::min()) {
                             uassertStatusOK(opCtx->recoveryUnit()->setTimestamp(timestamp));
                         }
 
-                        UpdateResult res = update(opCtx, db, request);
+                        UpdateResult res = update(opCtx, collectionAcquisition, request);
                         if (res.numMatched == 0 && res.upsertedId.isEmpty()) {
                             LOGV2_ERROR(21257,
                                         "No document was updated even though we got a DuplicateKey "
@@ -1855,7 +1826,6 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 timestamp = op.getTimestamp();
             }
 
-            const StringData ns = op.getNss().ns();
             // Operations that were part of a retryable findAndModify have two formats for
             // replicating pre/post images. The classic format has primaries writing explicit noop
             // oplog entries that contain the necessary details for reconstructed a response to a
@@ -1886,7 +1856,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
             // to insert a document. We only have to make sure we didn't race with an insert that
             // won, but with an earlier `ts`.
             bool upsertConfigImage = true;
-            auto status = writeConflictRetry(opCtx, "applyOps_update", ns, [&] {
+            auto status = writeConflictRetry(opCtx, "applyOps_update", op.getNss(), [&] {
                 WriteUnitOfWork wuow(opCtx);
                 if (timestamp != Timestamp::min()) {
                     uassertStatusOK(opCtx->recoveryUnit()->setTimestamp(timestamp));
@@ -1904,7 +1874,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     invariant(documentFound);
                 }
 
-                UpdateResult ur = update(opCtx, db, request);
+                UpdateResult ur = update(opCtx, collectionAcquisition, request);
                 if (ur.numMatched == 0 && ur.upsertedId.isEmpty()) {
                     if (collection && collection->isCapped() &&
                         mode == OplogApplication::Mode::kSecondary) {
@@ -2009,7 +1979,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
             if (!status.isOK()) {
                 if (inStableRecovery) {
                     repl::OplogApplication::checkOnOplogFailureForRecovery(
-                        opCtx, redact(op.toBSONForLogging()), redact(status));
+                        opCtx, op.getNss(), redact(op.toBSONForLogging()), redact(status));
                 }
                 return status;
             }
@@ -2045,9 +2015,8 @@ Status applyOperation_inlock(OperationContext* opCtx,
             // Determine if a change stream pre-image has to be recorded for the oplog entry.
             const bool recordChangeStreamPreImage = shouldRecordChangeStreamPreImage();
 
-            const StringData ns = op.getNss().ns();
             bool upsertConfigImage = true;
-            writeConflictRetry(opCtx, "applyOps_delete", ns, [&] {
+            writeConflictRetry(opCtx, "applyOps_delete", op.getNss(), [&] {
                 WriteUnitOfWork wuow(opCtx);
                 if (timestamp != Timestamp::min()) {
                     uassertStatusOK(opCtx->recoveryUnit()->setTimestamp(timestamp));
@@ -2070,7 +2039,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     request.setReturnDeleted(true);
                 }
 
-                DeleteResult result = deleteObject(opCtx, collection, request);
+                DeleteResult result = deleteObject(opCtx, collectionAcquisition, request);
                 if (op.getNeedsRetryImage()) {
                     // Even if `result.nDeleted` is 0, we want to perform a write to the
                     // imageCollection to advance the txnNumber/ts and invalidate the image. This
@@ -2095,11 +2064,12 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 if (result.nDeleted == 0 && inStableRecovery) {
                     repl::OplogApplication::checkOnOplogFailureForRecovery(
                         opCtx,
+                        op.getNss(),
                         redact(op.toBSONForLogging()),
                         !collection ? str::stream()
                                 << "(NamespaceNotFound): Failed to apply operation due "
                                    "to missing collection ("
-                                << requestNss << ")"
+                                << requestNss.toStringForErrorMsg() << ")"
                                     : "Applied a delete which did not delete anything."s);
                 }
                 // It is legal for a delete operation on the pre-images collection to delete zero
@@ -2167,7 +2137,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 timestamp = op.getTimestamp();
             }
 
-            writeConflictRetry(opCtx, "applyOps_insertGlobalIndexKey", collection->ns().ns(), [&] {
+            writeConflictRetry(opCtx, "applyOps_insertGlobalIndexKey", collection->ns(), [&] {
                 WriteUnitOfWork wuow(opCtx);
                 if (timestamp != Timestamp::min()) {
                     uassertStatusOK(opCtx->recoveryUnit()->setTimestamp(timestamp));
@@ -2191,7 +2161,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 timestamp = op.getTimestamp();
             }
 
-            writeConflictRetry(opCtx, "applyOps_deleteGlobalIndexKey", collection->ns().ns(), [&] {
+            writeConflictRetry(opCtx, "applyOps_deleteGlobalIndexKey", collection->ns(), [&] {
                 WriteUnitOfWork wuow(opCtx);
                 if (timestamp != Timestamp::min()) {
                     uassertStatusOK(opCtx->recoveryUnit()->setTimestamp(timestamp));
@@ -2199,7 +2169,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
 
                 global_index::deleteKey(
                     opCtx,
-                    collection,
+                    collectionAcquisition,
                     op.getObject().getObjectField(global_index::kOplogEntryIndexKeyFieldName),
                     op.getObject().getObjectField(global_index::kOplogEntryDocKeyFieldName));
 
@@ -2247,13 +2217,14 @@ Status applyCommand_inlock(OperationContext* opCtx,
 
     const auto& nss = op->getNss();
     if (!nss.isValid()) {
-        return {ErrorCodes::InvalidNamespace, "invalid ns: " + std::string(nss.ns())};
+        return {ErrorCodes::InvalidNamespace, "invalid ns: " + nss.toStringForErrorMsg()};
     }
     {
         auto catalog = CollectionCatalog::get(opCtx);
         if (!catalog->lookupCollectionByNamespace(opCtx, nss) && catalog->lookupView(opCtx, nss)) {
             return {ErrorCodes::CommandNotSupportedOnView,
-                    str::stream() << "applyOps not supported on view:" << nss.ns()};
+                    str::stream() << "applyOps not supported on view:"
+                                  << nss.toStringForErrorMsg()};
         }
     }
 
@@ -2373,19 +2344,54 @@ Status applyCommand_inlock(OperationContext* opCtx,
 
                 auto ns = cmd->parse(opCtx, OpMsgRequest::fromDBAndBody(nss.db(), o))->ns();
 
-                // This error is only possible during initial sync mode.
-                invariant(mode == OplogApplication::Mode::kInitialSync);
+                // TODO (SERVER-74953): Turn the 'mode == OplogApplication::Mode::kInitialSync' if
+                // condition below into an invariant and remove the trailing 'else' block.
+                if (mode == OplogApplication::Mode::kInitialSync) {
+                    // Aborting an index build involves writing to the catalog. This write needs to
+                    // be timestamped. It will be given 'writeTime' as the commit timestamp.
+                    TimestampBlock tsBlock(opCtx, writeTime);
+                    abortIndexBuilds(opCtx,
+                                     op->getCommandType(),
+                                     ns,
+                                     "Aborting index builds during initial sync");
+                    LOGV2_DEBUG(4665901,
+                                1,
+                                "Conflicting DDL operation encountered during initial sync; "
+                                "aborting index build and retrying",
+                                logAttrs(ns));
+                } else {
+                    invariant(!opCtx->lockState()->isLocked());
 
-                // Aborting an index build involves writing to the catalog. This write needs to be
-                // timestamped. It will be given 'writeTime' as the commit timestamp.
-                TimestampBlock tsBlock(opCtx, writeTime);
-                abortIndexBuilds(
-                    opCtx, op->getCommandType(), ns, "Aborting index builds during initial sync");
-                LOGV2_DEBUG(4665901,
-                            1,
-                            "Conflicting DDL operation encountered during initial sync; "
-                            "aborting index build and retrying",
-                            logAttrs(ns));
+                    auto swUUID = op->getUuid();
+                    if (!swUUID) {
+                        LOGV2_ERROR(21261,
+                                    "Failed command during oplog application. Expected a UUID",
+                                    "command"_attr = redact(o),
+                                    logAttrs(ns));
+                    }
+
+                    LOGV2_DEBUG(
+                        7702500,
+                        1,
+                        "Waiting for index build(s) to complete on the namespace before retrying "
+                        "the conflicting operation",
+                        logAttrs(ns),
+                        "oplogEntry"_attr = redact(op->toBSONForLogging()));
+
+                    IndexBuildsCoordinator::get(opCtx)->awaitNoIndexBuildInProgressForCollection(
+                        opCtx, swUUID.get());
+
+                    opCtx->recoveryUnit()->abandonSnapshot();
+                    opCtx->checkForInterrupt();
+
+                    LOGV2_DEBUG(
+                        51775,
+                        1,
+                        "Acceptable error during oplog application: background operation in "
+                        "progress for namespace",
+                        logAttrs(ns),
+                        "oplogEntry"_attr = redact(op->toBSONForLogging()));
+                }
 
                 break;
             }

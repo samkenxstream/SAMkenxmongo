@@ -1,7 +1,7 @@
 /*
  * Tests running killSessions to kill internal sessions on both mongos and mongod.
  *
- * @tags: [requires_fcv_60, uses_transactions, temporary_catalog_shard_incompatible]
+ * @tags: [requires_fcv_60, uses_transactions]
  */
 (function() {
 'use strict';
@@ -10,8 +10,13 @@ TestData.disableImplicitSessions = true;
 
 const st = new ShardingTest({
     shards: 1,
-    mongosOptions: {setParameter: {maxSessions: 1}},
-    shardOptions: {setParameter: {maxSessions: 1}}
+    mongosOptions: {
+        setParameter:
+            {maxSessions: 1, 'failpoint.skipClusterParameterRefresh': "{'mode':'alwaysOn'}"}
+    },
+    // The config server uses a session for internal operations, so raise the limit by 1 for a
+    // config shard.
+    shardOptions: {setParameter: {maxSessions: TestData.configShard ? 2 : 1}}
 });
 const shard0Primary = st.rs0.getPrimary();
 

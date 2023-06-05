@@ -38,6 +38,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/query_request_helper.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/s/mongos_server_parameters_gen.h"
 #include "mongo/util/str.h"
 
 using namespace fmt::literals;
@@ -60,12 +61,14 @@ RemoteCommandRequestBase::RemoteCommandRequestBase(RequestId requestId,
                                                    const BSONObj& metadataObj,
                                                    OperationContext* opCtx,
                                                    Milliseconds timeoutMillis,
-                                                   Options options)
+                                                   Options options,
+                                                   boost::optional<UUID> opKey)
     : id(requestId),
       dbname(theDbName),
       metadata(metadataObj),
       opCtx(opCtx),
       options(options),
+      operationKey(opKey),
       timeout(timeoutMillis) {
     // If there is a comment associated with the current operation, append it to the command that we
     // are about to dispatch to the shards.
@@ -73,14 +76,18 @@ RemoteCommandRequestBase::RemoteCommandRequestBase(RequestId requestId,
         ? theCmdObj.addField(*opCtx->getComment())
         : cmdObj = theCmdObj;
 
-    // maxTimeMSOpOnly is set in the network interface based on the remaining max time attached to
-    // the OpCtx.  It should never be specified explicitly.
-    uassert(4924403,
-            str::stream() << "Command request object should not manually specify "
-                          << query_request_helper::kMaxTimeMSOpOnlyField,
-            !cmdObj.hasField(query_request_helper::kMaxTimeMSOpOnlyField));
+    // For hedged requests, adjust timeout
+    if (cmdObj.hasField("maxTimeMSOpOnly")) {
+        int maxTimeField = cmdObj["maxTimeMSOpOnly"].Number();
+        if (auto maxTimeMSOpOnly = Milliseconds(maxTimeField);
+            timeout == executor::RemoteCommandRequest::kNoTimeout || maxTimeMSOpOnly < timeout) {
+            timeout = maxTimeMSOpOnly;
+        }
+    }
 
-    if (options.hedgeOptions.isHedgeEnabled) {
+    // Assumes if argument for opKey is not empty, cmdObj already contains serialized version
+    // of the opKey.
+    if (operationKey == boost::none && options.hedgeOptions.isHedgeEnabled) {
         operationKey.emplace(UUID::gen());
         cmdObj = cmdObj.addField(BSON("clientOperationKey" << operationKey.value()).firstElement());
     }
@@ -128,9 +135,16 @@ RemoteCommandRequestImpl<T>::RemoteCommandRequestImpl(RequestId requestId,
                                                       const BSONObj& metadataObj,
                                                       OperationContext* opCtx,
                                                       Milliseconds timeoutMillis,
-                                                      Options options)
-    : RemoteCommandRequestBase(
-          requestId, theDbName, theCmdObj, metadataObj, opCtx, timeoutMillis, options),
+                                                      Options options,
+                                                      boost::optional<UUID> operationKey)
+    : RemoteCommandRequestBase(requestId,
+                               theDbName,
+                               theCmdObj,
+                               metadataObj,
+                               opCtx,
+                               timeoutMillis,
+                               options,
+                               operationKey),
       target(theTarget) {
     if constexpr (std::is_same_v<T, std::vector<HostAndPort>>) {
         invariant(!theTarget.empty());
@@ -144,7 +158,8 @@ RemoteCommandRequestImpl<T>::RemoteCommandRequestImpl(const T& theTarget,
                                                       const BSONObj& metadataObj,
                                                       OperationContext* opCtx,
                                                       Milliseconds timeoutMillis,
-                                                      Options options)
+                                                      Options options,
+                                                      boost::optional<UUID> operationKey)
     : RemoteCommandRequestImpl(requestIdCounter.addAndFetch(1),
                                theTarget,
                                theDbName,
@@ -152,7 +167,8 @@ RemoteCommandRequestImpl<T>::RemoteCommandRequestImpl(const T& theTarget,
                                metadataObj,
                                opCtx,
                                timeoutMillis,
-                               options) {}
+                               options,
+                               operationKey) {}
 
 template <typename T>
 std::string RemoteCommandRequestImpl<T>::toString() const {

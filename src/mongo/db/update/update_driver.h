@@ -87,7 +87,7 @@ public:
                                            const FieldRefSet& immutablePaths,
                                            mutablebson::Document& doc) const;
 
-    Status populateDocumentWithQueryFields(const CanonicalQuery& query,
+    Status populateDocumentWithQueryFields(const MatchExpression& query,
                                            const FieldRefSet& immutablePaths,
                                            mutablebson::Document& doc) const;
 
@@ -148,13 +148,6 @@ public:
 
     UpdateType type() const {
         return _updateType;
-    }
-
-    bool modsAffectIndices() const {
-        return _affectIndices;
-    }
-    void refreshIndexKeys(const UpdateIndexData* indexedFields) {
-        _indexedFields = indexedFields;
     }
 
     bool logOp() const {
@@ -222,12 +215,6 @@ private:
 
     std::unique_ptr<UpdateExecutor> _updateExecutor;
 
-    // What are the list of fields in the collection over which the update is going to be
-    // applied that participate in indices?
-    //
-    // NOTE: Owned by the collection's info cache!.
-    const UpdateIndexData* _indexedFields = nullptr;
-
     //
     // mutable properties after parsing
     //
@@ -243,10 +230,6 @@ private:
     bool _skipDotsDollarsCheck = false;
 
     boost::intrusive_ptr<ExpressionContext> _expCtx;
-
-    // Are any of the fields mentioned in the mods participating in any index? Is set anew
-    // at each call to update.
-    bool _affectIndices = false;
 
     // Do any of the mods require positional match details when calling 'prepare'?
     bool _positional = false;

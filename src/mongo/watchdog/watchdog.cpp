@@ -32,7 +32,7 @@
 
 #include "mongo/watchdog/watchdog.h"
 
-#include <boost/align.hpp>
+#include <boost/align.hpp>  // IWYU pragma: keep
 #include <boost/filesystem.hpp>
 
 #ifndef _WIN32
@@ -129,6 +129,12 @@ void WatchdogPeriodicThread::setPeriod(Milliseconds period) {
 void WatchdogPeriodicThread::doLoop() {
     Client::initThread(_threadName);
     Client* client = &cc();
+
+    // TODO(SERVER-74659): Please revisit if this thread could be made killable.
+    {
+        stdx::lock_guard<Client> lk(*client);
+        client->setSystemOperationUnkillableByStepdown(lk);
+    }
 
     auto preciseClockSource = client->getServiceContext()->getPreciseClockSource();
 

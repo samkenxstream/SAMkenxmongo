@@ -2,16 +2,13 @@
  * Tests that the periodic job for persisting sampled queries on shardsvr mongods can handle
  * failover.
  *
- * @tags: [requires_fcv_63, featureFlagAnalyzeShardKey]
+ * @tags: [requires_fcv_70]
  */
 (function() {
 "use strict";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/sharding/analyze_shard_key/libs/query_sampling_util.js");
-
-// Set this to allow sample ids to be set by an external client.
-TestData.enableTestCommands = true;
 
 function testStepDown(rst) {
     const dbName = "testDb";
@@ -25,7 +22,7 @@ function testStepDown(rst) {
     const collectionUuid = QuerySamplingUtil.getCollectionUuid(primaryDB, collName);
 
     const localWriteFp = configureFailPoint(
-        primary, "analyzeShardKeyUtilHangBeforeExecutingCommandLocally", {}, {times: 1});
+        primary, "queryAnalysisClientHangExecutingCommandLocally", {}, {times: 1});
 
     const originalCmdObj =
         {findAndModify: collName, query: {a: 0}, update: {a: 1}, sampleId: UUID()};
@@ -75,7 +72,7 @@ function testStepUp(rst) {
     }];
 
     const remoteWriteFp =
-        configureFailPoint(secondary, "analyzeShardKeyUtilHangBeforeExecutingCommandRemotely");
+        configureFailPoint(secondary, "queryAnalysisClientHangExecutingCommandRemotely");
     assert.commandWorked(secondaryTestDB.getCollection(collName).runCommand(originalCmdObj));
 
     remoteWriteFp.wait();
@@ -100,6 +97,9 @@ const st = new ShardingTest({
         setParameter: {queryAnalysisWriterIntervalSecs: 1}
     }
 });
+
+// Force samples to get persisted even though query sampling is not enabled.
+QuerySamplingUtil.skipActiveSamplingCheckWhenPersistingSamples(st);
 
 testStepDown(st.rs0);
 testStepUp(st.rs0);

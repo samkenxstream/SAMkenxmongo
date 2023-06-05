@@ -165,7 +165,7 @@ struct CommandHelpers {
      * pattern or a database resource pattern, depending on whether parseNs returns a fully qualifed
      * collection name or just a database name.
      */
-    static ResourcePattern resourcePatternForNamespace(const std::string& ns);
+    static ResourcePattern resourcePatternForNamespace(const NamespaceString& ns);
 
     static Command* findCommand(StringData name);
 
@@ -659,6 +659,14 @@ public:
         return false;
     }
 
+    /**
+     * Override to true if this command should be allowed on a direct shard connection regardless
+     * of the directShardOperations ActionType.
+     */
+    virtual bool shouldSkipDirectConnectionChecks() const {
+        return false;
+    }
+
 private:
     // The full name of the command
     const std::string _name;
@@ -873,7 +881,7 @@ public:
     }
 
     ResourcePattern parseResourcePattern(const DatabaseName& dbName, const BSONObj& cmdObj) const {
-        return CommandHelpers::resourcePatternForNamespace(parseNs(dbName, cmdObj).ns());
+        return CommandHelpers::resourcePatternForNamespace(parseNs(dbName, cmdObj));
     }
 
     //

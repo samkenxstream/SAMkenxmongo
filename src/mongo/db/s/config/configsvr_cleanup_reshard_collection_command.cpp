@@ -50,7 +50,7 @@ using namespace fmt::literals;
 
 auto constructFinalMetadataRemovalUpdateOperation(OperationContext* opCtx,
                                                   const NamespaceString& nss) {
-    auto query = BSON(CollectionType::kNssFieldName << nss.toString());
+    auto query = BSON(CollectionType::kNssFieldName << NamespaceStringUtil::serialize(nss));
 
     auto collEntryFieldsToUnset = BSON(CollectionType::kReshardingFieldsFieldName
                                        << 1 << CollectionType::kAllowMigrationsFieldName << 1);
@@ -115,7 +115,7 @@ public:
             uassert(5403504,
                     "Expected collection entry for {} to no longer have resharding metadata, but "
                     "metadata documents still exist; please rerun the cleanupReshardCollection "
-                    "command"_format(ns().toString()),
+                    "command"_format(ns().toStringForErrorMsg()),
                     !collEntry.getReshardingFields());
         }
 

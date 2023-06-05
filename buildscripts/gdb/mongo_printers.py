@@ -9,9 +9,13 @@ from pathlib import Path
 import gdb
 import gdb.printing
 
+ROOT_PATH = str(Path(os.path.abspath(__file__)).parent.parent.parent)
+if ROOT_PATH not in sys.path:
+    sys.path.insert(0, ROOT_PATH)
+from src.third_party.immer.dist.tools.gdb_pretty_printers.printers import ListIter as ImmerListIter  # pylint: disable=wrong-import-position
+
 if not gdb:
-    sys.path.insert(0, str(Path(os.path.abspath(__file__)).parent.parent.parent))
-    from buildscripts.gdb.mongo import get_boost_optional
+    from buildscripts.gdb.mongo import get_boost_optional, lookup_type
     from buildscripts.gdb.optimizer_printers import register_abt_printers
 
 try:
@@ -29,9 +33,20 @@ if sys.version_info[0] < 3:
         "MongoDB gdb extensions only support Python 3. Your GDB was compiled against Python 2")
 
 
+def get_unique_ptr_bytes(obj):
+    """Read the value of a libstdc++ std::unique_ptr.
+
+    Returns a gdb.Value where its type resolves to `unsigned char*`. The caller must take care to
+    cast the returned value themselves. This function is particularly useful in the context of
+    mongo::Decorable<> types which store the decorations as a slab of memory with
+    std::unique_ptr<unsigned char[]>. In all other cases get_unique_ptr() can be preferred.
+    """
+    return obj.cast(gdb.lookup_type('std::_Head_base<0, unsigned char*, false>'))['_M_head_impl']
+
+
 def get_unique_ptr(obj):
     """Read the value of a libstdc++ std::unique_ptr."""
-    return obj.cast(gdb.lookup_type('std::_Head_base<0, unsigned char*, false>'))['_M_head_impl']
+    return get_unique_ptr_bytes(obj).cast(obj.type.template_argument(0).pointer())
 
 
 ###################################################################################################
@@ -127,7 +142,7 @@ class BSONObjPrinter(object):
     def __init__(self, val):
         """Initialize BSONObjPrinter."""
         self.val = val
-        self.ptr = self.val['_objdata'].cast(gdb.lookup_type('void').pointer())
+        self.ptr = self.val['_objdata'].cast(lookup_type('void').pointer())
         self.is_valid = False
 
         # Handle the endianness of the BSON object size, which is represented as a 32-bit integer
@@ -286,7 +301,7 @@ class RecordIdPrinter(object):
             holder = holder_ptr.dereference()
             str_len = int(holder["_capacity"])
             # Start of data is immediately after pointer for holder
-            start_ptr = (holder_ptr + 1).dereference().cast(gdb.lookup_type("char")).address
+            start_ptr = (holder_ptr + 1).dereference().cast(lookup_type("char")).address
             raw_bytes = [int(start_ptr[i]) for i in range(0, str_len)]
             hex_bytes = [hex(b & 0xFF)[2:].zfill(2) for b in raw_bytes]
             return "RecordId big string %d hex bytes @ %s: %s" % (str_len, holder_ptr + 1,
@@ -307,7 +322,7 @@ class DecorablePrinter(object):
         self.start = decl_vector["_M_impl"]["_M_start"]
         finish = decl_vector["_M_impl"]["_M_finish"]
         decorable_t = val.type.template_argument(0)
-        decinfo_t = gdb.lookup_type('mongo::DecorationRegistry<{}>::DecorationInfo'.format(
+        decinfo_t = lookup_type('mongo::DecorationRegistry<{}>::DecorationInfo'.format(
             str(decorable_t).replace("class", "").strip()))
         self.count = int((int(finish) - int(self.start)) / decinfo_t.sizeof)
 
@@ -322,7 +337,7 @@ class DecorablePrinter(object):
 
     def children(self):
         """Children."""
-        decoration_data = get_unique_ptr(self.val["_decorations"]["_decorationData"])
+        decoration_data = get_unique_ptr_bytes(self.val["_decorations"]["_decorationData"])
 
         for index in range(self.count):
             descriptor = self.start[index]
@@ -342,7 +357,7 @@ class DecorablePrinter(object):
             type_name = type_name.rstrip()
 
             # Cast the raw char[] into the actual object that is stored there.
-            type_t = gdb.lookup_type(type_name)
+            type_t = lookup_type(type_name)
             obj = decoration_data[dindex].cast(type_t)
 
             yield ('key', "%d:%s:%s" % (index, obj.address, type_name))
@@ -589,6 +604,61 @@ class AbslFlatHashMapPrinter(AbslHashMapPrinterBase):
             yield ('value', kvp['value'])
 
 
+class ImmutableMapIter(ImmerListIter):
+    def __init__(self, val):
+        super().__init__(val)
+        self.max = (1 << 64) - 1
+        self.pair = None
+        self.curr = (None, self.max, self.max)
+
+    def __next__(self):
+        if self.pair:
+            result = ('value', self.pair['second'])
+            self.pair = None
+            self.i += 1
+            return result
+        if self.i == self.size:
+            raise StopIteration
+        if self.i < self.curr[1] or self.i >= self.curr[2]:
+            self.curr = self.region()
+        self.pair = self.curr[0][self.i - self.curr[1]].cast(
+            gdb.lookup_type(self.v.type.template_argument(0).name))
+        result = ('key', self.pair['first'])
+        return result
+
+
+class ImmutableMapPrinter:
+    """Pretty-printer for mongo::immutable::map<>."""
+
+    def __init__(self, val):
+        self.val = val
+
+    def to_string(self):
+        return '%s of size %d' % (self.val.type, int(self.val['_storage']['impl_']['size']))
+
+    def children(self):
+        return ImmutableMapIter(self.val['_storage'])
+
+    def display_hint(self):
+        return 'map'
+
+
+class ImmutableSetPrinter:
+    """Pretty-printer for mongo::immutable::set<>."""
+
+    def __init__(self, val):
+        self.val = val
+
+    def to_string(self):
+        return '%s of size %d' % (self.val.type, int(self.val['_storage']['impl_']['size']))
+
+    def children(self):
+        return ImmerListIter(self.val['_storage'])
+
+    def display_hint(self):
+        return 'array'
+
+
 def find_match_brackets(search, opening='<', closing='>'):
     """Return the index of the closing bracket that matches the first opening bracket.
 
@@ -721,7 +791,7 @@ def make_inverse_enum_dict(enum_type_name):
     For example, if the enum type is 'mongo::sbe::vm::Builtin' with an element 'regexMatch', the
     dictionary will contain 'regexMatch' value and not 'mongo::sbe::vm::Builtin::regexMatch'.
     """
-    enum_dict = gdb.types.make_enum_dict(gdb.lookup_type(enum_type_name))
+    enum_dict = gdb.types.make_enum_dict(lookup_type(enum_type_name))
     enum_inverse_dic = dict()
     for key, value in enum_dict.items():
         enum_inverse_dic[int(value)] = key.split('::')[-1]  # take last element
@@ -768,11 +838,11 @@ class SbeCodeFragmentPrinter(object):
         # either use an inline buffer or an allocated one. The choice of storage is decoded in the
         # last bit of the 'metadata_' field.
         storage = self.val['_instrs']['storage_']
-        meta = storage['metadata_'].cast(gdb.lookup_type('size_t'))
+        meta = storage['metadata_'].cast(lookup_type('size_t'))
         self.is_inlined = (meta % 2 == 0)
         self.size = (meta >> 1)
         self.pdata = \
-            storage['data_']['inlined']['inlined_data'].cast(gdb.lookup_type('uint8_t').pointer()) \
+            storage['data_']['inlined']['inlined_data'].cast(lookup_type('uint8_t').pointer()) \
             if self.is_inlined \
             else storage['data_']['allocated']['allocated_data']
 
@@ -796,17 +866,17 @@ class SbeCodeFragmentPrinter(object):
         yield 'instrs total size', self.size
 
         # Sizes for types we'll use when parsing the insructions stream.
-        int_size = gdb.lookup_type('int').sizeof
-        ptr_size = gdb.lookup_type('void').pointer().sizeof
-        tag_size = gdb.lookup_type('mongo::sbe::value::TypeTags').sizeof
-        value_size = gdb.lookup_type('mongo::sbe::value::Value').sizeof
-        uint8_size = gdb.lookup_type('uint8_t').sizeof
-        uint32_size = gdb.lookup_type('uint32_t').sizeof
-        uint64_size = gdb.lookup_type('uint64_t').sizeof
-        builtin_size = gdb.lookup_type('mongo::sbe::vm::Builtin').sizeof
-        time_unit_size = gdb.lookup_type('mongo::TimeUnit').sizeof
-        timezone_size = gdb.lookup_type('mongo::TimeZone').sizeof
-        day_of_week_size = gdb.lookup_type('mongo::DayOfWeek').sizeof
+        int_size = lookup_type('int').sizeof
+        ptr_size = lookup_type('void').pointer().sizeof
+        tag_size = lookup_type('mongo::sbe::value::TypeTags').sizeof
+        value_size = lookup_type('mongo::sbe::value::Value').sizeof
+        uint8_size = lookup_type('uint8_t').sizeof
+        uint32_size = lookup_type('uint32_t').sizeof
+        uint64_size = lookup_type('uint64_t').sizeof
+        builtin_size = lookup_type('mongo::sbe::vm::Builtin').sizeof
+        time_unit_size = lookup_type('mongo::TimeUnit').sizeof
+        timezone_size = lookup_type('mongo::TimeZone').sizeof
+        day_of_week_size = lookup_type('mongo::DayOfWeek').sizeof
 
         cur_op = self.pdata
         end_op = self.pdata + self.size
@@ -851,9 +921,9 @@ class SbeCodeFragmentPrinter(object):
                 cur_op += uint32_size
             elif op_name in ['function', 'functionSmall']:
                 arity_size = \
-                    gdb.lookup_type('mongo::sbe::vm::ArityType').sizeof \
+                    lookup_type('mongo::sbe::vm::ArityType').sizeof \
                     if op_name == 'function' \
-                    else gdb.lookup_type('mongo::sbe::vm::SmallArityType').sizeof
+                    else lookup_type('mongo::sbe::vm::SmallArityType').sizeof
                 builtin_id = read_as_integer(cur_op, builtin_size)
                 args = 'builtin: ' + self.builtins_lookup.get(builtin_id, "unknown")
                 args += ' arity: ' + str(read_as_integer(cur_op + builtin_size, arity_size))
@@ -900,10 +970,10 @@ def build_pretty_printer():
     pp.add('Status', 'mongo::Status', False, StatusPrinter)
     pp.add('StatusWith', 'mongo::StatusWith', True, StatusWithPrinter)
     pp.add('StringData', 'mongo::StringData', False, StringDataPrinter)
-    pp.add('node_hash_map', 'absl::lts_20210324::node_hash_map', True, AbslNodeHashMapPrinter)
-    pp.add('node_hash_set', 'absl::lts_20210324::node_hash_set', True, AbslNodeHashSetPrinter)
-    pp.add('flat_hash_map', 'absl::lts_20210324::flat_hash_map', True, AbslFlatHashMapPrinter)
-    pp.add('flat_hash_set', 'absl::lts_20210324::flat_hash_set', True, AbslFlatHashSetPrinter)
+    pp.add('node_hash_map', 'absl::lts_20211102::node_hash_map', True, AbslNodeHashMapPrinter)
+    pp.add('node_hash_set', 'absl::lts_20211102::node_hash_set', True, AbslNodeHashSetPrinter)
+    pp.add('flat_hash_map', 'absl::lts_20211102::flat_hash_map', True, AbslFlatHashMapPrinter)
+    pp.add('flat_hash_set', 'absl::lts_20211102::flat_hash_set', True, AbslFlatHashSetPrinter)
     pp.add('RecordId', 'mongo::RecordId', False, RecordIdPrinter)
     pp.add('UUID', 'mongo::UUID', False, UUIDPrinter)
     pp.add('OID', 'mongo::OID', False, OIDPrinter)
@@ -914,6 +984,8 @@ def build_pretty_printer():
     pp.add('__wt_update', '__wt_update', False, WtUpdateToBsonPrinter)
     pp.add('CodeFragment', 'mongo::sbe::vm::CodeFragment', False, SbeCodeFragmentPrinter)
     pp.add('boost::optional', 'boost::optional', True, BoostOptionalPrinter)
+    pp.add('immutable::map', 'mongo::immutable::map', True, ImmutableMapPrinter)
+    pp.add('immutable::set', 'mongo::immutable::set', True, ImmutableSetPrinter)
 
     # Optimizer/ABT related pretty printers that can be used only with a running process.
     register_abt_printers(pp)

@@ -59,12 +59,12 @@ public:
     QueryStageSubplanTest() : _client(_opCtx.get()) {}
 
     virtual ~QueryStageSubplanTest() {
-        dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
+        dbtests::WriteContextForTests ctx(opCtx(), nss.ns_forTest());
         _client.dropCollection(nss);
     }
 
     void addIndex(const BSONObj& obj) {
-        ASSERT_OK(dbtests::createIndex(opCtx(), nss.ns(), obj));
+        ASSERT_OK(dbtests::createIndex(opCtx(), nss.ns_forTest(), obj));
     }
 
     void dropIndex(BSONObj keyPattern) {
@@ -126,7 +126,7 @@ private:
  * back to regular planning.
  */
 TEST_F(QueryStageSubplanTest, QueryStageSubplanGeo2dOr) {
-    dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
+    dbtests::WriteContextForTests ctx(opCtx(), nss.ns_forTest());
     addIndex(BSON("a"
                   << "2d"
                   << "b" << 1));
@@ -154,7 +154,7 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanGeo2dOr) {
         new SubplanStage(_expCtx.get(), collection, &ws, plannerParams, cq.get()));
 
     // Plan selection should succeed due to falling back on regular planning.
-    NoopYieldPolicy yieldPolicy(_clock);
+    NoopYieldPolicy yieldPolicy(_expCtx->opCtx, _clock);
     ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 }
 
@@ -192,7 +192,7 @@ void assertSubplanFromCache(QueryStageSubplanTest* test, const dbtests::WriteCon
     std::unique_ptr<SubplanStage> subplan(
         new SubplanStage(test->expCtx(), collection, &ws, plannerParams, cq.get()));
 
-    NoopYieldPolicy yieldPolicy(test->serviceContext()->getFastClockSource());
+    NoopYieldPolicy yieldPolicy(test->opCtx(), test->serviceContext()->getFastClockSource());
     ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 
     // Nothing is in the cache yet, so neither branch should have been planned from
@@ -215,7 +215,7 @@ void assertSubplanFromCache(QueryStageSubplanTest* test, const dbtests::WriteCon
  * Test the SubplanStage's ability to plan an individual branch using the plan cache.
  */
 TEST_F(QueryStageSubplanTest, QueryStageSubplanPlanFromCache) {
-    dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
+    dbtests::WriteContextForTests ctx(opCtx(), nss.ns_forTest());
 
     addIndex(BSON("a" << 1));
     addIndex(BSON("a" << 1 << "b" << 1));
@@ -228,7 +228,7 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanPlanFromCache) {
  * Test that the SubplanStage can plan an individual branch from the cache using a $** index.
  */
 TEST_F(QueryStageSubplanTest, QueryStageSubplanPlanFromCacheWithWildcardIndex) {
-    dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
+    dbtests::WriteContextForTests ctx(opCtx(), nss.ns_forTest());
 
     addIndex(BSON("$**" << 1));
     addIndex(BSON("a.$**" << 1));
@@ -240,7 +240,7 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanPlanFromCacheWithWildcardIndex) {
  * Ensure that the subplan stage doesn't create a plan cache entry if there are no query results.
  */
 TEST_F(QueryStageSubplanTest, QueryStageSubplanDontCacheZeroResults) {
-    dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
+    dbtests::WriteContextForTests ctx(opCtx(), nss.ns_forTest());
 
     addIndex(BSON("a" << 1 << "b" << 1));
     addIndex(BSON("a" << 1));
@@ -272,7 +272,7 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanDontCacheZeroResults) {
     std::unique_ptr<SubplanStage> subplan(
         new SubplanStage(_expCtx.get(), collection, &ws, plannerParams, cq.get()));
 
-    NoopYieldPolicy yieldPolicy(_clock);
+    NoopYieldPolicy yieldPolicy(_expCtx->opCtx, _clock);
     ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 
     // Nothing is in the cache yet, so neither branch should have been planned from
@@ -296,7 +296,7 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanDontCacheZeroResults) {
  * Ensure that the subplan stage doesn't create a plan cache entry if the candidate plans tie.
  */
 TEST_F(QueryStageSubplanTest, QueryStageSubplanDontCacheTies) {
-    dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
+    dbtests::WriteContextForTests ctx(opCtx(), nss.ns_forTest());
 
     addIndex(BSON("a" << 1 << "b" << 1));
     addIndex(BSON("a" << 1 << "c" << 1));
@@ -328,7 +328,7 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanDontCacheTies) {
     std::unique_ptr<SubplanStage> subplan(
         new SubplanStage(_expCtx.get(), collection, &ws, plannerParams, cq.get()));
 
-    NoopYieldPolicy yieldPolicy(_clock);
+    NoopYieldPolicy yieldPolicy(_expCtx->opCtx, _clock);
     ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 
     // Nothing is in the cache yet, so neither branch should have been planned from
@@ -476,7 +476,7 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanCanUseSubplanning) {
  * Regression test for SERVER-19388.
  */
 TEST_F(QueryStageSubplanTest, QueryStageSubplanPlanRootedOrNE) {
-    dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
+    dbtests::WriteContextForTests ctx(opCtx(), nss.ns_forTest());
     addIndex(BSON("a" << 1 << "b" << 1));
     addIndex(BSON("a" << 1 << "c" << 1));
 
@@ -500,7 +500,7 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanPlanRootedOrNE) {
     std::unique_ptr<SubplanStage> subplan(
         new SubplanStage(_expCtx.get(), collection, &ws, plannerParams, cq.get()));
 
-    NoopYieldPolicy yieldPolicy(_clock);
+    NoopYieldPolicy yieldPolicy(_expCtx->opCtx, _clock);
     ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 
     size_t numResults = 0;
@@ -517,7 +517,7 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanPlanRootedOrNE) {
 }
 
 TEST_F(QueryStageSubplanTest, ShouldReportErrorIfExceedsTimeLimitDuringPlanning) {
-    dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
+    dbtests::WriteContextForTests ctx(opCtx(), nss.ns_forTest());
     // Build a query with a rooted $or.
     auto findCommand = std::make_unique<FindCommandRequest>(nss);
     findCommand->setFilter(BSON("$or" << BSON_ARRAY(BSON("p1" << 1) << BSON("p2" << 2))));
@@ -545,12 +545,13 @@ TEST_F(QueryStageSubplanTest, ShouldReportErrorIfExceedsTimeLimitDuringPlanning)
     auto coll = ctx.getCollection();
     SubplanStage subplanStage(_expCtx.get(), coll, &workingSet, params, canonicalQuery.get());
 
-    AlwaysTimeOutYieldPolicy alwaysTimeOutPolicy(serviceContext()->getFastClockSource());
+    AlwaysTimeOutYieldPolicy alwaysTimeOutPolicy(_expCtx->opCtx,
+                                                 serviceContext()->getFastClockSource());
     ASSERT_EQ(ErrorCodes::ExceededTimeLimit, subplanStage.pickBestPlan(&alwaysTimeOutPolicy));
 }
 
 TEST_F(QueryStageSubplanTest, ShouldReportErrorIfKilledDuringPlanning) {
-    dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
+    dbtests::WriteContextForTests ctx(opCtx(), nss.ns_forTest());
     // Build a query with a rooted $or.
     auto findCommand = std::make_unique<FindCommandRequest>(nss);
     findCommand->setFilter(BSON("$or" << BSON_ARRAY(BSON("p1" << 1) << BSON("p2" << 2))));
@@ -570,14 +571,15 @@ TEST_F(QueryStageSubplanTest, ShouldReportErrorIfKilledDuringPlanning) {
     auto coll = ctx.getCollection();
     SubplanStage subplanStage(_expCtx.get(), coll, &workingSet, params, canonicalQuery.get());
 
-    AlwaysPlanKilledYieldPolicy alwaysPlanKilledYieldPolicy(serviceContext()->getFastClockSource());
+    AlwaysPlanKilledYieldPolicy alwaysPlanKilledYieldPolicy(_expCtx->opCtx,
+                                                            serviceContext()->getFastClockSource());
     ASSERT_EQ(ErrorCodes::QueryPlanKilled, subplanStage.pickBestPlan(&alwaysPlanKilledYieldPolicy));
 }
 
 TEST_F(QueryStageSubplanTest, ShouldThrowOnRestoreIfIndexDroppedBeforePlanSelection) {
     CollectionPtr collection;
     {
-        dbtests::WriteContextForTests ctx{opCtx(), nss.ns()};
+        dbtests::WriteContextForTests ctx{opCtx(), nss.ns_forTest()};
         addIndex(BSON("p1" << 1 << "opt1" << 1));
         addIndex(BSON("p1" << 1 << "opt2" << 1));
         addIndex(BSON("p2" << 1 << "opt1" << 1));
@@ -623,7 +625,7 @@ TEST_F(QueryStageSubplanTest, ShouldThrowOnRestoreIfIndexDroppedBeforePlanSelect
 TEST_F(QueryStageSubplanTest, ShouldNotThrowOnRestoreIfIndexDroppedAfterPlanSelection) {
     CollectionPtr collection;
     {
-        dbtests::WriteContextForTests ctx{opCtx(), nss.ns()};
+        dbtests::WriteContextForTests ctx{opCtx(), nss.ns_forTest()};
         addIndex(BSON("p1" << 1 << "opt1" << 1));
         addIndex(BSON("p1" << 1 << "opt2" << 1));
         addIndex(BSON("p2" << 1 << "opt1" << 1));
@@ -653,7 +655,7 @@ TEST_F(QueryStageSubplanTest, ShouldNotThrowOnRestoreIfIndexDroppedAfterPlanSele
     WorkingSet workingSet;
     SubplanStage subplanStage(_expCtx.get(), collection, &workingSet, params, canonicalQuery.get());
 
-    NoopYieldPolicy yieldPolicy(serviceContext()->getFastClockSource());
+    NoopYieldPolicy yieldPolicy(_expCtx->opCtx, serviceContext()->getFastClockSource());
     ASSERT_OK(subplanStage.pickBestPlan(&yieldPolicy));
 
     // Mimic a yield by saving the state of the subplan stage and dropping our lock. Then drop an

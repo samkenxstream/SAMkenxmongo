@@ -154,6 +154,11 @@ public:
     virtual ~CatalogCache();
 
     /**
+     * Shuts down and joins the executor used by all the caches to run their blocking work.
+     */
+    void shutDownAndJoin();
+
+    /**
      * Blocking method that ensures the specified database is in the cache, loading it if necessary,
      * and returns it. If the database was not in cache, all the sharded collections will be in the
      * 'needsRefresh' state.
@@ -393,6 +398,12 @@ private:
     void _triggerPlacementVersionRefresh(OperationContext* opCtx, const NamespaceString& nss);
 
     void _triggerIndexVersionRefresh(OperationContext* opCtx, const NamespaceString& nss);
+
+    // Same as getCollectionRoutingInfo but will fetch the index information from the cache even if
+    // the placement information is not sharded. Used internally when the a refresh is requested for
+    // the index component.
+    StatusWith<CollectionRoutingInfo> _getCollectionRoutingInfoWithoutOptimization(
+        OperationContext* opCtx, const NamespaceString& nss);
 
     // Interface from which chunks will be retrieved
     CatalogCacheLoader& _cacheLoader;

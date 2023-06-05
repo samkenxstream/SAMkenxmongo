@@ -60,15 +60,11 @@
 namespace mongo {
 namespace {
 
-const auto documentIdDecoration = OperationContext::declareDecoration<BSONObj>();
+const auto documentIdDecoration = OplogDeleteEntryArgs::declareDecoration<BSONObj>();
 
 bool isStandaloneOrPrimary(OperationContext* opCtx) {
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    const bool isReplSet =
-        replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
-    return !isReplSet ||
-        (repl::ReplicationCoordinator::get(opCtx)->getMemberState() ==
-         repl::MemberState::RS_PRIMARY);
+    return replCoord->canAcceptWritesForDatabase(opCtx, DatabaseName::kAdmin);
 }
 
 /**
@@ -103,31 +99,6 @@ private:
     const NamespaceString _nss;
     const bool _droppingCollection;
 };
-
-/**
- * Used to submit a range deletion task once it is certain that the update/insert to
- * config.rangeDeletions is committed.
- */
-class SubmitRangeDeletionHandler final : public RecoveryUnit::Change {
-public:
-    SubmitRangeDeletionHandler(OperationContext* opCtx, RangeDeletionTask task)
-        : _opCtx(opCtx), _task(std::move(task)) {}
-
-    void commit(OperationContext* opCtx, boost::optional<Timestamp>) override {
-        // (Ignore FCV check): This feature doesn't have any upgrade/downgrade concerns. The feature
-        // flag is used to turn on new range deleter on startup.
-        if (!feature_flags::gRangeDeleterService.isEnabledAndIgnoreFCVUnsafe()) {
-            migrationutil::submitRangeDeletionTask(_opCtx, _task).getAsync([](auto) {});
-        }
-    }
-
-    void rollback(OperationContext* opCtx) override {}
-
-private:
-    OperationContext* _opCtx;
-    RangeDeletionTask _task;
-};
-
 
 /**
  * Invalidates the in-memory routing table cache when a collection is dropped, so the next caller
@@ -185,7 +156,8 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
                                       std::vector<InsertStatement>::const_iterator begin,
                                       std::vector<InsertStatement>::const_iterator end,
                                       std::vector<bool> fromMigrate,
-                                      bool defaultFromMigrate) {
+                                      bool defaultFromMigrate,
+                                      InsertsOpStateAccumulator* opAccumulator) {
     const auto& nss = coll->ns();
 
     for (auto it = begin; it != end; ++it) {
@@ -223,11 +195,6 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
             auto deletionTask =
                 RangeDeletionTask::parse(IDLParserContext("ShardServerOpObserver"), insertedDoc);
 
-            if (!deletionTask.getPending()) {
-                opCtx->recoveryUnit()->registerChange(
-                    std::make_unique<SubmitRangeDeletionHandler>(opCtx, deletionTask));
-            }
-
             const auto numOrphanDocs = deletionTask.getNumOrphanDocs();
             BalancerStatsRegistry::get(opCtx)->onRangeDeletionTaskInsertion(
                 deletionTask.getCollectionUuid(), numOrphanDocs);
@@ -241,7 +208,7 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
             opCtx->recoveryUnit()->onCommit(
                 [insertedNss = collCSDoc.getNss(), reason = collCSDoc.getReason().getOwned()](
                     OperationContext* opCtx, boost::optional<Timestamp>) {
-                    if (nsIsDbOnly(insertedNss.ns())) {
+                    if (nsIsDbOnly(NamespaceStringUtil::serialize(insertedNss))) {
                         boost::optional<AutoGetDb> lockDbIfNotPrimary;
                         if (!isStandaloneOrPrimary(opCtx)) {
                             lockDbIfNotPrimary.emplace(opCtx, insertedNss.dbName(), MODE_IX);
@@ -274,7 +241,9 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
     }
 }
 
-void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
+void ShardServerOpObserver::onUpdate(OperationContext* opCtx,
+                                     const OplogUpdateEntryArgs& args,
+                                     OpStateAccumulator* opAccumulator) {
     const auto& updateDoc = args.updateArgs->update;
     // Most of these handlers do not need to run when the update is a full document replacement.
     // An empty updateDoc implies a no-op update and is not a valid oplog entry.
@@ -365,31 +334,11 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
             // block.
             AllowLockAcquisitionOnTimestampedUnitOfWork allowLockAcquisition(opCtx->lockState());
 
-            DatabaseName dbName(boost::none, db);
+            DatabaseName dbName = DatabaseNameUtil::deserialize(boost::none, db);
             AutoGetDb autoDb(opCtx, dbName, MODE_X);
             auto scopedDss =
                 DatabaseShardingState::assertDbLockedAndAcquireExclusive(opCtx, dbName);
             scopedDss->clearDbInfo(opCtx);
-        }
-    }
-
-    if (needsSpecialHandling && args.coll->ns() == NamespaceString::kRangeDeletionNamespace) {
-        if (!isStandaloneOrPrimary(opCtx))
-            return;
-
-        const auto pendingFieldRemovedStatus =
-            update_oplog_entry::isFieldRemovedByUpdate(args.updateArgs->update, "pending");
-
-        if (pendingFieldRemovedStatus == update_oplog_entry::FieldRemovedStatus::kFieldRemoved) {
-            auto deletionTask = RangeDeletionTask::parse(IDLParserContext("ShardServerOpObserver"),
-                                                         args.updateArgs->updatedDoc);
-
-            if (deletionTask.getDonorShardId() != ShardingState::get(opCtx)->shardId()) {
-                // Range deletion tasks for moved away chunks are scheduled through the
-                // MigrationCoordinator, so only schedule a task for received chunks.
-                opCtx->recoveryUnit()->registerChange(
-                    std::make_unique<SubmitRangeDeletionHandler>(opCtx, deletionTask));
-            }
         }
     }
 
@@ -402,7 +351,7 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
         opCtx->recoveryUnit()->onCommit(
             [updatedNss = collCSDoc.getNss(), reason = collCSDoc.getReason().getOwned()](
                 OperationContext* opCtx, boost::optional<Timestamp>) {
-                if (nsIsDbOnly(updatedNss.ns())) {
+                if (nsIsDbOnly(NamespaceStringUtil::serialize(updatedNss))) {
                     boost::optional<AutoGetDb> lockDbIfNotPrimary;
                     if (!isStandaloneOrPrimary(opCtx)) {
                         lockDbIfNotPrimary.emplace(opCtx, updatedNss.dbName(), MODE_IX);
@@ -449,15 +398,17 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
 
 void ShardServerOpObserver::aboutToDelete(OperationContext* opCtx,
                                           const CollectionPtr& coll,
-                                          BSONObj const& doc) {
+                                          BSONObj const& doc,
+                                          OplogDeleteEntryArgs* args,
+                                          OpStateAccumulator* opAccumulator) {
 
     if (coll->ns() == NamespaceString::kCollectionCriticalSectionsNamespace ||
         coll->ns() == NamespaceString::kRangeDeletionNamespace) {
-        documentIdDecoration(opCtx) = doc;
+        documentIdDecoration(args) = doc;
     } else {
         // Extract the _id field from the document. If it does not have an _id, use the
         // document itself as the _id.
-        documentIdDecoration(opCtx) = doc["_id"] ? doc["_id"].wrap() : doc;
+        documentIdDecoration(args) = doc["_id"] ? doc["_id"].wrap() : doc;
     }
 }
 
@@ -561,7 +512,7 @@ void ShardServerOpObserver::onModifyCollectionShardingIndexCatalog(OperationCont
                 uassert(7079505,
                         format(FMT_STRING("The critical section for collection {} must be taken in "
                                           "order to execute this command"),
-                               renameEntry.getToNss().toString()),
+                               renameEntry.getToNss().toStringForErrorMsg()),
                         toCSR->getCriticalSectionSignal(opCtx,
                                                         ShardingMigrationCriticalSection::kWrite));
                 toCSR->replaceIndexes(opCtx, fromIndexes, {*uuid, renameEntry.getLastmod()});
@@ -576,9 +527,10 @@ void ShardServerOpObserver::onModifyCollectionShardingIndexCatalog(OperationCont
 void ShardServerOpObserver::onDelete(OperationContext* opCtx,
                                      const CollectionPtr& coll,
                                      StmtId stmtId,
-                                     const OplogDeleteEntryArgs& args) {
+                                     const OplogDeleteEntryArgs& args,
+                                     OpStateAccumulator* opAccumulator) {
     const auto& nss = coll->ns();
-    auto& documentId = documentIdDecoration(opCtx);
+    auto& documentId = documentIdDecoration(args);
     invariant(!documentId.isEmpty());
 
     if (nss == NamespaceString::kShardConfigCollectionsNamespace) {
@@ -600,7 +552,7 @@ void ShardServerOpObserver::onDelete(OperationContext* opCtx,
         // TODO SERVER-58223: evaluate whether this is safe or whether acquiring the lock can block.
         AllowLockAcquisitionOnTimestampedUnitOfWork allowLockAcquisition(opCtx->lockState());
 
-        DatabaseName dbName(boost::none, deletedDatabase);
+        DatabaseName dbName = DatabaseNameUtil::deserialize(boost::none, deletedDatabase);
         AutoGetDb autoDb(opCtx, dbName, MODE_X);
         auto scopedDss = DatabaseShardingState::assertDbLockedAndAcquireExclusive(opCtx, dbName);
         scopedDss->clearDbInfo(opCtx);
@@ -632,7 +584,7 @@ void ShardServerOpObserver::onDelete(OperationContext* opCtx,
         opCtx->recoveryUnit()->onCommit(
             [deletedNss = collCSDoc.getNss(), reason = collCSDoc.getReason().getOwned()](
                 OperationContext* opCtx, boost::optional<Timestamp>) {
-                if (nsIsDbOnly(deletedNss.ns())) {
+                if (nsIsDbOnly(NamespaceStringUtil::serialize(deletedNss))) {
                     boost::optional<AutoGetDb> lockDbIfNotPrimary;
                     if (!isStandaloneOrPrimary(opCtx)) {
                         lockDbIfNotPrimary.emplace(opCtx, deletedNss.dbName(), MODE_IX);
@@ -709,6 +661,7 @@ void ShardServerOpObserver::onCreateCollection(OperationContext* opCtx,
                                                const OplogSlot& createOpTime,
                                                bool fromMigrate) {
     // Only the shard primay nodes control the collection creation and secondaries just follow
+    // Secondaries CSR will be the defaulted one (UNKNOWN in most of the cases)
     if (!opCtx->writesAreReplicated()) {
         return;
     }
@@ -733,10 +686,12 @@ void ShardServerOpObserver::onCreateCollection(OperationContext* opCtx,
             oss._allowCollectionCreation);
 
     // If the check above passes, this means the collection doesn't exist and is being created and
-    // that the caller will be responsible to eventially set the proper placement version
+    // that the caller will be responsible to eventially set the proper placement version.
     auto scopedCsr =
         CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(opCtx, collectionName);
-    if (!scopedCsr->getCurrentMetadataIfKnown()) {
+    if (oss._forceCSRAsUnknownAfterCollectionCreation) {
+        scopedCsr->clearFilteringMetadata(opCtx);
+    } else if (!scopedCsr->getCurrentMetadataIfKnown()) {
         scopedCsr->setFilteringMetadata(opCtx, CollectionMetadata());
     }
 }
@@ -745,7 +700,8 @@ repl::OpTime ShardServerOpObserver::onDropCollection(OperationContext* opCtx,
                                                      const NamespaceString& collectionName,
                                                      const UUID& uuid,
                                                      std::uint64_t numRecords,
-                                                     const CollectionDropType dropType) {
+                                                     const CollectionDropType dropType,
+                                                     bool markFromMigrate) {
     if (collectionName == NamespaceString::kServerConfigurationNamespace) {
         // Dropping system collections is not allowed for end users
         invariant(!opCtx->writesAreReplicated());
@@ -807,8 +763,8 @@ void ShardServerOpObserver::onCollMod(OperationContext* opCtx,
     abortOngoingMigrationIfNeeded(opCtx, nss);
 };
 
-void ShardServerOpObserver::_onReplicationRollback(OperationContext* opCtx,
-                                                   const RollbackObserverInfo& rbInfo) {
+void ShardServerOpObserver::onReplicationRollback(OperationContext* opCtx,
+                                                  const RollbackObserverInfo& rbInfo) {
     ShardingRecoveryService::get(opCtx)->recoverStates(opCtx, rbInfo.rollbackNamespaces);
 }
 

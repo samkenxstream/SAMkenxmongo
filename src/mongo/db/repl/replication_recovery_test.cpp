@@ -122,12 +122,12 @@ private:
 
 class ReplicationRecoveryTestObObserver : public OpObserverNoop {
 public:
-    using OpObserver::onDropCollection;
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   const UUID& uuid,
                                   std::uint64_t numRecords,
-                                  const CollectionDropType dropType) override {
+                                  const CollectionDropType dropType,
+                                  bool markFromMigrate) override {
         // If the oplog is not disabled for this namespace, then we need to reserve an op time for
         // the drop.
         if (!repl::ReplicationCoordinator::get(opCtx)->isOplogDisabledFor(opCtx, collectionName)) {
@@ -302,7 +302,7 @@ repl::OplogEntry _makeTransactionOplogEntry(repl::OpTime opTime,
     builder.append("t", opTime.getTerm());
     builder.append("v", repl::OplogEntry::kOplogVersion);
     builder.append("op", "c");
-    builder.append("ns", testNs.toString());
+    builder.append("ns", testNs.toString_forTest());
     builder.append("o", object);
     builder.append("wall", wallTime);
     builder.append("stmtId", stmtId);
@@ -1134,7 +1134,7 @@ TEST_F(ReplicationRecoveryTest, CommitTransactionOplogEntryCorrectlyUpdatesConfi
 
     const auto txnOperations = BSON_ARRAY(BSON("op"
                                                << "i"
-                                               << "ns" << testNs.toString() << "o"
+                                               << "ns" << testNs.toString_forTest() << "o"
                                                << BSON("_id" << 1)));
     const auto prepareDate = Date_t::now();
     const auto prepareOp =
@@ -1209,7 +1209,7 @@ TEST_F(ReplicationRecoveryTest,
 
     const auto txnOperations = BSON_ARRAY(BSON("op"
                                                << "i"
-                                               << "ns" << testNs.toString() << "o"
+                                               << "ns" << testNs.toString_forTest() << "o"
                                                << BSON("_id" << 1)));
     const auto prepareDate = Date_t::now();
     const auto prepareOp =

@@ -255,14 +255,7 @@ void _appendInProgressIndexesStats(OperationContext* opCtx,
             }
         }
 
-        // Not all indexes in the collection stats may be visible or consistent with our
-        // snapshot. For this reason, it is unsafe to check `isReady` on the entry, which
-        // asserts that the index's in-memory state is consistent with our snapshot.
-        if (!entry->isPresentInMySnapshot(opCtx)) {
-            continue;
-        }
-
-        if (!entry->isReadyInMySnapshot(opCtx)) {
+        if (!entry->isReady()) {
             indexBuilds.push_back(descriptor->indexName());
         }
     }
@@ -346,7 +339,7 @@ Status appendCollectionStorageStats(OperationContext* opCtx,
         result->append("indexSizes", BSONObj());
         result->append("scaleFactor", scale);
         return {ErrorCodes::NamespaceNotFound,
-                "Collection [" + collNss.toString() + "] not found."};
+                "Collection [" + collNss.toStringForErrorMsg() + "] not found."};
     }
 
     // We will parse all 'filterObj' into different groups of data to compute. This groups will be
@@ -407,7 +400,7 @@ Status appendCollectionRecordCount(OperationContext* opCtx,
     AutoGetCollectionForReadCommandMaybeLockFree collection(opCtx, nss);
     if (!collection) {
         return {ErrorCodes::NamespaceNotFound,
-                str::stream() << "Collection [" << nss.toString() << "] not found."};
+                str::stream() << "Collection [" << nss.toStringForErrorMsg() << "] not found."};
     }
 
     result->appendNumber("count", static_cast<long long>(collection->numRecords(opCtx)));

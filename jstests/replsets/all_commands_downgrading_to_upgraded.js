@@ -29,6 +29,7 @@ const isAnInternalCommand = "internal command";
 const isDeprecated = "deprecated command";
 const commandIsDisabledOnLastLTS = "skip command on downgrading fcv";
 const requiresParallelShell = "requires parallel shell";
+const cannotRunWhileDowngrading = "cannot run command while downgrading";
 
 const allCommands = {
     _addShard: {skip: isAnInternalCommand},
@@ -66,14 +67,16 @@ const allCommands = {
     _configsvrRemoveTags: {skip: isAnInternalCommand},
     _configsvrRepairShardedCollectionChunksHistory: {skip: isAnInternalCommand},
     _configsvrRenameCollectionMetadata: {skip: isAnInternalCommand},
+    _configsvrResetPlacementHistory: {skip: isAnInternalCommand},
     _configsvrReshardCollection: {skip: isAnInternalCommand},
     _configsvrRunRestore: {skip: isAnInternalCommand},
     _configsvrSetAllowMigrations: {skip: isAnInternalCommand},
     _configsvrSetClusterParameter: {skip: isAnInternalCommand},
     _configsvrSetUserWriteBlockMode: {skip: isAnInternalCommand},
-    _configsvrTransitionToCatalogShard: {skip: isAnInternalCommand},
+    _configsvrTransitionFromDedicatedConfigServer: {skip: isAnInternalCommand},
     _configsvrTransitionToDedicatedConfigServer: {skip: isAnInternalCommand},
     _configsvrUpdateZoneKeyRange: {skip: isAnInternalCommand},
+    _dropConnectionsToMongot: {skip: isAnInternalCommand},
     _flushDatabaseCacheUpdates: {skip: isAnInternalCommand},
     _flushDatabaseCacheUpdatesWithWriteConcern: {skip: isAnInternalCommand},
     _flushReshardingStateChange: {skip: isAnInternalCommand},
@@ -87,6 +90,7 @@ const allCommands = {
     _killOperations: {skip: isAnInternalCommand},
     _mergeAuthzCollections: {skip: isAnInternalCommand},
     _migrateClone: {skip: isAnInternalCommand},
+    _mongotConnPoolStats: {skip: isAnInternalCommand},
     _movePrimaryRecipientAbortMigration: {skip: isAnInternalCommand},
     _movePrimaryRecipientForgetMigration: {skip: isAnInternalCommand},
     _movePrimaryRecipientSyncData: {skip: isAnInternalCommand},
@@ -97,6 +101,7 @@ const allCommands = {
     _recvChunkStatus: {skip: isAnInternalCommand},
     _refreshQueryAnalyzerConfiguration: {skip: isAnInternalCommand},
     _shardsvrAbortReshardCollection: {skip: isAnInternalCommand},
+    _shardsvrCleanupStructuredEncryptionData: {skip: isAnInternalCommand},
     _shardsvrCleanupReshardCollection: {skip: isAnInternalCommand},
     _shardsvrCloneCatalogData: {skip: isAnInternalCommand},
     _shardsvrCompactStructuredEncryptionData: {skip: isAnInternalCommand},
@@ -144,7 +149,13 @@ const allCommands = {
     _shardsvrParticipantBlock: {skip: isAnInternalCommand},
     _shardsvrCheckMetadataConsistency: {skip: isAnInternalCommand},
     _shardsvrCheckMetadataConsistencyParticipant: {skip: isAnInternalCommand},
-    _startStreamProcessor: {skip: isAnInternalCommand},
+    streams_startStreamProcessor: {skip: isAnInternalCommand},
+    streams_startStreamSample: {skip: isAnInternalCommand},
+    streams_stopStreamProcessor: {skip: isAnInternalCommand},
+    streams_listStreamProcessors: {skip: isAnInternalCommand},
+    streams_getMoreStreamSample: {skip: isAnInternalCommand},
+    streams_getStats: {skip: isAnInternalCommand},
+    streams_testOnlyInsert: {skip: isAnInternalCommand},
     _transferMods: {skip: isAnInternalCommand},
     _vectorClockPersist: {skip: isAnInternalCommand},
     abortReshardCollection: {
@@ -231,8 +242,6 @@ const allCommands = {
     analyzeShardKey: {
         // TODO SERVER-74867: Remove the skip once 7.0 is lastLTS.
         skip: commandIsDisabledOnLastLTS,
-        // TODO SERVER-67966: Remove check when this feature flag is removed.
-        checkFeatureFlag: "AnalyzeShardKey",
         setUp: function(conn) {
             assert.commandWorked(conn.getDB(dbName).runCommand({create: collName}));
             assert.commandWorked(
@@ -365,6 +374,7 @@ const allCommands = {
         // operation.
         skip: "requires additional setup through a failed resharding operation",
     },
+    cleanupStructuredEncryptionData: {skip: "requires additional encrypted collection setup"},
     clearJumboFlag: {
         isShardedOnly: true,
         fullScenario: function(conn, fixture) {
@@ -487,7 +497,7 @@ const allCommands = {
             assert.commandWorked(
                 conn.getDB('admin').runCommand({shardCollection: fullNs, key: {_id: 1}}));
         },
-        command: {configureCollectionBalancing: fullNs, enableAutoSplitter: true},
+        command: {configureCollectionBalancing: fullNs, chunkSize: 1},
         teardown: function(conn) {
             assert.commandWorked(conn.getDB(dbName).runCommand({drop: collName}));
         },
@@ -497,8 +507,6 @@ const allCommands = {
     configureQueryAnalyzer: {
         // TODO SERVER-74867: Remove the skip once 7.0 is lastLTS.
         skip: commandIsDisabledOnLastLTS,
-        // TODO SERVER-67966: Remove check when this feature flag is removed.
-        checkFeatureFlag: "AnalyzeShardKey",
         setUp: function(conn) {
             assert.commandWorked(conn.getDB(dbName).runCommand({create: collName}));
             for (let i = 0; i < 10; i++) {
@@ -1091,13 +1099,7 @@ const allCommands = {
         },
     },
     movePrimary: {
-        isShardedOnly: true,
-        fullScenario: function(conn, fixture) {
-            assert.commandWorked(conn.getDB(dbName).runCommand({create: collName}));
-            assert.commandWorked(conn.getDB('admin').runCommand(
-                {movePrimary: dbName, to: fixture.shard0.shardName}));
-            assert.commandWorked(conn.getDB(dbName).runCommand({drop: collName}));
-        }
+        skip: cannotRunWhileDowngrading,
     },
     moveRange: {
         isShardedOnly: true,
@@ -1315,6 +1317,11 @@ const allCommands = {
         isAdminCommand: true,
         command: {replSetResizeOplog: 1, minRetentionHours: 1},
     },
+    resetPlacementHistory: {
+        command: {resetPlacementHistory: 1},
+        isShardedOnly: true,
+        isAdminCommand: true,
+    },
     reshardCollection: {
         // TODO SERVER-74867: Remove the skip once 7.0 is lastLTS.
         skip: commandIsDisabledOnLastLTS,
@@ -1493,10 +1500,7 @@ const allCommands = {
         command: {shardingState: 1},
         isShardSvrOnly: true,
     },
-    shutdown: {
-        // TODO SERVER-74810: Add a separate JS test for this.
-        skip: "tested in a separate JS test"
-    },
+    shutdown: {skip: "tested in multiVersion/genericSetFCVUsage/restart_during_downgrading_fcv.js"},
     sleep: {skip: isAnInternalCommand},
     split: {
         setUp: function(conn) {
@@ -1544,12 +1548,12 @@ const allCommands = {
         isAdminCommand: true,
         doesNotRunOnMongos: true,
     },
-    transitionToCatalogShard: {
+    transitionFromDedicatedConfigServer: {
         // TODO SERVER-74867: Remove the skip once 7.0 is lastLTS.
         skip: commandIsDisabledOnLastLTS,
         // TODO SERVER-66060: Remove check when this feature flag is removed.
         checkFeatureFlag: "CatalogShard",
-        command: {transitionToCatalogShard: 1},
+        command: {transitionFromDedicatedConfigServer: 1},
         isShardedOnly: true,
         isAdminCommand: true,
     },
@@ -1770,11 +1774,6 @@ let runAllCommands = function(command, test, conn, fixture) {
 };
 
 let runTest = function(conn, adminDB, fixture) {
-    let runDowngradingToUpgrading = false;
-    if (FeatureFlagUtil.isEnabled(adminDB, "DowngradingToUpgrading")) {
-        runDowngradingToUpgrading = true;
-    }
-
     assert.commandFailed(conn.adminCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
 
     jsTestLog("Running all commands in the downgradingToLastLTS FCV");
@@ -1801,30 +1800,28 @@ let runTest = function(conn, adminDB, fixture) {
         runAllCommands(command, test, conn, fixture);
     }
 
-    if (runDowngradingToUpgrading) {
-        assert.commandWorked(conn.adminCommand({setFeatureCompatibilityVersion: latestFCV}));
+    assert.commandWorked(conn.adminCommand({setFeatureCompatibilityVersion: latestFCV}));
 
-        jsTestLog("Running all commands after upgrading back to the latest FCV");
-        commandsList = AllCommandsTest.checkCommandCoverage(conn, allCommands);
-        if (isMongos(adminDB)) {
-            let shardCommandsList =
-                AllCommandsTest.checkCommandCoverage(fixture.shard0.rs.getPrimary(), allCommands);
-            commandsList = new Set(commandsList.concat(shardCommandsList));
+    jsTestLog("Running all commands after upgrading back to the latest FCV");
+    commandsList = AllCommandsTest.checkCommandCoverage(conn, allCommands);
+    if (isMongos(adminDB)) {
+        let shardCommandsList =
+            AllCommandsTest.checkCommandCoverage(fixture.shard0.rs.getPrimary(), allCommands);
+        commandsList = new Set(commandsList.concat(shardCommandsList));
+    }
+
+    for (const command of commandsList) {
+        const test = allCommands[command];
+
+        // Coverage already guaranteed above, but check again just in case.
+        assert(test, "Coverage failure: must explicitly define a test for " + command);
+
+        if (test.skip !== undefined) {
+            jsTestLog("Skipping " + command + ": " + test.skip);
+            continue;
         }
 
-        for (const command of commandsList) {
-            const test = allCommands[command];
-
-            // Coverage already guaranteed above, but check again just in case.
-            assert(test, "Coverage failure: must explicitly define a test for " + command);
-
-            if (test.skip !== undefined) {
-                jsTestLog("Skipping " + command + ": " + test.skip);
-                continue;
-            }
-
-            runAllCommands(command, test, conn, fixture);
-        }
+        runAllCommands(command, test, conn, fixture);
     }
 };
 

@@ -68,10 +68,11 @@ void acquireCollectionLocksInResourceIdOrder(
         // ResourceId(RESOURCE_COLLECTION, nss).
         temp.insert(catalog->resolveNamespaceStringOrUUID(opCtx, nsOrUUID));
         for (const auto& secondaryNssOrUUID : secondaryNssOrUUIDs) {
-            invariant(secondaryNssOrUUID.db() == nsOrUUID.db(),
+            invariant(secondaryNssOrUUID.dbName() == nsOrUUID.dbName(),
                       str::stream()
                           << "Unable to acquire locks for collections across different databases ("
-                          << secondaryNssOrUUID << " vs " << nsOrUUID << ")");
+                          << secondaryNssOrUUID.toStringForErrorMsg() << " vs "
+                          << nsOrUUID.toStringForErrorMsg() << ")");
             temp.insert(catalog->resolveNamespaceStringOrUUID(opCtx, secondaryNssOrUUID));
         }
 

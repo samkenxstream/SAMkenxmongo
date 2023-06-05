@@ -35,6 +35,7 @@
 
 #include "mongo/base/secure_allocator.h"
 #include "mongo/crypto/aead_encryption.h"
+#include "mongo/crypto/fle_stats_gen.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -250,6 +251,22 @@ struct FLEEdgePrfBlock {
 };
 
 /**
+ * A pair of non-anchor and anchor positions.
+ */
+struct ESCCountsPair {
+    uint64_t cpos;
+    uint64_t apos;
+};
+
+/**
+ * A pair of optional non-anchor and anchor positions returned by emulated binary search.
+ */
+struct EmuBinaryResult {
+    boost::optional<uint64_t> cpos;
+    boost::optional<uint64_t> apos;
+};
+
+/**
  * The information retrieved from ESC for a given ESC token. Count may reflect a count suitable for
  * insert or query.
  */
@@ -261,10 +278,32 @@ struct FLEEdgeCountInfo {
                      boost::optional<EDCDerivedFromDataTokenAndContentionFactorToken> edcParam)
         : count(c), tagToken(t), edc(edcParam) {}
 
+    FLEEdgeCountInfo(uint64_t c,
+                     ESCTwiceDerivedTagToken t,
+                     boost::optional<EmuBinaryResult> searchedCounts,
+                     boost::optional<ESCCountsPair> nullAnchorCounts,
+                     boost::optional<ECStats> stats,
+                     boost::optional<EDCDerivedFromDataTokenAndContentionFactorToken> edcParam)
+        : count(c),
+          tagToken(t),
+          searchedCounts(searchedCounts),
+          nullAnchorCounts(nullAnchorCounts),
+          stats(stats),
+          edc(edcParam) {}
+
+
     // May reflect a value suitable for insert or query.
     uint64_t count;
 
     ESCTwiceDerivedTagToken tagToken;
+
+    // Positions returned by emuBinary (used by compact & cleanup)
+    boost::optional<EmuBinaryResult> searchedCounts;
+
+    // Positions obtained from null anchor decode (used by cleanup)
+    boost::optional<ESCCountsPair> nullAnchorCounts;
+
+    boost::optional<ECStats> stats;
 
     boost::optional<EDCDerivedFromDataTokenAndContentionFactorToken> edc;
 };

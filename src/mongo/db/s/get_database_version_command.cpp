@@ -44,7 +44,6 @@
 
 
 namespace mongo {
-namespace {
 
 class GetDatabaseVersionCmd final : public TypedCommand<GetDatabaseVersionCmd> {
 public:
@@ -80,7 +79,7 @@ public:
                     str::stream() << definition()->getName() << " can only be run on shard servers",
                     serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
 
-            DatabaseName dbName(boost::none, _targetDb());
+            DatabaseName dbName = DatabaseNameUtil::deserialize(boost::none, _targetDb());
             AutoGetDb autoDb(opCtx, dbName, MODE_IS);
             const auto scopedDss =
                 DatabaseShardingState::assertDbLockedAndAcquireShared(opCtx, dbName);
@@ -90,6 +89,10 @@ public:
                 versionObj = dbVersion->toBSON();
             }
             result->getBodyBuilder().append("dbVersion", versionObj);
+
+            if (const auto isPrimaryShardForDb = scopedDss->_isPrimaryShardForDb(opCtx)) {
+                result->getBodyBuilder().append("isPrimaryShardForDb", *isPrimaryShardForDb);
+            }
         }
 
         StringData _targetDb() const {
@@ -110,5 +113,4 @@ public:
     }
 } getDatabaseVersionCmd;
 
-}  // namespace
 }  // namespace mongo

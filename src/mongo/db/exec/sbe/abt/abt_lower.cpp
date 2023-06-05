@@ -326,11 +326,16 @@ sbe::value::SlotVector SBENodeLowering::convertRequiredProjectionsToSlots(
     }
 
     sbe::value::SlotVector result;
+    // Need to dedup here, because even if 'projections' is unique, 'slotMap' can map two
+    // projections to the same slot. 'convertProjectionsToSlots' can't dedup because it preserves
+    // the order of items in the vector.
+    sbe::value::SlotSet seen;
     const auto& projections =
         getPropertyConst<ProjectionRequirement>(props._physicalProps).getProjections();
     for (const auto slot : convertProjectionsToSlots(slotMap, projections.getVector())) {
-        if (toExcludeSet.count(slot) == 0) {
+        if (toExcludeSet.count(slot) == 0 && seen.count(slot) == 0) {
             result.push_back(slot);
+            seen.insert(slot);
         }
     }
     return result;
@@ -707,7 +712,7 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const GroupByNode& n,
     tassert(6624227, "refs expected", refsAgg);
     auto& exprs = refsAgg->nodes();
 
-    sbe::SlotExprPairVector aggs;
+    sbe::HashAggStage::AggExprVector aggs;
     aggs.reserve(exprs.size());
 
     for (size_t idx = 0; idx < exprs.size(); ++idx) {
@@ -715,7 +720,9 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const GroupByNode& n,
         auto slot = _slotIdGenerator.generate();
 
         mapProjToSlot(slotMap, names[idx], slot);
-        aggs.push_back({slot, std::move(expr)});
+        // TODO: We need to update the nullptr to pass in the initializer expression for certain
+        // accumulators.
+        aggs.push_back({slot, sbe::HashAggStage::AggExprPair{nullptr, std::move(expr)}});
     }
 
     boost::optional<sbe::value::SlotId> collatorSlot = _namedSlots.getSlotIfExists("collator"_sd);
@@ -752,8 +759,11 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const NestedLoopJoinNode& 
     for (const ProjectionName& projectionName : n.getCorrelatedProjectionNames()) {
         correlatedSlots.push_back(slotMap.at(projectionName));
     }
-    // Soring is not essential. Here we sort only for SBE plan stability.
+    // Sorting is not essential. Here we sort only for SBE plan stability.
     std::sort(correlatedSlots.begin(), correlatedSlots.end());
+    // However, we should deduplicate the slots, in case two projections mapped to the same slot.
+    correlatedSlots.erase(std::unique(correlatedSlots.begin(), correlatedSlots.end()),
+                          correlatedSlots.end());
 
     auto expr = lowerExpression(filter, slotMap);
 
@@ -1047,7 +1057,7 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const PhysicalScanNode& n,
         NamespaceStringOrUUID nss = parseFromScanDef(def);
 
         // Unused.
-        boost::optional<sbe::value::SlotId> seekKeySlot;
+        boost::optional<sbe::value::SlotId> seekRecordIdSlot;
 
         sbe::ScanCallbacks callbacks({}, {}, {});
         if (n.useParallelScan()) {
@@ -1085,7 +1095,9 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const PhysicalScanNode& n,
                                           boost::none,
                                           fields,
                                           vars,
-                                          seekKeySlot,
+                                          seekRecordIdSlot,
+                                          boost::none /* minRecordIdSlot */,
+                                          boost::none /* maxRecordIdSlot */,
                                           forwardScan,
                                           nullptr /*yieldPolicy*/,
                                           planNodeId,
@@ -1208,6 +1220,7 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const IndexScanNode& n,
                                                  resultSlot,
                                                  scanRidSlot,
                                                  boost::none,
+                                                 boost::none,
                                                  indexKeysToInclude,
                                                  vars,
                                                  std::move(lowerBoundExpr),
@@ -1234,7 +1247,7 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const SeekNode& n,
     sbe::value::SlotVector vars;
     generateSlots(slotMap, n.getFieldProjectionMap(), seekRidSlot, rootSlot, fields, vars);
 
-    boost::optional<sbe::value::SlotId> seekKeySlot = slotMap.at(n.getRIDProjectionName());
+    boost::optional<sbe::value::SlotId> seekRecordIdSlot = slotMap.at(n.getRIDProjectionName());
 
     sbe::ScanCallbacks callbacks({}, {}, {});
     const PlanNodeId planNodeId = _nodeToGroupPropsMap.at(&n)._planNodeId;
@@ -1248,7 +1261,9 @@ std::unique_ptr<sbe::PlanStage> SBENodeLowering::walk(const SeekNode& n,
                                       boost::none,
                                       fields,
                                       vars,
-                                      seekKeySlot,
+                                      seekRecordIdSlot,
+                                      boost::none /* minRecordIdSlot */,
+                                      boost::none /* maxRecordIdSlot */,
                                       true /*forward*/,
                                       nullptr /*yieldPolicy*/,
                                       planNodeId,

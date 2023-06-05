@@ -47,6 +47,7 @@
 #include "mongo/db/snapshot_window_options_gen.h"
 #include "mongo/db/transaction/transaction_api.h"
 #include "mongo/db/transaction/transaction_participant_gen.h"
+#include "mongo/db/transaction/transaction_participant_resource_yielder.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -143,7 +144,7 @@ BSONObj buildCountChunksInRangeCommand(const UUID& collectionUUID,
     AggregateCommandRequest countRequest(ChunkType::ConfigNS);
 
     BSONObjBuilder builder;
-    builder.append("aggregate", ChunkType::ConfigNS.ns());
+    builder.append("aggregate", NamespaceStringUtil::serialize(ChunkType::ConfigNS));
 
     BSONObjBuilder queryBuilder;
     queryBuilder << ChunkType::collectionUUID << collectionUUID;
@@ -218,7 +219,7 @@ StatusWith<ChunkVersion> getMaxChunkVersionFromQueryResponse(
     const auto& chunksVector = queryResponse.getValue().docs;
     if (chunksVector.empty()) {
         return {ErrorCodes::Error(50577),
-                str::stream() << "Collection '" << coll.getNss().ns()
+                str::stream() << "Collection '" << coll.getNss().toStringForErrorMsg()
                               << "' no longer either exists, is sharded, or has chunks"};
     }
 
@@ -233,21 +234,22 @@ StatusWith<ChunkVersion> getMaxChunkVersionFromQueryResponse(
  */
 StatusWith<std::pair<CollectionType, ChunkVersion>> getCollectionAndVersion(
     OperationContext* opCtx, Shard* configShard, const NamespaceString& nss) {
-    auto findCollResponse =
-        configShard->exhaustiveFindOnConfig(opCtx,
-                                            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                            repl::ReadConcernLevel::kLocalReadConcern,
-                                            CollectionType::ConfigNS,
-                                            BSON(CollectionType::kNssFieldName << nss.ns()),
-                                            {},
-                                            1);
+    auto findCollResponse = configShard->exhaustiveFindOnConfig(
+        opCtx,
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        repl::ReadConcernLevel::kLocalReadConcern,
+        CollectionType::ConfigNS,
+        BSON(CollectionType::kNssFieldName << NamespaceStringUtil::serialize(nss)),
+        {},
+        1);
     if (!findCollResponse.isOK()) {
         return findCollResponse.getStatus();
     }
 
     if (findCollResponse.getValue().docs.empty()) {
         return {ErrorCodes::ConflictingOperationInProgress,
-                str::stream() << "Sharded collection '" << nss.ns() << "' no longer exists"};
+                str::stream() << "Sharded collection '" << nss.toStringForErrorMsg()
+                              << "' no longer exists"};
     }
 
     const CollectionType coll(findCollResponse.getValue().docs[0]);
@@ -302,14 +304,14 @@ void bumpCollectionMinorVersion(OperationContext* opCtx,
                                 Shard* configShard,
                                 const NamespaceString& nss,
                                 TxnNumber txnNumber) {
-    const auto findCollResponse = uassertStatusOK(
-        configShard->exhaustiveFindOnConfig(opCtx,
-                                            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                            repl::ReadConcernLevel::kLocalReadConcern,
-                                            CollectionType::ConfigNS,
-                                            BSON(CollectionType::kNssFieldName << nss.ns()),
-                                            {},
-                                            1));
+    const auto findCollResponse = uassertStatusOK(configShard->exhaustiveFindOnConfig(
+        opCtx,
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        repl::ReadConcernLevel::kLocalReadConcern,
+        CollectionType::ConfigNS,
+        BSON(CollectionType::kNssFieldName << NamespaceStringUtil::serialize(nss)),
+        {},
+        1));
     uassert(
         ErrorCodes::NamespaceNotFound, "Collection does not exist", !findCollResponse.docs.empty());
     const CollectionType coll(findCollResponse.docs[0]);
@@ -325,8 +327,8 @@ void bumpCollectionMinorVersion(OperationContext* opCtx,
         1 /* limit */));
 
     uassert(ErrorCodes::IncompatibleShardingMetadata,
-            str::stream() << "Tried to find max chunk version for collection '" << nss.ns()
-                          << ", but found no chunks",
+            str::stream() << "Tried to find max chunk version for collection '"
+                          << nss.toStringForErrorMsg() << ", but found no chunks",
             !findChunkResponse.docs.empty());
 
     const auto newestChunk = uassertStatusOK(ChunkType::parseFromConfigBSON(
@@ -400,7 +402,7 @@ void logMergeToChangelog(OperationContext* opCtx,
 
     ShardingLogging::get(opCtx)->logChange(opCtx,
                                            "merge",
-                                           nss.ns(),
+                                           NamespaceStringUtil::serialize(nss),
                                            logDetail.obj(),
                                            WriteConcernOptions(),
                                            std::move(configShard),
@@ -456,9 +458,8 @@ void mergeAllChunksOnShardInTransaction(OperationContext* opCtx,
 
     auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
     auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
-    auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(executor);
 
-    txn_api::SyncTransactionWithRetries txn(opCtx, sleepInlineExecutor, nullptr, inlineExecutor);
+    txn_api::SyncTransactionWithRetries txn(opCtx, executor, nullptr, inlineExecutor);
     txn.run(opCtx, updateChunksFn);
 }
 
@@ -674,9 +675,8 @@ ShardingCatalogManager::_splitChunkInTransaction(OperationContext* opCtx,
 
     auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
     auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
-    auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(executor);
 
-    txn_api::SyncTransactionWithRetries txn(opCtx, sleepInlineExecutor, nullptr, inlineExecutor);
+    txn_api::SyncTransactionWithRetries txn(opCtx, executor, nullptr, inlineExecutor);
 
     // TODO: SERVER-72431 Make split chunk commit idempotent, with that we won't need anymore the
     // transaction precondition and we will be able to remove the try/catch on the transaction run
@@ -701,8 +701,7 @@ ShardingCatalogManager::commitChunkSplit(OperationContext* opCtx,
                                          const boost::optional<Timestamp>& requestTimestamp,
                                          const ChunkRange& range,
                                          const std::vector<BSONObj>& splitPoints,
-                                         const std::string& shardName,
-                                         const bool fromChunkSplitter) {
+                                         const std::string& shardName) {
 
     // Mark opCtx as interruptible to ensure that all reads and writes to the metadata collections
     // under the exclusive _kChunkOpLock happen on the same term.
@@ -721,13 +720,6 @@ ShardingCatalogManager::commitChunkSplit(OperationContext* opCtx,
     }
 
     const auto [coll, version] = std::move(swCollAndVersion.getValue());
-
-    // Don't allow auto-splitting if the collection is being defragmented
-    uassert(ErrorCodes::ConflictingOperationInProgress,
-            str::stream() << "Can't commit auto-split while `" << nss.ns()
-                          << "` is undergoing a defragmentation.",
-            !(coll.getDefragmentCollection() && fromChunkSplitter));
-
     auto collPlacementVersion = version;
 
     // Return an error if collection epoch does not match epoch of request.
@@ -735,7 +727,8 @@ ShardingCatalogManager::commitChunkSplit(OperationContext* opCtx,
         (requestTimestamp && coll.getTimestamp() != requestTimestamp)) {
         return {ErrorCodes::StaleEpoch,
                 str::stream() << "splitChunk cannot split chunk " << range.toString()
-                              << ". Epoch of collection '" << nss.ns() << "' has changed."
+                              << ". Epoch of collection '" << nss.toStringForErrorMsg()
+                              << "' has changed."
                               << " Current epoch: " << coll.getEpoch()
                               << ", cmd epoch: " << requestEpoch};
     }
@@ -772,7 +765,7 @@ ShardingCatalogManager::commitChunkSplit(OperationContext* opCtx,
 
         ShardingLogging::get(opCtx)->logChange(opCtx,
                                                "split",
-                                               nss.ns(),
+                                               NamespaceStringUtil::serialize(nss),
                                                logDetail.obj(),
                                                WriteConcernOptions(),
                                                _localConfigShard,
@@ -794,7 +787,7 @@ ShardingCatalogManager::commitChunkSplit(OperationContext* opCtx,
             const auto status =
                 ShardingLogging::get(opCtx)->logChangeChecked(opCtx,
                                                               "multi-split",
-                                                              nss.ns(),
+                                                              NamespaceStringUtil::serialize(nss),
                                                               chunkDetail.obj(),
                                                               WriteConcernOptions(),
                                                               _localConfigShard,
@@ -909,9 +902,8 @@ void ShardingCatalogManager::_mergeChunksInTransaction(
 
     auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
     auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
-    auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(executor);
 
-    txn_api::SyncTransactionWithRetries txn(opCtx, sleepInlineExecutor, nullptr, inlineExecutor);
+    txn_api::SyncTransactionWithRetries txn(opCtx, executor, nullptr, inlineExecutor);
     txn.run(opCtx, updateChunksFn);
 }
 
@@ -1273,7 +1265,7 @@ ShardingCatalogManager::commitChunkMigration(OperationContext* opCtx,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         repl::ReadConcernLevel::kLocalReadConcern,
         CollectionType::ConfigNS,
-        BSON(CollectionType::kNssFieldName << nss.ns()),
+        BSON(CollectionType::kNssFieldName << NamespaceStringUtil::serialize(nss)),
         {},
         1));
     uassert(ErrorCodes::ConflictingOperationInProgress,
@@ -1296,8 +1288,8 @@ ShardingCatalogManager::commitChunkMigration(OperationContext* opCtx,
         BSON(ChunkType::lastmod << -1),
         1));
     uassert(ErrorCodes::IncompatibleShardingMetadata,
-            str::stream() << "Tried to find max chunk version for collection '" << nss.ns()
-                          << ", but found no chunks",
+            str::stream() << "Tried to find max chunk version for collection '"
+                          << nss.toStringForErrorMsg() << ", but found no chunks",
             !findResponse.docs.empty());
 
     const auto chunk = uassertStatusOK(
@@ -1317,7 +1309,7 @@ ShardingCatalogManager::commitChunkMigration(OperationContext* opCtx,
     if (currentCollectionPlacementVersion.epoch() != collectionEpoch ||
         currentCollectionPlacementVersion.getTimestamp() != collectionTimestamp) {
         return {ErrorCodes::StaleEpoch,
-                str::stream() << "The epoch of collection '" << nss.ns()
+                str::stream() << "The epoch of collection '" << nss.toStringForErrorMsg()
                               << "' has changed since the migration began. The config server's "
                                  "collection placement version epoch is now '"
                               << currentCollectionPlacementVersion.epoch().toString()
@@ -1360,8 +1352,8 @@ ShardingCatalogManager::commitChunkMigration(OperationContext* opCtx,
 
     uassert(4914702,
             str::stream() << "Migrated  chunk " << migratedChunk.toString()
-                          << " from ns: " << nss.ns() << " not owned by donor " << fromShard
-                          << " neither by recipient " << toShard,
+                          << " from ns: " << nss.toStringForErrorMsg() << " not owned by donor "
+                          << fromShard << " neither by recipient " << toShard,
             currentChunk.getShard() == fromShard);
 
     if (migratedChunk.getVersion().isNotComparableWith(currentChunk.getVersion()) ||
@@ -1416,9 +1408,9 @@ ShardingCatalogManager::commitChunkMigration(OperationContext* opCtx,
 
     if (!newHistory.empty() && newHistory.front().getValidAfter() >= validAfter) {
         return {ErrorCodes::IncompatibleShardingMetadata,
-                str::stream() << "The chunk history for chunk with namespace " << nss.ns()
-                              << " and min key " << migratedChunk.getMin()
-                              << " is corrupted. The last validAfter "
+                str::stream() << "The chunk history for chunk with namespace "
+                              << nss.toStringForErrorMsg() << " and min key "
+                              << migratedChunk.getMin() << " is corrupted. The last validAfter "
                               << newHistory.back().getValidAfter().toString()
                               << " is greater or equal to the new validAfter "
                               << validAfter.toString()};
@@ -1574,7 +1566,7 @@ void ShardingCatalogManager::upgradeChunksHistory(OperationContext* opCtx,
         uassertStatusOK(response.toStatus());
 
         uassert(ErrorCodes::Error(5760502),
-                str::stream() << "No chunks found for collection " << nss.ns(),
+                str::stream() << "No chunks found for collection " << nss.toStringForErrorMsg(),
                 response.getN() > 0);
     }
 
@@ -1589,7 +1581,7 @@ void ShardingCatalogManager::upgradeChunksHistory(OperationContext* opCtx,
             BSONObj(),
             boost::none));
         uassert(ErrorCodes::Error(5760503),
-                str::stream() << "No chunks found for collection " << nss.ns(),
+                str::stream() << "No chunks found for collection " << nss.toStringForErrorMsg(),
                 !findChunksResponse.docs.empty());
         return std::move(findChunksResponse.docs);
     }();
@@ -1606,7 +1598,8 @@ void ShardingCatalogManager::upgradeChunksHistory(OperationContext* opCtx,
         if (historyIsAt40) {
             uassert(
                 ErrorCodes::Error(5760504),
-                str::stream() << "Chunk " << upgradeChunk.getName() << " in collection " << nss.ns()
+                str::stream() << "Chunk " << upgradeChunk.getName() << " in collection "
+                              << nss.toStringForErrorMsg()
                               << " indicates that it has been upgraded to version 4.0, but is "
                                  "missing the history field. This indicates a corrupted routing "
                                  "table and requires a manual intervention to be fixed.",
@@ -1651,7 +1644,7 @@ void ShardingCatalogManager::upgradeChunksHistory(OperationContext* opCtx,
                 opCtx,
                 ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                 "admin",
-                BSON("_flushRoutingTableCacheUpdates" << nss.ns()),
+                BSON("_flushRoutingTableCacheUpdates" << NamespaceStringUtil::serialize(nss)),
                 Shard::RetryPolicy::kIdempotent)));
     }
 }
@@ -1726,7 +1719,7 @@ void ShardingCatalogManager::clearJumboFlag(OperationContext* opCtx,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         repl::ReadConcernLevel::kLocalReadConcern,
         CollectionType::ConfigNS,
-        BSON(CollectionType::kNssFieldName << nss.ns()),
+        BSON(CollectionType::kNssFieldName << NamespaceStringUtil::serialize(nss)),
         {},
         1));
     uassert(ErrorCodes::ConflictingOperationInProgress,
@@ -1750,7 +1743,7 @@ void ShardingCatalogManager::clearJumboFlag(OperationContext* opCtx,
     const auto targetChunkVector = std::move(targetChunkResult.docs);
     uassert(51262,
             str::stream() << "Unable to locate chunk " << chunk.toString()
-                          << " from ns: " << nss.ns(),
+                          << " from ns: " << nss.toStringForErrorMsg(),
             !targetChunkVector.empty());
 
     const auto targetChunk = uassertStatusOK(ChunkType::parseFromConfigBSON(
@@ -1774,8 +1767,8 @@ void ShardingCatalogManager::clearJumboFlag(OperationContext* opCtx,
 
     const auto chunksVector = std::move(findResponse.docs);
     uassert(ErrorCodes::IncompatibleShardingMetadata,
-            str::stream() << "Tried to find max chunk version for collection '" << nss.ns()
-                          << ", but found no chunks",
+            str::stream() << "Tried to find max chunk version for collection '"
+                          << nss.toStringForErrorMsg() << ", but found no chunks",
             !chunksVector.empty());
 
     const auto highestVersionChunk = uassertStatusOK(
@@ -1788,7 +1781,7 @@ void ShardingCatalogManager::clearJumboFlag(OperationContext* opCtx,
     // or had its shard key refined since the migration began, unbeknown to the shard when the
     // command was sent.
     uassert(ErrorCodes::StaleEpoch,
-            str::stream() << "The epoch of collection '" << nss.ns()
+            str::stream() << "The epoch of collection '" << nss.toStringForErrorMsg()
                           << "' has changed since the migration began. The config server's "
                              "collection placement version epoch is now '"
                           << currentCollectionPlacementVersion.epoch().toString()
@@ -2108,7 +2101,7 @@ void ShardingCatalogManager::splitOrMarkJumbo(OperationContext* opCtx,
                 ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                 repl::ReadConcernLevel::kLocalReadConcern,
                 CollectionType::ConfigNS,
-                BSON(CollectionType::kNssFieldName << nss.ns()),
+                BSON(CollectionType::kNssFieldName << NamespaceStringUtil::serialize(nss)),
                 {},
                 1));
             uassert(ErrorCodes::ConflictingOperationInProgress,
@@ -2159,7 +2152,8 @@ void ShardingCatalogManager::setAllowMigrationsAndBumpOneChunk(
     OperationContext* opCtx,
     const NamespaceString& nss,
     const boost::optional<UUID>& collectionUUID,
-    bool allowMigrations) {
+    bool allowMigrations,
+    const std::string& cmdName) {
     std::set<ShardId> cmShardIds;
     {
         // Mark opCtx as interruptible to ensure that all reads and writes to the metadata
@@ -2179,64 +2173,130 @@ void ShardingCatalogManager::setAllowMigrationsAndBumpOneChunk(
         uassert(ErrorCodes::InvalidUUID,
                 str::stream() << "Collection uuid " << collectionUUID
                               << " in the request does not match the current uuid " << cm.getUUID()
-                              << " for ns " << nss,
+                              << " for ns " << nss.toStringForErrorMsg(),
                 !collectionUUID || collectionUUID == cm.getUUID());
 
         cm.getAllShardIds(&cmShardIds);
-        withTransaction(
-            opCtx,
-            CollectionType::ConfigNS,
-            [this, allowMigrations, &nss, &collectionUUID](OperationContext* opCtx,
-                                                           TxnNumber txnNumber) {
-                // Update the 'allowMigrations' field. An unset 'allowMigrations' field implies
-                // 'true'. To ease backwards compatibility we omit 'allowMigrations' instead of
-                // setting it explicitly to 'true'.
+
+        auto updateCollectionAndChunkFn = [allowMigrations, &nss, &collectionUUID](
+                                              const txn_api::TransactionClient& txnClient,
+                                              ExecutorPtr txnExec) {
+            write_ops::UpdateCommandRequest updateCollOp(CollectionType::ConfigNS);
+            updateCollOp.setUpdates([&] {
+                write_ops::UpdateOpEntry entry;
                 const auto update = allowMigrations
                     ? BSON("$unset" << BSON(CollectionType::kAllowMigrationsFieldName << ""))
                     : BSON("$set" << BSON(CollectionType::kAllowMigrationsFieldName << false));
 
-                BSONObj query = BSON(CollectionType::kNssFieldName << nss.ns());
+                BSONObj query =
+                    BSON(CollectionType::kNssFieldName << NamespaceStringUtil::serialize(nss));
                 if (collectionUUID) {
                     query =
                         query.addFields(BSON(CollectionType::kUuidFieldName << *collectionUUID));
                 }
+                entry.setQ(query);
+                entry.setU(update);
+                entry.setMulti(false);
+                return std::vector<write_ops::UpdateOpEntry>{entry};
+            }());
 
-                const auto res = writeToConfigDocumentInTxn(
-                    opCtx,
-                    CollectionType::ConfigNS,
-                    BatchedCommandRequest::buildUpdateOp(CollectionType::ConfigNS,
-                                                         query,
-                                                         update /* update */,
-                                                         false /* upsert */,
-                                                         false /* multi */),
-                    txnNumber);
-                const auto numDocsModified = UpdateOp::parseResponse(res).getN();
-                uassert(ErrorCodes::ConflictingOperationInProgress,
-                        str::stream() << "Expected to match one doc for query " << query
-                                      << " but matched " << numDocsModified,
-                        numDocsModified == 1);
+            auto updateCollResponse = txnClient.runCRUDOpSync(updateCollOp, {0});
+            uassertStatusOK(updateCollResponse.toStatus());
+            uassert(ErrorCodes::ConflictingOperationInProgress,
+                    str::stream() << "Expected to match one doc but matched "
+                                  << updateCollResponse.getN(),
+                    updateCollResponse.getN() == 1);
 
-                bumpCollectionMinorVersion(opCtx, _localConfigShard.get(), nss, txnNumber);
-            });
+            FindCommandRequest collQuery{CollectionType::ConfigNS};
+            collQuery.setFilter(
+                BSON(CollectionType::kNssFieldName << NamespaceStringUtil::serialize(nss)));
+            collQuery.setLimit(1);
 
+            const auto findCollResponse = txnClient.exhaustiveFindSync(collQuery);
+            uassert(ErrorCodes::NamespaceNotFound,
+                    "Collection does not exist",
+                    findCollResponse.size() == 1);
+            const CollectionType coll(findCollResponse[0]);
+
+            // Find the newest chunk
+            FindCommandRequest chunkQuery{ChunkType::ConfigNS};
+            chunkQuery.setFilter(BSON(ChunkType::collectionUUID << coll.getUuid()));
+            chunkQuery.setSort(BSON(ChunkType::lastmod << -1));
+            chunkQuery.setLimit(1);
+            const auto findChunkResponse = txnClient.exhaustiveFindSync(chunkQuery);
+
+            uassert(ErrorCodes::IncompatibleShardingMetadata,
+                    str::stream() << "Tried to find max chunk version for collection "
+                                  << nss.toStringForErrorMsg() << ", but found no chunks",
+                    findChunkResponse.size() == 1);
+
+            const auto newestChunk = uassertStatusOK(ChunkType::parseFromConfigBSON(
+                findChunkResponse[0], coll.getEpoch(), coll.getTimestamp()));
+            const auto targetVersion = [&]() {
+                ChunkVersion version = newestChunk.getVersion();
+                version.incMinor();
+                return version;
+            }();
+
+            write_ops::UpdateCommandRequest updateChunkOp(ChunkType::ConfigNS);
+            BSONObjBuilder updateBuilder;
+            BSONObjBuilder updateVersionClause(updateBuilder.subobjStart("$set"));
+            updateVersionClause.appendTimestamp(ChunkType::lastmod(), targetVersion.toLong());
+            updateVersionClause.doneFast();
+            const auto update = updateBuilder.obj();
+            updateChunkOp.setUpdates([&] {
+                write_ops::UpdateOpEntry entry;
+                entry.setQ(BSON(ChunkType::name << newestChunk.getName()));
+                entry.setU(update);
+                entry.setMulti(false);
+                entry.setUpsert(false);
+                return std::vector<write_ops::UpdateOpEntry>{entry};
+            }());
+            auto updateChunkResponse = txnClient.runCRUDOpSync(updateChunkOp, {1});
+            uassertStatusOK(updateChunkResponse.toStatus());
+            LOGV2_DEBUG(
+                7353900, 1, "Finished all transaction operations in setAllowMigrations command");
+
+            return SemiFuture<void>::makeReady();
+        };
+        auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+        auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
+
+        txn_api::SyncTransactionWithRetries txn(
+            opCtx,
+            executor,
+            TransactionParticipantResourceYielder::make("setAllowMigrationsAndBumpOneChunk"),
+            inlineExecutor);
+
+        txn.run(opCtx, updateCollectionAndChunkFn);
         // From now on migrations are not allowed anymore, so it is not possible that new shards
         // will own chunks for this collection.
     }
+    // If we have a session checked out, we need to yield it, considering we'll be doing a network
+    // operation that may block.
+    auto resourceYielder = TransactionParticipantResourceYielder::make(cmdName);
+    resourceYielder->yield(opCtx);
 
-    // Trigger a refresh on each shard containing chunks for this collection.
+    // Trigger a refresh on every shard. We send this to every shard and not just shards that own
+    // chunks for the collection because the set of shards owning chunks is updated before the
+    // critical section is released during chunk migrations. If the last chunk is moved off of a
+    // shard and this flush is not sent to that donor, stopMigrations will not wait for the critical
+    // section to finish on that shard (SERVER-73984).
     const auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
-    // TODO (SERVER-74477): Remove cmShardIds and always send the refresh to all shards.
-    if (feature_flags::gAllowMigrationsRefreshToAll.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+    // TODO (SERVER-74477): Remove catch of invalid view definition once 7.0 becomes LastLTS
+    try {
         const auto allShardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
         sharding_util::tellShardsToRefreshCollection(opCtx, allShardIds, nss, executor);
-    } else {
+    } catch (const ExceptionFor<ErrorCodes::InvalidViewDefinition>&) {
+        // In multiversion scenarios, some nodes may hit the bug in SERVER-74313. We should retry
+        // the command only on the shards that own chunks.
         sharding_util::tellShardsToRefreshCollection(opCtx,
                                                      {std::make_move_iterator(cmShardIds.begin()),
                                                       std::make_move_iterator(cmShardIds.end())},
                                                      nss,
                                                      executor);
     }
+    resourceYielder->unyield(opCtx);
 }
 
 void ShardingCatalogManager::bumpCollectionMinorVersionInTxn(OperationContext* opCtx,
@@ -2310,14 +2370,17 @@ void ShardingCatalogManager::_commitChunkMigrationInTransaction(
     std::shared_ptr<const std::vector<ChunkType>> splitChunks,
     std::shared_ptr<ChunkType> controlChunk,
     const ShardId& donorShardId) {
-    // Verify the placement info for collectionUUID needs to be updated because the donor is losing
-    // its last chunk for the namespace.
-    const auto removeDonorFromPlacementHistory = !controlChunk && splitChunks->empty();
 
-    // Verify the placement info for collectionUUID needs to be updated because the recipient is
-    // acquiring its first chunk for the namespace.
-    const auto addRecipientToPlacementHistory = [&] {
-        const auto chunkQuery =
+    const auto placementChangeInParentColl = [&] {
+        // Check if the donor will stop owning data of the parent collection once the migration
+        // is committed.
+        if (!controlChunk && splitChunks->empty()) {
+            return true;
+        }
+
+        // Check if the recipient isn't owning data of the parent collection prior to the
+        // migration commit.
+        const auto query =
             BSON(ChunkType::collectionUUID << migratedChunk->getCollectionUUID() << ChunkType::shard
                                            << migratedChunk->getShard());
         auto findResponse = uassertStatusOK(_localConfigShard->exhaustiveFindOnConfig(
@@ -2325,10 +2388,14 @@ void ShardingCatalogManager::_commitChunkMigrationInTransaction(
             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
             repl::ReadConcernLevel::kLocalReadConcern,
             ChunkType::ConfigNS,
-            chunkQuery,
+            query,
             BSONObj(),
             1 /* limit */));
-        return findResponse.docs.empty();
+        if (findResponse.docs.empty()) {
+            return true;
+        }
+
+        return false;
     }();
 
     const auto configChunksUpdateRequest = [&migratedChunk, &splitChunks, &controlChunk] {
@@ -2370,9 +2437,8 @@ void ShardingCatalogManager::_commitChunkMigrationInTransaction(
          recipientShardId = migratedChunk->getShard(),
          migrationCommitTime = migratedChunk->getHistory().front().getValidAfter(),
          configChunksUpdateRequest = std::move(configChunksUpdateRequest),
-         removeDonorFromPlacementHistory,
-         addRecipientToPlacementHistory](const txn_api::TransactionClient& txnClient,
-                                         ExecutorPtr txnExec) -> SemiFuture<void> {
+         placementChangeInParentColl](const txn_api::TransactionClient& txnClient,
+                                      ExecutorPtr txnExec) -> SemiFuture<void> {
         const long long nChunksToUpdate = configChunksUpdateRequest.getUpdates().size();
 
         auto updateConfigChunksFuture =
@@ -2387,133 +2453,49 @@ void ShardingCatalogManager::_commitChunkMigrationInTransaction(
                             updateResponse.getN() == nChunksToUpdate);
                 });
 
-        if (!(removeDonorFromPlacementHistory || addRecipientToPlacementHistory)) {
+        if (!placementChangeInParentColl) {
             // End the transaction here.
             return std::move(updateConfigChunksFuture).semi();
         }
 
-        // The main method to store placement info as part of the transaction, given a valid
-        // descriptor.
-        auto persistPlacementInfoSubchain = [txnExec,
-                                             &txnClient](NamespacePlacementType&& placementInfo) {
-            write_ops::InsertCommandRequest insertPlacementEntry(
-                NamespaceString::kConfigsvrPlacementHistoryNamespace, {placementInfo.toBSON()});
-            return txnClient.runCRUDOp(insertPlacementEntry, {})
-                .thenRunOn(txnExec)
-                .then([](const BatchedCommandResponse& insertPlacementEntryResponse) {
-                    uassertStatusOK(insertPlacementEntryResponse.toStatus());
-                })
-                .semi();
-        };
-
-        // Obtain a valid placement descriptor from config.chunks and then store it as part of the
-        // transaction.
-        auto generateAndPersistPlacementInfoSubchain =
-            [txnExec, &txnClient](const NamespaceString& nss,
-                                  const UUID& collUuid,
-                                  const Timestamp& migrationCommitTime) {
-                // Compose the query - equivalent to
-                // 'configDb.chunks.distinct("shard", {uuid:collectionUuid})'
-                DistinctCommandRequest distinctRequest(ChunkType::ConfigNS);
-                distinctRequest.setKey(ChunkType::shard.name());
-                distinctRequest.setQuery(BSON(ChunkType::collectionUUID.name() << collUuid));
-                return txnClient.runCommand(DatabaseName::kConfig, distinctRequest.toBSON({}))
-                    .thenRunOn(txnExec)
-                    .then([=, &txnClient](BSONObj reply) {
-                        uassertStatusOK(getStatusFromWriteCommandReply(reply));
-                        std::vector<ShardId> shardIds;
-                        for (const auto& valueElement : reply.getField("values").Array()) {
-                            shardIds.emplace_back(valueElement.String());
-                        }
-
-                        NamespacePlacementType placementInfo(
-                            nss, migrationCommitTime, std::move(shardIds));
-                        placementInfo.setUuid(collUuid);
-                        write_ops::InsertCommandRequest insertPlacementEntry(
-                            NamespaceString::kConfigsvrPlacementHistoryNamespace,
-                            {placementInfo.toBSON()});
-
-                        return txnClient.runCRUDOp(insertPlacementEntry, {});
-                    })
-                    .thenRunOn(txnExec)
-                    .then([](const BatchedCommandResponse& insertPlacementEntryResponse) {
-                        uassertStatusOK(insertPlacementEntryResponse.toStatus());
-                    })
-                    .semi();
-            };
-
-        // Extend the transaction to also upsert the placement information that matches the
-        // migration commit.
+        // Extend the transaction to also persist the collection placement change.
         return std::move(updateConfigChunksFuture)
             .thenRunOn(txnExec)
             .then([&] {
-                // Retrieve the previous placement entry - it will be used as a base for the next
-                // update.
-                FindCommandRequest placementInfoQuery{
-                    NamespaceString::kConfigsvrPlacementHistoryNamespace};
-                placementInfoQuery.setFilter(BSON(NamespacePlacementType::kNssFieldName
-                                                  << nss.toString()
-                                                  << NamespacePlacementType::kTimestampFieldName
-                                                  << BSON("$lte" << migrationCommitTime)));
-                placementInfoQuery.setSort(BSON(NamespacePlacementType::kTimestampFieldName << -1));
-                placementInfoQuery.setLimit(1);
-                return txnClient.exhaustiveFind(placementInfoQuery);
+                // Use the updated content of config.chunks to build the collection placement
+                // metadata.
+                // The request is equivalent to "configDb.chunks.distinct('shard',{uuid:collUuid})".
+                DistinctCommandRequest distinctRequest(ChunkType::ConfigNS);
+                distinctRequest.setKey(ChunkType::shard.name());
+                distinctRequest.setQuery(BSON(ChunkType::collectionUUID.name() << collUuid));
+                return txnClient.runCommand(DatabaseName::kConfig, distinctRequest.toBSON({}));
             })
             .thenRunOn(txnExec)
-            .then([&,
-                   persistPlacementInfo = std::move(persistPlacementInfoSubchain),
-                   generateAndPersistPlacementInfo =
-                       std::move(generateAndPersistPlacementInfoSubchain)](
-                      const std::vector<BSONObj>& queryResponse) {
-                tassert(6892800,
-                        str::stream()
-                            << "Unexpected number of placement entries retrieved" << nss.toString(),
-                        queryResponse.size() <= 1);
-
-                if (queryResponse.size() == 0) {
-                    //  Historical placement data may not be available due to an FCV transition -
-                    //  invoke the more expensive fallback method.
-                    return generateAndPersistPlacementInfo(nss, collUuid, migrationCommitTime);
+            .then([=, &txnClient](BSONObj reply) {
+                uassertStatusOK(getStatusFromWriteCommandReply(reply));
+                std::vector<ShardId> shardIds;
+                for (const auto& valueElement : reply.getField("values").Array()) {
+                    shardIds.emplace_back(valueElement.String());
                 }
 
-                // Leverage the most recent placement info to build the new version.
-                auto placementInfo = NamespacePlacementType::parse(
-                    IDLParserContext("CommitMoveChunk"), queryResponse.front());
-                placementInfo.setTimestamp(migrationCommitTime);
+                NamespacePlacementType placementInfo(nss, migrationCommitTime, std::move(shardIds));
+                placementInfo.setUuid(collUuid);
+                write_ops::InsertCommandRequest insertPlacementEntry(
+                    NamespaceString::kConfigsvrPlacementHistoryNamespace, {placementInfo.toBSON()});
 
-                const auto& originalShardList = placementInfo.getShards();
-                std::vector<ShardId> updatedShardList;
-                updatedShardList.reserve(originalShardList.size() + 1);
-                if (addRecipientToPlacementHistory) {
-                    updatedShardList.push_back(recipientShardId);
-                }
-
-                std::copy_if(std::make_move_iterator(originalShardList.begin()),
-                             std::make_move_iterator(originalShardList.end()),
-                             std::back_inserter(updatedShardList),
-                             [&](const ShardId& shardId) {
-                                 if (removeDonorFromPlacementHistory && shardId == donorShardId) {
-                                     return false;
-                                 }
-                                 if (addRecipientToPlacementHistory &&
-                                     shardId == recipientShardId) {
-                                     // Ensure that the added recipient will only appear once.
-                                     return false;
-                                 }
-                                 return true;
-                             });
-                placementInfo.setShards(std::move(updatedShardList));
-
-                return persistPlacementInfo(std::move(placementInfo));
+                return txnClient.runCRUDOp(insertPlacementEntry, {});
+            })
+            .thenRunOn(txnExec)
+            .then([](const BatchedCommandResponse& insertPlacementEntryResponse) {
+                uassertStatusOK(insertPlacementEntryResponse.toStatus());
             })
             .semi();
     };
 
     auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
     auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
-    auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(executor);
 
-    txn_api::SyncTransactionWithRetries txn(opCtx, sleepInlineExecutor, nullptr, inlineExecutor);
+    txn_api::SyncTransactionWithRetries txn(opCtx, executor, nullptr, inlineExecutor);
 
     txn.run(opCtx, transactionChain);
 }

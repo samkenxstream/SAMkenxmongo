@@ -73,8 +73,13 @@ public:
         _autoColl.emplace(opCtx, *nss, MODE_IS);
 
         uassert(ErrorCodes::NamespaceNotFound,
-                str::stream() << "Collection " << nss->ns() << " does not exist",
+                str::stream() << "Collection " << nss->toStringForErrorMsg() << " does not exist",
                 _autoColl->getCollection());
+
+        uassert(ErrorCodes::NotWritablePrimary,
+                "No longer primary when trying to acquire active migrate cloner",
+                opCtx->writesAreReplicated() &&
+                    repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, *nss));
 
         {
             const auto scopedCsr =
@@ -84,8 +89,8 @@ public:
                 invariant(_chunkCloner);
             } else {
                 uasserted(ErrorCodes::IllegalOperation,
-                          str::stream()
-                              << "No active migrations were found for collection " << nss->ns());
+                          str::stream() << "No active migrations were found for collection "
+                                        << nss->toStringForErrorMsg());
             }
         }
 
@@ -302,7 +307,7 @@ public:
         writeConflictRetry(
             opCtx,
             "Fetching session related oplogs for migration",
-            NamespaceString::kRsOplogNamespace.ns(),
+            NamespaceString::kRsOplogNamespace,
             [&]() {
                 AutoGetActiveCloner autoCloner(opCtx, migrationSessionId, false);
                 opTime = autoCloner.getCloner()->nextSessionMigrationBatch(opCtx, arrBuilder);

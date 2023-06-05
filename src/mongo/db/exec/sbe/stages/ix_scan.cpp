@@ -47,6 +47,7 @@ IndexScanStageBase::IndexScanStageBase(StringData stageType,
                                        boost::optional<value::SlotId> indexKeySlot,
                                        boost::optional<value::SlotId> recordIdSlot,
                                        boost::optional<value::SlotId> snapshotIdSlot,
+                                       boost::optional<value::SlotId> indexIdentSlot,
                                        IndexKeysInclusionSet indexKeysToInclude,
                                        value::SlotVector vars,
                                        PlanYieldPolicy* yieldPolicy,
@@ -60,6 +61,7 @@ IndexScanStageBase::IndexScanStageBase(StringData stageType,
       _indexKeySlot(indexKeySlot),
       _recordIdSlot(recordIdSlot),
       _snapshotIdSlot(snapshotIdSlot),
+      _indexIdentSlot(indexIdentSlot),
       _indexKeysToInclude(indexKeysToInclude),
       _vars(std::move(vars)),
       _lowPriority(lowPriority) {
@@ -67,18 +69,6 @@ IndexScanStageBase::IndexScanStageBase(StringData stageType,
 }
 
 void IndexScanStageBase::prepareImpl(CompileCtx& ctx) {
-    if (_indexKeySlot) {
-        _recordAccessor = std::make_unique<value::OwnedValueAccessor>();
-    }
-
-    if (_recordIdSlot) {
-        _recordIdAccessor = std::make_unique<value::OwnedValueAccessor>();
-    }
-
-    if (_snapshotIdSlot) {
-        _snapshotIdAccessor = std::make_unique<value::OwnedValueAccessor>();
-    }
-
     _accessors.resize(_vars.size());
     for (size_t idx = 0; idx < _accessors.size(); ++idx) {
         auto [it, inserted] = _accessorMap.emplace(_vars[idx], &_accessors[idx]);
@@ -86,37 +76,53 @@ void IndexScanStageBase::prepareImpl(CompileCtx& ctx) {
     }
 
     tassert(5709602, "'_coll' should not be initialized prior to 'acquireCollection()'", !_coll);
-    std::tie(_coll, _collName, _catalogEpoch) = acquireCollection(_opCtx, _collUuid);
+    _coll.acquireCollection(_opCtx, _collUuid);
 
-    auto indexCatalog = _coll->getIndexCatalog();
+    auto indexCatalog = _coll.getPtr()->getIndexCatalog();
     auto indexDesc = indexCatalog->findIndexByName(_opCtx, _indexName);
-    tassert(4938500,
+    // uassert here, not tassert, because it is not a programming bug if the index got dropped just
+    // before we looked for it.
+    uassert(4938500,
             str::stream() << "could not find index named '" << _indexName << "' in collection '"
-                          << _collName << "'",
+                          << _coll.getCollName()->toStringForErrorMsg() << "'",
             indexDesc);
+
     _entry = indexCatalog->getEntry(indexDesc);
     tassert(4938503,
             str::stream() << "expected IndexCatalogEntry for index named: " << _indexName,
             static_cast<bool>(_entry));
-    _indexIdent = _entry->getIdent();
+
     _ordering = _entry->ordering();
 
-    if (_snapshotIdAccessor) {
+    auto [identTag, identVal] = value::makeNewString(StringData(_entry->getIdent()));
+    _indexIdentAccessor.reset(identTag, identVal);
+
+    if (_indexIdentSlot) {
+        _indexIdentViewAccessor.reset(identTag, identVal);
+    } else {
+        _indexIdentViewAccessor.reset();
+    }
+
+    if (_snapshotIdSlot) {
         _latestSnapshotId = _opCtx->recoveryUnit()->getSnapshotId().toNumber();
     }
 }
 
 value::SlotAccessor* IndexScanStageBase::getAccessor(CompileCtx& ctx, value::SlotId slot) {
     if (_indexKeySlot && *_indexKeySlot == slot) {
-        return _recordAccessor.get();
+        return &_recordAccessor;
     }
 
     if (_recordIdSlot && *_recordIdSlot == slot) {
-        return _recordIdAccessor.get();
+        return &_recordIdAccessor;
     }
 
     if (_snapshotIdSlot && *_snapshotIdSlot == slot) {
-        return _snapshotIdAccessor.get();
+        return &_snapshotIdAccessor;
+    }
+
+    if (_indexIdentSlot && *_indexIdentSlot == slot) {
+        return &_indexIdentViewAccessor;
     }
 
     if (auto it = _accessorMap.find(slot); it != _accessorMap.end()) {
@@ -128,11 +134,11 @@ value::SlotAccessor* IndexScanStageBase::getAccessor(CompileCtx& ctx, value::Slo
 
 void IndexScanStageBase::doSaveState(bool relinquishCursor) {
     if (relinquishCursor) {
-        if (_recordAccessor) {
-            prepareForYielding(*_recordAccessor, slotsAccessible());
+        if (_indexKeySlot) {
+            prepareForYielding(_recordAccessor, slotsAccessible());
         }
-        if (_recordIdAccessor) {
-            prepareForYielding(*_recordIdAccessor, slotsAccessible());
+        if (_recordIdSlot) {
+            prepareForYielding(_recordIdAccessor, slotsAccessible());
         }
         for (auto& accessor : _accessors) {
             prepareForYielding(accessor, slotsAccessible());
@@ -154,10 +160,13 @@ void IndexScanStageBase::doSaveState(bool relinquishCursor) {
 }
 
 void IndexScanStageBase::restoreCollectionAndIndex() {
-    tassert(5777406, "Collection name should be initialized", _collName);
-    tassert(5777407, "Catalog epoch should be initialized", _catalogEpoch);
-    _coll = restoreCollection(_opCtx, *_collName, _collUuid, *_catalogEpoch);
-    auto desc = _coll->getIndexCatalog()->findIndexByIdent(_opCtx, _indexIdent);
+    _coll.restoreCollection(_opCtx, _collUuid);
+
+    auto [identTag, identVal] = _indexIdentAccessor.getViewOfValue();
+    tassert(7566700, "Expected ident to be a string", value::isString(identTag));
+
+    auto indexIdent = value::getStringView(identTag, identVal);
+    auto desc = _coll.getPtr()->getIndexCatalog()->findIndexByIdent(_opCtx, indexIdent);
     uassert(ErrorCodes::QueryPlanKilled,
             str::stream() << "query plan killed :: index '" << _indexName << "' dropped",
             desc && !desc->getEntry()->isDropped());
@@ -175,7 +184,7 @@ void IndexScanStageBase::doRestoreState(bool relinquishCursor) {
     invariant(!_coll);
 
     // If this stage has not been prepared, then yield recovery is a no-op.
-    if (!_collName) {
+    if (!_coll.getCollName()) {
         return;
     }
     restoreCollectionAndIndex();
@@ -186,7 +195,7 @@ void IndexScanStageBase::doRestoreState(bool relinquishCursor) {
 
     // Yield is the only time during plan execution that the snapshotId can change. As such, we
     // update it accordingly as part of yield recovery.
-    if (_snapshotIdAccessor) {
+    if (_snapshotIdSlot) {
         _latestSnapshotId = _opCtx->recoveryUnit()->getSnapshotId().toNumber();
     }
 }
@@ -292,21 +301,21 @@ PlanState IndexScanStageBase::getNext() {
         }
     } while (!validateKey(_nextRecord));
 
-    if (_recordAccessor) {
-        _recordAccessor->reset(false,
-                               value::TypeTags::ksValue,
-                               value::bitcastFrom<KeyString::Value*>(&_nextRecord->keyString));
+    if (_indexKeySlot) {
+        _recordAccessor.reset(false,
+                              value::TypeTags::ksValue,
+                              value::bitcastFrom<KeyString::Value*>(&_nextRecord->keyString));
     }
 
-    if (_recordIdAccessor) {
-        _recordIdAccessor->reset(
+    if (_recordIdSlot) {
+        _recordIdAccessor.reset(
             false, value::TypeTags::RecordId, value::bitcastFrom<RecordId*>(&_nextRecord->loc));
     }
 
-    if (_snapshotIdAccessor) {
+    if (_snapshotIdSlot) {
         // Copy the latest snapshot ID into the 'snapshotId' slot.
-        _snapshotIdAccessor->reset(value::TypeTags::NumberInt64,
-                                   value::bitcastFrom<uint64_t>(_latestSnapshotId));
+        _snapshotIdAccessor.reset(value::TypeTags::NumberInt64,
+                                  value::bitcastFrom<uint64_t>(_latestSnapshotId));
     }
 
     if (_accessors.size()) {
@@ -348,6 +357,9 @@ std::unique_ptr<PlanStageStats> IndexScanStageBase::getStats(bool includeDebugIn
         if (_snapshotIdSlot) {
             bob.appendNumber("snapshotIdSlot", static_cast<long long>(*_snapshotIdSlot));
         }
+        if (_indexIdentSlot) {
+            bob.appendNumber("indexIdentSlot", static_cast<long long>(*_indexIdentSlot));
+        }
         bob.append("outputSlots", _vars.begin(), _vars.end());
         bob.append("indexKeysToInclude", _indexKeysToInclude.to_string());
         ret->debugInfo = bob.obj();
@@ -375,6 +387,12 @@ void IndexScanStageBase::debugPrintImpl(std::vector<DebugPrinter::Block>& blocks
 
     if (_snapshotIdSlot) {
         DebugPrinter::addIdentifier(blocks, _snapshotIdSlot.value());
+    } else {
+        DebugPrinter::addIdentifier(blocks, DebugPrinter::kNoneKeyword);
+    }
+
+    if (_indexIdentSlot) {
+        DebugPrinter::addIdentifier(blocks, _indexIdentSlot.value());
     } else {
         DebugPrinter::addIdentifier(blocks, DebugPrinter::kNoneKeyword);
     }
@@ -428,6 +446,7 @@ SimpleIndexScanStage::SimpleIndexScanStage(UUID collUuid,
                                            boost::optional<value::SlotId> indexKeySlot,
                                            boost::optional<value::SlotId> recordIdSlot,
                                            boost::optional<value::SlotId> snapshotIdSlot,
+                                           boost::optional<value::SlotId> indexIdentSlot,
                                            IndexKeysInclusionSet indexKeysToInclude,
                                            value::SlotVector vars,
                                            std::unique_ptr<EExpression> seekKeyLow,
@@ -443,6 +462,7 @@ SimpleIndexScanStage::SimpleIndexScanStage(UUID collUuid,
                          indexKeySlot,
                          recordIdSlot,
                          snapshotIdSlot,
+                         indexIdentSlot,
                          indexKeysToInclude,
                          std::move(vars),
                          yieldPolicy,
@@ -463,6 +483,7 @@ std::unique_ptr<PlanStage> SimpleIndexScanStage::clone() const {
                                                   _indexKeySlot,
                                                   _recordIdSlot,
                                                   _snapshotIdSlot,
+                                                  _indexIdentSlot,
                                                   _indexKeysToInclude,
                                                   _vars,
                                                   _seekKeyLow ? _seekKeyLow->clone() : nullptr,
@@ -483,20 +504,21 @@ void SimpleIndexScanStage::prepare(CompileCtx& ctx) {
     if (_seekKeyHigh) {
         ctx.root = this;
         _seekKeyHighCode = _seekKeyHigh->compile(ctx);
-        _seekKeyHighHolder = std::make_unique<value::OwnedValueAccessor>();
     }
-    _seekKeyLowHolder = std::make_unique<value::OwnedValueAccessor>();
+
+    _seekKeyLowHolder.reset();
+    _seekKeyHighHolder.reset();
 }
 
 void SimpleIndexScanStage::doSaveState(bool relinquishCursor) {
     // Seek points are external to the index scan and must be accessible no matter what as long
     // as the index scan is opened.
     if (_open && relinquishCursor) {
-        if (_seekKeyLowHolder) {
-            prepareForYielding(*_seekKeyLowHolder, true);
+        if (_seekKeyLow) {
+            prepareForYielding(_seekKeyLowHolder, true);
         }
-        if (_seekKeyHighHolder) {
-            prepareForYielding(*_seekKeyHighHolder, true);
+        if (_seekKeyHigh) {
+            prepareForYielding(_seekKeyHighHolder, true);
         }
     }
 
@@ -514,7 +536,7 @@ void SimpleIndexScanStage::open(bool reOpen) {
         uassert(4822851,
                 str::stream() << "seek key is wrong type: " << msgTagLow,
                 tagLow == value::TypeTags::ksValue);
-        _seekKeyLowHolder->reset(ownedLow, tagLow, valLow);
+        _seekKeyLowHolder.reset(ownedLow, tagLow, valLow);
 
         auto [ownedHi, tagHi, valHi] = _bytecode.run(_seekKeyHighCode.get());
         const auto msgTagHi = tagHi;
@@ -522,14 +544,14 @@ void SimpleIndexScanStage::open(bool reOpen) {
                 str::stream() << "seek key is wrong type: " << msgTagHi,
                 tagHi == value::TypeTags::ksValue);
 
-        _seekKeyHighHolder->reset(ownedHi, tagHi, valHi);
+        _seekKeyHighHolder.reset(ownedHi, tagHi, valHi);
     } else if (_seekKeyLow) {
         auto [ownedLow, tagLow, valLow] = _bytecode.run(_seekKeyLowCode.get());
         const auto msgTagLow = tagLow;
         uassert(4822853,
                 str::stream() << "seek key is wrong type: " << msgTagLow,
                 tagLow == value::TypeTags::ksValue);
-        _seekKeyLowHolder->reset(ownedLow, tagLow, valLow);
+        _seekKeyLowHolder.reset(ownedLow, tagLow, valLow);
     } else {
         auto sdi = _entry->accessMethod()->asSortedData()->getSortedDataInterface();
         KeyString::Builder kb(sdi->getKeyStringVersion(),
@@ -538,20 +560,20 @@ void SimpleIndexScanStage::open(bool reOpen) {
         kb.appendDiscriminator(KeyString::Discriminator::kExclusiveBefore);
 
         auto [copyTag, copyVal] = value::makeCopyKeyString(kb.getValueCopy());
-        _seekKeyLowHolder->reset(true, copyTag, copyVal);
+        _seekKeyLowHolder.reset(true, copyTag, copyVal);
     }
 }
 
 const KeyString::Value& SimpleIndexScanStage::getSeekKeyLow() const {
-    auto [tag, value] = _seekKeyLowHolder->getViewOfValue();
+    auto [tag, value] = _seekKeyLowHolder.getViewOfValue();
     return *value::getKeyStringView(value);
 }
 
 const KeyString::Value* SimpleIndexScanStage::getSeekKeyHigh() const {
-    if (!_seekKeyHighHolder) {
+    if (!_seekKeyHigh) {
         return nullptr;
     }
-    auto [tag, value] = _seekKeyHighHolder->getViewOfValue();
+    auto [tag, value] = _seekKeyHighHolder.getViewOfValue();
     return value::getKeyStringView(value);
 }
 
@@ -637,6 +659,7 @@ GenericIndexScanStage::GenericIndexScanStage(UUID collUuid,
                                              boost::optional<value::SlotId> indexKeySlot,
                                              boost::optional<value::SlotId> recordIdSlot,
                                              boost::optional<value::SlotId> snapshotIdSlot,
+                                             boost::optional<value::SlotId> indexIdentSlot,
                                              IndexKeysInclusionSet indexKeysToInclude,
                                              value::SlotVector vars,
                                              PlanYieldPolicy* yieldPolicy,
@@ -649,6 +672,7 @@ GenericIndexScanStage::GenericIndexScanStage(UUID collUuid,
                          indexKeySlot,
                          recordIdSlot,
                          snapshotIdSlot,
+                         indexIdentSlot,
                          indexKeysToInclude,
                          std::move(vars),
                          yieldPolicy,
@@ -668,6 +692,7 @@ std::unique_ptr<PlanStage> GenericIndexScanStage::clone() const {
                                                    _indexKeySlot,
                                                    _recordIdSlot,
                                                    _snapshotIdSlot,
+                                                   _indexIdentSlot,
                                                    _indexKeysToInclude,
                                                    _vars,
                                                    _yieldPolicy,

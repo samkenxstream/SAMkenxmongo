@@ -51,6 +51,7 @@
 #include "mongo/s/async_requests_sender.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/is_mongos.h"
 #include "mongo/s/multi_statement_transaction_requests_sender.h"
 #include "mongo/s/router_transactions_metrics.h"
 #include "mongo/s/shard_cannot_refresh_due_to_locks_held_exception.h"
@@ -1118,9 +1119,7 @@ BSONObj TransactionRouter::Router::_handOffCommitToCoordinator(OperationContext*
     }
 
     CoordinateCommitTransaction coordinateCommitCmd;
-    // Empty tenant id is acceptable here as command's tenant id will not be serialized to BSON.
-    // TODO SERVER-62491: Use system tenant id.
-    coordinateCommitCmd.setDbName(DatabaseName(boost::none, "admin"));
+    coordinateCommitCmd.setDbName(DatabaseName::kAdmin);
     coordinateCommitCmd.setParticipants(participantList);
     const auto coordinateCommitCmdObj = coordinateCommitCmd.toBSON(
         BSON(WriteConcernOptions::kWriteConcernField << opCtx->getWriteConcern().toBSON()));
@@ -1490,7 +1489,9 @@ void TransactionRouter::Router::_resetRouterState(
     }
 
     OperationContextSession::observeNewTxnNumberStarted(
-        opCtx, _sessionId(), txnNumberAndRetryCounter.getTxnNumber());
+        opCtx,
+        _sessionId(),
+        {txnNumberAndRetryCounter.getTxnNumber(), SessionCatalog::Provenance::kRouter});
 };
 
 void TransactionRouter::Router::_resetRouterStateForStartTransaction(
@@ -1536,9 +1537,7 @@ BSONObj TransactionRouter::Router::_commitWithRecoveryToken(OperationContext* op
 
     auto coordinateCommitCmd = [&] {
         CoordinateCommitTransaction coordinateCommitCmd;
-        // Empty tenant id is acceptable here as command's tenant id will not be serialized to BSON.
-        // TODO SERVER-62491: Use system tenant id.
-        coordinateCommitCmd.setDbName(DatabaseName(boost::none, "admin"));
+        coordinateCommitCmd.setDbName(DatabaseName::kAdmin);
         coordinateCommitCmd.setParticipants({});
 
         auto rawCoordinateCommit = coordinateCommitCmd.toBSON(

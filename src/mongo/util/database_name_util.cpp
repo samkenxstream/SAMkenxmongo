@@ -40,18 +40,66 @@ namespace mongo {
 
 std::string DatabaseNameUtil::serialize(const DatabaseName& dbName,
                                         const SerializationContext& context) {
-    if (!gMultitenancySupport) {
-        return dbName.toString();
-    }
+    if (!gMultitenancySupport)
+        dbName.toString();
 
-    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility)) {
+    // TODO SERVER-74284: uncomment to redirect command-sepcific serialization requests
+    // if (context.getSource() == SerializationContext::Source::Command &&
+    //     context.getCallerType() == SerializationContext::CallerType::Reply)
+    //     return serializeForCommands(dbName, context);
+
+    // if we're not serializing a Command Reply, use the default serializing rules
+    return serializeForStorage(dbName, context);
+}
+
+std::string DatabaseNameUtil::serializeForStorage(const DatabaseName& dbName,
+                                                  const SerializationContext& context) {
+    if (gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility)) {
         return dbName.toString();
     }
     return dbName.toStringWithTenantId();
 }
 
-DatabaseName parseDbNameFromStringExpectTenantIdInMultitenancyMode(StringData dbName) {
+std::string DatabaseNameUtil::serializeForCatalog(const DatabaseName& dbName,
+                                                  const SerializationContext& context) {
+    return dbName.toStringWithTenantId();
+}
+
+std::string DatabaseNameUtil::serializeForCommands(const DatabaseName& dbName,
+                                                   const SerializationContext& context) {
+    // tenantId came from either a $tenant field or security token
+    if (context.receivedNonPrefixedTenantId()) {
+        switch (context.getPrefix()) {
+            case SerializationContext::Prefix::ExcludePrefix:
+                // fallthrough
+            case SerializationContext::Prefix::Default:
+                return dbName.toString();
+            case SerializationContext::Prefix::IncludePrefix:
+                return dbName.toStringWithTenantId();
+            default:
+                MONGO_UNREACHABLE;
+        }
+    }
+
+    switch (context.getPrefix()) {
+        case SerializationContext::Prefix::ExcludePrefix:
+            return dbName.toString();
+        case SerializationContext::Prefix::Default:
+            // fallthrough
+        case SerializationContext::Prefix::IncludePrefix:
+            return dbName.toStringWithTenantId();
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+std::string DatabaseNameUtil::serializeForAuth(const DatabaseName& dbName,
+                                               const SerializationContext& context) {
+    return dbName.toStringWithTenantId();
+}
+
+DatabaseName DatabaseNameUtil::parseDbNameFromStringExpectTenantIdInMultitenancyMode(
+    StringData dbName) {
     if (!gMultitenancySupport) {
         return DatabaseName(boost::none, dbName);
     }
@@ -77,18 +125,28 @@ DatabaseName DatabaseNameUtil::deserialize(boost::optional<TenantId> tenantId,
                                            StringData db,
                                            const SerializationContext& context) {
     if (db.empty()) {
-        return DatabaseName();
+        return DatabaseName(tenantId, "");
     }
 
     if (!gMultitenancySupport) {
-        massert(7005302, "TenantId must not be set", tenantId == boost::none);
+        massert(7005302, "TenantId must not be set, but it is: ", tenantId == boost::none);
         return DatabaseName(boost::none, db);
     }
 
-    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility)) {
-        // TODO SERVER-62491 Remove this conditional, the tenantId should be kSystemTenantId.
-        // TODO SERVER-73025 Uncomment out this conditional to check that we always have a tenantId.
+    // TODO SERVER-74284: uncomment to redirect command-sepcific deserialization requests
+    // if (context.getSource() == SerializationContext::Source::Command &&
+    //     context.getCallerType() == SerializationContext::CallerType::Request)
+    //     return deserializeForCommands(std::move(tenantId), db, context);
+
+    // if we're not deserializing a Command Request, use the default deserializing rules
+    return deserializeForStorage(std::move(tenantId), db, context);
+}
+
+DatabaseName DatabaseNameUtil::deserializeForStorage(boost::optional<TenantId> tenantId,
+                                                     StringData db,
+                                                     const SerializationContext& context) {
+    if (gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility)) {
+        // TODO SERVER-73113 Uncomment out this conditional to check that we always have a tenantId.
         /* if (db != "admin" && db != "config" && db != "local")
             massert(7005300, "TenantId must be set", tenantId != boost::none);
         */
@@ -96,7 +154,7 @@ DatabaseName DatabaseNameUtil::deserialize(boost::optional<TenantId> tenantId,
         return DatabaseName(std::move(tenantId), db);
     }
 
-    auto dbName = parseDbNameFromStringExpectTenantIdInMultitenancyMode(db);
+    auto dbName = DatabaseNameUtil::parseDbNameFromStringExpectTenantIdInMultitenancyMode(db);
     // TenantId could be prefixed, or passed in separately (or both) and namespace is always
     // constructed with the tenantId separately.
     if (tenantId != boost::none) {
@@ -106,6 +164,53 @@ DatabaseName DatabaseNameUtil::deserialize(boost::optional<TenantId> tenantId,
         massert(7005301, "TenantId must match that in db prefix", tenantId == dbName.tenantId());
     }
     return dbName;
+}
+
+DatabaseName DatabaseNameUtil::deserializeForCommands(boost::optional<TenantId> tenantId,
+                                                      StringData db,
+                                                      const SerializationContext& context) {
+    // we only get here if we are processing a Command Request.  We disregard the feature flag in
+    // this case, essentially letting the request dictate the state of the feature.
+    if (tenantId != boost::none) {
+        switch (context.getPrefix()) {
+            case SerializationContext::Prefix::ExcludePrefix:
+                // fallthrough
+            case SerializationContext::Prefix::Default:
+                return DatabaseName(std::move(tenantId), db);
+            case SerializationContext::Prefix::IncludePrefix: {
+                auto dbName = parseDbNameFromStringExpectTenantIdInMultitenancyMode(db);
+                massert(8423386,
+                        str::stream() << "TenantId from $tenant or security token present as '"
+                                      << tenantId->toString()
+                                      << "' with expectPrefix field set but without a prefix set",
+                        dbName.tenantId());
+                massert(
+                    8423384,
+                    str::stream()
+                        << "TenantId from $tenant or security token must match prefixed tenantId: "
+                        << tenantId->toString() << " prefix " << dbName.tenantId()->toString(),
+                    tenantId.value() == dbName.tenantId());
+                return dbName;
+            }
+            default:
+                MONGO_UNREACHABLE;
+        }
+    }
+
+    auto dbName = parseDbNameFromStringExpectTenantIdInMultitenancyMode(db);
+    if ((dbName != DatabaseName::kAdmin) && (dbName != DatabaseName::kLocal) &&
+        (dbName != DatabaseName::kConfig))
+        massert(8423388, "TenantId must be set", dbName.tenantId() != boost::none);
+
+    return dbName;
+}
+
+DatabaseName DatabaseNameUtil::deserializeForCatalog(StringData db,
+                                                     const SerializationContext& context) {
+    // TenantId always prefix in the passed `db` for durable catalog. This method below checks for
+    // multitenancy and will either return a DatabaseName with (tenantId, nonPrefixedDb) or
+    // (none, prefixedDb).
+    return DatabaseNameUtil::parseDbNameFromStringExpectTenantIdInMultitenancyMode(db);
 }
 
 }  // namespace mongo

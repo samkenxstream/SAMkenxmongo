@@ -1045,6 +1045,91 @@ public:
         return printer.str();
     }
 
+    void printCandidateIndexEntry(ExplainPrinter& local,
+                                  const CandidateIndexEntry& candidateIndexEntry) {
+        local.fieldName("indexDefName", ExplainVersion::V3)
+            .print(candidateIndexEntry._indexDefName)
+            .separator(", ");
+
+        local.separator("{");
+        printFieldProjectionMap(local, candidateIndexEntry._fieldProjectionMap);
+        local.separator("}, {");
+
+        {
+            if constexpr (version < ExplainVersion::V3) {
+                bool first = true;
+                for (const auto type : candidateIndexEntry._predTypes) {
+                    if (first) {
+                        first = false;
+                    } else {
+                        local.print(", ");
+                    }
+                    local.print(IndexFieldPredTypeEnum::toString[static_cast<int>(type)]);
+                }
+            } else if constexpr (version == ExplainVersion::V3) {
+                std::vector<ExplainPrinter> printers;
+                for (const auto type : candidateIndexEntry._predTypes) {
+                    ExplainPrinter local1;
+                    local1.print(IndexFieldPredTypeEnum::toString[static_cast<int>(type)]);
+                    printers.push_back(std::move(local1));
+                }
+                local.fieldName("predType").print(printers);
+            } else {
+                MONGO_UNREACHABLE;
+            }
+        }
+
+        local.separator("}, ");
+        {
+            if (candidateIndexEntry._eqPrefixes.size() == 1) {
+                local.fieldName("intervals", ExplainVersion::V3);
+
+                ExplainPrinter intervals = printIntervalExpr<CompoundIntervalRequirement>(
+                    candidateIndexEntry._eqPrefixes.front()._interval);
+                local.printSingleLevel(intervals, "" /*singleLevelSpacer*/);
+            } else {
+                std::vector<ExplainPrinter> eqPrefixPrinters;
+                for (const auto& entry : candidateIndexEntry._eqPrefixes) {
+                    ExplainPrinter eqPrefixPrinter;
+                    eqPrefixPrinter.fieldName("startPos", ExplainVersion::V3)
+                        .print(entry._startPos)
+                        .separator(", ");
+
+                    ExplainPrinter intervals =
+                        printIntervalExpr<CompoundIntervalRequirement>(entry._interval);
+                    eqPrefixPrinter.separator("[")
+                        .fieldName("interval", ExplainVersion::V3)
+                        .printSingleLevel(intervals, "" /*singleLevelSpacer*/)
+                        .separator("]");
+
+                    eqPrefixPrinters.push_back(std::move(eqPrefixPrinter));
+                }
+
+                local.print(eqPrefixPrinters);
+            }
+        }
+
+        if (const auto& residualReqs = candidateIndexEntry._residualRequirements) {
+            local.separator("}, ");
+            if constexpr (version < ExplainVersion::V3) {
+                ExplainPrinter residualReqMapPrinter;
+                printResidualRequirements(residualReqMapPrinter, *residualReqs);
+                local.print(residualReqMapPrinter);
+            } else if (version == ExplainVersion::V3) {
+                printResidualRequirements(local, *residualReqs);
+            } else {
+                MONGO_UNREACHABLE;
+            }
+        }
+    }
+
+
+    std::string printCandidateIndexEntry(const CandidateIndexEntry& indexEntry) {
+        ExplainPrinter printer;
+        printCandidateIndexEntry(printer, indexEntry);
+        return printer.str();
+    }
+
     void printPartialSchemaEntry(ExplainPrinter& printer, const PartialSchemaEntry& entry) {
         const auto& [key, req] = entry;
 
@@ -1429,83 +1514,8 @@ public:
                 const CandidateIndexEntry& candidateIndexEntry = candidateIndexes.at(index);
 
                 ExplainPrinter local;
-                local.fieldName("candidateId")
-                    .print(index + 1)
-                    .separator(", ")
-                    .fieldName("indexDefName", ExplainVersion::V3)
-                    .print(candidateIndexEntry._indexDefName)
-                    .separator(", ");
-
-                local.separator("{");
-                printFieldProjectionMap(local, candidateIndexEntry._fieldProjectionMap);
-                local.separator("}, {");
-
-                {
-                    if constexpr (version < ExplainVersion::V3) {
-                        bool first = true;
-                        for (const auto type : candidateIndexEntry._predTypes) {
-                            if (first) {
-                                first = false;
-                            } else {
-                                local.print(", ");
-                            }
-                            local.print(IndexFieldPredTypeEnum::toString[static_cast<int>(type)]);
-                        }
-                    } else if constexpr (version == ExplainVersion::V3) {
-                        std::vector<ExplainPrinter> printers;
-                        for (const auto type : candidateIndexEntry._predTypes) {
-                            ExplainPrinter local1;
-                            local1.print(IndexFieldPredTypeEnum::toString[static_cast<int>(type)]);
-                            printers.push_back(std::move(local1));
-                        }
-                        local.fieldName("predType").print(printers);
-                    } else {
-                        MONGO_UNREACHABLE;
-                    }
-                }
-
-                local.separator("}, ");
-                {
-                    if (candidateIndexEntry._eqPrefixes.size() == 1) {
-                        local.fieldName("intervals", ExplainVersion::V3);
-
-                        ExplainPrinter intervals = printIntervalExpr<CompoundIntervalRequirement>(
-                            candidateIndexEntry._eqPrefixes.front()._interval);
-                        local.printSingleLevel(intervals, "" /*singleLevelSpacer*/);
-                    } else {
-                        std::vector<ExplainPrinter> eqPrefixPrinters;
-                        for (const auto& entry : candidateIndexEntry._eqPrefixes) {
-                            ExplainPrinter eqPrefixPrinter;
-                            eqPrefixPrinter.fieldName("startPos", ExplainVersion::V3)
-                                .print(entry._startPos)
-                                .separator(", ");
-
-                            ExplainPrinter intervals =
-                                printIntervalExpr<CompoundIntervalRequirement>(entry._interval);
-                            eqPrefixPrinter.separator("[")
-                                .fieldName("interval", ExplainVersion::V3)
-                                .printSingleLevel(intervals, "" /*singleLevelSpacer*/)
-                                .separator("]");
-
-                            eqPrefixPrinters.push_back(std::move(eqPrefixPrinter));
-                        }
-
-                        local.print(eqPrefixPrinters);
-                    }
-                }
-
-                if (const auto& residualReqs = candidateIndexEntry._residualRequirements) {
-                    if constexpr (version < ExplainVersion::V3) {
-                        ExplainPrinter residualReqMapPrinter;
-                        printResidualRequirements(residualReqMapPrinter, *residualReqs);
-                        local.print(residualReqMapPrinter);
-                    } else if (version == ExplainVersion::V3) {
-                        printResidualRequirements(local, *residualReqs);
-                    } else {
-                        MONGO_UNREACHABLE;
-                    }
-                }
-
+                local.fieldName("candidateId").print(index + 1).separator(", ");
+                printCandidateIndexEntry(local, candidateIndexEntry);
                 candidateIndexesPrinters.push_back(std::move(local));
             }
             ExplainPrinter candidateIndexesPrinter;
@@ -2767,7 +2777,10 @@ public:
             .print(nodeInfo._localCost.getCost())
             .separator(", ")
             .fieldName("adjustedCE")
-            .print(nodeInfo._adjustedCE);
+            .print(nodeInfo._adjustedCE)
+            .separator(", ")
+            .fieldName("rule")
+            .print(cascades::PhysicalRewriterTypeEnum::toString[static_cast<int>(nodeInfo._rule)]);
 
         ExplainGeneratorTransporter<version> subGen(
             _displayProperties, _memoInterface, _nodeMap, nodeInfo._nodeCEMap);
@@ -2821,12 +2834,6 @@ public:
                         local.print(physOptResult->_costLimit.toString());
                     } else {
                         local.print(physOptResult->_costLimit.getCost());
-                    }
-
-                    if (physOptResult->_nodeInfo) {
-                        const cascades::PhysicalRewriteType rule = physOptResult->_nodeInfo->_rule;
-                        local.separator(", ").fieldName("rule").print(
-                            cascades::PhysicalRewriterTypeEnum::toString[static_cast<int>(rule)]);
                     }
 
                     ExplainPrinter propPrinter =
@@ -3056,5 +3063,10 @@ std::string ExplainGenerator::explainIntervalExpr(
     const CompoundIntervalReqExpr::Node& intervalExpr) {
     ExplainGeneratorV2 gen;
     return gen.printIntervalExpr<CompoundIntervalRequirement>(intervalExpr).str();
+}
+
+std::string ExplainGenerator::explainCandidateIndex(const CandidateIndexEntry& indexEntry) {
+    ExplainGeneratorV2 gen;
+    return gen.printCandidateIndexEntry(indexEntry);
 }
 }  // namespace mongo::optimizer

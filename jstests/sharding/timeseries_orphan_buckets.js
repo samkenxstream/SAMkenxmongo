@@ -24,12 +24,6 @@ assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shard
 const primaryShard = st.getPrimaryShard(dbName);
 const otherShard = st.getOther(primaryShard);
 
-if (!TimeseriesTest.shardedtimeseriesCollectionsEnabled(primaryShard)) {
-    jsTestLog("Skipping test because the sharded time-series collection feature flag is disabled");
-    st.stop();
-    return;
-}
-
 let currentId = 0;
 function generateId() {
     return currentId++;
@@ -55,9 +49,7 @@ assert.commandWorked(sDB.adminCommand({
 
 // Split the chunks such that primary shard has chunk: [MinKey, 2020-01-01) and other shard has
 // chunk [2020-01-01, MaxKey].
-splitPoint = {
-    [`control.min.${timeField}`]: ISODate(`2020-01-01`)
-};
+let splitPoint = {[`control.min.${timeField}`]: ISODate(`2020-01-01`)};
 assert.commandWorked(
     sDB.adminCommand({split: `${dbName}.system.buckets.${collName}`, middle: splitPoint}));
 

@@ -31,12 +31,14 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/op_observer/op_observer_util.h"
 #include "mongo/db/op_observer/oplog_writer_impl.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/database_sharding_state.h"
-#include "mongo/db/s/op_observer_sharding_impl.h"
+#include "mongo/db/s/migration_chunk_cloner_source_op_observer.h"
+#include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/type_shard_identity.h"
@@ -70,8 +72,9 @@ protected:
         auto db = databaseHolder->openDb(operationContext(), kTestNss.dbName(), &justCreated);
         auto scopedDss = DatabaseShardingState::assertDbLockedAndAcquireExclusive(
             operationContext(), kTestNss.dbName());
-        scopedDss->setDbInfo(operationContext(),
-                             DatabaseType{kTestNss.dbName().db(), ShardId("this"), dbVersion1});
+        scopedDss->setDbInfo(
+            operationContext(),
+            DatabaseType{kTestNss.dbName().db().toString(), ShardId("this"), dbVersion1});
         ASSERT_TRUE(db);
         ASSERT_TRUE(justCreated);
 
@@ -137,10 +140,10 @@ TEST_F(DocumentKeyStateTest, MakeDocumentKeyStateUnsharded) {
                     << "key2" << true);
 
     // Check that an order for deletion from an unsharded collection extracts just the "_id" field
-    ASSERT_BSONOBJ_EQ(repl::getDocumentKey(operationContext(), *autoColl, doc).getShardKeyAndId(),
+    ASSERT_BSONOBJ_EQ(getDocumentKey(*autoColl, doc).getShardKeyAndId(),
                       BSON("_id"
                            << "hello"));
-    ASSERT_FALSE(OpObserverShardingImpl::isMigrating(operationContext(), kTestNss, doc));
+    ASSERT_FALSE(MigrationSourceManager::isMigrating(operationContext(), kTestNss, doc));
 }
 
 TEST_F(DocumentKeyStateTest, MakeDocumentKeyStateShardedWithoutIdInShardKey) {
@@ -164,12 +167,12 @@ TEST_F(DocumentKeyStateTest, MakeDocumentKeyStateShardedWithoutIdInShardKey) {
                     << "key2" << true);
 
     // Verify the shard key is extracted, in correct order, followed by the "_id" field.
-    ASSERT_BSONOBJ_EQ(repl::getDocumentKey(operationContext(), *autoColl, doc).getShardKeyAndId(),
+    ASSERT_BSONOBJ_EQ(getDocumentKey(*autoColl, doc).getShardKeyAndId(),
                       BSON("key" << 100 << "key3"
                                  << "abc"
                                  << "_id"
                                  << "hello"));
-    ASSERT_FALSE(OpObserverShardingImpl::isMigrating(operationContext(), kTestNss, doc));
+    ASSERT_FALSE(MigrationSourceManager::isMigrating(operationContext(), kTestNss, doc));
 }
 
 TEST_F(DocumentKeyStateTest, MakeDocumentKeyStateShardedWithIdInShardKey) {
@@ -193,11 +196,11 @@ TEST_F(DocumentKeyStateTest, MakeDocumentKeyStateShardedWithIdInShardKey) {
                            << "key" << 100);
 
     // Verify the shard key is extracted with "_id" in the right place.
-    ASSERT_BSONOBJ_EQ(repl::getDocumentKey(operationContext(), *autoColl, doc).getShardKeyAndId(),
+    ASSERT_BSONOBJ_EQ(getDocumentKey(*autoColl, doc).getShardKeyAndId(),
                       BSON("key" << 100 << "_id"
                                  << "hello"
                                  << "key2" << true));
-    ASSERT_FALSE(OpObserverShardingImpl::isMigrating(operationContext(), kTestNss, doc));
+    ASSERT_FALSE(MigrationSourceManager::isMigrating(operationContext(), kTestNss, doc));
 }
 
 TEST_F(DocumentKeyStateTest, MakeDocumentKeyStateShardedWithIdHashInShardKey) {
@@ -219,16 +222,16 @@ TEST_F(DocumentKeyStateTest, MakeDocumentKeyStateShardedWithIdHashInShardKey) {
                            << "key" << 100);
 
     // Verify the shard key is extracted with "_id" in the right place, not hashed.
-    ASSERT_BSONOBJ_EQ(repl::getDocumentKey(operationContext(), *autoColl, doc).getShardKeyAndId(),
+    ASSERT_BSONOBJ_EQ(getDocumentKey(*autoColl, doc).getShardKeyAndId(),
                       BSON("_id"
                            << "hello"));
-    ASSERT_FALSE(OpObserverShardingImpl::isMigrating(operationContext(), kTestNss, doc));
+    ASSERT_FALSE(MigrationSourceManager::isMigrating(operationContext(), kTestNss, doc));
 }
 
 TEST_F(DocumentKeyStateTest, CheckDBVersion) {
     OpObserverRegistry opObserver;
-    opObserver.addObserver(
-        std::make_unique<OpObserverShardingImpl>(std::make_unique<OplogWriterImpl>()));
+    opObserver.addObserver(std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
+    opObserver.addObserver(std::make_unique<MigrationChunkClonerSourceOpObserver>());
 
     OperationContext* opCtx = operationContext();
     AutoGetCollection autoColl(opCtx, kUnshardedNss, MODE_IX);
@@ -265,8 +268,9 @@ TEST_F(DocumentKeyStateTest, CheckDBVersion) {
         opObserver.onUpdate(opCtx, update);
     };
     auto onDelete = [&]() {
-        opObserver.aboutToDelete(opCtx, *autoColl, BSON("_id" << 0));
-        opObserver.onDelete(opCtx, *autoColl, kUninitializedStmtId, {});
+        OplogDeleteEntryArgs args;
+        opObserver.aboutToDelete(opCtx, *autoColl, BSON("_id" << 0), &args);
+        opObserver.onDelete(opCtx, *autoColl, kUninitializedStmtId, args);
     };
 
     // Using the latest dbVersion works

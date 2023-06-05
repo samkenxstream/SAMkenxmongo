@@ -41,9 +41,15 @@ namespace analyze_shard_key {
 // The maximum number of decimal places for the metrics returned by the analyzeShardKey command.
 const int kMaxNumDecimalPlaces = 10;
 
-// The size limit for the documents to an insert in a single batch. Leave some padding for other
+// The size limit for the documents to insert in a single command. The 2MB padding is to account
+// for the size of the fields other than the "documents" field, and the fact that BSON stores an
+// array as {'0': <object>, '1': <object>, ...}. The math is as follows. The limit for the number
+// of documents that can be included in a single insert command is 100'000. So the size of the
+// largest field name is 5 bytes (since the max index is 99999). There is 1 byte doc for the field
+// name's null terminator and 1 byte per document for the type. So the upper bound for the overhead
+// for the "documents" field is 700kB. The remaining > 1MB should be more than enough for the other
 // fields in the insert command.
-constexpr int kMaxBSONObjSizePerInsertBatch = BSONObjMaxUserSize - 100 * 1024;
+constexpr int kMaxBSONObjSizePerInsertBatch = BSONObjMaxUserSize - 2 * 1024 * 1024;
 
 //
 // The helpers used for validation within the analyzeShardKey or configureQueryAnalyzer command.
@@ -61,8 +67,7 @@ Status validateNamespace(const NamespaceString& nss);
  * that occurs during the validation. If the validation passed, returns an OK status and the
  * collection UUID for the collection when the validation occurred.
  */
-StatusWith<UUID> validateCollectionOptionsLocally(OperationContext* opCtx,
-                                                  const NamespaceString& nss);
+StatusWith<UUID> validateCollectionOptions(OperationContext* opCtx, const NamespaceString& nss);
 
 /*
  * If the shard key is invalid, returns a BadValue error. Otherwise, returns an OK status. This
@@ -105,37 +110,6 @@ double round(double val, int n);
  * Returns the percentage between 'part' and 'whole' (between 0 and 100).
  */
 double calculatePercentage(double part, double whole);
-
-/*
- * Runs the command 'cmdObj' against the database 'dbName'. If this mongod is currently the
- * primary, runs the command locally. Otherwise, runs the command on the remote primary. Then
- * asserts the command status using the given 'uassertCmdStatusFn' callback. Internally retries
- * the command on retryable errors for a set number of times so the command must be idempotent.
- * Returns the command response.
- */
-BSONObj executeCommandOnPrimary(OperationContext* opCtx,
-                                const DatabaseName& dbName,
-                                const BSONObj& cmdObj,
-                                const std::function<void(const BSONObj&)>& uassertCmdStatusFn);
-
-/*
- * Inserts the documents 'docs' into the collection 'nss'. If this mongod is currently the primary,
- * runs the insert command locally. Otherwise, runs the command on the remote primary. Then asserts
- * the command status using the 'uassertCmdStatusFn' callback. Internally retries the insert
- * command on retryable errors.
- */
-void insertDocuments(OperationContext* opCtx,
-                     const NamespaceString& nss,
-                     const std::vector<BSONObj>& docs,
-                     const std::function<void(const BSONObj&)>& uassertCmdStatusFn);
-
-/*
- * Drops the collection 'nss'. If this mongod is currently the primary, runs the dropCollection
- * command locally. Otherwise, runs the command on the remote primary. Internally asserts that the
- * top-level command is OK or the error is NamespaceNotFound. Internally retries the write command
- * on retryable errors.
- */
-void dropCollection(OperationContext* opCtx, const NamespaceString& nss);
 
 }  // namespace analyze_shard_key
 }  // namespace mongo

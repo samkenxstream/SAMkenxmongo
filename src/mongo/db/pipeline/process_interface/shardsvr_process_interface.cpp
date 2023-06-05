@@ -27,9 +27,6 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/pipeline/process_interface/shardsvr_process_interface.h"
 
 #include <fmt/format.h>
@@ -50,12 +47,11 @@
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/cluster_write.h"
 #include "mongo/s/query/document_source_merge_cursors.h"
-#include "mongo/s/router.h"
+#include "mongo/s/router_role.h"
 #include "mongo/s/shard_version_factory.h"
 #include "mongo/s/stale_shard_version_helpers.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
-
 
 namespace mongo {
 
@@ -74,31 +70,42 @@ void ShardServerProcessInterface::checkRoutingInfoEpochOrThrow(
     auto const shardId = ShardingState::get(expCtx->opCtx)->shardId();
     auto* catalogCache = Grid::get(expCtx->opCtx)->catalogCache();
 
-    // Since we are only checking the epoch, don't advance the time in store of the index cache
-    auto currentShardingIndexCatalogInfo =
-        uassertStatusOK(catalogCache->getCollectionRoutingInfo(expCtx->opCtx, nss)).sii;
+    auto receivedVersion = [&] {
+        // Since we are only checking the epoch, don't advance the time in store of the index cache
+        auto currentShardingIndexCatalogInfo =
+            uassertStatusOK(catalogCache->getCollectionRoutingInfo(expCtx->opCtx, nss)).sii;
 
-    // Mark the cache entry routingInfo for the 'nss' and 'shardId' if the entry is staler than
-    // 'targetCollectionPlacementVersion'.
-    const ShardVersion ignoreIndexVersion = ShardVersionFactory::make(
-        targetCollectionPlacementVersion,
-        currentShardingIndexCatalogInfo
-            ? boost::make_optional(currentShardingIndexCatalogInfo->getCollectionIndexes())
-            : boost::none);
-    catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
-        nss, ignoreIndexVersion, shardId);
+        // Mark the cache entry routingInfo for the 'nss' and 'shardId' if the entry is staler than
+        // 'targetCollectionPlacementVersion'.
+        auto ignoreIndexVersion = ShardVersionFactory::make(
+            targetCollectionPlacementVersion,
+            currentShardingIndexCatalogInfo
+                ? boost::make_optional(currentShardingIndexCatalogInfo->getCollectionIndexes())
+                : boost::none);
 
-    const auto routingInfo =
-        uassertStatusOK(catalogCache->getCollectionRoutingInfo(expCtx->opCtx, nss)).cm;
+        catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
+            nss, ignoreIndexVersion, shardId);
+        return ignoreIndexVersion;
+    }();
 
-    const auto foundVersion =
-        routingInfo.isSharded() ? routingInfo.getVersion() : ChunkVersion::UNSHARDED();
+    auto wantedVersion = [&] {
+        auto routingInfo =
+            uassertStatusOK(catalogCache->getCollectionRoutingInfo(expCtx->opCtx, nss));
+        auto foundVersion =
+            routingInfo.cm.isSharded() ? routingInfo.cm.getVersion() : ChunkVersion::UNSHARDED();
 
-    uassert(StaleEpochInfo(nss),
-            str::stream() << "Could not act as router for " << nss.ns() << ", wanted "
-                          << targetCollectionPlacementVersion.toString() << ", but found "
-                          << foundVersion.toString(),
-            foundVersion.isSameCollection(targetCollectionPlacementVersion));
+        auto ignoreIndexVersion = ShardVersionFactory::make(
+            foundVersion,
+            routingInfo.sii ? boost::make_optional(routingInfo.sii->getCollectionIndexes())
+                            : boost::none);
+        return ignoreIndexVersion;
+    }();
+
+    uassert(StaleEpochInfo(nss, receivedVersion, wantedVersion),
+            str::stream() << "Could not act as router for " << nss.toStringForErrorMsg()
+                          << ", received " << receivedVersion.toString() << ", but found "
+                          << wantedVersion.toString(),
+            wantedVersion.placementVersion().isSameCollection(receivedVersion.placementVersion()));
 }
 
 boost::optional<Document> ShardServerProcessInterface::lookupSingleDocument(
@@ -116,20 +123,20 @@ boost::optional<Document> ShardServerProcessInterface::lookupSingleDocument(
     return doLookupSingleDocument(expCtx, nss, collectionUUID, documentKey, std::move(opts));
 }
 
-Status ShardServerProcessInterface::insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                           const NamespaceString& ns,
-                                           std::vector<BSONObj>&& objs,
-                                           const WriteConcernOptions& wc,
-                                           boost::optional<OID> targetEpoch) {
+Status ShardServerProcessInterface::insert(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& ns,
+    std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
+    const WriteConcernOptions& wc,
+    boost::optional<OID> targetEpoch) {
     BatchedCommandResponse response;
     BatchWriteExecStats stats;
 
-    BatchedCommandRequest insertCommand(
-        buildInsertOp(ns, std::move(objs), expCtx->bypassDocumentValidation));
+    BatchedCommandRequest batchInsertCommand(std::move(insertCommand));
 
-    insertCommand.setWriteConcern(wc.toBSON());
+    batchInsertCommand.setWriteConcern(wc.toBSON());
 
-    cluster::write(expCtx->opCtx, insertCommand, &stats, &response, targetEpoch);
+    cluster::write(expCtx->opCtx, batchInsertCommand, &stats, &response, targetEpoch);
 
     return response.toStatus();
 }
@@ -137,7 +144,7 @@ Status ShardServerProcessInterface::insert(const boost::intrusive_ptr<Expression
 StatusWith<MongoProcessInterface::UpdateResult> ShardServerProcessInterface::update(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const NamespaceString& ns,
-    BatchedObjects&& batch,
+    std::unique_ptr<write_ops::UpdateCommandRequest> updateCommand,
     const WriteConcernOptions& wc,
     UpsertType upsert,
     bool multi,
@@ -145,11 +152,10 @@ StatusWith<MongoProcessInterface::UpdateResult> ShardServerProcessInterface::upd
     BatchedCommandResponse response;
     BatchWriteExecStats stats;
 
-    BatchedCommandRequest updateCommand(buildUpdateOp(expCtx, ns, std::move(batch), upsert, multi));
+    BatchedCommandRequest batchUpdateCommand(std::move(updateCommand));
+    batchUpdateCommand.setWriteConcern(wc.toBSON());
 
-    updateCommand.setWriteConcern(wc.toBSON());
-
-    cluster::write(expCtx->opCtx, updateCommand, &stats, &response, targetEpoch);
+    cluster::write(expCtx->opCtx, batchUpdateCommand, &stats, &response, targetEpoch);
 
     if (auto status = response.toStatus(); status != Status::OK()) {
         return status;
@@ -255,8 +261,8 @@ BSONObj ShardServerProcessInterface::getCollectionOptions(OperationContext* opCt
         }
 
         tassert(5983900,
-                str::stream() << "Expected at most one collection with the name " << nss << ": "
-                              << resultCollections.docs.size(),
+                str::stream() << "Expected at most one collection with the name "
+                              << nss.toStringForErrorMsg() << ": " << resultCollections.docs.size(),
                 resultCollections.docs.size() <= 1);
     }
 
@@ -290,8 +296,8 @@ std::list<BSONObj> ShardServerProcessInterface::getIndexSpecs(OperationContext* 
 void ShardServerProcessInterface::createCollection(OperationContext* opCtx,
                                                    const DatabaseName& dbName,
                                                    const BSONObj& cmdObj) {
-    auto cachedDbInfo = uassertStatusOK(
-        Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName.toStringWithTenantId()));
+    auto cachedDbInfo = uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(
+        opCtx, DatabaseNameUtil::serializeForCatalog(dbName)));
     BSONObjBuilder finalCmdBuilder(cmdObj);
     finalCmdBuilder.append(WriteConcernOptions::kWriteConcernField,
                            opCtx->getWriteConcern().toBSON());
@@ -299,7 +305,7 @@ void ShardServerProcessInterface::createCollection(OperationContext* opCtx,
     // TODO SERVER-67411 change executeCommandAgainstDatabasePrimary to take in DatabaseName
     auto response =
         executeCommandAgainstDatabasePrimary(opCtx,
-                                             dbName.toStringWithTenantId(),
+                                             DatabaseNameUtil::serialize(dbName),
                                              std::move(cachedDbInfo),
                                              finalCmdObj,
                                              ReadPreferenceSetting(ReadPreference::PrimaryOnly),
@@ -381,6 +387,27 @@ void ShardServerProcessInterface::dropCollection(OperationContext* opCtx,
                                    << "write concern failed while running command " << cmdObj);
 }
 
+void ShardServerProcessInterface::createTimeseriesView(OperationContext* opCtx,
+                                                       const NamespaceString& ns,
+                                                       const BSONObj& cmdObj,
+                                                       const TimeseriesOptions& userOpts) {
+    try {
+        ShardServerProcessInterface::createCollection(opCtx, ns.dbName(), cmdObj);
+    } catch (const DBException& ex) {
+        _handleTimeseriesCreateError(ex, opCtx, ns, userOpts);
+    }
+}
+
+Status ShardServerProcessInterface::insertTimeseries(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& ns,
+    std::unique_ptr<write_ops::InsertCommandRequest> insertCommand,
+    const WriteConcernOptions& wc,
+    boost::optional<OID> targetEpoch) {
+    return ShardServerProcessInterface::insert(
+        expCtx, ns, std::move(insertCommand), wc, targetEpoch);
+}
+
 std::unique_ptr<Pipeline, PipelineDeleter>
 ShardServerProcessInterface::attachCursorSourceToPipeline(Pipeline* ownedPipeline,
                                                           ShardTargetingPolicy shardTargetingPolicy,
@@ -428,7 +455,7 @@ ShardServerProcessInterface::expectUnshardedCollectionInScope(
 
 void ShardServerProcessInterface::checkOnPrimaryShardForDb(OperationContext* opCtx,
                                                            const NamespaceString& nss) {
-    DatabaseShardingState::assertIsPrimaryShardForDb(opCtx, nss.db());
+    DatabaseShardingState::assertIsPrimaryShardForDb(opCtx, nss.dbName());
 }
 
 }  // namespace mongo

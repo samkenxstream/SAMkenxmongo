@@ -4,6 +4,8 @@
 (function() {
 "use strict";
 
+load("jstests/libs/sbe_assert_error_override.js");  // Override error-code-checking APIs.
+
 const coll = db[jsTestName()];
 coll.drop();
 
@@ -392,4 +394,18 @@ const testOperatorText = (op) => {
 // most relevant results first.
 testOperatorText("$bottomN");
 testOperatorText("$topN");
+
+// Test constant output field.
+assert(coll.drop());
+assert.commandWorked(coll.insertMany([{a: 1}, {a: 2}, {a: 3}]));
+const testConstantOutput = (op) => {
+    const results =
+        coll.aggregate(
+                [{$group: {_id: null, result: {[op]: {n: 3, output: "abc", sortBy: {a: 1}}}}}])
+            .toArray();
+    assert.eq(results.length, 1, results);
+    assert.docEq(results[0], {_id: null, result: ["abc", "abc", "abc"]}, results);
+};
+testConstantOutput("$topN");
+testConstantOutput("$bottomN");
 })();

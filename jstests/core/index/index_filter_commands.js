@@ -35,6 +35,7 @@
  *   does_not_support_stepdowns,
  *   # The SBE plan cache was first enabled in 6.3.
  *   requires_fcv_63,
+ *   references_foreign_collection,
  * ]
  */
 
@@ -187,7 +188,7 @@ assert.eq(null, planCacheEntryForQuery(shape), coll.getPlanCache().list());
 
 // Check details of winning plan in plan cache after setting filter and re-executing query.
 assert.eq(1, coll.find(queryA1, projectionA1).sort(sortA1).itcount(), 'unexpected document count');
-planAfterSetFilter = planCacheEntryForQuery(shape);
+let planAfterSetFilter = planCacheEntryForQuery(shape);
 assert.neq(null, planAfterSetFilter, coll.getPlanCache().list());
 // Check 'indexFilterSet' field in plan details
 assert.eq(true, planAfterSetFilter.indexFilterSet, planAfterSetFilter);
@@ -441,7 +442,7 @@ if (checkSBEEnabled(db)) {
     assert.eq(lookupStage.strategy, "IndexedLoopJoin", explain);
     assert.eq(lookupStage.indexName, "foreign_a_1");
 
-    ixscanStage = getPlanStage(explain, "IXSCAN");
+    let ixscanStage = getPlanStage(explain, "IXSCAN");
     assert.neq(null, ixscanStage, explain);
     assert.eq(ixscanStage.indexName, "main_a_1_c_1", explain);
 

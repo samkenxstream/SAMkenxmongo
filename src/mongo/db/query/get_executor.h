@@ -46,6 +46,7 @@
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_settings.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/db/update/update_driver.h"
 
 namespace mongo {
@@ -310,10 +311,9 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCoun
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
     OpDebug* opDebug,
-    const CollectionPtr* collection,
+    const ScopedCollectionAcquisition& coll,
     ParsedDelete* parsedDelete,
-    boost::optional<ExplainOptions::Verbosity> verbosity,
-    DeleteStageParams::DocumentCounter&& documentCounter = nullptr);
+    boost::optional<ExplainOptions::Verbosity> verbosity);
 
 /**
  * Get a PlanExecutor for an update operation. 'parsedUpdate' describes the query predicate
@@ -337,10 +337,9 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDele
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
     OpDebug* opDebug,
-    const CollectionPtr* collection,
+    const ScopedCollectionAcquisition& coll,
     ParsedUpdate* parsedUpdate,
-    boost::optional<ExplainOptions::Verbosity> verbosity,
-    UpdateStageParams::DocumentCounter&& documentCounter = nullptr);
+    boost::optional<ExplainOptions::Verbosity> verbosity);
 
 /**
  * Direction of collection scan plan executor returned by makeCollectionScanPlanExecutor() below.

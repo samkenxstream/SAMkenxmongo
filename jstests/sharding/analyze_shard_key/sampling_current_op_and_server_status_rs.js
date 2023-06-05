@@ -1,7 +1,7 @@
 /**
  * Tests the currentOp and serverStatus for query sampling on a standalone replica set.
  *
- * @tags: [requires_fcv_70, featureFlagAnalyzeShardKey]
+ * @tags: [requires_fcv_70]
  */
 
 (function() {
@@ -42,6 +42,7 @@ for (let i = 0; i < numDocs; i++) {
     bulk.insert({x: i, y: i});
 }
 assert.commandWorked(bulk.execute());
+const collUuid = QuerySamplingUtil.getCollectionUuid(db, collName);
 
 function runCommandAndAssertCurrentOpAndServerStatus(opKind, cmdObj, oldState) {
     assert.commandWorked(primary.getDB(dbName).runCommand(cmdObj));
@@ -62,7 +63,7 @@ assert.eq(
 // Start query sampling.
 assert.commandWorked(
     primary.adminCommand({configureQueryAnalyzer: ns, mode: "full", sampleRate: sampleRate}));
-QuerySamplingUtil.waitForActiveSampling(primary);
+QuerySamplingUtil.waitForActiveSamplingReplicaSet(rst, ns, collUuid);
 
 // Execute different kinds of queries and check counters.
 const cmdObj0 = {
@@ -98,7 +99,7 @@ const state4 = runCommandAndAssertCurrentOpAndServerStatus(opKindWrite, cmdObj4,
 
 // Stop query sampling.
 assert.commandWorked(primary.adminCommand({configureQueryAnalyzer: ns, mode: "off"}));
-QuerySamplingUtil.waitForInactiveSampling(primary);
+QuerySamplingUtil.waitForInactiveSamplingReplicaSet(rst, ns, collUuid);
 
 const expectedFinalState = Object.assign({}, state4, true /* deep */);
 expectedFinalState.currentOp = [];

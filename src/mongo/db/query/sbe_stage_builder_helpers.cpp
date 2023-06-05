@@ -87,13 +87,20 @@ std::unique_ptr<sbe::EExpression> makeBinaryOp(sbe::EPrimBinary::Op binaryOp,
 std::unique_ptr<sbe::EExpression> makeBinaryOp(sbe::EPrimBinary::Op binaryOp,
                                                std::unique_ptr<sbe::EExpression> lhs,
                                                std::unique_ptr<sbe::EExpression> rhs,
-                                               sbe::RuntimeEnvironment* env) {
-    invariant(env);
+                                               sbe::RuntimeEnvironment* runtimeEnv) {
+    invariant(runtimeEnv);
 
-    auto collatorSlot = env->getSlotIfExists("collator"_sd);
+    auto collatorSlot = runtimeEnv->getSlotIfExists("collator"_sd);
     auto collatorVar = collatorSlot ? sbe::makeE<sbe::EVariable>(*collatorSlot) : nullptr;
 
     return makeBinaryOp(binaryOp, std::move(lhs), std::move(rhs), std::move(collatorVar));
+}
+
+std::unique_ptr<sbe::EExpression> makeBinaryOp(sbe::EPrimBinary::Op binaryOp,
+                                               std::unique_ptr<sbe::EExpression> lhs,
+                                               std::unique_ptr<sbe::EExpression> rhs,
+                                               PlanStageEnvironment& env) {
+    return makeBinaryOp(binaryOp, std::move(lhs), std::move(rhs), env.runtimeEnv);
 }
 
 std::unique_ptr<sbe::EExpression> makeIsMember(std::unique_ptr<sbe::EExpression> input,
@@ -108,13 +115,19 @@ std::unique_ptr<sbe::EExpression> makeIsMember(std::unique_ptr<sbe::EExpression>
 
 std::unique_ptr<sbe::EExpression> makeIsMember(std::unique_ptr<sbe::EExpression> input,
                                                std::unique_ptr<sbe::EExpression> arr,
-                                               sbe::RuntimeEnvironment* env) {
-    invariant(env);
+                                               sbe::RuntimeEnvironment* runtimeEnv) {
+    invariant(runtimeEnv);
 
-    auto collatorSlot = env->getSlotIfExists("collator"_sd);
+    auto collatorSlot = runtimeEnv->getSlotIfExists("collator"_sd);
     auto collatorVar = collatorSlot ? sbe::makeE<sbe::EVariable>(*collatorSlot) : nullptr;
 
     return makeIsMember(std::move(input), std::move(arr), std::move(collatorVar));
+}
+
+std::unique_ptr<sbe::EExpression> makeIsMember(std::unique_ptr<sbe::EExpression> input,
+                                               std::unique_ptr<sbe::EExpression> arr,
+                                               PlanStageEnvironment& env) {
+    return makeIsMember(std::move(input), std::move(arr), env.runtimeEnv);
 }
 
 std::unique_ptr<sbe::EExpression> generateNullOrMissingExpr(const sbe::EExpression& expr) {
@@ -144,7 +157,7 @@ std::unique_ptr<sbe::EExpression> generateNullOrMissing(std::unique_ptr<sbe::EEx
 }
 
 std::unique_ptr<sbe::EExpression> generateNullOrMissing(EvalExpr arg, StageBuilderState& state) {
-    auto expr = arg.extractExpr(state.slotVarMap, *state.data->env);
+    auto expr = arg.extractExpr(state.slotVarMap, *state.env);
     return generateNullOrMissingExpr(*expr);
 }
 
@@ -153,7 +166,7 @@ std::unique_ptr<sbe::EExpression> generateNonNumericCheck(const sbe::EVariable& 
 }
 
 std::unique_ptr<sbe::EExpression> generateNonNumericCheck(EvalExpr expr, StageBuilderState& state) {
-    return makeNot(makeFunction("isNumber", expr.extractExpr(state.slotVarMap, *state.data->env)));
+    return makeNot(makeFunction("isNumber", expr.extractExpr(state.slotVarMap, *state.env)));
 }
 
 std::unique_ptr<sbe::EExpression> generateLongLongMinCheck(const sbe::EVariable& var) {
@@ -176,7 +189,7 @@ std::unique_ptr<sbe::EExpression> generateNaNCheck(const sbe::EVariable& var) {
 }
 
 std::unique_ptr<sbe::EExpression> generateNaNCheck(EvalExpr expr, StageBuilderState& state) {
-    return makeFunction("isNaN", expr.extractExpr(state.slotVarMap, *state.data->env));
+    return makeFunction("isNaN", expr.extractExpr(state.slotVarMap, *state.env));
 }
 
 std::unique_ptr<sbe::EExpression> generateInfinityCheck(const sbe::EVariable& var) {
@@ -184,7 +197,7 @@ std::unique_ptr<sbe::EExpression> generateInfinityCheck(const sbe::EVariable& va
 }
 
 std::unique_ptr<sbe::EExpression> generateInfinityCheck(EvalExpr expr, StageBuilderState& state) {
-    return makeFunction("isInfinity"_sd, expr.extractExpr(state.slotVarMap, *state.data->env));
+    return makeFunction("isInfinity"_sd, expr.extractExpr(state.slotVarMap, *state.env));
 }
 
 std::unique_ptr<sbe::EExpression> generateNonPositiveCheck(const sbe::EVariable& var) {
@@ -342,7 +355,7 @@ std::pair<sbe::value::SlotId, EvalStage> projectEvalExpr(
     // into a slot.
     auto slot = slotIdGenerator->generate();
     stage = makeProject(
-        std::move(stage), planNodeId, slot, expr.extractExpr(state.slotVarMap, *state.data->env));
+        std::move(stage), planNodeId, slot, expr.extractExpr(state.slotVarMap, *state.env));
     return {slot, std::move(stage)};
 }
 
@@ -478,7 +491,7 @@ EvalStage makeUnion(std::vector<EvalStage> inputStages,
 
 EvalStage makeHashAgg(EvalStage stage,
                       sbe::value::SlotVector gbs,
-                      sbe::SlotExprPairVector aggs,
+                      sbe::HashAggStage::AggExprVector aggs,
                       boost::optional<sbe::value::SlotId> collatorSlot,
                       bool allowDiskUse,
                       sbe::SlotExprPairVector mergingExprs,
@@ -641,8 +654,8 @@ sbe::value::SlotId StageBuilderState::getGlobalVariableSlot(Variables::Id variab
         return it->second;
     }
 
-    auto slotId = data->env->registerSlot(
-        sbe::value::TypeTags::Nothing, 0, false /* owned */, slotIdGenerator);
+    auto slotId =
+        env->registerSlot(sbe::value::TypeTags::Nothing, 0, false /* owned */, slotIdGenerator);
     data->variableIdToSlotMap.emplace(variableId, slotId);
     return slotId;
 }
@@ -731,12 +744,13 @@ void indexKeyCorruptionCheckCallback(OperationContext* opCtx,
  * or that the index keys are still part of the underlying index.
  */
 bool indexKeyConsistencyCheckCallback(OperationContext* opCtx,
-                                      const StringMap<const IndexAccessMethod*>& iamTable,
+                                      StringMap<const IndexCatalogEntry*>& entryMap,
                                       sbe::value::SlotAccessor* snapshotIdAccessor,
-                                      sbe::value::SlotAccessor* indexIdAccessor,
+                                      sbe::value::SlotAccessor* indexIdentAccessor,
                                       sbe::value::SlotAccessor* indexKeyAccessor,
                                       const CollectionPtr& collection,
                                       const Record& nextRecord) {
+    // The index consistency check is only performed when 'snapshotIdAccessor' is set.
     if (snapshotIdAccessor) {
         auto currentSnapshotId = opCtx->recoveryUnit()->getSnapshotId();
         auto [snapshotIdTag, snapshotIdVal] = snapshotIdAccessor->getViewOfValue();
@@ -748,15 +762,15 @@ bool indexKeyConsistencyCheckCallback(OperationContext* opCtx,
         auto snapshotId = sbe::value::bitcastTo<uint64_t>(snapshotIdVal);
         if (currentSnapshotId.toNumber() != snapshotId) {
             tassert(5290707, "Should have index key accessor", indexKeyAccessor);
-            tassert(5290714, "Should have index id accessor", indexIdAccessor);
+            tassert(5290714, "Should have index ident accessor", indexIdentAccessor);
 
-            auto [indexIdTag, indexIdVal] = indexIdAccessor->getViewOfValue();
+            auto [identTag, identVal] = indexIdentAccessor->getViewOfValue();
             auto [ksTag, ksVal] = indexKeyAccessor->getViewOfValue();
 
-            const auto msgIndexIdTag = indexIdTag;
+            const auto msgIdentTag = identTag;
             tassert(5290708,
-                    str::stream() << "Index name is of wrong type: " << msgIndexIdTag,
-                    sbe::value::isString(indexIdTag));
+                    str::stream() << "Index name is of wrong type: " << msgIdentTag,
+                    sbe::value::isString(identTag));
 
             const auto msgKsTag = ksTag;
             tassert(5290710,
@@ -764,18 +778,33 @@ bool indexKeyConsistencyCheckCallback(OperationContext* opCtx,
                     ksTag == sbe::value::TypeTags::ksValue);
 
             auto keyString = sbe::value::getKeyStringView(ksVal);
-            auto indexId = sbe::value::getStringView(indexIdTag, indexIdVal);
+            auto indexIdent = sbe::value::getStringView(identTag, identVal);
             tassert(5290712, "KeyString does not exist", keyString);
 
-            auto it = iamTable.find(indexId);
-            tassert(5290713,
-                    str::stream() << "IndexAccessMethod not found for index " << indexId,
-                    it != iamTable.end());
+            auto it = entryMap.find(indexIdent);
 
-            auto iam = it->second->asSortedData();
+            // If 'entryMap' doesn't contain an entry for 'indexIdent', create one.
+            if (it == entryMap.end()) {
+                auto indexCatalog = collection->getIndexCatalog();
+                auto indexDesc = indexCatalog->findIndexByIdent(opCtx, indexIdent);
+                auto entry = indexDesc ? indexDesc->getEntry() : nullptr;
+
+                // Throw an error if we can't get the IndexDescriptor or the IndexCatalogEntry
+                // (or if the index is dropped).
+                uassert(ErrorCodes::QueryPlanKilled,
+                        str::stream() << "query plan killed :: index dropped: " << indexIdent,
+                        indexDesc && entry && !entry->isDropped());
+
+                auto [newIt, _] = entryMap.emplace(indexIdent, entry);
+
+                it = newIt;
+            }
+
+            auto entry = it->second;
+            auto iam = entry->accessMethod()->asSortedData();
             tassert(5290709,
-                    str::stream() << "Expected to find SortedDataIndexAccessMethod for index "
-                                  << indexId,
+                    str::stream() << "Expected to find SortedDataIndexAccessMethod for index: "
+                                  << indexIdent,
                     iam);
 
             auto& executionCtx = StorageExecutionContext::get(opCtx);
@@ -790,6 +819,7 @@ bool indexKeyConsistencyCheckCallback(OperationContext* opCtx,
 
             iam->getKeys(opCtx,
                          collection,
+                         entry,
                          pooledBuilder,
                          nextRecord.data.toBson(),
                          InsertDeleteOptions::ConstraintEnforcementMode::kEnforceConstraints,
@@ -802,6 +832,7 @@ bool indexKeyConsistencyCheckCallback(OperationContext* opCtx,
             return keys->count(*keyString);
         }
     }
+
     return true;
 }
 
@@ -810,13 +841,12 @@ std::unique_ptr<sbe::PlanStage> makeLoopJoinForFetch(std::unique_ptr<sbe::PlanSt
                                                      sbe::value::SlotId recordIdSlot,
                                                      std::vector<std::string> fields,
                                                      sbe::value::SlotVector fieldSlots,
-                                                     sbe::value::SlotId seekKeySlot,
+                                                     sbe::value::SlotId seekRecordIdSlot,
                                                      sbe::value::SlotId snapshotIdSlot,
-                                                     sbe::value::SlotId indexIdSlot,
+                                                     sbe::value::SlotId indexIdentSlot,
                                                      sbe::value::SlotId indexKeySlot,
                                                      sbe::value::SlotId indexKeyPatternSlot,
                                                      const CollectionPtr& collToFetch,
-                                                     StringMap<const IndexAccessMethod*> iamMap,
                                                      PlanNodeId planNodeId,
                                                      sbe::value::SlotVector slotsToForward) {
     // It is assumed that we are generating a fetch loop join over the main collection. If we are
@@ -824,26 +854,23 @@ std::unique_ptr<sbe::PlanStage> makeLoopJoinForFetch(std::unique_ptr<sbe::PlanSt
     // in the QSN tree to indicate which collection we are fetching over.
     tassert(6355301, "Cannot fetch from a collection that doesn't exist", collToFetch);
 
-    sbe::ScanCallbacks callbacks(
-        indexKeyCorruptionCheckCallback,
-        [iam = std::move(iamMap)](
-            auto&& arg1, auto&& arg2, auto&& arg3, auto&& arg4, auto&& arg5, auto&& arg6) {
-            return indexKeyConsistencyCheckCallback(arg1, iam, arg2, arg3, arg4, arg5, arg6);
-        });
+    sbe::ScanCallbacks callbacks(indexKeyCorruptionCheckCallback, indexKeyConsistencyCheckCallback);
 
-    // Scan the collection in the range [seekKeySlot, Inf).
+    // Scan the collection in the range [seekRecordIdSlot, Inf).
     auto scanStage = sbe::makeS<sbe::ScanStage>(collToFetch->uuid(),
                                                 resultSlot,
                                                 recordIdSlot,
                                                 snapshotIdSlot,
-                                                indexIdSlot,
+                                                indexIdentSlot,
                                                 indexKeySlot,
                                                 indexKeyPatternSlot,
                                                 boost::none,
                                                 std::move(fields),
                                                 std::move(fieldSlots),
-                                                seekKeySlot,
-                                                true,
+                                                seekRecordIdSlot,
+                                                boost::none /* minRecordIdSlot */,
+                                                boost::none /* maxRecordIdSlot */,
+                                                true /* forward */,
                                                 nullptr,
                                                 planNodeId,
                                                 std::move(callbacks));
@@ -854,7 +881,8 @@ std::unique_ptr<sbe::PlanStage> makeLoopJoinForFetch(std::unique_ptr<sbe::PlanSt
         std::move(inputStage),
         sbe::makeS<sbe::LimitSkipStage>(std::move(scanStage), 1, boost::none, planNodeId),
         std::move(slotsToForward),
-        sbe::makeSV(seekKeySlot, snapshotIdSlot, indexIdSlot, indexKeySlot, indexKeyPatternSlot),
+        sbe::makeSV(
+            seekRecordIdSlot, snapshotIdSlot, indexIdentSlot, indexKeySlot, indexKeyPatternSlot),
         nullptr,
         planNodeId);
 }
@@ -869,8 +897,8 @@ sbe::value::SlotId StageBuilderState::registerInputParamSlot(
         return it->second;
     }
 
-    auto slotId = data->env->registerSlot(
-        sbe::value::TypeTags::Nothing, 0, false /* owned */, slotIdGenerator);
+    auto slotId =
+        env->registerSlot(sbe::value::TypeTags::Nothing, 0, false /* owned */, slotIdGenerator);
     data->inputParamToSlotMap.emplace(paramId, slotId);
     return slotId;
 }
@@ -1043,7 +1071,7 @@ public:
             if (auto child = node->findChild(part)) {
                 node = child;
             } else {
-                node = node->emplace(part);
+                node = node->emplace_back(std::string(part));
             }
         }
     }
@@ -1193,12 +1221,12 @@ std::pair<std::unique_ptr<sbe::PlanStage>, sbe::value::SlotVector> projectFields
                 tassert(7182002, "Expected DfsState to have at least 2 entries", dfs.size() >= 2);
 
                 auto parent = dfs[dfs.size() - 2].first;
-                auto getFieldExpr = makeFunction(
-                    "getField"_sd,
-                    parent->value.hasSlot()
-                        ? makeVariable(*parent->value.getSlot())
-                        : parent->value.extractExpr(state.slotVarMap, *state.data->env),
-                    makeConstant(node->name));
+                auto getFieldExpr =
+                    makeFunction("getField"_sd,
+                                 parent->value.hasSlot()
+                                     ? makeVariable(*parent->value.getSlot())
+                                     : parent->value.extractExpr(state.slotVarMap, *state.env),
+                                 makeConstant(node->name));
 
                 auto hasOneChildToVisit = [&] {
                     size_t count = 0;

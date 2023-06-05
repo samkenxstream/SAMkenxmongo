@@ -73,14 +73,10 @@ var AnalyzeShardKeyUtil = (function() {
     /**
      * Extracts the shard key value from the given document.
      */
-    function extractShardKeyValueFromDocument(doc, shardKey, indexKey) {
+    function extractShardKeyValueFromDocument(doc, shardKey) {
         const shardKeyValue = {};
         for (let fieldName in shardKey) {
-            const isHashed = indexKey[fieldName] == "hashed";
-            const value = AnalyzeShardKeyUtil.getDottedField(doc, fieldName);
-            // TODO (SERVER-70994): After SERVER-72814, make sure that the analyzeShardKey command
-            // doesn't return hash values in the case where the supporting index is hashed.
-            shardKeyValue[fieldName] = isHashed ? convertShardKeyToHashed(value) : value;
+            shardKeyValue[fieldName] = AnalyzeShardKeyUtil.getDottedField(doc, fieldName);
         }
         return shardKeyValue;
     }
@@ -329,6 +325,19 @@ var AnalyzeShardKeyUtil = (function() {
         validateWriteDistributionMetrics(metrics.writeDistribution);
     }
 
+    function validateSampledQueryDocument(doc) {
+        const readCmdNames = new Set(["find", "aggregate", "count", "distinct"]);
+        assert(doc.hasOwnProperty("ns"), doc);
+        assert(doc.hasOwnProperty("collectionUuid"), doc);
+        assert(doc.hasOwnProperty("cmdName"), doc);
+        assert(doc.hasOwnProperty("cmd"), doc);
+        assert(doc.hasOwnProperty("expireAt"), doc);
+        if (readCmdNames.has(doc.cmdName)) {
+            assert(doc.cmd.hasOwnProperty("filter"));
+            assert(doc.cmd.hasOwnProperty("collation"));
+        }
+    }
+
     return {
         isHashedKeyPattern,
         isIdKeyPattern,
@@ -348,6 +357,7 @@ var AnalyzeShardKeyUtil = (function() {
         assertContainKeyCharacteristicsMetrics,
         assertKeyCharacteristicsMetrics,
         assertNotContainReadWriteDistributionMetrics,
-        assertContainReadWriteDistributionMetrics
+        assertContainReadWriteDistributionMetrics,
+        validateSampledQueryDocument
     };
 })();

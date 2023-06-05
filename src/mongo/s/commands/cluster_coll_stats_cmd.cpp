@@ -247,8 +247,10 @@ public:
                 opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObjToSend)),
             ReadPreferenceSetting::get(opCtx),
             Shard::RetryPolicy::kIdempotent,
-            {},
-            {});
+            {} /*query*/,
+            {} /*collation*/,
+            boost::none /*letParameters*/,
+            boost::none /*runtimeConstants*/);
 
         BSONObjBuilder shardStats;
         std::map<std::string, long long> counts;
@@ -346,7 +348,7 @@ public:
             shardStats.append(shardId.toString(), scaleIndividualShardStatistics(res, scale));
         }
 
-        result.append("ns", nss.ns());
+        result.append("ns", NamespaceStringUtil::serialize(nss));
 
         for (const auto& countEntry : counts) {
             if (fieldIsAnyOf(countEntry.first,

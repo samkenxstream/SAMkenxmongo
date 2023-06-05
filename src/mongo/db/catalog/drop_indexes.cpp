@@ -66,9 +66,11 @@ Status checkView(OperationContext* opCtx,
     if (!collection) {
         if (CollectionCatalog::get(opCtx)->lookupView(opCtx, nss)) {
             return Status(ErrorCodes::CommandNotSupportedOnView,
-                          str::stream() << "Cannot drop indexes on view " << nss);
+                          str::stream()
+                              << "Cannot drop indexes on view " << nss.toStringForErrorMsg());
         }
-        return Status(ErrorCodes::NamespaceNotFound, str::stream() << "ns not found " << nss);
+        return Status(ErrorCodes::NamespaceNotFound,
+                      str::stream() << "ns not found " << nss.toStringForErrorMsg());
     }
     return Status::OK();
 }
@@ -83,7 +85,8 @@ Status checkReplState(OperationContext* opCtx,
     if (writesAreReplicatedAndNotPrimary) {
         return Status(ErrorCodes::NotWritablePrimary,
                       str::stream() << "Not primary while dropping indexes on database "
-                                    << dbAndUUID.db() << " with collection " << dbAndUUID.uuid());
+                                    << dbAndUUID.dbName().toStringForErrorMsg()
+                                    << " with collection " << dbAndUUID.uuid());
     }
 
     // Disallow index drops on drop-pending namespaces (system.drop.*) if we are primary.
@@ -91,8 +94,9 @@ Status checkReplState(OperationContext* opCtx,
     const auto& nss = collection->ns();
     if (isPrimary && nss.isDropPendingNamespace()) {
         return Status(ErrorCodes::NamespaceNotFound,
-                      str::stream() << "Cannot drop indexes on drop-pending namespace " << nss
-                                    << " in database " << dbAndUUID.db() << " with uuid "
+                      str::stream() << "Cannot drop indexes on drop-pending namespace "
+                                    << nss.toStringForErrorMsg() << " in database "
+                                    << dbAndUUID.dbName().toStringForErrorMsg() << " with uuid "
                                     << dbAndUUID.uuid());
     }
 
@@ -225,35 +229,37 @@ std::vector<UUID> abortIndexBuildByIndexNames(OperationContext* opCtx,
 Status dropIndexByDescriptor(OperationContext* opCtx,
                              Collection* collection,
                              IndexCatalog* indexCatalog,
-                             const IndexDescriptor* desc) {
-    if (desc->isIdIndex()) {
+                             IndexCatalogEntry* entry) {
+    if (entry->descriptor()->isIdIndex()) {
         return Status(ErrorCodes::InvalidOptions, "cannot drop _id index");
     }
 
     // Support dropping unfinished indexes, but only if the index is 'frozen'. These indexes only
     // exist in standalone mode.
-    auto entry = indexCatalog->getEntry(desc);
     if (entry->isFrozen()) {
-        invariant(!entry->isReady(opCtx));
+        invariant(!entry->isReady());
         invariant(getReplSetMemberInStandaloneMode(opCtx->getServiceContext()));
         // Return here. No need to fall through to op observer on standalone.
-        return indexCatalog->dropUnfinishedIndex(opCtx, collection, desc);
+        return indexCatalog->dropUnfinishedIndex(opCtx, collection, entry);
     }
 
     // Do not allow dropping unfinished indexes that are not frozen.
-    if (!entry->isReady(opCtx)) {
+    if (!entry->isReady()) {
         return Status(ErrorCodes::IndexNotFound,
-                      str::stream()
-                          << "can't drop unfinished index with name: " << desc->indexName());
+                      str::stream() << "can't drop unfinished index with name: "
+                                    << entry->descriptor()->indexName());
     }
 
     // Log the operation first, which reserves an optime in the oplog and sets the timestamp for
     // future writes. This guarantees the durable catalog's metadata change to share the same
     // timestamp when dropping the index below.
-    opCtx->getServiceContext()->getOpObserver()->onDropIndex(
-        opCtx, collection->ns(), collection->uuid(), desc->indexName(), desc->infoObj());
+    opCtx->getServiceContext()->getOpObserver()->onDropIndex(opCtx,
+                                                             collection->ns(),
+                                                             collection->uuid(),
+                                                             entry->descriptor()->indexName(),
+                                                             entry->descriptor()->infoObj());
 
-    auto s = indexCatalog->dropIndex(opCtx, collection, desc);
+    auto s = indexCatalog->dropIndexEntry(opCtx, collection, entry);
     if (!s.isOK()) {
         return s;
     }
@@ -350,16 +356,16 @@ void dropReadyIndexes(OperationContext* opCtx,
                     opCtx, CollectionPtr(collection), indexName, collDescription.getKeyPattern()));
         }
 
-        auto desc = indexCatalog->findIndexByName(opCtx,
-                                                  indexName,
-                                                  IndexCatalog::InclusionPolicy::kReady |
-                                                      IndexCatalog::InclusionPolicy::kUnfinished |
-                                                      IndexCatalog::InclusionPolicy::kFrozen);
-        if (!desc) {
+        auto writableEntry = indexCatalog->getWritableEntryByName(
+            opCtx,
+            indexName,
+            IndexCatalog::InclusionPolicy::kReady | IndexCatalog::InclusionPolicy::kUnfinished |
+                IndexCatalog::InclusionPolicy::kFrozen);
+        if (!writableEntry) {
             uasserted(ErrorCodes::IndexNotFound,
                       str::stream() << "index not found with name [" << indexName << "]");
         }
-        uassertStatusOK(dropIndexByDescriptor(opCtx, collection, indexCatalog, desc));
+        uassertStatusOK(dropIndexByDescriptor(opCtx, collection, indexCatalog, writableEntry));
     }
 }
 
@@ -377,7 +383,7 @@ void assertNoMovePrimaryInProgress(OperationContext* opCtx, const NamespaceStrin
                 LOGV2(4976500, "assertNoMovePrimaryInProgress", logAttrs(nss));
 
                 uasserted(ErrorCodes::MovePrimaryInProgress,
-                          "movePrimary is in progress for namespace " + nss.toString());
+                          "movePrimary is in progress for namespace " + nss.toStringForErrorMsg());
             }
         }
     } catch (const DBException& ex) {
@@ -472,8 +478,10 @@ DropIndexesReply dropIndexes(OperationContext* opCtx,
 
         if (!*collection) {
             uasserted(ErrorCodes::NamespaceNotFound,
-                      str::stream() << "Collection '" << nss << "' with UUID " << dbAndUUID.uuid()
-                                    << " in database " << dbAndUUID.db() << " does not exist.");
+                      str::stream()
+                          << "Collection '" << nss.toStringForErrorMsg() << "' with UUID "
+                          << dbAndUUID.uuid() << " in database "
+                          << dbAndUUID.dbName().toStringForErrorMsg() << " does not exist.");
         }
 
         // The collection could have been renamed when we dropped locks.
@@ -502,7 +510,7 @@ DropIndexesReply dropIndexes(OperationContext* opCtx,
         // The index catalog requires that no active index builders are running when dropping ready
         // indexes.
         IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(collectionUUID);
-        writeConflictRetry(opCtx, "dropIndexes", dbAndUUID.toString(), [&] {
+        writeConflictRetry(opCtx, "dropIndexes", dbAndUUID, [&] {
             WriteUnitOfWork wuow(opCtx);
 
             // This is necessary to check shard version.
@@ -525,19 +533,19 @@ DropIndexesReply dropIndexes(OperationContext* opCtx,
                                                           collDesc.getKeyPattern()));
                 }
 
-                auto desc =
-                    indexCatalog->findIndexByName(opCtx,
-                                                  indexName,
-                                                  IndexCatalog::InclusionPolicy::kReady |
-                                                      IndexCatalog::InclusionPolicy::kUnfinished |
-                                                      IndexCatalog::InclusionPolicy::kFrozen);
-                if (!desc) {
+                auto writableEntry = indexCatalog->getWritableEntryByName(
+                    opCtx,
+                    indexName,
+                    IndexCatalog::InclusionPolicy::kReady |
+                        IndexCatalog::InclusionPolicy::kUnfinished |
+                        IndexCatalog::InclusionPolicy::kFrozen);
+                if (!writableEntry) {
                     // A similar index wasn't created while we yielded the locks during abort.
                     continue;
                 }
 
                 uassertStatusOK(dropIndexByDescriptor(
-                    opCtx, collection->getWritableCollection(opCtx), indexCatalog, desc));
+                    opCtx, collection->getWritableCollection(opCtx), indexCatalog, writableEntry));
             }
 
             wuow.commit();
@@ -555,16 +563,15 @@ DropIndexesReply dropIndexes(OperationContext* opCtx,
         invariant((*collection)->getIndexCatalog()->numIndexesInProgress() == 0);
     }
 
-    writeConflictRetry(
-        opCtx, "dropIndexes", dbAndUUID.toString(), [opCtx, &collection, &indexNames, &reply] {
-            WriteUnitOfWork wunit(opCtx);
+    writeConflictRetry(opCtx, "dropIndexes", dbAndUUID, [opCtx, &collection, &indexNames, &reply] {
+        WriteUnitOfWork wunit(opCtx);
 
-            // This is necessary to check shard version.
-            OldClientContext ctx(opCtx, (*collection)->ns());
-            dropReadyIndexes(
-                opCtx, collection->getWritableCollection(opCtx), indexNames, &reply, false);
-            wunit.commit();
-        });
+        // This is necessary to check shard version.
+        OldClientContext ctx(opCtx, (*collection)->ns());
+        dropReadyIndexes(
+            opCtx, collection->getWritableCollection(opCtx), indexNames, &reply, false);
+        wunit.commit();
+    });
 
     return reply;
 }
@@ -578,7 +585,7 @@ Status dropIndexesForApplyOps(OperationContext* opCtx,
     auto parsed = DropIndexes::parse(
         IDLParserContext{"dropIndexes", false /* apiStrict */, nss.tenantId()}, cmdObjWithDb);
 
-    return writeConflictRetry(opCtx, "dropIndexes", nss.db(), [opCtx, &nss, &cmdObj, &parsed] {
+    return writeConflictRetry(opCtx, "dropIndexes", nss, [opCtx, &nss, &cmdObj, &parsed] {
         AutoGetCollection collection(opCtx, nss, MODE_X);
 
         // If db/collection does not exist, short circuit and return.

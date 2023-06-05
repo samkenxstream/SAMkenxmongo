@@ -104,7 +104,7 @@ StatusWith<BSONObj> analyzeCommandAsAggregationCommand(OperationContext* opCtx,
                                                     << "insert"));
 
     return BSON("aggregate" << collection << "pipeline" << pipelineBuilder.arr() << "cursor"
-                            << BSONObj());
+                            << BSONObj() << "allowDiskUse" << false);
 }
 
 class CmdAnalyze final : public TypedCommand<CmdAnalyze> {
@@ -138,9 +138,8 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(6660400,
                     "Analyze command requires common query framework feature flag to be enabled",
-                    serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-                        feature_flags::gFeatureFlagCommonQueryFramework.isEnabled(
-                            serverGlobalParams.featureCompatibility));
+                    feature_flags::gFeatureFlagCommonQueryFramework.isEnabled(
+                        serverGlobalParams.featureCompatibility));
 
             const auto& cmd = request();
             const NamespaceString& nss = ns();
@@ -158,8 +157,9 @@ public:
                 const auto& collection = autoColl.getCollection();
 
                 // Namespace exists
-                uassert(
-                    6799700, str::stream() << "Couldn't find collection " << nss.ns(), collection);
+                uassert(6799700,
+                        str::stream() << "Couldn't find collection " << nss.toStringForErrorMsg(),
+                        collection);
 
                 // Namespace cannot be capped collection
                 const bool isCapped = collection->isCapped();
@@ -171,8 +171,8 @@ public:
                 const bool isNormalColl = nss.isNormalCollection();
                 const bool isClusteredColl = collection->isClustered();
                 uassert(6799702,
-                        str::stream()
-                            << nss.toString() << " is not a normal or clustered collection",
+                        str::stream() << nss.toStringForErrorMsg()
+                                      << " is not a normal or clustered collection",
                         isNormalColl || isClusteredColl);
 
                 if (sampleSize) {
@@ -247,7 +247,8 @@ public:
             const NamespaceString& ns = request().getNamespace();
 
             uassert(ErrorCodes::Unauthorized,
-                    str::stream() << "Not authorized to call analyze on collection " << ns,
+                    str::stream() << "Not authorized to call analyze on collection "
+                                  << ns.toStringForErrorMsg(),
                     authzSession->isAuthorizedForActionsOnNamespace(ns, ActionType::analyze));
         }
     };

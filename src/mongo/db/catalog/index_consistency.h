@@ -260,6 +260,7 @@ private:
      * inconsistent hash buckets during the first phase of validation to document keys.
      */
     void addIndexKey(OperationContext* opCtx,
+                     const IndexCatalogEntry* entry,
                      const KeyString::Value& ks,
                      IndexInfo* indexInfo,
                      const RecordId& recordId,
@@ -302,6 +303,13 @@ private:
      * Returns a hashed value from the given KeyString and index namespace.
      */
     uint32_t _hashKeyString(const KeyString::Value& ks, uint32_t indexNameHash) const;
+
+    /**
+     * Prints the collection document's and index entry's metadata.
+     */
+    void _printMetadata(OperationContext* opCtx,
+                        ValidateResults* results,
+                        const IndexEntryInfo& info);
 
 };  // KeyStringIndexConsistency
 }  // namespace mongo

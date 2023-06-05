@@ -54,14 +54,16 @@ bool nonShardedCollectionCommandPassthrough(OperationContext* opCtx,
             !cri.cm.isSharded());
 
     auto responses = scatterGatherVersionedTargetByRoutingTable(opCtx,
-                                                                dbName.toStringWithTenantId(),
+                                                                DatabaseNameUtil::serialize(dbName),
                                                                 nss,
                                                                 cri,
                                                                 cmdObj,
                                                                 ReadPreferenceSetting::get(opCtx),
                                                                 retryPolicy,
-                                                                {},
-                                                                {});
+                                                                {} /*query*/,
+                                                                {} /*collation*/,
+                                                                boost::none /*letParameters*/,
+                                                                boost::none /*runtimeConstants*/);
     invariant(responses.size() == 1);
 
     const auto cmdResponse = uassertStatusOK(std::move(responses.front().swResponse));

@@ -2,7 +2,7 @@
  * Test to validate the privileges required by configureQueryAnalyzer command. Also tests the
  * internal command _refreshQueryAnalyzerConfigurations.
  *
- * @tags: [requires_fcv_70, featureFlagAnalyzeShardKey]
+ * @tags: [requires_fcv_70]
  */
 
 (function() {
@@ -27,7 +27,7 @@ function testConfigureQueryAnalyzer(conn) {
     assert(adminDb.logout());
 
     const mode = "full";
-    const sampleRate = 100;
+    const sampleRate = 1;
 
     // Set up a user without any role or privilege.
     assert(adminDb.auth("super", "super"));

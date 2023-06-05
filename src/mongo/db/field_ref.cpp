@@ -29,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/field_ref.h"
 
 #include <algorithm>
@@ -53,6 +54,9 @@ void FieldRef::parse(StringData path) {
     // keep a copy in a local sting.
 
     _dotted = path.toString();
+    tassert(1589700,
+            "the size of the path is larger than accepted",
+            _dotted.size() <= BSONObjMaxInternalSize);
 
     // Separate the field parts using '.' as a delimiter.
     std::string::iterator beg = _dotted.begin();
@@ -192,8 +196,13 @@ void FieldRef::reserialize() const {
 }
 
 StringData FieldRef::getPart(FieldIndex i) const {
-    invariant(i < _parts.size());
-
+    // boost::container::small_vector already checks that the index `i` is in bounds, so we don't
+    // bother checking here. If we change '_parts' to a different container implementation
+    // that no longer performs a bounds check, we should add one here.
+    static_assert(
+        std::is_same<
+            decltype(_parts),
+            boost::container::small_vector<boost::optional<StringView>, kFewDottedFieldParts>>());
     const boost::optional<StringView>& part = _parts[i];
     if (part) {
         return part->toStringData(_dotted);
@@ -256,6 +265,10 @@ bool FieldRef::isNumericPathComponentLenient(StringData component) {
 
 bool FieldRef::isNumericPathComponentStrict(FieldIndex i) const {
     return FieldRef::isNumericPathComponentStrict(getPart(i));
+}
+
+bool FieldRef::isNumericPathComponentLenient(FieldIndex i) const {
+    return FieldRef::isNumericPathComponentLenient(getPart(i));
 }
 
 bool FieldRef::hasNumericPathComponents() const {

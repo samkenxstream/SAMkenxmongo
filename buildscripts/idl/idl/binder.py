@@ -272,6 +272,13 @@ def _bind_struct_common(ctxt, parsed_spec, struct, ast_struct):
     ast_struct.allow_global_collection_name = struct.allow_global_collection_name
     ast_struct.non_const_getter = struct.non_const_getter
     ast_struct.is_command_reply = struct.is_command_reply
+    ast_struct.query_shape_component = struct.query_shape_component
+    ast_struct.unsafe_dangerous_disable_extra_field_duplicate_checks = struct.unsafe_dangerous_disable_extra_field_duplicate_checks
+
+    # Check that unsafe_dangerous_disable_extra_field_duplicate_checks is used correctly
+    if ast_struct.unsafe_dangerous_disable_extra_field_duplicate_checks and ast_struct.strict is True:
+        ctxt.add_strict_and_disable_check_not_allowed(ast_struct)
+
     if struct.is_generic_cmd_list:
         if struct.is_generic_cmd_list == "arg":
             ast_struct.generic_list_type = ast.GenericListType.ARG
@@ -324,6 +331,20 @@ def _bind_struct_common(ctxt, parsed_spec, struct, ast_struct):
             if not _is_duplicate_field(ctxt, ast_struct.name, ast_struct.fields, ast_field):
                 ast_struct.fields.append(ast_field)
 
+            # Verify that each field on the struct defines a query shape type on the field if and only if
+            # query_shape_component is defined on the struct.
+            if not field.hidden and struct.query_shape_component and ast_field.query_shape is None:
+                ctxt.add_must_declare_shape_type(ast_field, ast_struct.name, ast_field.name)
+
+            if not struct.query_shape_component and ast_field.query_shape is not None:
+                ctxt.add_must_be_query_shape_component(ast_field, ast_struct.name, ast_field.name)
+
+            if ast_field.query_shape == ast.QueryShapeFieldType.ANONYMIZE and not (
+                    ast_field.type.cpp_type in ["std::string", "std::vector<std::string>"]
+                    or 'string' in ast_field.type.bson_serialization_type):
+                ctxt.add_query_shape_anonymize_must_be_string(ast_field, ast_field.name,
+                                                              ast_field.type.cpp_type)
+
     # Fill out the field comparison_order property as needed
     if ast_struct.generate_comparison_operators and ast_struct.fields:
         # If the user did not specify an ordering of fields, then number all fields in
@@ -363,6 +384,7 @@ def _inject_hidden_fields(struct):
     serialization_context_field.cpp_name = "serializationContext"
     serialization_context_field.optional = False
     serialization_context_field.default = "SerializationContext()"
+    serialization_context_field.hidden = True
 
     struct.fields.append(serialization_context_field)
 
@@ -438,6 +460,7 @@ def _bind_struct_type(struct):
     ast_type.cpp_type = _get_struct_qualified_cpp_name(struct)
     ast_type.bson_serialization_type = ["object"]
     ast_type.first_element_field_name = struct.fields[0].name if struct.fields else None
+    ast_type.is_query_shape_component = struct.query_shape_component
     return ast_type
 
 
@@ -452,6 +475,10 @@ def _bind_struct_field(ctxt, ast_field, idl_type):
         array = cast(syntax.ArrayType, idl_type)
         assert isinstance(array.element_type, syntax.Struct)
         struct = cast(syntax.Struct, array.element_type)
+
+    # Check that unsafe_dangerous_disable_extra_field_duplicate_checks is used correctly
+    if struct.unsafe_dangerous_disable_extra_field_duplicate_checks:
+        ctxt.add_inheritance_and_disable_check_not_allowed(ast_field)
 
     ast_field.type = _bind_struct_type(struct)
     ast_field.type.is_array = isinstance(idl_type, syntax.ArrayType)
@@ -1002,6 +1029,7 @@ def _bind_type(idltype):
     ast_type.deserializer = _normalize_method_name(idltype.cpp_type, idltype.deserializer)
     ast_type.deserialize_with_tenant = idltype.deserialize_with_tenant
     ast_type.internal_only = idltype.internal_only
+    ast_type.is_query_shape_component = True
     return ast_type
 
 
@@ -1027,6 +1055,11 @@ def _bind_field(ctxt, parsed_spec, field):
     ast_field.stability = field.stability
     ast_field.always_serialize = field.always_serialize
     ast_field.preparse = field.preparse
+
+    if field.query_shape is not None:
+        ast_field.query_shape = ast.QueryShapeFieldType.bind(field.query_shape)
+        if ast_field.query_shape is None:
+            ctxt.add_invalid_query_shape_value(ast_field, field.query_shape)
 
     ast_field.cpp_name = field.name
     if field.cpp_name:
@@ -1108,6 +1141,8 @@ def _bind_field(ctxt, parsed_spec, field):
         if ast_field.validator is None:
             return None
 
+    if ast_field.should_shapify and not ast_field.type.is_query_shape_component:
+        ctxt.add_must_be_query_shape_component(ast_field, ast_field.type.name, ast_field.name)
     return ast_field
 
 
@@ -1195,14 +1230,17 @@ def _bind_chained_struct(ctxt, parsed_spec, ast_struct, chained_struct):
             ast_struct.fields.append(ast_field)
 
 
-def _bind_globals(parsed_spec):
-    # type: (syntax.IDLSpec) -> ast.Global
+def _bind_globals(ctxt, parsed_spec):
+    # type: (errors.ParserContext, syntax.IDLSpec) -> ast.Global
     """Bind the globals object from the idl.syntax tree into the idl.ast tree by doing a deep copy."""
     if parsed_spec.globals:
         ast_global = ast.Global(parsed_spec.globals.file_name, parsed_spec.globals.line,
                                 parsed_spec.globals.column)
         ast_global.cpp_namespace = parsed_spec.globals.cpp_namespace
         ast_global.cpp_includes = parsed_spec.globals.cpp_includes
+
+        if not ast_global.cpp_namespace.startswith("mongo"):
+            ctxt.add_bad_cpp_namespace(ast_global, ast_global.cpp_namespace)
 
         configs = parsed_spec.globals.configs
         if configs:
@@ -1436,13 +1474,20 @@ def _bind_feature_flags(ctxt, param):
         ctxt.add_feature_flag_default_false_has_version(param)
         return None
 
-    # Feature flags that default to true are required to have a version
-    if param.default.literal == "true" and not param.version:
+    # Feature flags that default to true and should be FCV gated are required to have a version
+    if param.default.literal == "true" and param.shouldBeFCVGated.literal == "true" and not param.version:
         ctxt.add_feature_flag_default_true_missing_version(param)
         return None
 
+    # Feature flags that should not be FCV gated must not have a version
+    if param.shouldBeFCVGated.literal == "false" and param.version:
+        ctxt.add_feature_flag_fcv_gated_false_has_version(param)
+        return None
+
     expr = syntax.Expression(param.default.file_name, param.default.line, param.default.column)
-    expr.expr = '%s, "%s"_sd' % (param.default.literal, param.version if param.version else '')
+    expr.expr = '%s, "%s"_sd, %s' % (param.default.literal, param.version if
+                                     (param.shouldBeFCVGated.literal == "true"
+                                      and param.version) else '', param.shouldBeFCVGated.literal)
 
     ast_param.default = _bind_expression(expr)
     ast_param.default.export = False
@@ -1597,7 +1642,7 @@ def bind(parsed_spec):
 
     bound_spec = ast.IDLAST()
 
-    bound_spec.globals = _bind_globals(parsed_spec)
+    bound_spec.globals = _bind_globals(ctxt, parsed_spec)
 
     _validate_types(ctxt, parsed_spec)
 

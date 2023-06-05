@@ -436,14 +436,6 @@ public:
         return _coll->getIndexFreeStorageBytes(opCtx);
     }
 
-    boost::optional<Timestamp> getMinimumVisibleSnapshot() const override {
-        return _coll->getMinimumVisibleSnapshot();
-    }
-
-    void setMinimumVisibleSnapshot(Timestamp name) override {
-        MONGO_UNREACHABLE;
-    }
-
     boost::optional<Timestamp> getMinimumValidSnapshot() const override {
         return _coll->getMinimumValidSnapshot();
     }
@@ -779,9 +771,9 @@ TEST_F(MigrationChunkClonerSourceTest, CorrectDocumentsFetched) {
         cloner.onInsertOp(operationContext(), createCollectionDocument(151), {});
         cloner.onInsertOp(operationContext(), createCollectionDocument(210), {});
 
-        cloner.onDeleteOp(operationContext(), createCollectionDocument(80), {}, {});
-        cloner.onDeleteOp(operationContext(), createCollectionDocument(199), {}, {});
-        cloner.onDeleteOp(operationContext(), createCollectionDocument(220), {}, {});
+        cloner.onDeleteOp(operationContext(), createCollectionDocument(80), {});
+        cloner.onDeleteOp(operationContext(), createCollectionDocument(199), {});
+        cloner.onDeleteOp(operationContext(), createCollectionDocument(220), {});
 
         wuow.commit();
     }
@@ -876,19 +868,17 @@ TEST_F(MigrationChunkClonerSourceTest, RemoveDuplicateDocuments) {
 
         WriteUnitOfWork wuow(operationContext());
 
-        cloner.onDeleteOp(operationContext(), createCollectionDocument(100), {}, {});
+        cloner.onDeleteOp(operationContext(), createCollectionDocument(100), {});
         cloner.onInsertOp(operationContext(), createCollectionDocument(100), {});
-        cloner.onDeleteOp(operationContext(), createCollectionDocument(100), {}, {});
+        cloner.onDeleteOp(operationContext(), createCollectionDocument(100), {});
 
         cloner.onUpdateOp(operationContext(),
                           createCollectionDocument(199),
                           createCollectionDocumentForUpdate(199, 198),
-                          {},
                           {});
         cloner.onUpdateOp(operationContext(),
                           createCollectionDocument(199),
                           createCollectionDocumentForUpdate(199, 197),
-                          {},
                           {});
 
         wuow.commit();

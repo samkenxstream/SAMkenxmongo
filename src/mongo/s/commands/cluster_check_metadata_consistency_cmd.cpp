@@ -59,10 +59,12 @@ stdx::unordered_set<ShardId> getAllDbPrimaryShards(OperationContext* opCtx) {
         opCtx, aggRequest, {repl::ReadConcernLevel::kMajorityReadConcern});
 
     stdx::unordered_set<ShardId> shardIds;
-    shardIds.reserve(aggResponse.size());
+    shardIds.reserve(aggResponse.size() + 1);
     for (auto&& responseEntry : aggResponse) {
         shardIds.insert(responseEntry.firstElement().str());
     }
+    // The config server is authoritative for config database
+    shardIds.insert(ShardId::kConfigServerId);
     return shardIds;
 }
 
@@ -111,27 +113,34 @@ public:
 
     private:
         Response _runClusterLevel(OperationContext* opCtx, const NamespaceString& nss) {
-            uassert(
-                ErrorCodes::InvalidNamespace,
-                "cluster level mode must be run against the 'admin' database with {aggregate: 1}",
-                nss.isCollectionlessCursorNamespace());
+            uassert(ErrorCodes::InvalidNamespace,
+                    str::stream() << Request::kCommandName
+                                  << " command on admin database can only be run without "
+                                     "collection name. Found unexpected collection name: "
+                                  << nss.coll(),
+                    nss.isCollectionlessCursorNamespace());
 
             std::vector<std::pair<ShardId, BSONObj>> requests;
             ShardsvrCheckMetadataConsistency shardsvrRequest{nss};
+            shardsvrRequest.setCommonFields(request().getCommonFields());
             shardsvrRequest.setCursor(request().getCursor());
 
             // Send a request to all shards that are primaries for at least one database
+            const auto shardOpKey = UUID::gen();
+            auto shardRequestWithOpKey = appendOpKey(shardOpKey, shardsvrRequest.toBSON({}));
             for (auto&& shardId : getAllDbPrimaryShards(opCtx)) {
-                requests.emplace_back(std::move(shardId), shardsvrRequest.toBSON({}));
+                requests.emplace_back(std::move(shardId), shardRequestWithOpKey.getOwned());
             }
 
             // Send a request to the configsvr to check cluster metadata consistency.
+            const auto configOpKey = UUID::gen();
             ConfigsvrCheckClusterMetadataConsistency configsvrRequest;
             configsvrRequest.setDbName(DatabaseName::kAdmin);
             configsvrRequest.setCursor(request().getCursor());
-            requests.emplace_back(ShardId::kConfigServerId, configsvrRequest.toBSON({}));
+            requests.emplace_back(ShardId::kConfigServerId,
+                                  appendOpKey(configOpKey, configsvrRequest.toBSON({})));
 
-            auto ccc = _establishCursors(opCtx, nss, requests);
+            auto ccc = _establishCursors(opCtx, nss, requests, {shardOpKey, configOpKey});
             return _createInitialCursorReply(opCtx, nss, std::move(ccc));
         }
 
@@ -149,10 +158,11 @@ public:
                                                              const NamespaceString& nss) {
             const CachedDatabaseInfo dbInfo =
                 uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(
-                    opCtx, nss.dbName().toStringWithTenantId()));
+                    opCtx, DatabaseNameUtil::serializeForCatalog(nss.dbName())));
 
             ShardsvrCheckMetadataConsistency shardsvrRequest{nss};
             shardsvrRequest.setDbName(nss.dbName());
+            shardsvrRequest.setCommonFields(request().getCommonFields());
             shardsvrRequest.setCursor(request().getCursor());
             // Attach db and shard version;
             auto cmdObj = appendDbVersionIfPresent(shardsvrRequest.toBSON({}), dbInfo);
@@ -164,7 +174,8 @@ public:
         ClusterClientCursorGuard _establishCursors(
             OperationContext* opCtx,
             const NamespaceString& nss,
-            const std::vector<std::pair<ShardId, BSONObj>>& requests) {
+            const std::vector<std::pair<ShardId, BSONObj>>& requests,
+            std::vector<OperationKey> opKeys = {}) {
 
             ClusterClientCursorParams params(
                 nss,
@@ -178,7 +189,9 @@ public:
                 nss,
                 ReadPreferenceSetting(ReadPreference::PrimaryOnly, TagSet::primaryOnly()),
                 requests,
-                false /*allowPartialResults*/);
+                false /*allowPartialResults*/,
+                Shard::RetryPolicy::kIdempotent,
+                std::move(opKeys));
 
             // Transfer the established cursors to a ClusterClientCursor.
             return ClusterClientCursorImpl::make(
@@ -225,7 +238,14 @@ public:
 
             ccc->detachFromOperationContext();
 
+            auto&& opDebug = CurOp::get(opCtx)->debug();
+            opDebug.nShards = ccc->getNumRemotes();
+            opDebug.additiveMetrics.nBatches = 1;
+            opDebug.additiveMetrics.nreturned = firstBatch.size();
+
             if (cursorState == ClusterCursorManager::CursorState::Exhausted) {
+                opDebug.cursorExhausted = true;
+
                 CursorInitialReply resp;
                 InitialResponseCursor initRespCursor{std::move(firstBatch)};
                 initRespCursor.setResponseCursorBase({0LL /* cursorId */, nss});
@@ -253,6 +273,9 @@ public:
                     cursorType,
                     ClusterCursorManager::CursorLifetime::Mortal,
                     authUser));
+
+            // Record the cursorID in CurOp.
+            opDebug.cursorid = clusterCursorId;
 
             CursorInitialReply resp;
             InitialResponseCursor initRespCursor{std::move(firstBatch)};
@@ -287,7 +310,7 @@ public:
                     uassert(ErrorCodes::Unauthorized,
                             str::stream()
                                 << "Not authorized to check metadata consistency for database "
-                                << nss.db(),
+                                << nss.dbName().toStringForErrorMsg(),
                             isAuthorizedOnResource(ResourcePattern::forClusterResource()) ||
                                 isAuthorizedOnResource(ResourcePattern::forDatabaseName(nss.db())));
                     break;
@@ -295,7 +318,7 @@ public:
                     uassert(ErrorCodes::Unauthorized,
                             str::stream()
                                 << "Not authorized to check metadata consistency for collection "
-                                << nss,
+                                << nss.toStringForErrorMsg(),
                             isAuthorizedOnResource(ResourcePattern::forClusterResource()) ||
                                 isAuthorizedOnResource(ResourcePattern::forExactNamespace(nss)));
                     break;

@@ -217,7 +217,7 @@ var Cluster = function(options) {
 
             i = 0;
             while (st.rs(i)) {
-                var rs = st.rs(i++);
+                const rs = st.rs(i++);
                 this._addReplicaSetConns(rs);
                 replSets.push(rs);
             }
@@ -459,6 +459,12 @@ var Cluster = function(options) {
         return cluster;
     };
 
+    this.getReplicaSets = function getReplicaSets() {
+        assert(initialized, 'cluster must be initialized first');
+        assert(this.isReplication() || this.isSharded());
+        return replSets;
+    };
+
     this.isBalancerEnabled = function isBalancerEnabled() {
         return this.isSharded() && options.sharded.enableBalancer;
     };
@@ -594,10 +600,10 @@ var Cluster = function(options) {
     };
 
     /*
-     * Returns true if this cluster has a catalog shard.
-     * Catalog shard always have shard ID equal to "config".
+     * Returns true if this cluster has a config shard.
+     * Config shard always have shard ID equal to "config".
      */
-    this.hasCatalogShard = function hasCatalogShard() {
+    this.hasConfigShard = function hasConfigShard() {
         if (!this.isSharded()) {
             return false;
         }

@@ -9,6 +9,7 @@
 (function() {
 "use strict";
 load('jstests/libs/chunk_manipulation_util.js');
+load('jstests/replsets/rslib.js');
 load('jstests/sharding/libs/create_sharded_collection_util.js');
 load('jstests/sharding/libs/sharded_transactions_helpers.js');
 

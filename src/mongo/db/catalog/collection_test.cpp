@@ -94,7 +94,7 @@ TEST_F(CollectionTest, CappedNotifierTimeouts) {
     ASSERT_EQ(notifier->getVersion(), 0u);
 
     auto before = Date_t::now();
-    notifier->waitUntil(0u, before + Milliseconds(25));
+    notifier->waitUntil(operationContext(), 0u, before + Milliseconds(25));
     auto after = Date_t::now();
     ASSERT_GTE(after - before, Milliseconds(25));
     ASSERT_EQ(notifier->getVersion(), 0u);
@@ -114,7 +114,7 @@ TEST_F(CollectionTest, CappedNotifierWaitAfterNotifyIsImmediate) {
     ASSERT_EQ(notifier->getVersion(), thisVersion);
 
     auto before = Date_t::now();
-    notifier->waitUntil(prevVersion, before + Seconds(25));
+    notifier->waitUntil(operationContext(), prevVersion, before + Seconds(25));
     auto after = Date_t::now();
     ASSERT_LT(after - before, Seconds(25));
 }
@@ -130,13 +130,15 @@ TEST_F(CollectionTest, CappedNotifierWaitUntilAsynchronousNotifyAll) {
     auto thisVersion = prevVersion + 1;
 
     auto before = Date_t::now();
-    stdx::thread thread([before, prevVersion, &notifier] {
-        notifier->waitUntil(prevVersion, before + Milliseconds(25));
+    stdx::thread thread([this, before, prevVersion, &notifier] {
+        ThreadClient client(getServiceContext());
+        auto opCtx = cc().makeOperationContext();
+        notifier->waitUntil(opCtx.get(), prevVersion, before + Milliseconds(25));
         auto after = Date_t::now();
         ASSERT_GTE(after - before, Milliseconds(25));
         notifier->notifyAll();
     });
-    notifier->waitUntil(prevVersion, before + Seconds(25));
+    notifier->waitUntil(operationContext(), prevVersion, before + Seconds(25));
     auto after = Date_t::now();
     ASSERT_LT(after - before, Seconds(25));
     ASSERT_GTE(after - before, Milliseconds(25));
@@ -147,20 +149,54 @@ TEST_F(CollectionTest, CappedNotifierWaitUntilAsynchronousNotifyAll) {
 TEST_F(CollectionTest, CappedNotifierWaitUntilAsynchronousKill) {
     NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.t");
     makeCapped(nss);
-
     AutoGetCollectionForRead acfr(operationContext(), nss);
     const CollectionPtr& col = acfr.getCollection();
     auto notifier = col->getRecordStore()->getCappedInsertNotifier();
     auto prevVersion = notifier->getVersion();
 
     auto before = Date_t::now();
-    stdx::thread thread([before, prevVersion, &notifier] {
-        notifier->waitUntil(prevVersion, before + Milliseconds(25));
+    stdx::thread thread([this, before, prevVersion, &notifier] {
+        ThreadClient client(getServiceContext());
+        auto opCtx = cc().makeOperationContext();
+        notifier->waitUntil(opCtx.get(), prevVersion, before + Milliseconds(25));
         auto after = Date_t::now();
         ASSERT_GTE(after - before, Milliseconds(25));
         notifier->kill();
     });
-    notifier->waitUntil(prevVersion, before + Seconds(25));
+    notifier->waitUntil(operationContext(), prevVersion, before + Seconds(25));
+    auto after = Date_t::now();
+    ASSERT_LT(after - before, Seconds(25));
+    ASSERT_GTE(after - before, Milliseconds(25));
+    thread.join();
+    ASSERT_EQ(notifier->getVersion(), prevVersion);
+}
+
+TEST_F(CollectionTest, CappedNotifierWaitUntilInterrupt) {
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.t");
+    makeCapped(nss);
+
+    AutoGetCollectionForRead acfr(operationContext(), nss);
+    const CollectionPtr& col = acfr.getCollection();
+    auto notifier = col->getRecordStore()->getCappedInsertNotifier();
+    auto prevVersion = notifier->getVersion();
+
+    auto& clientToInterrupt = cc();
+    auto before = Date_t::now();
+    stdx::thread thread([this, before, prevVersion, &notifier, &clientToInterrupt] {
+        ThreadClient client(getServiceContext());
+        auto opCtx = cc().makeOperationContext();
+        notifier->waitUntil(opCtx.get(), prevVersion, before + Milliseconds(25));
+        auto after = Date_t::now();
+        ASSERT_GTE(after - before, Milliseconds(25));
+
+        stdx::lock_guard<Client> lk(clientToInterrupt);
+        getServiceContext()->killOperation(
+            lk, clientToInterrupt.getOperationContext(), ErrorCodes::Interrupted);
+    });
+
+    ASSERT_THROWS(notifier->waitUntil(operationContext(), prevVersion, before + Seconds(25)),
+                  ExceptionFor<ErrorCodes::Interrupted>);
+
     auto after = Date_t::now();
     ASSERT_LT(after - before, Seconds(25));
     ASSERT_GTE(after - before, Milliseconds(25));
@@ -208,13 +244,13 @@ TEST_F(CollectionTest, AsynchronouslyNotifyCappedWaitersIfNeeded) {
     auto thisVersion = prevVersion + 1;
 
     auto before = Date_t::now();
-    notifier->waitUntil(prevVersion, before + Milliseconds(25));
+    notifier->waitUntil(operationContext(), prevVersion, before + Milliseconds(25));
     stdx::thread thread([before, prevVersion, notifier] {
         auto after = Date_t::now();
         ASSERT_GTE(after - before, Milliseconds(25));
         notifier->notifyAll();
     });
-    notifier->waitUntil(prevVersion, before + Seconds(25));
+    notifier->waitUntil(operationContext(), prevVersion, before + Seconds(25));
     auto after = Date_t::now();
     ASSERT_LT(after - before, Seconds(25));
     ASSERT_GTE(after - before, Milliseconds(25));
@@ -262,9 +298,9 @@ TEST_F(CollectionTest, VerifyIndexIsUpdated) {
     auto idIndex = idxCatalog->findIdIndex(opCtx);
     auto userIdx = idxCatalog->findIndexByName(opCtx, indexName);
     auto oldRecordId = idIndex->getEntry()->accessMethod()->asSortedData()->findSingle(
-        opCtx, coll, BSON("_id" << 1));
+        opCtx, coll, idIndex->getEntry(), BSON("_id" << 1));
     auto oldIndexRecordID = userIdx->getEntry()->accessMethod()->asSortedData()->findSingle(
-        opCtx, coll, BSON("a" << 1));
+        opCtx, coll, userIdx->getEntry(), BSON("a" << 1));
     ASSERT_TRUE(!oldRecordId.isNull());
     ASSERT_EQ(oldRecordId, oldIndexRecordID);
     {
@@ -284,15 +320,16 @@ TEST_F(CollectionTest, VerifyIndexIsUpdated) {
                                             oldSnap,
                                             newDoc,
                                             collection_internal::kUpdateAllIndexes,
-                                            nullptr,
+                                            nullptr /* indexesAffected */,
+                                            nullptr /* opDebug */,
                                             &args);
         wuow.commit();
     }
     auto indexRecordId = userIdx->getEntry()->accessMethod()->asSortedData()->findSingle(
-        opCtx, coll, BSON("a" << 1));
+        opCtx, coll, userIdx->getEntry(), BSON("a" << 1));
     ASSERT_TRUE(indexRecordId.isNull());
     indexRecordId = userIdx->getEntry()->accessMethod()->asSortedData()->findSingle(
-        opCtx, coll, BSON("a" << 5));
+        opCtx, coll, userIdx->getEntry(), BSON("a" << 5));
     ASSERT_EQ(indexRecordId, oldRecordId);
 }
 
@@ -317,13 +354,13 @@ TEST_F(CollectionTest, VerifyIndexIsUpdatedWithDamages) {
     auto idIndex = idxCatalog->findIdIndex(opCtx);
     auto userIdx = idxCatalog->findIndexByName(opCtx, indexName);
     auto oldRecordId = idIndex->getEntry()->accessMethod()->asSortedData()->findSingle(
-        opCtx, coll, BSON("_id" << 1));
+        opCtx, coll, idIndex->getEntry(), BSON("_id" << 1));
     ASSERT_TRUE(!oldRecordId.isNull());
 
     auto newDoc = BSON("_id" << 1 << "a" << 5 << "b" << 32);
-    auto diff = doc_diff::computeOplogDiff(oldDoc, newDoc, 0, nullptr);
+    auto diff = doc_diff::computeOplogDiff(oldDoc, newDoc, 0);
     ASSERT(diff);
-    auto damagesOutput = doc_diff::computeDamages(oldDoc, diff->diff, false);
+    auto damagesOutput = doc_diff::computeDamages(oldDoc, *diff, false);
     {
         WriteUnitOfWork wuow(opCtx);
         Snapshotted<BSONObj> oldSnap(opCtx->recoveryUnit()->getSnapshotId(), oldDoc);
@@ -336,17 +373,18 @@ TEST_F(CollectionTest, VerifyIndexIsUpdatedWithDamages) {
                                                            damagesOutput.damageSource.get(),
                                                            damagesOutput.damages,
                                                            collection_internal::kUpdateAllIndexes,
-                                                           nullptr,
+                                                           nullptr /* indexesAffected */,
+                                                           nullptr /* opDebug */,
                                                            &args);
         ASSERT_OK(newDocStatus);
         ASSERT_BSONOBJ_EQ(newDoc, newDocStatus.getValue());
         wuow.commit();
     }
     auto indexRecordId = userIdx->getEntry()->accessMethod()->asSortedData()->findSingle(
-        opCtx, coll, BSON("a" << 1));
+        opCtx, coll, userIdx->getEntry(), BSON("a" << 1));
     ASSERT_TRUE(indexRecordId.isNull());
     indexRecordId = userIdx->getEntry()->accessMethod()->asSortedData()->findSingle(
-        opCtx, coll, BSON("a" << 5));
+        opCtx, coll, userIdx->getEntry(), BSON("a" << 5));
     ASSERT_EQ(indexRecordId, oldRecordId);
 }
 

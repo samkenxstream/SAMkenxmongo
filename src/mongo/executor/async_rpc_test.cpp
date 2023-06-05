@@ -30,7 +30,7 @@
 #include "mongo/bson/oid.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/db/query/cursor_response.h"
-#include "mongo/db/query/find_command_gen.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/repl/hello_gen.h"
 #include "mongo/executor/async_rpc.h"
 #include "mongo/executor/async_rpc_error_info.h"
@@ -453,7 +453,7 @@ TEST_F(AsyncRPCTestFixture, RemoteErrorWithGenericReplyFields) {
 TEST_F(AsyncRPCTestFixture, SuccessfulFind) {
     std::unique_ptr<Targeter> targeter = std::make_unique<LocalHostTargeter>();
     auto opCtxHolder = makeOperationContext();
-    DatabaseName testDbName = DatabaseName("testdb", boost::none);
+    DatabaseName testDbName = DatabaseName::createDatabaseName_forTest(boost::none, "testdb");
     NamespaceString nss = NamespaceString::createNamespaceString_forTest(testDbName);
 
     FindCommandRequest findCmd(nss);
@@ -765,7 +765,7 @@ TEST_F(AsyncRPCTestFixture, SendTxnCommandWithoutTxnRouterAppendsNoTxnFields) {
     auto opCtxHolder = makeOperationContext();
     auto targeter = std::make_unique<ShardIdTargeterForTest>(
         shardId, opCtxHolder.get(), readPref, getExecutorPtr(), testHost);
-    DatabaseName testDbName = DatabaseName("testdb", boost::none);
+    DatabaseName testDbName = DatabaseName::createDatabaseName_forTest(boost::none, "testdb");
     NamespaceString nss = NamespaceString::createNamespaceString_forTest(testDbName);
 
     FindCommandRequest findCmd(nss);
@@ -798,7 +798,7 @@ TEST_F(AsyncRPCTxnTestFixture, MultipleSendTxnCommand) {
     // Use a mock ShardIdTargeter to avoid calling into the ShardRegistry to get a target shard.
     auto targeter = std::make_unique<ShardIdTargeterForTest>(
         shardId, getOpCtx(), readPref, getExecutorPtr(), testHost);
-    DatabaseName testDbName = DatabaseName("testdb", boost::none);
+    DatabaseName testDbName = DatabaseName::createDatabaseName_forTest(boost::none, "testdb");
     NamespaceString nss = NamespaceString::createNamespaceString_forTest(testDbName);
 
     // Set up the transaction metadata.
@@ -864,7 +864,7 @@ TEST_F(AsyncRPCTxnTestFixture, EnsureProcessParticipantCalledCorrectlyOnSuccess)
     // Use a mock ShardIdTargeter to avoid calling into the ShardRegistry to get a target shard.
     auto targeter = std::make_unique<ShardIdTargeterForTest>(
         shardId, getOpCtx(), readPref, getExecutorPtr(), testHost);
-    DatabaseName testDbName = DatabaseName("testdb", boost::none);
+    DatabaseName testDbName = DatabaseName::createDatabaseName_forTest(boost::none, "testdb");
     NamespaceString nss = NamespaceString::createNamespaceString_forTest(testDbName);
 
     // Set up the transaction metadata.
@@ -927,7 +927,7 @@ TEST_F(AsyncRPCTxnTestFixture, EnsureProcessParticipantCalledCorrectlyOnRemoteEr
     // Use a mock ShardIdTargeter to avoid calling into the ShardRegistry to get a target shard.
     auto targeter = std::make_unique<ShardIdTargeterForTest>(
         shardId, getOpCtx(), readPref, getExecutorPtr(), testHost);
-    DatabaseName testDbName = DatabaseName("testdb", boost::none);
+    DatabaseName testDbName = DatabaseName::createDatabaseName_forTest(boost::none, "testdb");
     NamespaceString nss = NamespaceString::createNamespaceString_forTest(testDbName);
 
     // Set up the transaction metadata.
@@ -989,7 +989,7 @@ TEST_F(AsyncRPCTxnTestFixture, SendTxnCommandWithGenericArgs) {
     // Use a mock ShardIdTargeter to avoid calling into the ShardRegistry to get a target shard.
     auto targeter = std::make_unique<ShardIdTargeterForTest>(
         shardId, getOpCtx(), readPref, getExecutorPtr(), testHost);
-    DatabaseName testDbName = DatabaseName("testdb", boost::none);
+    DatabaseName testDbName = DatabaseName::createDatabaseName_forTest(boost::none, "testdb");
     NamespaceString nss = NamespaceString::createNamespaceString_forTest(testDbName);
 
     // Set up the transaction metadata.
@@ -1055,7 +1055,7 @@ TEST_F(AsyncRPCTxnTestFixture, SendTxnCommandReturnsRemoteError) {
     // Use a mock ShardIdTargeter to avoid calling into the ShardRegistry to get a target shard.
     auto targeter = std::make_unique<ShardIdTargeterForTest>(
         shardId, getOpCtx(), readPref, getExecutorPtr(), testHost);
-    DatabaseName testDbName = DatabaseName("testdb", boost::none);
+    DatabaseName testDbName = DatabaseName::createDatabaseName_forTest(boost::none, "testdb");
     NamespaceString nss = NamespaceString::createNamespaceString_forTest(testDbName);
 
     // Set up the transaction metadata.
@@ -1092,7 +1092,7 @@ TEST_F(AsyncRPCTxnTestFixture, SendTxnCommandReturnsLocalError) {
     // Use a mock ShardIdTargeter to avoid calling into the ShardRegistry to get a target shard.
     auto targeter = std::make_unique<ShardIdTargeterForTest>(
         shardId, getOpCtx(), readPref, getExecutorPtr(), testHost);
-    DatabaseName testDbName = DatabaseName("testdb", boost::none);
+    DatabaseName testDbName = DatabaseName::createDatabaseName_forTest(boost::none, "testdb");
     NamespaceString nss = NamespaceString::createNamespaceString_forTest(testDbName);
 
     // Set up the transaction metadata.
@@ -1202,6 +1202,102 @@ TEST_F(AsyncRPCTestFixture, RemoteErrorAttemptedTargetMatchesActual) {
     auto targetHeardFrom = remoteErr.getTargetUsed();
     ASSERT_EQ(targetAttempted, targetHeardFrom);
     ASSERT_EQ(target, targetHeardFrom);
+}
+
+auto extractUUID(const BSONElement& element) {
+    return UUID::fromCDR(element.uuid());
+}
+
+auto getOpKeyFromCommand(const BSONObj& cmdObj) {
+    return extractUUID(cmdObj["clientOperationKey"]);
+}
+
+TEST_F(AsyncRPCTestFixture, OperationKeyIsSetByDefault) {
+    std::unique_ptr<Targeter> targeter = std::make_unique<LocalHostTargeter>();
+    auto opCtxHolder = makeOperationContext();
+    DatabaseName testDbName = DatabaseName::createDatabaseName_forTest(boost::none, "testdb");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(testDbName);
+
+    FindCommandRequest findCmd(nss);
+    auto options = std::make_shared<AsyncRPCOptions<FindCommandRequest>>(
+        findCmd, getExecutorPtr(), _cancellationToken);
+    auto future = sendCommand(options, opCtxHolder.get(), std::move(targeter));
+    ASSERT_DOES_NOT_THROW([&] {
+        onCommand([&](const auto& request) {
+            (void)getOpKeyFromCommand(request.cmdObj);
+            return CursorResponse(nss, 0LL, {BSON("x" << 1)})
+                .toBSON(CursorResponse::ResponseType::InitialResponse);
+        });
+    }());
+    auto network = getNetworkInterfaceMock();
+    network->enterNetwork();
+    network->runReadyNetworkOperations();
+    network->exitNetwork();
+
+    future.get();
+}
+
+TEST_F(AsyncRPCTestFixture, UseOperationKeyWhenProvided) {
+    const auto opKey = UUID::gen();
+
+    std::unique_ptr<Targeter> targeter = std::make_unique<LocalHostTargeter>();
+    auto opCtxHolder = makeOperationContext();
+    DatabaseName testDbName = DatabaseName::createDatabaseName_forTest(boost::none, "testdb");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(testDbName);
+
+    FindCommandRequest findCmd(nss);
+    auto options = std::make_shared<AsyncRPCOptions<FindCommandRequest>>(
+        findCmd, getExecutorPtr(), _cancellationToken);
+    // Set OperationKey via AsyncRPCOptions.
+    options->genericArgs.stable.setClientOperationKey(opKey);
+    auto future = sendCommand(options, opCtxHolder.get(), std::move(targeter));
+    onCommand([&](const auto& request) {
+        ASSERT_EQ(getOpKeyFromCommand(request.cmdObj), opKey);
+        return CursorResponse(nss, 0LL, {BSON("x" << 1)})
+            .toBSON(CursorResponse::ResponseType::InitialResponse);
+    });
+    future.get();
+}
+
+/**
+ * Checks that if cancellation occurs after TaskExecutor receives a network response, the
+ * cancellation fails and the network response fulfills the final response.
+ */
+TEST_F(AsyncRPCTestFixture, CancelAfterNetworkResponse) {
+    auto pauseAfterNetworkResponseFailPoint =
+        globalFailPointRegistry().find("pauseTaskExecutorAfterReceivesNetworkRespones");
+    pauseAfterNetworkResponseFailPoint->setMode(FailPoint::alwaysOn);
+    std::unique_ptr<Targeter> targeter = std::make_unique<LocalHostTargeter>();
+    auto opCtxHolder = makeOperationContext();
+    DatabaseName testDbName = DatabaseName::createDatabaseName_forTest(boost::none, "testdb");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(testDbName);
+
+    CancellationSource source;
+    CancellationToken token = source.token();
+    FindCommandRequest findCmd(nss);
+    auto options =
+        std::make_shared<AsyncRPCOptions<FindCommandRequest>>(findCmd, getExecutorPtr(), token);
+    auto future = sendCommand(options, opCtxHolder.get(), std::move(targeter));
+
+    // Will pause processing response after network interface.
+    stdx::thread worker([&] {
+        onCommand([&](const auto& request) {
+            return CursorResponse(nss, 0LL, {BSON("x" << 1)})
+                .toBSON(CursorResponse::ResponseType::InitialResponse);
+        });
+    });
+
+    // Cancel after network response received in the TaskExecutor.
+    pauseAfterNetworkResponseFailPoint->waitForTimesEntered(1);
+    source.cancel();
+    pauseAfterNetworkResponseFailPoint->setMode(FailPoint::off);
+
+    // Canceling after network response received does not change the final response and
+    // does not send killOperation.
+    CursorInitialReply res = std::move(future).get().response;
+    ASSERT_BSONOBJ_EQ(res.getCursor()->getFirstBatch()[0], BSON("x" << 1));
+
+    worker.join();
 }
 
 }  // namespace

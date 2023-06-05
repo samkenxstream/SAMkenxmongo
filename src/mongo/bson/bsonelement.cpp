@@ -54,11 +54,6 @@
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
-
-#if !defined(__has_feature)
-#define __has_feature(x) 0
-#endif
-
 namespace mongo {
 
 using std::dec;
@@ -456,7 +451,7 @@ std::vector<BSONElement> BSONElement::Array() const {
         unsigned u;
         Status status = NumberParser{}(f, &u);
         if (status.isOK()) {
-            verify(u < 1000000);
+            MONGO_verify(u < 1000000);
             if (u >= v.size())
                 v.resize(u + 1);
             v[u] = e;
@@ -612,12 +607,12 @@ BSONObj BSONElement::embeddedObjectUserCheck() const {
 }
 
 BSONObj BSONElement::embeddedObject() const {
-    verify(isABSONObj());
+    MONGO_verify(isABSONObj());
     return BSONObj(value(), BSONObj::LargeSizeTrait{});
 }
 
 BSONObj BSONElement::codeWScopeObject() const {
-    verify(type() == CodeWScope);
+    MONGO_verify(type() == CodeWScope);
     int strSizeWNull = ConstDataView(value() + 4).read<LittleEndian<int>>();
     return BSONObj(value() + 4 + 4 + strSizeWNull);
 }

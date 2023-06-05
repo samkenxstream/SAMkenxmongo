@@ -1806,6 +1806,144 @@ BSONObj runStateMachineForDecryption(mongocrypt_ctx_t* ctx, FLEKeyVault* keyVaul
     return result;
 }
 
+/**
+ * Reads the anchor document identified by anchorId, and if found, decrypts the value
+ * and returns the parsed positions as a pair. If the anchor is not found, returns none.
+ */
+boost::optional<ESCCountsPair> readAndDecodeAnchor(const FLEStateCollectionReader& reader,
+                                                   const ESCTwiceDerivedValueToken& valueToken,
+                                                   const PrfBlock& anchorId) {
+    auto anchor = reader.getById(anchorId);
+    if (anchor.isEmpty()) {
+        return boost::none;
+    }
+
+    auto anchorDoc = uassertStatusOK(ESCCollection::decryptAnchorDocument(valueToken, anchor));
+    ESCCountsPair positions;
+    positions.apos = anchorDoc.position;
+    positions.cpos = anchorDoc.count;
+    return positions;
+}
+
+/**
+ * Performs all the ESC reads required by the QE cleanup algorithm.
+ */
+FLEEdgeCountInfo getEdgeCountInfoForCleanup(const FLEStateCollectionReader& reader,
+                                            ConstDataRange tag) {
+    auto escToken = EDCServerPayloadInfo::getESCToken(tag);
+
+    auto tagToken = FLETwiceDerivedTokenGenerator::generateESCTwiceDerivedTagToken(escToken);
+    auto valueToken = FLETwiceDerivedTokenGenerator::generateESCTwiceDerivedValueToken(escToken);
+
+    // step (C)
+    // positions.cpos is a_1
+    // positions.apos is a_2
+    auto positions = ESCCollection::emuBinaryV2(reader, tagToken, valueToken);
+
+    // step (D)
+    // nullAnchorPositions is r
+    auto nullAnchorPositions =
+        readAndDecodeAnchor(reader, valueToken, ESCCollection::generateNullAnchorId(tagToken));
+
+    // This holds what value of a_1 should be used when inserting/updating the null anchor.
+    auto latestCpos = 0;
+
+    if (positions.apos == boost::none) {
+        // case (E)
+        // Null anchor exists & contains the latest anchor position,
+        // and *maybe* the latest non-anchor position.
+        uassert(7295004, "ESC null anchor is expected but not found", nullAnchorPositions);
+
+        // emuBinary must not return 0 for cpos if an anchor exists
+        uassert(7295005, "Invalid non-anchor position encountered", positions.cpos.value_or(1) > 0);
+
+        // If emuBinary returns none for a_1, then the null anchor has the latest non-anchor pos.
+        // This may happen if a prior cleanup was interrupted after the null anchors were updated,
+        // but before the ECOC temp collection could be dropped, and on resume, no new insertions
+        // or compactions have occurred since the previous cleanup.
+        latestCpos = positions.cpos.value_or(nullAnchorPositions->cpos);
+
+    } else if (positions.apos.value() == 0) {
+        // case (F)
+        // No anchors yet exist, so null anchor cannot exist and emuBinary must have
+        // returned a value for cpos.
+        uassert(7295006, "Unexpected ESC null anchor is found", !nullAnchorPositions);
+        uassert(7295007, "Invalid non-anchor position encountered", positions.cpos);
+
+        latestCpos = positions.cpos.value();
+    } else /* (apos > 0) */ {
+        // case (G)
+        // New anchors exist - if null anchor exists, then it contains stale positions.
+
+        // emuBinary must not return 0 for cpos if an anchor exists
+        uassert(7295008, "Invalid non-anchor position encountered", positions.cpos.value_or(1) > 0);
+
+        // If emuBinary returns none for cpos, then the newest anchor has the latest non-anchor pos.
+        // This may happen if a prior compact was interrupted after it inserted a new anchor, but
+        // before the ECOC temp collection could be dropped, and cleanup started immediately
+        // after.
+        latestCpos = positions.cpos.value_or_eval([&]() {
+            auto anchorPositions = readAndDecodeAnchor(
+                reader,
+                valueToken,
+                ESCCollection::generateAnchorId(tagToken, positions.apos.value()));
+            uassert(7295009, "ESC anchor is expected but not found", anchorPositions);
+            return anchorPositions->cpos;
+        });
+    }
+
+    return FLEEdgeCountInfo(
+        latestCpos, tagToken, positions, nullAnchorPositions, reader.getStats(), boost::none);
+}
+
+/**
+ * Performs all the ESC reads required by the QE compact algorithm.
+ */
+FLEEdgeCountInfo getEdgeCountInfoForCompact(const FLEStateCollectionReader& reader,
+                                            ConstDataRange tag) {
+
+    auto escToken = EDCServerPayloadInfo::getESCToken(tag);
+
+    auto tagToken = FLETwiceDerivedTokenGenerator::generateESCTwiceDerivedTagToken(escToken);
+    auto valueToken = FLETwiceDerivedTokenGenerator::generateESCTwiceDerivedValueToken(escToken);
+
+    auto positions = ESCCollection::emuBinaryV2(reader, tagToken, valueToken);
+
+    // Handle case where cpos is none. This means that no new non-anchors have been inserted
+    // since since the last compact/cleanup.
+    // This could happen if a previous compact inserted an anchor, but the temp ECOC drop
+    // was interrupted. On restart, the compaction will run emuBinaryV2 again, but since the
+    // anchor was already inserted for this value, it may return null cpos if there have been no
+    // new insertions for that value since the first compact attempt.
+    if (positions.cpos == boost::none) {
+        // No new non-anchors since the last compact/cleanup.
+        // There must be at least one anchor.
+        uassert(7293602,
+                "An ESC anchor document is expected but none is found",
+                !positions.apos.has_value() || positions.apos.value() > 0);
+        // the anchor with the latest cpos already exists so no more work needed
+
+        return FLEEdgeCountInfo(
+            0, tagToken, positions, boost::none, reader.getStats(), boost::none);
+    }
+
+    uint64_t nextAnchorPos = 0;
+
+    if (positions.apos == boost::none) {
+        auto nullAnchorPositions =
+            readAndDecodeAnchor(reader, valueToken, ESCCollection::generateNullAnchorId(tagToken));
+
+        uassert(7293601, "ESC null anchor document not found", nullAnchorPositions);
+
+        nextAnchorPos = nullAnchorPositions->apos + 1;
+    } else {
+        nextAnchorPos = positions.apos.value() + 1;
+    }
+
+    return FLEEdgeCountInfo(
+        nextAnchorPos, tagToken, positions, boost::none, reader.getStats(), boost::none);
+}
+
 FLEEdgeCountInfo getEdgeCountInfo(const FLEStateCollectionReader& reader,
                                   ConstDataRange tag,
                                   FLETagQueryInterface::TagQueryType type,
@@ -1838,12 +1976,10 @@ FLEEdgeCountInfo getEdgeCountInfo(const FLEStateCollectionReader& reader,
             anchorId = ESCCollection::generateAnchorId(tagToken, positions.apos.value());
         }
 
-        BSONObj anchorDoc = reader.getById(anchorId);
-        uassert(7291903, "ESC anchor document not found", !anchorDoc.isEmpty());
+        auto anchorPositions = readAndDecodeAnchor(reader, valueToken, anchorId);
+        uassert(7291903, "ESC anchor document not found", anchorPositions);
 
-        auto escAnchor =
-            uassertStatusOK(ESCCollection::decryptAnchorDocument(valueToken, anchorDoc));
-        count = escAnchor.count + 1;
+        count = anchorPositions->cpos + 1;
     }
 
 
@@ -2607,10 +2743,9 @@ boost::optional<uint64_t> binarySearchCommon(const FLEStateCollectionReader& rea
 }
 }  // namespace
 
-ESCCollection::EmuBinaryResult ESCCollection::emuBinaryV2(
-    const FLEStateCollectionReader& reader,
-    const ESCTwiceDerivedTagToken& tagToken,
-    const ESCTwiceDerivedValueToken& valueToken) {
+EmuBinaryResult ESCCollection::emuBinaryV2(const FLEStateCollectionReader& reader,
+                                           const ESCTwiceDerivedTagToken& tagToken,
+                                           const ESCTwiceDerivedValueToken& valueToken) {
     auto tracker = FLEStatusSection::get().makeEmuBinaryTracker();
 
     auto x = ESCCollection::anchorBinaryHops(reader, tagToken, valueToken, tracker);
@@ -2716,7 +2851,20 @@ std::vector<std::vector<FLEEdgeCountInfo>> ESCCollection::getTags(
         countInfos.reserve(tokens.size());
 
         for (const auto& token : tokens) {
-            countInfos.push_back(getEdgeCountInfo(reader, token.esc, type, token.edc));
+            switch (type) {
+                case FLETagQueryInterface::TagQueryType::kCompact:
+                    countInfos.push_back(getEdgeCountInfoForCompact(reader, token.esc));
+                    break;
+                case FLETagQueryInterface::TagQueryType::kCleanup:
+                    countInfos.push_back(getEdgeCountInfoForCleanup(reader, token.esc));
+                    break;
+                case FLETagQueryInterface::TagQueryType::kInsert:
+                case FLETagQueryInterface::TagQueryType::kQuery:
+                    countInfos.push_back(getEdgeCountInfo(reader, token.esc, type, token.edc));
+                    break;
+                default:
+                    MONGO_UNREACHABLE;
+            }
         }
 
         countInfoSets.emplace_back(countInfos);
@@ -4002,14 +4150,23 @@ std::vector<CompactionToken> CompactionHelpers::parseCompactionTokens(BSONObj co
 
 void CompactionHelpers::validateCompactionTokens(const EncryptedFieldConfig& efc,
                                                  BSONObj compactionTokens) {
+    _validateTokens(efc, compactionTokens, "Compaction"_sd);
+}
+
+void CompactionHelpers::validateCleanupTokens(const EncryptedFieldConfig& efc,
+                                              BSONObj cleanupTokens) {
+    _validateTokens(efc, cleanupTokens, "Cleanup"_sd);
+}
+
+void CompactionHelpers::_validateTokens(const EncryptedFieldConfig& efc,
+                                        BSONObj tokens,
+                                        StringData cmd) {
     for (const auto& field : efc.getFields()) {
-        const auto& tokenElement = compactionTokens.getField(field.getPath());
-        uassert(
-            6346806,
-            str::stream()
-                << "Compaction tokens object is missing compaction token for the encrypted path '"
-                << field.getPath() << "'",
-            !tokenElement.eoo());
+        const auto& tokenElement = tokens.getField(field.getPath());
+        uassert(7294900,
+                str::stream() << cmd << " tokens object is missing " << cmd
+                              << " token for the encrypted path '" << field.getPath() << "'",
+                !tokenElement.eoo());
     }
 }
 
@@ -4833,6 +4990,14 @@ PrfBlock FLEUtil::prf(ConstDataRange key, uint64_t value) {
     DataView(bufValue.data()).write<LittleEndian<uint64_t>>(value);
 
     return prf(key, bufValue);
+}
+
+void FLEUtil::checkEFCForECC(const EncryptedFieldConfig& efc) {
+    uassert(7568300,
+            str::stream()
+                << "Queryable Encryption version 2 collections must not contain the eccCollection"
+                << " in EncryptedFieldConfig",
+            !efc.getEccCollection());
 }
 
 StatusWith<std::vector<uint8_t>> FLEUtil::decryptData(ConstDataRange key,

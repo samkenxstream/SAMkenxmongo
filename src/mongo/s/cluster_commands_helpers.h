@@ -86,7 +86,8 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContextWithDefaultsForTarg
  * Dispatches all the specified requests in parallel and waits until all complete, returning a
  * vector of the same size and positions as that of 'requests'.
  *
- * Throws StaleConfigException if any remote returns a stale shardVersion error.
+ * Throws StaleConfig if any of the remotes returns that error, regardless of what the other errors
+ * are.
  */
 std::vector<AsyncRequestsSender::Response> gatherResponses(
     OperationContext* opCtx,
@@ -170,7 +171,7 @@ std::vector<AsyncRequestsSender::Response> scatterGatherUnversionedTargetAllShar
  * the collection has query sampling enabled and the rate-limited sampler successfully generates a
  * sample id for it.
  *
- * Does not retry on StaleConfigException.
+ * Does not retry on StaleConfig errors.
  */
 [[nodiscard]] std::vector<AsyncRequestsSender::Response> scatterGatherVersionedTargetByRoutingTable(
     OperationContext* opCtx,
@@ -182,8 +183,24 @@ std::vector<AsyncRequestsSender::Response> scatterGatherUnversionedTargetAllShar
     Shard::RetryPolicy retryPolicy,
     const BSONObj& query,
     const BSONObj& collation,
+    const boost::optional<BSONObj>& letParameters,
+    const boost::optional<LegacyRuntimeConstants>& runtimeConstants,
     bool eligibleForSampling = false);
-
+/**
+ * This overload is for callers which already have a fully initialized 'ExpressionContext' (e.g.
+ * callers from the aggregation framework). Most callers should prefer the overload above.
+ */
+[[nodiscard]] std::vector<AsyncRequestsSender::Response> scatterGatherVersionedTargetByRoutingTable(
+    boost::intrusive_ptr<ExpressionContext> expCtx,
+    StringData dbName,
+    const NamespaceString& nss,
+    const CollectionRoutingInfo& cri,
+    const BSONObj& cmdObj,
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy,
+    const BSONObj& query,
+    const BSONObj& collation,
+    bool eligibleForSampling = false);
 
 /**
  * Utility for dispatching versioned commands on a namespace, deciding which shards to
@@ -191,7 +208,7 @@ std::vector<AsyncRequestsSender::Response> scatterGatherUnversionedTargetAllShar
  *
  * Callers can specify shards to skip, even if these shards would be otherwise targeted.
  *
- * Allows StaleConfigException errors to append to the response list.
+ * Allows StaleConfig errors to append to the response list.
  */
 std::vector<AsyncRequestsSender::Response>
 scatterGatherVersionedTargetByRoutingTableNoThrowOnStaleShardVersionErrors(
@@ -204,7 +221,9 @@ scatterGatherVersionedTargetByRoutingTableNoThrowOnStaleShardVersionErrors(
     const ReadPreferenceSetting& readPref,
     Shard::RetryPolicy retryPolicy,
     const BSONObj& query,
-    const BSONObj& collation);
+    const BSONObj& collation,
+    const boost::optional<BSONObj>& letParameters,
+    const boost::optional<LegacyRuntimeConstants>& runtimeConstants);
 
 /**
  * Utility for dispatching commands against the primary of a database and attaching the appropriate
@@ -222,7 +241,7 @@ AsyncRequestsSender::Response executeCommandAgainstDatabasePrimary(
  * Utility for dispatching commands against the shard with the MinKey chunk for the namespace and
  * attaching the appropriate shard version.
  *
- * Does not retry on StaleConfigException.
+ * Does not retry on StaleConfig errors.
  */
 AsyncRequestsSender::Response executeCommandAgainstShardWithMinKeyChunk(
     OperationContext* opCtx,
@@ -296,7 +315,9 @@ std::vector<std::pair<ShardId, BSONObj>> getVersionedRequestsForTargetedShards(
     const CollectionRoutingInfo& cri,
     const BSONObj& cmdObj,
     const BSONObj& query,
-    const BSONObj& collation);
+    const BSONObj& collation,
+    const boost::optional<BSONObj>& letParameters,
+    const boost::optional<LegacyRuntimeConstants>& runtimeConstants);
 
 /**
  * If the command is running in a transaction, returns the proper routing table to use for targeting

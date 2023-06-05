@@ -86,9 +86,15 @@ selector:
   # Time-series collections are not supported on mongos.
   - jstests/concurrency/fsm_workloads/create_timeseries_collection.js
 
-  # Performs finds with $where, which are slow. Because 'orphanCleanupDelaySecs' is set to 1 second,
-  # this may cause the finds to return incomplete results.
+  # Because 'orphanCleanupDelaySecs' is set to 1 second, this may cause the finds to return
+  # incomplete results.
+  # TODO SERVER-77354: Allow the following tests to run in this suite after 'orphanCleanupDelaySecs'
+  # is increased.
   - jstests/concurrency/fsm_workloads/indexed_insert_where.js
+  - jstests/concurrency/fsm_workloads/agg_sort.js
+
+  # TODO Undenylist (SERVER-71819).
+  - jstests/concurrency/fsm_workloads/schema_validator_with_expr_variables.js
 
   exclude_with_any_tags:
   - does_not_support_causal_consistency
@@ -119,12 +125,12 @@ executor:
           runningWithCausalConsistency: true
           runningWithBalancer: true
   hooks:
+  - class: CheckShardFilteringMetadata
   - class: CheckReplDBHashInBackground
   - class: CheckReplDBHash
   - class: CheckMetadataConsistencyInBackground
   - class: CheckOrphansDeleted
   - class: CheckRoutingTableConsistency
-  - class: CheckShardFilteringMetadata
   - class: ValidateCollections # Validation can interfere with other operations, so this goes last.
   - class: CleanupConcurrencyWorkloads
   fixture:
@@ -140,7 +146,6 @@ executor:
       set_parameters:
         enableTestCommands: 1
         roleGraphInvalidationIsFatal: 1
-        receiveChunkWaitForRangeDeleterTimeoutMS: 90000
         queryAnalysisWriterIntervalSecs: 1
     num_rs_nodes_per_shard: 3
     num_shards: 2

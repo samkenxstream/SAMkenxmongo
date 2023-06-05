@@ -367,7 +367,8 @@ StringData extractGeoNearFieldFromIndexes(OperationContext* opCtx,
     std::vector<const IndexDescriptor*> idxs;
     collection->getIndexCatalog()->findIndexByType(opCtx, IndexNames::GEO_2D, idxs);
     uassert(ErrorCodes::IndexNotFound,
-            str::stream() << "There is more than one 2d index on " << collection->ns().ns()
+            str::stream() << "There is more than one 2d index on "
+                          << collection->ns().toStringForErrorMsg()
                           << "; unsure which to use for $geoNear",
             idxs.size() <= 1U);
     if (idxs.size() == 1U) {
@@ -386,7 +387,8 @@ StringData extractGeoNearFieldFromIndexes(OperationContext* opCtx,
             "$geoNear requires a 2d or 2dsphere index, but none were found",
             !idxs.empty());
     uassert(ErrorCodes::IndexNotFound,
-            str::stream() << "There is more than one 2dsphere index on " << collection->ns().ns()
+            str::stream() << "There is more than one 2dsphere index on "
+                          << collection->ns().toStringForErrorMsg()
                           << "; unsure which to use for $geoNear",
             idxs.size() <= 1U);
 
@@ -563,8 +565,16 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::createRan
 
     TrialStage* trialStage = nullptr;
 
-    auto scopedCss = CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, coll->ns());
-    const bool isSharded = scopedCss->getCollectionDescription(opCtx).isSharded();
+    const auto [isSharded, optOwnershipFilter] = [&]() {
+        auto scopedCss =
+            CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, coll->ns());
+        const bool isSharded = scopedCss->getCollectionDescription(opCtx).isSharded();
+        boost::optional<ScopedCollectionFilter> optFilter = isSharded
+            ? boost::optional<ScopedCollectionFilter>(scopedCss->getOwnershipFilter(
+                  opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup))
+            : boost::none;
+        return std::pair(isSharded, std::move(optFilter));
+    }();
 
     // Because 'numRecords' includes orphan documents, our initial decision to optimize the $sample
     // cursor may have been mistaken. For sharded collections, build a TRIAL plan that will switch
@@ -618,8 +628,8 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::createRan
         if (isSharded) {
             // In the sharded case, we need to use a ShardFilterer within the ARHASH plan to
             // eliminate orphans from the working set, since the stage owns the cursor.
-            maybeShardFilter = std::make_unique<ShardFiltererImpl>(scopedCss->getOwnershipFilter(
-                opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup));
+            invariant(optOwnershipFilter);
+            maybeShardFilter = std::make_unique<ShardFiltererImpl>(*optOwnershipFilter);
         }
 
         auto arhashPlan = std::make_unique<SampleFromTimeseriesBucket>(
@@ -641,10 +651,9 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::createRan
         if (isSharded) {
             // In the sharded case, we need to add a shard-filterer stage to the backup plan to
             // eliminate orphans. The trial plan is thus SHARDING_FILTER-COLLSCAN.
-            auto collectionFilter = scopedCss->getOwnershipFilter(
-                opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup);
+            invariant(optOwnershipFilter);
             collScanPlan = std::make_unique<ShardFilterStage>(
-                expCtx.get(), std::move(collectionFilter), ws.get(), std::move(collScanPlan));
+                expCtx.get(), *optOwnershipFilter, ws.get(), std::move(collScanPlan));
         }
 
         auto topkSortPlan = std::make_unique<UnpackTimeseriesBucket>(
@@ -683,16 +692,15 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::createRan
         // Since the incoming operation is sharded, use the CSS to infer the filtering metadata for
         // the collection. We get the shard ownership filter after checking to see if the collection
         // is sharded to avoid an invariant from being fired in this call.
-        auto collectionFilter = scopedCss->getOwnershipFilter(
-            opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup);
+        invariant(optOwnershipFilter);
         // The trial plan is SHARDING_FILTER-MULTI_ITERATOR.
         auto randomCursorPlan = std::make_unique<ShardFilterStage>(
-            expCtx.get(), collectionFilter, ws.get(), std::move(root));
+            expCtx.get(), *optOwnershipFilter, ws.get(), std::move(root));
         // The backup plan is SHARDING_FILTER-COLLSCAN.
         std::unique_ptr<PlanStage> collScanPlan = std::make_unique<CollectionScan>(
             expCtx.get(), coll, CollectionScanParams{}, ws.get(), nullptr);
         collScanPlan = std::make_unique<ShardFilterStage>(
-            expCtx.get(), collectionFilter, ws.get(), std::move(collScanPlan));
+            expCtx.get(), *optOwnershipFilter, ws.get(), std::move(collScanPlan));
         // Place a TRIAL stage at the root of the plan tree, and pass it the trial and backup plans.
         root = std::make_unique<TrialStage>(expCtx.get(),
                                             ws.get(),
@@ -707,9 +715,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::createRan
                                                   std::move(ws),
                                                   std::move(root),
                                                   &coll,
-                                                  opCtx->inMultiDocumentTransaction()
-                                                      ? PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY
-                                                      : PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
+                                                  PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
                                                   QueryPlannerParams::RETURN_OWNED_DATA);
     if (!execStatus.isOK()) {
         return execStatus.getStatus();
@@ -1308,7 +1314,6 @@ PipelineD::buildInnerQueryExecutorGeneric(const MultipleCollectionAccessor& coll
     // sort optimization. We check eligibility and perform the rewrite here.
     auto [unpack, sort] = findUnpackThenSort(pipeline->_sources);
     const bool timeseriesBoundedSortOptimization =
-        serverGlobalParams.featureCompatibility.isVersionInitialized() &&
         feature_flags::gFeatureFlagBucketUnpackWithSort.isEnabled(
             serverGlobalParams.featureCompatibility) &&
         unpack && sort;
@@ -1557,8 +1562,8 @@ PipelineD::buildInnerQueryExecutorGeoNear(const MultipleCollectionAccessor& coll
     // $geoNear can only run over the main collection.
     const auto& collection = collections.getMainCollection();
     uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "$geoNear requires a geo index to run, but " << nss.ns()
-                          << " does not exist",
+            str::stream() << "$geoNear requires a geo index to run, but "
+                          << nss.toStringForErrorMsg() << " does not exist",
             collection);
 
     Pipeline::SourceContainer& sources = pipeline->_sources;

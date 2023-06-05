@@ -45,6 +45,9 @@ DBCollection.prototype.help = function() {
         ".bulkWrite( operations, <optional params> ) - bulk execute write operations, optional parameters are: w, wtimeout, j");
     print(
         "\tdb." + shortName +
+        ".checkMetadataConsistency() - return metadata inconsistency information found in the collection.");
+    print(
+        "\tdb." + shortName +
         ".count( query = {}, <optional params> ) - count the number of documents that matches the query, optional parameters are: limit, skip, hint, maxTimeMS");
     print(
         "\tdb." + shortName +
@@ -654,7 +657,7 @@ DBCollection.prototype.dropIndexes = function(indexNames) {
 
 DBCollection.prototype.drop = function(options = {}) {
     const cmdObj = Object.assign({drop: this.getName()}, options);
-    ret = this._db.runCommand(cmdObj);
+    const ret = this._db.runCommand(cmdObj);
     if (!ret.ok) {
         if (ret.errmsg == "ns not found")
             return false;
@@ -1472,6 +1475,14 @@ DBCollection.prototype.watch = function(pipeline, options) {
     [changeStreamStage, aggOptions] = this.getMongo()._extractChangeStreamOptions(options);
     pipeline.unshift(changeStreamStage);
     return this.aggregate(pipeline, aggOptions);
+};
+
+DBCollection.prototype.checkMetadataConsistency = function(options = {}) {
+    assert(options instanceof Object,
+           `'options' parameter expected to be type object but found: ${typeof options}`);
+    const res = assert.commandWorked(
+        this._db.runCommand(Object.extend({checkMetadataConsistency: this.getName()}, options)));
+    return new DBCommandCursor(this._db, res);
 };
 
 /**

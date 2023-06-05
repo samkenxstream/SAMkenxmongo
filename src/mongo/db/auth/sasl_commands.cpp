@@ -207,9 +207,10 @@ void warnIfCompressed(OperationContext* opCtx) {
 SaslReply doSaslStart(OperationContext* opCtx,
                       AuthenticationSession* session,
                       const SaslStartCommand& request) {
-    auto mechanism = uassertStatusOK(
-        SASLServerMechanismRegistry::get(opCtx->getServiceContext())
-            .getServerMechanism(request.getMechanism(), request.getDbName().toString()));
+    auto mechanism =
+        uassertStatusOK(SASLServerMechanismRegistry::get(opCtx->getServiceContext())
+                            .getServerMechanism(request.getMechanism(),
+                                                DatabaseNameUtil::serialize(request.getDbName())));
 
     uassert(ErrorCodes::BadValue,
             "Plaintext mechanisms may not be used with speculativeSaslStart",
@@ -232,7 +233,7 @@ SaslReply runSaslStart(OperationContext* opCtx,
     opCtx->markKillOnClientDisconnect();
 
     // Note that while updateDatabase can throw, it should not be able to for saslStart.
-    session->updateDatabase(request.getDbName().toStringWithTenantId());
+    session->updateDatabase(DatabaseNameUtil::serializeForAuth(request.getDbName()));
     session->setMechanismName(request.getMechanism());
 
     return doSaslStart(opCtx, session, request);

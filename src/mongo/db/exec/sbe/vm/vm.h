@@ -35,7 +35,9 @@
 
 #include "mongo/base/compare_numbers.h"
 #include "mongo/config.h"
+#include "mongo/db/exec/sbe/makeobj_spec.h"
 #include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/sort_spec.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/exec/sbe/vm/datetime.h"
 #include "mongo/db/exec/sbe/vm/label.h"
@@ -263,6 +265,8 @@ struct Instruction {
     enum Tags {
         pushConstVal,
         pushAccessVal,
+        pushOwnedAccessorVal,
+        pushEnvAccessorVal,
         pushMoveVal,
         pushLocalVal,
         pushMoveLocalVal,
@@ -431,6 +435,10 @@ struct Instruction {
                 return "pushConstVal";
             case pushAccessVal:
                 return "pushAccessVal";
+            case pushOwnedAccessorVal:
+                return "pushOwnedAccessorVal";
+            case pushEnvAccessorVal:
+                return "pushEnvAccessorVal";
             case pushMoveVal:
                 return "pushMoveVal";
             case pushLocalVal:
@@ -731,6 +739,7 @@ enum class Builtin : uint8_t {
     generateSortKey,
     generateCheapSortKey,
     sortKeyComponentVectorGetElement,
+    sortKeyComponentVectorToArray,
 
     makeBsonObj,
     tsSecond,
@@ -751,9 +760,120 @@ enum class Builtin : uint8_t {
     isoWeek,
     objectToArray,
     arrayToObject,
+
+    aggFirstNNeedsMoreInput,
+    aggFirstN,
+    aggFirstNMerge,
+    aggFirstNFinalize,
+    aggLastN,
+    aggLastNMerge,
+    aggLastNFinalize,
+    aggTopN,
+    aggTopNMerge,
+    aggTopNFinalize,
+    aggBottomN,
+    aggBottomNMerge,
+    aggBottomNFinalize,
+    aggMaxN,
+    aggMaxNMerge,
+    aggMaxNFinalize,
+    aggMinN,
+    aggMinNMerge,
+    aggMinNFinalize,
 };
 
 std::string builtinToString(Builtin b);
+
+/**
+ * This enum defines indices into an 'Array' that store state for $AccumulatorN expressions.
+ *
+ * The array contains five elements:
+ * - The element at index `kInternalArr` is the array that holds the values.
+ * - The element at index `kStartIdx` is the logical start index in the internal array. This is
+ *   used for emulating queue behaviour.
+ * - The element at index `kMaxSize` is the maximum number entries the data structure holds.
+ * - The element at index `kMemUsage` holds the current memory usage
+ * - The element at index `kMemLimit` holds the max memory limit allowed
+ */
+enum class AggMultiElems { kInternalArr, kStartIdx, kMaxSize, kMemUsage, kMemLimit, kSizeOfArray };
+
+/**
+ * Less than comparison based on a sort pattern.
+ */
+struct SortPatternLess {
+    SortPatternLess(const value::SortSpec* sortSpec) : _sortSpec(sortSpec) {}
+
+    bool operator()(const std::pair<value::TypeTags, value::Value>& lhs,
+                    const std::pair<value::TypeTags, value::Value>& rhs) const {
+        auto [cmpTag, cmpVal] = _sortSpec->compare(lhs.first, lhs.second, rhs.first, rhs.second);
+        uassert(5807000, "Invalid comparison result", cmpTag == value::TypeTags::NumberInt32);
+        return value::bitcastTo<int32_t>(cmpVal) < 0;
+    }
+
+private:
+    const value::SortSpec* _sortSpec;
+};
+
+/**
+ * Greater than comparison based on a sort pattern.
+ */
+struct SortPatternGreater {
+    SortPatternGreater(const value::SortSpec* sortSpec) : _sortSpec(sortSpec) {}
+
+    bool operator()(const std::pair<value::TypeTags, value::Value>& lhs,
+                    const std::pair<value::TypeTags, value::Value>& rhs) const {
+        auto [cmpTag, cmpVal] = _sortSpec->compare(lhs.first, lhs.second, rhs.first, rhs.second);
+        uassert(5807001, "Invalid comparison result", cmpTag == value::TypeTags::NumberInt32);
+        return value::bitcastTo<int32_t>(cmpVal) > 0;
+    }
+
+private:
+    const value::SortSpec* _sortSpec;
+};
+
+/**
+ * Comparison based on the key of a pair of elements.
+ */
+template <typename Comp>
+struct PairKeyComp {
+    PairKeyComp(const Comp& comp) : _comp(comp) {}
+
+    bool operator()(const std::pair<value::TypeTags, value::Value>& lhs,
+                    const std::pair<value::TypeTags, value::Value>& rhs) const {
+        auto [lPairTag, lPairVal] = lhs;
+        auto lPair = value::getArrayView(lPairVal);
+        auto lKey = lPair->getAt(0);
+
+        auto [rPairTag, rPairVal] = rhs;
+        auto rPair = value::getArrayView(rPairVal);
+        auto rKey = rPair->getAt(0);
+
+        return _comp(lKey, rKey);
+    }
+
+private:
+    const Comp _comp;
+};
+
+template <bool less>
+struct ValueCompare {
+    ValueCompare(const CollatorInterface* collator) : _collator(collator) {}
+
+    bool operator()(const std::pair<value::TypeTags, value::Value>& lhs,
+                    const std::pair<value::TypeTags, value::Value>& rhs) const {
+        auto [tag, val] =
+            value::compareValue(lhs.first, lhs.second, rhs.first, rhs.second, _collator);
+        uassert(7548805, "Invalid comparison result", tag == value::TypeTags::NumberInt32);
+        if constexpr (less) {
+            return value::bitcastTo<int>(val) < 0;
+        } else {
+            return value::bitcastTo<int>(val) > 0;
+        }
+    }
+
+private:
+    const CollatorInterface* _collator;
+};
 
 /**
  * This enum defines indices into an 'Array' that returns the partial sum result when 'needsMerge'
@@ -1095,8 +1215,6 @@ private:
                                                                value::Value operandValue);
     FastTuple<bool, value::TypeTags, value::Value> genericFloor(value::TypeTags operandTag,
                                                                 value::Value operandValue);
-    FastTuple<bool, value::TypeTags, value::Value> genericTrunc(value::TypeTags operandTag,
-                                                                value::Value operandValue);
     FastTuple<bool, value::TypeTags, value::Value> genericExp(value::TypeTags operandTag,
                                                               value::Value operandValue);
     FastTuple<bool, value::TypeTags, value::Value> genericLn(value::TypeTags operandTag,
@@ -1105,6 +1223,8 @@ private:
                                                                 value::Value operandValue);
     FastTuple<bool, value::TypeTags, value::Value> genericSqrt(value::TypeTags operandTag,
                                                                value::Value operandValue);
+    FastTuple<bool, value::TypeTags, value::Value> genericRoundTrunc(
+        std::string funcName, Decimal128::RoundingMode roundingMode, ArityType arity);
     std::pair<value::TypeTags, value::Value> genericNot(value::TypeTags tag, value::Value value);
     std::pair<value::TypeTags, value::Value> genericIsMember(value::TypeTags lhsTag,
                                                              value::Value lhsVal,
@@ -1388,10 +1508,35 @@ private:
                                                              TimeZone timezone,
                                                              DayOfWeek startOfWeek);
 
-    std::pair<value::TypeTags, value::Value> produceBsonObject(const value::MakeObjSpec* mos,
+    /**
+     * produceBsonObject() takes a MakeObjSpec ('spec'), a root value ('rootTag' and 'rootVal'),
+     * and 0 or more "computed" values as inputs, it builds an output BSON object based on the
+     * instructions provided by 'spec' and based on the contents of 'root' and the computed input
+     * values, and then it returns the output object. (Note the computed input values are not
+     * directly passed in as C++ parameters -- instead the computed input values are passed via
+     * the VM's stack.)
+     *
+     * 'spec' provides two lists of field names: "keepOrDrop" fields and "computed" fields. These
+     * lists are disjoint and do not contain duplicates. The number of computed input values passed
+     * in by the caller on the VM stack must match the number of fields in the "computed" list.
+     *
+     * For each field F in the "computed" list, this method will retrieve the corresponding computed
+     * input value V from the VM stack and add {F,V} to the output object.
+     *
+     * If 'root' is not an object, it is ignored. Otherwise, for each field F in 'root' with value V
+     * that does not appear in the "computed" list, this method will copy {F,V} to the output object
+     * if either: (1) field F appears in the "keepOrDrop" list and 'spec->fieldBehavior == keep'; or
+     * (2) field F does _not_ appear in the "keepOrDrop" list and 'spec->fieldBehavior == drop'. If
+     * neither of these conditions are met, field F in 'root' will be ignored.
+     *
+     * For any two distinct fields F1 and F2 in the output object, if F1 is in 'root' and F2 does
+     * not appear before F1 in 'root', -OR- if both F1 and F2 are not in 'root' and F2 does not
+     * appear before F1 in the "computed" list, then F2 will appear after F1 in the output object.
+     */
+    std::pair<value::TypeTags, value::Value> produceBsonObject(const MakeObjSpec* mos,
                                                                value::TypeTags rootTag,
                                                                value::Value rootVal,
-                                                               size_t startIdx);
+                                                               int stackOffset);
 
     FastTuple<bool, value::TypeTags, value::Value> builtinSplit(ArityType arity);
     FastTuple<bool, value::TypeTags, value::Value> builtinDate(ArityType arity);
@@ -1522,6 +1667,8 @@ private:
     FastTuple<bool, value::TypeTags, value::Value> builtinGenerateCheapSortKey(ArityType arity);
     FastTuple<bool, value::TypeTags, value::Value> builtinSortKeyComponentVectorGetElement(
         ArityType arity);
+    FastTuple<bool, value::TypeTags, value::Value> builtinSortKeyComponentVectorToArray(
+        ArityType arity);
     FastTuple<bool, value::TypeTags, value::Value> builtinMakeBsonObj(ArityType arity);
     FastTuple<bool, value::TypeTags, value::Value> builtinTsSecond(ArityType arity);
     FastTuple<bool, value::TypeTags, value::Value> builtinTsIncrement(ArityType arity);
@@ -1542,9 +1689,28 @@ private:
     FastTuple<bool, value::TypeTags, value::Value> builtinISOWeekYear(ArityType arity);
     FastTuple<bool, value::TypeTags, value::Value> builtinISODayOfWeek(ArityType arity);
     FastTuple<bool, value::TypeTags, value::Value> builtinISOWeek(ArityType arity);
-
     FastTuple<bool, value::TypeTags, value::Value> builtinObjectToArray(ArityType arity);
     FastTuple<bool, value::TypeTags, value::Value> builtinArrayToObject(ArityType arity);
+
+    FastTuple<bool, value::TypeTags, value::Value> builtinAggFirstNNeedsMoreInput(ArityType arity);
+    FastTuple<bool, value::TypeTags, value::Value> builtinAggFirstN(ArityType arity);
+    FastTuple<bool, value::TypeTags, value::Value> builtinAggFirstNMerge(ArityType arity);
+    FastTuple<bool, value::TypeTags, value::Value> builtinAggFirstNFinalize(ArityType arity);
+    FastTuple<bool, value::TypeTags, value::Value> builtinAggLastN(ArityType arity);
+    FastTuple<bool, value::TypeTags, value::Value> builtinAggLastNMerge(ArityType arity);
+    FastTuple<bool, value::TypeTags, value::Value> builtinAggLastNFinalize(ArityType arity);
+    template <typename Less>
+    FastTuple<bool, value::TypeTags, value::Value> builtinAggTopBottomN(ArityType arity);
+    template <typename Less>
+    FastTuple<bool, value::TypeTags, value::Value> builtinAggTopBottomNMerge(ArityType arity);
+    FastTuple<bool, value::TypeTags, value::Value> builtinAggTopBottomNFinalize(ArityType arity);
+    template <bool less>
+    FastTuple<bool, value::TypeTags, value::Value> builtinAggMinMaxN(ArityType arity);
+    template <bool less>
+    FastTuple<bool, value::TypeTags, value::Value> builtinAggMinMaxNMerge(ArityType arity);
+    template <bool less>
+    FastTuple<bool, value::TypeTags, value::Value> builtinAggMinMaxNFinalize(ArityType arity);
+
     FastTuple<bool, value::TypeTags, value::Value> dispatchBuiltin(Builtin f, ArityType arity);
 
     static constexpr size_t offsetOwned = 0;

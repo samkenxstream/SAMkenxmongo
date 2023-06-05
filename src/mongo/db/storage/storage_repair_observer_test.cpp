@@ -39,6 +39,7 @@
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/logv2/log.h"
 #include "mongo/unittest/death_test.h"
@@ -72,11 +73,15 @@ public:
 
     void createMockReplConfig(OperationContext* opCtx) {
         BSONObj replConfig;
-        Lock::DBLock dbLock(opCtx, DatabaseName(boost::none, "local"), MODE_X);
-        Helpers::putSingleton(
+        Lock::DBLock dbLock(opCtx, DatabaseName::kLocal, MODE_X);
+        auto coll = acquireCollection(
             opCtx,
-            NamespaceString::createNamespaceString_forTest(boost::none, "local.system.replset"),
-            replConfig);
+            CollectionAcquisitionRequest(NamespaceString::kSystemReplSetNamespace,
+                                         PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                         repl::ReadConcernArgs::get(opCtx),
+                                         AcquisitionPrerequisites::kWrite),
+            MODE_X);
+        Helpers::putSingleton(opCtx, coll, replConfig);
     }
 
     void assertReplConfigValid(OperationContext* opCtx, bool valid) {
@@ -94,7 +99,7 @@ public:
 
     bool hasReplConfig(OperationContext* opCtx) {
         BSONObj replConfig;
-        Lock::DBLock dbLock(opCtx, DatabaseName(boost::none, "local"), MODE_IS);
+        Lock::DBLock dbLock(opCtx, DatabaseName::kLocal, MODE_IS);
         return Helpers::getSingleton(
             opCtx,
             NamespaceString::createNamespaceString_forTest(boost::none, "local.system.replset"),

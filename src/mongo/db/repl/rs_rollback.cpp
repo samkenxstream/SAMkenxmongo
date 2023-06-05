@@ -70,6 +70,7 @@
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/session/logical_session_id.h"
 #include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/db/storage/remove_saver.h"
 #include "mongo/db/transaction/transaction_participant.h"
@@ -317,9 +318,10 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
             fixUpInfo.refetchTransactionDocs = true;
         } else {
             throw RSFatalException(
-                str::stream() << NamespaceString::kSessionTransactionsTableNamespace.ns()
-                              << " does not have a UUID, but local op has a transaction number: "
-                              << redact(oplogEntry.toBSONForLogging()));
+                str::stream()
+                << NamespaceString::kSessionTransactionsTableNamespace.toStringForErrorMsg()
+                << " does not have a UUID, but local op has a transaction number: "
+                << redact(oplogEntry.toBSONForLogging()));
         }
         if (oplogEntry.isPartialTransaction()) {
             // If this is a transaction which did not commit, we need do nothing more than
@@ -794,7 +796,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                              message,
                              logAttrs(nss),
                              "oplogEntry"_attr = redact(oplogEntry.toBSONForLogging()));
-        throw RSFatalException(str::stream() << message << ". ns: " << nss.ns());
+        throw RSFatalException(str::stream() << message << ". ns: " << nss.toStringForErrorMsg());
     }
     fixUpInfo.docsToRefetch.insert(doc);
     return Status::OK();
@@ -862,11 +864,11 @@ void dropIndex(OperationContext* opCtx,
                const string& indexName,
                NamespaceString& nss) {
     IndexCatalog* indexCatalog = collection->getIndexCatalog();
-    auto indexDescriptor = indexCatalog->findIndexByName(
+    auto writableEntry = indexCatalog->getWritableEntryByName(
         opCtx,
         indexName,
         IndexCatalog::InclusionPolicy::kReady | IndexCatalog::InclusionPolicy::kUnfinished);
-    if (!indexDescriptor) {
+    if (!writableEntry) {
         LOGV2_WARNING(21725,
                       "Rollback failed to drop index {indexName} in {namespace}: index not found.",
                       "Rollback failed to drop index: index not found",
@@ -875,9 +877,8 @@ void dropIndex(OperationContext* opCtx,
         return;
     }
 
-    auto entry = indexCatalog->getEntry(indexDescriptor);
-    if (entry->isReady(opCtx)) {
-        auto status = indexCatalog->dropIndex(opCtx, collection, indexDescriptor);
+    if (writableEntry->isReady()) {
+        auto status = indexCatalog->dropIndexEntry(opCtx, collection, writableEntry);
         if (!status.isOK()) {
             LOGV2_ERROR(21738,
                         "Rollback failed to drop index {indexName} in {namespace}: {error}",
@@ -887,7 +888,7 @@ void dropIndex(OperationContext* opCtx,
                         "error"_attr = redact(status));
         }
     } else {
-        auto status = indexCatalog->dropUnfinishedIndex(opCtx, collection, indexDescriptor);
+        auto status = indexCatalog->dropUnfinishedIndex(opCtx, collection, writableEntry);
         if (!status.isOK()) {
             LOGV2_ERROR(
                 21739,
@@ -1264,7 +1265,7 @@ void syncFixUp(OperationContext* opCtx,
                 throw RSFatalException(
                     str::stream()
                     << "A fetch on the transactions collection returned an unexpected namespace: "
-                    << resNss.ns()
+                    << resNss.toStringForErrorMsg()
                     << ". The transactions collection cannot be correctly rolled back, a full "
                        "resync is required.");
             }
@@ -1622,7 +1623,12 @@ void syncFixUp(OperationContext* opCtx,
                 const NamespaceString docNss(doc.ns);
                 Lock::DBLock docDbLock(opCtx, docNss.dbName(), MODE_X);
                 OldClientContext ctx(opCtx, docNss);
-                CollectionWriter collection(opCtx, uuid);
+                auto collection = acquireCollection(opCtx,
+                                                    {NamespaceStringOrUUID(docNss.dbName(), uuid),
+                                                     AcquisitionPrerequisites::kPretendUnsharded,
+                                                     repl::ReadConcernArgs::get(opCtx),
+                                                     AcquisitionPrerequisites::kWrite},
+                                                    MODE_X);
 
                 // Adds the doc to our rollback file if the collection was not dropped while
                 // rolling back createCollection operations. Does not log an error when
@@ -1630,9 +1636,10 @@ void syncFixUp(OperationContext* opCtx,
                 // the collection was dropped as part of rolling back a createCollection
                 // command and the document no longer exists.
 
-                if (collection && removeSaver) {
+                if (collection.exists() && removeSaver) {
                     BSONObj obj;
-                    bool found = Helpers::findOne(opCtx, collection.get(), pattern, obj);
+                    bool found =
+                        Helpers::findOne(opCtx, collection.getCollectionPtr(), pattern, obj);
                     if (found) {
                         auto status = removeSaver->goingToDelete(obj);
                         if (!status.isOK()) {
@@ -1671,8 +1678,8 @@ void syncFixUp(OperationContext* opCtx,
                     // here.
                     deletes++;
 
-                    if (collection) {
-                        if (collection->isCapped()) {
+                    if (collection.exists()) {
+                        if (collection.getCollectionPtr()->isCapped()) {
                             // Can't delete from a capped collection - so we truncate instead.
                             // if this item must go, so must all successors.
 
@@ -1683,7 +1690,8 @@ void syncFixUp(OperationContext* opCtx,
 
                                 const auto clock = opCtx->getServiceContext()->getFastClockSource();
                                 const auto findOneStart = clock->now();
-                                RecordId loc = Helpers::findOne(opCtx, collection.get(), pattern);
+                                RecordId loc =
+                                    Helpers::findOne(opCtx, collection.getCollectionPtr(), pattern);
                                 if (clock->now() - findOneStart > Milliseconds(200))
                                     LOGV2_WARNING(
                                         21726,
@@ -1695,21 +1703,23 @@ void syncFixUp(OperationContext* opCtx,
                                 if (!loc.isNull()) {
                                     try {
                                         writeConflictRetry(
-                                            opCtx,
-                                            "cappedTruncateAfter",
-                                            collection->ns().ns(),
-                                            [&] {
+                                            opCtx, "cappedTruncateAfter", collection.nss(), [&] {
                                                 collection_internal::cappedTruncateAfter(
-                                                    opCtx, collection.get(), loc, true);
+                                                    opCtx,
+                                                    collection.getCollectionPtr(),
+                                                    loc,
+                                                    true);
                                             });
                                     } catch (const DBException& e) {
                                         if (e.code() == 13415) {
                                             // hack: need to just make cappedTruncate do this...
+                                            CollectionWriter collectionWriter(opCtx, &collection);
                                             writeConflictRetry(
-                                                opCtx, "truncate", collection->ns().ns(), [&] {
+                                                opCtx, "truncate", collection.nss(), [&] {
                                                     WriteUnitOfWork wunit(opCtx);
                                                     uassertStatusOK(
-                                                        collection.getWritableCollection(opCtx)
+                                                        collectionWriter
+                                                            .getWritableCollection(opCtx)
                                                             ->truncate(opCtx));
                                                     wunit.commit();
                                                 });
@@ -1736,8 +1746,7 @@ void syncFixUp(OperationContext* opCtx,
                             }
                         } else {
                             deleteObjects(opCtx,
-                                          collection.get(),
-                                          *nss,
+                                          collection,
                                           pattern,
                                           true,   // justOne
                                           true);  // god
@@ -1765,7 +1774,7 @@ void syncFixUp(OperationContext* opCtx,
                     request.setGod();
                     request.setUpsert();
 
-                    update(opCtx, ctx.db(), request);
+                    update(opCtx, collection, request);
                 }
             } catch (const DBException& e) {
                 LOGV2(21713,
@@ -1846,7 +1855,8 @@ void syncFixUp(OperationContext* opCtx,
             fassertFailedWithStatusNoTrace(
                 40495,
                 Status(ErrorCodes::UnrecoverableRollbackError,
-                       str::stream() << "Can't find " << NamespaceString::kRsOplogNamespace.ns()));
+                       str::stream() << "Can't find "
+                                     << NamespaceString::kRsOplogNamespace.toStringForErrorMsg()));
         }
 
         // The oplog collection doesn't have indexes and therefore can take full advantage of the

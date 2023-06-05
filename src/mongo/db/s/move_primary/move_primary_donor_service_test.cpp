@@ -216,13 +216,13 @@ protected:
 
     auto pauseStateTransition(const std::string& progress, MovePrimaryDonorStateEnum state) {
         return pauseStateTransitionImpl(
-            progress, state, "pauseDuringMovePrimaryDonorStateEnumTransition");
+            progress, state, "pauseDuringMovePrimaryDonorStateTransition");
     }
 
     auto pauseStateTransitionAlternate(const std::string& progress,
                                        MovePrimaryDonorStateEnum state) {
         return pauseStateTransitionImpl(
-            progress, state, "pauseDuringMovePrimaryDonorStateEnumTransitionAlternate");
+            progress, state, "pauseDuringMovePrimaryDonorStateTransitionAlternate");
     }
 
     auto failCrudOpsOn(NamespaceString nss, ErrorCodes::Error code) {
@@ -233,7 +233,7 @@ protected:
                         fromjson(fmt::format("{{failCommands:['insert', 'update', 'delete'], "
                                              "namespace: '{}', failLocalClients: true, "
                                              "failInternalCommands: true, errorCode: {}}}",
-                                             nss.toString(),
+                                             nss.toString_forTest(),
                                              code)));
         return std::tuple{fp, count};
     }

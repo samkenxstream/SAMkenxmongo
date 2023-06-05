@@ -24,7 +24,7 @@ class ShardedClusterFixture(interface.Fixture):
                  preserve_dbpath=False, num_shards=1, num_rs_nodes_per_shard=1, num_mongos=1,
                  enable_sharding=None, enable_balancer=True, auth_options=None,
                  configsvr_options=None, shard_options=None, cluster_logging_prefix=None,
-                 catalog_shard=None):
+                 config_shard=None):
         """Initialize ShardedClusterFixture with different options for the cluster processes."""
 
         interface.Fixture.__init__(self, logger, job_num, fixturelib, dbpath_prefix=dbpath_prefix)
@@ -42,7 +42,7 @@ class ShardedClusterFixture(interface.Fixture):
             mongod_options.get("set_parameters", {})).copy()
         self.mongod_options["set_parameters"]["migrationLockAcquisitionMaxWaitMS"] = \
                 self.mongod_options["set_parameters"].get("migrationLockAcquisitionMaxWaitMS", 30000)
-        self.catalog_shard = catalog_shard
+        self.config_shard = config_shard
         self.preserve_dbpath = preserve_dbpath
         self.num_shards = num_shards
         self.num_rs_nodes_per_shard = num_rs_nodes_per_shard
@@ -91,7 +91,7 @@ class ShardedClusterFixture(interface.Fixture):
 
     def setup(self):
         """Set up the sharded cluster."""
-        if self.catalog_shard is None:
+        if self.config_shard is None:
             self.configsvr.setup()
 
         # Start up each of the shards
@@ -139,11 +139,11 @@ class ShardedClusterFixture(interface.Fixture):
 
         # Turn off the balancer if it is not meant to be enabled.
         if not self.enable_balancer:
-            self.stop_balancer()
+            self.stop_balancer(join_migrations=False)
 
         # Inform mongos about each of the shards
         for idx, shard in enumerate(self.shards):
-            self._add_shard(client, shard, self.catalog_shard == idx)
+            self._add_shard(client, shard, self.config_shard == idx)
 
         # Ensure that all CSRS nodes are up to date. This is strictly needed for tests that use
         # multiple mongoses. In those cases, the first mongos initializes the contents of the config
@@ -192,13 +192,18 @@ class ShardedClusterFixture(interface.Fixture):
                                 .format(port, interface.Fixture.AWAIT_READY_TIMEOUT_SECS))
                         time.sleep(0.1)
 
-    def stop_balancer(self, timeout_ms=60000):
+    # TODO SERVER-76343 remove the join_migrations parameter and the if clause depending on it.
+    def stop_balancer(self, timeout_ms=300000, join_migrations=True):
         """Stop the balancer."""
         client = interface.build_client(self, self.auth_options)
         client.admin.command({"balancerStop": 1}, maxTimeMS=timeout_ms)
+        if join_migrations:
+            for shard in self.shards:
+                shard_client = interface.build_client(shard.get_primary(), self.auth_options)
+                shard_client.admin.command({"_shardsvrJoinMigrations": 1})
         self.logger.info("Stopped the balancer")
 
-    def start_balancer(self, timeout_ms=60000):
+    def start_balancer(self, timeout_ms=300000):
         """Start the balancer."""
         client = interface.build_client(self, self.auth_options)
         client.admin.command({"balancerStart": 1}, maxTimeMS=timeout_ms)
@@ -329,8 +334,8 @@ class ShardedClusterFixture(interface.Fixture):
         auth_options = shard_options.pop("auth_options", self.auth_options)
         preserve_dbpath = shard_options.pop("preserve_dbpath", self.preserve_dbpath)
 
-        replset_config_options = self.fixturelib.make_historic(
-            shard_options.pop("replset_config_options", {}))
+        replset_config_options = shard_options.pop("replset_config_options", {})
+        replset_config_options = replset_config_options.copy()
         replset_config_options["configsvr"] = False
 
         mongod_options = self.mongod_options.copy()
@@ -340,16 +345,25 @@ class ShardedClusterFixture(interface.Fixture):
         mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "shard{}".format(index))
         mongod_options["replSet"] = self._SHARD_REPLSET_NAME_PREFIX + str(index)
 
-        if self.catalog_shard == index:
+        if self.config_shard == index:
             del mongod_options["shardsvr"]
             mongod_options["configsvr"] = ""
             replset_config_options["configsvr"] = True
             mongod_options["set_parameters"]["featureFlagCatalogShard"] = "true"
             mongod_options["set_parameters"]["featureFlagTransitionToCatalogShard"] = "true"
+            mongod_options["storageEngine"] = "wiredTiger"
 
             configsvr_options = self.configsvr_options.copy()
+
+            if "mongod_options" in configsvr_options:
+                mongod_options = self.fixturelib.merge_mongo_option_dicts(
+                    mongod_options, configsvr_options["mongod_options"])
+            if "replset_config_options" in configsvr_options:
+                replset_config_options = self.fixturelib.merge_mongo_option_dicts(
+                    replset_config_options, configsvr_options["replset_config_options"])
+
             for option, value in configsvr_options.items():
-                if option == "num_nodes":
+                if option in ("num_nodes", "mongod_options", "replset_config_options"):
                     continue
                 if option in shard_options:
                     if shard_options[option] != value:
@@ -363,8 +377,8 @@ class ShardedClusterFixture(interface.Fixture):
         return {
             "mongod_options": mongod_options, "mongod_executable": self.mongod_executable,
             "auth_options": auth_options, "preserve_dbpath": preserve_dbpath,
-            "replset_config_options": replset_config_options,
-            "shard_logging_prefix": shard_logging_prefix, **shard_options
+            "replset_config_options": replset_config_options, "shard_logging_prefix":
+                shard_logging_prefix, "config_shard": self.config_shard, **shard_options
         }
 
     def install_rs_shard(self, rs_shard):
@@ -390,7 +404,7 @@ class ShardedClusterFixture(interface.Fixture):
         """Install a mongos. Called by a builder."""
         self.mongos.append(mongos)
 
-    def _add_shard(self, client, shard, is_catalog_shard):
+    def _add_shard(self, client, shard, is_config_shard):
         """
         Add the specified program as a shard by executing the addShard command.
 
@@ -398,9 +412,9 @@ class ShardedClusterFixture(interface.Fixture):
         """
 
         connection_string = shard.get_internal_connection_string()
-        if is_catalog_shard:
-            self.logger.info("Adding %s as catalog shard...", connection_string)
-            client.admin.command({"transitionToCatalogShard": 1})
+        if is_config_shard:
+            self.logger.info("Adding %s as config shard...", connection_string)
+            client.admin.command({"transitionFromDedicatedConfigServer": 1})
         else:
             self.logger.info("Adding %s as a shard...", connection_string)
             client.admin.command({"addShard": connection_string})

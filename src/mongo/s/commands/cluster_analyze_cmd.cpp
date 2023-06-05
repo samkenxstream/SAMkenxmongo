@@ -72,9 +72,8 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(6765500,
                     "Analyze command requires common query framework feature flag to be enabled",
-                    serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-                        feature_flags::gFeatureFlagCommonQueryFramework.isEnabled(
-                            serverGlobalParams.featureCompatibility));
+                    feature_flags::gFeatureFlagCommonQueryFramework.isEnabled(
+                        serverGlobalParams.featureCompatibility));
 
             const NamespaceString& nss = ns();
 
@@ -91,8 +90,10 @@ public:
                     CommandHelpers::filterCommandRequestForPassthrough(unparsedRequest().body)),
                 ReadPreferenceSetting::get(opCtx),
                 Shard::RetryPolicy::kIdempotent,
-                BSONObj() /* query */,
-                BSONObj() /* collation */);
+                BSONObj() /*query*/,
+                BSONObj() /*collation*/,
+                boost::none /*letParameters*/,
+                boost::none /*runtimeConstants*/);
 
             for (const auto& shardResult : shardResponses) {
                 const auto& shardResponse = uassertStatusOK(std::move(shardResult.swResponse));
@@ -109,7 +110,8 @@ public:
             const NamespaceString& ns = request().getNamespace();
 
             uassert(ErrorCodes::Unauthorized,
-                    str::stream() << "Not authorized to call analyze on collection " << ns,
+                    str::stream() << "Not authorized to call analyze on collection "
+                                  << ns.toStringForErrorMsg(),
                     authzSession->isAuthorizedForActionsOnNamespace(ns, ActionType::analyze));
         }
     };

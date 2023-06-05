@@ -111,7 +111,10 @@ public:
                    ExplainOptions::Verbosity verbosity,
                    rpc::ReplyBuilderInterface* result) const override {
         const BSONObj& cmdObj = opMsgRequest.body;
-        const NamespaceString nss(parseNs(opMsgRequest.getDatabase(), cmdObj));
+        const NamespaceString nss(
+            parseNs(DatabaseNameUtil::deserialize(opMsgRequest.getValidatedTenantId(),
+                                                  opMsgRequest.getDatabase()),
+                    cmdObj));
 
         auto parsedDistinctCmd =
             ParsedDistinct::parse(opCtx, nss, cmdObj, ExtensionsCallbackNoop(), true);
@@ -146,7 +149,9 @@ public:
                                                            ReadPreferenceSetting::get(opCtx),
                                                            Shard::RetryPolicy::kIdempotent,
                                                            targetingQuery,
-                                                           targetingCollation);
+                                                           targetingCollation,
+                                                           boost::none /*letParameters*/,
+                                                           boost::none /*runtimeConstants*/);
         } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
             auto parsedDistinct = ParsedDistinct::parse(
                 opCtx, ex->getNamespace(), cmdObj, ExtensionsCallbackNoop(), true);
@@ -234,6 +239,8 @@ public:
                 Shard::RetryPolicy::kIdempotent,
                 query,
                 collation,
+                boost::none /*letParameters*/,
+                boost::none /*runtimeConstants*/,
                 true /* eligibleForSampling */);
         } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
             auto parsedDistinct = ParsedDistinct::parse(

@@ -28,6 +28,7 @@
  */
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/explain_gen.h"
 #include "mongo/db/internal_transactions_feature_flag_gen.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/pipeline/document_source_limit.h"
@@ -35,9 +36,11 @@
 #include "mongo/db/pipeline/document_source_project.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/timeseries/timeseries_options.h"
 #include "mongo/db/update/update_util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/is_mongos.h"
 #include "mongo/s/multi_statement_transaction_requests_sender.h"
@@ -53,6 +56,7 @@
 namespace mongo {
 namespace {
 
+MONGO_FAIL_POINT_DEFINE(hangBeforeMetadataRefreshClusterQuery);
 constexpr auto kIdFieldName = "_id"_sd;
 
 struct ParsedCommandInfo {
@@ -62,6 +66,7 @@ struct ParsedCommandInfo {
     bool upsert = false;
     int stmtId = kUninitializedStmtId;
     boost::optional<UpdateRequest> updateRequest;
+    boost::optional<BSONObj> hint;
 };
 
 struct AsyncRequestSenderResponseData {
@@ -72,14 +77,26 @@ struct AsyncRequestSenderResponseData {
         : shardId(shardId), cursorResponse(std::move(cursorResponse)) {}
 };
 
+// Computes the final sort pattern if necessary metadata is needed.
+BSONObj parseSortPattern(OperationContext* opCtx,
+                         NamespaceString nss,
+                         const ParsedCommandInfo& parsedInfo) {
+    std::unique_ptr<CollatorInterface> collator;
+    if (!parsedInfo.collation.isEmpty()) {
+        collator = uassertStatusOK(CollatorFactoryInterface::get(opCtx->getServiceContext())
+                                       ->makeFromBSON(parsedInfo.collation));
+    }
+    auto expCtx = make_intrusive<ExpressionContext>(opCtx, std::move(collator), nss);
+    auto sortPattern = SortPattern(parsedInfo.sort.value_or(BSONObj()), expCtx);
+    return sortPattern.serialize(SortPattern::SortKeySerialization::kForSortKeyMerging).toBson();
+}
+
 std::set<ShardId> getShardsToTarget(OperationContext* opCtx,
                                     const ChunkManager& cm,
                                     NamespaceString nss,
                                     const ParsedCommandInfo& parsedInfo) {
     std::set<ShardId> allShardsContainingChunksForNs;
-    uassert(ErrorCodes::InvalidOptions,
-            "_clusterQueryWithoutShardKey can only be run against sharded collections",
-            cm.isSharded());
+    uassert(ErrorCodes::NamespaceNotSharded, "The collection was dropped.", cm.isSharded());
 
     auto query = parsedInfo.query;
     auto collation = parsedInfo.collation;
@@ -99,9 +116,43 @@ std::set<ShardId> getShardsToTarget(OperationContext* opCtx,
     return allShardsContainingChunksForNs;
 }
 
-BSONObj createAggregateCmdObj(OperationContext* opCtx,
-                              const ParsedCommandInfo& parsedInfo,
-                              NamespaceString nss) {
+// TODO: SERVER-75760 Remove this validation since mongos should be doing this upfront.
+void validateFindAndModifyCommand(const write_ops::FindAndModifyCommandRequest& request) {
+    uassert(ErrorCodes::FailedToParse,
+            "Either an update or remove=true must be specified",
+            request.getRemove().value_or(false) || request.getUpdate());
+    if (request.getRemove().value_or(false)) {
+        uassert(ErrorCodes::FailedToParse,
+                "Cannot specify both an 'update' and 'remove'=true",
+                !request.getUpdate());
+
+        uassert(ErrorCodes::FailedToParse,
+                "Cannot specify both 'upsert'=true and 'remove'=true ",
+                !request.getUpsert() || !*request.getUpsert());
+
+        uassert(
+            ErrorCodes::FailedToParse,
+            "Cannot specify both 'new'=true and 'remove'=true; 'remove' always returns the deleted "
+            "document",
+            !request.getNew() || !*request.getNew());
+
+        uassert(ErrorCodes::FailedToParse,
+                "Cannot specify 'arrayFilters' and 'remove'=true",
+                !request.getArrayFilters());
+    }
+
+    if (request.getUpdate() &&
+        request.getUpdate()->type() == write_ops::UpdateModification::Type::kPipeline &&
+        request.getArrayFilters()) {
+        uasserted(ErrorCodes::FailedToParse, "Cannot specify 'arrayFilters' and a pipeline update");
+    }
+}
+
+BSONObj createAggregateCmdObj(
+    OperationContext* opCtx,
+    const ParsedCommandInfo& parsedInfo,
+    NamespaceString nss,
+    const boost::optional<TypeCollectionTimeseriesFields>& timeseriesFields) {
     AggregateCommandRequest aggregate(nss);
 
     aggregate.setCollation(parsedInfo.collation);
@@ -116,8 +167,20 @@ BSONObj createAggregateCmdObj(OperationContext* opCtx,
         aggregate.setStmtId(parsedInfo.stmtId);
     }
 
+    if (parsedInfo.hint) {
+        aggregate.setHint(parsedInfo.hint);
+    }
+
     aggregate.setPipeline([&]() {
-        std::vector<BSONObj> pipeline = {BSON(DocumentSourceMatch::kStageName << parsedInfo.query)};
+        std::vector<BSONObj> pipeline;
+        if (timeseriesFields) {
+            // We cannot aggregate on the buckets namespace with a query on the timeseries view, so
+            // we must generate a bucket unpack stage to correctly aggregate on the time-series
+            // collection.
+            pipeline.emplace_back(
+                timeseries::generateViewPipeline(timeseriesFields->getTimeseriesOptions(), false));
+        }
+        pipeline.emplace_back(BSON(DocumentSourceMatch::kStageName << parsedInfo.query));
         if (parsedInfo.sort) {
             pipeline.emplace_back(BSON(DocumentSourceSort::kStageName << *parsedInfo.sort));
         }
@@ -129,14 +192,14 @@ BSONObj createAggregateCmdObj(OperationContext* opCtx,
     return aggregate.toBSON({});
 }
 
-ParsedCommandInfo parseWriteCommand(OperationContext* opCtx,
-                                    StringData commandName,
-                                    const BSONObj& writeCmdObj) {
+ParsedCommandInfo parseWriteCommand(OperationContext* opCtx, const BSONObj& writeCmdObj) {
+    auto commandName = writeCmdObj.firstElementFieldNameStringData();
     ParsedCommandInfo parsedInfo;
     if (commandName == write_ops::UpdateCommandRequest::kCommandName) {
         auto updateRequest = write_ops::UpdateCommandRequest::parse(
             IDLParserContext("_clusterQueryWithoutShardKeyForUpdate"), writeCmdObj);
         parsedInfo.query = updateRequest.getUpdates().front().getQ();
+        parsedInfo.hint = updateRequest.getUpdates().front().getHint();
 
         // In the batch write path, when the request is reconstructed to be passed to
         // the two phase write protocol, only the stmtIds field is used.
@@ -155,6 +218,7 @@ ParsedCommandInfo parseWriteCommand(OperationContext* opCtx,
         auto deleteRequest = write_ops::DeleteCommandRequest::parse(
             IDLParserContext("_clusterQueryWithoutShardKeyForDelete"), writeCmdObj);
         parsedInfo.query = deleteRequest.getDeletes().front().getQ();
+        parsedInfo.hint = deleteRequest.getDeletes().front().getHint();
 
         // In the batch write path, when the request is reconstructed to be passed to
         // the two phase write protocol, only the stmtIds field is used.
@@ -169,9 +233,15 @@ ParsedCommandInfo parseWriteCommand(OperationContext* opCtx,
                commandName == write_ops::FindAndModifyCommandRequest::kCommandAlias) {
         auto findAndModifyRequest = write_ops::FindAndModifyCommandRequest::parse(
             IDLParserContext("_clusterQueryWithoutShardKeyFindAndModify"), writeCmdObj);
+        validateFindAndModifyCommand(findAndModifyRequest);
+
         parsedInfo.query = findAndModifyRequest.getQuery();
         parsedInfo.stmtId = findAndModifyRequest.getStmtId().value_or(kUninitializedStmtId);
-        parsedInfo.sort = findAndModifyRequest.getSort();
+        parsedInfo.hint = findAndModifyRequest.getHint();
+        parsedInfo.sort =
+            findAndModifyRequest.getSort() && !findAndModifyRequest.getSort()->isEmpty()
+            ? findAndModifyRequest.getSort()
+            : boost::none;
 
         if ((parsedInfo.upsert = findAndModifyRequest.getUpsert().get_value_or(false))) {
             parsedInfo.updateRequest = UpdateRequest{};
@@ -184,7 +254,8 @@ ParsedCommandInfo parseWriteCommand(OperationContext* opCtx,
             parsedInfo.collation = *parsedCollation;
         }
     } else {
-        uasserted(ErrorCodes::InvalidOptions, "Not a supported write command");
+        uasserted(ErrorCodes::InvalidOptions,
+                  str::stream() << commandName << " is not a supported batch write command");
     }
     return parsedInfo;
 }
@@ -207,24 +278,39 @@ public:
                   "Running read phase for a write without a shard key.",
                   "clientWriteRequest"_attr = request().getWriteCmd());
 
+            const auto writeCmdObj = request().getWriteCmd();
+
             // Get all shard ids for shards that have chunks in the desired namespace.
-            const NamespaceString nss(
-                CommandHelpers::parseNsCollectionRequired(ns().dbName(), request().getWriteCmd()));
+            const NamespaceString nss =
+                CommandHelpers::parseNsCollectionRequired(ns().dbName(), writeCmdObj);
+
+            hangBeforeMetadataRefreshClusterQuery.pauseWhileSet(opCtx);
             const auto cri = uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, nss));
 
             // Parse into OpMsgRequest to append the $db field, which is required for command
             // parsing.
-            const auto opMsgRequest =
-                OpMsgRequest::fromDBAndBody(nss.db(), request().getWriteCmd());
-
-            auto parsedInfoFromRequest =
-                parseWriteCommand(opCtx,
-                                  request().getWriteCmd().firstElementFieldNameStringData(),
-                                  opMsgRequest.body);
+            const auto opMsgRequest = OpMsgRequest::fromDBAndBody(ns().db(), writeCmdObj);
+            auto parsedInfoFromRequest = parseWriteCommand(opCtx, opMsgRequest.body);
 
             auto allShardsContainingChunksForNs =
                 getShardsToTarget(opCtx, cri.cm, nss, parsedInfoFromRequest);
-            auto cmdObj = createAggregateCmdObj(opCtx, parsedInfoFromRequest, nss);
+
+            // If the request omits the collation use the collection default collation. If
+            // the collection just has the simple collation, we can leave the collation as
+            // an empty BSONObj.
+            if (parsedInfoFromRequest.collation.isEmpty()) {
+                if (cri.cm.getDefaultCollator()) {
+                    parsedInfoFromRequest.collation =
+                        cri.cm.getDefaultCollator()->getSpec().toBSON();
+                }
+            }
+
+            const auto& timeseriesFields =
+                (cri.cm.isSharded() && cri.cm.getTimeseriesFields().has_value())
+                ? cri.cm.getTimeseriesFields()
+                : boost::none;
+            auto cmdObj =
+                createAggregateCmdObj(opCtx, parsedInfoFromRequest, nss, timeseriesFields);
 
             std::vector<AsyncRequestsSender::Request> requests;
             for (const auto& shardId : allShardsContainingChunksForNs) {
@@ -288,7 +374,12 @@ public:
             // Return a target document. If a sort order is specified, return the first target
             // document corresponding to the sort order for a particular sort key.
             AsyncResultsMergerParams params(std::move(remoteCursors), nss);
-            params.setSort(parsedInfoFromRequest.sort);
+            if (auto sortPattern = parseSortPattern(opCtx, nss, parsedInfoFromRequest);
+                !sortPattern.isEmpty()) {
+                params.setSort(sortPattern);
+            } else {
+                params.setSort(boost::none);
+            }
 
             std::unique_ptr<RouterExecStage> root = std::make_unique<RouterStageMerge>(
                 opCtx,
@@ -297,7 +388,7 @@ public:
 
             if (parsedInfoFromRequest.sort) {
                 root = std::make_unique<RouterStageRemoveMetadataFields>(
-                    opCtx, std::move(root), StringDataSet{AsyncResultsMerger::kSortKeyField});
+                    opCtx, std::move(root), Document::allMetadataFieldNames);
             }
 
             if (auto nextResponse = uassertStatusOK(root->next()); !nextResponse.isEOF()) {
@@ -317,6 +408,74 @@ public:
         }
 
     private:
+        void explain(OperationContext* opCtx,
+                     ExplainOptions::Verbosity verbosity,
+                     rpc::ReplyBuilderInterface* result) override {
+            const auto writeCmdObj = [&] {
+                const auto explainCmdObj = request().getWriteCmd();
+                const auto opMsgRequestExplainCmd =
+                    OpMsgRequest::fromDBAndBody(ns().db(), explainCmdObj);
+                auto explainRequest = ExplainCommandRequest::parse(
+                    IDLParserContext("_clusterQueryWithoutShardKeyExplain"),
+                    opMsgRequestExplainCmd.body);
+                return explainRequest.getCommandParameter().getOwned();
+            }();
+
+            // Get all shard ids for shards that have chunks in the desired namespace.
+            const NamespaceString nss =
+                CommandHelpers::parseNsCollectionRequired(ns().dbName(), writeCmdObj);
+            const auto cri = uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, nss));
+
+            // Parse into OpMsgRequest to append the $db field, which is required for command
+            // parsing.
+            const auto opMsgRequestWriteCmd = OpMsgRequest::fromDBAndBody(ns().db(), writeCmdObj);
+            auto parsedInfoFromRequest = parseWriteCommand(opCtx, opMsgRequestWriteCmd.body);
+
+            auto allShardsContainingChunksForNs =
+                getShardsToTarget(opCtx, cri.cm, nss, parsedInfoFromRequest);
+            auto cmdObj = createAggregateCmdObj(opCtx, parsedInfoFromRequest, nss, boost::none);
+
+            const auto aggExplainCmdObj = ClusterExplain::wrapAsExplain(cmdObj, verbosity);
+
+            std::vector<AsyncRequestsSender::Request> requests;
+            for (const auto& shardId : allShardsContainingChunksForNs) {
+                requests.emplace_back(
+                    shardId, appendShardVersion(aggExplainCmdObj, cri.getShardVersion(shardId)));
+            }
+
+            Timer timer;
+            MultiStatementTransactionRequestsSender ars(
+                opCtx,
+                Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
+                request().getDbName(),
+                requests,
+                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                Shard::RetryPolicy::kNoRetry);
+
+            ShardId shardId;
+            std::vector<AsyncRequestsSender::Response> responses;
+
+            while (!ars.done()) {
+                auto response = ars.next();
+                uassertStatusOK(response.swResponse);
+                responses.push_back(response);
+                shardId = response.shardId;
+            }
+
+            const auto millisElapsed = timer.millis();
+
+            auto bodyBuilder = result->getBodyBuilder();
+            uassertStatusOK(ClusterExplain::buildExplainResult(
+                opCtx,
+                responses,
+                parsedInfoFromRequest.sort ? ClusterExplain::kMergeSortFromShards
+                                           : ClusterExplain::kMergeFromShards,
+                millisElapsed,
+                writeCmdObj,
+                &bodyBuilder));
+            bodyBuilder.append("targetShardId", shardId);
+        }
+
         NamespaceString ns() const override {
             return NamespaceString(request().getDbName());
         }

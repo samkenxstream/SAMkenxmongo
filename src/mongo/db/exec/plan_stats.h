@@ -1170,7 +1170,7 @@ struct TimeseriesModifyStats final : public SpecificStats {
     }
 
     uint64_t estimateObjectSizeInBytes() const {
-        return sizeof(*this);
+        return objInserted.objsize() + sizeof(*this);
     }
 
     void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
@@ -1185,7 +1185,17 @@ struct TimeseriesModifyStats final : public SpecificStats {
     BSONObj bucketFilter;
     BSONObj residualFilter;
     size_t nBucketsUnpacked = 0u;
-    size_t nMeasurementsDeleted = 0u;
+    size_t nMeasurementsMatched = 0u;
+    size_t nMeasurementsModified = 0u;
+
+    // Will be 1 if this is an {upsert: true} update that did an insert, 0 otherwise.
+    size_t nMeasurementsUpserted = 0u;
+
+    // The object that was inserted. This is an empty document if no insert was performed.
+    BSONObj objInserted;
+
+    // True iff this is a $mod update.
+    bool isModUpdate;
 };
 
 struct SampleFromTimeseriesBucketStats final : public SpecificStats {
@@ -1227,9 +1237,22 @@ struct SpoolStats : public SpecificStats {
         visitor->visit(this);
     }
 
+    // The maximum number of bytes of memory we're willing to use during execution of the spool. If
+    // this limit is exceeded and 'allowDiskUse' is false, the query will fail at execution time. If
+    // 'allowDiskUse' is true, the data will be spilled to disk.
+    uint64_t maxMemoryUsageBytes = 0u;
+
+    // The maximum number of bytes of disk space we're willing to use during execution of the spool,
+    // if 'allowDiskUse' is true.
+    uint64_t maxDiskUsageBytes = 0u;
+
     // The amount of data we've spooled in bytes.
     uint64_t totalDataSizeBytes = 0u;
 
-    // TODO SERVER-74437 add more stats for spilling metrics
+    // The number of times that we spilled data to disk during the execution of this query.
+    uint64_t spills = 0u;
+
+    // The maximum size of the spill file written to disk, or 0 if no spilling occurred.
+    uint64_t spilledDataStorageSize = 0u;
 };
 }  // namespace mongo

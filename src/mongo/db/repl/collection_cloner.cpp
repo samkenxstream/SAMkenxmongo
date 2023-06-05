@@ -131,7 +131,7 @@ void CollectionCloner::preStage() {
     _stats.start = getSharedData()->getClock()->now();
 
     BSONObjBuilder b(BSON("collStats" << _sourceNss.coll().toString()));
-    if (gMultitenancySupport && serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+    if (gMultitenancySupport &&
         gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility) &&
         _sourceNss.tenantId()) {
         _sourceNss.tenantId()->serializeToBSON("$tenant", &b);
@@ -411,12 +411,15 @@ void CollectionCloner::handleNextBatch(DBClientCursor& cursor) {
     }
 
     // Schedule the next document batch insertion.
-    auto&& scheduleResult = _scheduleDbWorkFn(
-        [=](const executor::TaskExecutor::CallbackArgs& cbd) { insertDocumentsCallback(cbd); });
+    auto&& scheduleResult =
+        _scheduleDbWorkFn([=, this](const executor::TaskExecutor::CallbackArgs& cbd) {
+            insertDocumentsCallback(cbd);
+        });
 
     if (!scheduleResult.isOK()) {
         Status newStatus = scheduleResult.getStatus().withContext(
-            str::stream() << "Error cloning collection '" << _sourceNss.ns() << "'");
+            str::stream() << "Error cloning collection '" << _sourceNss.toStringForErrorMsg()
+                          << "'");
         // We must throw an exception to terminate query.
         uassertStatusOK(newStatus);
     }
@@ -439,9 +442,9 @@ void CollectionCloner::handleNextBatch(DBClientCursor& cursor) {
             }
         },
         [&](const BSONObj& data) {
+            const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "nss"_sd);
             // Only hang when cloning the specified collection, or if no collection was specified.
-            auto nss = data["nss"].str();
-            return nss.empty() || nss == _sourceNss.toString();
+            return fpNss.isEmpty() || fpNss == _sourceNss;
         });
 }
 
@@ -482,14 +485,14 @@ void CollectionCloner::insertDocumentsCallback(const executor::TaskExecutor::Cal
             }
         },
         [&](const BSONObj& data) {
-            return data["namespace"].String() == _sourceNss.ns() &&
+            return NamespaceStringUtil::parseFailPointData(data, "namespace") == _sourceNss &&
                 static_cast<int>(_stats.documentsCopied) >= data["numDocsToClone"].numberInt();
         });
 }
 
 bool CollectionCloner::isMyFailPoint(const BSONObj& data) const {
-    auto nss = data["nss"].str();
-    return (nss.empty() || nss == _sourceNss.toString()) && BaseCloner::isMyFailPoint(data);
+    const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "nss"_sd);
+    return (fpNss.isEmpty() || fpNss == _sourceNss) && BaseCloner::isMyFailPoint(data);
 }
 
 void CollectionCloner::waitForDatabaseWorkToComplete() {

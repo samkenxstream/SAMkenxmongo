@@ -104,8 +104,7 @@ Status GeoExpression::parseQuery(const BSONObj& obj) {
     return Status::OK();
 }
 
-BSONObj redactGeoExpression(const BSONObj& obj,
-                            boost::optional<StringData> literalArgsReplacement) {
+BSONObj customSerialization(const BSONObj& obj, SerializationOptions opts) {
 
     // Ideally each sub operator ($minDistance, $maxDistance, $geometry, $box) would serialize
     // itself, rather than GeoExpression reparse the query during serialization. However GeoMatch
@@ -127,8 +126,7 @@ BSONObj redactGeoExpression(const BSONObj& obj,
             // Alternatively, a legacy query can have a $maxDistance suboperator to make it more
             // explicit. None of these values are enums so it is fine to treat them as literals
             // during redaction.
-            outerElem = it.next();
-            bob.append(outerElem.fieldNameStringData(), *literalArgsReplacement);
+            opts.appendLiteral(&bob, it.next());
         }
         return bob.obj();
     }
@@ -141,18 +139,68 @@ BSONObj redactGeoExpression(const BSONObj& obj,
         while (embedded_it.more()) {
             BSONElement argElem = embedded_it.next();
             fieldName = argElem.fieldNameStringData();
-            if (fieldName == "$geometry") {
-                BSONObjBuilder nestedSubObj = BSONObjBuilder(subObj.subobjStart(fieldName));
-                BSONElement typeElt = argElem.Obj().getField("type");
-                if (!typeElt.eoo()) {
-                    nestedSubObj.append(typeElt);
+            if (fieldName == "$geometry"_sd) {
+                if (argElem.type() == BSONType::Array) {
+                    // This would be like {$geometry: [0, 0]} which must be a point.
+                    auto asArray = argElem.Array();
+                    tassert(7539807,
+                            "Expected the point to have exactly 2 elements: an x and y.",
+                            asArray.size() == 2UL);
+                    subObj.appendArray(fieldName,
+                                       BSON_ARRAY(opts.serializeLiteral(asArray[0])
+                                                  << opts.serializeLiteral(asArray[1])));
+                } else {
+                    BSONObjBuilder nestedSubObj = BSONObjBuilder(subObj.subobjStart(fieldName));
+                    auto geometryObj = argElem.Obj();
+                    if (auto typeElt = geometryObj["type"]) {
+                        nestedSubObj.append(typeElt);
+                    }
+                    if (auto coordinatesElem = geometryObj["coordinates"]) {
+                        opts.appendLiteral(&nestedSubObj, coordinatesElem);
+                    }
+                    // 'crs' can be present if users want to use STRICT_SPHERE coordinate system.
+                    if (auto crsElt = geometryObj["crs"]) {
+                        // 'crs' is always an object.
+                        tassert(7559700,
+                                "Expected 'crs' to be an object",
+                                geometryObj["crs"].type() == BSONType::Object);
+                        // 'crs' is required to have a 'type' field with the value 'name'.
+                        // Additionally, it is required to have an object properties field with a
+                        // single 'name' field.
+                        auto crsObjOrig = geometryObj["crs"];
+                        tassert(
+                            7559701,
+                            str::stream() << "Expected 'crs' to contain a string 'type' field, got "
+                                          << crsObjOrig,
+                            crsObjOrig["type"] && crsObjOrig["type"].type() == BSONType::String);
+                        tassert(7559702,
+                                str::stream()
+                                    << "Expected 'crs' to contain a 'properties' object, got , "
+                                    << crsObjOrig,
+                                crsObjOrig["properties"] &&
+                                    crsObjOrig["properties"].type() == BSONType::Object);
+                        tassert(7559703,
+                                str::stream() << "Expected 'crs.properties' to contain a 'name' "
+                                                 "string field, got "
+                                              << crsObjOrig["properties"],
+                                crsObjOrig["properties"].Obj()["name"] &&
+                                    crsObjOrig["properties"].Obj()["name"].type() ==
+                                        BSONType::String);
+                        BSONObjBuilder crsObjBuilder;
+                        opts.appendLiteral(&crsObjBuilder, "type", crsObjOrig["type"].String());
+                        BSONObjBuilder crsPropBuilder;
+                        opts.appendLiteral(&crsPropBuilder,
+                                           "name",
+                                           crsObjOrig["properties"].Obj()["name"].String());
+                        crsObjBuilder.append("properties", crsPropBuilder.obj());
+                        nestedSubObj.append("crs", crsObjBuilder.obj());
+                    }
+                    nestedSubObj.doneFast();
                 }
-                nestedSubObj.append("coordinates", *literalArgsReplacement);
-                nestedSubObj.doneFast();
             }
-            if (fieldName == "$maxDistance" || fieldName == "$box" || fieldName == "$nearSphere" ||
-                fieldName == "$minDistance") {
-                subObj.append(fieldName, *literalArgsReplacement);
+            if (fieldName == "$maxDistance"_sd || fieldName == "$box"_sd ||
+                fieldName == "$nearSphere"_sd || fieldName == "$minDistance"_sd) {
+                opts.appendLiteral(&subObj, argElem);
             }
         }
         subObj.doneFast();
@@ -466,7 +514,7 @@ bool GeoMatchExpression::contains(const GeometryContainer& queryGeom,
     if (GeoExpression::WITHIN == queryPredicate) {
         return queryGeom.contains(*geometry);
     } else {
-        verify(GeoExpression::INTERSECT == queryPredicate);
+        MONGO_verify(GeoExpression::INTERSECT == queryPredicate);
         return queryGeom.intersects(*geometry);
     }
 }
@@ -499,8 +547,8 @@ void GeoMatchExpression::debugString(StringBuilder& debug, int indentationLevel)
 }
 
 BSONObj GeoMatchExpression::getSerializedRightHandSide(SerializationOptions opts) const {
-    if (opts.replacementForLiteralArgs) {
-        return redactGeoExpression(_rawObj, opts.replacementForLiteralArgs);
+    if (opts.literalPolicy != LiteralSerializationPolicy::kUnchanged) {
+        return customSerialization(_rawObj, opts);
     }
     BSONObjBuilder subobj;
     subobj.appendElements(_rawObj);
@@ -555,8 +603,8 @@ void GeoNearMatchExpression::debugString(StringBuilder& debug, int indentationLe
 }
 
 BSONObj GeoNearMatchExpression::getSerializedRightHandSide(SerializationOptions opts) const {
-    if (opts.replacementForLiteralArgs) {
-        return redactGeoExpression(_rawObj, opts.replacementForLiteralArgs);
+    if (opts.literalPolicy != LiteralSerializationPolicy::kUnchanged) {
+        return customSerialization(_rawObj, opts);
     }
     BSONObjBuilder objBuilder;
     objBuilder.appendElements(_rawObj);

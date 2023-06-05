@@ -20,10 +20,11 @@ load('jstests/concurrency/fsm_workload_helpers/balancer.js');
 
 var $config = extendWorkload($config, function($config, $super) {
     $config.threadCount = 10;
-    $config.iterations = 10;
+    $config.iterations = 50;
     $config.startState = "init";  // Inherited from random_moveChunk_base.js.
-    $config.data.partitionSize = 100;
+    $config.data.partitionSize = 50;
     $config.data.secondaryDocField = 'y';
+    $config.data.tertiaryDocField = 'tertiaryField';
     $config.data.runningWithStepdowns =
         TestData.runningWithConfigStepdowns || TestData.runningWithShardStepdowns;
 
@@ -32,6 +33,13 @@ var $config = extendWorkload($config, function($config, $super) {
      */
     $config.data.generateRandomInt = function generateRandomInt(min, max) {
         return Math.floor(Math.random() * (max - min + 1)) + min;
+    };
+
+    /**
+     * Returns a random boolean.
+     */
+    $config.data.generateRandomBool = function generateRandomBool() {
+        return Math.random() > 0.5;
     };
 
     /**
@@ -67,7 +75,7 @@ var $config = extendWorkload($config, function($config, $super) {
      * mean the query could target a variable number of shards.
      */
     $config.data.generateRandomQuery = function generateRandomQuery(db, collName) {
-        const queryType = this.generateRandomInt(0, 2);
+        const queryType = this.generateRandomInt(0, 3);
         if (queryType === 0 /* Range query on shard key field. */) {
             return {
                 [this.defaultShardKeyField]:
@@ -78,6 +86,8 @@ var $config = extendWorkload($config, function($config, $super) {
                 [this.secondaryDocField]:
                     {$gte: this.partition.lower, $lte: this.partition.upper - 1}
             };
+        } else if (queryType === 2 /* Equality query on a field that does not exist */) {
+            return {[this.tertiaryDocField]: {$eq: this.generateRandomInt(0, 500)}, tid: this.tid};
         } else { /* Query any document in the partition. */
             return {tid: this.tid};
         }
@@ -93,9 +103,17 @@ var $config = extendWorkload($config, function($config, $super) {
         const newValue = this.generateRandomInt(this.partition.lower, this.partition.upper - 1);
         const updateType = this.generateRandomInt(0, 2);
         const doShardKeyUpdate = this.generateRandomInt(0, 1);
+        const doUpsert = this.generateRandomBool();
 
         // Used for validation after running the write operation.
         const containsMatchedDocs = db[collName].findOne(query) != null;
+
+        jsTestLog("updateOne state running with the following parameters: \n" +
+                  "query: " + tojson(query) + "\n" +
+                  "updateType: " + updateType + "\n" +
+                  "doShardKeyUpdate: " + doShardKeyUpdate + "\n" +
+                  "doUpsert: " + doUpsert + "\n" +
+                  "containsMatchedDocs: " + containsMatchedDocs);
 
         let res;
         try {
@@ -104,15 +122,17 @@ var $config = extendWorkload($config, function($config, $super) {
                     [doShardKeyUpdate ? this.defaultShardKeyField : this.secondaryDocField]:
                         newValue
                 };
-                res = db[collName].updateOne(query, {$set: update});
+                res = db[collName].updateOne(query, {$set: update}, {upsert: doUpsert});
             } else if (updateType === 1 /* Replacement Update */) {
                 // Always including a shard key update for replacement documents in order to keep
                 // the new document within the current thread's partition.
-                res = db[collName].replaceOne(query, {
-                    [this.defaultShardKeyField]: newValue,
-                    [this.secondaryDocField]: newValue,
-                    tid: this.tid
-                });
+                res = db[collName].replaceOne(query,
+                                              {
+                                                  [this.defaultShardKeyField]: newValue,
+                                                  [this.secondaryDocField]: newValue,
+                                                  tid: this.tid
+                                              },
+                                              {upsert: doUpsert});
             } else { /* Aggregation pipeline update */
                 const update = {
                     [doShardKeyUpdate ? this.defaultShardKeyField : this.secondaryDocField]:
@@ -121,7 +141,8 @@ var $config = extendWorkload($config, function($config, $super) {
 
                 // The $unset will result in a no-op since 'z' is not a field populated in any of
                 // the documents.
-                res = db[collName].updateOne(query, [{$set: update}, {$unset: "z"}]);
+                res = db[collName].updateOne(
+                    query, [{$set: update}, {$unset: "z"}], {upsert: doUpsert});
             }
         } catch (err) {
             if (this.shouldSkipWriteResponseValidation(err)) {
@@ -136,6 +157,14 @@ var $config = extendWorkload($config, function($config, $super) {
             assert.eq(res.matchedCount, 1, query);
         } else {
             assert.eq(res.matchedCount, 0, res);
+
+            if (doUpsert) {
+                assert.neq(res.upsertedId, null, res);
+                assert.eq(db[collName].find({"_id": res.upsertedId}).itcount(), 1);
+
+                // Clean up, remove upserted document.
+                assert.commandWorked(db[collName].deleteOne({"_id": res.upsertedId}));
+            }
         }
 
         assert.contains(res.modifiedCount, [0, 1], res);
@@ -241,34 +270,55 @@ var $config = extendWorkload($config, function($config, $super) {
         // Used for validation after running the write operation.
         const containsMatchedDocs = db[collName].findOne(query) != null;
 
+        // Only test sort when there are matching documents in the collection.
+        const doSort = containsMatchedDocs && this.generateRandomBool();
+        let sortDoc, sortVal;
+
+        // If sorting, ensure that the correct document is modified.
+        if (doSort) {
+            sortVal = {[this.secondaryDocField]: this.generateRandomInt(0, 1) === 0 ? -1 : 1};
+            sortDoc = db[collName].find(query).sort(sortVal)[0];
+        }
+
         let res;
         const findAndModifyType = this.generateRandomInt(0, 1);
         if (findAndModifyType === 0 /* Update */) {
             const newValue = this.generateRandomInt(this.partition.lower, this.partition.upper - 1);
             const updateType = this.generateRandomInt(0, 2);
             const doShardKeyUpdate = this.generateRandomInt(0, 1);
+            const doUpsert = this.generateRandomBool();
+
+            jsTestLog("findAndModifyUpdate state running with the following parameters: \n" +
+                      "query: " + tojson(query) + "\n" +
+                      "updateType: " + updateType + "\n" +
+                      "doShardKeyUpdate: " + doShardKeyUpdate + "\n" +
+                      "doUpsert: " + doUpsert + "\n" +
+                      "doSort: " + doSort + "\n" +
+                      "containsMatchedDocs: " + containsMatchedDocs);
+
+            const cmdObj = {
+                findAndModify: collName,
+                query: query,
+                upsert: doUpsert,
+            };
+            Object.assign(cmdObj, doSort && {sort: sortVal});
+
             if (updateType === 0 /* Update operator document */) {
                 const update = {
                     [doShardKeyUpdate ? this.defaultShardKeyField : this.secondaryDocField]:
                         newValue
                 };
-                res = db.runCommand({
-                    findAndModify: collName,
-                    query: query,
-                    update: {$set: update},
-                });
+                cmdObj.update = {$set: update};
+                res = db.runCommand(cmdObj);
             } else if (updateType === 1 /* Replacement Update */) {
                 // Always including a shard key update for replacement documents in order to
                 // keep the new document within the current thread's partition.
-                res = db.runCommand({
-                    findAndModify: collName,
-                    query: query,
-                    update: {
-                        [this.defaultShardKeyField]: newValue,
-                        [this.secondaryDocField]: newValue,
-                        tid: this.tid
-                    },
-                });
+                cmdObj.update = {
+                    [this.defaultShardKeyField]: newValue,
+                    [this.secondaryDocField]: newValue,
+                    tid: this.tid
+                };
+                res = db.runCommand(cmdObj);
             } else { /* Aggregation pipeline update */
                 const update = {
                     [doShardKeyUpdate ? this.defaultShardKeyField : this.secondaryDocField]:
@@ -277,11 +327,8 @@ var $config = extendWorkload($config, function($config, $super) {
 
                 // The $unset will result in a no-op since 'z' is not a field populated in any
                 // of the documents.
-                res = db.runCommand({
-                    findAndModify: collName,
-                    query: query,
-                    update: [{$set: update}, {$unset: "z"}],
-                });
+                cmdObj.update = [{$set: update}, {$unset: "z"}];
+                res = db.runCommand(cmdObj);
             }
 
             if (this.shouldSkipWriteResponseValidation(res)) {
@@ -292,18 +339,35 @@ var $config = extendWorkload($config, function($config, $super) {
             if (containsMatchedDocs) {
                 assert.eq(res.lastErrorObject.n, 1, res);
                 assert.eq(res.lastErrorObject.updatedExisting, true, res);
+            } else if (doUpsert) {
+                assert.eq(res.lastErrorObject.n, 1, res);
+                assert.eq(res.lastErrorObject.updatedExisting, false, res);
+                assert.neq(res.lastErrorObject.upserted, null, res);
+                assert.eq(db[collName].find({"_id": res.lastErrorObject.upserted}).itcount(), 1);
+
+                // Clean up, remove upserted document.
+                assert.commandWorked(db[collName].deleteOne({"_id": res.lastErrorObject.upserted}));
             } else {
                 assert.eq(res.lastErrorObject.n, 0, res);
                 assert.eq(res.lastErrorObject.updatedExisting, false, res);
             }
         } else { /* Remove */
             const numMatchedDocsBefore = db[collName].find(query).itcount();
-
-            res = assert.commandWorked(db.runCommand({
+            const cmdObj = {
                 findAndModify: collName,
                 query: query,
                 remove: true,
-            }));
+            };
+            if (doSort) {
+                cmdObj.sort = sortVal;
+            }
+
+            jsTestLog("findAndModifyDelete state running with the following parameters: \n" +
+                      "query: " + tojson(query) + "\n" +
+                      "numMatchedDocsBefore: " + numMatchedDocsBefore + "\n" +
+                      "containsMatchedDocs: " + containsMatchedDocs);
+
+            res = assert.commandWorked(db.runCommand(cmdObj));
 
             const numMatchedDocsAfter = db[collName].find(query).itcount();
 
@@ -317,11 +381,18 @@ var $config = extendWorkload($config, function($config, $super) {
                 assert.eq(numMatchedDocsAfter, numMatchedDocsBefore);
             }
         }
+
+        if (doSort) {
+            // Ensure correct document was modified by comparing sort field of the sortDoc and
+            // response image.
+            assert.eq(sortDoc.secondaryDocField, res.value.secondaryDocField, res);
+        }
     };
 
     $config.states.updateOne = function updateOne(db, collName, connCache) {
         jsTestLog("Running updateOne state");
         this.generateAndRunRandomUpdateOp(db, collName);
+        jsTestLog("Finished updateOne state");
     };
 
     $config.states.deleteOne = function deleteOne(db, collName, connCache) {
@@ -331,6 +402,10 @@ var $config = extendWorkload($config, function($config, $super) {
         // Used for validation after running the write operation.
         const containsMatchedDocs = db[collName].findOne(query) != null;
         const numMatchedDocsBefore = db[collName].find(query).itcount();
+
+        jsTestLog("deleteOne state running with query: " + tojson(query) + "\n" +
+                  "containsMatchedDocs: " + containsMatchedDocs + "\n" +
+                  "numMatchedDocsBefore: " + numMatchedDocsBefore);
 
         let res = assert.commandWorked(db[collName].deleteOne(query));
 
@@ -345,11 +420,13 @@ var $config = extendWorkload($config, function($config, $super) {
             // The count should both be 0.
             assert.eq(numMatchedDocsAfter, numMatchedDocsBefore);
         }
+        jsTestLog("Finished deleteOne state");
     };
 
     $config.states.findAndModify = function findAndModify(db, collName, connCache) {
         jsTestLog("Running findAndModify state");
         this.generateAndRunRandomFindAndModifyOp(db, collName);
+        jsTestLog("Finished findAndModify state");
     };
 
     $config.setup = function setup(db, collName, cluster) {

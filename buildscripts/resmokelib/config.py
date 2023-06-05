@@ -57,7 +57,7 @@ DEFAULTS = {
     "base_port": 20000,
     "backup_on_restart_dir": None,
     "buildlogger_url": "https://logkeeper2.build.10gen.cc",
-    "catalog_shard": None,
+    "config_shard": None,
     "continue_on_failure": False,
     "dbpath_prefix": None,
     "dbtest_executable": None,
@@ -67,6 +67,7 @@ DEFAULTS = {
     "flow_control_tickets": None,
     "force_excluded_tests": False,
     "fuzz_mongod_configs": None,
+    "fuzz_mongos_configs": None,
     "config_fuzz_seed": None,
     "genny_executable": None,
     "include_with_any_tags": None,
@@ -91,7 +92,6 @@ DEFAULTS = {
     "repeat_tests_min": None,
     "repeat_tests_secs": None,
     "replay_file": None,
-    "report_failure_status": "fail",
     "report_file": None,
     "run_all_feature_flag_tests": False,
     "run_no_feature_flag_tests": False,
@@ -104,6 +104,7 @@ DEFAULTS = {
     "shuffle": None,
     "stagger_jobs": None,
     "majority_read_concern": "on",
+    "shell_seed": None,
     "storage_engine": "wiredTiger",
     "storage_engine_cache_size_gb": None,
     "suite_files": "with_server",
@@ -170,7 +171,6 @@ _SuiteOptions = collections.namedtuple("_SuiteOptions", [
     "num_repeat_tests_max",
     "num_repeat_tests_min",
     "time_repeat_tests_secs",
-    "report_failure_status",
 ])
 
 
@@ -237,7 +237,6 @@ class SuiteOptions(_SuiteOptions):
                     REPEAT_TESTS_MAX,
                     REPEAT_TESTS_MIN,
                     REPEAT_TESTS_SECS,
-                    REPORT_FAILURE_STATUS,
                 ])))
 
         options = self._asdict()
@@ -302,8 +301,8 @@ DBTEST_EXECUTABLE = None
 # actually running them).
 DRY_RUN = None
 
-# If set, specifies which node is the catalog shard. Can also be set to 'any'.
-CATALOG_SHARD = None
+# If set, specifies which node is the config shard. Can also be set to 'any'.
+CONFIG_SHARD = None
 
 # URL to connect to the Evergreen service.
 EVERGREEN_URL = None
@@ -359,7 +358,13 @@ EXCLUDED_TAG = "__TEMPORARILY_DISABLED__"
 # If true, then a test failure or error will cause resmoke.py to exit and not run any more tests.
 FAIL_FAST = None
 
+# Defines how to fuzz mongod parameters
 FUZZ_MONGOD_CONFIGS = None
+
+# Defines how to fuzz mongos parameters
+FUZZ_MONGOS_CONFIGS = None
+
+# This seeds the random number generator used to fuzz mongod and mongos parameters
 CONFIG_FUZZ_SEED = None
 
 # Executable file for genny, passed in as a command line arg.
@@ -449,9 +454,6 @@ REPEAT_TESTS_MIN = None
 # If set, then each test is repeated the specified time (seconds) inside the suites.
 REPEAT_TESTS_SECS = None
 
-# Controls if the test failure status should be reported as failed or be silently ignored.
-REPORT_FAILURE_STATUS = None
-
 # If set, then resmoke.py will write out a report file with the status of each test that ran.
 REPORT_FILE = None
 
@@ -461,6 +463,9 @@ SERVICE_EXECUTOR = None
 # If set, resmoke will override the default fixture and connect to the fixture specified by this
 # connection string instead.
 SHELL_CONN_STRING = None
+
+# If set, resmoke will override the random seed for jstests.
+SHELL_SEED = None
 
 # If true, then the order the tests run in is randomized. Otherwise the tests will run in
 # alphabetical (case-insensitive) order.
@@ -572,12 +577,13 @@ DEFAULT_BENCHMARK_TEST_LIST = "build/benchmarks.txt"
 DEFAULT_UNIT_TEST_LIST = "build/unittests.txt"
 DEFAULT_INTEGRATION_TEST_LIST = "build/integration_tests.txt"
 DEFAULT_LIBFUZZER_TEST_LIST = "build/libfuzzer_tests.txt"
+DEFAULT_PRETTY_PRINTER_TEST_LIST = "build/pretty_printer_tests.txt"
 
 # External files or executables, used as suite selectors, that are created during the build and
 # therefore might not be available when creating a test membership map.
 EXTERNAL_SUITE_SELECTORS = (DEFAULT_BENCHMARK_TEST_LIST, DEFAULT_UNIT_TEST_LIST,
                             DEFAULT_INTEGRATION_TEST_LIST, DEFAULT_DBTEST_EXECUTABLE,
-                            DEFAULT_LIBFUZZER_TEST_LIST)
+                            DEFAULT_LIBFUZZER_TEST_LIST, DEFAULT_PRETTY_PRINTER_TEST_LIST)
 
 # Where to look for logging and suite configuration files
 CONFIG_DIR = None

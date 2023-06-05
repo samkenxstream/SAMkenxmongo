@@ -99,7 +99,7 @@ void checkCollectionOptions(OperationContext* opCtx,
     if (coll) {
         auto actualOptions = coll->getCollectionOptions();
         uassert(ErrorCodes::NamespaceExists,
-                str::stream() << "namespace " << ns.ns()
+                str::stream() << "namespace " << ns.toStringForErrorMsg()
                               << " already exists, but with different options: "
                               << actualOptions.toBSON(),
                 options.matchesStorageOptions(actualOptions, collatorFactory));
@@ -118,14 +118,17 @@ void checkCollectionOptions(OperationContext* opCtx,
     auto fullNewNamespace =
         NamespaceStringUtil::parseNamespaceFromRequest(ns.dbName(), options.viewOn);
     uassert(ErrorCodes::NamespaceExists,
-            str::stream() << "namespace " << ns.ns() << " already exists, but is a view on "
-                          << view->viewOn() << " rather than " << fullNewNamespace,
+            str::stream() << "namespace " << ns.toStringForErrorMsg()
+                          << " already exists, but is a view on "
+                          << view->viewOn().toStringForErrorMsg() << " rather than "
+                          << fullNewNamespace.toStringForErrorMsg(),
             view->viewOn() == fullNewNamespace);
 
     auto existingPipeline = pipelineAsBsonObj(view->pipeline());
     uassert(ErrorCodes::NamespaceExists,
-            str::stream() << "namespace " << ns.ns() << " already exists, but with pipeline "
-                          << existingPipeline << " rather than " << options.pipeline,
+            str::stream() << "namespace " << ns.toStringForErrorMsg()
+                          << " already exists, but with pipeline " << existingPipeline
+                          << " rather than " << options.pipeline,
             existingPipeline.woCompare(options.pipeline) == 0);
 
     // Note: the server can add more values to collation options which were not
@@ -139,7 +142,7 @@ void checkCollectionOptions(OperationContext* opCtx,
         const auto defaultCollatorSpecBSON =
             view->defaultCollator() ? view->defaultCollator()->getSpec().toBSON() : BSONObj();
         uasserted(ErrorCodes::NamespaceExists,
-                  str::stream() << "namespace " << ns.ns()
+                  str::stream() << "namespace " << ns.toStringForErrorMsg()
                                 << " already exists, but with collation: "
                                 << defaultCollatorSpecBSON << " rather than " << options.collation);
     }
@@ -273,13 +276,7 @@ public:
                         repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() ==
                             repl::ReplicationCoordinator::Mode::modeReplSet);
 
-                if (hasQueryType(cmd.getEncryptedFields().get(), QueryTypeEnum::RangePreview)) {
-                    uassert(
-                        6775220,
-                        "Queryable Encryption Range support is only supported when FCV supports "
-                        "6.1",
-                        gFeatureFlagFLE2Range.isEnabled(serverGlobalParams.featureCompatibility));
-                }
+                FLEUtil::checkEFCForECC(cmd.getEncryptedFields().get());
             }
 
             if (auto timeseries = cmd.getTimeseries()) {
@@ -306,8 +303,8 @@ public:
 
                     uassert(ErrorCodes::InvalidOptions,
                             str::stream()
-                                << cmd.getNamespace() << ": 'timeseries' is not allowed with '"
-                                << fieldName << "'",
+                                << cmd.getNamespace().toStringForErrorMsg()
+                                << ": 'timeseries' is not allowed with '" << fieldName << "'",
                             timeseries::kAllowedCollectionCreationOptions.contains(fieldName));
                 }
 
@@ -315,9 +312,9 @@ public:
                     return field.find('.') != std::string::npos;
                 };
                 auto mustBeTopLevel = [&cmd](StringData field) -> std::string {
-                    return str::stream()
-                        << cmd.getNamespace() << ": '" << field << "' must be a top-level field "
-                        << "and not contain a '.'";
+                    return str::stream() << cmd.getNamespace().toStringForErrorMsg() << ": '"
+                                         << field << "' must be a top-level field "
+                                         << "and not contain a '.'";
                 };
                 uassert(ErrorCodes::InvalidOptions,
                         mustBeTopLevel("timeField"),
@@ -395,8 +392,8 @@ public:
                 // Check for config.settings in the user command since a validator is allowed
                 // internally on this collection but the user may not modify the validator.
                 uassert(ErrorCodes::InvalidOptions,
-                        str::stream()
-                            << "Document validators not allowed on system collection " << ns(),
+                        str::stream() << "Document validators not allowed on system collection "
+                                      << ns().toStringForErrorMsg(),
                         ns() != NamespaceString::kConfigSettingsNamespace);
             }
 

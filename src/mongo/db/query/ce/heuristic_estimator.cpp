@@ -30,7 +30,7 @@
 #include "mongo/db/query/ce/heuristic_estimator.h"
 
 #include "mongo/db/query/ce/heuristic_predicate_estimation.h"
-
+#include "mongo/db/query/ce/sel_tree_utils.h"
 #include "mongo/db/query/optimizer/cascades/memo.h"
 #include "mongo/db/query/optimizer/utils/ce_math.h"
 
@@ -137,12 +137,16 @@ public:
     EvalFilterSelectivityResult transport(const PathDefault& node,
                                           CEType inputCard,
                                           EvalFilterSelectivityResult childResult) {
-        if (node.getDefault() == Constant::boolean(false)) {
-            // We have a {$exists: true} predicate on this path if we have a Constant[false] child
-            // here. Note that ${exists: false} is handled by the presence of a negation expression
-            // higher in the ABT.
-            childResult.selectivity = kDefaultExistsSel;
+        if (const auto* constPtr = node.getDefault().cast<Constant>();
+            constPtr && constPtr->isValueBool()) {
+            // We have a $exists predicate on this path. Constant[false] represents {$exists:
+            // true} whereas Constant[true] represents {$exists: false} here. Note that
+            // Constant[true] usually comes from NotPushdown which push down a higher negation
+            // through PathDefault.
+            const bool exists = !constPtr->getValueBool();
+            childResult.selectivity = exists ? kDefaultExistsSel : negateSel(kDefaultExistsSel);
         }
+
         return childResult;
     }
 
@@ -165,7 +169,7 @@ private:
     SelectivityType disjunctionSel(const SelectivityType left, const SelectivityType right) {
         // We sum the selectivities and subtract the overlapping part so that it's only counted
         // once.
-        return left + right - left * right;
+        return negateSel(negateSel(left) * negateSel(right));
     }
 };
 
@@ -173,8 +177,9 @@ class HeuristicTransport {
 public:
     CEType transport(const ScanNode& node, CEType /*bindResult*/) {
         // Default cardinality estimate.
-        const CEType metadataCE = _metadata._scanDefs.at(node.getScanDefName()).getCE();
-        return (metadataCE < 0.0) ? kDefaultCard : metadataCE;
+        const boost::optional<CEType>& metadataCE =
+            _metadata._scanDefs.at(node.getScanDefName()).getCE();
+        return metadataCE.get_value_or(kDefaultCard);
     }
 
     CEType transport(const ValueScanNode& node, CEType /*bindResult*/) {
@@ -221,44 +226,22 @@ public:
             return {0.0};
         }
 
-        SelectivityType topLevelSel{1.0};
-        std::vector<SelectivityType> topLevelSelectivities;
+        EstimateIntervalSelFn estimateIntervalFn = [&](SelectivityTreeBuilder& selTreeBuilder,
+                                                       const IntervalRequirement& interval) {
+            selTreeBuilder.atom(heuristicIntervalSel(interval, childResult));
+        };
 
-        // TODO SERVER-74540: Handle top-level disjunction.
-        PSRExpr::visitDNF(node.getReqMap().getRoot(), [&](const PartialSchemaEntry& e) {
+        EstimatePartialSchemaEntrySelFn estimateFn = [&](SelectivityTreeBuilder& selTreeBuilder,
+                                                         const PartialSchemaEntry& e) {
             const auto& [key, req] = e;
-            if (req.getIsPerfOnly()) {
-                // Ignore perf-only requirements.
-                return;
-            }
+            IntervalSelectivityTreeBuilder intEstimator{selTreeBuilder, estimateIntervalFn};
+            intEstimator.build(req.getIntervals());
+        };
 
-            SelectivityType disjSel{1.0};
-            std::vector<SelectivityType> disjSelectivities;
-            // Intervals are in DNF.
-            const auto intervalDNF = req.getIntervals();
-            const auto disjuncts = intervalDNF.cast<IntervalReqExpr::Disjunction>()->nodes();
-            for (const auto& disjunct : disjuncts) {
-                const auto& conjuncts = disjunct.cast<IntervalReqExpr::Conjunction>()->nodes();
-                SelectivityType conjSel{1.0};
-                std::vector<SelectivityType> conjSelectivities;
-                for (const auto& conjunct : conjuncts) {
-                    const auto& interval = conjunct.cast<IntervalReqExpr::Atom>()->getExpr();
-                    const SelectivityType sel = heuristicIntervalSel(interval, childResult);
-                    conjSelectivities.push_back(sel);
-                }
-                conjSel = conjExponentialBackoff(std::move(conjSelectivities));
-                disjSelectivities.push_back(conjSel);
-            }
-            disjSel = disjExponentialBackoff(std::move(disjSelectivities));
-            topLevelSelectivities.push_back(disjSel);
-        });
+        PartialSchemaRequirementsCardinalityEstimator estimator(estimateFn, childResult);
+        const CEType estimate = estimator.estimateCE(node.getReqMap().getRoot());
 
-        if (topLevelSelectivities.empty()) {
-            return childResult;
-        }
-        // The elements of the PartialSchemaRequirements map represent an implicit conjunction.
-        topLevelSel = conjExponentialBackoff(std::move(topLevelSelectivities));
-        CEType card = std::max(topLevelSel * childResult, kMinCard);
+        const CEType card = std::max(estimate, kMinCard);
         uassert(6716602, "Invalid cardinality.", validCardinality(card));
         return card;
     }

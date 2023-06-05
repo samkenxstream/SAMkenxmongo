@@ -73,10 +73,10 @@ TEST_F(ResourceCatalogTest, InsertTest) {
     catalog.add(thirdResourceId, thirdCollection);
 
     resource = catalog.name(firstResourceId);
-    ASSERT_EQ(firstCollection.toStringWithTenantId(), *resource);
+    ASSERT_EQ(firstCollection.toStringWithTenantId_forTest(), *resource);
 
     resource = catalog.name(thirdResourceId);
-    ASSERT_EQ(thirdCollection.toStringWithTenantId(), resource);
+    ASSERT_EQ(thirdCollection.toStringWithTenantId_forTest(), resource);
 }
 
 TEST_F(ResourceCatalogTest, RemoveTest) {
@@ -87,7 +87,7 @@ TEST_F(ResourceCatalogTest, RemoveTest) {
     catalog.remove(firstResourceId,
                    NamespaceString::createNamespaceString_forTest(boost::none, "BadNamespace"));
     auto resource = catalog.name(firstResourceId);
-    ASSERT_EQ(firstCollection.toStringWithTenantId(), *resource);
+    ASSERT_EQ(firstCollection.toStringWithTenantId_forTest(), *resource);
 
     catalog.remove(firstResourceId, firstCollection);
     catalog.remove(firstResourceId, firstCollection);
@@ -98,6 +98,11 @@ TEST_F(ResourceCatalogTest, RemoveTest) {
 
     resource = catalog.name(thirdResourceId);
     ASSERT_EQ(boost::none, resource);
+}
+
+TEST_F(ResourceCatalogTest, ResourceMutexTest) {
+    auto rid = catalog.newResourceIdForMutex("TestLabel");
+    ASSERT_EQ("TestLabel", *catalog.name(rid));
 }
 
 TEST_F(ResourceCatalogTest, CollisionTest) {
@@ -116,12 +121,12 @@ TEST_F(ResourceCatalogTest, CollisionTest) {
     // We remove a namespace, resolving the collision.
     catalog.remove(firstResourceId, firstCollection);
     resource = catalog.name(secondResourceId);
-    ASSERT_EQ(secondCollection.toStringWithTenantId(), *resource);
+    ASSERT_EQ(secondCollection.toStringWithTenantId_forTest(), *resource);
 
     // Adding the same namespace twice does not create a collision.
     catalog.add(secondResourceId, secondCollection);
     resource = catalog.name(secondResourceId);
-    ASSERT_EQ(secondCollection.toStringWithTenantId(), *resource);
+    ASSERT_EQ(secondCollection.toStringWithTenantId_forTest(), *resource);
 
     // The map should function normally for entries without collisions.
     catalog.add(firstResourceId, firstCollection);
@@ -130,7 +135,7 @@ TEST_F(ResourceCatalogTest, CollisionTest) {
 
     catalog.add(thirdResourceId, thirdCollection);
     resource = catalog.name(thirdResourceId);
-    ASSERT_EQ(thirdCollection.toStringWithTenantId(), *resource);
+    ASSERT_EQ(thirdCollection.toStringWithTenantId_forTest(), *resource);
 
     catalog.remove(thirdResourceId, thirdCollection);
     resource = catalog.name(thirdResourceId);
@@ -147,7 +152,7 @@ TEST_F(ResourceCatalogTest, CollisionTest) {
 }
 
 DEATH_TEST_F(ResourceCatalogTest, AddDatabaseInvalidResourceType, "invariant") {
-    catalog.add({RESOURCE_GLOBAL, 0}, DatabaseName{"db"});
+    catalog.add({RESOURCE_GLOBAL, 0}, DatabaseName::createDatabaseName_forTest(boost::none, "db"));
 }
 
 DEATH_TEST_F(ResourceCatalogTest, AddCollectionInvalidResourceType, "invariant") {
