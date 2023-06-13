@@ -34,6 +34,7 @@
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
 #include "mongo/db/pipeline/lookup_set_cache.h"
 
 namespace mongo {
@@ -52,9 +53,15 @@ public:
                                                  const BSONElement& spec);
 
 
-        bool allowShardedForeignCollection(NamespaceString nss,
-                                           bool inMultiDocumentTransaction) const override {
-            return !inMultiDocumentTransaction || _foreignNss != nss;
+        Status checkShardedForeignCollAllowed(NamespaceString nss,
+                                              bool inMultiDocumentTransaction) const override {
+            if (!inMultiDocumentTransaction || _foreignNss != nss) {
+                return Status::OK();
+            }
+
+            return Status(
+                ErrorCodes::NamespaceCannotBeSharded,
+                "Sharded $graphLookup is not allowed within a multi-document transaction");
         }
 
         PrivilegeVector requiredPrivileges(bool isMongos, bool bypassDocumentValidation) const {

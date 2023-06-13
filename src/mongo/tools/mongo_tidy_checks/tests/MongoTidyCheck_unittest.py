@@ -150,6 +150,17 @@ class MongoTidyTests(unittest.TestCase):
 
         self.run_clang_tidy()
 
+    def test_MongoCxx20StdChronoCheck(self):
+        self.write_config(
+            textwrap.dedent("""\
+                Checks: '-*,mongo-cxx20-std-chrono-check'
+                WarningsAsErrors: '*'
+                """))
+        prohibited_types = ["day", "day", "month", "year", "month_day", "month", "day", "day"]
+        self.expected_output = [
+            f"Illegal use of prohibited type 'std::chrono::{t}'." for t in prohibited_types]
+        self.run_clang_tidy()
+
     def test_MongoStdOptionalCheck(self):
 
         self.write_config(
@@ -311,6 +322,21 @@ class MongoTidyTests(unittest.TestCase):
         ]
 
         self.run_clang_tidy()
+
+    def test_MongoMacroDefinitionLeaksCheck(self):
+        self.write_config(
+            textwrap.dedent("""\
+                Checks: '-*,mongo-macro-definition-leaks-check'
+                WarningsAsErrors: '*'
+                HeaderFilterRegex: '(mongo/.*)'
+                """))
+
+        self.expected_output = [
+            "Missing #undef 'MONGO_LOGV2_DEFAULT_COMPONENT'",
+        ]
+
+        self.run_clang_tidy()
+
 
 if __name__ == '__main__':
 

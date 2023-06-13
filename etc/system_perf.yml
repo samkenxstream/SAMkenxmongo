@@ -1861,7 +1861,9 @@ buildvariants:
 
   - name: linux-standalone.2022-11
     display_name: Linux Standalone 2022-11
-    cron: &linux-standalone-cron "0 0 * * 2,4,6"  # Tuesday, Thursday and Saturday at 00:00
+    # TODO SERVER-74399 Reduce frequency back to baseline.
+    # cron: &linux-standalone-cron "0 0 * * 2,4,6"  # Tuesday, Thursday and Saturday at 00:00
+    cron: &linux-standalone-cron "0 0 * * *"  # Everyday at 00:00
     modules: *modules
     expansions:
       mongodb_setup_release: 2022-11
@@ -2217,6 +2219,29 @@ buildvariants:
       - name: ycsb_60GB.long
       - name: crud_workloads_majority
       - name: tpcc
+
+  - name: linux-standalone-limited-query-stats
+    display_name: Linux Standalone 2022-11 (Rate Limited QueryStats)
+    # Match the baseline non-query-stats cron
+    cron: *linux-standalone-cron
+    modules: *modules
+    expansions:
+      mongodb_setup_release: 2022-11
+      mongodb_setup: standalone-query-stats-small-rate-limit
+      infrastructure_provisioning_release: 2022-11
+      infrastructure_provisioning: single
+      workload_setup: 2022-11
+      platform: linux
+      project_dir: *project_dir
+      authentication: enabled
+      storageEngine: wiredTiger
+      compile_variant: "-arm64"
+    run_on:
+      - "rhel70-perf-single"
+    depends_on: *_compile_amazon_linux2_arm64
+    tasks:
+      - name: schedule_patch_auto_tasks
+      - name: schedule_variant_auto_tasks
 
   - name: linux-1-node-replSet-all-feature-flags.2022-11
     display_name: Linux 1-Node ReplSet (all feature flags) 2022-11
@@ -3340,7 +3365,9 @@ buildvariants:
   - &linux-microbenchmarks-standalone-arm
     name: linux-microbenchmarks-standalone-arm.2023-01
     display_name: MicroBenchmarks Arm Standalone inMemory.2023-01
-    cron: "0 0 * * 0,2,3,4,5"  # Run it every day except Saturday and Monday.
+    # TODO SERVER-74399 Reduce frequency back to baseline.
+    # cron: "0 0 * * 0,2,3,4,5"  # Run it every day except Saturday and Monday.
+    cron: &linux-microbench-cron "0 0 * * *"  # Everyday at 00:00
     modules: *modules
     expansions: &standalone-arm-expansions
       mongodb_setup_release: 2022-11
@@ -3393,6 +3420,14 @@ buildvariants:
     expansions:
       <<: *standalone-arm-expansions
       mongodb_setup: mongo-perf-standalone-query-stats
+
+# Variant: Microbenchmarks with rate limited QueryStats
+  - <<: *linux-microbenchmarks-standalone-arm
+    name: linux-microbenchmarks-standalone-arm-limited-query-stats.2023-01
+    display_name: MicroBenchmarks (Rate Limitied QueryStats)
+    expansions:
+      <<: *standalone-arm-expansions
+      mongodb_setup: mongo-perf-standalone-query-stats-small-rate-limit
 
   - &linux-microbenchmarks-repl-arm
     name: linux-microbenchmarks-repl-arm.2023-01

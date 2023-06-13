@@ -31,7 +31,6 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/ddl_lock_manager.h"
 #include "mongo/db/s/metadata_consistency_util.h"
 #include "mongo/db/s/operation_sharding_state.h"
@@ -107,19 +106,34 @@ public:
 
         Response typedRun(OperationContext* opCtx) {
             uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
-            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
-            const auto nss = ns();
-            switch (metadata_consistency_util::getCommandLevel(nss)) {
-                case MetadataConsistencyCommandLevelEnum::kClusterLevel:
-                    return _runClusterLevel(opCtx, nss);
-                case MetadataConsistencyCommandLevelEnum::kDatabaseLevel:
-                    return _runDatabaseLevel(opCtx, nss);
-                case MetadataConsistencyCommandLevelEnum::kCollectionLevel:
-                    return _runCollectionLevel(opCtx, nss);
-                default:
-                    MONGO_UNREACHABLE;
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+            {
+                // Ensure that opCtx will get interrupted in the event of a stepdown.
+                Lock::GlobalLock lk(opCtx, MODE_IX);
+                uassert(ErrorCodes::InterruptedDueToReplStateChange,
+                        "Not primary while attempting to start a metadata consistency check",
+                        repl::ReplicationCoordinator::get(opCtx)->getMemberState().primary());
             }
+
+            const auto response = [&] {
+                const auto nss = ns();
+                switch (metadata_consistency_util::getCommandLevel(nss)) {
+                    case MetadataConsistencyCommandLevelEnum::kClusterLevel:
+                        return _runClusterLevel(opCtx, nss);
+                    case MetadataConsistencyCommandLevelEnum::kDatabaseLevel:
+                        return _runDatabaseLevel(opCtx, nss);
+                    case MetadataConsistencyCommandLevelEnum::kCollectionLevel:
+                        return _runCollectionLevel(opCtx, nss);
+                    default:
+                        MONGO_UNREACHABLE;
+                }
+            }();
+
+            // Make sure the response gets invalidated in case of interruption
+            opCtx->checkForInterrupt();
+
+            return response;
         }
 
     private:
@@ -197,11 +211,8 @@ public:
 
             // Take a DDL lock on the database
             static constexpr StringData kLockReason{"checkMetadataConsistency"_sd};
-            auto ddlLockManager = DDLLockManager::get(opCtx);
-            const auto dbDDLLock = ddlLockManager->lock(
-                opCtx, nss.db(), kLockReason, DDLLockManager::kDefaultLockTimeout);
-
-            DatabaseShardingState::assertIsPrimaryShardForDb(opCtx, nss.dbName());
+            const DDLLockManager::ScopedDatabaseDDLLock dbDDLLock{
+                opCtx, nss.dbName(), kLockReason, MODE_X, DDLLockManager::kDefaultLockTimeout};
 
             return establishCursors(opCtx,
                                     Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),

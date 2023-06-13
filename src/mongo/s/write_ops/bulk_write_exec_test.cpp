@@ -130,12 +130,18 @@ protected:
 
     ServiceContext::UniqueOperationContext _opCtxHolder;
     OperationContext* _opCtx;
+
+    // This failpoint is to skip running the useTwoPhaseWriteProtocol check which expects the Grid
+    // to be initialized. With the feature flag on, the helper always returns false, which signifies
+    // that we have a targetable write op.
+    std::unique_ptr<FailPointEnableBlock> _skipUseTwoPhaseWriteProtocolCheck =
+        std::make_unique<FailPointEnableBlock>("skipUseTwoPhaseWriteProtocolCheck");
 };
 
 // Test targeting a single op in a bulkWrite request.
 TEST_F(BulkWriteOpTest, TargetSingleOp) {
     ShardId shardId("shard");
-    NamespaceString nss("foo.bar");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("foo.bar");
     ShardEndpoint endpoint(
         shardId, ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none), boost::none);
 
@@ -168,7 +174,7 @@ TEST_F(BulkWriteOpTest, TargetSingleOp) {
 
 // Test targeting a single op with target error.
 TEST_F(BulkWriteOpTest, TargetSingleOpError) {
-    NamespaceString nss("foo.bar");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("foo.bar");
     ShardEndpoint endpoint(ShardId("shard"),
                            ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none),
                            boost::none);
@@ -209,8 +215,8 @@ TEST_F(BulkWriteOpTest, TargetSingleOpError) {
 // Test multiple ordered ops that target the same shard.
 TEST_F(BulkWriteOpTest, TargetMultiOpsOrdered_SameShard) {
     ShardId shardId("shard");
-    NamespaceString nss0("foo.bar");
-    NamespaceString nss1("bar.foo");
+    NamespaceString nss0 = NamespaceString::createNamespaceString_forTest("foo.bar");
+    NamespaceString nss1 = NamespaceString::createNamespaceString_forTest("bar.foo");
     // Two different endpoints targeting the same shard for the two namespaces.
     ShardEndpoint endpoint0(
         shardId, ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none), boost::none);
@@ -263,8 +269,8 @@ TEST_F(BulkWriteOpTest, TargetMultiOpsOrdered_SameShard) {
 // Test multiple ordered ops where one of them result in a target error.
 TEST_F(BulkWriteOpTest, TargetMultiOpsOrdered_RecordTargetErrors) {
     ShardId shardId("shard");
-    NamespaceString nss0("foo.bar");
-    NamespaceString nss1("bar.foo");
+    NamespaceString nss0 = NamespaceString::createNamespaceString_forTest("foo.bar");
+    NamespaceString nss1 = NamespaceString::createNamespaceString_forTest("bar.foo");
     ShardEndpoint endpoint0(
         shardId, ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none), boost::none);
     ShardEndpoint endpoint1(
@@ -330,8 +336,8 @@ TEST_F(BulkWriteOpTest, TargetMultiOpsOrdered_RecordTargetErrors) {
 TEST_F(BulkWriteOpTest, TargetMultiOpsOrdered_DifferentShard) {
     ShardId shardIdA("shardA");
     ShardId shardIdB("shardB");
-    NamespaceString nss0("foo.bar");
-    NamespaceString nss1("bar.foo");
+    NamespaceString nss0 = NamespaceString::createNamespaceString_forTest("foo.bar");
+    NamespaceString nss1 = NamespaceString::createNamespaceString_forTest("bar.foo");
     ShardEndpoint endpointA0(
         shardIdA, ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none), boost::none);
     ShardEndpoint endpointB0(
@@ -439,7 +445,7 @@ TEST_F(BulkWriteOpTest, TargetMultiOpsOrdered_DifferentShard) {
 TEST_F(BulkWriteOpTest, TargetMultiTargetOpsOrdered) {
     ShardId shardIdA("shardA");
     ShardId shardIdB("shardB");
-    NamespaceString nss0("foo.bar");
+    NamespaceString nss0 = NamespaceString::createNamespaceString_forTest("foo.bar");
     ShardEndpoint endpointA(
         shardIdA, ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none), boost::none);
     ShardEndpoint endpointB(
@@ -572,7 +578,7 @@ TEST_F(BulkWriteOpTest, TargetMultiTargetOpsOrdered) {
 TEST_F(BulkWriteOpTest, TargetMultiOpsUnordered_OneShard_TwoEndpoints) {
     ShardId shardIdA("shardA");
     ShardId shardIdB("shardB");
-    NamespaceString nss0("foo.bar");
+    NamespaceString nss0 = NamespaceString::createNamespaceString_forTest("foo.bar");
 
     // The endpoints we'll use for our targeter.
     ShardEndpoint endpointA(
@@ -701,8 +707,8 @@ TEST_F(BulkWriteOpTest, TargetMultiOpsUnordered_OneShard_TwoEndpoints) {
 TEST_F(BulkWriteOpTest, TargetMultiOpsUnordered) {
     ShardId shardIdA("shardA");
     ShardId shardIdB("shardB");
-    NamespaceString nss0("foo.bar");
-    NamespaceString nss1("bar.foo");
+    NamespaceString nss0 = NamespaceString::createNamespaceString_forTest("foo.bar");
+    NamespaceString nss1 = NamespaceString::createNamespaceString_forTest("bar.foo");
     ShardEndpoint endpointA0(
         shardIdA, ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none), boost::none);
     ShardEndpoint endpointB0(
@@ -766,8 +772,8 @@ TEST_F(BulkWriteOpTest, TargetMultiOpsUnordered) {
 // Test multiple unordered ops where one of them result in a target error.
 TEST_F(BulkWriteOpTest, TargetMultiOpsUnordered_RecordTargetErrors) {
     ShardId shardId("shard");
-    NamespaceString nss0("foo.bar");
-    NamespaceString nss1("bar.foo");
+    NamespaceString nss0 = NamespaceString::createNamespaceString_forTest("foo.bar");
+    NamespaceString nss1 = NamespaceString::createNamespaceString_forTest("bar.foo");
     ShardEndpoint endpoint0(
         shardId, ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none), boost::none);
     ShardEndpoint endpoint1(
@@ -810,8 +816,8 @@ TEST_F(BulkWriteOpTest, TargetMultiOpsUnordered_RecordTargetErrors) {
 // bulk command request.
 TEST_F(BulkWriteOpTest, BuildChildRequestFromTargetedWriteBatch) {
     ShardId shardId("shard");
-    NamespaceString nss0("foster.the.people");
-    NamespaceString nss1("sonate.pacifique");
+    NamespaceString nss0 = NamespaceString::createNamespaceString_forTest("foster.the.people");
+    NamespaceString nss1 = NamespaceString::createNamespaceString_forTest("sonate.pacifique");
 
     // Two different endpoints targeting the same shard for the two namespaces.
     ShardEndpoint endpoint0(
@@ -876,7 +882,7 @@ TEST_F(BulkWriteOpTest, BuildChildRequestFromTargetedWriteBatch) {
 // Tests that stmtIds are correctly attached to bulkWrite requests when the operations
 // are ordered.
 TEST_F(BulkWriteOpTest, TestOrderedOpsNoExistingStmtIds) {
-    NamespaceString nss("mgmt.kids");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("mgmt.kids");
 
     ShardEndpoint endpointA(ShardId("shardA"),
                             ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none),
@@ -928,7 +934,7 @@ TEST_F(BulkWriteOpTest, TestOrderedOpsNoExistingStmtIds) {
 // Tests that stmtIds are correctly attached to bulkWrite requests when the operations
 // are unordered.
 TEST_F(BulkWriteOpTest, TestUnorderedOpsNoExistingStmtIds) {
-    NamespaceString nss("zero7.spinning");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("zero7.spinning");
 
     ShardEndpoint endpointA(ShardId("shardA"),
                             ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none),
@@ -979,7 +985,7 @@ TEST_F(BulkWriteOpTest, TestUnorderedOpsNoExistingStmtIds) {
 // Tests that stmtIds are correctly attached to bulkWrite requests when the operations
 // are unordered and stmtIds are attached to the request already.
 TEST_F(BulkWriteOpTest, TestUnorderedOpsStmtIdsExist) {
-    NamespaceString nss("zero7.spinning");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("zero7.spinning");
 
     ShardEndpoint endpointA(ShardId("shardA"),
                             ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none),
@@ -1031,7 +1037,7 @@ TEST_F(BulkWriteOpTest, TestUnorderedOpsStmtIdsExist) {
 // Tests that stmtIds are correctly attached to bulkWrite requests when the operations
 // are unordered and the stmtId field exists.
 TEST_F(BulkWriteOpTest, TestUnorderedOpsStmtIdFieldExists) {
-    NamespaceString nss("zero7.spinning");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("zero7.spinning");
 
     ShardEndpoint endpointA(ShardId("shardA"),
                             ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none),
@@ -1082,7 +1088,7 @@ TEST_F(BulkWriteOpTest, TestUnorderedOpsStmtIdFieldExists) {
 
 // Test BatchItemRef.getLet().
 TEST_F(BulkWriteOpTest, BatchItemRefGetLet) {
-    NamespaceString nss("foo.bar");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("foo.bar");
 
     // The content of the request (updateOp and Let) do not matter here,
     // only that BatchItemRef.getLet() matches BulkWriteCommandRequest.setLet().
@@ -1143,8 +1149,8 @@ public:
 };
 
 TEST_F(BulkWriteExecTest, RefreshTargetersOnTargetErrors) {
-    NamespaceString nss0("foo.bar");
-    NamespaceString nss1("bar.foo");
+    NamespaceString nss0 = NamespaceString::createNamespaceString_forTest("foo.bar");
+    NamespaceString nss1 = NamespaceString::createNamespaceString_forTest("bar.foo");
     ShardEndpoint endpoint0(
         kShardIdA, ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none), boost::none);
     ShardEndpoint endpoint1(
@@ -1214,7 +1220,7 @@ TEST_F(BulkWriteExecTest, RefreshTargetersOnTargetErrors) {
 }
 
 TEST_F(BulkWriteExecTest, CollectionDroppedBeforeRefreshingTargeters) {
-    NamespaceString nss("foo.bar");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("foo.bar");
     ShardEndpoint endpoint(
         kShardIdA, ShardVersionFactory::make(ChunkVersion::IGNORED(), boost::none), boost::none);
 

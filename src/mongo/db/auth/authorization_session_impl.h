@@ -104,8 +104,7 @@ public:
 
     void grantInternalAuthorization(OperationContext* opCtx) override;
 
-    StatusWith<PrivilegeVector> checkAuthorizedToListCollections(StringData dbname,
-                                                                 const BSONObj& cmdObj) override;
+    StatusWith<PrivilegeVector> checkAuthorizedToListCollections(const ListCollections&) override;
 
     bool isUsingLocalhostBypass() override;
 
@@ -134,7 +133,7 @@ public:
     bool isAuthorizedForActionsOnNamespace(const NamespaceString& ns,
                                            const ActionSet& actions) override;
 
-    bool isAuthorizedForAnyActionOnAnyResourceInDB(StringData dbname) override;
+    bool isAuthorizedForAnyActionOnAnyResourceInDB(const DatabaseName&) override;
 
     bool isAuthorizedForAnyActionOnResource(const ResourcePattern& resource) override;
 

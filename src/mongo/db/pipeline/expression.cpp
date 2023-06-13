@@ -85,7 +85,7 @@ Value ExpressionConstant::serializeConstant(const SerializationOptions& opts, Va
     // Other serialization policies need to include this $const in order to be unambiguous for
     // re-parsing this output later. If for example the constant was '$cashMoney' - we don't want to
     // misinterpret it as a field path when parsing.
-    return opts.serializeLiteral(Value(DOC("$const" << val)));
+    return Value(DOC("$const" << opts.serializeLiteral(val)));
 }
 
 /* --------------------------- Expression ------------------------------ */
@@ -5708,12 +5708,12 @@ StatusWith<Value> ExpressionSubtract::apply(Value lhs, Value rhs) {
                 long long longDiff = lhs.getDate().toMillisSinceEpoch();
                 double doubleRhs = rhs.coerceToDouble();
                 // check the doubleRhs should not exceed int64 limit and result will not overflow
-                if (doubleRhs < static_cast<double>(limits::min()) ||
-                    doubleRhs >= static_cast<double>(limits::max()) ||
-                    overflow::sub(longDiff, llround(doubleRhs), &longDiff)) {
-                    return Status(ErrorCodes::Overflow, str::stream() << "date overflow");
+                if (doubleRhs >= static_cast<double>(limits::min()) &&
+                    doubleRhs < static_cast<double>(limits::max()) &&
+                    !overflow::sub(longDiff, llround(doubleRhs), &longDiff)) {
+                    return Value(Date_t::fromMillisSinceEpoch(longDiff));
                 }
-                return Value(Date_t::fromMillisSinceEpoch(longDiff));
+                return Status(ErrorCodes::Overflow, str::stream() << "date overflow");
             }
             case NumberDecimal: {
                 long long longDiff = lhs.getDate().toMillisSinceEpoch();

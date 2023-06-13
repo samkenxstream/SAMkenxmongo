@@ -4914,13 +4914,16 @@ TEST(IDLAccessCheck, TestSimplePrivilegeAccessCheck) {
 }
 
 TEST(IDLAccessCheck, TestComplexAccessCheck) {
+    const auto kTestDB = DatabaseName::createDatabaseName_forTest(boost::none, "test"_sd);
     AuthorizationContract ac;
     ac.addPrivilege(Privilege(ResourcePattern::forClusterResource(), ActionType::addShard));
     ac.addPrivilege(Privilege(ResourcePattern::forClusterResource(), ActionType::serverStatus));
 
-    ac.addPrivilege(Privilege(ResourcePattern::forDatabaseName("test"), ActionType::trafficRecord));
+    ac.addPrivilege(
+        Privilege(ResourcePattern::forDatabaseName(kTestDB), ActionType::trafficRecord));
 
-    ac.addPrivilege(Privilege(ResourcePattern::forAnyResource(), ActionType::splitVector));
+    ac.addPrivilege(
+        Privilege(ResourcePattern::forAnyResource(boost::none), ActionType::splitVector));
 
     ac.addAccessCheck(AccessCheckEnum::kIsAuthenticated);
     ac.addAccessCheck(AccessCheckEnum::kIsAuthorizedToParseNamespaceElement);

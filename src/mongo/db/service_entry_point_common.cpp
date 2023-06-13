@@ -524,8 +524,8 @@ void appendErrorLabelsAndTopologyVersion(OperationContext* opCtx,
     const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     // NotPrimary errors always include a topologyVersion, since we increment topologyVersion on
     // stepdown. ShutdownErrors only include a topologyVersion if the server is in quiesce mode,
-    // since we only increment the topologyVersion at shutdown and alert waiting isMaster commands
-    // if the server enters quiesce mode.
+    // since we only increment the topologyVersion at shutdown and alert waiting isMaster/hello
+    // commands if the server enters quiesce mode.
     const auto shouldAppendTopologyVersion =
         (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet &&
          isNotPrimaryError) ||
@@ -1577,7 +1577,6 @@ void ExecCommandDatabase::_initiateCommand() {
     _invocation->checkAuthorization(opCtx, request);
     const auto dbName =
         DatabaseNameUtil::deserialize(request.getValidatedTenantId(), request.getDatabase());
-    const bool iAmPrimary = replCoord->canAcceptWritesForDatabase_UNSAFE(opCtx, dbName);
 
     if (!opCtx->getClient()->isInDirectClient() &&
         !MONGO_unlikely(skipCheckingForNotPrimaryInCommandDispatch.shouldFail())) {
@@ -1781,8 +1780,7 @@ void ExecCommandDatabase::_initiateCommand() {
     }
 
     if (!opCtx->getClient()->isInDirectClient() &&
-        readConcernArgs.getLevel() != repl::ReadConcernLevel::kAvailableReadConcern &&
-        (iAmPrimary || (readConcernArgs.hasLevel() || readConcernArgs.getArgsAfterClusterTime()))) {
+        readConcernArgs.getLevel() != repl::ReadConcernLevel::kAvailableReadConcern) {
         boost::optional<ShardVersion> shardVersion;
         if (auto shardVersionElem = request.body[ShardVersion::kShardVersionField]) {
             shardVersion = ShardVersion::parse(shardVersionElem);

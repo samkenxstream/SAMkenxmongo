@@ -52,10 +52,11 @@
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/find_common.h"
-#include "mongo/db/query/find_request_shapifier.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/query_shape.h"
 #include "mongo/db/query/query_stats.h"
+#include "mongo/db/query/query_stats_find_key_generator.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/query_analysis_writer.h"
 #include "mongo/db/service_context.h"
@@ -149,9 +150,14 @@ std::unique_ptr<CanonicalQuery> parseQueryAndBeginOperation(
     // Register query stats collection. Exclude queries against non-existent collections and
     // collections with encrypted fields. It is important to do this before canonicalizing and
     // optimizing the query, each of which would alter the query shape.
-    if (collection && !collection.get()->getCollectionOptions().encryptedFieldConfig) {
-        query_stats::registerRequest(expCtx, collection.get()->ns(), [&]() {
-            return std::make_unique<query_stats::FindRequestShapifier>(expCtx, *parsedRequest);
+    if (!collection || !collection.get()->getCollectionOptions().encryptedFieldConfig) {
+        BSONObj queryShape = query_shape::extractQueryShape(
+            *parsedRequest,
+            SerializationOptions::kRepresentativeQueryShapeSerializeOptions,
+            expCtx);
+        query_stats::registerRequest(expCtx, nss, [&]() {
+            return std::make_unique<query_stats::FindKeyGenerator>(
+                expCtx, *parsedRequest, std::move(queryShape));
         });
     }
 
@@ -690,8 +696,6 @@ public:
                 auto&& [stats, _] =
                     explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
                 LOGV2_WARNING(23798,
-                              "Plan executor error during find command: {error}, "
-                              "stats: {stats}, cmd: {cmd}",
                               "Plan executor error during find command",
                               "error"_attr = exception.toStatus(),
                               "stats"_attr = redact(stats),

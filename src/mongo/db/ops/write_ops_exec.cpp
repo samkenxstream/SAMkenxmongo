@@ -674,11 +674,13 @@ boost::optional<BSONObj> advanceExecutor(OperationContext* opCtx,
     PlanExecutor::ExecState state;
     try {
         state = exec->getNext(&value, nullptr);
+    } catch (const WriteConflictException&) {
+        // Propagate the WCE to be retried at a higher-level without logging.
+        throw;
     } catch (DBException& exception) {
         auto&& explainer = exec->getPlanExplainer();
         auto&& [stats, _] = explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
         LOGV2_WARNING(7267501,
-                      "Plan executor error during findAndModify: {error}, stats: {stats}",
                       "Plan executor error during findAndModify",
                       "error"_attr = exception.toStatus(),
                       "stats"_attr = redact(stats));
@@ -750,6 +752,10 @@ UpdateResult writeConflictRetryUpsert(OperationContext* opCtx,
                           << "' is a capped collection. Writes in transactions are not allowed on "
                              "capped collections.",
             !inTransaction);
+    }
+
+    if (isTimeseriesUpdate) {
+        timeseries::assertTimeseriesBucketsCollection(collection.getCollectionPtr().get());
     }
 
     ParsedUpdate parsedUpdate(opCtx,
@@ -1133,16 +1139,10 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
     }();
 
     if (source == OperationSource::kTimeseriesUpdate) {
-        uassert(ErrorCodes::NamespaceNotFound,
-                "Could not find time-series buckets collection for update",
-                collection.getCollectionPtr());
-
-        auto timeseriesOptions = collection.getCollectionPtr()->getTimeseriesOptions();
-        uassert(ErrorCodes::InvalidOptions,
-                "Time-series buckets collection is missing time-series options",
-                timeseriesOptions);
+        timeseries::assertTimeseriesBucketsCollection(collection.getCollectionPtr().get());
 
         // Only translate the hint if it is specified with an index key.
+        auto timeseriesOptions = collection.getCollectionPtr()->getTimeseriesOptions();
         if (timeseries::isHintIndexKey(updateRequest->getHint())) {
             updateRequest->setHint(
                 uassertStatusOK(timeseries::createBucketsIndexSpecFromTimeseriesIndexSpec(
@@ -1517,15 +1517,10 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
         opCtx, acquisitionRequest, fixLockModeForSystemDotViewsChanges(ns, MODE_IX));
 
     if (source == OperationSource::kTimeseriesDelete) {
-        uassert(ErrorCodes::NamespaceNotFound,
-                "Could not find time-series buckets collection for write",
-                collection.getCollectionPtr());
-        auto timeseriesOptions = collection.getCollectionPtr()->getTimeseriesOptions();
-        uassert(ErrorCodes::InvalidOptions,
-                "Time-series buckets collection is missing time-series options",
-                timeseriesOptions);
+        timeseries::assertTimeseriesBucketsCollection(collection.getCollectionPtr().get());
 
         // Only translate the hint if it is specified by index key.
+        auto timeseriesOptions = collection.getCollectionPtr()->getTimeseriesOptions();
         if (timeseries::isHintIndexKey(request.getHint())) {
             request.setHint(
                 uassertStatusOK(timeseries::createBucketsIndexSpecFromTimeseriesIndexSpec(
@@ -2094,6 +2089,10 @@ void tryPerformTimeseriesBucketCompression(
     OperationContext* opCtx,
     const timeseries::bucket_catalog::ClosedBucket& closedBucket,
     const write_ops::InsertCommandRequest& request) {
+    // When enabled, we skip constructing ClosedBuckets which results in skipping compression.
+    invariant(!feature_flags::gTimeseriesAlwaysUseCompressedBuckets.isEnabled(
+        serverGlobalParams.featureCompatibility));
+
     // Buckets with just a single measurement is not worth compressing.
     if (closedBucket.numMeasurements.has_value() && closedBucket.numMeasurements.value() <= 1) {
         return;
@@ -2387,12 +2386,7 @@ std::tuple<TimeseriesBatches, TimeseriesStmtIds, size_t /* numInserted */> inser
     // invalidated.
     auto catalog = CollectionCatalog::get(opCtx);
     auto bucketsColl = catalog->lookupCollectionByNamespace(opCtx, bucketsNs);
-    uassert(ErrorCodes::NamespaceNotFound,
-            "Could not find time-series buckets collection for write",
-            bucketsColl);
-    uassert(ErrorCodes::InvalidOptions,
-            "Time-series buckets collection is missing time-series options",
-            bucketsColl->getTimeseriesOptions());
+    timeseries::assertTimeseriesBucketsCollection(bucketsColl);
 
     auto timeSeriesOptions = *bucketsColl->getTimeseriesOptions();
 

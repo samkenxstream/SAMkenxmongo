@@ -36,9 +36,10 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/partitioned_cache.h"
 #include "mongo/db/query/plan_explainer.h"
-#include "mongo/db/query/request_shapifier.h"
+#include "mongo/db/query/query_stats_key_generator.h"
 #include "mongo/db/query/util/memory_util.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/views/view.h"
 #include <cstdint>
 #include <memory>
 
@@ -98,15 +99,17 @@ extern CounterMetric queryStatsStoreSizeEstimateBytesMetric;
 // Used to aggregate the metrics for one query stats key over all its executions.
 class QueryStatsEntry {
 public:
-    QueryStatsEntry(std::unique_ptr<RequestShapifier> requestShapifier, NamespaceStringOrUUID nss)
-        : firstSeenTimestamp(Date_t::now().toMillisSinceEpoch() / 1000, 0),
-          requestShapifier(std::move(requestShapifier)),
-          nss(nss) {
+    QueryStatsEntry(std::unique_ptr<KeyGenerator> keyGenerator, NamespaceStringOrUUID nss)
+        : firstSeenTimestamp(Date_t::now()), keyGenerator(std::move(keyGenerator)), nss(nss) {
         // Increment by size of query stats store key (hash returns size_t) and value
         // (QueryStatsEntry)
         queryStatsStoreSizeEstimateBytesMetric.increment(sizeof(QueryStatsEntry) +
                                                          sizeof(std::size_t));
     }
+
+    QueryStatsEntry(QueryStatsEntry& entry) = delete;
+
+    QueryStatsEntry(QueryStatsEntry&& entry) = delete;
 
     ~QueryStatsEntry() {
         // Decrement by size of query stats store key (hash returns size_t) and value
@@ -119,9 +122,11 @@ public:
         BSONObjBuilder builder{sizeof(QueryStatsEntry) + 100};
         builder.append("lastExecutionMicros", (BSONNumeric)lastExecutionMicros);
         builder.append("execCount", (BSONNumeric)execCount);
-        queryExecMicros.appendTo(builder, "queryExecMicros");
+        totalExecMicros.appendTo(builder, "totalExecMicros");
+        firstResponseExecMicros.appendTo(builder, "firstResponseExecMicros");
         docsReturned.appendTo(builder, "docsReturned");
         builder.append("firstSeenTimestamp", firstSeenTimestamp);
+        builder.append("latestSeenTimestamp", latestSeenTimestamp);
         return builder.obj();
     }
 
@@ -137,7 +142,12 @@ public:
     /**
      * Timestamp for when this query shape was added to the store. Set on construction.
      */
-    const Timestamp firstSeenTimestamp;
+    const Date_t firstSeenTimestamp;
+
+    /**
+     * Timestamp for when the latest time this query shape was seen.
+     */
+    Date_t latestSeenTimestamp;
 
     /**
      * Last execution time in microseconds.
@@ -149,14 +159,22 @@ public:
      */
     uint64_t execCount = 0;
 
-    AggregatedMetric queryExecMicros;
+    /**
+     * Aggregates the total time for execution including getMore requests.
+     */
+    AggregatedMetric totalExecMicros;
+
+    /**
+     * Aggregates the time for execution for first batch only.
+     */
+    AggregatedMetric firstResponseExecMicros;
 
     AggregatedMetric docsReturned;
 
     /**
-     * The RequestShapifier that can generate the query stats key for this request.
+     * The KeyGenerator that can generate the query stats key for this request.
      */
-    std::unique_ptr<RequestShapifier> requestShapifier;
+    std::unique_ptr<KeyGenerator> keyGenerator;
 
     NamespaceStringOrUUID nss;
 };
@@ -214,7 +232,7 @@ QueryStatsStore& getQueryStatsStore(OperationContext* opCtx);
  *   optimizing it, in order to preserve the user's input for the query shape.
  * - Calling this affects internal state. It should be called exactly once for each request for
  *   which query stats may be collected.
- * - The std::function argument to construct an abstracted RequestShapifier is provided to break
+ * - The std::function argument to construct an abstracted KeyGenerator is provided to break
  *   library cycles so this library does not need to know how to parse everything. It is done as a
  *   deferred construction callback to ensure that this feature does not impact performance if
  *   collecting stats is not needed due to the feature being disabled or the request being rate
@@ -222,7 +240,7 @@ QueryStatsStore& getQueryStatsStore(OperationContext* opCtx);
  */
 void registerRequest(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                      const NamespaceString& collection,
-                     std::function<std::unique_ptr<RequestShapifier>(void)> makeShapifier);
+                     std::function<std::unique_ptr<KeyGenerator>(void)> makeKeyGenerator);
 
 /**
  * Writes query stats to the query stats store for the operation identified by `queryStatsKeyHash`.
@@ -236,8 +254,9 @@ void registerRequest(const boost::intrusive_ptr<ExpressionContext>& expCtx,
  */
 void writeQueryStats(OperationContext* opCtx,
                      boost::optional<size_t> queryStatsKeyHash,
-                     std::unique_ptr<RequestShapifier> requestShapifier,
+                     std::unique_ptr<KeyGenerator> keyGenerator,
                      uint64_t queryExecMicros,
+                     uint64_t firstResponseExecMicros,
                      uint64_t docsReturned);
 }  // namespace query_stats
 }  // namespace mongo

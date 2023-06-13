@@ -37,6 +37,7 @@
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_set_window_fields_gen.h"
 #include "mongo/db/pipeline/expression_dependencies.h"
+#include "mongo/db/pipeline/percentile_algo.h"
 #include "mongo/db/pipeline/window_function/window_bounds.h"
 #include "mongo/db/pipeline/window_function/window_function.h"
 #include "mongo/db/query/datetime/date_time_support.h"
@@ -502,9 +503,9 @@ public:
         MutableDocument subObj;
         tassert(5433604, "ExpMovingAvg neither N nor alpha was set", _N || _alpha);
         if (_N) {
-            subObj[kNArg] = opts.serializeLiteralValue(_N.get());
+            subObj[kNArg] = opts.serializeLiteral(_N.get());
         } else {
-            subObj[kAlphaArg] = opts.serializeLiteralValue(_alpha.get());
+            subObj[kAlphaArg] = opts.serializeLiteral(_alpha.get());
         }
         subObj[kInputArg] = _input->serialize(opts);
         MutableDocument outerObj;
@@ -946,7 +947,7 @@ public:
                        boost::intrusive_ptr<::mongo::Expression> initializeExpr,
                        WindowBounds bounds,
                        std::vector<double> ps,
-                       int32_t method)
+                       PercentileMethod method)
         : Expression(expCtx, std::move(accumulatorName), std::move(input), std::move(bounds)),
           _ps(std::move(ps)),
           _method(method),
@@ -960,7 +961,7 @@ public:
 
 private:
     std::vector<double> _ps;
-    int32_t _method;
+    PercentileMethod _method;
     boost::intrusive_ptr<::mongo::Expression> _intializeExpr;
 };
 

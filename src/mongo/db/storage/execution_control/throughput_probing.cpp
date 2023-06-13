@@ -155,7 +155,7 @@ void ThroughputProbing::_probeStable(double throughput) {
     _stableThroughput = throughput;
 
     auto readTotal = _readTicketHolder->outof();
-    auto writeTotal = _readTicketHolder->outof();
+    auto writeTotal = _writeTicketHolder->outof();
     auto readPeak = _readTicketHolder->getAndResetPeakUsed();
     auto writePeak = _writeTicketHolder->getAndResetPeakUsed();
 
@@ -227,9 +227,7 @@ void ThroughputProbing::_probeDown(double throughput) {
 }
 
 void ThroughputProbing::_setConcurrency(double concurrency) {
-    auto ratio = gReadWriteRatio.load();
-    auto total = ratio + 1;
-    auto readPct = ratio / total;
+    auto readPct = gReadWriteRatio.load();
     auto writePct = 1 - readPct;
 
     _readTicketHolder->resize(std::clamp(static_cast<int>(std::round(concurrency * readPct)),

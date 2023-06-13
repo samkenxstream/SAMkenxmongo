@@ -422,9 +422,10 @@ WiredTigerKVEngine::WiredTigerKVEngine(OperationContext* opCtx,
         ss << "debug_mode=(cursor_copy=true),";
     }
     if constexpr (kThreadSanitizerEnabled) {
-        // TSAN builds may take longer for certain operations, increase the relevant timeouts.
+        // TSAN builds may take longer for certain operations, increase or disable the relevant
+        // timeouts.
         ss << "cache_stuck_timeout_ms=600000,";
-        ss << "generation_drain_timeout_ms=480000,";
+        ss << "generation_drain_timeout_ms=0,";
     }
     if (TestingProctor::instance().isEnabled()) {
         // Enable debug write-ahead logging for all tables when testing is enabled.
@@ -1905,6 +1906,10 @@ Status WiredTigerKVEngine::dropIdent(RecoveryUnit* ru,
 
 void WiredTigerKVEngine::dropIdentForImport(OperationContext* opCtx, StringData ident) {
     const std::string uri = _uri(ident);
+
+    WiredTigerRecoveryUnit* wtRu = checked_cast<WiredTigerRecoveryUnit*>(opCtx->recoveryUnit());
+    wtRu->getSessionNoTxn()->closeAllCursors(uri);
+    _sessionCache->closeAllCursors(uri);
 
     WiredTigerSession session(_conn);
 

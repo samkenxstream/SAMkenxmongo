@@ -217,7 +217,8 @@ Value DocumentSourceCursor::serialize(SerializationOptions opts) const {
     auto verbosity = opts.verbosity;
     // We never parse a DocumentSourceCursor, so we only serialize for explain. Since it's never
     // part of user input, there's no need to compute its query shape.
-    if (!verbosity || opts.transformIdentifiers || opts.replacementForLiteralArgs)
+    if (!verbosity || opts.transformIdentifiers ||
+        opts.literalPolicy != LiteralSerializationPolicy::kUnchanged)
         return Value();
 
     invariant(_exec);
@@ -348,7 +349,7 @@ DocumentSourceCursor::DocumentSourceCursor(
     for (auto& [nss, coll] : collections.getSecondaryCollections()) {
         if (coll) {
             PlanSummaryStats stats;
-            explainer.getSecondarySummaryStats(nss.toString(), &stats);
+            explainer.getSecondarySummaryStats(nss, &stats);
             CollectionQueryInfo::get(coll).notifyOfQuery(pExpCtx->opCtx, coll, stats);
         }
     }

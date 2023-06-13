@@ -75,11 +75,6 @@ namespace mongo {
 namespace {
 const auto getTTLMonitor = ServiceContext::declareDecoration<std::unique_ptr<TTLMonitor>>();
 
-bool isBatchingEnabled() {
-    return feature_flags::gBatchMultiDeletes.isEnabled(serverGlobalParams.featureCompatibility) &&
-        ttlMonitorBatchDeletes.load();
-}
-
 // When batching is enabled, returns BatchedDeleteStageParams that limit the amount of work done in
 // a delete such that it is possible not all expired documents will be removed. Returns nullptr
 // otherwise.
@@ -509,13 +504,7 @@ bool TTLMonitor::_doTTLIndexDelete(OperationContext* opCtx,
                                    TTLCollectionCache* ttlCollectionCache,
                                    const UUID& uuid,
                                    const TTLCollectionCache::Info& info) {
-    // Skip collections that have not been made visible yet. The TTLCollectionCache
-    // already has the index information available, so we want to avoid removing it
-    // until the collection is visible.
     auto collectionCatalog = CollectionCatalog::get(opCtx);
-    if (collectionCatalog->isCollectionAwaitingVisibility(uuid)) {
-        return false;
-    }
 
     // The collection was dropped.
     auto nss = collectionCatalog->lookupNSSByUUID(opCtx, uuid);
@@ -710,7 +699,7 @@ bool TTLMonitor::_deleteExpiredWithIndex(OperationContext* opCtx,
     // Maintain a consistent view of whether batching is enabled - batching depends on
     // parameters that can be set at runtime, and it is illegal to try to get
     // BatchedDeleteStageStats from a non-batched delete.
-    bool batchingEnabled = isBatchingEnabled();
+    const bool batchingEnabled = ttlMonitorBatchDeletes.load();
 
     Timer timer;
     auto exec = InternalPlanner::deleteWithIndexScan(opCtx,
@@ -783,7 +772,7 @@ bool TTLMonitor::_deleteExpiredWithCollscan(OperationContext* opCtx,
     // Maintain a consistent view of whether batching is enabled - batching depends on
     // parameters that can be set at runtime, and it is illegal to try to get
     // BatchedDeleteStageStats from a non-batched delete.
-    bool batchingEnabled = isBatchingEnabled();
+    const bool batchingEnabled = ttlMonitorBatchDeletes.load();
 
     // Deletes records using a bounded collection scan from the beginning of time to the
     // expiration time (inclusive).
@@ -848,9 +837,6 @@ void TTLMonitor::onStepUp(OperationContext* opCtx) {
     auto ttlInfos = ttlCollectionCache.getTTLInfos();
     for (const auto& [uuid, infos] : ttlInfos) {
         auto collectionCatalog = CollectionCatalog::get(opCtx);
-        if (collectionCatalog->isCollectionAwaitingVisibility(uuid)) {
-            continue;
-        }
 
         // The collection was dropped.
         auto nss = collectionCatalog->lookupNSSByUUID(opCtx, uuid);

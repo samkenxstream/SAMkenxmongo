@@ -569,7 +569,8 @@ env.Library(
     target='change_stream_pre_images_collection_manager',
     source=[
         'change_stream_pre_images_collection_manager.cpp',
-        'change_stream_pre_images_truncate_markers.cpp'
+        'change_stream_pre_images_truncate_manager.cpp',
+        'change_stream_pre_images_truncate_markers_per_nsUUID.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/pipeline/change_stream_preimage',
@@ -594,10 +595,12 @@ env.CppUnitTest(
     target='change_stream_pre_images_manager_test',
     source=[
         'change_stream_pre_images_remover_test.cpp',
+        'change_stream_pre_images_truncate_manager_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/catalog/catalog_test_fixture',
         '$BUILD_DIR/mongo/db/catalog/collection_catalog',
+        '$BUILD_DIR/mongo/db/catalog/collection_crud',
         '$BUILD_DIR/mongo/db/op_observer/op_observer',
         '$BUILD_DIR/mongo/db/op_observer/op_observer_impl',
         '$BUILD_DIR/mongo/db/op_observer/oplog_writer_impl',
@@ -608,6 +611,7 @@ env.CppUnitTest(
         'change_stream_pre_images_collection_manager',
         'change_stream_serverless_helpers',
         'change_streams_cluster_parameter',
+        'shard_role',
     ],
 )
 
@@ -843,8 +847,6 @@ env.Library(
         'server_base',
         'stats/resource_consumption_metrics',
         'stats/timer_stats',
-        # TODO (SERVER-66896): Remove this dependency.
-        'storage/storage_engine_feature_flags',
         'timeseries/timeseries_options',
     ],
 )
@@ -1110,6 +1112,19 @@ env.Library(
         'storage/storage_engine_lock_file',
         'storage/storage_engine_metadata',
         'storage/storage_options',
+    ],
+)
+
+env.Library(
+    target='service_context_non_d',
+    source=[
+        'transaction_resources_decoration_non_mongod.cpp',
+    ],
+    LIBDEPS=[
+        'service_context',
+    ],
+    LIBDEPS_PRIVATE=[
+        'concurrency/lock_manager',
     ],
 )
 
@@ -1975,6 +1990,19 @@ env.Library(
 )
 
 env.Library(
+    target='keys_collection_util',
+    source=[
+        'keys_collection_util.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/concurrency/exception_util',
+        'dbhelpers',
+        'keys_collection_document',
+        'shard_role',
+    ],
+)
+
+env.Library(
     target='keys_collection_client_direct',
     source=[
         'keys_collection_client_direct.cpp',
@@ -2113,6 +2141,13 @@ env.Library(
     ],
 )
 
+# This library is the base class for tests which require the presence of ServiceContext. However it
+# does not perform any default initialisation of the relevant services, such as lockers and
+# transaction resources, so any test which directly references it must perform its own
+# initialisation.
+#
+# If a test requires the presence of a storage engine, it should use the
+# service_context_d_test_fixture below directly.
 env.Library(
     target='service_context_test_fixture',
     source=[
@@ -2792,16 +2827,5 @@ env.Benchmark(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/idl/idl_parser',
-    ],
-)
-
-env.Benchmark(
-    target='operation_cpu_timer_bm',
-    source=[
-        'operation_cpu_timer_bm.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
-        'service_context',
     ],
 )

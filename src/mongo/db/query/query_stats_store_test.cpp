@@ -30,10 +30,11 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/query/aggregate_request_shapifier.h"
-#include "mongo/db/query/find_request_shapifier.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/query_shape.h"
 #include "mongo/db/query/query_stats.h"
+#include "mongo/db/query/query_stats_aggregate_key_generator.h"
+#include "mongo/db/query/query_stats_find_key_generator.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/unittest/inline_auto_update.h"
@@ -53,26 +54,19 @@ std::size_t hash(const BSONObj& obj) {
 
 class QueryStatsStoreTest : public ServiceContextTest {
 public:
-    BSONObj makeQueryStatsKeyFindRequest(
-        const FindCommandRequest& fcr,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        bool applyHmac = false,
-        LiteralSerializationPolicy literalPolicy = LiteralSerializationPolicy::kUnchanged) {
+    BSONObj makeQueryStatsKeyFindRequest(const FindCommandRequest& fcr,
+                                         const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                         bool applyHmac) {
         auto fcrCopy = std::make_unique<FindCommandRequest>(fcr);
         auto parsedFind = uassertStatusOK(parsed_find_command::parse(expCtx, std::move(fcrCopy)));
-        FindRequestShapifier findShapifier(expCtx, *parsedFind);
-
-        SerializationOptions opts;
-        if (literalPolicy != LiteralSerializationPolicy::kUnchanged) {
-            // TODO SERVER-75400 Use only 'literalPolicy.'
-            opts.replacementForLiteralArgs = "?";
-            opts.literalPolicy = literalPolicy;
-        }
-        if (applyHmac) {
-            opts.transformIdentifiers = true;
-            opts.transformIdentifiersCallback = applyHmacForTest;
-        }
-        return findShapifier.makeQueryStatsKey(opts, expCtx);
+        auto queryShape = query_shape::extractQueryShape(
+            *parsedFind, SerializationOptions::kRepresentativeQueryShapeSerializeOptions, expCtx);
+        FindKeyGenerator findKeyGenerator(expCtx, *parsedFind, queryShape);
+        return findKeyGenerator.generate(
+            expCtx->opCtx,
+            applyHmac
+                ? boost::optional<SerializationOptions::TokenizeIdentifierFunc>(applyHmacForTest)
+                : boost::none);
     }
 
     BSONObj makeTelemetryKeyAggregateRequest(
@@ -81,19 +75,14 @@ public:
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         bool applyHmac = false,
         LiteralSerializationPolicy literalPolicy = LiteralSerializationPolicy::kUnchanged) {
-        AggregateRequestShapifier aggShapifier(acr, pipeline, expCtx);
+        AggregateKeyGenerator aggKeyGenerator(acr, pipeline, expCtx, acr.getNamespace());
 
-        SerializationOptions opts;
-        if (literalPolicy != LiteralSerializationPolicy::kUnchanged) {
-            // TODO SERVER-75419 Use only 'literalPolicy.'
-            opts.replacementForLiteralArgs = "?";
-            opts.literalPolicy = literalPolicy;
-        }
+        SerializationOptions opts(literalPolicy);
         if (applyHmac) {
             opts.transformIdentifiers = true;
             opts.transformIdentifiersCallback = applyHmacForTest;
         }
-        return aggShapifier.makeQueryStatsKey(opts, expCtx);
+        return aggKeyGenerator.makeQueryStatsKeyForTest(opts, expCtx);
     }
 };
 
@@ -176,12 +165,12 @@ TEST_F(QueryStatsStoreTest, EvictEntries) {
 
 TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
     auto expCtx = make_intrusive<ExpressionContextForTest>();
-    FindCommandRequest fcr(NamespaceStringOrUUID(NamespaceString("testDB.testColl")));
+    FindCommandRequest fcr(
+        NamespaceStringOrUUID(NamespaceString::createNamespaceString_forTest("testDB.testColl")));
 
     fcr.setFilter(BSON("a" << 1));
 
-    auto key = makeQueryStatsKeyFindRequest(
-        fcr, expCtx, true, LiteralSerializationPolicy::kToDebugTypeString);
+    auto key = makeQueryStatsKeyFindRequest(fcr, expCtx, true);
 
     ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
         R"({
@@ -196,14 +185,14 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
                         "$eq": "?number"
                     }
                 }
-            }
+            },
+            "collectionType": "collection"
         })",
         key);
 
     // Add sort.
     fcr.setSort(BSON("sortVal" << 1 << "otherSort" << -1));
-    key = makeQueryStatsKeyFindRequest(
-        fcr, expCtx, true, LiteralSerializationPolicy::kToDebugTypeString);
+    key = makeQueryStatsKeyFindRequest(fcr, expCtx, true);
     ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
         R"({
             "queryShape": {
@@ -221,14 +210,14 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
                     "HASH<sortVal>": 1,
                     "HASH<otherSort>": -1
                 }
-            }
+            },
+            "collectionType": "collection"
         })",
         key);
 
     // Add inclusion projection.
     fcr.setProjection(BSON("e" << true << "f" << true));
-    key = makeQueryStatsKeyFindRequest(
-        fcr, expCtx, true, LiteralSerializationPolicy::kToDebugTypeString);
+    key = makeQueryStatsKeyFindRequest(fcr, expCtx, true);
     ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
         R"({
             "queryShape": {
@@ -251,15 +240,15 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
                     "HASH<sortVal>": 1,
                     "HASH<otherSort>": -1
                 }
-            }
+            },
+            "collectionType": "collection"
         })",
         key);
 
     // Add let.
     fcr.setLet(BSON("var1" << 1 << "var2"
                            << "const1"));
-    key = makeQueryStatsKeyFindRequest(
-        fcr, expCtx, true, LiteralSerializationPolicy::kToDebugTypeString);
+    key = makeQueryStatsKeyFindRequest(fcr, expCtx, true);
     ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
         R"({
             "queryShape": {
@@ -286,7 +275,8 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
                     "HASH<sortVal>": 1,
                     "HASH<otherSort>": -1
                 }
-            }
+            },
+            "collectionType": "collection"
         })",
         key);
 
@@ -294,8 +284,7 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
     fcr.setHint(BSON("z" << 1 << "c" << 1));
     fcr.setMax(BSON("z" << 25));
     fcr.setMin(BSON("z" << 80));
-    key = makeQueryStatsKeyFindRequest(
-        fcr, expCtx, true, LiteralSerializationPolicy::kToDebugTypeString);
+    key = makeQueryStatsKeyFindRequest(fcr, expCtx, true);
     ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
         R"({
             "queryShape": {
@@ -323,16 +312,17 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
                     "HASH<c>": 1
                 },
                 "max": {
-                    "HASH<z>": "?"
+                    "HASH<z>": "?number"
                 },
                 "min": {
-                    "HASH<z>": "?"
+                    "HASH<z>": "?number"
                 },
                 "sort": {
                     "HASH<sortVal>": 1,
                     "HASH<otherSort>": -1
                 }
-            }
+            },
+            "collectionType": "collection"
         })",
         key);
 
@@ -343,8 +333,7 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
     fcr.setMaxTimeMS(1000);
     fcr.setNoCursorTimeout(false);
 
-    key = makeQueryStatsKeyFindRequest(
-        fcr, expCtx, true, LiteralSerializationPolicy::kToDebugTypeString);
+    key = makeQueryStatsKeyFindRequest(fcr, expCtx, true);
 
     ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
         R"({
@@ -373,10 +362,10 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
                     "HASH<c>": 1
                 },
                 "max": {
-                    "HASH<z>": "?"
+                    "HASH<z>": "?number"
                 },
                 "min": {
-                    "HASH<z>": "?"
+                    "HASH<z>": "?number"
                 },
                 "sort": {
                     "HASH<sortVal>": 1,
@@ -386,9 +375,9 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
                 "skip": "?number"
             },
             "maxTimeMS": "?number",
-            "batchSize": "?number"
-            }
-        )",
+            "batchSize": "?number",
+            "collectionType": "collection"
+        })",
         key);
 
     // Add the fields that shouldn't be hmacApplied.
@@ -397,10 +386,8 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
     fcr.setAllowPartialResults(true);
     fcr.setAllowDiskUse(false);
     fcr.setShowRecordId(true);
-    fcr.setAwaitData(false);
     fcr.setMirrored(true);
-    key = makeQueryStatsKeyFindRequest(
-        fcr, expCtx, true, LiteralSerializationPolicy::kToDebugTypeString);
+    key = makeQueryStatsKeyFindRequest(fcr, expCtx, true);
 
     ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
         R"({
@@ -429,10 +416,10 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
                     "HASH<c>": 1
                 },
                 "max": {
-                    "HASH<z>": "?"
+                    "HASH<z>": "?number"
                 },
                 "min": {
-                    "HASH<z>": "?"
+                    "HASH<z>": "?number"
                 },
                 "sort": {
                     "HASH<sortVal>": 1,
@@ -440,21 +427,20 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
                 },
                 "limit": "?number",
                 "skip": "?number",
-                "singleBatch": "?bool",
-                "allowDiskUse": "?bool",
-                "showRecordId": "?bool",
-                "awaitData": "?bool",
-                "mirrored": "?bool"
+                "singleBatch": true,
+                "allowDiskUse": false,
+                "showRecordId": true,
+                "mirrored": true
             },
             "allowPartialResults": true,
             "maxTimeMS": "?number",
-            "batchSize": "?number"
+            "batchSize": "?number",
+            "collectionType": "collection"
         })",
         key);
 
     fcr.setAllowPartialResults(false);
-    key = makeQueryStatsKeyFindRequest(
-        fcr, expCtx, true, LiteralSerializationPolicy::kToDebugTypeString);
+    key = makeQueryStatsKeyFindRequest(fcr, expCtx, true);
     // Make sure that a false allowPartialResults is also accurately captured.
     ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
         R"({
@@ -483,10 +469,10 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
                     "HASH<c>": 1
                 },
                 "max": {
-                    "HASH<z>": "?"
+                    "HASH<z>": "?number"
                 },
                 "min": {
-                    "HASH<z>": "?"
+                    "HASH<z>": "?number"
                 },
                 "sort": {
                     "HASH<sortVal>": 1,
@@ -494,28 +480,52 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
                 },
                 "limit": "?number",
                 "skip": "?number",
-                "singleBatch": "?bool",
-                "allowDiskUse": "?bool",
-                "showRecordId": "?bool",
-                "awaitData": "?bool",
-                "mirrored": "?bool"
+                "singleBatch": true,
+                "allowDiskUse": false,
+                "showRecordId": true,
+                "mirrored": true
             },
             "allowPartialResults": false,
             "maxTimeMS": "?number",
-            "batchSize": "?number"
+            "batchSize": "?number",
+            "collectionType": "collection"
+        })",
+        key);
+
+    FindCommandRequest fcr2(NamespaceStringOrUUID(NamespaceString("testDB.testColl")));
+    fcr2.setAwaitData(true);
+    fcr2.setTailable(true);
+    fcr2.setSort(BSON("$natural" << 1));
+    key = makeQueryStatsKeyFindRequest(fcr2, expCtx, true);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "queryShape": {
+                "cmdNs": {
+                    "db": "HASH<testDB>",
+                    "coll": "HASH<testColl>"
+                },
+                "command": "find",
+                "filter": {},
+                "hint": {
+                    "$natural": 1
+                },
+                "tailable": true,
+                "awaitData": true
+            },
+            "collectionType": "collection"
         })",
         key);
 }
 
 TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestEmptyFields) {
     auto expCtx = make_intrusive<ExpressionContextForTest>();
-    FindCommandRequest fcr(NamespaceStringOrUUID(NamespaceString("testDB.testColl")));
+    FindCommandRequest fcr(
+        NamespaceStringOrUUID(NamespaceString::createNamespaceString_forTest("testDB.testColl")));
     fcr.setFilter(BSONObj());
     fcr.setSort(BSONObj());
     fcr.setProjection(BSONObj());
 
-    auto hmacApplied = makeQueryStatsKeyFindRequest(
-        fcr, expCtx, true, LiteralSerializationPolicy::kToDebugTypeString);
+    auto hmacApplied = makeQueryStatsKeyFindRequest(fcr, expCtx, true);
     ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
         R"({
             "queryShape": {
@@ -525,22 +535,23 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestEmptyFields) {
                 },
                 "command": "find",
                 "filter": {}
-            }
+            },
+            "collectionType": "collection"
         })",
         hmacApplied);  // NOLINT (test auto-update)
 }
 
 TEST_F(QueryStatsStoreTest, CorrectlyRedactsHintsWithOptions) {
     auto expCtx = make_intrusive<ExpressionContextForTest>();
-    FindCommandRequest fcr(NamespaceStringOrUUID(NamespaceString("testDB.testColl")));
+    FindCommandRequest fcr(
+        NamespaceStringOrUUID(NamespaceString::createNamespaceString_forTest("testDB.testColl")));
 
     fcr.setFilter(BSON("b" << 1));
     fcr.setHint(BSON("z" << 1 << "c" << 1));
     fcr.setMax(BSON("z" << 25));
     fcr.setMin(BSON("z" << 80));
 
-    auto key = makeQueryStatsKeyFindRequest(
-        fcr, expCtx, false, LiteralSerializationPolicy::kToDebugTypeString);
+    auto key = makeQueryStatsKeyFindRequest(fcr, expCtx, false);
 
     ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
         R"({
@@ -560,12 +571,13 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsHintsWithOptions) {
                     "c": 1
                 },
                 "max": {
-                    "z": "?"
+                    "z": "?number"
                 },
                 "min": {
-                    "z": "?"
+                    "z": "?number"
                 }
-            }
+            },
+            "collectionType": "collection"
         })",
         key);
     // Test with a string hint. Note that this is the internal representation of the string hint
@@ -573,8 +585,7 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsHintsWithOptions) {
     fcr.setHint(BSON("$hint"
                      << "z"));
 
-    key = makeQueryStatsKeyFindRequest(
-        fcr, expCtx, false, LiteralSerializationPolicy::kToDebugTypeString);
+    key = makeQueryStatsKeyFindRequest(fcr, expCtx, false);
     ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
         R"({
             "queryShape": {
@@ -592,46 +603,18 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsHintsWithOptions) {
                     "$hint": "z"
                 },
                 "max": {
-                    "z": "?"
+                    "z": "?number"
                 },
                 "min": {
-                    "z": "?"
+                    "z": "?number"
                 }
-            }
+            },
+            "collectionType": "collection"
         })",
         key);
 
     fcr.setHint(BSON("z" << 1 << "c" << 1));
-    key = makeQueryStatsKeyFindRequest(fcr, expCtx, true, LiteralSerializationPolicy::kUnchanged);
-    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
-        R"({
-            "queryShape": {
-                "cmdNs": {
-                    "db": "HASH<testDB>",
-                    "coll": "HASH<testColl>"
-                },
-                "command": "find",
-                "filter": {
-                    "HASH<b>": {
-                        "$eq": 1
-                    }
-                },
-                "hint": {
-                    "HASH<z>": 1,
-                    "HASH<c>": 1
-                },
-                "max": {
-                    "HASH<z>": 25
-                },
-                "min": {
-                    "HASH<z>": 80
-                }
-            }
-        })",
-        key);
-
-    key = makeQueryStatsKeyFindRequest(
-        fcr, expCtx, true, LiteralSerializationPolicy::kToDebugTypeString);
+    key = makeQueryStatsKeyFindRequest(fcr, expCtx, true);
     ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
         R"({
             "queryShape": {
@@ -650,19 +633,19 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsHintsWithOptions) {
                     "HASH<c>": 1
                 },
                 "max": {
-                    "HASH<z>": "?"
+                    "HASH<z>": "?number"
                 },
                 "min": {
-                    "HASH<z>": "?"
+                    "HASH<z>": "?number"
                 }
-            }
+            },
+            "collectionType": "collection"
         })",
         key);
 
     // Test that $natural comes through unmodified.
     fcr.setHint(BSON("$natural" << -1));
-    key = makeQueryStatsKeyFindRequest(
-        fcr, expCtx, true, LiteralSerializationPolicy::kToDebugTypeString);
+    key = makeQueryStatsKeyFindRequest(fcr, expCtx, true);
     ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
         R"({
             "queryShape": {
@@ -680,12 +663,13 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsHintsWithOptions) {
                     "$natural": -1
                 },
                 "max": {
-                    "HASH<z>": "?"
+                    "HASH<z>": "?number"
                 },
                 "min": {
-                    "HASH<z>": "?"
+                    "HASH<z>": "?number"
                 }
-            }
+            },
+            "collectionType": "collection"
         })",
         key);
 }
@@ -698,7 +682,7 @@ TEST_F(QueryStatsStoreTest, DefinesLetVariables) {
     // 'makeQueryStatsKey' call to do that.
     auto opCtx = makeOperationContext();
     auto fcr = std::make_unique<FindCommandRequest>(
-        NamespaceStringOrUUID(NamespaceString("testDB.testColl")));
+        NamespaceStringOrUUID(NamespaceString::createNamespaceString_forTest("testDB.testColl")));
     fcr->setLet(BSON("var" << 2));
     fcr->setFilter(fromjson("{$expr: [{$eq: ['$a', '$$var']}]}"));
     fcr->setProjection(fromjson("{varIs: '$$var'}"));
@@ -707,8 +691,10 @@ TEST_F(QueryStatsStoreTest, DefinesLetVariables) {
                                          << "testDB"));
     auto&& [expCtx, parsedFind] =
         uassertStatusOK(parsed_find_command::parse(opCtx.get(), std::move(fcr)));
+    auto queryShape = query_shape::extractQueryShape(
+        *parsedFind, SerializationOptions::kRepresentativeQueryShapeSerializeOptions, expCtx);
     QueryStatsEntry testMetrics{
-        std::make_unique<query_stats::FindRequestShapifier>(expCtx, *parsedFind),
+        std::make_unique<query_stats::FindKeyGenerator>(expCtx, *parsedFind, queryShape),
         parsedFind->findCommandRequest->getNamespaceOrUUID()};
 
     auto hmacApplied =
@@ -738,7 +724,8 @@ TEST_F(QueryStatsStoreTest, DefinesLetVariables) {
                     "varIs": "$$var",
                     "_id": true
                 }
-            }
+            },
+            "collectionType": "collection"
         })",
         hmacApplied);
 
@@ -771,14 +758,15 @@ TEST_F(QueryStatsStoreTest, DefinesLetVariables) {
                     "BL649QER7lTs0+8ozTMVNAa6JNjbhf57YT8YQ4EkT1E=": "$$adaJc6H3zDirh5/52MLv5yvnb6nXNP15Z4HzGfumvx8=",
                     "ljovqLSfuj6o2syO1SynOzHQK1YVij6+Wlx1fL8frUo=": true
                 }
-            }
+            },
+            "collectionType": "collection"
         })",
         hmacApplied);
 }
 
 TEST_F(QueryStatsStoreTest, CorrectlyRedactsAggregateCommandRequestAllFieldsSimplePipeline) {
     auto expCtx = make_intrusive<ExpressionContextForTest>();
-    AggregateCommandRequest acr(NamespaceString("testDB.testColl"));
+    AggregateCommandRequest acr(NamespaceString::createNamespaceString_forTest("testDB.testColl"));
     auto matchStage = fromjson(R"({
             $match: {
                 foo: { $in: ["a", "b"] },
@@ -850,7 +838,8 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsAggregateCommandRequestAllFieldsSimp
                         }
                     }
                 ]
-            }
+            },
+            "collectionType": "collection"
         })",
         shapified);
 
@@ -898,7 +887,7 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsAggregateCommandRequestAllFieldsSimp
                         }
                     },
                     {
-                        "$limit": "?"
+                        "$limit": "?number"
                     },
                     {
                         "$out": {
@@ -907,7 +896,8 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsAggregateCommandRequestAllFieldsSimp
                         }
                     }
                 ]
-            }
+            },
+            "collectionType": "collection"
         })",
         shapified);
 
@@ -961,7 +951,7 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsAggregateCommandRequestAllFieldsSimp
                         }
                     },
                     {
-                        "$limit": "?"
+                        "$limit": "?number"
                     },
                     {
                         "$out": {
@@ -979,7 +969,8 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsAggregateCommandRequestAllFieldsSimp
                     "HASH<z>": 1,
                     "HASH<c>": 1
                 }
-            }
+            },
+            "collectionType": "collection"
         })",
         shapified);
 
@@ -1032,7 +1023,7 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsAggregateCommandRequestAllFieldsSimp
                         }
                     },
                     {
-                        "$limit": "?"
+                        "$limit": "?number"
                     },
                     {
                         "$out": {
@@ -1054,7 +1045,8 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsAggregateCommandRequestAllFieldsSimp
                     "HASH<var1>": "$HASH<foo>",
                     "HASH<var2>": "?string"
                 }
-            }
+            },
+            "collectionType": "collection"
         })",
         shapified);
 
@@ -1110,7 +1102,7 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsAggregateCommandRequestAllFieldsSimp
                         }
                     },
                     {
-                        "$limit": "?"
+                        "$limit": "?number"
                     },
                     {
                         "$out": {
@@ -1138,13 +1130,14 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsAggregateCommandRequestAllFieldsSimp
             },
             "maxTimeMS": "?number",
             "bypassDocumentValidation": "?bool",
-            "comment": "?string"
+            "comment": "?string",
+            "collectionType": "collection"
         })",
         shapified);
 }
 TEST_F(QueryStatsStoreTest, CorrectlyRedactsAggregateCommandRequestEmptyFields) {
     auto expCtx = make_intrusive<ExpressionContextForTest>();
-    AggregateCommandRequest acr(NamespaceString("testDB.testColl"));
+    AggregateCommandRequest acr(NamespaceString::createNamespaceString_forTest("testDB.testColl"));
     acr.setPipeline({});
     auto pipeline = Pipeline::parse({}, expCtx);
 
@@ -1159,7 +1152,8 @@ TEST_F(QueryStatsStoreTest, CorrectlyRedactsAggregateCommandRequestEmptyFields) 
                 },
                 "command": "aggregate",
                 "pipeline": []
-            }
+            },
+            "collectionType": "collection"
         })",
         shapified);  // NOLINT (test auto-update)
 }

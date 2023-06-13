@@ -29,6 +29,7 @@
 
 #include "mongo/db/query/sbe_stage_builder.h"
 
+#include "mongo/db/exec/shard_filterer_impl.h"
 #include <fmt/format.h>
 
 #include "mongo/db/catalog/clustered_collection_util.h"
@@ -206,13 +207,20 @@ void prepareSlotBasedExecutableTree(OperationContext* opCtx,
     // Populate/renew "shardFilterer" if there exists a "shardFilterer" slot. The slot value should
     // be set to Nothing in the plan cache to avoid extending the lifetime of the ownership filter.
     if (auto shardFiltererSlot = env->getSlotIfExists("shardFilterer"_sd)) {
-        const auto& collection = collections.getMainCollection();
-        tassert(6108307,
-                "Setting shard filterer slot on un-sharded collection",
-                collection.isSharded());
+        auto shardFilterer = [&]() -> std::unique_ptr<ShardFilterer> {
+            if (collections.isAcquisition()) {
+                return std::make_unique<ShardFiltererImpl>(
+                    *collections.getMainAcquisition()->getShardingFilter());
+            } else {
+                const auto& collection = collections.getMainCollection();
+                tassert(6108307,
+                        "Setting shard filterer slot on un-sharded collection",
+                        collection.isSharded());
 
-        ShardFiltererFactoryImpl shardFiltererFactory(collection);
-        auto shardFilterer = shardFiltererFactory.makeShardFilterer(opCtx);
+                ShardFiltererFactoryImpl shardFiltererFactory(collection);
+                return shardFiltererFactory.makeShardFilterer(opCtx);
+            }
+        }();
         env->resetSlot(*shardFiltererSlot,
                        sbe::value::TypeTags::shardFilterer,
                        sbe::value::bitcastFrom<ShardFilterer*>(shardFilterer.release()),
@@ -394,13 +402,18 @@ SlotBasedStageBuilder::SlotBasedStageBuilder(OperationContext* opCtx,
     // SERVER-52803: In the future if we need to gather more information from the QuerySolutionNode
     // tree, rather than doing one-off scans for each piece of information, we should add a formal
     // analysis pass here.
-    // NOTE: Currently, we assume that each query operates on at most one collection, so there can
-    // be only one STAGE_COLLSCAN node.
+    // Currently, we assume that each query operates on at most one collection, but a rooted $or
+    // queries can have more than one collscan stages with clustered collections.
     auto [node, ct] = getFirstNodeByType(solution.root(), STAGE_COLLSCAN);
-    const auto count = ct;
+    auto [_, orCt] = getFirstNodeByType(solution.root(), STAGE_OR);
+    const unsigned long numCollscanStages = ct;
+    const unsigned long numOrStages = orCt;
     tassert(7182000,
-            str::stream() << "Found " << count << " nodes of type COLLSCAN, expected one or zero",
-            count <= 1);
+            str::stream() << "Found " << numCollscanStages << " nodes of type COLLSCAN, and "
+                          << numOrStages
+                          << " nodes of type OR, expected less than one COLLSCAN nodes or at "
+                             "least one OR stage.",
+            numCollscanStages <= 1 || numOrStages > 0);
 
     if (node) {
         auto csn = static_cast<const CollectionScanNode*>(node);
@@ -2495,8 +2508,8 @@ sbe::value::SlotVector generateAccumulator(
                         str::stream()
                             << accStmt.expr.name << " accumulator must have an object argument",
                         objConst.isObject());
-                auto outputField =
-                    objConst.getDocument().toBson().getField(AccumulatorN::kFieldNameOutput);
+                auto objBson = objConst.getDocument().toBson();
+                auto outputField = objBson.getField(AccumulatorN::kFieldNameOutput);
                 if (outputField.ok()) {
                     auto [outputTag, outputVal] =
                         sbe::bson::convertFrom<false /* View */>(outputField);

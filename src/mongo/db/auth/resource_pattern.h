@@ -55,21 +55,15 @@ class ResourcePattern {
 
 public:
     // TODO (SERVER-76195) Remove legacy non-tenant aware APIs from ResourcePattern
-    // forAnyResource() - Remove boost::none default.
     // forAnyNormalResource() - Remove boost::none default.
     // forClusterResource() - Remove boost::none default.
-    // forDatabaseName() - Remove `StringData` variant.
     // forCollectionName() - Remove variant without tenantId arg.
-    // forAnySystemBuckets() - Remove boost::none default.
-    // forAnySystemBucketsInDatabase() - Remove `StringData` variant.
-    // forAnySystemBucketsInAnyDatabase() - Remove variant without tenantId arg.
-    // forExactSystemBucketsCollection() - Remove variant with discrete db/coll args.
     // databaseToMatch() - Remove in favor of dbNameToMatch.
 
     /**
      * Returns a pattern that matches absolutely any resource.
      */
-    static ResourcePattern forAnyResource(const boost::optional<TenantId>& tenantId = boost::none) {
+    static ResourcePattern forAnyResource(const boost::optional<TenantId>& tenantId) {
         return ResourcePattern(MatchTypeEnum::kMatchAnyResource, tenantId);
     }
 
@@ -100,12 +94,6 @@ public:
             NamespaceString::createNamespaceStringForAuth(dbName.tenantId(), dbName.db(), ""_sd));
     }
 
-    static ResourcePattern forDatabaseName(StringData dbName) {
-        return ResourcePattern(
-            MatchTypeEnum::kMatchDatabaseName,
-            NamespaceString::createNamespaceStringForAuth(boost::none, dbName, ""));
-    }
-
     /**
      * Returns a pattern that matches NamespaceStrings "ns" for which ns.coll() ==
      * collectionName.
@@ -132,8 +120,7 @@ public:
      * Returns a pattern that matches any collection with the prefix "system.buckets." in any
      * database.
      */
-    static ResourcePattern forAnySystemBuckets(
-        const boost::optional<TenantId>& tenantId = boost::none) {
+    static ResourcePattern forAnySystemBuckets(const boost::optional<TenantId>& tenantId) {
         return ResourcePattern(MatchTypeEnum::kMatchAnySystemBucketResource, tenantId);
     }
 
@@ -144,12 +131,6 @@ public:
     static ResourcePattern forAnySystemBucketsInDatabase(const DatabaseName& dbName) {
         return ResourcePattern(MatchTypeEnum::kMatchAnySystemBucketInDBResource,
                                NamespaceString(dbName));
-    }
-
-    static ResourcePattern forAnySystemBucketsInDatabase(StringData dbName) {
-        return ResourcePattern(
-            MatchTypeEnum::kMatchAnySystemBucketInDBResource,
-            NamespaceString::createNamespaceStringForAuth(boost::none, dbName, ""));
     }
 
     /**
@@ -163,23 +144,15 @@ public:
             NamespaceString::createNamespaceStringForAuth(boost::none, "", collectionName));
     }
 
-    static ResourcePattern forAnySystemBucketsInAnyDatabase(StringData collectionName) {
-        return forAnySystemBucketsInAnyDatabase(boost::none, collectionName);
-    }
-
     /**
      * Returns a pattern that matches a collection with the name
      * "<dbName>.system.buckets.<collectionName>"
      */
     static ResourcePattern forExactSystemBucketsCollection(const NamespaceString& nss) {
-        invariant(!nss.coll().startsWith("system.buckets."));
+        uassert(ErrorCodes::InvalidNamespace,
+                "Invalid namespace '{}.system.buckets.{}'"_format(nss.db(), nss.coll()),
+                !nss.coll().startsWith("system.buckets."));
         return ResourcePattern(MatchTypeEnum::kMatchExactSystemBucketResource, nss);
-    }
-
-    static ResourcePattern forExactSystemBucketsCollection(StringData dbName,
-                                                           StringData collectionName) {
-        return forExactSystemBucketsCollection(
-            NamespaceString::createNamespaceStringForAuth(boost::none, dbName, collectionName));
     }
 
     /**

@@ -1745,9 +1745,6 @@ Value parseAndSerializeAccumExpr(
     std::function<boost::intrusive_ptr<Expression>(
         ExpressionContext* expCtx, BSONElement, const VariablesParseState&)> func) {
     SerializationOptions options;
-    // TODO SERVER-75399 Use only 'literalPolicy.'
-    std::string replacementChar = "?";
-    options.replacementForLiteralArgs = replacementChar;
     options.literalPolicy = LiteralSerializationPolicy::kToDebugTypeString;
     options.transformIdentifiers = true;
     options.transformIdentifiersCallback = applyHmacForTest;
@@ -1761,9 +1758,6 @@ Document parseAndSerializeAccum(
     std::function<AccumulationExpression(
         ExpressionContext* const expCtx, BSONElement, VariablesParseState)> func) {
     SerializationOptions options;
-    // TODO SERVER-75399 Use only 'literalPolicy.'
-    std::string replacementChar = "?";
-    options.replacementForLiteralArgs = replacementChar;
     options.literalPolicy = LiteralSerializationPolicy::kToDebugTypeString;
     options.transformIdentifiers = true;
     options.transformIdentifiersCallback = applyHmacForTest;
@@ -1792,14 +1786,14 @@ TEST(Accumulators, SerializeWithRedaction) {
     ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
         R"({
             "$accumulator": {
-                "init": "?",
+                "init": "?string",
                 "initArgs": "[]",
-                "accumulate": "?",
+                "accumulate": "?string",
                 "accumulateArgs": [
                     "$HASH<a>",
                     "$HASH<b>"
                 ],
-                "merge": "?",
+                "merge": "?string",
                 "lang": "js"
             }
         })",
@@ -1814,12 +1808,7 @@ TEST(Accumulators, SerializeWithRedaction) {
         R"({
             "$topN": {
                 "n": "?number",
-                "output": {
-                    "HASH<output>": "$HASH<output>",
-                    "HASH<sortFields>": [
-                        "$HASH<sortKey>"
-                    ]
-                },
+                "output": "$HASH<output>",
                 "sortBy": {
                     "HASH<sortKey>": 1
                 }
@@ -1873,12 +1862,7 @@ TEST(Accumulators, SerializeWithRedaction) {
     ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
         R"({
             "$top": {
-                "output": {
-                    "HASH<output>": "$HASH<b>",
-                    "HASH<sortFields>": [
-                        "$HASH<sales>"
-                    ]
-                },
+                "output": "$HASH<b>",
                 "sortBy": {
                     "HASH<sales>": 1
                 }
@@ -1917,7 +1901,7 @@ TEST(Accumulators, SerializeWithRedaction) {
     actual = parseAndSerializeAccum(internalJsReduce.firstElement(),
                                     &AccumulatorInternalJsReduce::parseInternalJsReduce);
     ASSERT_DOCUMENT_EQ_AUTO(  // NOLINT
-        R"({"$_internalJsReduce":{"data":"$HASH<emits>","eval":"?"}})",
+        R"({"$_internalJsReduce":{"data":"$HASH<emits>","eval":"?string"}})",
         actual);
 }
 

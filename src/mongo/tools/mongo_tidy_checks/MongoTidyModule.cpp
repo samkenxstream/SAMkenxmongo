@@ -32,8 +32,10 @@
 #include "MongoCollectionShardingRuntimeCheck.h"
 #include "MongoConfigHeaderCheck.h"
 #include "MongoCxx20BannedIncludesCheck.h"
+#include "MongoCxx20StdChronoCheck.h"
 #include "MongoFCVConstantCheck.h"
 #include "MongoHeaderBracketCheck.h"
+#include "MongoMacroDefinitionLeaksCheck.h"
 #include "MongoMutexCheck.h"
 #include "MongoStdAtomicCheck.h"
 #include "MongoStdOptionalCheck.h"
@@ -60,6 +62,7 @@ public:
         CheckFactories.registerCheck<MongoConfigHeaderCheck>("mongo-config-header-check");
         CheckFactories.registerCheck<MongoCxx20BannedIncludesCheck>(
             "mongo-cxx20-banned-includes-check");
+        CheckFactories.registerCheck<MongoCxx20StdChronoCheck>("mongo-cxx20-std-chrono-check");
         CheckFactories.registerCheck<MongoStdOptionalCheck>("mongo-std-optional-check");
         CheckFactories.registerCheck<MongoVolatileCheck>("mongo-volatile-check");
         CheckFactories.registerCheck<MongoTraceCheck>("mongo-trace-check");
@@ -70,6 +73,8 @@ public:
         CheckFactories.registerCheck<MongoUnstructuredLogCheck>("mongo-unstructured-log-check");
         CheckFactories.registerCheck<MongoCollectionShardingRuntimeCheck>(
             "mongo-collection-sharding-runtime-check");
+        CheckFactories.registerCheck<MongoMacroDefinitionLeaksCheck>(
+            "mongo-macro-definition-leaks-check");
     }
 };
 

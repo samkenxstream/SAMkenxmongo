@@ -50,7 +50,6 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_util.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/util/fail_point.h"
 #include "mongo/util/pcre.h"
 #include "mongo/util/pcre_util.h"
 
@@ -59,9 +58,6 @@
 
 namespace mongo {
 namespace {
-
-MONGO_FAIL_POINT_DEFINE(hangBeforeNotifyingCreateDatabaseCommitted);
-
 
 using namespace fmt::literals;
 
@@ -124,8 +120,6 @@ DatabaseType ShardingCatalogManager::createDatabase(
 
     DBDirectClient client(opCtx);
 
-    boost::optional<DDLLockManager::ScopedLock> dbLock;
-
     // Resolve the shard against the received parameter (which may encode either a shard ID or a
     // connection string).
     if (optPrimaryShard) {
@@ -148,6 +142,7 @@ DatabaseType ShardingCatalogManager::createDatabase(
         return filterBuilder.obj();
     }();
 
+    boost::optional<DDLLockManager::ScopedBaseDDLLock> dbLock;
 
     // First perform an optimistic attempt without taking the lock to check if database exists.
     // If the database is not found take the lock and try again.
@@ -164,10 +159,12 @@ DatabaseType ShardingCatalogManager::createDatabase(
 
         // Do another loop, with the db lock held in order to avoid taking the expensive path on
         // concurrent create database operations
-        dbLock.emplace(DDLLockManager::get(opCtx)->lock(opCtx,
-                                                        str::toLower(dbName),
-                                                        "createDatabase" /* reason */,
-                                                        DDLLockManager::kDefaultLockTimeout));
+        dbLock.emplace(opCtx,
+                       DatabaseNameUtil::deserialize(boost::none, str::toLower(dbName)),
+                       "createDatabase" /* reason */,
+                       MODE_X,
+                       DDLLockManager::kDefaultLockTimeout,
+                       true /*waitForRecovery*/);
     }
 
     // Expensive createDatabase code path
@@ -276,8 +273,6 @@ DatabaseType ShardingCatalogManager::createDatabase(
             txn_api::SyncTransactionWithRetries txn(
                 opCtx, executor, nullptr /*resourceYielder*/, inlineExecutor);
             txn.run(opCtx, transactionChain);
-
-            hangBeforeNotifyingCreateDatabaseCommitted.pauseWhileSet();
 
             DatabasesAdded commitCompletedEvent(
                 {DatabaseNameUtil::deserialize(boost::none, dbName)},

@@ -217,8 +217,9 @@ const expectToReopenArchivedBuckets = function() {
     jsTestLog("Exiting expectToReopenArchivedBuckets.");
 }();
 
+// TODO SERVER-77454: Investigate re-enabling this.
 const expectToReopenCompressedBuckets = function() {
-    if (!FeatureFlagUtil.isEnabled(db, "TimeseriesAlwaysUseCompressedBuckets")) {
+    if (!FeatureFlagUtil.isPresentAndEnabled(db, "TimeseriesAlwaysUseCompressedBuckets")) {
         return;
     }
 
@@ -253,7 +254,7 @@ const expectToReopenCompressedBuckets = function() {
     checkIfBucketReopened(backward, /* willCreateBucket */ false, /* willReopenBucket */ true);
 
     jsTestLog("Exiting expectToReopenCompressedBuckets.");
-}();
+};
 
 const failToReopenNonSuitableBuckets = function() {
     jsTestLog("Entering failToReopenNonSuitableBuckets...");
